@@ -293,26 +293,26 @@
 
 需要 Go ≥ 1.22、Node.js ≥ 16、Rust 工具链（MSVC 或 MinGW 均可）。
 
+Go 网关源码已随仓库提供（`go-gateway/`），**无需另行 clone 上游**：
+
 ```powershell
 # 1) 构建网关（Go），产物直接作为内嵌资源
-git clone --depth 1 https://github.com/Sliverkiss/workbuddy2api.git
-cd workbuddy2api
-
-#    应用「国际版支持」补丁（需要国际版时才要；只做国服可跳过）
-git apply ..\workbuddy-switch-gateway\patches\intl-support.patch
-
+cd go-gateway
 go build -trimpath -ldflags "-s -w" `
-  -o ..\workbuddy-switch-gateway\crates\wb-switch-core\embedded\gateway.exe `
+  -o ..\crates\wb-switch-core\embedded\gateway.exe `
   .\cmd\server
 
 # 2) 构建前端并打包为单一可执行文件
-cd ..\workbuddy-switch-gateway
+cd ..
 .\scripts\build-single.ps1        # 产出 dist-single\wb-switch.exe
 
 # 3) 生成安装包（可选）
 npm install
 npm run tauri build
 ```
+
+> `scripts/build-single.ps1` 会自动调用 `go-gateway/` 完成第 1 步，上面显式列出
+> 只是为了便于单独调试网关。
 
 ---
 
@@ -468,12 +468,17 @@ curl $OPENAI_BASE_URL/chat/completions \
 ### 项目结构
 
 ```
+go-gateway/                   Go 网关源码（上游 workbuddy2api 的 vendor 副本，构建期编译并内嵌）
+  cmd/server/                   网关入口
+  internal/pool/                账号池与到期分层选号（本项目改动最集中的模块）
+  internal/scheduler/           签到 / 保活 / 积分到期巡检 / 猫猫旅行
 crates/wb-switch-core/        核心逻辑（不依赖 Tauri，可被桌面端与 HTTP 服务复用）
   src/modules/account.rs        账号存储
   src/modules/gateway.rs        网关托管与账号桥接（本项目新增）
   src/modules/gateway_embed.rs  内嵌网关的释放与缓存（本项目新增）
   src/modules/travel.rs         猫猫旅行（App 侧）
   build.rs                      构建期压缩内嵌网关（本项目新增）
+crates/wb-switch-gateway/     Rust 版网关（本项目新增，迁移中；chat_completions 仍为占位）
 crates/wb-switch-server/      HTTP 服务形态（npm / webui）
 src/                          React 前端
   src/pages/GatewayPage.tsx     兼容网关页面（本项目新增）
@@ -483,6 +488,10 @@ src-tauri/                    桌面壳（Tauri 2）
 scripts/build-single.ps1      构建单一可执行文件（本项目新增）
 ```
 
+> **两份网关实现并存**：v0.4.0 的实际运行依赖是 `go-gateway/`（内嵌为
+> `embedded/gateway.exe`）。`crates/wb-switch-gateway/` 是进行中的 Rust 重写，
+> 尚未接入主构建流程，`chat_completions` 目前返回 503 占位。
+
 ### 测试
 
 ```bash
@@ -490,10 +499,10 @@ cargo test -p wb-switch-core    # 核心逻辑单元测试
 npm run build                   # 前端类型检查与构建
 ```
 
-网关侧（Go）自带完整测试套件；应用补丁后：
+网关侧（Go）自带完整测试套件，在 vendor 目录内直接运行：
 
 ```bash
-cd path/to/workbuddy2api && go test ./...
+cd go-gateway && go test ./...
 ```
 
 > 已知有 3 个单测在 Windows 上失败（`session` / `export_import` / `codebuddy_cli`
@@ -505,10 +514,13 @@ cd path/to/workbuddy2api && go test ./...
 
 ## 对上游的改动
 
-本项目对 `workbuddy2api`（Go 网关）的改动以补丁形式维护：
+本项目的 Go 网关源码**已 vendor 进本仓库**（`go-gateway/`，上游 `workbuddy2api`
+的源码副本，不带独立 git 历史），改动直接体现在该目录中，不再以补丁形式应用到
+外部 clone。原始补丁留档供比对：
 
 ```
-patches/intl-support.patch        （基于上游 cfb1713 生成）
+patches/intl-support.patch        （基于上游 cfb1713 生成的原始补丁，仅作参考）
+go-gateway/                       （当前实际构建来源）
 ```
 
 改动内容：
@@ -579,7 +591,8 @@ patches/intl-support.patch        （基于上游 cfb1713 生成）
 版权声明（见 [`LICENSE`](./LICENSE)），并在此基础上补充整合部分的版权声明。
 
 > 本仓库是**独立整合作品**，与上述两个上游项目相互独立、各自演进。
-> 上游的后续更新不会被自动合入；对网关的改动以 `patches/` 下的补丁形式单独维护。
+> 上游的后续更新不会被自动合入；网关源码以 `go-gateway/` 的 vendor 副本为准，
+> `patches/intl-support.patch` 保留为最初那轮改动的对照凭据。
 > 本项目不代表上游作者的立场或背书。
 
 整合部分（本项目新增）同样以 MIT 许可证发布。逐项来源说明与改动清单见

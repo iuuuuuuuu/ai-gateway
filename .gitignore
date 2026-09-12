@@ -36,7 +36,11 @@ backups/
 npm/platform/*/bin/
 
 # 个人开发工作流（trellis）
-.trellis/
+# 说明：AGENTS.md 与 .trellis/spec、.trellis/tasks 是团队共享的规范与任务存档，
+# 已被远端跟踪，必须继续入库；只有 workspace（个人流水账）与临时运行产物不入库。
+.trellis/workspace/
+.trellis/tasks/*/context.jsonl
+.trellis/.tmp/
 
 # AI 工具本地配置
 .codebuddy/
@@ -45,6 +49,8 @@ npm/platform/*/bin/
 .codex/
 .grok/
 /.workbuddy/
+.trae/
+.workbuddy-ai/
 
 # 内嵌网关二进制（构建产物，由 scripts/build-gateway 生成）
 crates/wb-switch-core/embedded/
@@ -52,6 +58,8 @@ crates/wb-switch-core/embedded/
 # 单文件构建产物（不入库，改由 CI/本地构建生成）
 dist-single/
 _rel/
+# 发布产物目录（含签名密钥，绝不入库）
+_rel7/
 
 # CI 工作流：需 workflow scope 才能推送；本仓库暂由本地构建
 # 原上游工作流依赖其私有密钥，已备份至 _workflows_backup/

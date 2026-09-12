@@ -7,3 +7,15 @@
 # picking either side (task state lives in task.json, not index.md). See
 # .trellis/spec/cli/backend/directory-structure.md for details.
 .trellis/workspace/*/journal-*.md merge=union
+
+# 统一以 LF 存库，避免 Windows/macOS 协作时整文件换行抖动。
+# go-gateway/ 是上游 Go 源码的 vendor 副本，强制 LF 以便日后与上游 diff 对齐。
+* text=auto eol=lf
+*.patch text eol=lf
+*.png binary
+*.ico binary
+*.icns binary
+*.dll binary
+*.exe binary
+*.rgba binary
+*.zip binary
