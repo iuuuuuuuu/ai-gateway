@@ -107,6 +107,7 @@ pub fn router() -> Router {
         .route("/api/gateway/sync", post(api_gateway_sync))
         .route("/api/gateway/restart", post(api_gateway_restart))
         .route("/api/gateway/models", get(api_gateway_models))
+        .route("/api/gateway/usage", get(api_gateway_usage))
         // ---- 一键导入：接入本机 AI 客户端 ----
         .route("/api/gateway/agents", get(api_agents_detect))
         .route("/api/gateway/agents/import", post(api_agents_import))
@@ -843,6 +844,15 @@ async fn api_gateway_models() -> Response {
     json_ok(json!({
         "models": wb_switch_core::modules::gateway::fetch_models().await,
     }))
+}
+
+/// GET /api/gateway/usage?days=7 —— 网关累计 Token 用量（days 省略 = 全部历史）。
+async fn api_gateway_usage(Query(params): Query<HashMap<String, String>>) -> Response {
+    let days = params
+        .get("days")
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|d| *d > 0);
+    json_ok(wb_switch_core::modules::gateway::fetch_usage(days).await)
 }
 
 /// GET /api/gateway/agents —— 探测全部客户端的安装与配置状态。

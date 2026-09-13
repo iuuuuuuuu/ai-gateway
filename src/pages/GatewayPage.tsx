@@ -34,6 +34,7 @@ import type {
   GatewayPoolAccount,
   GatewayPortCheck,
   GatewayStatus,
+  GatewayUsageResult,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -71,7 +72,17 @@ function Row({ children, className }: { children: React.ReactNode; className?: s
   );
 }
 
-function Stat({ label, value, tone }: { label: string; value: React.ReactNode; tone?: "ok" | "warn" | "off" }) {
+function Stat({
+  label,
+  value,
+  hint,
+  tone,
+}: {
+  label: string;
+  value: React.ReactNode;
+  hint?: React.ReactNode;
+  tone?: "ok" | "warn" | "off";
+}) {
   return (
     <div className="min-w-0 rounded-lg border border-border/60 px-3 py-2">
       <div className="text-[11px] text-muted-foreground">{label}</div>
@@ -85,6 +96,60 @@ function Stat({ label, value, tone }: { label: string; value: React.ReactNode; t
       >
         {value}
       </div>
+      {hint ? <div className="mt-0.5 truncate text-[11px] tabular-nums text-muted-foreground">{hint}</div> : null}
+    </div>
+  );
+}
+
+/** 网关 Token 用量的统计范围选项。 */
+type UsageRangeKey = "today" | "7d" | "30d" | "all";
+
+const USAGE_RANGE_OPTIONS: { key: UsageRangeKey; label: string; days?: number }[] = [
+  { key: "today", label: "今日", days: 1 },
+  { key: "7d", label: "近 7 天", days: 7 },
+  { key: "30d", label: "近 30 天", days: 30 },
+  { key: "all", label: "全部" },
+];
+
+const exactTokenFormatter = new Intl.NumberFormat("en-US");
+
+/** 大数紧凑展示（与 Token 统计页的 K/M/B 风格一致）。 */
+function formatUsageCompact(value: number): string {
+  const abs = Math.abs(value);
+  if (abs >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(1)}B`;
+  if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (abs >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  return exactTokenFormatter.format(value);
+}
+
+/** 一组数值的最大值（至少为 1，避免除零）。 */
+function maxOf(values: number[]): number {
+  return values.reduce((max, value) => Math.max(max, value), 1);
+}
+
+/** 用量分布行：名称 + 占比条 + 数值（可带底部说明）。 */
+function UsageBarRow({
+  label,
+  value,
+  max,
+  meta,
+}: {
+  label: string;
+  value: number;
+  max: number;
+  meta?: string;
+}) {
+  const percent = max > 0 ? Math.max(3, Math.round((value / max) * 100)) : 0;
+  return (
+    <div className="space-y-1.5 px-4 py-2 sm:px-5">
+      <div className="flex items-baseline justify-between gap-3 text-xs">
+        <span className="min-w-0 truncate">{label}</span>
+        <span className="shrink-0 tabular-nums text-muted-foreground">{formatUsageCompact(value)}</span>
+      </div>
+      <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+        <div className="h-full rounded-full bg-primary/70" style={{ width: `${percent}%` }} />
+      </div>
+      {meta ? <div className="truncate text-[11px] text-muted-foreground">{meta}</div> : null}
     </div>
   );
 }
@@ -158,6 +223,13 @@ export default function GatewayPage() {
   /** 端口可用性检测结果（null = 尚未检测/正在检测）。 */
   const [portCheck, setPortCheck] = useState<GatewayPortCheck | null>(null);
   const [checkingPort, setCheckingPort] = useState(false);
+
+  /** 网关 Token 用量：范围选择、数据与加载态。 */
+  const [usageRange, setUsageRange] = useState<UsageRangeKey>("7d");
+  const [usage, setUsage] = useState<GatewayUsageResult | null>(null);
+  const [usageLoading, setUsageLoading] = useState(true);
+  /** 手动刷新触发的自增序号（同范围下重新拉取）。 */
+  const [usageNonce, setUsageNonce] = useState(0);
 
   /**
    * 端口 / API Key 是否存在「已编辑但未保存」的内容。
@@ -257,6 +329,30 @@ export default function GatewayPage() {
     return () => window.clearInterval(timer);
   }, [refresh]);
 
+  // Token 用量按所选范围拉取；usage 区块不参与 status 的 5 秒轮询，
+  // 避免把可能较大的聚合响应反复传输（切换范围或点刷新时再取）。
+  useEffect(() => {
+    let cancelled = false;
+    setUsageLoading(true);
+    const days = USAGE_RANGE_OPTIONS.find((option) => option.key === usageRange)?.days;
+    api
+      .getGatewayUsage(days)
+      .then((res) => {
+        if (!cancelled) setUsage(res);
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setUsage({ running: false, reachable: false, usage: null, error: api.asError(e) });
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setUsageLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [usageRange, usageNonce]);
+
   // 端口变化后防抖检测可用性。
   // 网关正跑在自己的端口上时该端口必然「被占用」，此时不报冲突。
   useEffect(() => {
@@ -339,6 +435,23 @@ export default function GatewayPage() {
   const pool = status?.pool ?? null;
   const poolAccounts = pool?.accounts ?? [];
   const running = Boolean(status?.running);
+
+  // 用量区块的派生数据。
+  const usageSnapshot = usage?.usage ?? null;
+  const usageSummary = usageSnapshot?.summary ?? null;
+  const usageModels = usageSnapshot?.models ?? [];
+  const usageAccounts = usageSnapshot?.accounts ?? [];
+  const usageDaily = usageSnapshot?.daily ?? [];
+  const usageMaxModel = maxOf(usageModels.map((m) => m.total));
+  const usageMaxAccount = maxOf(usageAccounts.map((a) => a.total));
+  const usageMaxDaily = maxOf(usageDaily.map((d) => d.total));
+  const usageNickname = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const account of status?.accounts ?? []) {
+      map.set(account.uid, account.nickname || account.uid.slice(0, 8));
+    }
+    return map;
+  }, [status?.accounts]);
 
   const endpoint = status?.openaiBase ?? "";
   const endpointHint = useMemo(() => {
@@ -683,6 +796,174 @@ export default function GatewayPage() {
                   网关未运行
                 </>
               )}
+            </div>
+          </Row>
+        )}
+      </Section>
+
+      <Section
+        title="Token 用量"
+        description="经网关成功请求的上游用量，按模型 / 账号 / 日期聚合（网关重启后保留）"
+      >
+        <Row>
+          <div className="min-w-0">
+            <div className="text-[13px]">统计范围</div>
+            <div className="mt-0.5 text-[11px] tabular-nums text-muted-foreground">
+              {usageSummary
+                ? `共 ${exactTokenFormatter.format(usageSummary.records)} 次调用 · 合计 ${exactTokenFormatter.format(usageSummary.total)} tokens`
+                : "等待网关数据"}
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-1.5">
+            {USAGE_RANGE_OPTIONS.map((option) => (
+              <Button
+                key={option.key}
+                variant={usageRange === option.key ? "default" : "outline"}
+                size="sm"
+                className="h-7 px-2 text-xs"
+                onClick={() => setUsageRange(option.key)}
+              >
+                {option.label}
+              </Button>
+            ))}
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-7"
+              onClick={() => setUsageNonce((value) => value + 1)}
+              disabled={usageLoading}
+              aria-label="刷新用量"
+            >
+              <RefreshCw className={cn("size-3.5", usageLoading && "animate-spin")} />
+            </Button>
+          </div>
+        </Row>
+
+        {usageLoading && !usageSnapshot ? (
+          <Row className="justify-center">
+            <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
+              <Loader2 className="size-3.5 animate-spin" />
+              正在读取网关用量…
+            </div>
+          </Row>
+        ) : (usage && !usage.running) || !running ? (
+          <Row className="justify-center">
+            <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
+              <CheckCircle2 className="size-3.5" />
+              网关未运行，启动后这里会展示经网关请求的 Token 用量
+            </div>
+          </Row>
+        ) : !usage?.reachable ? (
+          <Row className="justify-center">
+            <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
+              <Activity className="size-3.5" />
+              网关已启动但暂时无法读取用量{usage?.error ? `：${usage.error}` : ""}
+            </div>
+          </Row>
+        ) : usageSnapshot?.enabled === false ? (
+          <Row className="justify-center">
+            <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
+              <AlertTriangle className="size-3.5" />
+              当前网关可执行文件不支持用量统计，请更新网关后重试
+            </div>
+          </Row>
+        ) : usageSnapshot && usageSummary ? (
+          <>
+            <div className="mx-4 grid grid-cols-2 gap-2 py-3 sm:mx-5 sm:grid-cols-4">
+              <Stat
+                label="总 Token"
+                value={formatUsageCompact(usageSummary.total)}
+                hint={exactTokenFormatter.format(usageSummary.total)}
+              />
+              <Stat
+                label="输入"
+                value={formatUsageCompact(usageSummary.input)}
+                hint={
+                  usageSummary.cacheHitRate != null
+                    ? `缓存命中率 ${(usageSummary.cacheHitRate * 100).toFixed(1)}%`
+                    : "无缓存读取数据"
+                }
+              />
+              <Stat
+                label="输出"
+                value={formatUsageCompact(usageSummary.output)}
+                hint={`缓存写入 ${formatUsageCompact(usageSummary.cacheWrite)}`}
+              />
+              <Stat
+                label="调用次数"
+                value={exactTokenFormatter.format(usageSummary.records)}
+                hint="成功请求"
+              />
+            </div>
+
+            <div className="grid gap-4 border-t border-border/50 pb-2 pt-3 sm:grid-cols-2">
+              <div className="min-w-0">
+                <div className="px-4 text-[12px] font-medium text-muted-foreground sm:px-5">按模型</div>
+                <div className="mt-1">
+                  {usageModels.length > 0 ? (
+                    usageModels.slice(0, 5).map((model) => (
+                      <UsageBarRow
+                        key={model.key}
+                        label={model.key}
+                        value={model.total}
+                        max={usageMaxModel}
+                        meta={`${exactTokenFormatter.format(model.records)} 次调用 · 输入 ${formatUsageCompact(model.input)} / 输出 ${formatUsageCompact(model.output)}`}
+                      />
+                    ))
+                  ) : (
+                    <div className="px-4 py-2 text-xs text-muted-foreground sm:px-5">该范围内暂无数据</div>
+                  )}
+                </div>
+              </div>
+              <div className="min-w-0">
+                <div className="px-4 text-[12px] font-medium text-muted-foreground sm:px-5">按账号</div>
+                <div className="mt-1">
+                  {usageAccounts.length > 0 ? (
+                    usageAccounts.slice(0, 5).map((account) => (
+                      <UsageBarRow
+                        key={account.key}
+                        label={usageNickname.get(account.key) ?? `${account.key.slice(0, 8)}…`}
+                        value={account.total}
+                        max={usageMaxAccount}
+                        meta={`${exactTokenFormatter.format(account.records)} 次调用 · ${account.key.slice(0, 8)}`}
+                      />
+                    ))
+                  ) : (
+                    <div className="px-4 py-2 text-xs text-muted-foreground sm:px-5">该范围内暂无数据</div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {usageDaily.length > 0 ? (
+              <div className="border-t border-border/50 px-4 pb-3 pt-3 sm:px-5">
+                <div className="text-[12px] font-medium text-muted-foreground">每日用量</div>
+                <div className="mt-2 flex h-16 items-end gap-1">
+                  {usageDaily.slice(-30).map((day) => (
+                    <div
+                      key={day.key}
+                      className="flex h-full flex-1 items-end"
+                      title={`${day.key} · ${exactTokenFormatter.format(day.total)} tokens · ${day.records} 次调用`}
+                    >
+                      <div
+                        className="w-full rounded-t-[3px] bg-primary/60 transition-colors hover:bg-primary"
+                        style={{ height: `${Math.max(4, Math.round((day.total / usageMaxDaily) * 100))}%` }}
+                      />
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-1 flex justify-between text-[10px] text-muted-foreground">
+                  <span>{usageDaily[Math.max(0, usageDaily.length - 30)]?.key}</span>
+                  <span>{usageDaily[usageDaily.length - 1]?.key}</span>
+                </div>
+              </div>
+            ) : null}
+          </>
+        ) : (
+          <Row className="justify-center">
+            <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
+              <AlertTriangle className="size-3.5" />
+              无法读取网关用量{usage?.error ? `：${usage.error}` : ""}
             </div>
           </Row>
         )}

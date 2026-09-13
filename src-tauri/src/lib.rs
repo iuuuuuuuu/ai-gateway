@@ -204,6 +204,7 @@ pub fn run() {
             commands::stop_gateway,
             commands::restart_gateway,
             commands::sync_gateway_accounts,
+            commands::get_gateway_usage,
             // 一键导入：接入本机 AI 客户端
             commands::detect_agent_clients,
             commands::get_gateway_models,

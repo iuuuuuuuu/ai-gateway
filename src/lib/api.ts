@@ -31,6 +31,7 @@ import type {
   GatewayStatus,
   GatewayPortCheck,
   GatewaySyncResult,
+  GatewayUsageResult,
   GithubConfig,
   ImportPreviewAccount,
   ImportResult,
@@ -61,6 +62,7 @@ const DEMO_READ_COMMANDS = new Set([
   "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
   "get_github_config", "check_update", "get_launch_at_login_enabled", "switch_progress",
   "get_travel_status", "get_auto_travel_config",
+  "get_gateway_usage",
 ]);
 
 export function isDemoMode(): boolean {
@@ -142,6 +144,7 @@ const ROUTES: Record<string, Route> = {
   restart_gateway: { method: "POST", path: "/api/gateway/restart" },
   sync_gateway_accounts: { method: "POST", path: "/api/gateway/sync" },
   get_gateway_models: { method: "GET", path: "/api/gateway/models" },
+  get_gateway_usage: { method: "GET", path: "/api/gateway/usage" },
   // ---- 一键导入：接入本机 AI 客户端 ----
   detect_agent_clients: { method: "GET", path: "/api/gateway/agents" },
   import_agent_client: { method: "POST", path: "/api/gateway/agents/import" },
@@ -626,6 +629,16 @@ export function switchGatewayMode(
 export async function getGatewayModels(): Promise<GatewayModelItem[]> {
   const res = await call<{ models?: GatewayModelItem[] }>("get_gateway_models");
   return res.models ?? [];
+}
+
+/**
+ * 获取网关累计 Token 用量统计（网关自统计，重启保留）。
+ *
+ * `days` 省略或非正数 = 全部历史；网关未运行 / 不可达时也不抛错，
+ * 由返回的 running / reachable / error 字段区分状态。
+ */
+export function getGatewayUsage(days?: number): Promise<GatewayUsageResult> {
+  return call<GatewayUsageResult>("get_gateway_usage", days && days > 0 ? { days } : undefined);
 }
 
 /** 探测本机 AI 客户端（全部 11 类智能体）的安装与配置状态。 */

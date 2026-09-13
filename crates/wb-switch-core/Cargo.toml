@@ -1,6 +1,6 @@
 [package]
 name = "wb-switch-core"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 description = "wb-switch 核心逻辑（账号/切换/会话/签到/更新），不依赖 Tauri，可被桌面端与 HTTP server 复用"
 
@@ -21,7 +21,9 @@ aes-gcm = "0.10"
 base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+# Win32_System_JobObjects / Win32_System_Threading / Win32_Security 供网关子进程的
+# Job Object 孤儿防护使用（应用退出时连带终止 gateway.exe）。
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [build-dependencies]
 # 构建期压缩内嵌网关

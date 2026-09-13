@@ -1,6 +1,7 @@
 import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
+  GatewayUsageGroup, GatewayUsageResult,
   GithubConfig, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals,
   TravelConfig, TravelStatus,
 } from "./types";
@@ -402,6 +403,41 @@ function demoTokenStatistics(days?: number): TokenStatistics {
   return { generatedAt: Date.now(), rangeDays: days ?? null, sources: [demoTokenSource("workbuddy", 1), demoTokenSource("codebuddy-cli", 0.58), demoTokenSource("codebuddy-ide", 0.36)] };
 }
 
+/** 演示用网关 Token 用量：与网关 /usage 响应同构。 */
+function demoGatewayUsage(days?: number): GatewayUsageResult {
+  const rangeDays = days && days > 0 ? days : null;
+  const dayCount = Math.min(14, rangeDays ?? 14);
+  const waves = [0.85, 1.12, 0.74, 1.28, 0.92, 0.41, 0.63];
+  const daily = Array.from({ length: dayCount }, (_, index) => {
+    const wave = waves[(dayCount - 1 - index) % 7];
+    return {
+      key: localDate(dayCount - 1 - index),
+      ...demoTokenTotals(Math.round(3_180_000 * wave), Math.round(268_000 * wave), Math.round(2_790_000 * wave), Math.round(43_000 * wave), Math.round(9 * wave)),
+    };
+  });
+  const summary = daily.reduce(
+    (sum, row) => demoTokenTotals(sum.input + row.input, sum.output + row.output, sum.cacheRead + row.cacheRead, sum.cacheWrite + row.cacheWrite, sum.records + row.records),
+    demoTokenTotals(0, 0, 0, 0, 0),
+  );
+  const models: GatewayUsageGroup[] = [
+    { key: "deepseek-v4-flash", ...demoTokenTotals(30_900_000, 2_430_000, 27_120_000, 410_000, 87) },
+    { key: "kimi-k3-1", ...demoTokenTotals(8_640_000, 780_000, 7_390_000, 96_000, 24) },
+    { key: "glm-5.2", ...demoTokenTotals(3_180_000, 342_000, 2_610_000, 37_000, 10) },
+    { key: "hy3", ...demoTokenTotals(1_090_000, 120_000, 880_000, 12_000, 5) },
+  ];
+  const usageAccounts: GatewayUsageGroup[] = [
+    { key: accounts[0].uid ?? accounts[0].id, ...demoTokenTotals(26_400_000, 2_140_000, 23_180_000, 352_000, 74) },
+    { key: accounts[1].uid ?? accounts[1].id, ...demoTokenTotals(11_900_000, 968_000, 10_320_000, 138_000, 33) },
+    { key: accounts[2].uid ?? accounts[2].id, ...demoTokenTotals(5_510_000, 564_000, 4_500_000, 65_000, 19) },
+  ];
+  return {
+    running: true,
+    reachable: true,
+    usage: { enabled: true, generatedAt: Date.now(), rangeDays, summary, models, accounts: usageAccounts, daily },
+    error: null,
+  };
+}
+
 /** Read-only demo response provider. It never reads or mutates real user data. */
 export function screenshotDemoResponse(command: string, args?: Record<string, unknown>): unknown {
   const demoAccounts = hydratedAccounts();
@@ -426,6 +462,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_credit_expiry": return creditExpiry(String(args?.accountId ?? ""));
     case "get_credit_statistics": return buildStatistics();
     case "get_token_statistics": return demoTokenStatistics(typeof args?.days === "number" ? args.days : undefined);
+    case "get_gateway_usage": return demoGatewayUsage(typeof args?.days === "number" ? args.days : undefined);
     case "get_auto_checkin_config": return checkinConfig();
     case "get_checkin_logs": return { logs: checkinLogs() };
     case "get_travel_status": return travelStatus(String(args?.accountId ?? ""));

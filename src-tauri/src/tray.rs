@@ -11,7 +11,7 @@ use tauri::{
 };
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
-use wb_switch_core::modules::{checkin, update};
+use wb_switch_core::modules::{checkin, gateway, update};
 
 const TRAY_ID: &str = "main-menu-bar";
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -94,11 +94,23 @@ fn emit_main_window_visible<R: Runtime>(app: &AppHandle<R>, visible: bool) {
 ///
 /// `code == None` is Tauri's runtime exit after zero windows remain.
 /// `code == Some(_)` is an explicit `app.exit()` / restart — let those through.
+///
+/// `RunEvent::Exit` 时确定性回收网关子进程：正常情况下由 `stop_gateway()` 收尾，
+/// 异常结束（崩溃/强杀）则由 core 层的 Job Object 兜底。
 pub fn on_run_event(event: RunEvent) {
-    if let RunEvent::ExitRequested { api, code, .. } = event {
-        if should_keep_tray_alive(code) {
-            api.prevent_exit();
+    match event {
+        RunEvent::ExitRequested { api, code, .. } => {
+            if should_keep_tray_alive(code) {
+                api.prevent_exit();
+            }
         }
+        RunEvent::Exit => {
+            let stopped = gateway::stop_gateway();
+            if stopped.get("stopped").and_then(Value::as_bool) == Some(true) {
+                gateway::update_runtime_state("stopped", None);
+            }
+        }
+        _ => {}
     }
 }
 

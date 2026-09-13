@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"workbuddy2api/internal/usage"
 )
 
 // chatSeq 进程级请求序号。
@@ -29,7 +31,25 @@ type chatStat struct {
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
 
+	// counters/hasCounters 为网关 Token 用量统计的采集结果（与日志字段解耦：
+	// 日志只关心 output，统计需要完整的输入/输出/缓存计量）。
+	counters    usage.Counters
+	hasCounters bool
+
 	logged bool
+}
+
+// setCounters 记录一次可用的完整计量。
+func (s *chatStat) setCounters(c usage.Counters) {
+	s.counters = c
+	s.hasCounters = true
+}
+
+// setUsageMap 从上游 usage 对象提取统计计量；字段不可识别时忽略。
+func (s *chatStat) setUsageMap(u map[string]any) {
+	if c, ok := usage.ParseOpenAIUsage(u); ok {
+		s.setCounters(c)
+	}
 }
 
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
@@ -50,8 +70,8 @@ func (s *chatStat) done() {
 	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
 }
 
-// chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
-// 并记录首个 data 帧的 TTFB；原始字节原样返回给下游透传。
+// chatStatsReader 在流式透传时抓取 SSE 末帧的 usage（completion_tokens 用于日志，
+// 完整计量用于 Token 用量统计），并记录首个 data 帧的 TTFB；原始字节原样返回给下游透传。
 // 注意：不做 rune 估算，token 数一律采信上游 usage。
 type chatStatsReader struct {
 	br       *bufio.Reader
@@ -61,6 +81,9 @@ type chatStatsReader struct {
 	hasUsage bool // 末帧是否带 usage
 	tokens   int
 	pend     []byte // 已读未返回的行缓存
+
+	counters    usage.Counters
+	hasCounters bool
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -74,7 +97,10 @@ func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
 // Tokens 返回末帧 usage.completion_tokens 与是否缺失；无 usage 时 ok=false。
 func (s *chatStatsReader) Tokens() (int, bool) { return s.tokens, s.hasUsage }
 
-// parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
+// Usage 返回末帧 usage 的完整计量（输入/输出/缓存）与是否可用。
+func (s *chatStatsReader) Usage() (usage.Counters, bool) { return s.counters, s.hasCounters }
+
+// parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确计量。
 func (s *chatStatsReader) parseSSELine(line string) {
 	line = strings.TrimRight(line, "\r\n")
 	if !strings.HasPrefix(line, "data: ") {
@@ -99,15 +125,17 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		}
 	}
 	var chunk struct {
-		Usage *struct {
-			CompletionTokens int `json:"completion_tokens"`
-		} `json:"usage"`
+		Usage map[string]any `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
 		return
 	}
 	s.hasUsage = true
-	s.tokens = chunk.Usage.CompletionTokens
+	s.tokens = numOf(chunk.Usage["completion_tokens"])
+	if c, ok := usage.ParseOpenAIUsage(chunk.Usage); ok {
+		s.counters = c
+		s.hasCounters = true
+	}
 }
 
 // Read 返回原始数据，同时解析统计 TTFB/token。

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"workbuddy2api/internal/server"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/usage"
 )
 
 func main() {
@@ -50,6 +52,14 @@ func main() {
 	p.SetStore(store)
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
+
+	// Token 用量统计：与 state.json 同目录的 usage.json（独立文件，避免与池状态互相迁移）。
+	usagePath := ""
+	if cfg.StateFile != "" {
+		usagePath = filepath.Join(filepath.Dir(cfg.StateFile), "usage.json")
+	}
+	usageStore := usage.New(usagePath)
+	defer usageStore.Flush()
 
 	// 熔断器 + 在途上限 + 三因子加权调优（从 config 注入，非正值回退默认）。
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
@@ -126,6 +136,7 @@ func main() {
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
+		Usage:        usageStore,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -146,7 +157,8 @@ func main() {
 	}
 	go func() {
 		<-ctx.Done()
-		p.Flush() // 信号触发：先落盘再做优雅停机
+		p.Flush()         // 信号触发：先落盘再做优雅停机
+		usageStore.Flush() // Token 用量同样在退出前补一次落盘
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)

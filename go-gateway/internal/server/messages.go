@@ -21,8 +21,11 @@ package server
 //   - 流式：chat SSE → Anthropic SSE（message_start / content_block_* / message_delta / message_stop）
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -78,6 +81,13 @@ func anthropicToChat(raw []byte) ([]byte, string, error) {
 			firstUser = userText
 		}
 		messages = append(messages, msgs...)
+	}
+
+	// 整流 tool 配对：并发工具乱序完成、上下文压缩丢块等会让历史里的
+	// assistant.tool_calls 与 role:tool 对不上，上游命中直接 400 code=11148。
+	if rectified, fixed := rectifyChatToolSequence(messages); fixed > 0 {
+		log.Printf("rectify /v1/messages tool sequence: fixed=%d", fixed)
+		messages = rectified
 	}
 
 	targetModel := resolveClaudeModel(req.Model)
@@ -240,8 +250,11 @@ func anthropicMessageToChat(raw json.RawMessage) ([]map[string]any, string, erro
 	}
 
 	if text.Len() > 0 {
-		// 已有 tool_result 时，把正文合并进同一条 user 消息之前。
-		out = append([]map[string]any{{"role": msg.Role, "content": text.String()}}, out...)
+		// tool_result 必须紧跟 assistant 的 tool_calls，因此正文追加在
+		// tool 消息之后（与 CC Switch convert_message_to_openai 的顺序一致）。
+		// 若把正文插到最前，会形成 assistant → user → tool 的断裂序列，
+		// 上游按 tool_call_sequence_broken 拒绝。
+		out = append(out, map[string]any{"role": msg.Role, "content": text.String()})
 	}
 	return out, text.String(), nil
 }
@@ -337,12 +350,27 @@ func anthropicToolChoiceToChat(raw json.RawMessage) any {
 	}
 }
 
+// newMessageID 生成 Anthropic 形状的唯一消息 id（msg_ + 24 位十六进制）。
+//
+// 为什么必须唯一：Claude 客户端把 message.id 当作消息身份键，用于会话
+// transcript 重建、去重与上下文压缩。上游响应缺 id 时若退化为固定常量
+// （旧实现为 msg_wb2api / chatcmpl-wb2api），不同轮次的 assistant 响应会被
+// 客户端误判为同一条消息，历史重建后 tool_use / tool_result 错配，
+// 最终触发上游 400 code=11148。
+func newMessageID() string {
+	var buf [12]byte
+	if _, err := rand.Read(buf[:]); err == nil {
+		return "msg_" + hex.EncodeToString(buf[:])
+	}
+	// crypto/rand 实际不可失败；兜底用纳秒时间戳保证唯一。
+	return "msg_" + fmt.Sprintf("%x", time.Now().UnixNano())
+}
+
 // chatToAnthropic 把非流式 chat.completion 转成 Anthropic message 对象。
 func chatToAnthropic(chat map[string]any, model string) map[string]any {
-	id := str(chat["id"])
-	if id == "" {
-		id = "msg_wb2api"
-	}
+	// 不透传上游 chat.completion id：上游在缺 id 时给的是固定常量，
+	// 直接透传等于回到「所有响应同一个 id」的问题上。
+	id := newMessageID()
 	if model == "" {
 		model = str(chat["model"])
 	}
@@ -448,7 +476,10 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
 	stat := newChatStat(nowFunc(), body, true)
 	stat.model = req.Model
 	stat.mode = "messages"
-	defer stat.done()
+	defer func() {
+		stat.done()
+		h.recordUsage(stat)
+	}()
 
 	chatBody, sessKey, err := anthropicToChat(body)
 	if err != nil {
@@ -475,6 +506,7 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
 	stat.status = http.StatusOK
 	if toks, ok := result.Response["usage"].(map[string]any); ok {
 		stat.toks = numOf(toks["completion_tokens"])
+		stat.setUsageMap(toks)
 	}
 	writeJSON(w, http.StatusOK, chatToAnthropic(result.Response, req.Model))
 }

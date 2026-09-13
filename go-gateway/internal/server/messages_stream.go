@@ -65,6 +65,7 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, result *chatResult, mod
 	ctx.closeOpenBlocks(out)
 	if ctx.usage != nil {
 		stat.toks = numOf(ctx.usage["completion_tokens"])
+		stat.setUsageMap(ctx.usage)
 	}
 	_ = out.write("message_delta", map[string]any{
 		"type": "message_delta",
@@ -104,8 +105,10 @@ type anthropicToolState struct {
 }
 
 func newAnthropicStreamState(model string) *anthropicStreamState {
+	// messageID 每响应唯一（见 newMessageID）：客户端按 id 合并历史，
+	// 恒定 id 会让不同轮次的响应被误并，破坏 tool 配对。
 	return &anthropicStreamState{
-		messageID: "msg_wb2api",
+		messageID: newMessageID(),
 		model:     model,
 		toolCalls: map[int]*anthropicToolState{},
 		textIndex: 0,
@@ -132,9 +135,6 @@ func (s *anthropicStreamState) messageObject(stopReason, status string) map[stri
 
 // consume 处理单个 chat SSE chunk。
 func (s *anthropicStreamState) consume(out *sseWriter, chunk map[string]any) error {
-	if id := str(chunk["id"]); id != "" && s.messageID == "msg_wb2api" {
-		s.messageID = id
-	}
 	if m := str(chunk["model"]); m != "" && s.model == "" {
 		s.model = m
 	}

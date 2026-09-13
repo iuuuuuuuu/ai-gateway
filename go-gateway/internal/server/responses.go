@@ -22,6 +22,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 
@@ -72,6 +73,13 @@ func responsesToChat(raw []byte) ([]byte, string, error) {
 		return nil, "", err
 	}
 	messages = append(messages, inputMsgs...)
+
+	// 与 /v1/messages 同源的整流：Codex 历史经压缩/截断后也可能出现
+	// function_call 与 function_call_output 不配对，上游命中 400 code=11148。
+	if rectified, fixed := rectifyChatToolSequence(messages); fixed > 0 {
+		log.Printf("rectify /v1/responses tool sequence: fixed=%d", fixed)
+		messages = rectified
+	}
 
 	out := map[string]any{
 		"model":    req.Model,
@@ -466,7 +474,10 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stat := newChatStat(nowFunc(), body, true)
-	defer stat.done()
+	defer func() {
+		stat.done()
+		h.recordUsage(stat)
+	}()
 
 	chatBody, sessKey, err := responsesToChat(body)
 	if err != nil {
@@ -500,6 +511,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		if n, ok2 := toks["completion_tokens"].(float64); ok2 {
 			stat.toks = int(n)
 		}
+		stat.setUsageMap(toks)
 	}
 	writeJSON(w, http.StatusOK, chatToResponses(result.Response, req.Model))
 }

@@ -106,6 +106,7 @@ func (h *Handler) streamResponses(w http.ResponseWriter, result *chatResult, mod
 	_ = ctx.finishItems(out)
 	if ctx.usage != nil {
 		stat.toks = numOf(ctx.usage["completion_tokens"])
+		stat.setUsageMap(ctx.usage)
 	}
 	_ = out.write("response.completed", ctx.completedEvent())
 }

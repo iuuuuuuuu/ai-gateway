@@ -586,6 +586,105 @@ fn proc_slot() -> &'static Mutex<Option<Child>> {
     GATEWAY_PROC.get_or_init(|| Mutex::new(None))
 }
 
+// ---------------------------------------------------------------------------
+// 孤儿进程防护：Windows Job Object
+// ---------------------------------------------------------------------------
+
+/// 网关子进程所属的 Job Object 包装。
+///
+/// 只靠 `stop_gateway()` 无法覆盖应用异常结束的路径（崩溃、任务管理器强杀、
+/// 更新重启时的 `std::process::exit`）。这些情况下 Windows 不会回收子进程，
+/// gateway.exe 会变成孤儿继续占用端口。Job 设置 `KILL_ON_JOB_CLOSE` 后，
+/// 父进程无论以何种方式退出，系统在关闭句柄时都会连带终止 Job 内的子进程。
+///
+/// 句柄在进程存活期间一直持有；句柄关闭（含进程崩溃导致的系统自动关闭）
+/// 即代表杀死网关。
+#[cfg(windows)]
+struct GatewayJob(windows::Win32::Foundation::HANDLE);
+
+// 句柄是进程级资源，仅通过 Win32 API 使用，跨线程共享安全。
+#[cfg(windows)]
+unsafe impl Send for GatewayJob {}
+#[cfg(windows)]
+unsafe impl Sync for GatewayJob {}
+
+#[cfg(windows)]
+impl GatewayJob {
+    /// 创建带 KILL_ON_JOB_CLOSE 限制的 Job；失败返回 None（不影响网关本身运行）。
+    fn create() -> Option<Self> {
+        use windows::Win32::System::JobObjects::{
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        unsafe {
+            let handle = CreateJobObjectW(None, windows::core::PCWSTR::null()).ok()?;
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .is_err()
+            {
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
+                return None;
+            }
+            Some(Self(handle))
+        }
+    }
+
+    /// 把网关子进程收进 Job。
+    fn assign(&self, child: &Child) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+        let process = HANDLE(child.as_raw_handle());
+        unsafe { AssignProcessToJobObject(self.0, process).is_ok() }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for GatewayJob {
+    fn drop(&mut self) {
+        // 显式关闭句柄：KILL_ON_JOB_CLOSE 在最后一个句柄关闭时终止 Job 内所有进程。
+        // （进程存活期间单例 Job 不会被 Drop，句柄保持打开；进程结束时由系统关闭。）
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+/// 进程级单例 Job（创建一次，失败不重试）。
+#[cfg(windows)]
+fn gateway_job() -> Option<&'static GatewayJob> {
+    static JOB: OnceLock<Option<GatewayJob>> = OnceLock::new();
+    JOB.get_or_init(GatewayJob::create).as_ref()
+}
+
+/// 把新启动的网关子进程纳入 Job：应用进程结束时由系统连带回收。
+///
+/// 加入失败不阻断启动（显式 stop_gateway 仍可正常停止），只打日志提示兜底失效。
+fn attach_child_to_job(child: &Child) {
+    #[cfg(windows)]
+    {
+        match gateway_job() {
+            None => eprintln!("[gateway] Job Object 创建失败：应用异常退出时可能残留网关进程"),
+            Some(job) if !job.assign(child) => {
+                eprintln!(
+                    "[gateway] 网关子进程加入 Job Object 失败：应用异常退出时可能残留网关进程"
+                )
+            }
+            Some(_) => {}
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child;
+    }
+}
+
 /// 网关是否在运行（本进程视角）。
 pub fn is_running() -> bool {
     GATEWAY_RUNNING.load(Ordering::SeqCst)
@@ -874,6 +973,8 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
     }
 
     let child = cmd.spawn().map_err(|e| format!("启动网关失败: {e}"))?;
+    // 立即纳入 Job：之后父进程意外结束也会被系统连带终止，避免孤儿进程占端口。
+    attach_child_to_job(&child);
     *proc_slot().lock().unwrap() = Some(child);
     GATEWAY_RUNNING.store(true, Ordering::SeqCst);
 
@@ -927,8 +1028,9 @@ pub fn stop_gateway() -> Value {
     let stopped = match slot.as_mut() {
         Some(child) => {
             let pid = child.id();
-            // Windows 需连同子进程树一起结束
-            let _ = Command::new("taskkill")
+            // Windows 需连同子进程树一起结束；走 cmd_builder 加 CREATE_NO_WINDOW，
+            // 避免退出/停止时闪出 taskkill 控制台窗口。
+            let _ = crate::modules::process::cmd_builder("taskkill")
                 .args(["/F", "/T", "/PID", &pid.to_string()])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -1196,6 +1298,69 @@ pub async fn fetch_models() -> Vec<Value> {
     Vec::new()
 }
 
+/// 从运行中的网关拉取 Token 用量统计（GET /usage）。
+///
+/// `days` 为统计范围（近 N 天，含今天）；None 或非正值表示全部历史。
+/// 网关未运行 / 未就绪 / 返回异常时同样返回结构化结果而不报错，
+/// 由调用方依据 `running` / `reachable` / `usage` 给出不同提示：
+///   { "running": bool, "reachable": bool, "usage": {...} | null, "error": string | null }
+pub async fn fetch_usage(days: Option<i64>) -> Value {
+    let cfg = load_gateway_config();
+    let port = cfg.get("port").and_then(Value::as_u64).unwrap_or(7863) as u16;
+    let api_key = cfg
+        .get("api_key")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let mut url = format!("http://127.0.0.1:{port}/usage");
+    if let Some(d) = days.filter(|d| *d > 0) {
+        url.push_str(&format!("?days={d}"));
+    }
+
+    let running = is_running();
+    let fail = |error: String| {
+        json!({
+            "running": running,
+            "reachable": false,
+            "usage": Value::Null,
+            "error": error,
+        })
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(2500))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return fail(format!("无法创建 HTTP 客户端: {e}")),
+    };
+
+    let mut req = client.get(&url);
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {api_key}"));
+    }
+
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            if !resp.status().is_success() {
+                return fail(format!("网关 /usage 返回 HTTP {status}"));
+            }
+            match resp.json::<Value>().await {
+                Ok(v) => json!({
+                    "running": running,
+                    "reachable": true,
+                    "usage": v,
+                    "error": Value::Null,
+                }),
+                Err(e) => fail(format!("解析网关 /usage 响应失败: {e}")),
+            }
+        }
+        Err(e) => fail(e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1392,5 +1557,72 @@ mod tests {
         assert!(super::read_credit_block(&dir.join("absent.json")).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 孤儿进程防护：Job 句柄关闭（父进程结束的等价事件）必须连带终止子进程。
+    // 覆盖崩溃/任务管理器强杀等 stop_gateway 来不及执行的情况。
+    #[cfg(windows)]
+    #[test]
+    fn job_object_kills_child_when_handle_closes() {
+        use std::time::{Duration, Instant};
+
+        let Some(job) = super::GatewayJob::create() else {
+            // 极少数环境不支持 Job Object 时跳过；显式 stop_gateway 仍然有效。
+            return;
+        };
+        let mut child = Command::new("cmd")
+            .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        assert!(job.assign(&child), "子进程应成功加入 Job");
+
+        drop(job); // 等价于父进程退出时系统自动关闭句柄
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if child.try_wait().expect("try_wait").is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("Job 句柄关闭后子进程仍存活");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    // 启动路径接线：attach_child_to_job 必须把子进程登记进单例 Job，
+    // 否则 Job 兜底形同虚设。
+    #[cfg(windows)]
+    #[test]
+    fn attach_child_registers_with_singleton_job() {
+        let mut child = Command::new("cmd")
+            .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        let Some(job) = super::gateway_job() else {
+            // 环境不支持 Job Object 时跳过；显式 stop_gateway 仍然有效。
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        };
+        super::attach_child_to_job(&child);
+
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{BOOL, HANDLE};
+        use windows::Win32::System::JobObjects::IsProcessInJob;
+        let mut in_job = BOOL::default();
+        unsafe {
+            IsProcessInJob(HANDLE(child.as_raw_handle()), job.0, &mut in_job)
+                .expect("IsProcessInJob");
+        }
+        assert!(in_job.as_bool(), "子进程应已加入单例 Job");
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

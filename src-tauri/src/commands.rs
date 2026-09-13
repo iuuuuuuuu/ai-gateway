@@ -780,6 +780,12 @@ pub async fn get_gateway_models() -> Result<Value, String> {
     }))
 }
 
+/// 获取网关累计 Token 用量统计（days 省略 = 全部历史）。
+#[tauri::command]
+pub async fn get_gateway_usage(days: Option<i64>) -> Result<Value, String> {
+    Ok(wb_switch_core::modules::gateway::fetch_usage(days).await)
+}
+
 /// 把网关接入指定客户端（写配置 + 自动备份，支持多模型）。
 #[tauri::command(rename_all = "camelCase")]
 pub fn import_agent_client(

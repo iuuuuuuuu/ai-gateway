@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/usage"
 )
 
 // Config handler 依赖。
@@ -29,6 +31,8 @@ type Config struct {
 	RedisMode    string
 	SoftCooldown time.Duration // 429 冷却，默认 60s
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+	// Usage Token 用量统计器（可选；nil = 不统计，/usage 返回 enabled=false）。
+	Usage *usage.Stats
 }
 
 // ServiceName 网关身份标识。经 /healthz 响应体 service 字段与 X-Service 头同时透出：
@@ -61,6 +65,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /messages", h.withAuth(h.messages))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
+	h.mux.HandleFunc("GET /usage", h.withAuth(h.usageReport))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
 }
@@ -133,6 +138,38 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
 	})
+}
+
+// usageReport 返回网关累计 Token 用量（GET /usage?days=N，days 省略或 0 = 全部）。
+//
+// 数据来源是网关自己记录的每次成功请求的上游 usage，与本地客户端日志统计相互独立。
+// 未装配统计器时返回 enabled=false，让宿主能区分「网关没开统计」与「统计为空」。
+func (h *Handler) usageReport(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Usage == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled":     false,
+			"generatedAt": time.Now().UnixMilli(),
+		})
+		return
+	}
+	days := 0
+	if raw := r.URL.Query().Get("days"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			days = n
+		}
+	}
+	snapshot := h.cfg.Usage.Snapshot(days)
+	snapshot["enabled"] = true
+	writeJSON(w, http.StatusOK, snapshot)
+}
+
+// recordUsage 把一次请求采集到的完整用量写入统计；无计量或未装配统计时跳过。
+// 只统计成功请求（上游返回了可用 usage 的请求），失败请求不计入。
+func (h *Handler) recordUsage(s *chatStat) {
+	if h.cfg.Usage == nil || !s.hasCounters {
+		return
+	}
+	h.cfg.Usage.Record(s.uid, s.model, s.counters)
 }
 
 // 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
@@ -305,7 +342,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(body, &peek)
 
 	st := newChatStat(time.Now(), body, peek.Stream)
-	defer st.done()
+	defer func() {
+		st.done()
+		h.recordUsage(st)
+	}()
 
 	sessKey := ""
 	if h.cfg.Session != nil {
@@ -327,6 +367,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		_ = upstream.Stream(w, stats)
 		st.ttfb = stats.TTFB()
 		st.toks, _ = stats.Tokens()
+		if counters, ok := stats.Usage(); ok {
+			st.setCounters(counters)
+		}
 		result.Stream.Close()
 		h.release(result.UID)
 		return
@@ -335,6 +378,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result.Response)
 	st.status = http.StatusOK
 	st.toks = completionTokens(result.Response)
+	if u, ok := result.Response["usage"].(map[string]any); ok {
+		st.setUsageMap(u)
+	}
 }
 
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。

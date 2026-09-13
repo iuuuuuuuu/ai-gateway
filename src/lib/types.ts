@@ -582,6 +582,49 @@ export interface GatewayPortCheck {
   suggest: number | null;
 }
 
+/** 网关 Token 用量中的一组计量（口径与本地 Token 统计页一致）。 */
+export interface GatewayUsageTotals {
+  /** input + output + cacheWrite（不含 cacheRead，避免重复计数）。 */
+  total: number;
+  /** 输入 token，已包含缓存读取。 */
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  uncachedInput: number;
+  /** 计入统计的成功请求数。 */
+  records: number;
+  /** 缓存命中率 = cacheRead / input；无输入时为 null。 */
+  cacheHitRate: number | null;
+}
+
+/** 带分组键的用量（模型名 / 账号 uid / 日期）。 */
+export interface GatewayUsageGroup extends GatewayUsageTotals {
+  key: string;
+}
+
+/** 网关 /usage 响应（enabled=false 表示该网关未启用统计）。 */
+export interface GatewayUsageSnapshot {
+  enabled: boolean;
+  generatedAt: number;
+  /** 统计范围（近 N 天）；null = 全部历史。 */
+  rangeDays?: number | null;
+  summary?: GatewayUsageTotals;
+  models?: GatewayUsageGroup[];
+  accounts?: GatewayUsageGroup[];
+  /** 按日期升序的日聚合。 */
+  daily?: GatewayUsageGroup[];
+  dailyByModel?: Record<string, GatewayUsageGroup[]>;
+}
+
+/** get_gateway_usage 的统一响应：网关不可达时 usage 为 null 且带 error。 */
+export interface GatewayUsageResult {
+  running: boolean;
+  reachable: boolean;
+  usage: GatewayUsageSnapshot | null;
+  error: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // 智能体客户端一键导入（agent_import）
 // ---------------------------------------------------------------------------
