@@ -86,10 +86,14 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 		}
 	}
 
+	// 请求的目标模型：用于「模型级限流」的选号过滤与冷却记账。
+	// 取不到时为空串，各环节自动退化为原有行为（不做模型过滤）。
+	model := modelOf(body)
+
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUID(stickyUID)
+			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, model)
 			if acct == nil {
 				if h.cfg.Session != nil {
 					h.cfg.Session.Unbind(sessKey)
@@ -98,7 +102,7 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickExcluding(tried)
+			acct = h.cfg.Pool.PickForModel(model, tried)
 		}
 		if acct == nil {
 			lastStatus = http.StatusServiceUnavailable
@@ -145,7 +149,7 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 			lastStatus = status
 			kind := upstream.Classify(status, string(respBody))
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-			h.applyErrorPolicy(acct.UID, kind)
+			h.applyErrorPolicy(acct.UID, model, kind, string(respBody))
 			fail(acct.UID)
 			continue
 		}

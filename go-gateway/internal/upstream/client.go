@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,10 @@ const (
 	ErrNotFound                   // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
 	ErrServer                     // 5xx 上游故障
 	ErrClient                     // 其他 4xx / 业务错误
+	// ErrModelRate 模型级限流：该账号的**这个模型**额度用尽（429 code=6004），
+	// 与整个账号被封的 ErrSoftRate 不同 —— 上游明确提示"您也可以切换其他模型继续使用"，
+	// 即该账号的其他模型仍然可用。冷却时长取上游给出的重置时间（解析失败回退软冷却）。
+	ErrModelRate
 )
 
 func (k ErrKind) String() string {
@@ -45,6 +50,8 @@ func (k ErrKind) String() string {
 		return "server"
 	case ErrClient:
 		return "client"
+	case ErrModelRate:
+		return "model_rate"
 	default:
 		return "none"
 	}
@@ -71,6 +78,116 @@ var hardMarkers = []string{
 
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 
+// modelRateMarkers 模型级限流的判定依据（429 + 其中之一）。
+//
+// 主力信号是上游业务码 6004；文案关键词作为兜底 —— 上游改码不改文案时仍能识别，
+// 但**必须**同时是 429，避免把其他场景的"频率限制"字样误判成模型限流。
+var modelRateMarkers = []string{"超出频率限制", "切换其他模型"}
+
+// modelRateCode 上游「模型级限流」的业务码。
+const modelRateCode = 6004
+
+// resetTimeRe 从报错文案里提取重置时刻。
+//
+// 实测文案（2026-09-15 现场）：
+//
+//	您的使用量已超出频率限制，将在 2026-09-15 13:25:47 UTC+8 重置，您也可以切换其他模型继续使用。
+//
+// 捕获组 1 = 时间字面量（日期 + 时间），捕获组 2 = 时区后缀（如 "UTC+8" / "UTC+08:00"）。
+// 时区后缀可选：上游换成 RFC3339 或纯本地时间时，退化为按本地时区解释。
+var resetTimeRe = regexp.MustCompile(`(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})(?:\s*(UTC[+-]\d{1,2}(?::\d{2})?|Z))?`)
+
+// ParseResetTime 从上游报错文案里解析「重置时刻」；解析不出返回零值与 false。
+//
+// 时区处理：
+//   - "UTC+8" / "UTC+08:00" → 固定偏移（上游实测用的就是这种）
+//   - "Z" / 无后缀但带 Z    → UTC
+//   - 无时区后缀            → 按本地时区解释（上游历史上返回过裸本地时间）
+//
+// 只返回**未来**的时刻：解析出过去的时间说明文案里的重置点已过（如重放旧日志），
+// 此时返回 false 交给调用方回退固定冷却，避免写入一个立即失效的冷却。
+func ParseResetTime(body string, now time.Time) (time.Time, bool) {
+	m := resetTimeRe.FindStringSubmatch(body)
+	if m == nil {
+		return time.Time{}, false
+	}
+	literal := strings.Replace(m[1], "T", " ", 1)
+	layout := "2006-01-02 15:04:05"
+
+	var loc *time.Location
+	switch tz := strings.TrimSpace(m[2]); {
+	case tz == "":
+		loc = time.Local
+	case tz == "Z":
+		loc = time.UTC
+	default:
+		loc = parseUTCOffset(tz)
+		if loc == nil {
+			loc = time.Local
+		}
+	}
+	ts, err := time.ParseInLocation(layout, literal, loc)
+	if err != nil {
+		return time.Time{}, false
+	}
+	if !ts.After(now) {
+		return time.Time{}, false
+	}
+	return ts, true
+}
+
+// parseUTCOffset 解析 "UTC+8" / "UTC-05:30" 形式的固定偏移时区；非法返回 nil。
+func parseUTCOffset(s string) *time.Location {
+	rest := strings.TrimPrefix(s, "UTC")
+	if rest == "" || (rest[0] != '+' && rest[0] != '-') {
+		return nil
+	}
+	sign := 1
+	if rest[0] == '-' {
+		sign = -1
+	}
+	rest = rest[1:]
+	hours, minutes := 0, 0
+	if i := strings.IndexByte(rest, ':'); i >= 0 {
+		h, err1 := strconv.Atoi(rest[:i])
+		mm, err2 := strconv.Atoi(rest[i+1:])
+		if err1 != nil || err2 != nil {
+			return nil
+		}
+		hours, minutes = h, mm
+	} else {
+		h, err := strconv.Atoi(rest)
+		if err != nil {
+			return nil
+		}
+		hours = h
+	}
+	if hours > 23 || minutes > 59 {
+		return nil
+	}
+	offset := sign * (hours*3600 + minutes*60)
+	return time.FixedZone(s, offset)
+}
+
+// IsModelRateLimited 报告 429 响应体是否为「模型级限流」（该账号该模型额度用尽）。
+//
+// 注意与 ErrSoftRate 的区别：ErrSoftRate 是账号级限流（整个账号被限速），
+// 而模型级限流只影响当前请求的那个模型，该账号换模型仍可用 —— 上游文案
+// "您也可以切换其他模型继续使用" 明确指出了这一点。
+func IsModelRateLimited(body string) bool {
+	var env apiEnvelope
+	if json.Unmarshal([]byte(body), &env) == nil && env.Code == modelRateCode {
+		return true
+	}
+	// 文案兜底：上游改码不改文案时仍能识别。
+	for _, m := range modelRateMarkers {
+		if strings.Contains(body, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 func Classify(status int, body string) ErrKind {
 	if status == http.StatusPaymentRequired {
@@ -88,6 +205,11 @@ func Classify(status int, body string) ErrKind {
 		}
 	}
 	if status == http.StatusTooManyRequests {
+		// 模型级限流优先于账号级软限流：两者的冷却粒度与时长都不同
+		// （模型级按 uid+model 冷却到上游给的重置时间）。
+		if IsModelRateLimited(body) {
+			return ErrModelRate
+		}
 		return ErrSoftRate
 	}
 	if status == http.StatusNotFound {
