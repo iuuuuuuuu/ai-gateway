@@ -704,6 +704,26 @@ cd path/to/workbuddy2api && go test ./...
 
 > 若你只使用国服，可跳过该补丁，功能与上游一致。
 
+**请求体超限显式报错**（`internal/server/handler.go` 等三处协议入口）
+
+修复长对话报 `unexpected EOF` 的问题（Issue #5 后续）：
+
+- 原先 `readLimitedBody` 用 `io.LimitReader(8MB)` 读取，读满即返回，调用方无法区分
+  「读完了」与「被截断了」。截断后的字节不是合法 JSON，`prepareBody` 解析失败后仍
+  原样透传给上游，上游解码报 `11101 Unmarshal chat params failed with error:
+  unexpected EOF` —— 客户端只看到「请求参数有误」，无法定位到是网关截断
+- 现在上限提到 32MB（长对话很容易突破 8MB），并多读 1 字节判定越界；超限返回 **413**
+  并说明原因，错误码按协议区分（OpenAI `payload_too_large` / Anthropic
+  `request_too_large`），三个协议入口行为一致
+
+**熔断期状态画像修正**（`internal/pool/pool.go`）
+
+- `cool_remaining_sec` 原先只看 `until`、`cool_kind` 取可能早已失效的历史值，导致
+  熔断中的账号显示成「冷却中 · 剩余 0 秒 · 余额不足」——即使它余额充足。现在按
+  **真正决定恢复的那个截止**（两截止取较晚者）计算剩余与类型，熔断期显示 `breaker`
+- 实现注记：`healthy()` 要求 `until` 与 `breakerUntil` **都**过期（AND 关系），故恢复
+  时刻是**较晚**者；而既有 `expiry()` 取的是**较早**者（供全冷却兜底挑「最快有可能
+  恢复」的号去试）。两者语义相反，故新增 `recoveryAt()` 而非复用 `expiry()`
 ## 上游来源与许可证
 
 本项目基于以下两个开源项目整合改造，**绝大部分代码来自上游**：

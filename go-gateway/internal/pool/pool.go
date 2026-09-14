@@ -1212,14 +1212,67 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		ExpireDay:       e.expiryDayKey(),
 	}
 	if st.Cooling {
-		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。
-		st.CoolRemaining = int64(time.Until(e.until).Seconds() + 0.999)
+		// 剩余秒数与类型都必须按**真正生效的那个截止**计算，不能只看 e.until。
+		//
+		// 两个截止正交：until 是按错误类别的即时冷却，breakerUntil 是连续失败的指数
+		// 退避熔断。熔断触发时 until 可能早已归零（甚至从未设置），此时唯一生效的是
+		// breakerUntil。旧实现按 time.Until(e.until) 算剩余、按 e.coolKind 报类型，
+		// 于是熔断中的账号显示成「冷却中 · 剩余 0 秒 · 余额不足」——即使它余额充足，
+		// 用户据此完全无法判断该等多久、以及到底为什么被停用（Issue #5 截图现场：
+		// 7161 积分的账号显示「冷却中」且剩余 0 秒）。
+		//
+		// 注意 Until 字段保持原语义（= e.until 这个即时冷却截止）不变：它参与持久化
+		// 口径且被既有契约测试依赖；「何时恢复」的权威答案由 CoolRemaining 与
+		// BreakerUntil 共同表达。
+		deadline := e.recoveryAt(now)
+		st.CoolRemaining = int64(time.Until(deadline).Seconds() + 0.999)
 		if st.CoolRemaining < 0 {
 			st.CoolRemaining = 0
 		}
-		st.CoolKind = e.coolKind.String()
+		// 熔断主导恢复时刻时报 breaker，否则才是 until 的即时冷却类型。
+		if e.breakerGovernsRecovery(now) {
+			st.CoolKind = "breaker"
+		} else {
+			st.CoolKind = e.coolKind.String()
+		}
 	}
 	return st
+}
+
+// recoveryAt 返回账号「何时恢复可选」——两个生效截止中**较晚**的那个。
+//
+// 与 expiry() 的区别（不可混用）：
+//   - healthy() 要求 until 与 breakerUntil **都**已过期（两者是 AND 关系），
+//     所以真正恢复的时刻是较晚者。expiry() 取的是较早者（供全冷却兜底挑
+//     "最快有可能恢复"的账号去试），语义不同。
+//   - 状态画像要回答用户"还要等多久"，必须用本函数。
+// 不在冷却期时返回零值。
+func (e *entry) recoveryAt(now time.Time) time.Time {
+	var t time.Time
+	if !e.until.IsZero() && now.Before(e.until) {
+		t = e.until
+	}
+	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+		if t.IsZero() || e.breakerUntil.After(t) {
+			t = e.breakerUntil
+		}
+	}
+	return t
+}
+
+// breakerGovernsRecovery 报告「账号何时恢复」是否由熔断截止决定（即 breakerUntil
+// 是两者中较晚、因而真正卡住恢复的那个）。
+//
+// 与 fallbackKind 的比较方向**恰好相反**，不可复用：
+//   - fallbackKind 服务于全冷却兜底，expiry() 取的是较早截止（兜底挑"最快有可能
+//     恢复"的号去试），故它在 breakerUntil **更早**时报 breaker；
+//   - 本函数服务于状态画像，要回答"还要等多久"，恢复取决于**较晚**的截止。
+func (e *entry) breakerGovernsRecovery(now time.Time) bool {
+	if e.breakerUntil.IsZero() || !now.Before(e.breakerUntil) {
+		return false
+	}
+	// until 已失效，或熔断截止不早于 until → 熔断是较晚者，主导恢复。
+	return e.until.IsZero() || !now.Before(e.until) || !e.breakerUntil.Before(e.until)
 }
 
 // ---------------------------------------------------------------------------
