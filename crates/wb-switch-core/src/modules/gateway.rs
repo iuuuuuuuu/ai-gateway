@@ -60,9 +60,13 @@ pub fn gateway_state_file() -> PathBuf {
     gateway_dir().join(GATEWAY_STATE_DIR).join("state.json")
 }
 
-/// 可执行文件名。
+/// 可执行文件名（Windows 带 .exe 后缀，macOS/Linux 不带）。
 fn gateway_exe_name() -> &'static str {
-    "gateway.exe"
+    if cfg!(windows) {
+        "gateway.exe"
+    } else {
+        "gateway"
+    }
 }
 
 /// 定位网关可执行文件。
@@ -958,6 +962,8 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
         .current_dir(gateway_dir())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // 非 Windows 平台不需要抑制控制台窗口，保持默认行为。
+    #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;

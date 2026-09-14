@@ -17,6 +17,12 @@ flate2 = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # CodeBuddy CN IDE Safe Storage (state.vscdb secret inject)
+# aes/cbc/pbkdf2/sha1 供 macOS（Keychain→PBKDF2-SHA1→AES-128-CBC）与
+# Linux（secret-tool→AES-128-CBC）分支使用；Windows 分支只用 aes-gcm。
+aes = "0.8"
+cbc = "0.1"
+pbkdf2 = "0.12"
+sha1 = "0.10"
 aes-gcm = "0.10"
 base64 = "0.22"
 

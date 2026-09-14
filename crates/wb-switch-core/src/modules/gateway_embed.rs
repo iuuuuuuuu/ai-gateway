@@ -82,6 +82,13 @@ pub fn materialize() -> Result<PathBuf, String> {
     let _ = std::fs::remove_file(&target);
     std::fs::rename(&tmp, &target).map_err(|e| format!("替换网关失败: {e}"))?;
 
+    // macOS/Linux 必须有执行位，否则 spawn 报 Permission denied（Windows 无需）。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
+    }
+
     Ok(target)
 }
 

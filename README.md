@@ -5,7 +5,7 @@
 **账号管理 + OpenAI 兼容网关，一个桌面应用搞定**
 
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows-0078D4.svg)](#系统要求)
+[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows-0078D4.svg)](#系统要求)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB.svg)](https://tauri.app)
 [![Gateway](https://img.shields.io/badge/API-OpenAI%20Compatible-412991.svg)](#兼容网关)
 
@@ -302,16 +302,12 @@ Pi / Grok Build / ZCode / Kimi Code / OpenClaw / Hermes Agent。
 
 ### 系统要求
 
-| 项目 | 要求 |
+| 平台 | 要求 |
 |---|---|
-| 操作系统 | Windows 10 / 11（x64） |
-| 运行时 | [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)（Win10/11 一般已内置） |
+| Windows 10 / 11（x64） | 需 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)（一般已内置） |
+| macOS（Apple Silicon） | 直接运行，首次打开需 `xattr -cr` 放行（见下） |
 | 磁盘 | 约 50 MB |
-| 其他 | 无需安装 Docker、Node.js 或 Go |
-
-> **本项目为 Windows 专属**。macOS 与 Linux 支持已**移除**：仓库不再保留对应平台的
-> 构建脚本与 CI 矩阵，也不再产出 DMG、`.deb`、AppImage 等安装包。非 Windows 平台的
-> 构建与运行不在本项目的支持范围内。
+| 其他 | 无需安装 Docker、Node.js 或 Go（从安装包运行时） |
 
 ### 安装方式一：安装包（推荐）
 
@@ -319,13 +315,16 @@ Pi / Grok Build / ZCode / Kimi Code / OpenClaw / Hermes Agent。
 
 | 文件 | 说明 |
 |---|---|
-| `workbuddy-switch_<版本>_x64-setup.exe` | 安装向导，自动创建开始菜单与卸载项 |
-| `workbuddy-switch-windows-x86_64-portable.zip` | 便携版，解压即用，不写入注册表 |
-| `latest.json` / `latest-windows-x86_64.json` | 自动更新清单（应用内更新使用） |
+| `workbuddy-switch_<版本>_aarch64.dmg` | macOS（Apple Silicon）磁盘映像，拖入「应用程序」即安装 |
+| `WorkBuddy.Switch.Gateway_<版本>_x64-setup.exe` | Windows 安装向导，自动创建开始菜单与卸载项 |
+| `WorkBuddy.Switch.Gateway_<版本>_x64_en-US.msi` | Windows MSI 包，适合批量部署 |
+| `WorkBuddy_Switch_Gateway_<版本>_portable.zip` | Windows 便携版，解压即用，不写入注册表 |
+| `WorkBuddy.Switch.Gateway_<版本>_amd64.deb` | Linux（Debian/Ubuntu）安装包 |
+| `WorkBuddy.Switch.Gateway_<版本>_amd64.AppImage` | Linux 免安装可执行文件 |
 
-### 安装方式二：便携版（免安装）
+### 安装方式二：便携版（Windows，免安装）
 
-下载 `workbuddy-switch-windows-x86_64-portable.zip`，解压后双击 `wb-switch-rust.exe`
+下载 `WorkBuddy_Switch_Gateway_<版本>_portable.zip`，解压后双击 `wb-switch-rust.exe`
 即可运行，不写入注册表。
 
 > `WebView2Loader.dll` 必须与 `wb-switch-rust.exe` 位于同一目录，请勿删除。
@@ -342,50 +341,45 @@ Pi / Grok Build / ZCode / Kimi Code / OpenClaw / Hermes Agent。
 > 0.6.1 起安装器支持覆盖更新（自定义 NSIS 模板，见 `src-tauri/installer.nsi`）；
 > 从更早版本升级到 0.6.1 时同样无需手动卸载。
 
-### 安装方式三：从源码构建（Windows）
+### 安装方式三：从源码构建
 
-需要 Go ≥ 1.22、Node.js ≥ 20、Rust 工具链。
+需要 Go ≥ 1.22、Node.js ≥ 20、Rust 工具链（Windows 需 MSVC 工具链以链接 WebView2）。
 
-> 本项目**仅支持 Windows x64**。macOS / Linux 的构建、打包与 CI 矩阵均已移除。
+> 网关源码随仓库分发在 `go-gateway/`，无需另行 clone 上游、也不需要打补丁。
 
-```powershell
-# 1) 构建网关（Go），产物直接作为内嵌资源
-#    Go 源码已随仓库分发在 go-gateway/，无需另行 clone 上游
-cd go-gateway
-go build -trimpath -ldflags "-s -w" `
-  -o ..\crates\wb-switch-core\embedded\gateway.exe `
-  .\cmd\server
-cd ..
+```bash
+# 1) 构建网关（Go）—— 产物落到 crates/wb-switch-core/embedded/，
+#    cargo build 时由 build.rs 压缩内嵌进主程序
+sh scripts/build-gateway.sh                              # 当前平台
+GOOS=windows GOARCH=amd64 sh scripts/build-gateway.sh    # 交叉编译到指定平台
+GOOS=darwin  GOARCH=arm64 sh scripts/build-gateway.sh
 
-# 2) 构建前端并打包为单一可执行文件
-.\scripts\build-single.ps1        # 产出 dist-single\wb-switch.exe
+# 2) 前端 + 桌面应用
+npm ci
+npm run tauri -- build --bundles app                     # macOS（产出 .app）
+npm run tauri -- build --bundles nsis,msi                # Windows
 
-# 3) 生成 Windows 安装包（可选，产出 NSIS 安装程序）
-npm install
-npm run tauri build
+# 3) macOS 额外产出 dmg（无头环境也能打，不依赖 Finder）
+sh scripts/make-dmg.sh <版本> <aarch64|x86_64> \
+  "target/release/bundle/macos/WorkBuddy Switch Gateway.app"
 ```
+
+> macOS 产物为 adhoc 签名（无 Apple 开发者证书），首次打开若提示「已损坏」，执行
+> `xattr -cr "/Applications/WorkBuddy Switch Gateway.app"` 放行。
 
 开发调试命令：
 
-```powershell
+```bash
 npm install
 npm run tauri dev        # 开发模式
 npm run build            # 前端类型检查与构建
-npm run tauri build      # 构建 Windows 安装包
+npm run tauri build      # 构建当前平台安装包
 ```
 
 ### 发布新版本
 
-签名密钥（自动更新用）通过 `TAURI_SIGNING_PRIVATE_KEY` 环境变量注入（CI 使用仓库 secret）。
-
-1. `npm run tauri build` 生成 Windows 安装包及其签名（CI 以 `--bundles nsis` 构建，产出 `workbuddy-switch_<版本>_x64-setup.exe` + `.exe.sig`）。CI 会先清掉 `target/**/release/bundle`，避免 cargo cache 把旧安装包带进 Release。
-2. `UPDATE_OS=windows UPDATE_ARCH=x86_64 sh scripts/gen-update-json.sh` 生成 `latest-windows-x86_64.json`（该脚本只支持 `UPDATE_OS=windows`）。
-   **手动执行时须同时传 `UPDATE_ARCHIVE_NAME=workbuddy-switch-windows-x86_64-setup.exe`**，否则清单里的文件名会与实际上传的资产名不一致，导致更新 404。
-3. `python3 scripts/merge-update-manifests.py <产物目录>` 把各 `latest-*.json` 合并为 `latest.json`
-4. 将安装包、签名更新包、`latest*.json` 一并上传到 GitHub Release
-
-> CI（`.github/workflows/build.yml`）的矩阵只构建 `win-x64`，产出 NSIS 安装程序
-> `workbuddy-switch_<版本>_x64-setup.exe`。
+推一个 `v*` tag 即可，`.github/workflows/release.yml` 会构建 Windows x64 / macOS arm64 /
+Linux x64 三个平台并建 Release。日常 push 走 `.github/workflows/ci.yml`，三平台编译校验 + 单测 + Go 网关单测，不产出安装包。
 
 **npm 版（webui）发布**：
 

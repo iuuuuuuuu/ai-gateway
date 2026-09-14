@@ -1,0 +1,323 @@
+name: release
+
+# 打 v* tag（或手动触发）时构建全部平台并发布 GitHub Release。
+#
+# 关于签名与自动更新：
+#   当前 tauri.conf.json 里 createUpdaterArtifacts=false —— 产物不带 .sig，
+#   也不生成 latest.json，因此应用内「检查更新」暂时不可用（不会报错，只是查不到）。
+#   拿到签名私钥后要接回自动更新，需要做三件事：
+#     1. tauri.conf.json: createUpdaterArtifacts 改回 true
+#     2. 仓库 secrets 加 TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#     3. 本文件里恢复 gen-update-json.sh + merge-update-manifests.py 两步，
+#        并把 .sig / latest*.json 一并上传（旧版 build.yml 里有现成写法）
+#
+# macOS 产物为 adhoc 签名（无 Apple 开发者证书），用户首次打开会提示「已损坏」，
+# 需执行 `xattr -cr "/Applications/WorkBuddy Switch Gateway.app"` 放行。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build / ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+            goos: windows
+            goarch: amd64
+          - name: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            bundles: app
+            goos: darwin
+            goarch: arm64
+            arch_label: aarch64
+          - name: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+            goos: linux
+            goarch: amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: 安装 Linux 系统依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      # dmgbuild 直接写 Finder 元数据而不启动 Finder，所以无头 CI 里
+      # DMG 也能保留大图标与拖拽箭头（Tauri 自带的 bundle_dmg.sh 在 CI 里不稳定，
+      # 本项目一直用 scripts/make-dmg.sh 代替）。
+      - name: 安装 dmgbuild
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/dmgbuild-venv"
+          "$RUNNER_TEMP/dmgbuild-venv/bin/python" -m pip install --quiet \
+            --disable-pip-version-check "dmgbuild==1.6.7"
+          echo "$RUNNER_TEMP/dmgbuild-venv/bin" >> "$GITHUB_PATH"
+
+      # portable.zip 用 Python 打包：文件名含中文（使用说明.txt），
+      # zipfile 写 UTF-8 名称标志位比 compress-archive/zip 更可靠。
+      - name: 准备 Python
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: 解析版本号
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          # 手动触发时没有 tag，退回 Cargo.toml 里的版本
+          if ! printf '%s' "$VER" | grep -qE '^[0-9]'; then
+            VER=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          fi
+          echo "APP_VERSION=$VER" >> "$GITHUB_ENV"
+          echo "版本号: $VER"
+
+      # 必须在前端与 Rust 构建之前：build.rs 会把网关 gzip 后编进主程序，
+      # 缺了它应用能起来但网关功能会报「本构建未内嵌网关二进制」。
+      - name: 构建内嵌网关（Go）
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: sh scripts/build-gateway.sh
+
+      - run: npm ci
+
+      - name: 构建前端
+        run: npm run build
+
+      # 不注入 TAURI_SIGNING_PRIVATE_KEY：createUpdaterArtifacts=false 时
+      # Tauri 不做签名，也就不会因缺少私钥而失败（见文件头说明）。
+      - name: 构建桌面应用
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cargo 缓存会把上一版的安装包一起带出来，不清理就会混进 Release
+          rm -rf "target/${{ matrix.target }}/release/bundle"
+          npm run tauri -- build \
+            --target ${{ matrix.target }} \
+            --bundles ${{ matrix.bundles }}
+          echo "bundle 内容:"
+          find "target/${{ matrix.target }}/release/bundle" -type f | sort || true
+
+      - name: 定位 bundle 目录
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 工作区在仓库根，但历史上也出现过 src-tauri/target；两处都认。
+          for base in target src-tauri/target; do
+            d="$base/${{ matrix.target }}/release/bundle"
+            if [ -d "$d" ]; then
+              echo "BUNDLE_ROOT=$d" >> "$GITHUB_ENV"
+              echo "bundle 目录: $d"
+              exit 0
+            fi
+          done
+          echo "未找到 bundle 目录" >&2
+          exit 1
+
+      - name: 打包 macOS（校验主程序 + adhoc 签名 + dmg）
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=$(find "$BUNDLE_ROOT/macos" -maxdepth 1 -type d -name '*.app' | head -1)
+          if [ -z "$APP" ]; then
+            echo "未找到 .app" >&2
+            ls -la "$BUNDLE_ROOT/macos" >&2 || true
+            exit 1
+          fi
+
+          # 前端资源（frontendDist）会被**编进主程序二进制**，不在 Contents/Resources/
+          # 下 —— Resources 只放 bundle.resources 显式列出的文件（本仓库是
+          # WebView2Loader.dll）与图标。所以不要去断言 Resources/dist，
+          # 它本来就不该存在（按官方文档：路径形式的 frontendDist 一律嵌入二进制）。
+          # 这里只校验主程序存在且体积合理，用来发现构建残缺。
+          BIN=$(find "$APP/Contents/MacOS" -maxdepth 1 -type f | head -1)
+          if [ -z "$BIN" ]; then
+            echo "未找到主程序" >&2
+            ls -la "$APP/Contents/MacOS" >&2 || true
+            exit 1
+          fi
+          SIZE=$(wc -c < "$BIN" | tr -d ' ')
+          if [ "$SIZE" -lt 1048576 ]; then
+            echo "主程序体积异常（$SIZE 字节），疑似构建不完整" >&2
+            exit 1
+          fi
+          echo "主程序: $BIN ($((SIZE / 1048576)) MB)"
+
+          # 无开发者证书，adhoc 签名；否则 Apple Silicon 上可能拒绝启动
+          codesign --force --deep --sign - "$APP"
+          sh scripts/make-dmg.sh "$APP_VERSION" "${{ matrix.arch_label }}" "$APP"
+          mkdir -p dist-bin
+          cp "workbuddy-switch_${APP_VERSION}_${{ matrix.arch_label }}.dmg" dist-bin/
+
+      - name: 打包 Windows（portable.zip）
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          set -euo pipefail
+          RELEASE_DIR="target/${{ matrix.target }}/release"
+          [ -d "$RELEASE_DIR" ] || RELEASE_DIR="src-tauri/target/${{ matrix.target }}/release"
+
+          COUNT=$(find "$RELEASE_DIR" -maxdepth 1 -type f -name '*.exe' | wc -l | tr -d ' ')
+          if [ "$COUNT" != "1" ]; then
+            echo "预期 release 目录下有 1 个主程序 exe，实际 $COUNT 个:" >&2
+            find "$RELEASE_DIR" -maxdepth 1 -type f -name '*.exe' >&2 || true
+            exit 1
+          fi
+          EXE=$(find "$RELEASE_DIR" -maxdepth 1 -type f -name '*.exe')
+
+          mkdir -p dist-bin
+          STAGE=$(mktemp -d)
+          cp "$EXE" "$STAGE/app.exe"
+          cp src-tauri/WebView2Loader.dll "$STAGE/WebView2Loader.dll"
+
+          # 免安装版说明：仓库里放了 release/使用说明.txt 就用它（逐字照搬，
+          # 方便按版本手写更新日志），否则生成一份简短说明。
+          NOTES="release/使用说明.txt"
+          [ -f "$NOTES" ] || NOTES=""
+
+          python - "$STAGE" "dist-bin/WorkBuddy_Switch_Gateway_${APP_VERSION}_portable.zip" "$NOTES" "$APP_VERSION" <<'PY'
+          import pathlib, sys, zipfile
+
+          stage, out, notes, ver = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+
+          if notes:
+              readme = pathlib.Path(notes).read_text(encoding="utf-8")
+          else:
+              readme = f"""WorkBuddy Switch Gateway {ver} —— 免安装版
+
+          【运行】双击 WorkBuddy-Switch-Gateway.exe
+             WebView2Loader.dll 必须与 exe 同目录，请勿删除
+
+          【依赖】需系统已装 WebView2 Runtime（Win10/11 一般自带）
+
+          详细说明见仓库 README.md。
+          """
+
+          with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              z.write(stage / "app.exe", "WorkBuddy-Switch-Gateway.exe")
+              z.write(stage / "WebView2Loader.dll", "WebView2Loader.dll")
+              z.writestr("使用说明.txt", readme)
+          print(f"已生成 {out}")
+          PY
+
+      # 安装包（NSIS setup.exe + MSI）与上面的 portable.zip 是两回事，各自收集。
+      # 首次发版就漏了这一步，只发出了 portable.zip —— 所以这里对数量做硬断言。
+      - name: 收集 Windows 安装包
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-bin
+          for spec in "nsis:*-setup.exe" "msi:*.msi"; do
+            sub="${spec%%:*}"; glob="${spec#*:}"
+            COUNT=$(find "$BUNDLE_ROOT/$sub" -maxdepth 1 -type f -name "$glob" 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$COUNT" != "1" ]; then
+              echo "预期 $BUNDLE_ROOT/$sub 下恰好 1 个 $glob，实际 $COUNT 个" >&2
+              ls -la "$BUNDLE_ROOT/$sub" >&2 || true
+              exit 1
+            fi
+            find "$BUNDLE_ROOT/$sub" -maxdepth 1 -type f -name "$glob" -exec cp {} dist-bin/ \;
+          done
+
+      - name: 收集 Linux 产物
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-bin
+          find "$BUNDLE_ROOT" -type f \
+            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) \
+            -exec cp {} dist-bin/ \;
+
+      # 按平台断言应有的产物，而不是只看「非空」——
+      # 只看非空的话，Windows 漏掉 exe/msi 只剩 portable.zip 也能混过去。
+      - name: 检查产物齐全
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la dist-bin
+          case "${{ runner.os }}" in
+            Windows) expect="*-setup.exe *.msi *_portable.zip" ;;
+            macOS)   expect="*.dmg" ;;
+            Linux)   expect="*.deb *.AppImage" ;;
+          esac
+          for glob in $expect; do
+            n=$(find dist-bin -maxdepth 1 -type f -name "$glob" | wc -l | tr -d ' ')
+            if [ "$n" != "1" ]; then
+              echo "预期 dist-bin 下恰好 1 个 $glob，实际 $n 个" >&2
+              exit 1
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist-bin/
+          if-no-files-found: error
+
+  release:
+    name: 发布 Release
+    needs: build
+    # 手动触发没有 tag，不建 Release（只留在 Artifacts 里供下载验证）
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 列出待发布资产
+        run: ls -la artifacts
+
+      # draft: true —— 首次跑通 macOS 之前先不直接对外发布，
+      # 你在 Release 页面核对无误后点 Publish 即可。信任这条流水线后改成 false。
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          draft: true
+          generate_release_notes: true
