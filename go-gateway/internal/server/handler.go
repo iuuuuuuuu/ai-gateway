@@ -386,24 +386,41 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。
 // kind 是唯一权威分类（来自 upstream.Classify），此处不再按原始 status 二次判断。
-// 仅在 chatCompletions 轮转循环内调用：调用方已准备好 lastErr 并打算 continue 换号。
+// 仅在 chat 轮转循环内调用：调用方已准备好 lastErr 并打算 continue 换号。
 //
-// 五条路径，各司其职：
+// model 是本次请求的目标模型，rawBody 是上游原始响应体 —— 仅 ErrModelRate 需要
+// 用到（按 uid+model 记账，并从文案里取重置时间）。
+//
+// 六条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate / ErrNotFound → Cooldown(CoolSoft)：即时软冷却（429/404）。
+//   - ErrModelRate → CooldownModel：**模型级**冷却到上游给的重置时间；该账号其他模型不受影响。
+//   - ErrSoftRate / ErrNotFound → Cooldown(CoolSoft)：账号级即时软冷却（429/404）。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
 //
-// 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
-// 成功（NoteSuccess）清 fails/熔断；签到解冻（ReenableIfCredits→reviveCoolingLocked）只清冷却，不动熔断。
-func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind) {
+// 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；模型冷却按各自截止到期；
+// 熔断按其指数退避截止到期；成功（NoteSuccess）清 fails/熔断；
+// 签到解冻（ReenableIfCredits→reviveCoolingLocked）只清账号级冷却，不动熔断与模型冷却。
+func (h *Handler) applyErrorPolicy(uid, model string, kind upstream.ErrKind, rawBody string) {
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
+	case upstream.ErrModelRate:
+		// 模型级限流（429 code=6004）：只冷却该账号的这个模型。
+		//
+		// 上游文案给出确切重置时刻（"将在 2026-09-15 13:25:47 UTC+8 重置"），
+		// 优先用它 —— 比固定 soft_rate 更准，既不会过早重试（继续撞限流），
+		// 也不会过晚恢复（白等）。解析不出时回退固定软冷却时长。
+		now := time.Now()
+		until, parsed := upstream.ParseResetTime(rawBody, now)
+		if !parsed {
+			until = now.Add(h.cfg.SoftCooldown)
+		}
+		h.cfg.Pool.CooldownModel(uid, model, until, modelRateReason(model, until, parsed), parsed)
 	case upstream.ErrSoftRate:
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
 	case upstream.ErrSessionDead:
@@ -417,6 +434,20 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind) {
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 	}
+}
+
+// modelRateReason 生成模型冷却的展示文案（含模型名与重置时间）。
+//
+// 前端直接用这条文案，避免两端各自格式化时间导致口径不一致。
+func modelRateReason(model string, until time.Time, parsed bool) string {
+	name := model
+	if name == "" {
+		name = "（未知模型）"
+	}
+	if parsed {
+		return fmt.Sprintf("%s 已达频率上限，%s 重置", name, until.In(time.Local).Format("01-02 15:04"))
+	}
+	return fmt.Sprintf("%s 已达频率上限（未取到重置时间，按软冷却 %s 处理）", name, until.In(time.Local).Format("15:04"))
 }
 
 // ---------------------------------------------------------------------------

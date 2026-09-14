@@ -531,6 +531,20 @@ export interface GatewayConfig {
   last_error?: string | null;
 }
 
+/** 单个「账号+模型」的冷却记录（来自网关 /status 的 model_cooling）。 */
+export interface GatewayModelCooling {
+  /** 被限流的模型名。 */
+  model: string;
+  /** 冷却截止时刻（ISO 8601）。 */
+  until?: string;
+  /** 距到期的剩余秒数（后端已算好，避免前后端时钟偏差）。 */
+  remaining_sec?: number;
+  /** 面向用户的说明文案（含模型名与重置时间）。 */
+  reason?: string;
+  /** true = 到期时间取自上游报错文案；false = 解析失败，回退固定软冷却。 */
+  reset_at_parsed?: boolean;
+}
+
 /** 网关账号池中的单个账号运行态（来自网关 /status）。 */
 export interface GatewayPoolAccount {
   uid: string;
@@ -548,6 +562,15 @@ export interface GatewayPoolAccount {
   soonest_expire_at?: number;
   /** 到期日（YYYY-MM-DD），即选号分层档位键；同一天的账号同级。 */
   expire_day?: string;
+  /**
+   * 该账号当前因「模型级限流」而冷却的模型（按到期时间升序）。
+   *
+   * 与 `cooling` 的区别（界面据此区分两种冷却）：
+   * - `cooling` = 账号级：余额（积分）欠费或账号被限速，整号不可用
+   * - `model_cooling` 非空 = 模型级：仅这些模型不可用，换模型仍可用
+   * 两者可同时存在。
+   */
+  model_cooling?: GatewayModelCooling[];
 }
 
 /** 网关 /status 响应。 */

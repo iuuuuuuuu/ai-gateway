@@ -167,8 +167,44 @@ function validatePort(value: number): string | null {
   return null;
 }
 
+/** 把剩余秒数格式化成「1 小时 5 分钟」这类中文时长。 */
+function formatRemaining(sec: number): string {
+  if (sec <= 0) return "即将恢复";
+  const totalMinutes = Math.max(1, Math.ceil(sec / 60));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours > 0 && minutes > 0) return `${hours} 小时 ${minutes} 分钟`;
+  if (hours > 0) return `${hours} 小时`;
+  return `${minutes} 分钟`;
+}
+
+/** 把冷却截止时刻格式化成「09-15 13:25」（本地时区）。 */
+function formatUntil(iso?: string): string | null {
+  if (!iso) return null;
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return null;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}`;
+}
+
+/**
+ * 冷却原因说明：区分「账号级（余额欠费）」与「模型级（单一模型限流）」。
+ *
+ * 这两种状态此前在界面上都只显示"冷却中"，用户无法判断是该充值还是换个模型就好。
+ */
+function coolReasonText(acc: GatewayPoolAccount): string {
+  if (acc.disabled) return acc.reason || "已禁用";
+  if (acc.cool_kind === "hard_credit") return "余额不足（积分欠费），等签到或充值后恢复";
+  if (acc.cool_kind === "soft_rate") return "账号被限速，短暂冷却后自动恢复";
+  if (acc.cool_kind === "breaker") return "连续失败触发熔断，按退避时间恢复";
+  return acc.reason || "冷却中";
+}
+
 /** 网关账号池账号卡片：展示冷却/熔断/在途等运行态。 */
 function PoolAccountRow({ acc }: { acc: GatewayPoolAccount }) {
+  const modelCools = acc.model_cooling ?? [];
+  // 「冷却中」只表示**账号级**不可用（余额欠费/被限速/熔断）。
+  // 模型级限流不影响整号可用性，故单独在下方区域呈现，不占用这个状态标签。
   const state = acc.disabled
     ? { label: "已禁用", cls: "bg-destructive/10 text-destructive" }
     : acc.cooling
@@ -179,31 +215,85 @@ function PoolAccountRow({ acc }: { acc: GatewayPoolAccount }) {
     ? { label: `到期 ${acc.expire_day.slice(5)}`, title: `最近到期积分：${acc.expire_day}（同一天的账号同级平均分摊）` }
     : { label: "到期未知", title: "尚未取到积分到期信息：会排在其他账号之后，仅在它们不可用时才使用" };
   return (
-    <div className="mx-4 flex min-w-0 items-center gap-3 border-b border-border/50 py-2.5 last:border-b-0 sm:mx-5">
-      <div className="min-w-0 flex-1">
-        <div className="truncate text-sm">{acc.nickname || acc.uid}</div>
-        <div className="truncate font-mono text-[11px] text-muted-foreground">{acc.uid}</div>
+    <div className="border-b border-border/50 last:border-b-0">
+      <div className="mx-4 flex min-w-0 items-center gap-3 py-2.5 sm:mx-5">
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm">{acc.nickname || acc.uid}</div>
+          <div className="truncate font-mono text-[11px] text-muted-foreground">{acc.uid}</div>
+        </div>
+        <div className="flex shrink-0 items-center gap-3 text-[11px] tabular-nums text-muted-foreground">
+          {typeof acc.in_flight === "number" && acc.in_flight > 0 ? <span>在途 {acc.in_flight}</span> : null}
+          {typeof acc.success_count === "number" && acc.success_count > 0 ? <span>成功 {acc.success_count}</span> : null}
+          {typeof acc.err_total === "number" && acc.err_total > 0 ? <span>失败 {acc.err_total}</span> : null}
+          <span
+            className={cn(
+              "rounded-md px-1.5 py-0.5",
+              acc.expire_day ? "bg-muted" : "bg-muted/50 text-muted-foreground/70",
+            )}
+            title={expiry.title}
+          >
+            {expiry.label}
+          </span>
+          <span
+            className={cn("rounded-md px-1.5 py-0.5 font-medium", state.cls)}
+            title={coolReasonText(acc)}
+          >
+            {state.label}
+          </span>
+        </div>
       </div>
-      <div className="flex shrink-0 items-center gap-3 text-[11px] tabular-nums text-muted-foreground">
-        {typeof acc.in_flight === "number" && acc.in_flight > 0 ? <span>在途 {acc.in_flight}</span> : null}
-        {typeof acc.success_count === "number" && acc.success_count > 0 ? <span>成功 {acc.success_count}</span> : null}
-        {typeof acc.err_total === "number" && acc.err_total > 0 ? <span>失败 {acc.err_total}</span> : null}
-        <span
-          className={cn(
-            "rounded-md px-1.5 py-0.5",
-            acc.expire_day ? "bg-muted" : "bg-muted/50 text-muted-foreground/70",
-          )}
-          title={expiry.title}
-        >
-          {expiry.label}
-        </span>
-        <span
-          className={cn("rounded-md px-1.5 py-0.5 font-medium", state.cls)}
-          title={acc.reason || undefined}
-        >
-          {state.label}
-        </span>
-      </div>
+
+      {/* 账号状态明细区：区分「余额欠费」与「单一模型冷却」，后者列出模型 + 恢复时间。 */}
+      {acc.cooling || modelCools.length > 0 ? (
+        <div className="mx-4 mb-2.5 flex flex-col gap-1 rounded-lg bg-muted/40 px-2.5 py-2 text-[11px] sm:mx-5">
+          {acc.cooling ? (
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 font-medium text-amber-700 dark:text-amber-400">
+                {acc.cool_kind === "hard_credit" ? "余额欠费" : acc.cool_kind === "breaker" ? "熔断" : "账号限速"}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-muted-foreground" title={coolReasonText(acc)}>
+                {coolReasonText(acc)}
+              </span>
+              {typeof acc.cool_remaining_sec === "number" && acc.cool_remaining_sec > 0 ? (
+                <span className="shrink-0 tabular-nums text-muted-foreground">
+                  剩余 {formatRemaining(acc.cool_remaining_sec)}
+                </span>
+              ) : null}
+            </div>
+          ) : null}
+          {modelCools.map((mc) => {
+            const until = formatUntil(mc.until);
+            return (
+              <div key={mc.model} className="flex min-w-0 items-center gap-2">
+                <span className="shrink-0 rounded bg-sky-500/15 px-1.5 py-0.5 font-medium text-sky-700 dark:text-sky-400">
+                  模型冷却
+                </span>
+                <span className="min-w-0 flex-1 truncate font-mono text-muted-foreground" title={mc.reason || mc.model}>
+                  {mc.model}
+                </span>
+                <span
+                  className="shrink-0 tabular-nums text-muted-foreground"
+                  title={
+                    mc.reset_at_parsed === false
+                      ? "上游报错里未给出可解析的重置时间，按固定软冷却时长处理"
+                      : until
+                        ? `预计 ${until} 恢复`
+                        : undefined
+                  }
+                >
+                  {until ? `${until} 恢复` : ""}
+                  {typeof mc.remaining_sec === "number" && mc.remaining_sec > 0
+                    ? `（剩 ${formatRemaining(mc.remaining_sec)}）`
+                    : ""}
+                </span>
+              </div>
+            );
+          })}
+          <div className="text-muted-foreground/70">
+            {modelCools.length > 0 ? "模型冷却只影响上述模型，该账号的其他模型仍可使用。" : null}
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
