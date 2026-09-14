@@ -14,19 +14,23 @@ import (
 func TestParseResetTimeRealSample(t *testing.T) {
 	const real = `{"code":"6004","msg":"您的使用量已超出频率限制，将在 2026-09-15 13:25:47 UTC+8 重置，您也可以切换其他模型继续使用。","requestId":"62b8393f-e7ce-46e6-912e-6e610a8d1e01"}`
 
-	// 取一个早于该时刻的 now，让它成为"未来时刻"。
-	now := time.Date(2026, 9, 15, 10, 0, 0, 0, time.Local)
+	// now 必须显式取 UTC，不能写 time.Local —— ParseResetTime 只接受"未来"时刻，
+	// 而比较的是**绝对时刻**。文案里的 13:25:47 UTC+8 等于 05:25:47Z，若 now 用
+	// 本地时区，在 UTC 的机器（CI）上 now=10:00Z 就晚于重置点，该样本被判为"过去"
+	// 而解析失败，测试只在 +08:00 的本机能过 —— 那是测试的环境依赖，不是实现问题。
+	now := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
 	got, ok := ParseResetTime(real, now)
 	if !ok {
-		t.Fatalf("未解析出重置时间")
+		t.Fatalf("未解析出重置时间（now=%s）", now.Format(time.RFC3339))
 	}
-	// UTC+8 的 13:25:47 = 本地（若本地为 +08:00）13:25:47
-	want := time.Date(2026, 9, 15, 13, 25, 47, 0, time.FixedZone("UTC+8", 8*3600))
+	// UTC+8 的 13:25:47 == 2026-09-15T05:25:47Z。got.Equal 比较的是 instant，
+	// 故断言同样与本机时区无关。
+	want := time.Date(2026, 9, 15, 5, 25, 47, 0, time.UTC)
 	if !got.Equal(want) {
-		t.Errorf("解析结果=%s (%s)，期望 %s (%s)", got.Format(time.RFC3339), got.Location(), want.Format(time.RFC3339), want.Location())
+		t.Errorf("解析结果=%s (%s)，期望 %s (%s)", got.UTC().Format(time.RFC3339), got.Location(), want.Format(time.RFC3339), want.Location())
 	}
-	// 关键：与"现在"的实际间隔应约 3h25m（若本地就是 +08:00）
-	t.Logf("now=%s  重置=%s  间隔=%s", now.Format(time.RFC3339), got.Format(time.RFC3339), got.Sub(now))
+	// 关键：与 now 的间隔应恰为 5h25m47s（绝对时刻，与时区无关）
+	t.Logf("now=%s  重置=%s  间隔=%s", now.Format(time.RFC3339), got.UTC().Format(time.RFC3339), got.Sub(now))
 }
 
 func TestParseResetTimeVariants(t *testing.T) {
