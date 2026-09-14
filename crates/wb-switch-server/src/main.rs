@@ -12,7 +12,7 @@ mod api;
 use serde_json::json;
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, config, process, rotate, travel, update,
+    account, auth_file, checkin, config, process, refresh, rotate, travel, update,
 };
 
 fn default_port() -> u16 {
@@ -21,6 +21,14 @@ fn default_port() -> u16 {
 
 /// 后台任务：自动签到启动即核验、每 30 分钟补签；自动轮换按配置间隔执行。
 fn spawn_background_loops() {
+    // 启动时清理历史误报的「需重新登录」标记：旧版本把传输层失败（网络/代理
+    // 不可达）也写成 needs_relogin，会让这些账号被排除出网关账号池。
+    // 真正失效的凭证不受影响。
+    let repaired = refresh::repair_false_relogin_flags();
+    if repaired > 0 {
+        eprintln!("[refresh] 已清除 {repaired} 个账号因网络失败误报的「需重新登录」标记");
+    }
+
     tokio::spawn(async move {
         if let Err(error) = config::compact_checkin_logs() {
             eprintln!("[签到] 历史日志整理失败: {error}");

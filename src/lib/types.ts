@@ -82,6 +82,70 @@ export interface ImportResult {
   overwritten: number;
 }
 
+/** 本机候选账号的来源类型。 */
+export type LocalAccountSource = "current" | "snapshot" | "backup";
+
+/** 本机候选账号的凭证可用性。 */
+export type LocalAccountFreshness = "refreshable" | "access_only" | "expired";
+
+/** 本机扫描发现的单个候选账号（不含 token）。 */
+export interface LocalImportCandidate {
+  /** 本次扫描结果中的序号。 */
+  index: number;
+  /** 来源文件绝对路径；导入时以此为准（跨扫描稳定）。 */
+  path: string;
+  /** 账号元数据（脱敏）。 */
+  meta: AccountMeta;
+  source: LocalAccountSource;
+  /** 来源展示名：当前登录 / 历史快照 / 切换备份。 */
+  sourceLabel: string;
+  freshness: LocalAccountFreshness;
+  /** 凭证可用性展示名。 */
+  freshnessLabel: string;
+  /** 同一账号在本机共有多少份文件（>1 表示还有更旧的重复快照）。 */
+  duplicateCount: number;
+  /** 是否已在账号库中。 */
+  alreadyImported: boolean;
+  /** 库中已有该账号，但本机这份凭证更新：导入会覆盖刷新。 */
+  updatesStored: boolean;
+  /** 来源文件最后修改时间（毫秒）。 */
+  modifiedAt: number;
+}
+
+/** GET /api/import-local/scan 响应。 */
+export interface LocalScanResult {
+  ok: boolean;
+  candidates: LocalImportCandidate[];
+  total: number;
+  /** 识别出的认证文件总数（含被去重掉的旧快照）。 */
+  filesScanned: number;
+  /** 可导入（凭证未完全过期）的候选数。 */
+  usable: number;
+  /** 认证文件目录。 */
+  authDir: string;
+  /** 本工具备份目录。 */
+  backupDir: string;
+}
+
+/** POST /api/import-local/selected 响应。 */
+export interface LocalImportResult {
+  ok: boolean;
+  imported: number;
+  /** 新增账号数。 */
+  added: number;
+  /** 覆盖刷新既有账号数。 */
+  updated: number;
+  /** 逐个账号的结果明细。 */
+  outcomes: Array<{
+    name: string;
+    region: string;
+    source: LocalAccountSource;
+    file: string;
+    freshness: LocalAccountFreshness;
+    updated: boolean;
+  }>;
+}
+
 export interface Session {
   id: string;
   title: string;
@@ -521,6 +585,17 @@ export interface GatewayStatus {
     nickname?: string;
     expiresAt?: number;
     needsRelogin?: boolean;
+  }>;
+  /**
+   * 因「需重新登录」而被排除出网关账号池的账号。
+   *
+   * 这些账号的 refresh token 已被服务端拒绝，继续留在池里只会每次请求白跑一轮，
+   * 因此同步时不会写入网关凭证目录；重新登录成功后会自动恢复。
+   */
+  excludedAccounts?: Array<{
+    uid: string;
+    nickname?: string;
+    reason?: string | null;
   }>;
   authDir: string;
   accountsInLibrary: number;

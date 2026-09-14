@@ -97,6 +97,17 @@ impl Region {
             Region::Intl => "国际版",
         }
     }
+
+    /// 该区域账号凭证里 `domain` 字段的默认值。
+    ///
+    /// 客户端写认证文件时一定带 domain，但**本工具自己产出的备份**与历史记录
+    /// 可能缺失该字段；缺失时按来源区域补齐，`Region::from_domain` 能原样还原。
+    pub fn auth_domain(self) -> &'static str {
+        match self {
+            Region::Cn => "www.workbuddy.cn",
+            Region::Intl => "www.workbuddy.ai",
+        }
+    }
 }
 
 /// 按账号区域返回 API 基址（供各模块拼接端点）。

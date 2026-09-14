@@ -38,6 +38,28 @@ Token 统计与网关的接口契约可直接查阅实现本身：
 - Write a custom component only when shadcn components and their composition APIs cannot satisfy the requirement. Record the reason before doing so.
 - Custom UI must still reuse the project's Rhea theme tokens, spacing, radii, states, and accessibility conventions. Do not substitute native interactive shortcuts such as `details/summary` when an appropriate shadcn component exists.
 
+## 构建与签名（Build & Signing）
+
+构建带 updater 签名的安装包时，**不要再去搜索私钥**，位置与用法如下（固定不变）：
+
+- 一条命令：`pwsh scripts/build-signed.ps1`（仅校验密钥不构建：加 `-CheckOnly`）
+- 签名私钥：`%USERPROFILE%\.wb-switch\wb-switch-updater.key`（minisign 私钥）
+- 私钥口令：`%USERPROFILE%\.wb-switch\wb-switch-updater.password`
+- 两者都在**仓库外**，`.gitignore` 已排除 `*.key`；**本仓库是公开仓库，严禁把口令写入任何被 git 跟踪的文件。**
+
+背景（改动相关代码前务必了解，否则会重复踩坑）：
+
+- `src-tauri/tauri.conf.json` 的 `createUpdaterArtifacts` **一直为 `true`**，因此
+  `tauri build` 必须拿到私钥；`tauri.conf.json` 里的 `plugins.updater.pubkey`
+  必须与私钥配对（keyid `217C0E2B4321D841`），否则客户端会拒绝更新包。
+- `TAURI_SIGNING_PRIVATE_KEY` 的值必须是密钥**内容**，不是路径。传路径会报
+  `failed to decode base64 secret key: Invalid symbol 58`（路径里的冒号）。
+  读取方式：`(Get-Content -LiteralPath $key -Raw).Trim()`。
+- **缺口令时 `tauri signer sign` 不报错，而是阻塞等待 stdin 输入**，表现为"构建卡住"；
+  口令错误才会秒级报错。所以非交互场景务必先确认口令可用（`-CheckOnly` 就是为此）。
+- 加密私钥的 keynum 偏移（54..62）与公钥（2..10）不同，**不能直接比对**；
+  判断配对是否正确的唯一可靠方式是实际签一次，再比签名与公钥的 keyid。
+
 ## Git Commit Language
 
 - Use Conventional Commit type prefixes such as `feat:`, `fix:`, and `docs:`.

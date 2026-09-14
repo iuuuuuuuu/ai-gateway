@@ -139,6 +139,23 @@ Pi / Grok Build / ZCode / Kimi Code / OpenClaw / Hermes Agent。
 > 由于账号池是网关**启动时**扫描凭证目录建立的，模式切换必须重导出凭证并重启子进程
 > 才真正生效 —— 这一步已由核心层的 `switch_mode` 合并完成，用户点一下即可，无需手动重启。
 
+#### 需重新登录的账号会被排除出账号池
+
+refresh token 被服务端明确拒绝（如 `12153 Offline user session not found`）时，账号会被
+标记「需重新登录」。这类凭证**不会**写入网关凭证目录：
+
+- 网关池里不会再出现它，避免每次请求都白跑一轮再换号（表现为「网关一直用失效账号调模型」）
+- 网关页「运行状态」会给出提示，列出被排除的账号，并指引到「账号管理」页重新登录
+- 重新登录成功后标记被清除，下一次自动同步（30 秒一轮）会把它重新放回池中
+
+> 标记与「哪些账号该导出」都参与账号指纹，因此标记翻转本身就会触发重新同步，
+> 不需要手动点「立即同步」。
+>
+> **网络失败不等于需要重新登录**：请求根本没发出去（网络不可达 / 代理未启动，
+> 响应 `code=-1`）时只记录瞬时错误，不会打上该标记。早期版本曾把两者混为一谈，
+> 结果一次代理抖动就让整批国际版账号被误判为失效并移出账号池；升级后启动时会
+> 自动清理这类历史误报标记（真正的失效凭证不受影响）。
+
 #### 猫猫旅行
 
 随签到时点（09:00 / 21:00）对每个可用账号推进一趟状态机：
@@ -221,8 +238,27 @@ Pi / Grok Build / ZCode / Kimi Code / OpenClaw / Hermes Agent。
 > 该 token 端点**一次性消费**：取到一次后再次轮询会退回 `11217 login ing`，
 > 因此应用会在拿到 token 后立即入库并重试拉取账号信息。
 
-**一键导入**：「账号管理」页的「从本机导入」会**同时探测两个区域的认证文件**，
-把本机已登录的账号全部并入账号库，提示中会标明各自区域。
+**一键导入**：「账号管理」页的「从本机导入」会扫描**三类来源**，把本机登录过的账号
+一次找齐：
+
+| 来源 | 位置 | 说明 |
+|---|---|---|
+| 当前登录态 | `auth/workbuddy-desktop.info`、`workbuddy-desktop-ai.info` | 每区域各 1 个（固定文件名） |
+| 历史登录快照 | `auth/workbuddy-desktop[-ai].<时间>.<pid>.<uuid>.info` | 客户端每次登录/切换时留存 |
+| 切换备份 | `~/.wb-switch/backups/*.info` | 本工具每次切换账号前的备份 |
+
+弹框里可勾选任意多个账号批量导入，并标注每个候选的来源、区域与凭证可用性
+（可保活 / 仅 access 有效 / 凭证已过期），已在账号库中的会标出「已在账号库」或「将更新」。
+
+> 旧版的「导入本机账号」只读两个固定文件名，因此**每区域最多只能拿到当前登录的 1 个账号**，
+> 历史登录过的账号完全没有入口。
+>
+> **同一账号只保留凭证最新的一份**：同一 `(区域, uid)` 可能有多份文件，按「凭证可用性 →
+> 到期时间 → 文件修改时间」排序取最优。这样不会让一份 refresh token 已被轮换掉的旧快照
+> 顶掉有效凭证。跨区域永不合并（两区域 uid 命名空间独立）。
+>
+> 快照里的 token 会过期：国服 access token 60 天 / refresh token 90 天，国际版约 1 年。
+> 已完全过期的候选仍可导入，但需要重新登录才能保活。
 
 账号卡片上会给国际版账号打一个「国际版」标记，国服账号不加标记。
 
@@ -413,7 +449,8 @@ scripts/             # 构建与发布脚本
 
 1. 打开应用，进入「账号管理」页面
 2. 点击「OAuth 登录」，先选服务区域：国服用微信 / 企业微信扫码，国际版用
-   Google / GitHub / X 授权；也可「从本机导入」已登录的账号
+   Google / GitHub / X 授权；也可「从本机导入」批量找回本机登录过的账号
+   （当前登录态 + 历史快照 + 切换备份，可多选）
 3. 账号卡片显示登录状态、签到状态、积分余额与到期时间
 4. 「切换」按钮可将该账号写入 WorkBuddy 客户端 / CodeBuddy CLI / CodeBuddy CN IDE
    - **CodeBuddy CLI**：写入 `~/.codebuddy/settings.json` 的 `env.CODEBUDDY_AUTH_TOKEN`
@@ -573,6 +610,26 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 > 并重启子进程才真正生效 —— 这一步已由 `switch_mode` 自动完成（保存配置 →
 > 重导出 → 按需重启）。若网关当时没在运行，则只做前两步，下次启动自然是新池。
 
+**Q：账号卡片显示「需重新登录」，但网关还在用这个账号？**
+> 已修复。refresh token 被服务端拒绝后，账号会被标记「需重新登录」，并**不再写入
+> 网关凭证目录** —— 网关池里不会再有它，也就不会每次请求都拿失效凭证去试一轮。
+> 网关页「运行状态」会列出被排除的账号；到「账号管理」页重新登录后，标记自动清除，
+> 下一轮同步（30 秒）就会把它放回池中。
+>
+> 注意**网络失败不算**需重新登录：请求没发出去（网络不可达 / 代理未启动）只记录
+> 瞬时错误，不会打标记。早期版本把两者混为一谈，一次代理抖动就会让整批账号被误判
+> 失效并移出账号池；升级后启动时会自动清理这类历史误报标记。
+
+**Q：「从本机导入」能找回历史登录过的账号吗？**
+> 能。它会扫描当前登录态（每区域 1 个固定文件）、客户端留存的历史登录快照
+> （`workbuddy-desktop[-ai].<时间>.<pid>.<uuid>.info`）以及本工具的切换备份
+> （`~/.wb-switch/backups/`），可在弹框里一次勾选多个账号导入。
+>
+> 同一 `(区域, uid)` 的多份文件只保留**凭证最新**的一份（按可用性 → 到期时间 →
+> 文件修改时间取优），避免旧快照里已被轮换的 refresh token 顶掉有效凭证。
+> 快照 token 会过期（国服 refresh token 90 天，国际版约 1 年），已过期的候选
+> 仍可导入，但需要重新登录才能保活。
+
 **Q：国际版的模型列表为什么是固定的？**
 > 上游 `/console/enterprises/personal/models` 在国际版返回 500，无法动态拉取，
 > 因此国际版模型来自内置静态表（取自客户端本地配置 `acc-product-config-v3.json`）。
@@ -590,6 +647,8 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 ```
 crates/wb-switch-core/        核心逻辑（不依赖 Tauri，可被桌面端与 HTTP 服务复用）
   src/modules/account.rs        账号存储
+  src/modules/auth_file.rs      认证文件读写 + 本机历史登录态扫描（本项目扩展）
+  src/modules/refresh.rs        Token 刷新与保活（含传输层失败与凭证失效的区分）
   src/modules/agent_import.rs   智能体一键接入与配置生成（本项目新增）
   src/modules/gateway.rs        网关托管与账号桥接（本项目新增）
   src/modules/gateway_embed.rs  内嵌网关的释放与缓存（本项目新增）
@@ -600,6 +659,7 @@ crates/wb-switch-server/      HTTP 服务形态（npm / webui）
 src/                          React 前端
   src/pages/GatewayPage.tsx     兼容网关页面（本项目新增）
   src/pages/AgentsPage.tsx      智能体管理页面（本项目新增）
+  src/components/import-local-dialog.tsx  从本机批量导入账号（本项目新增）
 src-tauri/                    桌面壳（Tauri 2）
   src/tray.rs                   托盘与单实例行为
   src/commands.rs               前端可调用的命令
@@ -613,7 +673,7 @@ cargo test --workspace          # 核心逻辑 + 桌面端单元测试
 npm run build                   # 前端类型检查与构建
 ```
 
-> Windows x64 上实测 `cargo test --workspace` 全部通过（207 个用例）。
+> Windows x64 上实测 `cargo test --workspace` 全部通过（229 个核心用例 + 55 个网关用例）。
 > 构建需要 **MSVC 工具链**（`stable-x86_64-pc-windows-msvc`，Tauri 依赖它链接
 > WebView2）；若需安装，可用
 > `winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`。

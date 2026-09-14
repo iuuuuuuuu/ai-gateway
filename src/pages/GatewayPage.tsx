@@ -435,6 +435,8 @@ export default function GatewayPage() {
   const pool = status?.pool ?? null;
   const poolAccounts = pool?.accounts ?? [];
   const running = Boolean(status?.running);
+  /** 因需重新登录被排除出账号池的账号（后端同步时不导出其凭证）。 */
+  const excludedAccounts = status?.excludedAccounts ?? [];
 
   // 用量区块的派生数据。
   const usageSnapshot = usage?.usage ?? null;
@@ -513,6 +515,19 @@ export default function GatewayPage() {
       ) : null}
 
       <Section title="运行状态" description="账号池状态每 5 秒自动刷新">
+        {excludedAccounts.length > 0 && (
+          <div className="mx-4 mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-900 sm:mx-5">
+            <div className="flex items-center gap-1.5 font-medium">
+              <AlertTriangle className="size-3.5" />
+              {excludedAccounts.length} 个账号需重新登录，已排除出账号池
+            </div>
+            <div className="mt-1 leading-5 opacity-90">
+              {excludedAccounts.map((a) => a.nickname || a.uid).join("、")}
+              ：refresh token 已失效，继续使用只会让每次请求失败一次。请到「账号管理」页重新登录，
+              恢复后会自动重新加入账号池。
+            </div>
+          </div>
+        )}
         <div className="mx-4 grid grid-cols-2 gap-2 py-3 sm:mx-5 sm:grid-cols-4">
           <Stat
             label="服务"

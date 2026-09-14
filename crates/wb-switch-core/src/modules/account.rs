@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::modules::config::{accounts_file, atomic_write};
+use crate::modules::auth_file::{self, CredentialFreshness};
+use crate::modules::config::{accounts_file, atomic_write, Region};
 
 fn load_accounts_from_path(path: &Path) -> Vec<Value> {
     if let Ok(text) = std::fs::read_to_string(path) {
@@ -232,6 +233,7 @@ pub fn build_auth_headers(account: &Value) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::config::now_ms;
     use serde_json::json;
 
     #[test]
@@ -470,6 +472,100 @@ mod tests {
         assert!(load_accounts_from_path(&path).is_empty());
         std::fs::remove_dir_all(&test_dir).expect("temporary account store should clean up");
     }
+
+    // ---- 本机历史账号发现与导入 ----
+
+    /// 同区域同 uid 出现多份文件时，只留凭证最新的一份。
+    #[test]
+    fn scan_prefers_freshest_credential_per_identity() {
+        use crate::modules::auth_file::{discover_local_accounts_in, CredentialFreshness};
+
+        let auth = temp_scan_dir("scan-auth");
+        let backups = temp_scan_dir("scan-backup");
+        let now = now_ms();
+        let fresh = now + 30 * 24 * 3600 * 1000;
+        let stale = now - 3600 * 1000;
+
+        let payload = |access: &str, refresh: &str, at_exp: i64, rt_exp: i64| {
+            json!({
+                "account": {"uid": "uid-1", "nickname": "同一人"},
+                "auth": {"accessToken": access, "refreshToken": refresh,
+                         "expiresAt": at_exp, "refreshExpiresAt": rt_exp},
+            })
+            .to_string()
+        };
+        std::fs::write(
+            auth.join("workbuddy-desktop.2026-09-01T00-00-00Z.1.a.info"),
+            payload("AT-OLD", "RT-OLD", stale, stale),
+        )
+        .unwrap();
+        std::fs::write(
+            auth.join("workbuddy-desktop.2026-09-10T00-00-00Z.1.b.info"),
+            payload("AT-NEW", "RT-NEW", fresh, fresh),
+        )
+        .unwrap();
+
+        let found = discover_local_accounts_in(&auth, &backups);
+        assert_eq!(found.len(), 1, "同区域同 uid 只保留一份");
+        assert_eq!(
+            get_str(&found[0].account, "access_token").as_deref(),
+            Some("AT-NEW"),
+            "必须保留凭证最新的那份，否则会导入已轮换失效的 refresh token"
+        );
+        assert_eq!(found[0].freshness, CredentialFreshness::Refreshable);
+        assert_eq!(found[0].duplicate_count, 2);
+
+        std::fs::remove_dir_all(&auth).ok();
+        std::fs::remove_dir_all(&backups).ok();
+    }
+
+    /// 导入同一候选两次必须幂等：第二次原地刷新，不产生重复账号。
+    #[test]
+    fn reimporting_same_candidate_is_idempotent() {
+        use crate::modules::auth_file::discover_local_accounts_in;
+
+        let auth = temp_scan_dir("import-auth");
+        let backups = temp_scan_dir("import-backup");
+        let now = now_ms();
+        let fresh = now + 30 * 24 * 3600 * 1000;
+
+        std::fs::write(
+            auth.join("workbuddy-desktop.2026-09-01T00-00-00Z.1.a.info"),
+            json!({
+                "account": {"uid": "uid-new", "nickname": "新账号"},
+                "auth": {"accessToken": "AT-NEW", "refreshToken": "RT-NEW",
+                         "expiresAt": fresh, "refreshExpiresAt": fresh},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let found = discover_local_accounts_in(&auth, &backups);
+        assert_eq!(found.len(), 1, "扫描应先看到 1 个候选");
+
+        // 用账号库的同一套合并规则验证语义（不触碰真实账号库文件）。
+        let mut store: Vec<Value> = vec![];
+        let saved = upsert_collected_account(&mut store, found[0].account.clone());
+        assert_eq!(store.len(), 1);
+        assert_eq!(saved["uid"], "uid-new");
+
+        let again = upsert_collected_account(&mut store, found[0].account.clone());
+        assert_eq!(store.len(), 1, "重复导入必须幂等");
+        assert_eq!(again["id"], saved["id"], "本地 id 必须保持不变");
+
+        std::fs::remove_dir_all(&auth).ok();
+        std::fs::remove_dir_all(&backups).ok();
+    }
+
+    /// 造一个独立的临时扫描目录。
+    fn temp_scan_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wb-account-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
 }
 
 /// 删除账号（按 id）。
@@ -485,6 +581,197 @@ pub fn import_local() -> Result<Value, String> {
     Ok(account_meta(&saved))
 }
 
+/// 本机扫描的候选账号（脱敏，供界面展示与勾选）。
+///
+/// 序列化为 camelCase 以对接前端；Rust 侧保持 snake_case。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalImportCandidate {
+    /// 候选在本次扫描结果中的稳定索引。
+    pub index: usize,
+    /// 来源文件的绝对路径（同时是跨扫描稳定的选择键）。
+    pub path: String,
+    /// 账号元数据（不含 token）。
+    pub meta: Value,
+    /// 来源类型键：current / snapshot / backup。
+    pub source: String,
+    /// 来源类型展示名。
+    pub source_label: String,
+    /// 凭证可用性键：refreshable / access_only / expired。
+    pub freshness: String,
+    /// 凭证可用性展示名。
+    pub freshness_label: String,
+    /// 同账号在本机共有多少份文件（>1 表示存在更旧的重复快照）。
+    pub duplicate_count: usize,
+    /// 是否已在账号库中（按 区域+uid 命中）。
+    pub already_imported: bool,
+    /// 账号库中同区域同 uid、但凭证更旧：导入会用这本新凭证覆盖。
+    pub updates_stored: bool,
+    /// 文件最后修改时间（毫秒）。
+    pub modified_at: i64,
+}
+
+/// 凭证可用性的展示名。
+fn freshness_label(freshness: CredentialFreshness) -> &'static str {
+    match freshness {
+        CredentialFreshness::Refreshable => "可保活",
+        CredentialFreshness::AccessOnly => "仅 access 有效",
+        CredentialFreshness::Expired => "凭证已过期",
+    }
+}
+
+/// 本机扫描结果（含来源目录与文件数统计，供界面说明扫描范围）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalScanResult {
+    /// 去重后的候选账号，按凭证到期时间降序。
+    pub candidates: Vec<LocalImportCandidate>,
+    /// 识别出的认证文件总数（含被去重掉的旧快照）。
+    pub files_scanned: usize,
+    /// 认证文件目录。
+    pub auth_dir: String,
+    /// 本工具备份目录。
+    pub backup_dir: String,
+    /// 可导入（凭证未完全过期）的候选数。
+    pub usable: usize,
+}
+
+/// 扫描本机全部历史登录态（当前认证文件 + 客户端快照 + 本工具备份）。
+///
+/// 这是「从本机导入」的数据来源：`import_local_all` 只看两个固定文件名，
+/// 因此每区域最多 1 个账号；本函数额外扫出历史快照里的账号。
+/// 同一 (区域, uid) 的多份文件已在 `discover_local_accounts` 内按凭证新旧去重。
+///
+/// 结果按凭证到期时间降序（越新越靠前），并标注哪些账号已在库中。
+pub fn scan_local_accounts() -> LocalScanResult {
+    let stored = load_accounts();
+    let discovery = auth_file::discover_local();
+    let files_scanned = discovery.files_scanned;
+
+    let candidates: Vec<LocalImportCandidate> = discovery
+        .candidates
+        .into_iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let meta = account_meta(&candidate.account);
+            // 已在库中的判定与 upsert 的身份规则一致：同区域 + 同 uid。
+            let candidate_uid = get_str(&candidate.account, "uid");
+            let existing = candidate_uid.as_deref().and_then(|uid| {
+                stored.iter().find(|a| {
+                    Region::of(a) == candidate.region && get_str(a, "uid").as_deref() == Some(uid)
+                })
+            });
+            let candidate_exp = auth_file::credential_expiry(&candidate.account).unwrap_or(0);
+            let stored_exp = existing
+                .and_then(|a| auth_file::credential_expiry(a))
+                .unwrap_or(0);
+            LocalImportCandidate {
+                index,
+                path: candidate.path.to_string_lossy().into_owned(),
+                meta,
+                source: candidate.source.key().to_string(),
+                source_label: candidate.source.label().to_string(),
+                freshness: candidate.freshness.key().to_string(),
+                freshness_label: freshness_label(candidate.freshness).to_string(),
+                duplicate_count: candidate.duplicate_count,
+                already_imported: existing.is_some(),
+                // 库里没有 → 是新增；库里有但凭证比本机旧 → 导入会刷新它。
+                updates_stored: existing.is_some() && candidate_exp > stored_exp,
+                modified_at: candidate.modified_at,
+            }
+        })
+        .collect();
+
+    let usable = candidates
+        .iter()
+        .filter(|c| c.freshness != CredentialFreshness::Expired.key())
+        .count();
+
+    LocalScanResult {
+        candidates,
+        files_scanned,
+        auth_dir: discovery.auth_dir.to_string_lossy().into_owned(),
+        backup_dir: discovery.backup_dir.to_string_lossy().into_owned(),
+        usable,
+    }
+}
+
+/// 按来源路径（或扫描索引）把本机候选账号并入账号库。
+///
+/// 选择键用**文件路径**而非索引：扫描与导入之间隔着一次前端往返，期间
+/// 客户端可能刚好写入新的快照而改变排序，路径才是稳定标识。`indexes`
+/// 同时接受扫描顺序索引，兼容按序号调用的调用方。
+///
+/// 缺 uid 的候选按「区域 + 真实邮箱」去重（非空 uid 始终优先，与
+/// `upsert_collected_account` 同一套规则）；完全无法定身份的记录照旧入库。
+pub fn import_local_selected(
+    paths: &[String],
+    indexes: &[usize],
+) -> Result<LocalImportResult, String> {
+    let selected: Vec<auth_file::LocalCandidate> = auth_file::discover_local_accounts()
+        .into_iter()
+        .enumerate()
+        .filter(|(index, candidate)| {
+            paths.iter().any(|p| candidate.path.to_string_lossy() == p.as_str())
+                || indexes.contains(index)
+        })
+        .map(|(_, candidate)| candidate)
+        .collect();
+
+    if selected.is_empty() {
+        return Err("未选择任何本机账号（或所选文件已不存在，请重新扫描）".to_string());
+    }
+
+    let mut accounts = load_accounts();
+    let mut added = 0usize;
+    let mut updated = 0usize;
+    let mut outcomes: Vec<Value> = Vec::new();
+
+    for candidate in selected {
+        // upsert 命中已有身份时会保留本地 id，因此用「保存结果的 id 是否早已
+        // 存在」判断本次是覆盖还是新增，可同时覆盖 uid 命中与邮箱兜底命中。
+        let known_ids: Vec<String> = accounts.iter().filter_map(|a| get_str(a, "id")).collect();
+        let saved = upsert_collected_account(&mut accounts, candidate.account);
+        let saved_id = get_str(&saved, "id").unwrap_or_default();
+        let was_update = known_ids.iter().any(|id| id == &saved_id);
+        if was_update {
+            updated += 1;
+        } else {
+            added += 1;
+        }
+        outcomes.push(json!({
+            "name": account_display_name(&saved),
+            "region": Region::of(&saved).label(),
+            "source": candidate.source.key(),
+            "file": candidate.file_name,
+            "freshness": candidate.freshness.key(),
+            "updated": was_update,
+        }));
+    }
+
+    save_accounts(&accounts).map_err(|e| format!("保存账号库失败：{e}"))?;
+
+    Ok(LocalImportResult {
+        imported: added + updated,
+        added,
+        updated,
+        outcomes,
+    })
+}
+
+/// 本机导入的结果计数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalImportResult {
+    /// 本次实际写入账号库的数量（新增 + 覆盖）。
+    pub imported: usize,
+    /// 其中新增的账号数。
+    pub added: usize,
+    /// 其中覆盖刷新既有账号的数量。
+    pub updated: usize,
+    /// 逐个账号的结果明细。
+    pub outcomes: Vec<Value>,
+}
+
 /// 从本机一键导入**所有可发现的区域**（国服 + 国际版）。
 ///
 /// CodeBuddy / WorkBuddy 客户端把不同区域的登录态写在同目录的**不同文件**里：
@@ -492,10 +779,11 @@ pub fn import_local() -> Result<Value, String> {
 ///   workbuddy-desktop-ai.info    国际版
 /// 因此这里逐个探测，把能读到的全部并入账号库。
 ///
+/// 只读**当前**登录态（每区域 1 个）。历史登录过的账号要靠
+/// `scan_local_accounts` / `import_local_selected` 才能发现。
+///
 /// 返回本次实际导入（或更新）的账号元数据列表；全部未发现时给出可操作的错误。
 pub fn import_local_all() -> Result<Vec<Value>, String> {
-    use crate::modules::config::Region;
-
     let mut imported: Vec<Value> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
 
@@ -506,10 +794,7 @@ pub fn import_local_all() -> Result<Vec<Value>, String> {
                 // 区域以认证文件为准：旧记录可能缺 domain，用文件名兜底标注。
                 let mut acc = acc;
                 if get_str(&acc, "domain").is_none() {
-                    acc["domain"] = json!(match region {
-                        Region::Cn => "www.workbuddy.cn",
-                        Region::Intl => "www.workbuddy.ai",
-                    });
+                    acc["domain"] = json!(region.auth_domain());
                 }
                 match save_collected_account(acc) {
                     Ok(saved) => imported.push(account_meta(&saved)),

@@ -79,6 +79,12 @@ fn spawn_background_loops() {
     // 账号库 → 网关 自动同步：新增/变更账号会自动进入网关凭证目录，
     // 网关运行中则自动重启以加载，无需用户手动点「立即同步」。
     tauri::async_runtime::spawn(async move {
+        // 先清理旧版本因网络失败误报的「需重新登录」标记，再开始同步，
+        // 否则这些账号会一直留在网关凭证目录之外。
+        let repaired = modules::refresh::repair_false_relogin_flags();
+        if repaired > 0 {
+            eprintln!("[refresh] 已清除 {repaired} 个账号因网络失败误报的「需重新登录」标记");
+        }
         modules::gateway::run_auto_sync_loop(30).await;
     });
 }
@@ -160,6 +166,8 @@ pub fn run() {
             commands::oauth_start,
             commands::oauth_status,
             commands::import_local,
+            commands::scan_local_accounts,
+            commands::import_local_selected,
             commands::export_accounts,
             commands::export_accounts_to_path,
             commands::preview_import_accounts,

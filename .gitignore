@@ -59,3 +59,10 @@ _rel/
 *.key
 *.key.pub
 !.gitignore
+
+# AI 助手的本机仓库导航备忘（只在本地用，不入库）
+NAVIGATION.md
+
+# Python 缓存（仓库根出现过 __pycache__/*.pyc 被误加进暂存区）
+__pycache__/
+*.pyc

@@ -309,7 +309,13 @@ pub fn accounts_fingerprint() -> String {
             // token 只取尾部若干字符参与指纹：避免把完整凭证写进日志/内存字符串
             let at_tail: String = at.chars().rev().take(12).collect();
             let rt_len = rt.len();
-            Some(format!("{uid}|{at_tail}|{rt_len}|{}", to_sec(exp)))
+            // 需重登标记必须参与指纹：它的变化会改变「哪些账号该导出」，
+            // 若不计入，标记翻转后 `sync_if_changed` 会认为无事发生而不重推凭证。
+            let relogin = if needs_relogin(a) { 1 } else { 0 };
+            Some(format!(
+                "{uid}|{at_tail}|{rt_len}|{}|{relogin}",
+                to_sec(exp)
+            ))
         })
         .collect();
     parts.sort();
@@ -446,26 +452,45 @@ fn active_uids() -> Option<Vec<String>> {
     }
 }
 
+/// 账号是否已被标记为「需重新登录」。
+///
+/// 复用 `refresh::needs_relogin`：它会排除旧版本因传输层失败留下的误报标记
+///（`code=-1` 并不代表凭证失效），避免这些账号被永久排除出网关池。
+pub use crate::modules::refresh::needs_relogin;
+
 /// 账号库 -> 网关凭证目录。返回 (账号数, 有变化的 uid 列表)。
 pub fn export_accounts_to_gateway() -> Result<(usize, Vec<String>), String> {
-    let dir = gateway_auth_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let accounts = account::load_accounts();
+    export_accounts_to_dir(&gateway_auth_dir(), &account::load_accounts(), active_uids())
+}
+
+/// `export_accounts_to_gateway` 的可注入目录版本（便于单测验证真实文件增删）。
+///
+/// `only` 语义见 `select_export_uids`：None=不过滤（负载均衡），Some=仅这些 uid。
+pub fn export_accounts_to_dir(
+    dir: &std::path::Path,
+    accounts: &[Value],
+    only: Option<Vec<String>>,
+) -> Result<(usize, Vec<String>), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let mut changed = Vec::new();
     let mut written = 0usize;
-
-    // 按模式过滤：指定账号模式只导出锁定的那一个账号
-    let only: Option<Vec<String>> = active_uids();
 
     // 「是否导出某账号」只在这里定义一次，导出与清理共用。
     // 分开写会导致切换模式时判定不一致（曾被此坑到：清理用账号库全集，
     // 从负载均衡切到指定账号后其余凭证残留，网关仍把它们加载进池）。
+    //
+    // 需重登的账号同样不导出：它的 refresh token 已被服务端拒绝，
+    // 留在池里只会让每次请求白跑一轮（实测：网关无视该标记持续使用失效账号）。
+    // 重新登录成功后 `needs_relogin` 被清除，下次同步会自动把它放回池中。
     let should_export = |acc: &Value| -> bool {
+        if needs_relogin(acc) {
+            return false;
+        }
         let uid = account::get_str(acc, "uid").unwrap_or_default();
         !select_export_uids(&[uid], &only).is_empty()
     };
 
-    for acc in &accounts {
+    for acc in accounts {
         if !should_export(acc) {
             continue;
         }
@@ -488,16 +513,18 @@ pub fn export_accounts_to_gateway() -> Result<(usize, Vec<String>), String> {
         written += 1;
     }
 
-    // 清理不再需要的凭证：账号库中已删除的，以及因模式切换而不再导出的。
+    // 清理不再需要的凭证：账号库中已删除的、因模式切换而不再导出的，
+    // 以及已被标记需重新登录的（留着只会让网关持续调用失效凭证）。
     let all_uids: Vec<String> = accounts
         .iter()
+        .filter(|a| !needs_relogin(a))
         .filter_map(|a| account::get_str(a, "uid"))
         .collect();
     let live: Vec<String> = select_export_uids(&all_uids, &only)
         .iter()
         .map(|u| format!("workbuddy-{u}.json"))
         .collect();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
         for ent in entries.flatten() {
             let name = ent.file_name().to_string_lossy().to_string();
             if name.starts_with("workbuddy") && name.ends_with(".json") && !live.contains(&name) {
@@ -935,6 +962,29 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
     // 先把账号库导出为网关凭证，保证启动即能加载到账号
     let (count, _) = export_accounts_to_gateway()?;
     if count == 0 {
+        // 区分「本来就没有账号」与「账号都在需重登状态」：后者不给出提示的话，
+        // 用户只会看到「账号库为空」，完全不知道去重新登录就能恢复。
+        let accounts = account::load_accounts();
+        let dead = accounts.iter().filter(|a| needs_relogin(a)).count();
+        if dead > 0 && dead == accounts.len() {
+            return Err(format!(
+                "账号库中的 {dead} 个账号都已标记「需重新登录」（refresh token 已失效），\
+                 已暂停导出到网关。请先在「账号管理」页重新登录，恢复后会自动重新加入。"
+            ));
+        }
+        if gateway_mode() == GatewayMode::Pinned {
+            let pinned = pinned_uid().unwrap_or_default();
+            if accounts
+                .iter()
+                .any(|a| account::get_str(a, "uid").as_deref() == Some(pinned.as_str()) && needs_relogin(a))
+            {
+                return Err(
+                    "「指定账号」锁定的账号已标记「需重新登录」，请先在「账号管理」页重新登录，\
+                     或改选其他账号。"
+                        .to_string(),
+                );
+            }
+        }
         return Err(match gateway_mode() {
             GatewayMode::Pinned => "「指定账号」模式尚未选择账号，请在网关页面选择后启动".to_string(),
             GatewayMode::Balance => "账号库为空，请先添加账号再启动网关".to_string(),
@@ -1089,6 +1139,19 @@ pub async fn gateway_status() -> Value {
     }
 
     let account_count = account::load_accounts().len();
+    // 需重登的账号不导出到网关，界面需要能看到「为什么某个账号不在池里」。
+    let excluded_accounts: Vec<Value> = account::load_accounts()
+        .iter()
+        .filter(|a| needs_relogin(a))
+        .filter_map(|a| {
+            let uid = account::get_str(a, "uid")?;
+            Some(json!({
+                "uid": uid,
+                "nickname": account::get_str(a, "nickname").unwrap_or_default(),
+                "reason": account::get_str(a, "needs_relogin_reason"),
+            }))
+        })
+        .collect();
     let exe_path = exe.as_ref().map(|p| p.to_string_lossy().to_string());
     let exe_found = exe.is_some();
     json!({
@@ -1102,6 +1165,8 @@ pub async fn gateway_status() -> Value {
         "exeSource": gateway_source(),
         "mode": gateway_mode().as_str(),
         "pinnedUid": pinned_uid(),
+        // 被排除出网关池的账号（需重新登录），供界面提示
+        "excludedAccounts": excluded_accounts,
         // 供前端下拉选择「指定账号」
         "accounts": account::load_accounts()
             .iter()
@@ -1470,6 +1535,172 @@ mod tests {
     fn finalize_fills_listen_default() {
         let cfg = super::finalize_gateway_config(json!({"listen": "  "}));
         assert_eq!(cfg["listen"], ":7863");
+    }
+
+    // 回归保护：被标记「需重新登录」的账号不得导出到网关。
+    //
+    // 曾经的缺陷是导出只看 uid/模式，完全无视 `needs_relogin` —— 于是 refresh
+    // token 已被服务端拒绝的账号仍留在网关池里，网关每次请求都拿它去试一轮，
+    // 表现为「网关无视账号需重登，一直用失效账号调用模型」。
+    #[test]
+    fn needs_relogin_accounts_are_excluded_from_gateway_export() {
+        let healthy = json!({"uid": "uid-ok", "access_token": "AT", "domain": "www.workbuddy.ai"});
+        let dead = json!({
+            "uid": "uid-dead",
+            "access_token": "AT",
+            "domain": "www.workbuddy.ai",
+            "needs_relogin": true,
+            "needs_relogin_reason": "刷新失败(code=12153)",
+        });
+
+        assert!(!needs_relogin(&healthy));
+        assert!(needs_relogin(&dead));
+
+        // 判定口径与导出循环一致：dead 应被 should_export 拒绝。
+        let only: Option<Vec<String>> = None;
+        let should_export = |acc: &Value| -> bool {
+            if needs_relogin(acc) {
+                return false;
+            }
+            let uid = account::get_str(acc, "uid").unwrap_or_default();
+            !select_export_uids(&[uid], &only).is_empty()
+        };
+        assert!(should_export(&healthy), "健康账号必须导出");
+        assert!(!should_export(&dead), "需重登账号必须被排除出网关凭证目录");
+
+        // 清理清单同样不含它 —— 否则残留凭证会被网关继续加载进池。
+        let accounts = vec![healthy, dead];
+        let live: Vec<String> = accounts
+            .iter()
+            .filter(|a| !needs_relogin(a))
+            .filter_map(|a| account::get_str(a, "uid"))
+            .collect();
+        assert_eq!(live, vec!["uid-ok".to_string()]);
+    }
+
+    // 标记翻转必须改变指纹，否则自动同步不会重推凭证（账号会一直留在池里）。
+    #[test]
+    fn fingerprint_changes_when_relogin_flag_flips() {
+        let acc_ok = json!({"uid": "uid-1", "access_token": "AT", "expiresAt": 1000});
+        let mut acc_dead = acc_ok.clone();
+        acc_dead["needs_relogin"] = json!(true);
+
+        let fingerprint = |a: &Value| -> String {
+            let uid = account::get_str(a, "uid").unwrap_or_default();
+            let at = account::get_str(a, "access_token").unwrap_or_default();
+            let rt = account::get_str(a, "refresh_token").unwrap_or_default();
+            let exp = a.get("expiresAt").and_then(Value::as_i64).unwrap_or(0);
+            let at_tail: String = at.chars().rev().take(12).collect();
+            let rt_len = rt.len();
+            let relogin = if needs_relogin(a) { 1 } else { 0 };
+            format!("{uid}|{at_tail}|{rt_len}|{}|{relogin}", to_sec(exp))
+        };
+
+        assert_ne!(
+            fingerprint(&acc_ok),
+            fingerprint(&acc_dead),
+            "需重登标记必须参与指纹，否则标记翻转后不会触发重新同步"
+        );
+    }
+
+    /// 端到端：导出到真实目录时，需重登账号的凭证文件必须被写入-剔除。
+    ///
+    /// 覆盖两种路径：
+    ///   1. 标记出现时，已有的凭证文件必须被**删除**（否则网关重启仍会加载它）；
+    ///   2. 标记清除后（重新登录成功），凭证必须被**写回**。
+    #[test]
+    fn export_removes_and_restores_relogin_account_credentials() {
+        let dir = std::env::temp_dir().join(format!(
+            "wb-gw-export-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let healthy = json!({
+            "uid": "uid-ok", "nickname": "健康号", "access_token": "AT-OK",
+            "refresh_token": "RT-OK", "domain": "www.workbuddy.ai", "expiresAt": 1_900_000_000_000i64,
+        });
+        let dead = json!({
+            "uid": "uid-dead", "nickname": "失效号", "access_token": "AT-DEAD",
+            "refresh_token": "RT-DEAD", "domain": "www.workbuddy.ai", "expiresAt": 1_900_000_000_000i64,
+            "needs_relogin": true,
+            "needs_relogin_reason": "刷新失败(code=12153): Offline user session not found",
+        });
+
+        // 1) 健康账号：凭证落盘（count 统计的是处理的账号记录数，不是文件数）
+        let (count, _) = export_accounts_to_dir(&dir, &[healthy.clone()], None)
+            .expect("export healthy");
+        assert_eq!(count, 1);
+        assert!(dir.join("workbuddy-uid-ok.json").exists());
+
+        // 先把失效账号以「健康」形态写进去（模拟它此前登录正常、凭证已在池中）
+        let dead_before = json!({
+            "uid": "uid-dead", "nickname": "失效号", "access_token": "AT-DEAD",
+            "refresh_token": "RT-DEAD", "domain": "www.workbuddy.ai", "expiresAt": 1_900_000_000_000i64,
+        });
+        export_accounts_to_dir(&dir, &[dead_before], None).expect("seed dead before flag");
+        assert!(
+            dir.join("workbuddy-uid-dead.json").exists(),
+            "前置条件：失效账号的凭证文件此刻存在"
+        );
+
+        // 2) 账号被打上需重登标记后：它的凭证必须被清理，健康账号保留
+        let (_, changed) = export_accounts_to_dir(&dir, &[healthy.clone(), dead.clone()], None)
+            .expect("export with dead");
+        assert!(
+            !dir.join("workbuddy-uid-dead.json").exists(),
+            "需重登账号的凭证文件必须被删除，否则网关仍会把它加载进池"
+        );
+        assert!(
+            dir.join("workbuddy-uid-ok.json").exists(),
+            "健康账号不受影响"
+        );
+        assert!(
+            changed.iter().any(|c| c == "removed:workbuddy-uid-dead.json"),
+            "变更列表应报告删除，便于界面/日志追踪：{changed:?}"
+        );
+
+        // 3) 重新登录成功（标记清除）后：凭证必须被写回
+        let recovered = json!({
+            "uid": "uid-dead", "nickname": "失效号", "access_token": "AT-NEW",
+            "refresh_token": "RT-NEW", "domain": "www.workbuddy.ai", "expiresAt": 1_900_000_000_000i64,
+        });
+        export_accounts_to_dir(&dir, &[healthy, recovered], None).expect("export recovered");
+        assert!(
+            dir.join("workbuddy-uid-dead.json").exists(),
+            "重新登录后凭证必须被写回，账号才能回到池中"
+        );
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("workbuddy-uid-dead.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["auth"]["accessToken"], "AT-NEW");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 历史误报标记（code=-1）不得导致账号被移出网关池。
+    #[test]
+    fn legacy_transport_error_flag_keeps_account_in_pool() {
+        let dir = std::env::temp_dir().join(format!(
+            "wb-gw-legacy-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let legacy = json!({
+            "uid": "uid-legacy", "nickname": "被误判的号", "access_token": "AT",
+            "refresh_token": "RT", "domain": "www.workbuddy.ai",
+            "needs_relogin": true,
+            "needs_relogin_reason": "刷新失败(code=-1): error sending request for url (https://www.workbuddy.ai/v2/plugin/auth/token/refresh)",
+        });
+
+        let (count, _) =
+            export_accounts_to_dir(&dir, &[legacy], None).expect("export legacy");
+        assert_eq!(count, 1, "传输层失败留下的误报标记不应把账号排除出池");
+        assert!(dir.join("workbuddy-uid-legacy.json").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // 模式切换补丁：切回负载均衡必须清掉 pinned_uid（否则残留旧锁定值）。

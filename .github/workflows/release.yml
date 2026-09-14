@@ -3,13 +3,23 @@ name: release
 # 打 v* tag（或手动触发）时构建全部平台并发布 GitHub Release。
 #
 # 关于签名与自动更新：
-#   当前 tauri.conf.json 里 createUpdaterArtifacts=false —— 产物不带 .sig，
-#   也不生成 latest.json，因此应用内「检查更新」暂时不可用（不会报错，只是查不到）。
-#   拿到签名私钥后要接回自动更新，需要做三件事：
-#     1. tauri.conf.json: createUpdaterArtifacts 改回 true
-#     2. 仓库 secrets 加 TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD
-#     3. 本文件里恢复 gen-update-json.sh + merge-update-manifests.py 两步，
-#        并把 .sig / latest*.json 一并上传（旧版 build.yml 里有现成写法）
+#   tauri.conf.json 里 createUpdaterArtifacts=true，产物带 .sig，并生成
+#   latest.json 供应用内「检查更新」使用（endpoints 指向 releases/latest/download/）。
+#
+#   因此本工作流**必须**注入签名私钥，否则三个平台都会在「构建桌面应用」失败。
+#   仓库 secrets 需要配好这两个（缺任意一个都会失败）：
+#     TAURI_SIGNING_PRIVATE_KEY          私钥内容（不是路径！传路径会报
+#                                        Invalid symbol 58，因为路径里有冒号）
+#     TAURI_SIGNING_PRIVATE_KEY_PASSWORD 私钥口令
+#   本地同一把密钥位于 %USERPROFILE%\.wb-switch\wb-switch-updater.key，
+#   本地构建走 scripts/build-signed.ps1（详见 AGENTS.md「构建与签名」）。
+#
+#   注意：minisign 私钥与平台无关，一把密钥即可签所有平台，不存在
+#   「只配了 Windows 用的密钥」这回事 —— 历史上 macOS 任务失败的真实原因是
+#   secrets 里根本没有配置私钥，而不是密钥不适用于 macOS。
+#
+#   仍待处理：gen-update-json.sh 目前只支持 Windows，macOS/Linux 只上传 .sig，
+#   不生成各自的 latest-<os>-<arch>.json（Windows 是主力分发平台，够用）。
 #
 # macOS 产物为 adhoc 签名（无 Apple 开发者证书），用户首次打开会提示「已损坏」，
 # 需执行 `xattr -cr "/Applications/WorkBuddy Switch Gateway.app"` 放行。
@@ -28,6 +38,15 @@ env:
 jobs:
   build:
     name: build / ${{ matrix.name }}
+    # 单平台失败不阻断其余平台，也不阻断 Release。
+    #
+    # 注意这里有两层，缺一不可：
+    #   1. continue-on-error 只保证「本 job 失败不把整个 run 判为失败」；
+    #   2. release job 必须配合 !cancelled() 才会在 build 失败时照常执行 ——
+    #      因为 needs: build 默认要求依赖成功，否则 release 会被直接 skip。
+    # 只加 continue-on-error 而不改 release 的 if，仍然会出现「一个平台挂了、
+    # 整个 Release 一个资产都发不出来」的情况（v0.7.1 就是这样）。
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -125,12 +144,29 @@ jobs:
       - name: 构建前端
         run: npm run build
 
-      # 不注入 TAURI_SIGNING_PRIVATE_KEY：createUpdaterArtifacts=false 时
-      # Tauri 不做签名，也就不会因缺少私钥而失败（见文件头说明）。
+      # 必须注入签名私钥：createUpdaterArtifacts=true 时 Tauri 对**每个**平台
+      # 都要求私钥，缺失即失败（v0.7.1/v0.7.2 就是这样三平台全挂、Release 被跳过的）。
+      # 私钥与平台无关，同一把密钥签所有平台。
       - name: 构建桌面应用
         shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          # 私钥缺失时立刻给出可读原因，而不是让 Tauri 报晦涩的解码错误。
+          # 注意 secrets 在 if 条件里不可直接引用，所以这里用 env 判断。
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "错误：未配置仓库 secret TAURI_SIGNING_PRIVATE_KEY。" >&2
+            echo "  设置：gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.wb-switch/wb-switch-updater.key" >&2
+            echo "  说明见 AGENTS.md「构建与签名」。" >&2
+            exit 1
+          fi
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
+            echo "错误：未配置仓库 secret TAURI_SIGNING_PRIVATE_KEY_PASSWORD。" >&2
+            echo "  设置：gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD" >&2
+            exit 1
+          fi
           # cargo 缓存会把上一版的安装包一起带出来，不清理就会混进 Release
           rm -rf "target/${{ matrix.target }}/release/bundle"
           npm run tauri -- build \
@@ -138,6 +174,14 @@ jobs:
             --bundles ${{ matrix.bundles }}
           echo "bundle 内容:"
           find "target/${{ matrix.target }}/release/bundle" -type f | sort || true
+          # 断言签名确实产出：少了 .sig 客户端就无法更新，必须在这里拦住。
+          # 用计数而非 `find | grep -q`：前者结果确定、且失败时能打印数量便于排查。
+          SIG_COUNT=$(find "target/${{ matrix.target }}/release/bundle" -type f -name '*.sig' | wc -l | tr -d ' ')
+          if [ "$SIG_COUNT" -eq 0 ]; then
+            echo "错误：构建完成但没有生成任何 .sig，签名未生效。" >&2
+            exit 1
+          fi
+          echo "签名文件数：$SIG_COUNT"
 
       - name: 定位 bundle 目录
         shell: bash
@@ -275,6 +319,10 @@ jobs:
 
       # 按平台断言应有的产物，而不是只看「非空」——
       # 只看非空的话，Windows 漏掉 exe/msi 只剩 portable.zip 也能混过去。
+      #
+      # 这一步必须在「生成 updater 清单」**之前**：清单步骤会往 dist-bin 里
+      # 额外放一份固定名副本（同样是 *-setup.exe），放在后面会让下面的
+      # 「恰好 1 个 *-setup.exe」断言数出 2 个而误报失败。
       - name: 检查产物齐全
         shell: bash
         run: |
@@ -293,6 +341,58 @@ jobs:
             fi
           done
 
+      # 生成 updater 清单。自动更新要求「固定 URL」，而安装包名里带版本号，
+      # 所以这里额外复制一份固定名副本，清单指向固定名。
+      #
+      # 关键：重命名后**不需要**重新签名。已实测验证（pynacl 对真实产物验签）：
+      # minisign 验签只覆盖文件内容，签名里 trusted comment 的 file: 字段
+      # 不参与校验 —— 用「WorkBuddy Switch Gateway_0.7.0_x64-setup.exe」签出的
+      # .sig，能验过重命名成 workbuddy-switch-windows-x86_64-setup.exe 的同一文件。
+      # （scripts/publish-release.sh 头部注释里"必须重新签名"的说法是错的。）
+      - name: 生成 updater 清单
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          UPDATE_OS: windows
+          UPDATE_ARCH: x86_64
+          UPDATE_ARCHIVE_NAME: workbuddy-switch-windows-x86_64-setup.exe
+        run: |
+          set -euo pipefail
+          VER="$APP_VERSION"
+          # 安装包文件名含空格（productName 是 "WorkBuddy Switch Gateway"），
+          # 先断言命中数为 1，避免多个匹配时静默取到错误的那一个。
+          MATCHES=$(find "$BUNDLE_ROOT/nsis" -maxdepth 1 -type f -name "*_${VER}_x64-setup.exe" | wc -l | tr -d ' ')
+          if [ "$MATCHES" != "1" ]; then
+            echo "错误：预期恰好 1 个 ${VER} 的 NSIS 安装包，实际 $MATCHES 个" >&2
+            ls -la "$BUNDLE_ROOT/nsis" >&2 || true
+            exit 1
+          fi
+          ARCHIVE=$(find "$BUNDLE_ROOT/nsis" -maxdepth 1 -type f -name "*_${VER}_x64-setup.exe")
+          if [ ! -f "$ARCHIVE.sig" ]; then
+            echo "错误：安装包没有配套 .sig，签名未生效：$ARCHIVE.sig" >&2
+            exit 1
+          fi
+          cp "$ARCHIVE" "dist-bin/$UPDATE_ARCHIVE_NAME"
+          cp "$ARCHIVE.sig" "dist-bin/$UPDATE_ARCHIVE_NAME.sig"
+          UPDATE_VERSION="$VER" BUNDLE_DIR="$BUNDLE_ROOT/nsis" sh scripts/gen-update-json.sh
+          MANIFEST="$BUNDLE_ROOT/nsis/latest-${UPDATE_OS}-${UPDATE_ARCH}.json"
+          test -f "$MANIFEST"
+          cp "$MANIFEST" dist-bin/
+          # 断言清单里的 URL 与签名都已写入，避免生成出空壳清单。
+          # 不用 grep -q：它静默失败会让人看不出是"清单不对"还是"步骤本身挂了"。
+          if ! grep -q "$UPDATE_ARCHIVE_NAME" "$MANIFEST"; then
+            echo "错误：清单里没有指向 $UPDATE_ARCHIVE_NAME 的 URL" >&2
+            cat "$MANIFEST" >&2
+            exit 1
+          fi
+          if ! grep -q '"signature"' "$MANIFEST"; then
+            echo "错误：清单里缺少 signature 字段" >&2
+            cat "$MANIFEST" >&2
+            exit 1
+          fi
+          echo "updater 清单已生成："
+          cat "$MANIFEST"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
@@ -303,9 +403,15 @@ jobs:
     name: 发布 Release
     needs: build
     # 手动触发没有 tag，不建 Release（只留在 Artifacts 里供下载验证）
-    if: startsWith(github.ref, 'refs/tags/v')
+    #
+    # !cancelled() 不可省略：needs: build 默认要求依赖成功，只要有一个平台
+    # 失败（continue-on-error 不会把结果改成 success），release 就会被 skip。
+    # 加上它之后，只要不是被主动取消，Windows 等成功的平台产物照常发布。
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -314,8 +420,17 @@ jobs:
       - name: 列出待发布资产
         run: ls -la artifacts
 
+      # 把各平台的 latest-<os>-<arch>.json 合并成 latest.json ——
+      # tauri.conf.json 的 endpoints 第一项就是 releases/latest/download/latest.json，
+      # 缺了它应用内「检查更新」会 404。
+      - name: 合并 updater 清单
+        run: python3 scripts/merge-update-manifests.py artifacts
+
       # draft: true —— 首次跑通 macOS 之前先不直接对外发布，
       # 你在 Release 页面核对无误后点 Publish 即可。信任这条流水线后改成 false。
+      #
+      # 注意：draft 的 Release 不参与 releases/latest/ 解析，所以只要还是 draft，
+      # 自动更新端点就是 404 —— 必须点 Publish 之后客户端才能收到更新。
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*

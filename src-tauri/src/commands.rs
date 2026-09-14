@@ -182,6 +182,38 @@ pub fn import_local() -> Result<Value, String> {
     }))
 }
 
+/// GET /api/import-local/scan —— 扫描本机全部历史登录态。
+///
+/// 除两个固定认证文件（当前登录态）外，还会扫出客户端留存的历史登录快照与
+/// 本工具切换前的备份，按「区域 + uid」去重后只保留凭证最新的一份。
+/// 返回的候选项不含 token，仅用于界面展示与勾选。
+#[tauri::command]
+pub fn scan_local_accounts() -> Value {
+    let scan = account::scan_local_accounts();
+    json!({
+        "ok": true,
+        "candidates": scan.candidates,
+        "total": scan.candidates.len(),
+        "filesScanned": scan.files_scanned,
+        "usable": scan.usable,
+        "authDir": scan.auth_dir,
+        "backupDir": scan.backup_dir,
+    })
+}
+
+/// POST /api/import-local/selected —— 按来源文件路径（或扫描索引）批量导入。
+#[tauri::command]
+pub fn import_local_selected(paths: Vec<String>, indexes: Vec<usize>) -> Result<Value, String> {
+    let result = account::import_local_selected(&paths, &indexes)?;
+    Ok(json!({
+        "ok": true,
+        "imported": result.imported,
+        "added": result.added,
+        "updated": result.updated,
+        "outcomes": result.outcomes,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // 导出 / 导入账号
 // ---------------------------------------------------------------------------

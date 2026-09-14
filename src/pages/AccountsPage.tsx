@@ -31,6 +31,7 @@ import {
 } from "@/components/ui/dialog";
 import { ExportAccountsDialog } from "@/components/export-accounts-dialog";
 import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
+import { ImportLocalDialog } from "@/components/import-local-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
@@ -146,8 +147,9 @@ export default function AccountsPage() {
   const [oauthOpen, setOauthOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  /** 从本机导入（扫描当前登录态 + 历史快照 + 切换备份）弹框 */
+  const [importLocalOpen, setImportLocalOpen] = useState(false);
   const [switchAccount, setSwitchAccount] = useState<AccountMeta | null>(null);
-  const [importing, setImporting] = useState(false);
   const [autoCheckinConfig, setAutoCheckinConfig] = useState<CheckinConfig | null>(null);
   const [autoCheckinSaving, setAutoCheckinSaving] = useState(false);
   /** 账号 id -> 今日是否已签到（undefined=查询中/未知） */
@@ -332,25 +334,12 @@ export default function AccountsPage() {
     void ensureCredits(accounts.map((account) => account.id));
   }, [accounts, ensureCredits]);
 
-  async function onImport() {
-    setImporting(true);
-    try {
-      const res = await importLocal();
-      const list = res.accounts ?? [];
-      if (list.length === 0) {
-        toast.error("未发现本机账号", { description: "请先在 WorkBuddy 客户端登录" });
-        return;
-      }
-      // 标明区域：同一台机器可能同时存在国服与国际版登录态
-      const detail = list
-        .map((a) => `${a.nickname || a.email || a.id}（${a.region ?? "未知区域"}）`)
-        .join("、");
-      toast.success(`已导入 ${list.length} 个账号`, { description: detail });
-    } catch (e) {
-      toast.error("导入失败", { description: api.asError(e) });
-    } finally {
-      setImporting(false);
-    }
+  /** 从本机批量导入完成提示（含新增/覆盖拆分）。 */
+  function onLocalImported(result: { imported: number; added: number; updated: number }) {
+    const parts = [`新增 ${result.added} 个`];
+    if (result.updated > 0) parts.push(`更新 ${result.updated} 个`);
+    toast.success(`已导入 ${result.imported} 个账号`, { description: parts.join("，") });
+    void fetchAll();
   }
 
   async function onAutoCheckinChange(enabled: boolean) {
@@ -682,8 +671,13 @@ export default function AccountsPage() {
               </Button>
             </DemoAction>
             <DemoAction>
-              <Button className="h-10 px-4" onClick={onImport} disabled={importing} variant="outline">
-                {importing ? <Loader2 className="animate-spin" /> : <Download />}导入本机账号
+              <Button
+                className="h-10 px-4"
+                onClick={() => setImportLocalOpen(true)}
+                variant="outline"
+                title="扫描本机当前登录态、历史登录快照与切换备份，可一次导入多个账号"
+              >
+                <Download />从本机导入
               </Button>
             </DemoAction>
           </div>
@@ -901,6 +895,11 @@ export default function AccountsPage() {
         open={importOpen}
         onOpenChange={setImportOpen}
         onImported={onImported}
+      />
+      <ImportLocalDialog
+        open={importLocalOpen}
+        onOpenChange={setImportLocalOpen}
+        onImported={onLocalImported}
       />
       <SwitchAccountDialog
         open={switchAccount !== null}

@@ -35,6 +35,8 @@ import type {
   GithubConfig,
   ImportPreviewAccount,
   ImportResult,
+  LocalImportResult,
+  LocalScanResult,
   OAuthPollResult,
   OAuthStartResult,
   RotateLog,
@@ -104,6 +106,8 @@ const ROUTES: Record<string, Route> = {
   oauth_start: { method: "POST", path: "/api/oauth/start" },
   oauth_status: { method: "POST", path: "/api/oauth/status" },
   import_local: { method: "POST", path: "/api/import-local" },
+  scan_local_accounts: { method: "GET", path: "/api/import-local/scan" },
+  import_local_selected: { method: "POST", path: "/api/import-local/selected" },
   export_accounts: { method: "POST", path: "/api/export-accounts" },
   export_accounts_to_path: { method: "POST", path: "/api/export-accounts-to-path" },
   preview_import_accounts: { method: "POST", path: "/api/import/preview" },
@@ -288,6 +292,21 @@ export function importLocal(): Promise<{
   imported: number;
 }> {
   return call("import_local");
+}
+
+/**
+ * 扫描本机全部历史登录态（当前认证文件 + 客户端快照 + 本工具备份）。
+ *
+ * 「导入本机账号」原本只看两个固定认证文件，因此每区域最多 1 个账号；
+ * 本接口额外扫出历史快照，按「区域 + uid」去重后只保留凭证最新的一份。
+ */
+export function scanLocalAccounts(): Promise<LocalScanResult> {
+  return call("scan_local_accounts", {});
+}
+
+/** 按来源文件路径批量导入本机账号（路径跨扫描稳定，优于索引）。 */
+export function importLocalSelected(paths: string[]): Promise<LocalImportResult> {
+  return call("import_local_selected", { paths, indexes: [] });
 }
 
 export function exportAccounts(accountIds: string[]): Promise<{ ok: boolean; accounts: AccountRecord[] }> {

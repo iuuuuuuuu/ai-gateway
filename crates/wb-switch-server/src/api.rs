@@ -62,6 +62,11 @@ pub fn router() -> Router {
         .route("/api/oauth/start", post(api_oauth_start))
         .route("/api/oauth/status", post(api_oauth_status))
         .route("/api/import-local", post(api_import_local))
+        .route("/api/import-local/scan", get(api_scan_local))
+        .route(
+            "/api/import-local/selected",
+            post(api_import_local_selected),
+        )
         .route("/api/export-accounts", post(api_export_accounts))
         .route(
             "/api/export-accounts-to-path",
@@ -223,6 +228,52 @@ async fn api_import_local() -> Response {
             "imported": list.len(),
             "accounts": list,
             "account": list.first().cloned(),
+        })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/import-local/scan —— 扫描本机全部历史登录态（当前 + 快照 + 备份）。
+async fn api_scan_local() -> Response {
+    let scan = account::scan_local_accounts();
+    json_ok(json!({
+        "ok": true,
+        "candidates": scan.candidates,
+        "total": scan.candidates.len(),
+        "filesScanned": scan.files_scanned,
+        "usable": scan.usable,
+        "authDir": scan.auth_dir,
+        "backupDir": scan.backup_dir,
+    }))
+}
+
+/// POST /api/import-local/selected —— 按路径/索引批量导入本机账号。
+async fn api_import_local_selected(Json(body): Json<Value>) -> Response {
+    let paths: Vec<String> = body
+        .get("paths")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let indexes: Vec<usize> = body
+        .get("indexes")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_u64().map(|n| n as usize))
+                .collect()
+        })
+        .unwrap_or_default();
+    match account::import_local_selected(&paths, &indexes) {
+        Ok(result) => json_ok(json!({
+            "ok": true,
+            "imported": result.imported,
+            "added": result.added,
+            "updated": result.updated,
+            "outcomes": result.outcomes,
         })),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }
