@@ -130,7 +130,10 @@ type responsesToolCall struct {
 	id        string
 	name      string
 	arguments strings.Builder
-	added     bool
+	// pending 暂存「先于 output_item.added 到达」的参数分片：item 未声明前不能发
+	// arguments.delta，否则客户端收到指向未知 item 的增量。added 后补发。
+	pending strings.Builder
+	added   bool
 }
 
 func newResponsesStreamState(model string) *responsesStreamState {
@@ -155,6 +158,12 @@ func (s *responsesStreamState) createdEvent() map[string]any {
 	}
 }
 
+// snapshot 组装一个 Responses 响应对象。
+//
+// 必须携带 usage：Codex 恒以 stream:true 调用，只在 response.completed.response.usage
+// 里读 token 用量；缺失会让每一轮的用量显示为 0/未知。非流式路径（responses.go 的
+// chatToResponses）本来就有 usage，这里补齐后两条路径口径一致。
+// usage 未知时 responsesUsage 返回全 0 而不是省略字段，避免客户端解析成 null 报错。
 func (s *responsesStreamState) snapshot(status string, output []any) map[string]any {
 	if output == nil {
 		output = []any{}
@@ -166,6 +175,7 @@ func (s *responsesStreamState) snapshot(status string, output []any) map[string]
 		"status":     status,
 		"model":      s.model,
 		"output":     output,
+		"usage":      responsesUsage(s.usage),
 	}
 }
 
@@ -249,6 +259,12 @@ func (s *responsesStreamState) consume(out *sseWriter, chunk map[string]any) err
 	return nil
 }
 
+// consumeToolCall 处理一个 tool_call 分片。
+//
+// 与 Anthropic 适配层同源的问题：response.function_call_arguments.delta 必须落在已经
+// response.output_item.added 过的 item 上。上游允许 function.arguments 先于
+// function.name/id 到达，若此时直接发 delta，客户端会收到一个指向未声明 item 的增量。
+// 因此参数一律先累积到 pending，待 output_item.added 发出后再补发（内容不丢）。
 func (s *responsesStreamState) consumeToolCall(out *sseWriter, call map[string]any) error {
 	idx := numOf(call["index"])
 	tc, ok := s.toolCalls[idx]
@@ -260,22 +276,23 @@ func (s *responsesStreamState) consumeToolCall(out *sseWriter, call map[string]a
 	if id := str(call["id"]); id != "" {
 		tc.id = id
 	}
+	args := ""
 	if fn, ok := call["function"].(map[string]any); ok {
 		if name := str(fn["name"]); name != "" {
 			tc.name = name
 		}
-		if args := str(fn["arguments"]); args != "" {
+		args = str(fn["arguments"])
+		if args != "" {
 			tc.arguments.WriteString(args)
 		}
 	}
 	// 首个带 name/id 的分片补 output_item.added；后续分片只发 arguments.delta。
 	if !tc.added && (tc.name != "" || tc.id != "") {
 		tc.added = true
-		outputIndex := 1 + indexOfInt(s.toolOrder, idx)
 		if err := out.write("response.output_item.added", map[string]any{
 			"type":            "response.output_item.added",
 			"sequence_number": s.seq(),
-			"output_index":    outputIndex,
+			"output_index":    s.toolOutputIndex(idx),
 			"item": map[string]any{
 				"type":      "function_call",
 				"id":        tc.id,
@@ -287,22 +304,38 @@ func (s *responsesStreamState) consumeToolCall(out *sseWriter, call map[string]a
 		}); err != nil {
 			return err
 		}
-	}
-	if fn, ok := call["function"].(map[string]any); ok {
-		if args := str(fn["arguments"]); args != "" {
-			outputIndex := 1 + indexOfInt(s.toolOrder, idx)
-			if err := out.write("response.function_call_arguments.delta", map[string]any{
-				"type":            "response.function_call_arguments.delta",
-				"sequence_number": s.seq(),
-				"item_id":         tc.id,
-				"output_index":    outputIndex,
-				"delta":           args,
-			}); err != nil {
+		// 补发先于 added 到达的参数分片（顺序合法，内容不丢）。
+		if pending := tc.pending.String(); pending != "" {
+			if err := s.writeToolArgsDelta(out, tc, idx, pending); err != nil {
 				return err
 			}
+			tc.pending.Reset()
+		}
+	}
+	if args != "" && !tc.added {
+		tc.pending.WriteString(args)
+	} else if args != "" {
+		if err := s.writeToolArgsDelta(out, tc, idx, args); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// toolOutputIndex 工具项在 output 数组中的下标（文本项占 0 时顺延 1）。
+func (s *responsesStreamState) toolOutputIndex(idx int) int {
+	return 1 + indexOfInt(s.toolOrder, idx)
+}
+
+// writeToolArgsDelta 发出一个 function_call_arguments.delta。
+func (s *responsesStreamState) writeToolArgsDelta(out *sseWriter, tc *responsesToolCall, idx int, args string) error {
+	return out.write("response.function_call_arguments.delta", map[string]any{
+		"type":            "response.function_call_arguments.delta",
+		"sequence_number": s.seq(),
+		"item_id":         tc.id,
+		"output_index":    s.toolOutputIndex(idx),
+		"delta":           args,
+	})
 }
 
 func (s *responsesStreamState) textDoneEvent() map[string]any {

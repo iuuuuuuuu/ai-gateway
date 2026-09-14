@@ -100,8 +100,11 @@ type anthropicToolState struct {
 	id        string
 	name      string
 	arguments strings.Builder
-	index     int
-	open      bool
+	// pending 暂存「先于 name 到达」的参数分片（name 未知时块无法开启，
+	// 此时不能发 delta，否则会先于 content_block_start）。name 到达后补发。
+	pending strings.Builder
+	index   int
+	open    bool
 }
 
 func newAnthropicStreamState(model string) *anthropicStreamState {
@@ -198,6 +201,15 @@ func (s *anthropicStreamState) openText(out *sseWriter) error {
 	})
 }
 
+// consumeToolCall 处理一个 tool_call 分片。
+//
+// Anthropic 协议要求 input_json_delta 必须落在「已经 content_block_start 过」的
+// index 上，而 content_block_start 又必须带 name。上游允许 function.arguments 先于
+// function.name 到达（分片边界由上游写入顺序决定），因此这里**不能**在 name 未知时
+// 直接发 delta：那样会先于 start 发出，客户端按协议拒绝/丢弃该工具块。
+//
+// 处理方式：arguments 一律先累积到 tc.arguments；只有块已开启（name 已知）才发出
+// input_json_delta。name 到达时会把此前累积的参数一并补发，保证内容不丢、顺序合法。
 func (s *anthropicStreamState) consumeToolCall(out *sseWriter, call map[string]any) error {
 	idx := numOf(call["index"])
 	tc, ok := s.toolCalls[idx]
@@ -231,23 +243,38 @@ func (s *anthropicStreamState) consumeToolCall(out *sseWriter, call map[string]a
 		}); err != nil {
 			return err
 		}
+		// name 迟到时，把先于 name 到达的参数在 start 之后补发（内容不丢）。
+		if pending := tc.pending.String(); pending != "" {
+			if err := s.writeToolArgs(out, tc, pending); err != nil {
+				return err
+			}
+			tc.pending.Reset()
+		}
 	}
 	if fn != nil {
 		if args := str(fn["arguments"]); args != "" {
 			tc.arguments.WriteString(args)
-			if err := out.write("content_block_delta", map[string]any{
-				"type":  "content_block_delta",
-				"index": tc.index,
-				"delta": map[string]any{
-					"type":         "input_json_delta",
-					"partial_json": args,
-				},
-			}); err != nil {
+			if !tc.open {
+				// name 未到：先暂存，待 start 之后再补发（绝不发出跨 start 的 delta）。
+				tc.pending.WriteString(args)
+			} else if err := s.writeToolArgs(out, tc, args); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// writeToolArgs 在已开启的工具块上发出一个 input_json_delta。
+func (s *anthropicStreamState) writeToolArgs(out *sseWriter, tc *anthropicToolState, args string) error {
+	return out.write("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": tc.index,
+		"delta": map[string]any{
+			"type":         "input_json_delta",
+			"partial_json": args,
+		},
+	})
 }
 
 func (s *anthropicStreamState) nextBlockIndex() int {
@@ -280,22 +307,41 @@ func (s *anthropicStreamState) closeOpenBlocks(out *sseWriter) {
 }
 
 // stopReason 把 chat 的 finish_reason 映射成 Anthropic 的 stop_reason。
+//
+// 注意 tool_use 的判定口径：只有**真正开启过工具块**（tc.open）才算工具调用。
+// 上游只发了 arguments（甚至只有 index）却没给 name 时，块永远开不起来，
+// 客户端一个 tool_use 块都收不到；此时若仍回 tool_use，客户端会被要求执行一个
+// 它根本没收到的工具，只能卡住等下一次输入。这种情况下退化为 end_turn，
+// 让客户端按普通文本轮次收尾。
 func (s *anthropicStreamState) stopReason() string {
 	switch s.finishReason {
 	case "length":
 		return "max_tokens"
 	case "tool_calls":
-		return "tool_use"
+		if s.hasOpenToolBlock() {
+			return "tool_use"
+		}
+		return "end_turn"
 	case "stop":
 		return "end_turn"
 	case "":
-		if len(s.toolOrder) > 0 {
+		if s.hasOpenToolBlock() {
 			return "tool_use"
 		}
 		return "end_turn"
 	default:
 		return "end_turn"
 	}
+}
+
+// hasOpenToolBlock 报告是否至少有一个工具块真的发给了客户端。
+func (s *anthropicStreamState) hasOpenToolBlock() bool {
+	for _, tc := range s.toolCalls {
+		if tc != nil && tc.open {
+			return true
+		}
+	}
+	return false
 }
 
 var _ = io.EOF
