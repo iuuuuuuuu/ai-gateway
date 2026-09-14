@@ -13,6 +13,10 @@
 //  2. 档内挑选：同档账号按「闲置补偿 + 成功率」加权取 Top5，再加权随机抽签，
 //     即同一天到期的账号平均分摊。
 //
+// 短名单（Top5）的公平性保证（见 shuffleTiesWs）：当截断边界上存在等权重平局时
+// 随机打散，避免同权重账号因 UID 字典序而固定霸占短名单、其余账号永远拿不到流量
+//（issue #5：14 个账号只被路由到 5 个）。
+//
 // 当所有账号都没有到期信息时，自动退回原三因子口径
 //（credits 占比 ×10 + 闲置补偿 + 成功率 ×3），行为与引入分层前一致。
 package pool
@@ -263,6 +267,13 @@ const (
 	defaultIdleWeightPerHour = 0.5
 	defaultIdleWeightMax     = 5.0
 )
+
+// shortlistSize top-N 短名单大小。
+//
+// 短名单的用途是「让持续报错/额度低的号自然让出流量」，但 N 一旦小于账号总数，
+// 就必然有账号被长期排除在外。同权重时靠随机洗牌轮换（见 shuffleTiesWs），
+// 保证被排除的账号随时间轮转，不会固定饿死某几个号。
+const shortlistSize = 5
 
 // New 构建池；stateFp 非空时尝试加载旧状态，并启动后台周期性落盘 goroutine。
 func New(stateFp string) *Pool {
@@ -577,31 +588,39 @@ func (p *Pool) pick(tried map[string]bool) *auth.Auth {
 		}
 	}
 	// 权重只算一次：顶 5 截断要排序，若在 sort 比较器里现算 weightOf 会翻成 O(n log n) 次
-	// 冗余浮点计算（46 账号约 500 次）。先做 O(n) 预计算，再按 (权重, uid) 排序。
-	type weighted struct {
-		e *entry
-		w float64
-	}
-	ws := make([]weighted, len(cands))
+	// 冗余浮点计算（46 账号约 500 次）。先做 O(n) 预计算，再按权重降序排序。
+	ws := make([]weightedEntry, len(cands))
 	for i, e := range cands {
 		w := p.weightOf(e, maxCredits, now)
 		if tiered {
 			w = p.tierWeightOf(e, now)
 		}
-		ws[i] = weighted{e: e, w: w}
+		ws[i] = weightedEntry{e: e, w: w}
 	}
+	// 短名单截断的平局处理（issue #5）：权重完全相同时（首次启动、credits 全 0、
+	// 无成功/错误记录）若一律按 UID 字典序截断，短名单会恒为最小的 5 个 UID，
+	// 其余账号永远进不来 —— 实测 14 个账号只有 5 个被路由到。
+	//
+	// 但排序本身必须有确定性的平局键：cands 来自 map 遍历（顺序随机），
+	// 若仅用 SliceStable 按权重排序，等权重账号的相对顺序会随 map 随机化而抖动，
+	// 使「注入随机源即可复现」的契约失效。因此：
+	//   - 先按 (权重降序, UID 升序) 得到确定性顺序；
+	//   - 仅当截断边界上存在等权重平局（即谁入选由 UID 决定）时，才用随机洗牌
+	//     把这一档打散，让被排除的账号随时间轮换。
 	sort.Slice(ws, func(i, j int) bool {
 		if ws[i].w != ws[j].w {
 			return ws[i].w > ws[j].w
 		}
 		return ws[i].e.a.UID < ws[j].e.a.UID
 	})
+	p.shuffleTiesWs(ws)
+	sort.SliceStable(ws, func(i, j int) bool { return ws[i].w > ws[j].w })
 	cands = cands[:0]
 	for _, c := range ws {
 		cands = append(cands, c.e)
 	}
-	if len(cands) > 5 {
-		cands = cands[:5]
+	if len(cands) > shortlistSize {
+		cands = cands[:shortlistSize]
 	}
 
 	eligible := make([]*entry, 0, len(cands))
@@ -790,6 +809,49 @@ func (p *Pool) pickWeightedMode(cands []*entry, tiered bool) *entry {
 	return cands[len(cands)-1]
 }
 
+// weightedEntry 候选账号及其挑选权重（短名单排序用）。
+type weightedEntry struct {
+	e *entry
+	w float64
+}
+
+// shuffleTiesWs 只在**截断边界上存在等权重平局**时随机洗牌，用于打破短名单的确定性偏向。
+//
+// 为什么要洗牌：短名单按权重降序截断，等权重账号必须有一个稳定的先后顺序，否则排序
+// 结果不确定。但如果这个顺序恒为 UID 字典序，短名单就会固定包含最小的 N 个 UID，
+// 其余账号永远进不来（issue #5：14 个号只用 5 个）。随机化后同权重账号可公平轮换。
+//
+// 为什么必须限定「边界有平局才洗」：
+//   - 权重各不相同（如 credits 差异明显）时不存在平局，洗牌只会在注入确定性随机源
+//     的测试里白白消耗随机数、打乱既有可复现语义，属无谓副作用；
+//   - 只在真正需要打破平局时消费随机数，保持「权重高者优先」的确定性不变。
+//
+// 前置条件：ws 已按 (权重降序, UID 升序) 排好。调用方必须已持有 p.mu。
+func (p *Pool) shuffleTiesWs(ws []weightedEntry) {
+	if len(ws) <= shortlistSize {
+		return // 全部候选都在短名单内，截断不会排除任何账号 → 无需洗牌
+	}
+	// 检查「第 shortlistSize 名」与「第 shortlistSize+1 名」是否同权重：
+	// 同权重才意味着谁入选由排序顺序（UID）决定，需要随机化。
+	cut := shortlistSize
+	if ws[cut-1].w != ws[cut].w {
+		return // 边界无平局：入榜与落榜权重不同，结果已确定，不应洗牌
+	}
+
+	rnd := rand.Int64N
+	if p.randInt64N != nil {
+		rnd = p.randInt64N
+	}
+	// Fisher-Yates 洗牌（从后往前，与 [0,i] 中随机一个交换）。
+	for i := len(ws) - 1; i > 0; i-- {
+		j := int(rnd(int64(i + 1)))
+		if j < 0 || j > i {
+			j = i // 注入源契约外返回越界值时兜底，避免 panic
+		}
+		ws[i], ws[j] = ws[j], ws[i]
+	}
+}
+
 // tierWeightOf 到期同档内的权重：只保留闲置补偿 + 成功率，不含 credits。
 //
 // 为什么去掉 credits：同一到期档意味着这些额度的「紧迫度相同」，
@@ -869,7 +931,14 @@ func (p *Pool) SetCredits(uid string, credits int64) {
 }
 
 // Cooldown 冷却账号至 now+d（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）。
+//
 // 冷却入口同时是熔断器的失败信号：喂入 fails，达到阈值按指数退避熔断（与 until 正交）。
+//
+// 例外（issue #5）：CoolSoft（429 限流）**不参与**指数退避的指数放大。
+// 429 是瞬时过载信号，重试同一账号很快就能成功；若让它放大 retryCount，
+// 一次流量高峰会把账号按 30m→1h→2h→4h→6h 逐步封死（实测 3 次 429 即封 30 分钟），
+// 而该状态会落盘，重启也不恢复 —— 用户反馈的「频繁不可用 + 重启无效」即源于此。
+// 软冷却仍正常累计 fails（保留「反复失败即熔断」的语义），但熔断时长不叠加放大。
 func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -877,7 +946,8 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 		e.until = time.Now().Add(d)
 		e.coolKind = kind
 		e.reason = reason
-		p.recordBreakerFailureLocked(e) // 冷却入口也是熔断器的失败信号
+		// 软冷却（429）不放大退避指数；硬冷却与 5xx 仍走完整熔断语义。
+		p.recordBreakerFailureLockedKind(e, kind != CoolSoft)
 		p.dirty.Store(true)
 	}
 }
@@ -886,21 +956,34 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 // 熔断与冷却（until）解耦：冷却按错误类别给固定时长，熔断则对"反复失败"逐次加长封禁。
 // 调用方必须已持有 p.mu。
 func (p *Pool) recordBreakerFailureLocked(e *entry) {
+	p.recordBreakerFailureLockedKind(e, true)
+}
+
+// recordBreakerFailureLockedKind 是 recordBreakerFailureLocked 的带参版本：
+// escalate=false 时只累计 fails、照常触发熔断，但**不递增 retryCount**，
+// 因而熔断时长不随次数指数增长（用于 429 这类瞬时错误的防放大，见 Cooldown 注释）。
+// 调用方必须已持有 p.mu。
+func (p *Pool) recordBreakerFailureLockedKind(e *entry, escalate bool) {
 	e.fails++
 	if e.fails < p.breakerThreshold {
 		return
 	}
 	d := p.breakerCooldown
-	for i := 0; i < e.retryCount; i++ {
-		d *= 2
-		if d >= p.breakerCooldownMax {
-			d = p.breakerCooldownMax
-			break
+	// escalate 决定是否按「已放大次数」取退避指数；不放大时恒用首次熔断时长。
+	if escalate {
+		for i := 0; i < e.retryCount; i++ {
+			d *= 2
+			if d >= p.breakerCooldownMax {
+				d = p.breakerCooldownMax
+				break
+			}
 		}
 	}
-	// 触发熔断：重置失败计数供下一轮重新累计；retryCount 递增放大退避指数。
+	// 触发熔断：重置失败计数供下一轮重新累计；retryCount 仅在放大时递增。
 	e.fails = 0
-	e.retryCount++
+	if escalate {
+		e.retryCount++
+	}
 	e.breakerUntil = time.Now().Add(d)
 }
 

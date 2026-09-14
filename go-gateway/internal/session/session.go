@@ -260,14 +260,39 @@ func expired(e entry, now time.Time, ttl time.Duration) bool {
 	return now.Sub(e.lastActive) > ttl
 }
 
-// hashIndex FNV-1a 哈希取模（antigravity 双段分配的稳定散列）。
+// hashIndex 把会话键稳定散列到 [0,n)（antigravity 双段分配的稳定散列）。
+//
+// issue #5 修复：直接 `h % n` 在 n 为偶数时会把**账号可用数量砍半**。
+// 原因是 FNV-1a 的最低位只等于「初值最低位 XOR 所有输入字节最低位」——
+// 乘法因子 16777619 与异或都不影响最低位。于是 h 的奇偶性完全由 key 各字节的
+// 奇偶性决定；n 为偶数时 h%n 的奇偶性 == h 的奇偶性，导致：
+// 末字节为偶数的 key（如 "c0"、"uuid-0"）只会命中偶数下标账号，
+// 末字节为奇数的 key 只会命中奇数下标账号 —— 实测 14 个账号只有 7 个被用到。
+//
+// 修复方式：先对哈希做一次 avalanche 混淆（murmur3 finalizer），
+// 让结果的每一位都依赖输入的所有位，从而消除「输入低位 → 输出下标奇偶」的相关性。
+// 仍然保证同一 key 恒定映射到同一 index（粘性语义不变）。
 func hashIndex(key string, n int) int {
+	if n <= 0 {
+		return 0
+	}
 	var h uint32 = 2166136261
 	for i := 0; i < len(key); i++ {
 		h ^= uint32(key[i])
 		h *= 16777619
 	}
-	return int(h % uint32(n))
+	return int(mix32(h) % uint32(n))
+}
+
+// mix32 32 位 avalanche 混淆（murmur3 finalizer）：
+// 让结果的每一位都依赖输入的所有位，消除低位相关性。
+func mix32(h uint32) uint32 {
+	h ^= h >> 16
+	h *= 0x85ebca6b
+	h ^= h >> 13
+	h *= 0xc2b2ae35
+	h ^= h >> 16
+	return h
 }
 
 // ExtractKey 从请求体提取会话键；按任务书给定顺序依次尝试，找不到返回空串（绝不失败）。
