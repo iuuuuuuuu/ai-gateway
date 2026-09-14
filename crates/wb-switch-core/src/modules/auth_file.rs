@@ -14,7 +14,12 @@ use crate::modules::config::{atomic_write, backup_dir, now_ms, utc_iso};
 /// 认证文件所在目录（国服与国际版共用同一目录）。
 fn auth_dir() -> PathBuf {
     let home = crate::modules::config::home_dir();
-    home.join("AppData/Local/CodeBuddyExtension/Data/Public/auth")
+    #[cfg(target_os = "macos")]
+    return home.join("Library/Application Support/CodeBuddyExtension/Data/Public/auth");
+    #[cfg(target_os = "windows")]
+    return home.join("AppData/Local/CodeBuddyExtension/Data/Public/auth");
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    return home.join(".local/share/CodeBuddyExtension/Data/Public/auth");
 }
 
 /// 指定区域的认证文件名。
@@ -54,29 +59,45 @@ pub fn auth_file_path() -> PathBuf {
 /// 探测顺序：运行进程 Path → 缓存 → 注册表 → 环境变量/盘符扫描。
 /// 都找不到时返回 LOCALAPPDATA 默认路径，供启动失败文案写出尝试路径。
 pub fn workbuddy_app_path_for(region: crate::modules::config::Region) -> PathBuf {
-    if let Some(exe) = crate::modules::process::windows_workbuddy_exe_path(region) {
-        return exe;
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(exe) = crate::modules::process::windows_workbuddy_exe_path(region) {
+            return exe;
+        }
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let (dir, exe_name) = match region {
+            crate::modules::config::Region::Cn => ("WorkBuddy", "WorkBuddy.exe"),
+            crate::modules::config::Region::Intl => ("WorkBuddyAI", "WorkBuddyAI.exe"),
+        };
+        return std::path::Path::new(&local)
+            .join("Programs")
+            .join(dir)
+            .join(exe_name);
     }
-    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    let (dir, exe_name) = match region {
-        crate::modules::config::Region::Cn => ("WorkBuddy", "WorkBuddy.exe"),
-        crate::modules::config::Region::Intl => ("WorkBuddyAI", "WorkBuddyAI.exe"),
-    };
-    std::path::Path::new(&local)
-        .join("Programs")
-        .join(dir)
-        .join(exe_name)
+    #[cfg(not(target_os = "windows"))]
+    {
+        // macOS/Linux 只有单一客户端，区域参数仅用于保持调用方签名一致。
+        let _ = region;
+        crate::modules::process::macos_workbuddy_app_path()
+    }
 }
 
 /// 状态展示用：任一区域已解析到的客户端路径，否则国服默认路径。
 pub fn workbuddy_app_path() -> PathBuf {
-    use crate::modules::config::Region;
-    for region in [Region::Cn, Region::Intl] {
-        if let Some(exe) = crate::modules::process::windows_workbuddy_exe_path(region) {
-            return exe;
+    #[cfg(target_os = "windows")]
+    {
+        use crate::modules::config::Region;
+        for region in [Region::Cn, Region::Intl] {
+            if let Some(exe) = crate::modules::process::windows_workbuddy_exe_path(region) {
+                return exe;
+            }
         }
+        workbuddy_app_path_for(Region::Cn)
     }
-    workbuddy_app_path_for(Region::Cn)
+    #[cfg(not(target_os = "windows"))]
+    {
+        crate::modules::process::macos_workbuddy_app_path()
+    }
 }
 
 /// 读取认证文件 JSON；不存在或解析失败返回 None。

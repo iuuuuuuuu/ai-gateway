@@ -2,11 +2,11 @@
 //!
 //! 查找顺序（任一命中即内嵌）：
 //!   1. 环境变量 WB_SWITCH_GATEWAY_BIN
-//!   2. crates/wb-switch-core/embedded/gateway.exe（约定目录）
-//!   3. 仓库根 dist/gateway.exe
+//!   2. crates/wb-switch-core/embedded/gateway[.exe]（约定目录）
+//!   3. 仓库根 dist/gateway[.exe]
 //!
 //! 都找不到时生成 `None`，程序仍可编译，只是不内嵌网关
-//!（此时回退到用户自备 gateway.exe 的旧方式）。
+//!（此时回退到用户自备 gateway 可执行文件的旧方式）。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,7 +19,8 @@ fn candidate_paths() -> Vec<PathBuf> {
         }
     }
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
-    let name = "gateway.exe";
+    // Windows 产物带 .exe 后缀；macOS/Linux 不带。与 scripts/build-gateway.sh 一致。
+    let name = if cfg!(windows) { "gateway.exe" } else { "gateway" };
     out.push(manifest.join("embedded").join(name));
     // 仓库根 dist/（crates/wb-switch-core → ../..）
     if let Some(root) = manifest.parent().and_then(Path::parent) {

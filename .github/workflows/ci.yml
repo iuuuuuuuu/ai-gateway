@@ -1,0 +1,84 @@
+name: ci
+
+# push / PR 的编译校验：三个平台各跑一遍类型检查、单测与全 workspace 编译。
+# 发版见 release.yml（打 v* tag 触发）。
+#
+# 这里刻意不构建 Go 网关、也不打安装包 —— 只回答「还能不能编译、测试过不过」，
+# 让问题在 push 阶段暴露，而不是等到发版当天。
+# 三平台都跑是重点：历史上出现过多次「只在某一个平台编译失败」的回归
+# （例如 macOS 专用的 Dock 图标代码打断 Windows 构建）。
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"] # v* 交给 release.yml
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: 安装 Linux 系统依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: npm ci
+
+      - name: 前端类型检查与构建
+        run: npm run build
+
+      - name: 核心单测
+        run: cargo test -p wb-switch-core
+
+      # 全 workspace 编译（含 src-tauri 桌面壳）。--all-targets 会把测试代码
+      # 也编一遍，所以平台门控写错（少一个 cfg）在这里就会红。
+      - name: 全 workspace 编译校验
+        run: cargo check --workspace --all-targets
+
+  gateway:
+    name: gateway / Go 单测与构建
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      # 网关源码随仓库分发（Go 版本），这里验证单测与三平台交叉构建链路。
+      - name: Go 单测
+        working-directory: go-gateway
+        run: go test ./...
+
+      - name: 构建网关（linux）
+        env:
+          GOOS: linux
+          GOARCH: amd64
+        run: sh scripts/build-gateway.sh
