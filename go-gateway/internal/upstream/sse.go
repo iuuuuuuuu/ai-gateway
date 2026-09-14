@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -72,7 +73,13 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 								}
 								if txt, ok := delta["content"].(string); ok {
 									content.WriteString(txt)
-									gotAnyContent = true
+									// 只有**非空**正文才锁死 message 回退路径：
+									// 首帧常带 "content":""（仅含 role 的保活/开场帧），
+									// 若空串也置位，后续"完整消息放在 message 里"的上游
+									// 形态就再也读不到内容，客户端只会收到空回复。
+									if txt != "" {
+										gotAnyContent = true
+									}
 								}
 								if rc, ok := delta["reasoning_content"].(string); ok {
 									reasoning.WriteString(rc)
@@ -83,10 +90,11 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 										if !ok {
 											continue
 										}
-										idx := 0
-										if v, ok := call["index"].(float64); ok {
-											idx = int(v)
-										}
+										// index 必须是数字：上游偶发把它发成 JSON 字符串
+										//（"0"/"1"）。只认 float64 会让所有调用落到槽位 0，
+										// 多个并行工具调用被合并成一条（名字取最后一个、
+										// 参数被拼接），模型拿到的工具调用直接损坏。
+										idx := indexOfToolCall(call)
 										merged, seen := toolCalls[idx]
 										if !seen {
 											merged = map[string]any{"index": idx}
@@ -155,6 +163,36 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		resp["usage"] = usage
 	}
 	return resp, nil
+}
+
+// indexOfToolCall 取 tool_call 分片的 index。
+//
+// 兼容三种上游形态（实测均出现过）：
+//   - 数字：{"index":0}          （标准）
+//   - 字符串数字：{"index":"0"}  （部分上游把 int 序列化成字符串）
+//   - 缺省：无 index 字段        （视为单调用，回落 0）
+//
+// 为什么必须兼容字符串：只认 float64 时字符串 index 会静默变成 0，
+// 使多个并行工具调用全部合并进槽位 0 —— 名字被后者覆盖、参数被拼接，
+// 客户端拿到一个损坏的工具调用（见回归测试）。
+func indexOfToolCall(call map[string]any) int {
+	switch v := call["index"].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return int(n)
+		}
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 // mergeToolCallDelta 把流式 tool_call 片段合并到累计对象：
@@ -272,6 +310,14 @@ func normalizeFrame(obj map[string]any) map[string]any {
 		out["usage"] = u
 	} else {
 		out["usage"] = nil
+	}
+	// error 帧必须原样保留：上游常在 HTTP 200 的流中途发
+	// {"error":{...}}（如 code=11128 渠道未批准、账号被封）来表示失败。
+	// 白名单重建会把它降级成一个普通的 "chat.completion.chunk"，客户端于是
+	// 把「截断的回答 + 正常 [DONE]」当成一次成功，永远不知道请求失败了。
+	// 保留 error 字段让客户端/上层能识别终止性错误。
+	if e, ok := obj["error"]; ok && e != nil {
+		out["error"] = e
 	}
 	return out
 }
