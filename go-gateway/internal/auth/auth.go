@@ -201,3 +201,39 @@ func LoadDir(dir string) ([]*Auth, error) {
 	}
 	return out, nil
 }
+
+// ---------------------------------------------------------------------------
+// 区域（realm）判定
+//
+// 账号分两个区域：国服（cn，copilot.tencent.com / codebuddy.cn）与国际版
+//（global，workbuddy.ai）。两者的可用模型、活动、端点都不同，
+// 因此「把请求发给哪个区域的账号」是一个需要显式表达的约束。
+//
+// 判定依据是登录域名后缀，与 upstream 侧的口径一致。
+// 放在 auth 包是因为 pool 需要它，而 pool 不能 import upstream（会循环依赖）。
+// ---------------------------------------------------------------------------
+
+// Realm 常量。
+const (
+	RealmCN     = "cn"
+	RealmGlobal = "global"
+)
+
+// IsIntl 报告账号是否属于国际版（登录域名以 .ai 结尾）。
+//
+// 与 upstream.IsIntl 判定一致；保留两处是因为包依赖方向限制，
+// 改动任一处时需同步（有测试交叉验证）。
+func (a *Auth) IsIntl() bool {
+	if a == nil {
+		return false
+	}
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(a.Domain)), ".ai")
+}
+
+// Realm 返回账号所属区域（"cn" / "global"）。
+func (a *Auth) Realm() string {
+	if a.IsIntl() {
+		return RealmGlobal
+	}
+	return RealmCN
+}

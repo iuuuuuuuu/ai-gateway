@@ -113,7 +113,13 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 
 	// 请求的目标模型：用于「模型级限流」的选号过滤与冷却记账。
 	// 取不到时为空串，各环节自动退化为原有行为（不做模型过滤）。
-	model := modelOf(body)
+	//
+	// 同时解析可选的区域前缀 `cn:` / `global:`：指定后选号被限制在该区域，
+	// 避免把请求发给不支持该模型的区域（上游会返回 11102）。
+	// 无前缀时 realm 为空 = 不限制区域，保持既有行为。
+	// 注意返回顺序是 (realm, bare) —— 写反会把区域当成模型名，
+	// 表现为「单一模型锁定」报「收到的是 (未指定)」。
+	realm, model := resolveModel(modelOf(body))
 
 	// 「单一模型」锁定：非空时只放行该模型。
 	//
@@ -122,6 +128,9 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 	// 若允许其他模型通过，客户端换个模型就能绕过轮转与额度控制，
 	// 也让「当前烧的是哪个模型」变得不可预期 —— 因此明确拒绝并说明原因，
 	// 比静默改写模型（用户以为在用 A、实际用了 B）更安全。
+	//
+	// 比较用剥前缀后的裸模型名：用户配的是 `deepseek-v4.1-flash`，
+	// 客户端可能带 `cn:` 前缀请求，两者应视为同一个模型。
 	if allowed := h.cfg.AllowedModel; allowed != "" && !strings.EqualFold(model, allowed) {
 		// 返回非 nil 的 result：调用方会在错误分支里读 result.UID 记日志，
 		// 返回 nil 会 panic。UID 留空即可（本次没有选中任何账号）。
@@ -133,6 +142,11 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 		var acct *auth.Auth
 		if stickyUID != "" {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, model)
+			// 粘性账号也必须满足区域约束：否则会话粘性会把请求
+			// 一直钉在错误区域的账号上，前缀指定形同虚设。
+			if acct != nil && realm != "" && acct.Realm() != realm {
+				acct = nil
+			}
 			if acct == nil {
 				if h.cfg.Session != nil {
 					h.cfg.Session.Unbind(sessKey)
@@ -141,7 +155,7 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickForModel(model, tried)
+			acct = h.cfg.Pool.PickForModelRealm(model, realm, tried)
 		}
 		if acct == nil {
 			lastStatus = http.StatusServiceUnavailable

@@ -604,7 +604,7 @@ func (p *Pool) Pick() *auth.Auth {
 
 // PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	return p.pick(tried, "")
+	return p.pick(tried, "", "")
 }
 
 // PickForModel 选出一个**该模型当前未被限流**的可用账号；无可用返回 nil。
@@ -612,13 +612,69 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 // model 为空时等价于 PickExcluding（不做模型过滤）——调用方拿不到模型名时
 // 退化为原有行为，不会因为新特性而选不出账号。
 func (p *Pool) PickForModel(model string, tried map[string]bool) *auth.Auth {
+	return p.PickForModelRealm(model, "", tried)
+}
+
+// PickForModelRealm 同上，但把候选限制在指定区域。
+//
+// realm 语义（与模型名前缀协议一致）：
+//
+//	""       不限制区域（默认；保持既有行为）
+//	"cn"     只选国服账号
+//	"global" 只选国际版账号
+//
+// 为什么需要它：同一个模型名在两个区域可能是不同的服务
+//（如 gpt-6-astra 只在国际版存在、deepseek-v4-flash 只在国服存在）。
+// 客户端用 `cn:模型名` / `global:模型名` 前缀显式指定区域时，
+// 选号必须尊重该约束，否则会把请求发给不支持该模型的区域，
+// 上游返回 11102 model service info not found。
+//
+// realm 无匹配账号时返回 nil（而非回退到不限区域）——
+// 回退会让「显式指定区域」失效，客户端拿到的是难以理解的模型不存在错误。
+func (p *Pool) PickForModelRealm(model, realm string, tried map[string]bool) *auth.Auth {
+	realm = normalizeRealm(realm)
 	p.mu.RLock()
 	rot := p.rotationOn
 	p.mu.RUnlock()
 	if rot {
-		return p.pickRotation(tried, model)
+		return p.pickRotation(tried, model, realm)
 	}
-	return p.pick(tried, model)
+	return p.pick(tried, model, realm)
+}
+
+// normalizeRealm 归一化区域值；无法识别时返回 ""（不限制）。
+//
+// 大小写敏感：前缀协议要求精确的小写枚举（见 server.resolveModel），
+// 这里保持一致，避免 "GLOBAL:" 被当成合法前缀。
+func normalizeRealm(realm string) string {
+	switch realm {
+	case realmCN, realmGlobal:
+		return realm
+	default:
+		return ""
+	}
+}
+
+// 区域枚举（与模型名前缀协议、auth 的域名判定保持一致）。
+const (
+	realmCN     = "cn"
+	realmGlobal = "global"
+)
+
+// accountRealm 返回账号所属区域。
+func accountRealm(a *auth.Auth) string {
+	if a.IsIntl() {
+		return realmGlobal
+	}
+	return realmCN
+}
+
+// realmAllows 该账号是否满足区域约束（realm 为空 = 不限制）。
+func realmAllows(a *auth.Auth, realm string) bool {
+	if realm == "" {
+		return true
+	}
+	return accountRealm(a) == realm
 }
 
 // SetRotation 开关「单一模型 + 积分轮转」模式。
@@ -650,7 +706,7 @@ func (p *Pool) RotationOn() bool {
 //
 // tried 仍被尊重（请求级轮换：同一请求内换过号就不再回头），
 // 这样上层 forward 的重试逻辑无需改动。
-func (p *Pool) pickRotation(tried map[string]bool, model string) *auth.Auth {
+func (p *Pool) pickRotation(tried map[string]bool, model, realm string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -671,6 +727,11 @@ func (p *Pool) pickRotation(tried map[string]bool, model string) *auth.Auth {
 		if tried != nil && tried[uid] {
 			continue
 		}
+		// 区域约束（realm 为空 = 不限制）：客户端用 cn:/global: 前缀
+		// 显式指定区域时，不能把请求发给另一区域的账号。
+		if !realmAllows(e.a, realm) {
+			continue
+		}
 		if !p.rotationUsableLocked(e, now, model, nil) {
 			continue
 		}
@@ -679,7 +740,7 @@ func (p *Pool) pickRotation(tried map[string]bool, model string) *auth.Auth {
 	if len(cands) == 0 {
 		// 无可用账号：沿用既有兜底（取最早截止的冷却账号试一次）。
 		p.rotationUID = ""
-		return p.pickEarliestExpiryLocked(tried, now, model)
+		return p.pickEarliestExpiryLocked(tried, now, model, realm)
 	}
 	sort.Slice(cands, func(i, j int) bool {
 		ki, kj := cands[i].expiryDayKey(), cands[j].expiryDayKey()
@@ -743,7 +804,7 @@ func (p *Pool) rotationUsableLocked(e *entry, now time.Time, model string, tried
 // 并发防雪崩：跳过 lastUsed 距今 < minPickGap 的账号（除非候选全部刚被用过，
 // 此时退回最近最少使用 LRU 账号），迫使高并发请求发散。
 // minPickGap=0（测试用）时过滤恒通过，退化为纯加权随机。
-func (p *Pool) pick(tried map[string]bool, model string) *auth.Auth {
+func (p *Pool) pick(tried map[string]bool, model, realm string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -751,6 +812,11 @@ func (p *Pool) pick(tried map[string]bool, model string) *auth.Auth {
 	var cands []*entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
+			continue
+		}
+		// 区域约束（realm 为空 = 不限制）：客户端用 cn:/global: 前缀
+		// 显式指定区域时，不能把请求发给另一区域的账号。
+		if !realmAllows(e.a, realm) {
 			continue
 		}
 		// 顺手清理已过期的模型冷却，避免 map 随模型种类无限增长。
@@ -772,7 +838,7 @@ func (p *Pool) pick(tried map[string]bool, model string) *auth.Auth {
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now, model)
+		return p.pickEarliestExpiryLocked(tried, now, model, realm)
 	}
 
 	// 到期分层：只保留最早到期的一档。
@@ -904,10 +970,16 @@ func (p *Pool) earliestExpiryTierLocked(cands []*entry) ([]*entry, bool) {
 // model 非空时同样排除"该模型正被限流"的账号：否则兜底会把刚被 6004 拒掉的账号
 // 立刻再选一次，既浪费轮换又让用户看到重复报错。若排除后无候选则返回 nil，
 // 由调用方报告"全部账号该模型均受限"（比继续撞限流更有信息量）。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, model string) *auth.Auth {
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, model, realm string) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
+			continue
+		}
+		// 区域约束同样适用于兜底：显式指定区域时，
+		// 宁可不选（返回 nil，上层报「该区域无可用账号」）
+		// 也不要把请求发给错误区域的账号。
+		if !realmAllows(e.a, realm) {
 			continue
 		}
 		if e.disabled {
