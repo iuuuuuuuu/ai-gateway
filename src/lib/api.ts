@@ -53,7 +53,7 @@ import { screenshotDemoResponse } from "./screenshot-demo";
 /**
  * 双通道适配层：
  * - 桌面 App（Tauri）：`invoke` 调用 Rust commands
- * - webui（浏览器）：HTTP fetch 调用本地 workbuddy-switch 服务（127.0.0.1）
+ * - webui（浏览器）：HTTP fetch 调用本地 ai-gateway 服务（127.0.0.1）
  */
 const API_BASE = "http://127.0.0.1:57890";
 
@@ -159,6 +159,55 @@ const ROUTES: Record<string, Route> = {
   batch_import_agent_clients: { method: "POST", path: "/api/gateway/agents/batch-import" },
   restore_agent_client: { method: "POST", path: "/api/gateway/agents/restore" },
   list_agent_backups: { method: "GET", path: "/api/gateway/agents/backups" },
+  // ---- Trae / 豆包 多应用支持 ----
+  app_env_check: { method: "GET", path: "/api/apps/env" },
+  app_set_manual_path: { method: "POST", path: "/api/apps/manual-path" },
+  switch_action: { method: "POST", path: "/api/apps/switch" },
+  current_account: { method: "GET", path: "/api/apps/current" },
+  list_snapshots: { method: "GET", path: "/api/apps/snapshots" },
+  delete_snapshot: { method: "POST", path: "/api/apps/snapshots/delete" },
+  trae_list_accounts: { method: "GET", path: "/api/trae/accounts" },
+  trae_add_account: { method: "POST", path: "/api/trae/accounts/add" },
+  trae_delete_account: { method: "POST", path: "/api/trae/accounts/delete" },
+  trae_discover_accounts: { method: "GET", path: "/api/trae/discover" },
+  trae_entitlement: { method: "GET", path: "/api/trae/entitlement" },
+  trae_device_info: { method: "GET", path: "/api/trae/device" },
+  trae_checkin_run: { method: "POST", path: "/api/trae/checkin" },
+  trae_credits_history: { method: "GET", path: "/api/trae/credits/history" },
+  trae_clear_cooldown: { method: "POST", path: "/api/trae/cooldown/clear" },
+  doubao_list_accounts: { method: "GET", path: "/api/doubao/accounts" },
+  doubao_save_account: { method: "POST", path: "/api/doubao/accounts/save" },
+  doubao_delete_account: { method: "POST", path: "/api/doubao/accounts/delete" },
+  doubao_get_credential: { method: "GET", path: "/api/doubao/credential" },
+  doubao_set_credential: { method: "POST", path: "/api/doubao/credential" },
+  doubao_captured_credential: { method: "GET", path: "/api/doubao/credential/captured" },
+  doubao_credential_auto_apply: { method: "POST", path: "/api/doubao/credential/apply" },
+  doubao_keepalive: { method: "POST", path: "/api/doubao/keepalive" },
+  doubao_renew: { method: "POST", path: "/api/doubao/renew" },
+  doubao_diagnose: { method: "GET", path: "/api/doubao/diagnose" },
+  doubao_fetch_quota: { method: "GET", path: "/api/doubao/quota" },
+  doubao_quota_batch: { method: "POST", path: "/api/doubao/quota/batch" },
+  doubao_probe_account: { method: "GET", path: "/api/doubao/probe" },
+  doubao_backup_chatdata: { method: "POST", path: "/api/doubao/chatdata/backup" },
+  doubao_restore_chatdata: { method: "POST", path: "/api/doubao/chatdata/restore" },
+  doubao_chatdata_info: { method: "GET", path: "/api/doubao/chatdata/info" },
+  doubao_export_chats: { method: "POST", path: "/api/doubao/chats/export" },
+  get_app_settings: { method: "GET", path: "/api/apps/settings" },
+  // ---- 本地 MITM 代理 ----
+  proxy_config: { method: "GET", path: "/api/proxy/config" },
+  proxy_status: { method: "GET", path: "/api/proxy/status" },
+  proxy_start: { method: "POST", path: "/api/proxy/start" },
+  proxy_stop: { method: "POST", path: "/api/proxy/stop" },
+  proxy_cert_status: { method: "GET", path: "/api/proxy/cert" },
+  proxy_cert_generate: { method: "POST", path: "/api/proxy/cert/generate" },
+  proxy_capture_local: { method: "POST", path: "/api/proxy/capture-local" },
+  proxy_cleanup_stale: { method: "POST", path: "/api/proxy/cleanup" },
+  proxy_parse_upstream: { method: "POST", path: "/api/proxy/parse-upstream" },
+  task_status: { method: "GET", path: "/api/tasks/status" },
+  task_register: { method: "POST", path: "/api/tasks/register" },
+  task_unregister: { method: "POST", path: "/api/tasks/unregister" },
+  task_run_now: { method: "POST", path: "/api/tasks/run" },
+  save_app_settings: { method: "POST", path: "/api/apps/settings" },
 };
 
 function queryString(args?: Record<string, unknown>): string {
@@ -187,7 +236,7 @@ async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise
       body: route.method === "POST" ? JSON.stringify(args ?? {}) : undefined,
     });
   } catch {
-    throw new Error(`无法连接 workbuddy-switch 服务（${API_BASE}），请先运行 \`workbuddy-switch\``);
+    throw new Error(`无法连接 ai-gateway 服务（${API_BASE}），请先运行 \`ai-gateway\``);
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -705,7 +754,7 @@ export function getGatewayUsage(days?: number): Promise<GatewayUsageResult> {
   return call<GatewayUsageResult>("get_gateway_usage", days && days > 0 ? { days } : undefined);
 }
 
-/** 探测本机 AI 客户端（全部 11 类智能体）的安装与配置状态。 */
+/** 探测本机 AI 客户端（全部 12 类智能体）的安装与配置状态。 */
 export function detectAgentClients(): Promise<AgentDetectionResult> {
   return call<AgentDetectionResult>("detect_agent_clients");
 }
@@ -753,3 +802,636 @@ export function listAgentBackups(
   return call<{ backups: AgentBackupItem[] }>("list_agent_backups", { target });
 }
 
+
+// ---------------------------------------------------------------------------
+// Trae / 豆包 多应用支持
+// ---------------------------------------------------------------------------
+
+/** 应用安装与运行状态。 */
+export interface AppEnvStatus {
+  targetApp: string;
+  appName: string;
+  layout: "icube" | "chromium" | "authfile";
+  installed: boolean;
+  exePath: string | null;
+  dataDir: string;
+  dataDirExists: boolean;
+  profilesDir: string;
+  snapshotCount: number;
+  manualPath: string | null;
+  settingsPathKey: string;
+  running: boolean;
+}
+
+/** 探测某个应用的安装、数据目录与快照状态。 */
+export function appEnvCheck(targetApp: string): Promise<AppEnvStatus> {
+  return call<AppEnvStatus>("app_env_check", { targetApp });
+}
+
+/** 保存应用的手动 exe 路径（空串 = 清除）。 */
+export function appSetManualPath(targetApp: string, path: string): Promise<{ ok: boolean }> {
+  return call<{ ok: boolean }>("app_set_manual_path", { targetApp, path });
+}
+
+/** 登录态动作。 */
+export type SwitchActionName =
+  | "Switch"
+  | "SaveCurrentLogin"
+  | "BackupCurrent"
+  | "RestoreOnly"
+  | "ResetDeviceIds"
+  | "KeepAlive";
+
+export interface SwitchStep {
+  stage: string;
+  status: string;
+  message: string;
+}
+
+export interface SwitchActionResult {
+  ok: boolean;
+  message: string;
+  steps: SwitchStep[];
+}
+
+/**
+ * 执行一次登录态动作。
+ *
+ * `expectedCurrentUid` 是防误覆盖守卫：只有它与快照目录里记录的当前账号一致时，
+ * 才会把现场登录态写回来源账号的槽位。
+ */
+export function switchAction(args: {
+  action: SwitchActionName;
+  targetApp: string;
+  userId?: string | null;
+  proxyPort?: number | null;
+  includeIndexeddb?: boolean;
+  expectedCurrentUid?: string | null;
+}): Promise<SwitchActionResult> {
+  return call<SwitchActionResult>("switch_action", {
+    action: args.action,
+    targetApp: args.targetApp,
+    userId: args.userId ?? null,
+    proxyPort: args.proxyPort ?? null,
+    includeIndexeddb: args.includeIndexeddb ?? false,
+    expectedCurrentUid: args.expectedCurrentUid ?? null,
+  });
+}
+
+/** 当前登录态属于哪个账号。 */
+export function currentAccount(targetApp: string): Promise<{ userId: string }> {
+  return call<{ userId: string }>("current_account", { targetApp });
+}
+
+/** 快照条目。 */
+export interface SnapshotItem {
+  userId: string;
+  isCurrent: boolean;
+  modifiedAt: number | null;
+  hasMeta: boolean;
+}
+
+/** 列出某应用的登录态快照。 */
+export function listSnapshots(
+  targetApp: string,
+): Promise<{ snapshots: SnapshotItem[]; currentUserId: string }> {
+  return call<{ snapshots: SnapshotItem[]; currentUserId: string }>("list_snapshots", {
+    targetApp,
+  });
+}
+
+/** 删除某个账号的快照（含上一代备份）。 */
+export function deleteSnapshot(
+  targetApp: string,
+  userId: string,
+): Promise<{ ok: boolean }> {
+  return call<{ ok: boolean }>("delete_snapshot", { targetApp, userId });
+}
+
+/** Trae 账号（JWT 已脱敏）。 */
+export interface TraeAccountMeta {
+  userId: string;
+  name: string;
+  addedAt: string | null;
+  updatedAt: string | null;
+  jwtStatus: "ok" | "warn" | "expired" | "unknown";
+  jwtExpHours: number | null;
+  jwtExpTimestamp: number | null;
+  hasRefreshToken: boolean;
+  refreshTokenInvalid: boolean;
+  refreshTokenFails: number;
+  deviceIdMasked: string;
+  cooldown?: { type?: string; until?: number; reason?: string; error_count?: number };
+}
+
+/** Trae 账号列表。 */
+export function traeListAccounts(): Promise<{ accounts: TraeAccountMeta[] }> {
+  return call<{ accounts: TraeAccountMeta[] }>("trae_list_accounts");
+}
+
+/** 粘贴 JWT 添加/更新 Trae 账号。 */
+export function traeAddAccount(args: {
+  jwt: string;
+  name?: string;
+  refreshToken?: string;
+}): Promise<{ ok: boolean; account: TraeAccountMeta }> {
+  return call<{ ok: boolean; account: TraeAccountMeta }>("trae_add_account", {
+    jwt: args.jwt,
+    name: args.name ?? null,
+    refreshToken: args.refreshToken ?? null,
+  });
+}
+
+/** 删除 Trae 账号。 */
+export function traeDeleteAccount(userId: string): Promise<{ ok: boolean }> {
+  return call<{ ok: boolean }>("trae_delete_account", { userId });
+}
+
+/** 本机发现到的 Trae 账号候选。 */
+export interface TraeDiscoveredAccount {
+  userId: string;
+  dcUid: string | null;
+  /** 为假时**禁止入池**：uid 属于账户中心 id 空间，与账号池不同体系。 */
+  uidConfident: boolean;
+  appKind: string;
+  appLabel: string;
+  apps: string[];
+  evidenceTsMs: number;
+  evidenceCount: number;
+  inPool: boolean;
+  payIdentity: string | null;
+}
+
+/** 发现本机登录过的 Trae 账号（Trae Work + Trae 双应用）。 */
+export function traeDiscoverAccounts(): Promise<{
+  accounts: TraeDiscoveredAccount[];
+  apps: { kind: string; label: string }[];
+}> {
+  return call<{ accounts: TraeDiscoveredAccount[]; apps: { kind: string; label: string }[] }>(
+    "trae_discover_accounts",
+  );
+}
+
+/** 读取某应用的套餐身份。 */
+export function traeEntitlement(
+  appKind: string,
+): Promise<{ identity?: string | null; raw?: unknown }> {
+  return call<{ identity?: string | null; raw?: unknown }>("trae_entitlement", { appKind });
+}
+
+/** 读取（或重置）账号的设备指纹。 */
+export function traeDeviceInfo(
+  userId: string,
+  reset = false,
+): Promise<{ userId: string; deviceId: string; sessionId: string; marketUserId: string }> {
+  return call<{ userId: string; deviceId: string; sessionId: string; marketUserId: string }>(
+    "trae_device_info",
+    { userId, reset },
+  );
+}
+
+/** 单账号签到结果。 */
+export interface TraeCheckinOutcome {
+  userId: string;
+  name: string;
+  status: "success" | "already" | "fail" | "skip";
+  code: number | null;
+  message: string;
+  credits: number | null;
+  delta: number | null;
+  errorType: string | null;
+  cooldownUntil: number | null;
+}
+
+export interface TraeCheckinResult {
+  ok: number;
+  already: number;
+  failed: number;
+  skipped: number;
+  total: number;
+  results: TraeCheckinOutcome[];
+}
+
+/** 执行一轮 Trae 签到（不传 userIds = 全部账号）。 */
+export function traeCheckinRun(
+  userIds?: string[],
+  retry = 1,
+): Promise<TraeCheckinResult> {
+  return call<TraeCheckinResult>("trae_checkin_run", {
+    userIds: userIds && userIds.length > 0 ? userIds : null,
+    retry,
+  });
+}
+
+/** Trae 积分历史记录。 */
+export function traeCreditsHistory(): Promise<{
+  records: { date: string; userId: string; credits: number; delta: number }[];
+}> {
+  return call<{ records: { date: string; userId: string; credits: number; delta: number }[] }>(
+    "trae_credits_history",
+  );
+}
+
+/** 清除某账号的签到冷却。 */
+export function traeClearCooldown(userId: string): Promise<{ ok: boolean }> {
+  return call<{ ok: boolean }>("trae_clear_cooldown", { userId });
+}
+
+/** 豆包账号视图（凭证已脱敏）。 */
+export interface DoubaoAccountView {
+  userId: string;
+  name: string | null;
+  note: string | null;
+  addedAt: string | null;
+  lastActiveAt: string | null;
+  sessionIdMasked: string;
+  sidGuardMasked: string;
+  ttwidMasked: string;
+  hasSessionId: boolean;
+  hasTtwid: boolean;
+  sessionExpireAt: string | null;
+  expired: boolean | null;
+  sessionState: "ok" | "expired" | "unknown" | "none";
+  sessionSource: string | null;
+  cookiesSyncedAt: string | null;
+  lastRenewAt: string | null;
+  quotaLevel: string | null;
+  quotaExpireAt: string | null;
+  quotaSummary: string | null;
+  quotaCheckedAt: string | null;
+}
+
+/** 豆包账号列表。 */
+export function doubaoListAccounts(): Promise<{
+  accounts: DoubaoAccountView[];
+  lastKeepaliveAt: string | null;
+}> {
+  return call<{ accounts: DoubaoAccountView[]; lastKeepaliveAt: string | null }>(
+    "doubao_list_accounts",
+  );
+}
+
+/** 新增/更新豆包账号。 */
+export function doubaoPublishAccount(args: {
+  userId: string;
+  name?: string;
+  note?: string;
+}): Promise<{ ok: boolean; account: DoubaoAccountView }> {
+  return call<{ ok: boolean; account: DoubaoAccountView }>("doubao_save_account", {
+    userId: args.userId,
+    name: args.name ?? null,
+    note: args.note ?? null,
+  });
+}
+
+/** 删除豆包账号。 */
+export function doubaoDeleteAccount(userId: string): Promise<{ ok: boolean }> {
+  return call<{ ok: boolean }>("doubao_delete_account", { userId });
+}
+
+/** 读取账号的明文凭证（仅编辑弹窗回填用）。 */
+export function doubaoGetCredential(userId: string): Promise<{
+  userId: string;
+  sessionId: string | null;
+  sidGuard: string | null;
+  ttwid: string | null;
+}> {
+  return call<{
+    userId: string;
+    sessionId: string | null;
+    sidGuard: string | null;
+    ttwid: string | null;
+  }>("doubao_get_credential", { userId });
+}
+
+/** 设置账号凭证。 */
+export function doubaoSetCredential(args: {
+  userId: string;
+  sessionId?: string | null;
+  sidGuard?: string | null;
+  ttwid?: string | null;
+}): Promise<{ ok: boolean; account: DoubaoAccountView }> {
+  return call<{ ok: boolean; account: DoubaoAccountView }>("doubao_set_credential", {
+    userId: args.userId,
+    sessionId: args.sessionId ?? null,
+    sidGuard: args.sidGuard ?? null,
+    ttwid: args.ttwid ?? null,
+  });
+}
+
+/** 读取最近一次代理抓包凭证。 */
+export function doubaoCapturedCredential(): Promise<{
+  available: boolean;
+  uid?: string | null;
+  host?: string | null;
+  capturedAt?: string | null;
+  sessionId?: string | null;
+  sidGuard?: string | null;
+  ttwid?: string | null;
+}> {
+  return call<{
+    available: boolean;
+    uid?: string | null;
+    host?: string | null;
+    capturedAt?: string | null;
+    sessionId?: string | null;
+    sidGuard?: string | null;
+    ttwid?: string | null;
+  }>("doubao_captured_credential");
+}
+
+/** 把抓包凭证回写账号池（幂等）。 */
+export function doubaoCredentialAutoApply(): Promise<{
+  applied: boolean;
+  account?: DoubaoAccountView;
+}> {
+  return call<{ applied: boolean; account?: DoubaoAccountView }>(
+    "doubao_credential_auto_apply",
+  );
+}
+
+/** 会话保活（启动客户端触发服务端滑动续期）。 */
+export function doubaoKeepalive(): Promise<{ ok: boolean; message: string }> {
+  return call<{ ok: boolean; message: string }>("doubao_keepalive");
+}
+
+/** HTTP 续期探活。 */
+export function doubaoRenew(syncOnly = false): Promise<{
+  ok: number;
+  expired: number;
+  skipped: number;
+  errors: number;
+  total: number;
+  results: { userId: string; name: string; status: string; message: string }[];
+}> {
+  return call<{
+    ok: number;
+    expired: number;
+    skipped: number;
+    errors: number;
+    total: number;
+    results: { userId: string; name: string; status: string; message: string }[];
+  }>("doubao_renew", { syncOnly });
+}
+
+/** 会话与凭证诊断。 */
+export function doubaoDiagnose(): Promise<Record<string, unknown>> {
+  return call<Record<string, unknown>>("doubao_diagnose");
+}
+
+/** 额度窗口项。 */
+export interface DoubaoQuotaWindow {
+  name: string;
+  usedPercent: number | null;
+  exhausted: boolean;
+  resetAt: string | null;
+}
+
+/** 额度查询结果。 */
+export interface DoubaoQuotaView {
+  userId: string;
+  ok: boolean;
+  level: string | null;
+  expireAt: string | null;
+  hasSubscription: boolean;
+  isGift: boolean;
+  subscription: Record<string, unknown> | null;
+  windows: DoubaoQuotaWindow[];
+  items: { name: string; total: number; left: number | null; used: number | null }[];
+  summary: string;
+}
+
+/** 查询单个账号的会员额度。 */
+export function doubaoFetchQuota(userId: string): Promise<DoubaoQuotaView> {
+  return call<DoubaoQuotaView>("doubao_fetch_quota", { userId });
+}
+
+/** 批量巡检全部账号额度。 */
+export function doubaoQuotaBatch(): Promise<{
+  ok: number;
+  failed: number;
+  exhausted: string[];
+  results: { userId: string; name: string; ok: boolean; summary?: string; error?: string }[];
+}> {
+  return call<{
+    ok: number;
+    failed: number;
+    exhausted: string[];
+    results: { userId: string; name: string; ok: boolean; summary?: string; error?: string }[];
+  }>("doubao_quota_batch");
+}
+
+/** 账号会话探活。 */
+export function doubaoProbeAccount(
+  userId: string,
+): Promise<{ ok: boolean; status?: string; detail?: string; error?: string }> {
+  return call<{ ok: boolean; status?: string; detail?: string; error?: string }>(
+    "doubao_probe_account",
+    { userId },
+  );
+}
+
+/** 备份账号的客户端对话状态。 */
+export function doubaoBackupChatdata(
+  userId: string,
+): Promise<{ ok: boolean; userId: string; files: number; path: string }> {
+  return call<{ ok: boolean; userId: string; files: number; path: string }>(
+    "doubao_backup_chatdata",
+    { userId },
+  );
+}
+
+/** 恢复账号的客户端对话状态。 */
+export function doubaoRestoreChatdata(
+  userId: string,
+): Promise<{ ok: boolean; userId: string; profiles: number }> {
+  return call<{ ok: boolean; userId: string; profiles: number }>("doubao_restore_chatdata", {
+    userId,
+  });
+}
+
+/** 对话备份信息。 */
+export function doubaoChatdataInfo(userId: string): Promise<{
+  backed: boolean;
+  files?: number;
+  backedAt?: string | null;
+  sizeBytes?: number;
+  path?: string;
+}> {
+  return call<{
+    backed: boolean;
+    files?: number;
+    backedAt?: string | null;
+    sizeBytes?: number;
+    path?: string;
+  }>("doubao_chatdata_info", { userId });
+}
+
+/** 从官方 IM API 导出对话。 */
+export function doubaoExportChats(
+  userId: string,
+  limitConvs = 50,
+  maxPages = 10,
+): Promise<{
+  ok: boolean;
+  conversations: number;
+  messages: number;
+  jsonPath: string;
+  mdPath: string;
+}> {
+  return call<{
+    ok: boolean;
+    conversations: number;
+    messages: number;
+    jsonPath: string;
+    mdPath: string;
+  }>("doubao_export_chats", { userId, limitConvs, maxPages });
+}
+
+/** 读取应用设置。 */
+export function getAppSettings(): Promise<Record<string, unknown>> {
+  return call<Record<string, unknown>>("get_app_settings");
+}
+
+/** 合并写入应用设置。 */
+export function saveAppSettings(
+  patch: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  return call<Record<string, unknown>>("save_app_settings", { patch });
+}
+
+// ---------------------------------------------------------------------------
+// 本地 MITM 代理（设备身份隔离 + 凭证抓取）
+// ---------------------------------------------------------------------------
+
+/** 代理配置。 */
+export interface ProxyConfigView {
+  port: number;
+  domains: string;
+  defaultDomains: string;
+  lastPort: number | null;
+  /** 用户原有的系统代理 [启用, 地址, 绕过列表]，停止时会原样还原。 */
+  existingSystemProxy: [boolean, string, string] | null;
+}
+
+/** 读取代理配置。 */
+export function proxyConfig(): Promise<ProxyConfigView> {
+  return call<ProxyConfigView>("proxy_config");
+}
+
+/** 代理运行状态。 */
+export function proxyStatus(): Promise<{ running: boolean; port: number | null; captured: number }> {
+  return call<{ running: boolean; port: number | null; captured: number }>("proxy_status");
+}
+
+/**
+ * 启动代理并接管系统代理。
+ *
+ * 代理会改写系统代理设置；停止时还原为用户原有的值。启动前会先记下原值，
+ * 因此不会把「上一次自己设的」误当成用户设置。
+ */
+export function proxyStart(
+  port?: number,
+  domains?: string,
+): Promise<{ ok: boolean; port: number; domains: string }> {
+  return call<{ ok: boolean; port: number; domains: string }>("proxy_start", {
+    port: port ?? null,
+    domains: domains ?? null,
+  });
+}
+
+/** 停止代理并还原系统代理。 */
+export function proxyStop(): Promise<{ ok: boolean; alreadyStopped?: boolean }> {
+  return call<{ ok: boolean; alreadyStopped?: boolean }>("proxy_stop");
+}
+
+/** CA 证书状态。 */
+export function proxyCertStatus(): Promise<{
+  certsDir: string;
+  caCerPath: string;
+  caPemPath: string;
+  caExists: boolean;
+  hint: string;
+}> {
+  return call<{
+    certsDir: string;
+    caCerPath: string;
+    caPemPath: string;
+    caExists: boolean;
+    hint: string;
+  }>("proxy_cert_status");
+}
+
+/** 生成自签 CA（已存在则复用）。 */
+export function proxyCertGenerate(): Promise<{
+  ok: boolean;
+  certsDir: string;
+  caCerPath: string;
+}> {
+  return call<{ ok: boolean; certsDir: string; caCerPath: string }>("proxy_cert_generate");
+}
+
+/** 从本机离线捕获 Trae 的 Cloud-IDE-JWT（代理抓不到时的兜底）。 */
+export function proxyCaptureLocal(): Promise<{
+  ok: boolean;
+  captured?: number;
+  accounts?: { userId: string; source: string }[];
+  message?: string;
+}> {
+  return call<{
+    ok: boolean;
+    captured?: number;
+    accounts?: { userId: string; source: string }[];
+    message?: string;
+  }>("proxy_capture_local");
+}
+
+/** 清理上一次异常退出残留的系统代理设置。 */
+export function proxyCleanupStale(): Promise<{ ok: boolean; restored: string | null }> {
+  return call<{ ok: boolean; restored: string | null }>("proxy_cleanup_stale");
+}
+
+/** 解析上游代理地址（供界面校验输入）。 */
+export function proxyParseUpstream(
+  spec: string,
+): Promise<{ ok: boolean; addr?: string; error?: string }> {
+  return call<{ ok: boolean; addr?: string; error?: string }>("proxy_parse_upstream", { spec });
+}
+
+// ---------------------------------------------------------------------------
+// 计划任务（Windows schtasks）
+// ---------------------------------------------------------------------------
+
+/** 计划任务状态。 */
+export interface TaskStatusItem {
+  kind: string;
+  name: string;
+  label: string;
+  cliKey: string;
+  registered: boolean;
+  time: string;
+  error: string | null;
+}
+
+/** 查询全部计划任务的注册状态。 */
+export function taskStatus(): Promise<{ tasks: TaskStatusItem[] }> {
+  return call<{ tasks: TaskStatusItem[] }>("task_status");
+}
+
+/** 注册（或覆盖）一个每日计划任务。时间格式 HH:MM。 */
+export function taskRegister(
+  kind: string,
+  time: string,
+): Promise<{ ok: boolean; message: string }> {
+  return call<{ ok: boolean; message: string }>("task_register", { kind, time });
+}
+
+/** 删除计划任务（不存在也算成功）。 */
+export function taskUnregister(kind: string): Promise<{ ok: boolean }> {
+  return call<{ ok: boolean }>("task_unregister", { kind });
+}
+
+/** 立即执行一次任务（不依赖计划任务，用于验证配置）。 */
+export function taskRunNow(kind: string): Promise<{ ok: boolean; exitCode: number }> {
+  return call<{ ok: boolean; exitCode: number }>("task_run_now", { kind });
+}

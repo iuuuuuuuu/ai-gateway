@@ -20,8 +20,8 @@ sed -i -E "s/\"version\": \"[0-9]+\.[0-9]+\.[0-9]+\"/\"version\": \"$V\"/" \
 
 # 各 Cargo.toml 顶层的 version = "x.y.z"
 sed -i -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$V\"/" \
-  src-tauri/Cargo.toml crates/wb-switch-core/Cargo.toml \
-  crates/wb-switch-server/Cargo.toml crates/wb-switch-gateway/Cargo.toml
+  src-tauri/Cargo.toml crates/ai-gateway-core/Cargo.toml \
+  crates/ai-gateway-server/Cargo.toml crates/ai-gateway-router/Cargo.toml
 
 # 平台包 package.json
 for f in npm/platform/*/package.json; do
@@ -31,7 +31,7 @@ done
 # Cargo.lock 里 workspace 各 crate 的 version（只替换紧随包名之后的那一行）。
 # 必须锚定包名：Cargo.lock 里 bit-set / bit-vec / ctor 等第三方 crate 的版本号
 # 也恰好是 0.8.0 这类值，一律全局替换会误伤依赖锁。
-sed -i -E "/^name = \"wb-switch-(core|gateway|rust|server)\"/{n;s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$V\"/}" Cargo.lock
+sed -i -E "/^name = \"ai-gateway-(core|gateway|rust|server)\"/{n;s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$V\"/}" Cargo.lock
 
 # 主包 optionalDependencies 引用版本（用 node 解析 JSON，避免正则误伤）
 node -e "

@@ -1,0 +1,15 @@
+{
+  "name": "ai-gateway-darwin-arm64",
+  "version": "1.0.0",
+  "description": "ai-gateway platform binary (darwin-arm64)",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin"
+  ],
+  "license": "MIT"
+}

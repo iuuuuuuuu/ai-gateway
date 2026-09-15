@@ -144,7 +144,7 @@ const exactTokenFormatter = new Intl.NumberFormat("en-US");
  */
 type GatewayLayout = "classic" | "merged";
 
-const LAYOUT_STORAGE_KEY = "wb-switch.gateway-layout";
+const LAYOUT_STORAGE_KEY = "ai-gateway.gateway-layout";
 
 /**
  * Radix Select 的「空值」哨兵。
@@ -980,8 +980,8 @@ export default function GatewayPage() {
           <AlertTriangle />
           <AlertTitle>未找到网关可执行文件</AlertTitle>
           <AlertDescription>
-            请把 <code className="font-mono">gateway.exe</code> 放到 workbuddy-switch
-            同目录，或用环境变量 <code className="font-mono">WB_SWITCH_GATEWAY_BIN</code> 指定路径。
+            请把 <code className="font-mono">gateway.exe</code> 放到 ai-gateway
+            同目录，或用环境变量 <code className="font-mono">AI_GATEWAY_ROUTER_BIN</code> 指定路径。
           </AlertDescription>
         </Alert>
       ) : null}
@@ -1655,7 +1655,7 @@ export default function GatewayPage() {
           <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-primary/30 bg-primary/5 p-3 text-xs">
             <div className="flex items-center gap-2">
               <Bot className="size-4 text-primary shrink-0" />
-              <span>现已提供独立的「智能体管理」页面，支持 11 类智能体的多模型多选与一键批量更新。</span>
+              <span>现已提供独立的「智能体管理」页面，支持 12 类智能体的多模型多选与一键批量更新。</span>
             </div>
             <Button size="sm" variant="outline" className="h-7 text-xs font-medium" asChild>
               <Link to="/agents">前往智能体管理 →</Link>

@@ -35,6 +35,13 @@ const (
 	// 与整个账号被封的 ErrSoftRate 不同 —— 上游明确提示"您也可以切换其他模型继续使用"，
 	// 即该账号的其他模型仍然可用。冷却时长取上游给出的重置时间（解析失败回退软冷却）。
 	ErrModelRate
+	// ErrContextTooLong 请求的上下文超出模型窗口（HTTP 400 code=11115）。
+	//
+	// 这是**请求侧**错误，与账号无关：同一个请求体发给任何账号都会同样失败。
+	// 因此必须与 ErrClient 区分开 —— 否则会落入「换号重试」路径，把整个请求体
+	// 对着每个账号重传一遍（2026-09-15 实测：1.12M token 的请求被重传 3 次），
+	// 最后还被包装成 503 no_healthy_account，把排查方向引向「账号故障」。
+	ErrContextTooLong
 )
 
 func (k ErrKind) String() string {
@@ -53,6 +60,8 @@ func (k ErrKind) String() string {
 		return "client"
 	case ErrModelRate:
 		return "model_rate"
+	case ErrContextTooLong:
+		return "context_too_long"
 	default:
 		return "none"
 	}
@@ -102,6 +111,61 @@ var modelRateMarkers = []string{"超出频率限制", "切换其他模型"}
 
 // modelRateCode 上游「模型级限流」的业务码。
 const modelRateCode = 6004
+
+// contextTooLongCode 上游「上下文超长」的业务码。
+//
+// 实测响应（2026-09-15 现场，prompt 1121509 > 上限 1048576）：
+//
+//	400 {"code":11115,"msg":"prompt is too long: 1119655 tokens > 1048576 maximum",
+//	     "extError":{"code":"context_length_exceeded","type":"invalid_request_error"},
+//	     "displayMsg":{"en":"The request exceeds the model context limit...",
+//	                   "zh":"对话内容超出模型长度上限，请精简对话或减少附件后重试。"}}
+const contextTooLongCode = 11115
+
+// contextTooLongMarkers 上下文超长的判定文案（中英双通道兜底）。
+//
+// 业务码是主信号；文案兜底用于上游改码不改文案的场景。措辞取自上游真实响应，
+// 刻意含中英两版 displayMsg —— 上游按 Accept-Language 切换语言，只认一种会漏判。
+//
+// 注意 msg 有多种写法：实测同一业务码下遇到过 "prompt is too long"（国际版）
+// 与 "input length too long"（国服 glm-5.3），两种都要登记。
+var contextTooLongMarkers = []string{
+	"context_length_exceeded",
+	"prompt is too long",
+	"input length too long",
+	"exceeds the model context limit",
+	"对话内容超出模型长度上限",
+	"超出模型长度上限",
+}
+
+// IsContextTooLong 报告上游响应是否为「请求上下文超出模型窗口」。
+//
+// 三路判定，任一命中即成立：业务码 11115、extError.code=context_length_exceeded、
+// 或真实文案关键词（见 contextTooLongCode 注释里的实测响应）。
+//
+// 不按 status 门控：上游以 400 为主，但判定依据是业务语义而非状态码，
+// 上游若改用 413 也能识别。
+func IsContextTooLong(body string) bool {
+	var env apiEnvelope
+	if json.Unmarshal([]byte(body), &env) == nil && env.Code == contextTooLongCode {
+		return true
+	}
+	var ext struct {
+		ExtError struct {
+			Code string `json:"code"`
+		} `json:"extError"`
+	}
+	if json.Unmarshal([]byte(body), &ext) == nil && strings.EqualFold(ext.ExtError.Code, "context_length_exceeded") {
+		return true
+	}
+	lower := strings.ToLower(body)
+	for _, m := range contextTooLongMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) {
+			return true
+		}
+	}
+	return false
+}
 
 // resetTimeRe 从报错文案里提取重置时刻。
 //
@@ -302,6 +366,12 @@ func Classify(status int, body string) ErrKind {
 		}
 		return ErrSoftRate
 	}
+	// 上下文超长必须早于通用 4xx 判定：它是请求侧错误，换号无用，
+	// 需要独立 kind 让调用方「立即失败」而不是轮转重传整个请求体。
+	// 放在 429 之后是有意的：429 一律按限流归类，保持既有语义不变。
+	if IsContextTooLong(body) {
+		return ErrContextTooLong
+	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
 	}
@@ -313,6 +383,49 @@ func Classify(status int, body string) ErrKind {
 	}
 	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。
 	return ErrNone
+}
+
+// ContextTooLongMessage 把上下文超长的上游响应体提炼成一条**保留原文**的客户端消息。
+//
+// 为什么必须保留上游原文：下游客户端（如 DeepSeek Harness）靠文案模式识别上下文溢出
+// （`prompt is too long` / `context_length_exceeded` / `exceeds the model context limit`），
+// 据此触发自动压缩并重试。若只回我们自己的措辞，客户端就认不出这是溢出，
+// 只会把它当成普通失败 —— 那正是本次死锁难以自愈的原因之一。
+//
+// 因此输出形如：`<上游 msg>（<中文 displayMsg>）`，两种语言的特征串都在，
+// 中文提示同时给人类看。上游字段缺失时逐级回退，最终回退到原始 body。
+func ContextTooLongMessage(body string) string {
+	var env struct {
+		Msg       string `json:"msg"`
+		ExtError  struct {
+			Message string `json:"message"`
+		} `json:"extError"`
+		DisplayMsg struct {
+			Zh string `json:"zh"`
+			En string `json:"en"`
+		} `json:"displayMsg"`
+	}
+	_ = json.Unmarshal([]byte(body), &env)
+
+	primary := strings.TrimSpace(env.Msg)
+	if primary == "" {
+		primary = strings.TrimSpace(env.ExtError.Message)
+	}
+	hint := strings.TrimSpace(env.DisplayMsg.Zh)
+	if hint == "" {
+		hint = strings.TrimSpace(env.DisplayMsg.En)
+	}
+
+	switch {
+	case primary == "" && hint == "":
+		return truncate(strings.TrimSpace(body), 400)
+	case primary == "":
+		return hint
+	case hint == "" || strings.Contains(primary, hint):
+		return primary
+	default:
+		return primary + "（" + hint + "）"
+	}
 }
 
 // apiEnvelope 上游统一信封。

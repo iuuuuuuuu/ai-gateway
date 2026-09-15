@@ -1,5 +1,5 @@
 #!/bin/sh
-# 构建内嵌网关（Go），产物落到 crates/wb-switch-core/embedded/，
+# 构建内嵌网关（Go），产物落到 crates/ai-gateway-core/embedded/，
 # 之后 cargo build 时 build.rs 会把它 gzip 压缩后编进主程序。
 #
 # 保持 POSIX sh 兼容：CI（Ubuntu）用 `sh` 调用时是 dash，不支持 pipefail
@@ -31,9 +31,9 @@ GOARCH="${GOARCH:-$(go env GOARCH)}"
 
 # Windows 用 .exe 后缀；macOS/Linux 不带后缀。build.rs 按同样规则查找。
 if [ "$GOOS" = "windows" ]; then
-  OUT="$ROOT/crates/wb-switch-core/embedded/gateway.exe"
+  OUT="$ROOT/crates/ai-gateway-core/embedded/gateway.exe"
 else
-  OUT="$ROOT/crates/wb-switch-core/embedded/gateway"
+  OUT="$ROOT/crates/ai-gateway-core/embedded/gateway"
 fi
 
 echo "==> 构建 $GOOS/$GOARCH"

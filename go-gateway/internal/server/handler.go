@@ -412,7 +412,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if ferr != nil {
 		st.status = status
 		st.uid = result.UID
-		writeOpenAIError(w, status, errorCodeFor(ferr), errText(ferr))
+		code, msg := openAIFailure(ferr)
+		writeOpenAIError(w, status, code, msg)
 		return
 	}
 	st.uid = result.UID
@@ -554,6 +555,57 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_, _ = w.Write(raw)
 }
 
+// openAIFailure 把转发失败翻译成 OpenAI 形状的错误码与消息。
+//
+// 默认沿用既有契约（no_healthy_account + 503，语义是「账号池暂时不可用，
+// 稍后重试」）；只有**请求侧**错误才偏离 —— 那些错误重试多少次都一样，
+// 必须让客户端看到真实原因，而不是被误导去等账号恢复。
+//
+// 两类请求侧错误（两者都是「重试无用、要改请求」）：
+//   - 单一模型模式拒绝 → model_not_allowed（见 modelLockedError）
+//   - 上下文超长       → context_length_exceeded
+func openAIFailure(err error) (code, msg string) {
+	if f := failureOf(err); f != nil && f.Kind == FailureContextTooLong {
+		return "context_length_exceeded", f.Message
+	}
+	// 其余交给 errorCodeFor（当前只有 model_not_allowed 与 no_healthy_account），
+	// 即 chat/completions 一直以来的行为。
+	return errorCodeFor(err), errText(err)
+}
+
+// anthropicFailure 同上，Anthropic 词汇表。
+//
+// 上下文超长在 Anthropic 语义里是 invalid_request_error（其真实文案即
+// "prompt is too long: ..."），而非 request_too_large（那是请求**字节数**超限）。
+func anthropicFailure(err error) (code, msg string) {
+	if f := failureOf(err); f != nil && f.Kind == FailureContextTooLong {
+		return "invalid_request_error", f.Message
+	}
+	if errorCodeFor(err) != "no_healthy_account" {
+		return "invalid_request_error", errText(err)
+	}
+	return "api_error", errText(err)
+}
+
+// responsesFailure 同上，Responses API 的上游失败码是 upstream_error。
+//
+// 单一模型拒绝沿用 #14 为该协议定的 invalid_request_error，**不**把
+// errorCodeFor 的 model_not_allowed 直接透出：model_not_allowed 是本网关给
+// chat/completions 形状定的码，不属于 Responses 词汇表（见 responsesBodyCodes
+// ——该协议用 invalid_request / payload_too_large）。同理 anthropicFailure 保持
+// invalid_request_error。三个入口共享的是「谁来判定失败类别」这条映射链，
+// 不是同一个码面值；把码面值也一起统一会让各协议的词汇表互相串味。
+func responsesFailure(err error) (code, msg string) {
+	if f := failureOf(err); f != nil && f.Kind == FailureContextTooLong {
+		return "context_length_exceeded", f.Message
+	}
+	if errorCodeFor(err) != "no_healthy_account" {
+		return "invalid_request_error", errText(err)
+	}
+	return "upstream_error", errText(err)
+}
+
+// writeOpenAIError 写出 OpenAI 形状的错误体。
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, map[string]any{
 		"error": map[string]any{

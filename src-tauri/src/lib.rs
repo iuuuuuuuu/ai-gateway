@@ -1,14 +1,18 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod commands;
+// Trae / 豆包 的命令层（与 WorkBuddy 系分开，便于独立演进）
+mod commands_apps;
+// 本地 MITM 代理的命令层（系统代理编排 + 事件转发）
+mod commands_proxy;
 #[cfg(desktop)]
 mod tray;
 
 use std::time::Duration;
 #[cfg(desktop)]
 use tauri::Manager;
-use wb_switch_core::modules;
+use ai_gateway_core::modules;
 
-const SCREENSHOT_DEMO_ENV: &str = "WB_SWITCH_SCREENSHOT_DEMO";
+const SCREENSHOT_DEMO_ENV: &str = "AI_GATEWAY_SCREENSHOT_DEMO";
 
 pub(crate) fn is_screenshot_demo() -> bool {
     std::env::var(SCREENSHOT_DEMO_ENV).as_deref() == Ok("1")
@@ -147,6 +151,22 @@ pub fn run() {
                     tray::is_silent_startup(std::env::args()),
                 );
             }
+            // 数据目录迁移必须**最先**执行，且**不受截图演示模式影响**。
+            //
+            // 为什么不能放进下面的 `if !is_screenshot_demo()` 里：改名后旧版数据在
+            // `~/.wb-switch`。若演示模式跳过迁移，本次运行就会在空的 `~/.ai-gateway`
+            // 下建出一份**不完整**的账号库 —— 而「目标目录已有数据」正是迁移的跳过
+            // 条件，于是真实数据从此再也搬不过来（实测踩到过：演示运行写出 2 个账号，
+            // 把旧目录的 8 个账号永久挡在门外）。
+            //
+            // 迁移本身只做文件拷贝、不读账号、不触网，因此在演示模式下执行同样安全。
+            {
+                let migration = modules::migrate_store::migrate_store_dir();
+                if migration.migrated() {
+                    eprintln!("[migrate] {}", migration.describe());
+                }
+            }
+
             // README 截图模式只渲染前端虚构数据，禁止读取账号后执行签到、轮换或保活。
             if !is_screenshot_demo() {
                 spawn_background_loops();
@@ -234,6 +254,56 @@ pub fn run() {
             commands::batch_import_agent_clients,
             commands::restore_agent_client,
             commands::list_agent_backups,
+            // ---- Trae / 豆包 多应用支持 ----
+            commands_apps::app_env_check,
+            commands_apps::app_set_manual_path,
+            commands_apps::switch_action,
+            commands_apps::current_account,
+            commands_apps::list_snapshots,
+            commands_apps::delete_snapshot,
+            commands_apps::trae_list_accounts,
+            commands_apps::trae_add_account,
+            commands_apps::trae_delete_account,
+            commands_apps::trae_discover_accounts,
+            commands_apps::trae_entitlement,
+            commands_apps::trae_device_info,
+            commands_apps::trae_checkin_run,
+            commands_apps::trae_credits_history,
+            commands_apps::trae_clear_cooldown,
+            commands_apps::doubao_list_accounts,
+            commands_apps::doubao_save_account,
+            commands_apps::doubao_delete_account,
+            commands_apps::doubao_get_credential,
+            commands_apps::doubao_set_credential,
+            commands_apps::doubao_captured_credential,
+            commands_apps::doubao_credential_auto_apply,
+            commands_apps::doubao_keepalive,
+            commands_apps::doubao_renew,
+            commands_apps::doubao_diagnose,
+            commands_apps::doubao_fetch_quota,
+            commands_apps::doubao_quota_batch,
+            commands_apps::doubao_probe_account,
+            commands_apps::doubao_backup_chatdata,
+            commands_apps::doubao_restore_chatdata,
+            commands_apps::doubao_chatdata_info,
+            commands_apps::doubao_export_chats,
+            commands_apps::get_app_settings,
+            commands_apps::save_app_settings,
+            // ---- 计划任务（schtasks 双轨：应用内调度 + 系统计划任务） ----
+            commands_apps::task_status,
+            commands_apps::task_register,
+            commands_apps::task_unregister,
+            commands_apps::task_run_now,
+            // ---- 本地 MITM 代理（设备身份隔离 + 凭证抓取） ----
+            commands_proxy::proxy_config,
+            commands_proxy::proxy_status,
+            commands_proxy::proxy_start,
+            commands_proxy::proxy_stop,
+            commands_proxy::proxy_cert_status,
+            commands_proxy::proxy_cert_generate,
+            commands_proxy::proxy_capture_local,
+            commands_proxy::proxy_cleanup_stale,
+            commands_proxy::proxy_parse_upstream,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

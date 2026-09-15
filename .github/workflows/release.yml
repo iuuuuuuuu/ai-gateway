@@ -11,7 +11,7 @@ name: release
 #     TAURI_SIGNING_PRIVATE_KEY          私钥内容（不是路径！传路径会报
 #                                        Invalid symbol 58，因为路径里有冒号）
 #     TAURI_SIGNING_PRIVATE_KEY_PASSWORD 私钥口令
-#   本地同一把密钥位于 %USERPROFILE%\.wb-switch\wb-switch-updater.key，
+#   本地同一把密钥位于 %USERPROFILE%\.ai-gateway\ai-gateway-updater.key，
 #   本地构建走 scripts/build-signed.ps1（详见 AGENTS.md「构建与签名」）。
 #
 #   注意：minisign 私钥与平台无关，一把密钥即可签所有平台，不存在
@@ -22,7 +22,7 @@ name: release
 #   不生成各自的 latest-<os>-<arch>.json（Windows 是主力分发平台，够用）。
 #
 # macOS 产物为 adhoc 签名（无 Apple 开发者证书），用户首次打开会提示「已损坏」，
-# 需执行 `xattr -cr "/Applications/WorkBuddy Switch Gateway.app"` 放行。
+# 需执行 `xattr -cr "/Applications/AI Gateway.app"` 放行。
 
 on:
   push:
@@ -172,7 +172,7 @@ jobs:
           # 注意 secrets 在 if 条件里不可直接引用，所以这里用 env 判断。
           if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
             echo "错误：未配置仓库 secret TAURI_SIGNING_PRIVATE_KEY。" >&2
-            echo "  设置：gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.wb-switch/wb-switch-updater.key" >&2
+            echo "  设置：gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.ai-gateway/ai-gateway-updater.key" >&2
             echo "  说明见 AGENTS.md「构建与签名」。" >&2
             exit 1
           fi
@@ -247,7 +247,7 @@ jobs:
           codesign --force --deep --sign - "$APP"
           sh scripts/make-dmg.sh "$APP_VERSION" "${{ matrix.arch_label }}" "$APP"
           mkdir -p dist-bin
-          cp "workbuddy-switch_${APP_VERSION}_${{ matrix.arch_label }}.dmg" dist-bin/
+          cp "ai-gateway_${APP_VERSION}_${{ matrix.arch_label }}.dmg" dist-bin/
 
       - name: 打包 Windows（portable.zip）
         if: runner.os == 'Windows'
@@ -277,7 +277,7 @@ jobs:
           NOTES="release/使用说明.txt"
           [ -f "$NOTES" ] || NOTES=""
 
-          python - "$STAGE" "dist-bin/WorkBuddy_Switch_Gateway_${APP_VERSION}_portable.zip" "$NOTES" "$APP_VERSION" <<'PY'
+          python - "$STAGE" "dist-bin/AI_Gateway_${APP_VERSION}_portable.zip" "$NOTES" "$APP_VERSION" <<'PY'
           import pathlib, sys, zipfile
 
           stage, out, notes, ver = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
@@ -285,9 +285,9 @@ jobs:
           if notes:
               readme = pathlib.Path(notes).read_text(encoding="utf-8")
           else:
-              readme = f"""WorkBuddy Switch Gateway {ver} —— 免安装版
+              readme = f"""AI Gateway {ver} —— 免安装版
 
-          【运行】双击 WorkBuddy-Switch-Gateway.exe
+          【运行】双击 AI-Gateway.exe
              WebView2Loader.dll 必须与 exe 同目录，请勿删除
 
           【依赖】需系统已装 WebView2 Runtime（Win10/11 一般自带）
@@ -296,7 +296,7 @@ jobs:
           """
 
           with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-              z.write(stage / "app.exe", "WorkBuddy-Switch-Gateway.exe")
+              z.write(stage / "app.exe", "AI-Gateway.exe")
               z.write(stage / "WebView2Loader.dll", "WebView2Loader.dll")
               z.writestr("使用说明.txt", readme)
           print(f"已生成 {out}")
@@ -360,8 +360,8 @@ jobs:
       #
       # 关键：重命名后**不需要**重新签名。已实测验证（pynacl 对真实产物验签）：
       # minisign 验签只覆盖文件内容，签名里 trusted comment 的 file: 字段
-      # 不参与校验 —— 用「WorkBuddy Switch Gateway_0.7.0_x64-setup.exe」签出的
-      # .sig，能验过重命名成 workbuddy-switch-windows-x86_64-setup.exe 的同一文件。
+      # 不参与校验 —— 用「AI Gateway_0.7.0_x64-setup.exe」签出的
+      # .sig，能验过重命名成 ai-gateway-windows-x86_64-setup.exe 的同一文件。
       # （scripts/publish-release.sh 头部注释里"必须重新签名"的说法是错的。）
       - name: 生成 updater 清单
         if: runner.os == 'Windows'
@@ -369,11 +369,11 @@ jobs:
         env:
           UPDATE_OS: windows
           UPDATE_ARCH: x86_64
-          UPDATE_ARCHIVE_NAME: workbuddy-switch-windows-x86_64-setup.exe
+          UPDATE_ARCHIVE_NAME: ai-gateway-windows-x86_64-setup.exe
         run: |
           set -euo pipefail
           VER="$APP_VERSION"
-          # 安装包文件名含空格（productName 是 "WorkBuddy Switch Gateway"），
+          # 安装包文件名含空格（productName 是 "AI Gateway"），
           # 先断言命中数为 1，避免多个匹配时静默取到错误的那一个。
           MATCHES=$(find "$BUNDLE_ROOT/nsis" -maxdepth 1 -type f -name "*_${VER}_x64-setup.exe" | wc -l | tr -d ' ')
           if [ "$MATCHES" != "1" ]; then

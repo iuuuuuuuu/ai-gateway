@@ -1,7 +1,9 @@
-import { useEffect, useState, type ReactElement, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactElement, type ReactNode } from "react";
+import { toast } from "sonner";
 import { ArrowUpCircle, CircleCheck, ExternalLink, Loader2, RefreshCw, Save } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -626,9 +628,9 @@ function PermissionCheckCard() {
             <p className="mb-1 font-medium text-foreground">如何授权（拖拽方式）：</p>
             <ol className="list-decimal space-y-1 pl-4">
               <li>点上方「打开完全磁盘访问」</li>
-              <li>再点「在 Finder 中显示」打开 workbuddy-switch 所在位置</li>
+              <li>再点「在 Finder 中显示」打开 ai-gateway 所在位置</li>
               <li>
-                把 <b>workbuddy-switch.app</b> 从 Finder <b>直接拖进</b>完全磁盘访问的列表区域
+                把 <b>ai-gateway.app</b> 从 Finder <b>直接拖进</b>完全磁盘访问的列表区域
                 （即使没有提示框，拖入即生效），然后打开它的开关
               </li>
               <li>回到本页点「检测权限」，或直接重试切换</li>
@@ -943,6 +945,492 @@ function AppearanceCard() {
   );
 }
 
+/**
+ * 多应用环境配置：Trae Work / Trae / 豆包 的安装路径与豆包端点。
+ *
+ * 为什么需要手动指定路径：客户端安装位置五花八门（自定义盘符、绿色版），
+ * exe 发现链的 6 级回退仍可能在部分机器上落空。此时让用户直接给出路径，
+ * 比让他反复重装客户端现实得多。
+ */
+function AppEnvCard() {
+  const APPS = [
+    { kind: "TraeWork", label: "Trae Work", hint: "TRAE SOLO CN.exe" },
+    { kind: "Trae", label: "Trae", hint: "Trae CN.exe" },
+    { kind: "Doubao", label: "豆包", hint: "Doubao.exe" },
+  ] as const;
+
+  const [envs, setEnvs] = useState<Record<string, api.AppEnvStatus | null>>({});
+  const [paths, setPaths] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    const results = await Promise.all(
+      APPS.map(async (app) => {
+        try {
+          return [app.kind, await api.appEnvCheck(app.kind)] as const;
+        } catch {
+          return [app.kind, null] as const;
+        }
+      }),
+    );
+    const nextEnvs: Record<string, api.AppEnvStatus | null> = {};
+    const nextPaths: Record<string, string> = {};
+    for (const [kind, status] of results) {
+      nextEnvs[kind] = status;
+      nextPaths[kind] = status?.manualPath ?? "";
+    }
+    setEnvs(nextEnvs);
+    setPaths(nextPaths);
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const savePath = async (kind: string) => {
+    setBusy(true);
+    try {
+      await api.appSetManualPath(kind, paths[kind] ?? "");
+      toast.success("已保存安装路径");
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <SettingsGroup id="settings-app-env" title="应用环境">
+      <CardContent className="space-y-0 p-0">
+        <p className="px-4 pt-4 text-xs text-muted-foreground sm:px-5">
+          Trae Work / Trae / 豆包的安装路径。自动探测失败时可在此手动指定。
+        </p>
+        {APPS.map((app, index) => {
+          const env = envs[app.kind];
+          return (
+            <div
+              key={app.kind}
+              className={cn(
+                "space-y-2 px-4 py-4 sm:px-5",
+                index < APPS.length - 1 && "border-b border-border/60",
+              )}
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm font-medium">{app.label}</span>
+                {env ? (
+                  <>
+                    <Badge variant={env.installed ? "secondary" : "outline"}>
+                      {env.installed ? "已安装" : "未检测到"}
+                    </Badge>
+                    <Badge variant={env.running ? "secondary" : "outline"}>
+                      {env.running ? "运行中" : "未运行"}
+                    </Badge>
+                    <span className="text-xs text-muted-foreground">
+                      快照 {env.snapshotCount} 个
+                    </span>
+                  </>
+                ) : (
+                  <Badge variant="outline">检测失败</Badge>
+                )}
+              </div>
+              {env?.exePath && (
+                <p className="break-all font-mono text-xs text-muted-foreground">{env.exePath}</p>
+              )}
+              <div className="flex gap-2">
+                <Input
+                  value={paths[app.kind] ?? ""}
+                  onChange={(e) =>
+                    setPaths((prev) => ({ ...prev, [app.kind]: e.target.value }))
+                  }
+                  placeholder={`手动指定路径，例如 D:\\Programs\\${app.hint}`}
+                  className="font-mono text-xs"
+                  aria-label={`${app.label} 安装路径`}
+                />
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => void savePath(app.kind)}
+                >
+                  保存
+                </Button>
+              </div>
+            </div>
+          );
+        })}
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/**
+ * 本地代理：设备身份隔离与凭证抓取。
+ *
+ * 代理会**改写系统代理设置**，停止时还原为用户原有的值。因此界面必须把
+ * 「当前是否在运行」「原有代理是什么」明确展示出来 —— 用户最怕的是
+ * 「用了这个功能之后网断了，还不知道为什么」。
+ */
+function ProxyCard() {
+  const [config, setConfig] = useState<api.ProxyConfigView | null>(null);
+  const [running, setRunning] = useState(false);
+  const [port, setPort] = useState("");
+  const [domains, setDomains] = useState("");
+  const [cert, setCert] = useState<Awaited<ReturnType<typeof api.proxyCertStatus>> | null>(null);
+  const [logs, setLogs] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const [cfg, status, certStatus] = await Promise.all([
+        api.proxyConfig(),
+        api.proxyStatus(),
+        api.proxyCertStatus(),
+      ]);
+      setConfig(cfg);
+      setRunning(status.running);
+      setCert(certStatus);
+      setPort((current) => current || String(cfg.port));
+      setDomains((current) => current || cfg.domains);
+    } catch (e) {
+      // 代理状态读取失败不打扰用户（可能是首次运行、证书目录还没建）
+      console.error(api.asError(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // 代理日志实时推送：只保留最近 200 行，避免长时间运行把内存吃满
+  useEffect(() => {
+    if (!api.isDesktop()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void import("@tauri-apps/api/event").then(async ({ listen }) => {
+      const stop = await listen<{ line: string }>("proxy-log", (event) => {
+        if (disposed) return;
+        setLogs((prev) => [...prev, event.payload.line].slice(-200));
+      });
+      if (disposed) stop();
+      else unlisten = stop;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  const start = async () => {
+    setBusy(true);
+    try {
+      const parsed = Number(port);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+        throw new Error("端口必须是 1-65535 之间的整数");
+      }
+      await api.proxyStart(parsed, domains);
+      toast.success(`代理已启动，系统代理已指向 127.0.0.1:${parsed}`);
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const stop = async () => {
+    setBusy(true);
+    try {
+      await api.proxyStop();
+      toast.success("代理已停止，系统代理已还原");
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const genCert = async () => {
+    setBusy(true);
+    try {
+      const res = await api.proxyCertGenerate();
+      toast.success(`CA 证书已就绪：${res.caCerPath}`);
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const captureLocal = async () => {
+    setBusy(true);
+    try {
+      const res = await api.proxyCaptureLocal();
+      if (res.ok) toast.success(res.message ?? "已从本机捕获凭证");
+      else toast.warning(res.message ?? "未在本机找到可捕获的凭证");
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const existing = config?.existingSystemProxy;
+
+  return (
+    <SettingsGroup id="settings-proxy" title="本地代理">
+      <CardContent className="space-y-0 p-0">
+        <p className="px-4 pt-4 text-xs text-muted-foreground sm:px-5">
+          拦截目标域名的请求，为每个账号注入独立设备标识，并自动抓取登录凭证。
+          代理运行期间会接管系统代理设置，停止时还原。
+        </p>
+
+        <SettingsFieldRow
+          label="运行状态"
+          description={
+            existing && existing[0]
+              ? `检测到系统原有代理：${existing[1]}（停止时会还原为它）`
+              : "当前未检测到系统代理，停止时会清空代理设置"
+          }
+        >
+          <Badge variant={running ? "secondary" : "outline"}>{running ? "运行中" : "已停止"}</Badge>
+        </SettingsFieldRow>
+
+        <SettingsFieldRow label="监听端口" description="仅监听 127.0.0.1，不对局域网开放">
+          <Input
+            value={port}
+            onChange={(e) => setPort(e.target.value)}
+            disabled={running}
+            className="w-full sm:w-32"
+            aria-label="代理端口"
+          />
+        </SettingsFieldRow>
+
+        <SettingsFieldRow
+          label="拦截域名"
+          description="逗号分隔，按后缀匹配；未命中的请求透明转发，不影响其他应用上网"
+        >
+          <Input
+            value={domains}
+            onChange={(e) => setDomains(e.target.value)}
+            disabled={running}
+            className="w-full font-mono text-xs sm:w-80"
+            aria-label="拦截域名"
+          />
+        </SettingsFieldRow>
+
+        <SettingsFieldRow
+          label="CA 证书"
+          description={
+            cert?.caExists
+              ? "已生成。需在系统中信任后 HTTPS 拦截才生效"
+              : "尚未生成。首次启动代理时会自动创建"
+          }
+        >
+          <div className="flex gap-2">
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => void genCert()}>
+              生成
+            </Button>
+          </div>
+        </SettingsFieldRow>
+
+        {cert && !cert.caExists && (
+          <Alert className="!w-auto mx-4 my-3 sm:mx-5">
+            <AlertDescription className="text-xs">{cert.hint}</AlertDescription>
+          </Alert>
+        )}
+
+        <div className="flex flex-wrap gap-2 px-4 py-4 sm:px-5">
+          {running ? (
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => void stop()}>
+              <Loader2 className={cn("size-3.5", busy && "animate-spin")} />
+              停止代理
+            </Button>
+          ) : (
+            <Button size="sm" disabled={busy} onClick={() => void start()}>
+              <Loader2 className={cn("size-3.5", busy && "animate-spin")} />
+              启动代理
+            </Button>
+          )}
+          <Button size="sm" variant="outline" disabled={busy} onClick={() => void captureLocal()}>
+            从本机捕获凭证
+          </Button>
+          <Button size="sm" variant="ghost" disabled={busy} onClick={() => void load()}>
+            <RefreshCw className="size-3.5" />
+            刷新状态
+          </Button>
+        </div>
+
+        {logs.length > 0 && (
+          <div className="px-4 pb-4 sm:px-5">
+            <div className="mb-1 text-xs font-medium">代理日志</div>
+            <pre className="max-h-40 overflow-auto rounded-lg border border-border/60 bg-muted/40 p-2 text-[11px] leading-5">
+              {logs.join("\n")}
+            </pre>
+          </div>
+        )}
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/**
+ * 计划任务：把签到 / 保活 / 额度巡检注册为 Windows 计划任务。
+ *
+ * 为什么需要系统级计划任务而不只靠应用内调度：应用内调度只在应用运行时有效。
+ * 用户不会 24 小时开着这个工具，而「每天签到」必须每天都发生。
+ */
+function ScheduledTaskCard() {
+  const [tasks, setTasks] = useState<api.TaskStatusItem[]>([]);
+  const [times, setTimes] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await api.taskStatus();
+      setTasks(res.tasks);
+      setTimes((prev) => {
+        const next = { ...prev };
+        for (const task of res.tasks) {
+          if (next[task.kind] === undefined) {
+            // 已注册的沿用系统里的时间；未注册的给个合理默认
+            next[task.kind] = task.registered && task.time ? task.time : defaultTimeFor(task.kind);
+          }
+        }
+        return next;
+      });
+    } catch (e) {
+      toast.error(api.asError(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const register = async (kind: string) => {
+    setBusy(true);
+    try {
+      const res = await api.taskRegister(kind, times[kind] ?? "09:00");
+      toast.success(res.message);
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const unregister = async (kind: string) => {
+    setBusy(true);
+    try {
+      await api.taskUnregister(kind);
+      toast.success("已删除计划任务");
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runNow = async (kind: string) => {
+    setBusy(true);
+    try {
+      const res = await api.taskRunNow(kind);
+      if (res.ok) toast.success("任务执行完成");
+      else toast.warning(`任务执行结束但返回非零（退出码 ${res.exitCode}），请查看日志`);
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <SettingsGroup id="settings-tasks" title="计划任务">
+      <CardContent className="space-y-0 p-0">
+        <p className="px-4 pt-4 text-xs text-muted-foreground sm:px-5">
+          注册为 Windows 计划任务后，即使应用没在运行也会按时执行。
+          应用内调度仍然生效，两者互补。
+        </p>
+        {tasks.map((task, index) => (
+          <div
+            key={task.kind}
+            className={cn(
+              "space-y-2 px-4 py-4 sm:px-5",
+              index < tasks.length - 1 && "border-b border-border/60",
+            )}
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm font-medium">{task.label}</span>
+              <Badge variant={task.registered ? "secondary" : "outline"}>
+                {task.registered ? `已注册 ${task.time || ""}`.trim() : "未注册"}
+              </Badge>
+            </div>
+            {task.error && (
+              <p className="text-xs text-destructive">{task.error}</p>
+            )}
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                value={times[task.kind] ?? ""}
+                onChange={(e) =>
+                  setTimes((prev) => ({ ...prev, [task.kind]: e.target.value }))
+                }
+                placeholder="09:00"
+                className="w-24"
+                aria-label={`${task.label} 执行时间`}
+              />
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={busy}
+                onClick={() => void register(task.kind)}
+              >
+                {task.registered ? "更新时间" : "注册"}
+              </Button>
+              {task.registered && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={busy}
+                  onClick={() => void unregister(task.kind)}
+                >
+                  删除
+                </Button>
+              )}
+              <Button size="sm" variant="ghost" disabled={busy} onClick={() => void runNow(task.kind)}>
+                立即执行
+              </Button>
+            </div>
+          </div>
+        ))}
+        {tasks.length === 0 && (
+          <p className="px-4 py-4 text-xs text-muted-foreground sm:px-5">
+            正在读取计划任务状态…
+          </p>
+        )}
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/** 各任务的默认执行时间。 */
+function defaultTimeFor(kind: string): string {
+  switch (kind) {
+    case "trae_checkin":
+      return "09:00";
+    case "doubao_renew":
+      return "09:00";
+    case "doubao_quota":
+      return "09:30";
+    default:
+      return "09:00";
+  }
+}
+
 /** 设置页：自动签到配置 / 权限检测 / 更新配置。 */
 export default function SettingsPage() {
   return (
@@ -954,6 +1442,9 @@ export default function SettingsPage() {
 
       <div className="min-w-0 space-y-12">
         <AppearanceCard />
+        <AppEnvCard />
+        <ProxyCard />
+        <ScheduledTaskCard />
         <PermissionCheckCard />
         <AutoCheckinCard />
         <AutoRotateCard />

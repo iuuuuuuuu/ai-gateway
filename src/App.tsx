@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
-import { ArrowUp, Bot, MessagesSquare, Server, Settings, Sparkles, User } from "lucide-react";
+import { ArrowUp, Bot, MessageCircle, MessagesSquare, Server, Settings, Sparkles, Terminal, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
@@ -11,6 +11,8 @@ import TokenStatsPage from "@/pages/TokenStatsPage";
 import GatewayPage from "@/pages/GatewayPage";
 import AgentsPage from "@/pages/AgentsPage";
 import SettingsPage from "@/pages/SettingsPage";
+import TraePage from "@/pages/TraePage";
+import DoubaoPage from "@/pages/DoubaoPage";
 import { StatusDot, AppIconMark } from "@/components/product-marks";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { Badge } from "@/components/ui/badge";
@@ -123,7 +125,7 @@ function Layout() {
                 fontWeight: 640,
               }}
             >
-              WorkBuddy Switch
+              AI Gateway
             </div>
             {demoModeEnabled && (
               <Badge variant="secondary" className="mt-1 h-5 border-0 px-1.5 text-[10px] text-sidebar-foreground/60 shadow-none">
@@ -192,6 +194,34 @@ function Layout() {
             智能体管理
           </NavLink>
           <NavLink
+            to="/trae"
+            className={({ isActive }) =>
+              cn(
+                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+                isActive
+                  ? "bg-foreground/[0.06] font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+              )
+            }
+          >
+            <Terminal className="size-4" />
+            Trae 账号
+          </NavLink>
+          <NavLink
+            to="/doubao"
+            className={({ isActive }) =>
+              cn(
+                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+                isActive
+                  ? "bg-foreground/[0.06] font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+              )
+            }
+          >
+            <MessageCircle className="size-4" />
+            豆包账号
+          </NavLink>
+          <NavLink
             to="/settings"
             className={({ isActive }) =>
               cn(
@@ -233,6 +263,8 @@ export default function App() {
             <Route path="/token-stats" element={<TokenStatsPage />} />
             <Route path="/gateway" element={<GatewayPage />} />
             <Route path="/agents" element={<AgentsPage />} />
+            <Route path="/trae" element={<TraePage />} />
+            <Route path="/doubao" element={<DoubaoPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>

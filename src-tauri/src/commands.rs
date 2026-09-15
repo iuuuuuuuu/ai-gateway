@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use tauri::Emitter;
-use wb_switch_core::modules::{
+use ai_gateway_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits, export_import, oauth,
     process, refresh, rotate, session, switch, token_stats, travel, update,
 };
@@ -293,7 +293,7 @@ pub fn check_auth_permission() -> Value {
             "ok": false,
             "error": e.to_string(),
             "dir": path.parent().map(|p| p.to_string_lossy().to_string()),
-            "hint": "请在 系统设置→隐私与安全性 中授权：优先「App 管理」开启 wb-switch，若没有则去「完全磁盘访问」把 wb-switch 拖进去；授权后需重启 App 生效",
+            "hint": "请在 系统设置→隐私与安全性 中授权：优先「App 管理」开启 ai-gateway，若没有则去「完全磁盘访问」把 ai-gateway 拖进去；授权后需重启 App 生效",
         }),
     }
 }
@@ -661,7 +661,7 @@ pub fn set_launch_at_login_enabled(_app: tauri::AppHandle, enabled: bool) -> Res
 // ---------------------------------------------------------------------------
 // 兼容网关（workbuddy2api）—— 桌面 GUI 命令
 //
-// 与 server 版共用 wb_switch_core::modules::gateway，因此行为一致：
+// 与 server 版共用 ai_gateway_core::modules::gateway，因此行为一致：
 // 同一套端口检测、账号导出、进程托管逻辑。
 // 区别：GUI 直接在进程内调用，不起 HTTP 服务，也不需要浏览器。
 // ---------------------------------------------------------------------------
@@ -669,20 +669,20 @@ pub fn set_launch_at_login_enabled(_app: tauri::AppHandle, enabled: bool) -> Res
 /// 网关运行态 + 账号池详情。
 #[tauri::command]
 pub async fn get_gateway_status() -> Result<Value, String> {
-    Ok(wb_switch_core::modules::gateway::gateway_status().await)
+    Ok(ai_gateway_core::modules::gateway::gateway_status().await)
 }
 
 /// 读取网关配置。
 #[tauri::command]
 pub fn get_gateway_config() -> Result<Value, String> {
-    let cfg = wb_switch_core::modules::gateway::load_gateway_config();
-    let exe = wb_switch_core::modules::gateway::resolve_gateway_exe();
+    let cfg = ai_gateway_core::modules::gateway::load_gateway_config();
+    let exe = ai_gateway_core::modules::gateway::resolve_gateway_exe();
     Ok(json!({
         "config": cfg,
         "exeFound": exe.is_some(),
         "exePath": exe.map(|p| p.to_string_lossy().to_string()),
-        "exeSource": wb_switch_core::modules::gateway::gateway_source(),
-        "authDir": wb_switch_core::modules::gateway::gateway_auth_dir().to_string_lossy(),
+        "exeSource": ai_gateway_core::modules::gateway::gateway_source(),
+        "authDir": ai_gateway_core::modules::gateway::gateway_auth_dir().to_string_lossy(),
     }))
 }
 
@@ -715,7 +715,7 @@ pub fn save_gateway_config(
     if let Some(u) = pinned_uid {
         patch.insert("pinned_uid".to_string(), json!(u));
     }
-    let v = wb_switch_core::modules::gateway::save_gateway_config(&Value::Object(patch))?;
+    let v = ai_gateway_core::modules::gateway::save_gateway_config(&Value::Object(patch))?;
     Ok(json!({ "config": v }))
 }
 
@@ -725,7 +725,7 @@ pub fn check_gateway_port(port: u16) -> Result<Value, String> {
     if port == 0 {
         return Err("端口号需在 1-65535 之间".to_string());
     }
-    Ok(wb_switch_core::modules::gateway::inspect_port(port))
+    Ok(ai_gateway_core::modules::gateway::inspect_port(port))
 }
 
 /// 切换网关工作模式并立即生效（重导出凭证 + 按需重启）。
@@ -735,8 +735,8 @@ pub fn check_gateway_port(port: u16) -> Result<Value, String> {
 /// 合成一步，让「负载均衡 ↔ 指定账号」点击即生效。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn switch_gateway_mode(mode: String, pinned_uid: Option<String>) -> Result<Value, String> {
-    let mode = wb_switch_core::modules::gateway::GatewayMode::from_str(&mode);
-    let result = wb_switch_core::modules::gateway::switch_mode(mode, pinned_uid).await;
+    let mode = ai_gateway_core::modules::gateway::GatewayMode::from_str(&mode);
+    let result = ai_gateway_core::modules::gateway::switch_mode(mode, pinned_uid).await;
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
         let msg = result
             .get("error")
@@ -753,7 +753,7 @@ pub async fn switch_gateway_mode(mode: String, pinned_uid: Option<String>) -> Re
 /// 网关运行时自动重启以生效（模型锁定由网关启动时读取，与切换模式同理）。
 #[tauri::command]
 pub async fn set_allowed_model(model: String) -> Result<Value, String> {
-    let result = wb_switch_core::modules::gateway::set_allowed_model(&model).await;
+    let result = ai_gateway_core::modules::gateway::set_allowed_model(&model).await;
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
         let msg = result
             .get("error")
@@ -772,17 +772,17 @@ pub async fn start_gateway(port: Option<u16>) -> Result<Value, String> {
         if p == 0 {
             return Err("端口号需在 1-65535 之间".to_string());
         }
-        wb_switch_core::modules::gateway::save_gateway_config(&json!({ "port": p }))?;
+        ai_gateway_core::modules::gateway::save_gateway_config(&json!({ "port": p }))?;
     }
-    let cfg = wb_switch_core::modules::gateway::load_gateway_config();
-    match wb_switch_core::modules::gateway::start_gateway(&cfg).await {
+    let cfg = ai_gateway_core::modules::gateway::load_gateway_config();
+    match ai_gateway_core::modules::gateway::start_gateway(&cfg).await {
         Ok(v) => {
-            wb_switch_core::modules::gateway::update_runtime_state("started", None);
+            ai_gateway_core::modules::gateway::update_runtime_state("started", None);
             Ok(v)
         }
         Err(e) => {
             let msg = e.clone();
-            wb_switch_core::modules::gateway::update_runtime_state("failed", Some(e));
+            ai_gateway_core::modules::gateway::update_runtime_state("failed", Some(e));
             Err(msg)
         }
     }
@@ -791,24 +791,24 @@ pub async fn start_gateway(port: Option<u16>) -> Result<Value, String> {
 /// 停止网关。
 #[tauri::command]
 pub fn stop_gateway() -> Result<Value, String> {
-    let r = wb_switch_core::modules::gateway::stop_gateway();
-    wb_switch_core::modules::gateway::update_runtime_state("stopped", None);
+    let r = ai_gateway_core::modules::gateway::stop_gateway();
+    ai_gateway_core::modules::gateway::update_runtime_state("stopped", None);
     Ok(r)
 }
 
 /// 重启网关（应用新配置/新账号）。
 #[tauri::command]
 pub async fn restart_gateway() -> Result<Value, String> {
-    wb_switch_core::modules::gateway::stop_gateway();
+    ai_gateway_core::modules::gateway::stop_gateway();
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    let cfg = wb_switch_core::modules::gateway::load_gateway_config();
-    wb_switch_core::modules::gateway::start_gateway(&cfg).await
+    let cfg = ai_gateway_core::modules::gateway::load_gateway_config();
+    ai_gateway_core::modules::gateway::start_gateway(&cfg).await
 }
 
 /// 双向同步账号；auto_reload 时按需重启网关。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn sync_gateway_accounts(auto_reload: Option<bool>) -> Result<Value, String> {
-    Ok(wb_switch_core::modules::gateway::sync_and_reload(auto_reload.unwrap_or(true)).await)
+    Ok(ai_gateway_core::modules::gateway::sync_and_reload(auto_reload.unwrap_or(true)).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -817,7 +817,7 @@ pub async fn sync_gateway_accounts(auto_reload: Option<bool>) -> Result<Value, S
 
 /// 网关根地址（不带 /v1），供客户端配置使用。
 fn gateway_root_base() -> (String, String, u16) {
-    let cfg = wb_switch_core::modules::gateway::load_gateway_config();
+    let cfg = ai_gateway_core::modules::gateway::load_gateway_config();
     let port = cfg.get("port").and_then(Value::as_u64).unwrap_or(7863) as u16;
     let api_key = cfg
         .get("api_key")
@@ -831,7 +831,7 @@ fn gateway_root_base() -> (String, String, u16) {
 #[tauri::command]
 pub fn detect_agent_clients() -> Result<Value, String> {
     let (base, api_key, _) = gateway_root_base();
-    let targets = wb_switch_core::modules::agent_import::detect_all(&base, &api_key);
+    let targets = ai_gateway_core::modules::agent_import::detect_all(&base, &api_key);
     Ok(json!({
         "base": base,
         "hasApiKey": !api_key.is_empty(),
@@ -851,14 +851,14 @@ pub fn detect_agent_clients() -> Result<Value, String> {
 #[tauri::command]
 pub async fn get_gateway_models() -> Result<Value, String> {
     Ok(json!({
-        "models": wb_switch_core::modules::gateway::fetch_models().await,
+        "models": ai_gateway_core::modules::gateway::fetch_models().await,
     }))
 }
 
 /// 获取网关累计 Token 用量统计（days 省略 = 全部历史）。
 #[tauri::command]
 pub async fn get_gateway_usage(days: Option<i64>) -> Result<Value, String> {
-    Ok(wb_switch_core::modules::gateway::fetch_usage(days).await)
+    Ok(ai_gateway_core::modules::gateway::fetch_usage(days).await)
 }
 
 /// 把网关接入指定客户端（写配置 + 自动备份，支持多模型）。
@@ -880,7 +880,7 @@ pub fn import_agent_client(
         },
     };
 
-    let outcome = wb_switch_core::modules::agent_import::import_target(
+    let outcome = ai_gateway_core::modules::agent_import::import_target(
         &target, &base, &api_key, &model_list,
     )?;
     Ok(json!({
@@ -910,10 +910,10 @@ pub fn batch_import_agent_clients(
 
     let outcomes = match targets {
         Some(ids) if !ids.is_empty() => {
-            wb_switch_core::modules::agent_import::import_targets(&ids, &base, &api_key, &model_list)?
+            ai_gateway_core::modules::agent_import::import_targets(&ids, &base, &api_key, &model_list)?
         }
         _ => {
-            wb_switch_core::modules::agent_import::import_all_installed(&base, &api_key, &model_list)?
+            ai_gateway_core::modules::agent_import::import_all_installed(&base, &api_key, &model_list)?
         }
     };
 
@@ -933,7 +933,7 @@ pub fn batch_import_agent_clients(
 /// 回滚某个客户端到导入前的配置。
 #[tauri::command(rename_all = "camelCase")]
 pub fn restore_agent_client(target: String, backup_id: Option<String>) -> Result<Value, String> {
-    let backups = wb_switch_core::modules::agent_import::list_backups(&target);
+    let backups = ai_gateway_core::modules::agent_import::list_backups(&target);
     let id = match backup_id {
         Some(id) if !id.trim().is_empty() => id,
         _ => backups
@@ -943,7 +943,7 @@ pub fn restore_agent_client(target: String, backup_id: Option<String>) -> Result
             .ok_or_else(|| format!("没有找到 {target} 的备份记录"))?
             .to_string(),
     };
-    let restored = wb_switch_core::modules::agent_import::restore_backup(&target, &id)?;
+    let restored = ai_gateway_core::modules::agent_import::restore_backup(&target, &id)?;
     Ok(json!({ "ok": true, "restored": restored, "backupId": id }))
 }
 
@@ -951,7 +951,7 @@ pub fn restore_agent_client(target: String, backup_id: Option<String>) -> Result
 #[tauri::command]
 pub fn list_agent_backups(target: String) -> Result<Value, String> {
     Ok(json!({
-        "backups": wb_switch_core::modules::agent_import::list_backups(&target),
+        "backups": ai_gateway_core::modules::agent_import::list_backups(&target),
     }))
 }
 

@@ -17,17 +17,17 @@
     不匹配就秒级失败，绝不浪费一次完整构建。
 
     私钥与口令的固定位置（均在仓库外，公开仓库零提交风险）：
-      %USERPROFILE%\.wb-switch\wb-switch-updater.key       minisign 私钥
-      %USERPROFILE%\.wb-switch\wb-switch-updater.password  私钥口令
+      %USERPROFILE%\.ai-gateway\ai-gateway-updater.key       minisign 私钥
+      %USERPROFILE%\.ai-gateway\ai-gateway-updater.password  私钥口令
 
 .PARAMETER Bundles
     要构建的 bundle 类型，默认 "nsis"（Windows 安装包）。多平台用逗号分隔，如 "nsis,msi"。
 
 .PARAMETER KeyFile
-    私钥文件路径，默认 %USERPROFILE%\.wb-switch\wb-switch-updater.key。
+    私钥文件路径，默认 %USERPROFILE%\.ai-gateway\ai-gateway-updater.key。
 
 .PARAMETER PasswordFile
-    口令文件路径，默认 %USERPROFILE%\.wb-switch\wb-switch-updater.password。
+    口令文件路径，默认 %USERPROFILE%\.ai-gateway\ai-gateway-updater.password。
 
 .PARAMETER CheckOnly
     只做密钥预检（路径、口令、keyid 与 tauri.conf.json 公钥是否配对），不执行构建。
@@ -48,13 +48,49 @@
 [CmdletBinding()]
 param(
     [string]$Bundles = "nsis",
-    [string]$KeyFile = (Join-Path $env:USERPROFILE ".wb-switch\wb-switch-updater.key"),
-    [string]$PasswordFile = (Join-Path $env:USERPROFILE ".wb-switch\wb-switch-updater.password"),
+    [string]$KeyFile = "",
+    [string]$PasswordFile = "",
     [switch]$CheckOnly
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot   # 仓库根
+
+# ── 密钥路径解析（含旧路径回退）─────────────────────────────────────────
+#
+# 更名后默认路径变成 ~/.ai-gateway/ai-gateway-updater.*，但**已发布的密钥仍在旧路径**
+# ~/.wb-switch/wb-switch-updater.* 下。
+#
+# 刻意不自动移动密钥文件：私钥丢失即无法再为已发布客户端签名新版本，
+# 而脚本自动搬运私钥是个不必要的风险面。改为「新路径优先、旧路径回退」，
+# 并在用到旧路径时明确提示用户，由用户自行决定是否迁移。
+function Resolve-KeyPath {
+    param(
+        [string]$Explicit,
+        [string]$NewName,
+        [string]$LegacyName
+    )
+    if ($Explicit) { return $Explicit }
+    $new = Join-Path $env:USERPROFILE ".ai-gateway\$NewName"
+    if (Test-Path -LiteralPath $new) { return $new }
+    $legacy = Join-Path $env:USERPROFILE ".wb-switch\$LegacyName"
+    if (Test-Path -LiteralPath $legacy) { return $legacy }
+    # 两者都不存在：返回新路径，让后续的存在性检查给出面向新路径的报错
+    return $new
+}
+
+if (-not $KeyFile) {
+    $KeyFile = Resolve-KeyPath -Explicit "" -NewName "ai-gateway-updater.key" -LegacyName "wb-switch-updater.key"
+}
+if (-not $PasswordFile) {
+    $PasswordFile = Resolve-KeyPath -Explicit "" -NewName "ai-gateway-updater.password" -LegacyName "wb-switch-updater.password"
+}
+
+if ($KeyFile -match '\.wb-switch\\') {
+    Write-Host "提示：正在使用更名前的旧密钥路径 $KeyFile" -ForegroundColor Yellow
+    Write-Host "      如需迁移到新路径，请手动把 .key 与 .password 复制到 %USERPROFILE%\.ai-gateway\ 并改名为 ai-gateway-updater.*" -ForegroundColor Yellow
+    Write-Host "      （脚本刻意不自动搬运私钥：私钥丢失即无法再为已发布客户端签名）" -ForegroundColor Yellow
+}
 
 # ── 工具函数 ────────────────────────────────────────────────────────────
 
@@ -136,7 +172,7 @@ $prevKey = $env:TAURI_SIGNING_PRIVATE_KEY
 $prevPw = $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 try {
     Push-Location $probeDir
-    Set-Content -LiteralPath (Join-Path $probeDir "probe.txt") -Value "wb-switch signing probe" -Encoding ascii
+    Set-Content -LiteralPath (Join-Path $probeDir "probe.txt") -Value "ai-gateway signing probe" -Encoding ascii
     $env:TAURI_SIGNING_PRIVATE_KEY = $keyContent
     $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $password
 

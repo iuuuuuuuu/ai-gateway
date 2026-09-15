@@ -1,0 +1,15 @@
+{
+  "name": "ai-gateway-linux-x64",
+  "version": "1.0.0",
+  "description": "ai-gateway platform binary (linux-x64)",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin"
+  ],
+  "license": "MIT"
+}

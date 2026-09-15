@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <!-- MiniMax Code：用「M」双峰 + 光标形状表达代码助手，矢量而非官方位图
+       （官方图标是受版权保护的美术资源，本仓库不内置） -->
+  <rect width="24" height="24" rx="5.5" fill="#111827"/>
+  <path d="M6.2 16.4V8.6l2.9 4.3 2.9-4.3v7.8"
+        stroke="#F9FAFB" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M15.4 9.6l3.4 3.2-3.4 3.2"
+        stroke="#34D399" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

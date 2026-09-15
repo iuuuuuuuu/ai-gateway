@@ -55,7 +55,7 @@ jobs:
         run: npm run build
 
       - name: 核心单测
-        run: cargo test -p wb-switch-core
+        run: cargo test -p ai-gateway-core
 
       # 全 workspace 编译（含 src-tauri 桌面壳）。--all-targets 会把测试代码
       # 也编一遍，所以平台门控写错（少一个 cfg）在这里就会红。

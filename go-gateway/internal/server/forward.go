@@ -227,6 +227,31 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 			lastBody = string(respBody)
 			lastTransportErr = nil
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+
+			// 上下文超长是**请求侧**错误：换号无用（同一请求体发给任何账号都同样失败），
+			// 继续轮转只会把整个请求体对着每个账号重传一遍（实测 1.12M token × 3），
+			// 最后还被伪装成「账号全部不可用」，把排查方向引向账号故障。
+			//
+			// 立即以真实状态返回，交由客户端精简上下文后重试。
+			// 不罚账号也不换号：账号状态完全不动（applyErrorPolicy 对请求侧错误
+			// 本就只换号不罚，这里连换号都省掉）。
+			//
+			// 这是**唯一**改变对外状态码的路径；其余失败仍沿用原有的
+			// 503 no_healthy_account 契约（账号池耗尽的语义）。
+			if kind == upstream.ErrContextTooLong {
+				uid := acct.UID
+				releaseHeld()
+				// 带上 UID：调用方在失败路径也要读 result.UID 记日志，
+				// 返回 nil 会让它空指针崩溃（本测试即抓到此点）。
+				return &chatResult{UID: uid}, status, &forwardFailure{
+					Kind:   FailureContextTooLong,
+					Status: status,
+					// 保留上游原文：下游客户端靠文案识别上下文溢出并触发自动压缩，
+					// 只回我们自己的措辞会让它认不出这是溢出。
+					Message: upstream.ContextTooLongMessage(string(respBody)),
+				}
+			}
+
 			h.applyErrorPolicy(acct.UID, model, kind, string(respBody))
 			fail(acct.UID)
 			continue
@@ -270,6 +295,50 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 	}
 	// 失败时也带上最后尝试过的账号，请求日志据此仍能显示 uid（与原实现一致）。
 	return &chatResult{UID: lastUID}, lastStatus, errors.New(msg)
+}
+
+// FailureKind 失败类别：决定回给客户端的错误码。
+//
+// 存在的意义是让**请求侧**错误说实话：旧实现无论什么原因都回
+// no_healthy_account + "all accounts unavailable (cooling/disabled)"，
+// 把「这次请求太大」伪装成「账号全挂了」，排查时被直接带偏（2026-09-15 现场）。
+type FailureKind int
+
+const (
+	// FailureUpstream 其余上游失败：沿用既有契约（503 no_healthy_account）。
+	// 账号池耗尽的语义由它承载，客户端据此稍后重试。
+	FailureUpstream FailureKind = iota
+	// FailureContextTooLong 请求上下文超出模型窗口：请求侧错误，换号无用。
+	FailureContextTooLong
+)
+
+// forwardFailure 一次需要特殊上报的转发失败。
+//
+// 只有需要偏离「503 no_healthy_account」默认契约的失败才用它；
+// 其余失败仍是普通 error，行为与旧实现完全一致。
+type forwardFailure struct {
+	Kind    FailureKind
+	Status  int    // 回给客户端的 HTTP 状态
+	Message string // 面向客户端的错误消息
+}
+
+func (e *forwardFailure) Error() string { return e.Message }
+
+// failureOf 取出 *forwardFailure（若有），供各协议入口按类别选错误码。
+func failureOf(err error) *forwardFailure {
+	var f *forwardFailure
+	if errors.As(err, &f) {
+		return f
+	}
+	return nil
+}
+
+// errText 供各协议入口取失败文案。
+func errText(err error) string {
+	if err == nil {
+		return "unknown error"
+	}
+	return err.Error()
 }
 
 // release 供调用方在流式转发结束后归还租约。

@@ -24,9 +24,9 @@ These instructions are for AI assistants working in this project.
 
 Token 统计与网关的接口契约可直接查阅实现本身：
 
-- `crates/wb-switch-core/src/modules/token_stats.rs` — Token 统计聚合
+- `crates/ai-gateway-core/src/modules/token_stats.rs` — Token 统计聚合
   （`get_statistics(days: Option<i64>)`）
-- `crates/wb-switch-server/src/api.rs` — HTTP 路由（含 `GET /api/token-stats`）
+- `crates/ai-gateway-server/src/api.rs` — HTTP 路由（含 `GET /api/token-stats`）
 - `src-tauri/src/commands.rs` — 对应的 Tauri 命令包装
 
 <!-- TRELLIS:END -->
@@ -43,8 +43,8 @@ Token 统计与网关的接口契约可直接查阅实现本身：
 构建带 updater 签名的安装包时，**不要再去搜索私钥**，位置与用法如下（固定不变）：
 
 - 一条命令：`pwsh scripts/build-signed.ps1`（仅校验密钥不构建：加 `-CheckOnly`）
-- 签名私钥：`%USERPROFILE%\.wb-switch\wb-switch-updater.key`（minisign 私钥）
-- 私钥口令：`%USERPROFILE%\.wb-switch\wb-switch-updater.password`
+- 签名私钥：`%USERPROFILE%\.ai-gateway\ai-gateway-updater.key`（minisign 私钥）
+- 私钥口令：`%USERPROFILE%\.ai-gateway\ai-gateway-updater.password`
 - 两者都在**仓库外**，`.gitignore` 已排除 `*.key`；**本仓库是公开仓库，严禁把口令写入任何被 git 跟踪的文件。**
 
 背景（改动相关代码前务必了解，否则会重复踩坑）：

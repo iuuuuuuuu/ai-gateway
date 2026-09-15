@@ -1,6 +1,6 @@
 <div align="center">
 
-# WorkBuddy Switch Gateway
+# AI Gateway
 
 **账号管理 + OpenAI 兼容网关，一个桌面应用搞定**
 
@@ -60,13 +60,83 @@
 | 会话复制 | 将当前账号的会话以新 ID 复制给目标账号（含 jsonl 正文、数据库索引、edge-sync 注册） |
 | 自动轮换 | 定时把「积分最紧迫」的账号设为后续会话默认账号，避免额度过期浪费 |
 
+### Trae 账号管理
+
+支持 **Trae Work** 与 **Trae**（Trae CN IDE）两个应用。两者是同一套 icube 内核的
+VS Code fork，**共用同一份账号库**，但登录态快照互相独立 —— 同一账号可以在两个
+应用里分别切换，互不影响。
+
+| 模块 | 能力 |
+|---|---|
+| 账号入库 | 粘贴 Cloud-IDE-JWT、本机使用痕迹自动发现（双应用合并） |
+| 账号切换 | 备份现场 → 关闭客户端 → 恢复目标快照 → 启动；保留一代备份可回退 |
+| 一键签到 | `status` 预检 → `claim`（仅网络异常重试）→ 错误分类 → 冷却落盘 |
+| 积分归属 | 三层兜底：claim 奖励字段 → 复查余额差值 → 旧行为 |
+| 设备指纹 | 按 uid 确定性派生 `device_id` / `session_id` / `market_user_id`，实现账号间设备隔离 |
+| 设备重置 | 6 层机器标识重置（`machineid` / 遥测 / aha 设备 / TinyStorage / 注册表 MachineGuid / webview 追踪） |
+
+**两套 uid 体系（最容易踩的坑）**：`storage.json` 里
+`iCubeAuthInfo://icube-dc:<uid>` 的 uid 属于**账户中心编号体系**，而账号库与 JWT
+`data.id` 属于 **Cloud-IDE 编号体系**。实测同一账号两者完全不同
+（`dc=199439841787403` vs `Cloud-IDE=2328112497170937`）。因此本机发现必须由
+**使用痕迹**（`icube_gtm.users`、`state.vscdb` 的 `solo.mobile.allowControl` 等）
+推导 Cloud-IDE uid；推导失败时明确标记「无法确认」并**拒绝入池** ——
+宁可不给候选，也不产生一个永远登录不上的重复账号。
+
+**登录态快照覆盖 15 个物理路径**（README 常说的「9 类核心文件」）：
+`storage.json`、`state.vscdb` 及其 WAL/SHM/backup 边车、`machineid`、`aha/`、
+`Preferences`、`Local State`、`Local Storage/leveldb`、`Network/`、
+`Partitions/trae-webview`、`Session Storage` 等。两个细节是硬性要求：
+
+- **恢复前必须删除现场残留的 `state.vscdb-wal` / `-shm`**：客户端强杀后 WAL 未
+  checkpoint，恢复时若保留，SQLite 启动会把**切换前账号**的登录证据回放回新库 ——
+  表现为「切换后账号没变」
+- **备份必须包含 WAL/SHM 边车**：客户端常被强杀，最新登录写入可能还在边车里，
+  漏拷会丢数据
+
+### 豆包账号管理
+
+| 模块 | 能力 |
+|---|---|
+| 账号入库 | 手动录入、本地代理抓包自动回写 |
+| 登录态切换 | 多 Profile 快照（Chromium 布局），含版本校验、单代回滚、防误覆盖守卫 |
+| 会话保活 | 启动客户端 → 等待落盘 → 优雅关闭，触发服务端 30 天滑动续期 |
+| 会话探活 | 两段式：权威探活（会员额度接口）+ 保活探活（回收服务端下发的新凭证） |
+| 会员额度 | 精确解析 + 宽容兜底两段式；支持单账号查询与全量巡检 |
+| 对话备份 | 客户端状态备份/恢复（IndexedDB + DoubaoStorage） |
+| 对话导出 | 官方 IM API 拉取正文，输出 markdown + json |
+
+**为什么保活靠「启动客户端」而不是 HTTP**：实测（豆包 Chromium 147）
+`Local State` 的 `os_crypt.encrypted_key` 经 DPAPI + AES-256-GCM 解出的**仍是
+二进制密文** —— 客户端在 Chromium 的 `v10` 之外还有一层客户端级加密，离线拿不到
+明文 `sessionid`。而字节 passport 是 30 天**滑动**续期：客户端带有效会话上线一次，
+服务端就顺延。所以保活 = 启动 → 等待 → 优雅关闭；cookie 解密只用于诊断。
+
+**抓包凭证回写有三条硬约束**（都来自实测踩坑）：
+
+- **目标账号取抓包文件自己的 uid**：早期用「uid 探测链」定位目标，而凭证来自抓包
+  文件，两者来源不同，实测导致两个账号拿到了**同一个** sessionid（跨账号污染）
+- **绝不自动建号**：浏览器网页版与其他字节系应用也会产生豆包 cookie，
+  无差别建号会污染账号池
+- **幂等**：`session_id`、`sid_guard`、`ttwid` 三者都没变时不写盘，
+  否则每 20 秒的轮询会把文件时间戳刷得毫无意义
+
+**多 Profile 遍历不可省**：豆包自带账号隔离，登录会话可能位于**任意** Profile。
+只抓 `Default` 会漏掉活跃会话，恢复后客户端打开的活跃 Profile 未登录 ——
+这是实测根因，不是理论担忧。恢复前还会校验快照 `schemaVersion` 与 leveldb 的
+`CURRENT` → `MANIFEST` 完整性，并修复 `Local State` 的活跃 Profile 指针。
+
+> **对话正文存在豆包云端**，按账号归属。本地备份的是客户端状态（会话列表缓存、
+> 技能配置）；恢复并重新登录后完整历史会从云端重新同步。需要把对话带走时用
+> 「导出对话」，它直接调官方接口拉取正文。
+
 ### 智能体管理
 
 把网关一键接入本机已安装的 AI 客户端（独立页面）。
 
 | 模块 | 能力 |
 |---|---|
-| 客户端探测 | 自动识别 11 类客户端的安装目录、配置文件与版本 |
+| 客户端探测 | 自动识别 12 类客户端的安装目录、配置文件与版本 |
 | 一键接入 | 按客户端实际协议写入网关地址、API Key 与所选模型，写入前自动备份 |
 | 多协议适配 | Anthropic Messages（Claude 系）、OpenAI Chat、OpenAI Responses（Codex / Grok） |
 | 模型注入 | 支持多模型；Claude 系按 Sonnet / Opus / Haiku / Fable 四槽位映射 |
@@ -74,7 +144,12 @@
 | 历史回滚 | 每次写入生成时间戳备份，页面内一键恢复至任意历史版本 |
 
 支持的客户端：Claude Code / Claude Desktop / Codex / DeepSeek Harness / OpenCode /
-Pi / Grok Build / ZCode / Kimi Code / OpenClaw / Hermes Agent。
+Pi / Grok Build / ZCode / Kimi Code / OpenClaw / Hermes Agent / MiniMax Code。
+
+> **MiniMax Code** 走 Anthropic Messages 协议（其配置用 `@ai-sdk/anthropic` 适配器）。
+> 接入时在 `~/.minimax/config.yaml` 的 `provider` 块注册本网关并把 `defaultModel`
+> 指向它；**原有的 MiniMax 官方 provider（含 `managed-login` 登录态）原样保留** ——
+> 官方账号与本网关可同时存在、随时切换。
 
 ### 兼容网关
 
@@ -229,7 +304,7 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 | **单实例保护** | 重复启动不会开出第二个窗口，而是聚焦（必要时从托盘唤回）已有实例 |
 | **官方身份校验** | 用网关 `/healthz` 的 `service` 标识确认应答者身份，避免「假启动成功」 |
 | **双区域支持** | 国服（codebuddy.cn）与国际版（workbuddy.ai）账号可共存于同一账号库，按账号 `domain` 自动路由 |
-| **智能体一键接入** | 11 类客户端自动写入网关配置（多协议 + 多模型），写入前自动备份、可回滚 |
+| **智能体一键接入** | 12 类客户端自动写入网关配置（多协议 + 多模型），写入前自动备份、可回滚 |
 | **客户端按区重启** | 切换账号时按账号区域关闭/启动对应客户端（国服 WorkBuddy / 国际版 WorkBuddy AI 互不干扰） |
 | **官方用量按区取数** | 国际版账号的官方请求用量与积分查询走 workbuddy.ai 域名，不再误发国服域名被拒 |
 
@@ -286,7 +361,7 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 |---|---|---|
 | 当前登录态 | `auth/workbuddy-desktop.info`、`workbuddy-desktop-ai.info` | 每区域各 1 个（固定文件名） |
 | 历史登录快照 | `auth/workbuddy-desktop[-ai].<时间>.<pid>.<uuid>.info` | 客户端每次登录/切换时留存 |
-| 切换备份 | `~/.wb-switch/backups/*.info` | 本工具每次切换账号前的备份 |
+| 切换备份 | `~/.ai-gateway/backups/*.info` | 本工具每次切换账号前的备份 |
 
 弹框里可勾选任意多个账号批量导入，并标注每个候选的来源、区域与凭证可用性
 （可保活 / 仅 access 有效 / 凭证已过期），已在账号库中的会标出「已在账号库」或「将更新」。
@@ -328,7 +403,7 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 > 数据，留着开关只会让用户切到 `all` 后得到一堆无意义的失败日志，故已移除。
 > 历史配置里残留的 `region_scope` 会被忽略。
 >
-> 若上游日后补齐了国际版接口，可手动把 `~/.wb-switch/gateway/gateway_native_config.json`
+> 若上游日后补齐了国际版接口，可手动把 `~/.ai-gateway/gateway/gateway_native_config.json`
 > 的 `schedule.checkin_scope` 改成 `"all"`，让**网关侧**的签到与旅行覆盖国际版
 > （默认 `"cn"`，不在界面上暴露）。App 侧无此开关。
 
@@ -340,25 +415,25 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 ## 架构设计
 
 ```
-┌──────────────────── wb-switch.exe（单一可执行文件）────────────────────┐
+┌──────────────────── ai-gateway.exe（单一可执行文件）────────────────────┐
 │                                                                        │
 │  桌面壳（Tauri 2 / Rust）                                               │
 │  ├─ 主窗口：内嵌 React 前端（账号管理 · Token 统计 · 积分统计 · 兼容网关）│
 │  ├─ 系统托盘与单实例保护                                                │
 │  └─ 后台任务：签到 · 保活 · 自动轮换 · 旅行 · 账号同步                   │
 │                                                                        │
-│  wb-switch-core（Rust 库）                                              │
+│  ai-gateway-core（Rust 库）                                              │
 │  ├─ account / auth_file / switch / session …   账号与登录态             │
 │  ├─ checkin / refresh / rotate / travel …      定时任务                 │
 │  ├─ gateway.rs                                 网关托管与账号桥接        │
 │  └─ gateway_embed.rs                           内嵌网关的释放与缓存      │
 │                                                                        │
 │  内嵌网关二进制（Go，gzip 压缩，构建期写入）                              │
-│  └─ 运行时释放为 ~/.wb-switch/gateway/bin/gateway-<指纹>.exe            │
+│  └─ 运行时释放为 ~/.ai-gateway/gateway/bin/gateway-<指纹>.exe            │
 └────────────────────────────────────────────────────────────────────────┘
             │                                        │
             ▼                                        ▼
-  ~/.wb-switch/accounts.json              ~/.wb-switch/gateway/
+  ~/.ai-gateway/accounts.json              ~/.ai-gateway/gateway/
      （账号库 · 唯一真源）                    └─ gateway_auths/
                                                  （网关凭证 · 派生素材）
 ```
@@ -393,27 +468,27 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 
 | 文件 | 说明 |
 |---|---|
-| `workbuddy-switch_<版本>_aarch64.dmg` | macOS（Apple Silicon）磁盘映像，拖入「应用程序」即安装 |
-| `workbuddy-switch_<版本>_x64.dmg` | macOS（Intel）磁盘映像，同上 |
-| `WorkBuddy.Switch.Gateway_<版本>_x64-setup.exe` | Windows 安装向导，自动创建开始菜单与卸载项 |
-| `WorkBuddy.Switch.Gateway_<版本>_x64_en-US.msi` | Windows MSI 包，适合批量部署 |
-| `WorkBuddy_Switch_Gateway_<版本>_portable.zip` | Windows 便携版，解压即用，不写入注册表 |
-| `WorkBuddy.Switch.Gateway_<版本>_amd64.deb` | Linux（Debian/Ubuntu）安装包 |
-| `WorkBuddy.Switch.Gateway_<版本>_amd64.AppImage` | Linux 免安装可执行文件 |
+| `ai-gateway_<版本>_aarch64.dmg` | macOS（Apple Silicon）磁盘映像，拖入「应用程序」即安装 |
+| `ai-gateway_<版本>_x64.dmg` | macOS（Intel）磁盘映像，同上 |
+| `AI.Gateway_<版本>_x64-setup.exe` | Windows 安装向导，自动创建开始菜单与卸载项 |
+| `AI.Gateway_<版本>_x64_en-US.msi` | Windows MSI 包，适合批量部署 |
+| `AI_Gateway_<版本>_portable.zip` | Windows 便携版，解压即用，不写入注册表 |
+| `AI.Gateway_<版本>_amd64.deb` | Linux（Debian/Ubuntu）安装包 |
+| `AI.Gateway_<版本>_amd64.AppImage` | Linux 免安装可执行文件 |
 
 ### 安装方式二：便携版（Windows，免安装）
 
-下载 `WorkBuddy_Switch_Gateway_<版本>_portable.zip`，解压后双击 `wb-switch-rust.exe`
+下载 `AI_Gateway_<版本>_portable.zip`，解压后双击 `ai-gateway.exe`
 即可运行，不写入注册表。
 
-> `WebView2Loader.dll` 必须与 `wb-switch-rust.exe` 位于同一目录，请勿删除。
+> `WebView2Loader.dll` 必须与 `ai-gateway.exe` 位于同一目录，请勿删除。
 
 ### 更新到新版本
 
 - **安装版（推荐）**：直接双击新版安装包即可**覆盖更新** —— 安装器不会询问是否
   卸载，安装目录沿用上次位置（自定义目录同样适用），只更新程序文件并把注册表版本
   提升到新版本；安装前会自动结束正在运行的旧版本。
-- **便携版**：解压新版便携包，把 `wb-switch-rust.exe` 覆盖到程序目录
+- **便携版**：解压新版便携包，把 `ai-gateway.exe` 覆盖到程序目录
   （`WebView2Loader.dll` 无需更换），重启应用即可。
 - **应用内更新**：应用检测到新版本后会提示下载并运行安装包，流程与双击安装包一致。
 
@@ -427,7 +502,7 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 > 网关源码随仓库分发在 `go-gateway/`，无需另行 clone 上游、也不需要打补丁。
 
 ```bash
-# 1) 构建网关（Go）—— 产物落到 crates/wb-switch-core/embedded/，
+# 1) 构建网关（Go）—— 产物落到 crates/ai-gateway-core/embedded/，
 #    cargo build 时由 build.rs 压缩内嵌进主程序
 sh scripts/build-gateway.sh                              # 当前平台
 GOOS=windows GOARCH=amd64 sh scripts/build-gateway.sh    # 交叉编译到指定平台
@@ -440,11 +515,11 @@ npm run tauri -- build --bundles nsis,msi                # Windows
 
 # 3) macOS 额外产出 dmg（无头环境也能打，不依赖 Finder）
 sh scripts/make-dmg.sh <版本> <aarch64|x86_64> \
-  "target/release/bundle/macos/WorkBuddy Switch Gateway.app"
+  "target/release/bundle/macos/AI Gateway.app"
 ```
 
 > macOS 产物为 adhoc 签名（无 Apple 开发者证书），首次打开若提示「已损坏」，执行
-> `xattr -cr "/Applications/WorkBuddy Switch Gateway.app"` 放行。
+> `xattr -cr "/Applications/AI Gateway.app"` 放行。
 
 开发调试命令：
 
@@ -462,17 +537,17 @@ Linux x64 三个平台并建 Release。日常 push 走 `.github/workflows/ci.yml
 
 **npm 版（webui）发布**：
 
-1. CI 在 tag 发布时编译 server 二进制，作为平台包 `workbuddy-switch-win32-x64` 发布到 npm registry
-2. `cd npm && npm publish`（包名 `workbuddy-switch`，postinstall 从平台包复制二进制到 `bin/`，不依赖 GitHub）
+1. CI 在 tag 发布时编译 server 二进制，作为平台包 `ai-gateway-win32-x64` 发布到 npm registry
+2. `cd npm && npm publish`（包名 `ai-gateway`，postinstall 从平台包复制二进制到 `bin/`，不依赖 GitHub）
 
 ### 目录结构
 
 ```
 src-tauri/src/       # Tauri command 薄包装与托盘
 crates/
-  wb-switch-core/    # 核心逻辑：账号/认证/切换/会话/签到/刷新/更新/配置/智能体接入
-  wb-switch-server/  # HTTP server + CLI：axum API + rust-embed 前端
-  wb-switch-gateway/ # 网关内核（Rust 移植版，chat_completions 仍为占位）
+  ai-gateway-core/    # 核心逻辑：账号/认证/切换/会话/签到/刷新/更新/配置/智能体接入
+  ai-gateway-server/  # HTTP server + CLI：axum API + rust-embed 前端
+  ai-gateway-router/ # 网关内核（Rust 移植版，chat_completions 仍为占位）
 src/                 # 前端：components/pages/lib（api.ts 双通道：Tauri invoke / HTTP fetch）
 go-gateway/          # Go 版网关源码（当前实际构建依赖，编译后内嵌）
 npm/                 # npm 包：package.json + bin + scripts/install.js
@@ -503,12 +578,12 @@ scripts/             # 构建与发布脚本
 
 ### 智能体管理
 
-1. 进入「智能体管理」页面，应用会自动探测本机 11 类客户端（安装目录、配置文件与版本）
+1. 进入「智能体管理」页面，应用会自动探测本机 12 类客户端（安装目录、配置文件与版本）
 2. 在顶部「分发模型配置」中选择要注入的模型：排第 1 位的自动作为默认主模型；
    Claude 系客户端按 Sonnet / Opus / Haiku / Fable 四个槽位顺序映射
 3. 单卡片「一键接入」只写入该客户端；顶部「一键更新所有已安装智能体」逐客户端执行，
    单个失败不会影响其他客户端
-4. 每次写入前自动备份到 `~/.wb-switch/agent-backups/<客户端>/<时间戳>/`，
+4. 每次写入前自动备份到 `~/.ai-gateway/agent-backups/<客户端>/<时间戳>/`，
    卡片「备份历史」中可查看并一键回滚
 
 > 接入会覆盖各客户端现有网关配置（每次均自动备份）。以 Claude Desktop 为例，
@@ -560,7 +635,7 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 
 ### 网关配置项
 
-配置文件位于 `~/.wb-switch/gateway/gateway_config.json`，也可在界面中修改：
+配置文件位于 `~/.ai-gateway/gateway/gateway_config.json`，也可在界面中修改：
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
@@ -586,6 +661,50 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 
 > 关闭积分巡检后，分层选号将只依赖签到与本应用同步的数据，到期档位更新会明显滞后。
 
+### Trae / 豆包 使用指南
+
+#### Trae
+
+1. 进入「Trae 账号」页面，用顶部标签切换 **Trae Work** / **Trae**
+2. 添加账号二选一：
+   - **粘贴 JWT**：从客户端登录态里取出 `Cloud-IDE-JWT` 贴进去，账号 id 自动解析
+   - **发现本机账号**：从客户端使用痕迹推导。标记为「无法确认」的候选**不会**入池
+     （它的编号属于账户中心体系，与账号库不是同一套编号）
+3. 账号列表里可执行：**切换**、**保存登录态**、**重置设备指纹**、**清除冷却**
+4. 点「一键签到」跑一轮；失败的账号按错误类型落冷却，不会反复撞限流
+
+> **保存登录态** = 把客户端当前的登录状态存进该账号的快照槽。
+> **切换** = 先备份现场、再恢复目标账号的快照，并保留一代备份可回退。
+
+#### 豆包
+
+1. 进入「豆包账号」页面
+2. 获取凭证（二选一）：
+   - **本地代理抓包**（推荐）：在「设置 → 本地代理」启动代理并信任 CA，
+     然后用豆包客户端访问一次，凭证会自动抓取并回写（页面每 20 秒轮询一次）
+   - **手动录入**：点「编辑」填写 `sessionid` / `sid_guard` / `ttwid`
+3. 账号列表里可执行：**探活**、**查询额度**、**备份/恢复对话状态**、
+   **导出对话**（markdown + json，输出到 `~/.ai-gateway/exports/`）
+4. 顶部按钮：「保活」（启动客户端触发会话续期）、「探活续期」（HTTP 探测）、
+   「额度巡检」（批量查询）、「诊断」（排查为什么读不到凭证）
+
+> 抓包回写**只认抓包文件自己的 uid**，且**绝不自动创建账号** ——
+> 浏览器网页版与其他字节系应用也会产生豆包 cookie，无差别建号会污染账号池。
+
+#### 本地代理
+
+代理拦截目标域名的请求，为每个账号注入独立设备标识，并自动抓取登录凭证。
+
+- **启动前会记下你原有的系统代理**，停止时原样还原；界面会显示检测到的原值
+- **CA 证书**需安装到「受信任的根证书颁发机构」，否则 HTTPS 拦截会因证书不受信而失败
+- 代理**意外崩溃**时会立刻还原系统代理（否则应用还在但系统代理指向死端口，本机断网）
+- 未命中的域名透明转发，不影响其他应用上网
+
+#### 计划任务
+
+「设置 → 计划任务」可把 Trae 签到 / 豆包保活 / 额度巡检注册为 Windows 计划任务，
+**即使应用没在运行也会按时执行**。可设置执行时间、随时删除，或点「立即执行」验证配置。
+
 ### 托盘与单实例
 
 - **关闭窗口**：隐藏到托盘而非退出，后台任务与网关继续运行
@@ -598,15 +717,37 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 
 | 内容 | 路径 | 说明 |
 |---|---|---|
-| 账号库 | `~/.wb-switch/accounts.json` | **唯一真源**，含所有账号凭证，建议单独备份 |
-| 网关凭证 | `~/.wb-switch/gateway/gateway_auths/` | 由账号库派生，删除后可自动重建 |
-| 网关配置 | `~/.wb-switch/gateway/gateway_config.json` | 端口、API Key、模式等 |
-| 网关原生配置 | `~/.wb-switch/gateway/gateway_native_config.json` | 转换后交给网关进程的配置 |
-| 内嵌网关副本 | `~/.wb-switch/gateway/bin/` | 按内容指纹命名，版本升级后自动更新 |
-| 智能体配置备份 | `~/.wb-switch/agent-backups/` | 一键接入前自动备份，可随时回滚 |
-| 签到 / 轮换日志 | `~/.wb-switch/*_logs.json` | 最多保留 30 天 |
+| 账号库 | `~/.ai-gateway/accounts.json` | **唯一真源**，含所有账号凭证，建议单独备份 |
+| Trae 账号库 | `~/.ai-gateway/trae_accounts.json` | Trae Work 与 Trae 共用（两者登录态独立） |
+| 豆包账号库 | `~/.ai-gateway/doubao_accounts.json` | 含会话凭证（等价于密码，勿分享） |
+| 网关凭证 | `~/.ai-gateway/gateway/gateway_auths/` | 由账号库派生，删除后可自动重建 |
+| 网关配置 | `~/.ai-gateway/gateway/gateway_config.json` | 端口、API Key、模式等 |
+| 网关原生配置 | `~/.ai-gateway/gateway/gateway_native_config.json` | 转换后交给网关进程的配置 |
+| 内嵌网关副本 | `~/.ai-gateway/gateway/bin/` | 按内容指纹命名，版本升级后自动更新 |
+| 登录态快照 | `~/.ai-gateway/profiles*/` | Trae 系与豆包各一套，含一代 `.bak` 回退 |
+| 豆包对话备份 | `~/.ai-gateway/doubao_chats/` | 客户端状态（对话正文在云端） |
+| 对话导出 | `~/.ai-gateway/exports/` | markdown + json |
+| 代理抓包日志 | `~/.ai-gateway/logs/` | 凭证已脱敏，但可能含其他请求信息 |
+| CA 证书 | `~/.ai-gateway/certs/` | 自签 CA，安装后请妥善保管私钥 |
+| 智能体配置备份 | `~/.ai-gateway/agent-backups/` | 一键接入前自动备份，可随时回滚 |
+| 签到 / 轮换日志 | `~/.ai-gateway/*_logs.json` | 最多保留 30 天 |
 
-> `accounts.json` 包含可直接登录的凭证，请勿分享或提交到版本库。
+> `accounts.json` 与 `doubao_accounts.json` 包含可直接登录的凭证，请勿分享或提交到版本库。
+
+### 从更名前的版本升级
+
+旧版本（`WorkBuddy Switch Gateway`）的数据在 `~/.wb-switch`。新版本首次启动会**自动迁移**：
+
+- **复制式**迁移：旧目录**原样保留**，新旧两版可并存，也可随时回退旧版
+- **并集合并**：账号库按 `(区域, uid)` 去重合并，新库里的条目优先（不会用旧值覆盖你后来的修改）
+- **只迁移一次**：完成标记写在 `~/.ai-gateway/.migrated-from-wb-switch`，
+  之后你在新版里删除的账号不会被旧目录「复活」
+- 设了 `AI_GATEWAY_HOME` 时不迁移（隔离环境不该被真实数据污染）
+
+> 签名私钥仍在旧路径 `~/.wb-switch/wb-switch-updater.key`。
+> `scripts/build-signed.ps1` 会**自动回退**到旧路径并提示；
+> 如需迁移请手动复制到 `%USERPROFILE%\.ai-gateway\` 并改名为 `ai-gateway-updater.*`
+> —— 脚本刻意不自动搬运私钥。
 
 ---
 
@@ -666,7 +807,7 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 **Q：「从本机导入」能找回历史登录过的账号吗？**
 > 能。它会扫描当前登录态（每区域 1 个固定文件）、客户端留存的历史登录快照
 > （`workbuddy-desktop[-ai].<时间>.<pid>.<uuid>.info`）以及本工具的切换备份
-> （`~/.wb-switch/backups/`），可在弹框里一次勾选多个账号导入。
+> （`~/.ai-gateway/backups/`），可在弹框里一次勾选多个账号导入。
 >
 > 同一 `(区域, uid)` 的多份文件只保留**凭证最新**的一份（按可用性 → 到期时间 →
 > 文件修改时间取优），避免旧快照里已被轮换的 refresh token 顶掉有效凭证。
@@ -678,7 +819,7 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 > 因此国际版模型来自内置静态表（取自客户端本地配置 `acc-product-config-v3.json`）。
 > 上游新增模型时需要同步更新该表。
 
-**Q：能同时运行上游的 workbuddy-switch 吗？**
+**Q：能同时运行上游的 ai-gateway 吗？**
 > 可以。两者的应用标识与安装目录不同，互不冲突。
 
 ---
@@ -688,8 +829,9 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 ### 项目结构
 
 ```
-crates/wb-switch-core/        核心逻辑（不依赖 Tauri，可被桌面端与 HTTP 服务复用）
+crates/ai-gateway-core/        核心逻辑（不依赖 Tauri，可被桌面端与 HTTP 服务复用）
   src/modules/account.rs        账号存储
+  src/modules/app_profile.rs    5 应用 × 3 快照布局的档案表（多应用扩展）
   src/modules/auth_file.rs      认证文件读写 + 本机历史登录态扫描（本项目扩展）
   src/modules/refresh.rs        Token 刷新与保活（含传输层失败与凭证失效的区分）
   src/modules/agent_import.rs   智能体一键接入与配置生成（本项目新增）
@@ -697,15 +839,49 @@ crates/wb-switch-core/        核心逻辑（不依赖 Tauri，可被桌面端�
   src/modules/gateway_embed.rs  内嵌网关的释放与缓存（本项目新增）
   src/modules/travel.rs         猫猫旅行（App 侧）
   src/modules/yaml_lite.rs      轻量 YAML 读写（本项目新增）
+  src/modules/switcher/         登录态切换器（多应用扩展）
+    mod.rs                       动作编排 + 进度回调 + 防误覆盖守卫
+    copy.rs                      替换语义拷贝 + 单代回滚 + 槽位解析
+    icube.rs                     Trae 系快照（15 项白名单、WAL 边车、对称恢复）
+    chromium.rs                  豆包快照（多 Profile、版本校验、活跃 Profile 修复）
+    proc.rs                      三层优雅关闭（WM_CLOSE → 温和 taskkill → 强制）
+    locate.rs                    6 级 exe 发现回退链
+    machine.rs                   6 层设备标识重置
+  src/modules/trae_account.rs   Trae 账号库与 JWT 解析（多应用扩展）
+  src/modules/trae_device.rs    Trae 账号级设备指纹确定性派生（多应用扩展）
+  src/modules/trae_checkin.rs   Trae 签到（错误分类、冷却、积分三层兜底）
+  src/modules/trae_discover.rs  双应用本机账号发现（两套 uid 体系）
+  src/modules/doubao_account.rs 豆包账号池与凭证（含抓包回写）（多应用扩展）
+  src/modules/doubao_session.rs 豆包保活与两段式探活（多应用扩展）
+  src/modules/doubao_quota.rs   豆包会员额度（精确解析 + 宽容兜底）
+  src/modules/doubao_chats.rs   豆包对话备份与官方 IM API 导出
+  src/modules/device_proxy/     MITM 设备代理（多应用扩展）
+    mod.rs                       代理生命周期 + 事件 trait
+    handler.rs                   请求拦截、JWT 与豆包凭证捕获
+    ca.rs                        自签 CA 与按域名签发叶子证书
+    upstream.rs                  上游连接（透传用户 VPN）
+    sys_proxy.rs                 Windows 系统代理编排（停止时原样还原）
+    bypass.rs                    OAuth 域名直连豁免
+    logger.rs                    抓包日志（凭证脱敏）
+    ws.rs                        WebSocket 观测桥接
+    local_capture.rs             本机离线凭证捕获
+  src/modules/scheduler.rs      Windows 计划任务（多应用扩展）
+  src/modules/cli_task.rs       CLI 任务模式（--task-run，刻意不启动 Tauri）
+  src/modules/migrate_store.rs  数据目录迁移（复制式、幂等）（多应用扩展）
   build.rs                      构建期压缩内嵌网关（本项目新增）
-crates/wb-switch-server/      HTTP 服务形态（npm / webui）
+crates/ai-gateway-router/      网关内核（Rust 版）
+crates/ai-gateway-server/      HTTP 服务形态（npm / webui）
 src/                          React 前端
   src/pages/GatewayPage.tsx     兼容网关页面（本项目新增）
   src/pages/AgentsPage.tsx      智能体管理页面（本项目新增）
+  src/pages/TraePage.tsx        Trae 账号页面（多应用扩展）
+  src/pages/DoubaoPage.tsx      豆包账号页面（多应用扩展）
   src/components/import-local-dialog.tsx  从本机批量导入账号（本项目新增）
 src-tauri/                    桌面壳（Tauri 2）
   src/tray.rs                   托盘与单实例行为
-  src/commands.rs               前端可调用的命令
+  src/commands.rs               WorkBuddy 系命令
+  src/commands_apps.rs          Trae / 豆包 / 计划任务命令（多应用扩展）
+  src/commands_proxy.rs         本地代理命令（多应用扩展）
 scripts/build-single.ps1      构建单一可执行文件（本项目新增）
 ```
 
@@ -716,7 +892,7 @@ cargo test --workspace          # 核心逻辑 + 桌面端单元测试
 npm run build                   # 前端类型检查与构建
 ```
 
-> Windows x64 上实测 `cargo test --workspace` 全部通过（229 个核心用例 + 55 个网关用例）。
+> Windows x64 上实测 `cargo test --workspace` 全部通过（454 个核心用例 + 55 个网关用例）。
 > 构建需要 **MSVC 工具链**（`stable-x86_64-pc-windows-msvc`，Tauri 依赖它链接
 > WebView2）；若需安装，可用
 > `winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`。
@@ -862,12 +1038,22 @@ cd path/to/workbuddy2api && go test ./...
 ```
 MIT License
 
-Copyright (c) 2026 wb-switch        （workbuddy-switch 原作者）
+Copyright (c) 2026 ai-gateway        （ai-gateway 原作者）
 Copyright (c) 2026 Sliverkiss        （workbuddy2api 原作者）
 Copyright (c) 2026 momo0410          （本项目整合部分）
 ```
 
 完整条款见 [`LICENSE`](./LICENSE)。
+
+---
+
+## 赞赏
+
+如果这个项目对你有帮助，欢迎请作者喝杯快乐水 ☕
+
+<div align="center">
+<img src="src/assets/donate-qr.jpg" alt="赞赏码" width="220" />
+</div>
 
 ---
 

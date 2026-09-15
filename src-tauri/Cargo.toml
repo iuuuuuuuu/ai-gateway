@@ -1,7 +1,7 @@
 [package]
-name = "wb-switch-rust"
-version = "0.8.4"
-description = "wb-switch —— WorkBuddy 账号切换工具（Rust/Tauri 版）"
+name = "ai-gateway"
+version = "1.0.0"
+description = "ai-gateway —— WorkBuddy 账号切换工具（Rust/Tauri 版）"
 authors = ["apple"]
 edition = "2021"
 
@@ -11,7 +11,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "wb_switch_rust_lib"
+name = "ai_gateway_lib"
 # 桌面版只需 rlib（iOS 用 staticlib）。
 #
 # 刻意去掉 cdylib：它是 Android 需要的产物类型，会让 GNU 链接器尝试导出
@@ -35,7 +35,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
-wb-switch-core = { path = "../crates/wb-switch-core" }
+ai-gateway-core = { path = "../crates/ai-gateway-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }

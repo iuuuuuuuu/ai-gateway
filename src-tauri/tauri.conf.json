@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "WorkBuddy Switch Gateway",
-  "version": "0.8.4",
-  "identifier": "com.momo0410.wbswitch.gateway",
+  "productName": "AI Gateway",
+  "version": "1.0.0",
+  "identifier": "com.momo0410.aigateway",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:14200",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "WorkBuddy Switch Gateway · 账号管理 + 兼容网关",
+        "title": "AI Gateway · 账号管理 + 兼容网关",
         "width": 1000,
         "height": 720,
         "minWidth": 720,

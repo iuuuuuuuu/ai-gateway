@@ -27,6 +27,7 @@ import deepseekIcon from "@/assets/agent-icons/deepseek.svg";
 import grokIcon from "@/assets/agent-icons/grok.svg";
 import hermesIcon from "@/assets/agent-icons/hermes.png";
 import kimiIcon from "@/assets/agent-icons/kimi-light.svg";
+import minimaxIcon from "@/assets/agent-icons/minimax-code.svg";
 import openclawIcon from "@/assets/agent-icons/openclaw.svg";
 import opencodeIcon from "@/assets/agent-icons/opencode.svg";
 import piIcon from "@/assets/agent-icons/pi-logo-on-light.svg";
@@ -69,6 +70,7 @@ const CLIENT_ICONS: Record<string, string> = {
   "kimi-code": kimiIcon,
   openclaw: openclawIcon,
   hermes: hermesIcon,
+  "minimax-code": minimaxIcon,
 };
 
 /** Claude 客户端的模型槽位上限：Sonnet / Opus / Haiku / Fable。 */
@@ -139,6 +141,12 @@ const CLIENT_METAS: Record<string, ClientMeta> = {
     protocol: "OpenAI Chat",
     protocolBadge: "POST /v1/chat/completions",
     description: "Hermes Agent 终端助手。自动在 custom_providers 列表挂载所有选定模型。",
+  },
+  "minimax-code": {
+    protocol: "Anthropic Messages",
+    protocolBadge: "POST /v1/messages",
+    description:
+      "MiniMax Code 桌面客户端。在 provider 块注册本网关（Anthropic 协议适配器），并把 defaultModel 指向它；官方 MiniMax 账号配置原样保留。",
   },
 };
 
@@ -712,7 +720,7 @@ export default function AgentsPage() {
           </div>
 
           <div className="text-[11px] text-muted-foreground">
-            支持 11 类智能体的一键写入、模型多选与历史无损回滚
+            支持 12 类智能体的一键写入、模型多选与历史无损回滚
           </div>
         </div>
 
