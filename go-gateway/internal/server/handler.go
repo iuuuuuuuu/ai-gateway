@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
@@ -310,14 +311,21 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	dynamicModelsCache.RUnlock()
 
-	acct := h.cfg.Pool.Pick()
+	acct := h.pickModelsProbeAccount()
 	if acct == nil {
 		return nil
 	}
 	infos, err := h.cfg.Upstream.FetchModels(acct)
 	if err != nil || len(infos) == 0 {
-		// 拉取失败惩罚该账号，避免下次 Pick 又选中同一个反复失败；lastFail 保持全局负缓存。
-		h.cfg.Pool.NoteError(acct.UID)
+		// **不喂熔断器**：/models 是「能力探测」接口（拿 contextWindow / efforts），
+		// 它的失败不代表该账号不能聊天 —— 实测国际版账号的
+		// /console/enterprises/personal/models 恒返回 500，而同账号的 chat 完全正常。
+		//
+		// 曾经这里调 NoteError(acct.UID)，导致：国际版账号恰好占据最早到期档位
+		// （分层选号优先选它们）→ 每次客户端启动探测模型都记一次失败 → 累计 3 次
+		// 触发 30 分钟熔断 → 界面上表现为「这几个国际版账号莫名被熔断」。
+		//
+		// 防重复请求由下面的 lastFail 负缓存负责，无需惩罚账号。
 		dynamicModelsCache.Lock()
 		dynamicModelsCache.lastFail = time.Now()
 		dynamicModelsCache.Unlock()
@@ -329,6 +337,34 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
 	dynamicModelsCache.Unlock()
 	return infos
+}
+
+// pickModelsProbeAccount 选一个用于探测 /models 的账号。
+//
+// 优先非国际版：国际版该端点恒 500（实测 5/5），选它只会浪费一次请求并让
+// 动态模型列表永远拉不到（只能退回静态表）。
+//
+// 为什么不用 Pool.Pick()：探测是**只读能力发现**，不需要遵循分层/轮转选号策略 ——
+// 那些策略的目的是「把流量导向最该用的账号」，而这里只需要一个能用的账号。
+// 用 Pick() 反而会固定选中「最早到期档位」（可能整档都是国际版）。
+//
+// 全是国际版时仍返回其中一个（而非 nil）：万一上游修好了该端点，可自愈。
+func (h *Handler) pickModelsProbeAccount() *auth.Auth {
+	var intlFallback *auth.Auth
+	for _, uid := range h.cfg.Pool.AvailableUIDs() {
+		a := h.cfg.Pool.AuthByUID(uid)
+		if a == nil {
+			continue
+		}
+		if upstream.IsIntl(a) {
+			if intlFallback == nil {
+				intlFallback = a
+			}
+			continue
+		}
+		return a
+	}
+	return intlFallback
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
