@@ -174,7 +174,23 @@ pub fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 本软件自身的数据目录（`~/.wb-switch`）。
+///
+/// 可用环境变量 `WB_SWITCH_HOME` 覆盖到任意目录，用于**开发/测试隔离**：
+/// 起一个独立实例、指向空目录，就不会动到正在使用的那份账号库与网关状态。
+///
+/// 为什么需要这个开关：Windows 上 `dirs::home_dir()` 走 `SHGetKnownFolderPath`，
+/// **不读 `USERPROFILE`**（实测：把 USERPROFILE 指到临时目录后，宿主服务仍然读到
+/// 真实的 ~/.wb-switch），因此光靠环境变量没法隔离数据目录。
+///
+/// 不设该变量时行为与之前完全一致（仍为 `~/.wb-switch`），对正常使用零影响。
 pub fn store_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("WB_SWITCH_HOME") {
+        let p = PathBuf::from(dir);
+        if !p.as_os_str().is_empty() {
+            return p;
+        }
+    }
     home_dir().join(".wb-switch")
 }
 
@@ -746,27 +762,38 @@ static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 /// 代理地址**复用**「设置 → 更新代理」里已填的值（`github_config.json` 的 `proxy`），
 /// 用户无需配两遍。未配置时不挂代理（保持原有直连行为）。
 fn http_client_builder() -> reqwest::ClientBuilder {
-    let builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(DEFAULT_HTTP_USER_AGENT);
-    match proxy_url() {
-        Some(proxy) => match reqwest::Proxy::all(&proxy) {
-            // 本机回环（网关 /healthz、/status、/v1/models）不能走代理 ——
-            // 否则「探测本地网关是否在跑」会被转发到远端代理而失败，
-            // 表现为网关明明活着却显示未就绪。
-            //
-            // 注意必须用 `Proxy::no_proxy`（排除指定主机），**不能**用
-            // `ClientBuilder::no_proxy()` —— 后者的语义是「清空所有代理 +
-            // 关闭系统代理」，会把上面刚设的代理一起删掉。实测踩过：
-            // `builder.proxy(p).no_proxy()` 导致代理完全不生效，
-            // 国际版积分查询仍报 error sending request。
-            Ok(p) => {
-                let no_proxy = reqwest::NoProxy::from_string("localhost,127.0.0.1,::1");
-                builder.proxy(p.no_proxy(no_proxy))
-            }
-            Err(_) => builder, // 地址非法：不挂代理，回落直连（由调用方报错）
-        },
-        None => builder,
+    apply_proxy(
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent(DEFAULT_HTTP_USER_AGENT),
+        proxy_url().as_deref(),
+    )
+}
+
+/// 把代理挂到 builder 上（抽成纯函数以便单测）。
+///
+/// `proxy` 为 None / 空串 → 原样返回（直连，保持原有行为）。
+///
+/// 本机回环（网关 /healthz、/status、/v1/models）不能走代理 —— 否则
+/// 「探测本地网关是否在跑」会被转发到远端代理而失败，表现为网关明明活着
+/// 却显示未就绪。
+///
+/// **注意**必须用 `Proxy::no_proxy(Some(NoProxy))`（排除指定主机），
+/// **不能**用 `ClientBuilder::no_proxy()` —— 后者的语义是「清空所有代理 +
+/// 关闭系统代理」，会把上面刚设的代理一起删掉。实测踩过：
+/// `builder.proxy(p).no_proxy()` 导致代理完全不生效，国际版积分查询仍报
+/// `error sending request`。
+fn apply_proxy(builder: reqwest::ClientBuilder, proxy: Option<&str>) -> reqwest::ClientBuilder {
+    let Some(raw) = proxy.map(str::trim).filter(|s| !s.is_empty()) else {
+        return builder;
+    };
+    match reqwest::Proxy::all(raw) {
+        Ok(p) => {
+            let no_proxy = reqwest::NoProxy::from_string("localhost,127.0.0.1,::1");
+            builder.proxy(p.no_proxy(no_proxy))
+        }
+        // 地址非法：不挂代理，回落直连（由调用方报错）
+        Err(_) => builder,
     }
 }
 
@@ -940,6 +967,173 @@ mod tests {
             .single()
             .expect("test timestamp must be unambiguous")
             .timestamp_millis()
+    }
+
+    // -----------------------------------------------------------------------
+    // 出站代理（宿主侧）
+    //
+    // 背景：reqwest 有两个名字极像、语义相反、且都不会编译报错的 API ——
+    //
+    //   Proxy::no_proxy(Option<NoProxy>)   排除指定主机，**保留**代理
+    //   ClientBuilder::no_proxy()          清空所有代理 + 关系统代理
+    //
+    // 最初误写成 `builder.proxy(p).no_proxy()`（本意是排除回环），实际把刚设的
+    // 代理删掉了 → 宿主仍直连 → 国际版积分查询报
+    // `error sending request for url (https://www.workbuddy.ai/...)`。
+    //
+    // 单看返回值无法区分这两种写法（都返回 builder），所以必须**发一个真实请求**
+    // 看它是否经过代理：这里起一个只会被「作为 HTTP 代理」访问到的本地监听端口，
+    // 请求一个不存在的目标域名 —— 若代理生效，监听端会收到 CONNECT 请求。
+    // -----------------------------------------------------------------------
+
+    /// 起一个本地假代理，返回 (端口, 收到请求的计数器)。
+    /// 假代理对任何 CONNECT 都回 200 然后立即关闭，仅用于证明「请求确实来了」。
+    fn spawn_fake_proxy() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("应能绑定本地端口");
+        let port = listener.local_addr().expect("应能取到端口").port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_bg = hits.clone();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                // 读一行就够了：CONNECT host:port HTTP/1.1
+                let mut line = String::new();
+                {
+                    let mut r = BufReader::new(&mut s);
+                    let _ = r.read_line(&mut line);
+                }
+                if line.starts_with("CONNECT") {
+                    hits_bg.fetch_add(1, Ordering::SeqCst);
+                }
+                // 回 200 让客户端认为隧道建立，然后关闭（客户端随后会失败，无妨）
+                let _ = s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
+                let _ = s.flush();
+            }
+        });
+
+        (port, hits)
+    }
+
+    /// 核心回归：挂了代理后，请求**必须**经过代理。
+    ///
+    /// 若误用 ClientBuilder::no_proxy()，代理被清空 → 请求直连 → 假代理
+    /// 收不到任何东西 → hits == 0 → 本测试失败。
+    #[tokio::test]
+    async fn proxy_is_actually_used_after_applying_no_proxy() {
+        use std::sync::atomic::Ordering;
+
+        let (port, hits) = spawn_fake_proxy();
+        let proxy = format!("http://127.0.0.1:{port}");
+
+        let client = apply_proxy(
+            reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)),
+            Some(&proxy),
+        )
+        .build()
+        .expect("client 应能构建");
+
+        // 目标域名故意不可达：我们只关心「请求是否先到了假代理」。
+        let _ = client
+            .get("https://workbuddy.ai.invalid/probe")
+            .send()
+            .await;
+
+        assert!(
+            hits.load(Ordering::SeqCst) > 0,
+            "请求没有经过代理 —— 代理被 no_proxy 清空了？\
+             （误用 ClientBuilder::no_proxy() 会导致此现象）"
+        );
+    }
+
+    /// 回环地址被排除：访问 127.0.0.1 时不走代理。
+    ///
+    /// 否则「探测本地网关是否在跑」会被转发到远端代理而失败，
+    /// 表现为网关明明活着却显示未就绪。
+    #[tokio::test]
+    async fn loopback_bypasses_proxy() {
+        use std::sync::atomic::Ordering;
+
+        // 目标是一个真实的本地服务（不是代理），它应被直接访问。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("应能绑定");
+        let port = listener.local_addr().expect("取端口").port();
+        let direct_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dh = direct_hits.clone();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut line = String::new();
+                {
+                    let mut r = BufReader::new(&mut s);
+                    let _ = r.read_line(&mut line);
+                }
+                if line.starts_with("GET") {
+                    dh.fetch_add(1, Ordering::SeqCst);
+                }
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+                let _ = s.flush();
+            }
+        });
+
+        // 代理指向一个不存在的端口：若回环流量误走代理，请求必然失败。
+        let (_proxy_port, proxy_hits) = spawn_fake_proxy();
+        let client = apply_proxy(
+            reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)),
+            Some(&format!("http://127.0.0.1:{_proxy_port}")),
+        )
+        .build()
+        .expect("client 应能构建");
+
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/probe"))
+            .send()
+            .await;
+
+        assert!(resp.is_ok(), "回环请求应直连成功，实际失败: {resp:?}");
+        assert!(
+            direct_hits.load(Ordering::SeqCst) > 0,
+            "回环请求没有到达本地服务"
+        );
+        assert_eq!(
+            proxy_hits.load(Ordering::SeqCst),
+            0,
+            "回环请求不应经过代理（NoProxy 未生效）"
+        );
+    }
+
+    /// 未配置代理时保持原有直连行为（不因新特性改变默认）。
+    #[tokio::test]
+    async fn no_proxy_configured_means_direct() {
+        use std::sync::atomic::Ordering;
+
+        let (port, hits) = spawn_fake_proxy();
+        let client = apply_proxy(
+            reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)),
+            None, // 未配置
+        )
+        .build()
+        .expect("client 应能构建");
+
+        // 请求本机另一个端口（直连），不应碰代理。
+        let _ = client.get(format!("http://127.0.0.1:{port}/x")).send().await;
+        // 此时假代理收到的是普通 GET（非 CONNECT），计数应为 0。
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "未配置代理时不应走代理"
+        );
+    }
+
+    /// 非法代理地址不应让 client 构建失败（回落直连）。
+    #[test]
+    fn invalid_proxy_falls_back_to_direct() {
+        let built = apply_proxy(reqwest::Client::builder(), Some("://bad")).build();
+        assert!(built.is_ok(), "非法代理地址应回落直连而不是报错");
     }
 
     #[test]
