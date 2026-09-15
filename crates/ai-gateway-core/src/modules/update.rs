@@ -69,9 +69,14 @@ pub fn load_github_config() -> Value {
             }
         }
     }
-    // 历史配置可能指向上游仓库（changexbc/ai-gateway 或 changexbc/ai-gateway）；
-    // 迁到本仓库，避免把用户更新成上游版本而丢失网关功能。
-    if owner == "changexbc" && (repo == "ai-gateway" || repo == "ai-gateway") {
+    // 历史配置可能指向上游仓库（changexbc/workbuddy-switch 或本仓库旧名
+    // workbuddy-switch-gateway）；迁到当前仓库，避免把用户更新成上游版本
+    // 而丢失网关功能。
+    //
+    // 注意：更名脚本曾把这里两个不同的仓库名都替换成了 "ai-gateway"，
+    // 使条件退化成 `repo == "ai-gateway" || repo == "ai-gateway"`（恒等重复），
+    // 于是上游配置根本不会被迁移。这里恢复成各自真实的名字。
+    if owner == "changexbc" && (repo == "workbuddy-switch" || repo == "workbuddy-switch-gateway") {
         repo = GITHUB_REPO.to_string();
         should_normalize = true;
     }
