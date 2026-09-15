@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -91,6 +92,21 @@ func main() {
 	}
 
 	up := upstream.New()
+	// 出站代理：必须在 New() 之后、其它 transport 调优之前设置 ——
+	// SetProxy 会重建 Transport，之后的调优（ResponseHeaderTimeout）才作用在新实例上。
+	//
+	// 为什么需要：国际版（workbuddy.ai）在国内直连不稳定（实测 wsarecv 超时），
+	// 走代理才稳。宿主把「设置 → 更新代理」里已填的地址复用到此处，用户无需配两遍。
+	// 地址无效不致命：记日志并继续直连，避免一个配置项导致网关起不来。
+	if proxy := strings.TrimSpace(cfg.Proxy); proxy != "" {
+		if err := up.SetProxy(proxy); err != nil {
+			log.Printf("proxy: 配置无效，忽略并直连：%v", err)
+		} else {
+			log.Printf("proxy: 出站请求经 %s", proxy)
+		}
+	} else {
+		log.Printf("proxy: 未配置（国际版账号在部分网络下可能超时，可在软件的「设置 → 更新代理」中填写）")
+	}
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
