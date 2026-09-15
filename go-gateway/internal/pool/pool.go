@@ -131,6 +131,15 @@ type entry struct {
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
 
+	// sessionDeadFails 连续 ErrSessionDead（12153）计数，达到阈值才禁用。
+	//
+	// 为什么需要它：12153 会被**临时性**触发（网络抖动 / 上游闪断 / refresh 竞态），
+	// 旧行为一次即 Disable，把健康账号永久杀掉 —— 实测发现一批 disabled 账号
+	// 其实 refresh 完全正常，是历史误判的受害者。
+	// 改为「连续 N 次才禁用」后，偶发失败不会杀号；
+	// 任何证明账号未死的时刻（refresh 成功 / chat 成功 / 手工复活）都清零。
+	sessionDeadFails int
+
 	// expireAt 该账号「最近到期积分」的到期时刻（Unix 秒）；0 = 未知。
 	//
 	// 运行期权威值，来源有二，按新鲜度覆盖：
@@ -306,6 +315,18 @@ const (
 	defaultBreakerCooldown    = 30 * time.Minute
 	defaultBreakerCooldownMax = 6 * time.Hour
 )
+
+// sessionDeadThreshold 连续 ErrSessionDead（12153）达到该次数才永久禁用。
+//
+// 取 3 的理由：12153 会被临时性触发（网络抖动 / 上游闪断 / refresh 竞态），
+// 单次即杀号会误杀健康账号。连续 3 次（跨多次保活周期）才认为是真的 session 死亡。
+const sessionDeadThreshold = 3
+
+// sessionDeadReason 禁用原因（与旧文案保持一致，便于既有运维脚本匹配）。
+const sessionDeadReason = "12153 session dead"
+
+// SessionDeadThreshold 暴露阈值（供 scheduler 日志 / 运维文档引用）。
+func SessionDeadThreshold() int { return sessionDeadThreshold }
 
 // StoreSnapshotter 池状态快照镜像的最小接口（redisstore.Store 满足；Noop 空实现安全）。
 // 与本地 state.json 并存，作启动恢复备份：快照比本地新才采用，否则本地优先。
@@ -1305,6 +1326,57 @@ func (p *Pool) Disable(uid, reason string) {
 	}
 }
 
+// NoteSessionDead 记录一次 ErrSessionDead（12153）——**不立即禁用**。
+//
+// 旧行为是「一次 12153 即 Disable」，但该错误会被临时性触发（网络抖动 / 上游闪断 /
+// refresh 竞态），一次失败就永久杀号会误杀健康账号 —— 实测发现一批 disabled 账号
+// 其实 refresh 完全正常，是历史误判的受害者。
+//
+// 现改为连续 sessionDeadThreshold 次才禁用：计数 +1，达阈值则 Disable 并清计数。
+// 返回 true 表示本次已达阈值并完成禁用。
+//
+// 注意：即使账号已 disabled，计数仍会累计 —— 但保活循环会跳过 disabled 账号，
+// 因此只有「禁用后复活且计数未清」这类边界才会走到。
+func (p *Pool) NoteSessionDead(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.sessionDeadFails++
+	if e.sessionDeadFails < sessionDeadThreshold {
+		p.dirty.Store(true)
+		return false
+	}
+	e.sessionDeadFails = 0
+	e.disabled = true
+	e.reason = sessionDeadReason
+	p.dirty.Store(true)
+	return true
+}
+
+// ClearSessionDead 清零连续 12153 计数 —— 任何证明账号未死的时刻都该调用：
+// refresh 成功（保活）、chat 成功（NoteSuccess）、手工复活。
+func (p *Pool) ClearSessionDead(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok && e.sessionDeadFails != 0 {
+		e.sessionDeadFails = 0
+		p.dirty.Store(true)
+	}
+}
+
+// SessionDeadFails 查询当前连续 12153 计数（运维/测试用）。
+func (p *Pool) SessionDeadFails(uid string) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.sessionDeadFails
+	}
+	return 0
+}
+
 // reviveCoolingLocked 只清冷却（until/coolKind/reason）并更新 credits，不动熔断器
 // （fails/retryCount/breakerUntil）。签到解冻走这里：签到成功只证明余额恢复与
 // billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx 信号）不应被签到覆盖。
@@ -1346,6 +1418,7 @@ func (p *Pool) NoteError(uid string) {
 
 // NoteSuccess 成功请求累加成功计数、刷新 lastSuccess，并清空连续失败与熔断运行态。
 // 二进制模型：清 fails + retryCount + breakerUntil；不碰 until/coolKind（那些是即时冷却，各自到期）。
+// 同时清零连续 12153 计数：一次成功即证明账号未死（误判防护的复活路径）。
 func (p *Pool) NoteSuccess(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1355,6 +1428,7 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.fails = 0
 		e.retryCount = 0
 		e.breakerUntil = time.Time{}
+		e.sessionDeadFails = 0
 		p.dirty.Store(true)
 	}
 }
