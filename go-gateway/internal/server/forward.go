@@ -121,6 +121,12 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 	// 表现为「单一模型锁定」报「收到的是 (未指定)」。
 	realm, model := resolveModel(modelOf(body))
 
+	// 前缀只是给网关的**选号指令**，上游不认识它 —— 必须把请求体里的
+	// model 改写成裸名，否则上游返回 400 code=11102 model [cn:xxx] not found
+	//（实测确认：前缀成功约束了选号，却让请求本身失败）。
+	// 无前缀时 model 与原值相同，rewriteModel 会原样返回，不做多余序列化。
+	body = rewriteModel(body, model)
+
 	// 「单一模型」锁定：非空时只放行该模型。
 	//
 	// 为什么在选号之前就拒绝（而不是换个模型重试）：轮转模式的语义是
@@ -280,6 +286,46 @@ func modelOf(body []byte) string {
 	}
 	_ = json.Unmarshal(body, &probe)
 	return probe.Model
+}
+
+// rewriteModel 把请求体里的 model 字段改成 bare。
+//
+// 为什么必须改写：`cn:` / `global:` 前缀只是**给网关的选号指令**，
+// 上游并不认识它。若把带前缀的原串原样转发，上游会返回
+//
+//	400 code=11102 model [cn:glm-5.2] service info not found
+//
+// 即「前缀成功约束了选号，却让请求本身失败」——
+// 实测确认过这个现象（前缀请求全部 11102，无前缀的同名请求正常）。
+//
+// bare 为空或与当前值相同时返回原 body（不重新序列化，避免无谓的格式变化）。
+// 解析失败时同样原样返回：宁可让上游报错，也不要把请求体改坏。
+func rewriteModel(body []byte, bare string) []byte {
+	if bare == "" {
+		return body
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return body
+	}
+	cur, ok := doc["model"]
+	if !ok {
+		return body // 没有 model 字段：无从改写
+	}
+	var curStr string
+	if err := json.Unmarshal(cur, &curStr); err != nil || curStr == bare {
+		return body // 不是字符串或无需改动
+	}
+	encoded, err := json.Marshal(bare)
+	if err != nil {
+		return body
+	}
+	doc["model"] = encoded
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // buildSessKey 为没有原生会话字段的协议（如 Anthropic Messages）合成粘性键。
