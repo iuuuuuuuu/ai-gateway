@@ -754,7 +754,7 @@ export function getGatewayUsage(days?: number): Promise<GatewayUsageResult> {
   return call<GatewayUsageResult>("get_gateway_usage", days && days > 0 ? { days } : undefined);
 }
 
-/** 探测本机 AI 客户端（全部 11 类智能体）的安装与配置状态。 */
+/** 探测本机 AI 客户端（全部 12 类智能体）的安装与配置状态。 */
 export function detectAgentClients(): Promise<AgentDetectionResult> {
   return call<AgentDetectionResult>("detect_agent_clients");
 }

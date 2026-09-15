@@ -1655,7 +1655,7 @@ export default function GatewayPage() {
           <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-primary/30 bg-primary/5 p-3 text-xs">
             <div className="flex items-center gap-2">
               <Bot className="size-4 text-primary shrink-0" />
-              <span>现已提供独立的「智能体管理」页面，支持 11 类智能体的多模型多选与一键批量更新。</span>
+              <span>现已提供独立的「智能体管理」页面，支持 12 类智能体的多模型多选与一键批量更新。</span>
             </div>
             <Button size="sm" variant="outline" className="h-7 text-xs font-medium" asChild>
               <Link to="/agents">前往智能体管理 →</Link>

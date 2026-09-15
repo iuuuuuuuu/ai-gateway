@@ -1,6 +1,6 @@
 //! 一键导入与更新：把本网关接入本机已安装的 AI 客户端。
 //!
-//! 支持 11 类主流客户端智能体：
+//! 支持 12 类主流客户端智能体：
 //!
 //! | # | 客户端 | 配置文件 | 协议 |
 //! |---|---|---|---|
@@ -15,6 +15,7 @@
 //! | 9 | Kimi Code | `~/.kimi-code/config.toml` | OpenAI Chat |
 //! | 10 | OpenClaw | `~/.openclaw/openclaw.json` | OpenAI Chat |
 //! | 11 | Hermes Agent | `~/.hermes/config.yaml` | OpenAI Chat |
+//! | 12 | MiniMax Code | `~/.minimax/config.yaml` | Anthropic Messages（`@ai-sdk/anthropic`） |
 //!
 //! 安全约定：
 //!   - 写入前一律备份原文件到 `~/.ai-gateway/agent-backups/<target>/<时间戳>/`；
@@ -28,8 +29,8 @@ use serde_json::{json, Map, Value};
 
 use crate::modules::config::{atomic_write, home_dir, now_ms, store_dir};
 
-/// 受支持的全部 11 类客户端标识（与 UI 列表顺序严格对齐）。
-pub const TARGETS: [&str; 11] = [
+/// 受支持的全部 12 类客户端标识（与 UI 列表顺序严格对齐）。
+pub const TARGETS: [&str; 12] = [
     "claude-code",
     "claude-desktop",
     "codex",
@@ -41,6 +42,7 @@ pub const TARGETS: [&str; 11] = [
     "kimi-code",
     "openclaw",
     "hermes",
+    "minimax-code",
 ];
 
 /// 托管配置在客户端侧使用的提供方名称（显示名，会写进各客户端配置文件）。
@@ -225,6 +227,28 @@ pub fn hermes_config_path() -> PathBuf {
         .unwrap_or_else(|| home_dir().join(".hermes").join("config.yaml"))
 }
 
+/// MiniMax Code 数据目录：`$MINIMAX_HOME` → `~/.minimax`。
+///
+/// 与 Hermes 不同，这里返回**目录**而不是文件：MiniMax Code 除 `config.yaml`
+/// 外还有 `auth/`、`sessions/`、`plugins/` 等，探测与展示都需要目录本身。
+pub fn minimax_home() -> PathBuf {
+    std::env::var_os("MINIMAX_HOME")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".minimax"))
+}
+
+/// MiniMax Code 配置文件路径：`<minimax_home>/config.yaml`。
+pub fn minimax_config_path() -> PathBuf {
+    minimax_home().join("config.yaml")
+}
+
+/// 本网关在 MiniMax Code 里注册的 provider id。
+///
+/// MiniMax 用 `defaultModel: <providerId>/<modelId>` 定位默认模型，
+/// 因此 provider id 必须与模型名一起构成合法的 `<id>/<model>` 组合。
+const MINIMAX_PROVIDER_KEY: &str = "ai-gateway";
+
 // ---------------------------------------------------------------------------
 // 检测
 // ---------------------------------------------------------------------------
@@ -264,7 +288,7 @@ fn probe_cmd_version(exe: &str, args: &[&str]) -> Option<String> {
     None
 }
 
-/// 探测全部 11 类目标客户端的安装与配置状态。
+/// 探测全部 12 类目标客户端的安装与配置状态。
 pub fn detect_all(gateway_base: &str, api_key: &str) -> Vec<TargetStatus> {
     vec![
         detect_claude_code(gateway_base, api_key),
@@ -278,6 +302,7 @@ pub fn detect_all(gateway_base: &str, api_key: &str) -> Vec<TargetStatus> {
         detect_kimi_code(gateway_base, api_key),
         detect_openclaw(gateway_base, api_key),
         detect_hermes(gateway_base, api_key),
+        detect_minimax_code(gateway_base, api_key),
     ]
 }
 
@@ -630,6 +655,40 @@ fn detect_hermes(gateway_base: &str, api_key: &str) -> TargetStatus {
     }
 }
 
+fn detect_minimax_code(gateway_base: &str, api_key: &str) -> TargetStatus {
+    let path = minimax_config_path();
+    let home = minimax_home();
+    let installed = path.is_file() || home.is_dir();
+
+    // 已接入的判据：provider 块里出现本网关的 provider id，且 baseURL 指向本网关。
+    // 只查 `MINIMAX_PROVIDER_KEY` 而不是 `PROVIDER_NAME`：后者是显示名，
+    // 用户可能手动改过，而 provider id 是我们写入并据此定位的稳定标识。
+    let mut configured = false;
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        configured = text.contains(MINIMAX_PROVIDER_KEY)
+            && text.contains(gateway_base)
+            && (api_key.is_empty() || text.contains(api_key));
+    }
+
+    TargetStatus {
+        id: "minimax-code",
+        label: "MiniMax Code",
+        installed,
+        configured,
+        config_path: path.to_string_lossy().to_string(),
+        note: if installed {
+            String::new()
+        } else {
+            "未检测到 MiniMax Code（~/.minimax 不存在）".to_string()
+        },
+        version: if installed {
+            Some("MiniMax Code".to_string())
+        } else {
+            None
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 备份与恢复
 // ---------------------------------------------------------------------------
@@ -771,6 +830,7 @@ pub fn import_target(
         "kimi-code" => import_kimi_code(base, api_key, &safe_models),
         "openclaw" => import_openclaw(base, api_key, &safe_models),
         "hermes" => import_hermes(base, api_key, &safe_models),
+        "minimax-code" => import_minimax_code(base, api_key, &safe_models),
         other => Err(format!("不支持的客户端: {other}")),
     }
 }
@@ -1060,6 +1120,24 @@ fn import_hermes(base: &str, api_key: &str, models: &[String]) -> Result<ImportO
     })
 }
 
+fn import_minimax_code(base: &str, api_key: &str, models: &[String]) -> Result<ImportOutcome, String> {
+    let path = minimax_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 MiniMax Code 目录失败: {e}"))?;
+    }
+    let backup = backup_files("minimax-code", &[path.clone()])?;
+    let existing = std::fs::read_to_string(&path).ok();
+    let text = build_minimax_config(existing.as_deref(), base, api_key, models)?;
+    atomic_write(&path, &text).map_err(|e| format!("写入 MiniMax Code 配置失败: {e}"))?;
+
+    Ok(ImportOutcome {
+        target: "minimax-code".to_string(),
+        backup_dir: backup.to_string_lossy().to_string(),
+        files: vec![path.to_string_lossy().to_string()],
+        models: models.to_vec(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 各客户端配置生成器（支持多模型注入）
 // ---------------------------------------------------------------------------
@@ -1076,7 +1154,7 @@ pub fn build_dsh_settings(
     models: &[String],
 ) -> Result<String, String> {
     let primary = models.first().map(String::as_str).unwrap_or("deepseek-v4-flash");
-    let mut root = parse_yaml_map(existing)?;
+    let mut root = parse_yaml_map(existing, "DSH")?;
 
     let llm = ensure_yaml_map(&mut root, "llm-pi-ai");
     let providers = ensure_yaml_map(llm, "providers");
@@ -1110,7 +1188,7 @@ pub fn build_dsh_settings(
 
 /// 生成 DSH .credentials.yaml：写入 API Key 引用。
 pub fn build_dsh_credentials(existing: Option<&str>, api_key: &str) -> Result<String, String> {
-    let mut root = parse_yaml_map(existing)?;
+    let mut root = parse_yaml_map(existing, "DSH")?;
     if !root.contains_key("version") {
         root.insert("version".to_string(), json!(1));
     }
@@ -1596,6 +1674,95 @@ pub fn build_hermes_config(
     Ok(text)
 }
 
+/// 生成 MiniMax Code `config.yaml`：在 `provider` 下注册本网关 provider，
+/// 并把 `defaultModel` 指向它。
+///
+/// ## 结构（实测自 MiniMax Code 本机配置）
+///
+/// ```yaml
+/// provider:
+///   <providerId>:
+///     name: <显示名>
+///     npm: '@ai-sdk/anthropic'      # 决定协议：Anthropic Messages
+///     options:
+///       baseURL: <网关地址>
+///       apiKey: <网关密钥>
+///     models:
+///       <modelId>: { name: <modelId>, ... }
+/// defaultModel: <providerId>/<modelId>   # 注意是「斜杠」组合，不是嵌套
+/// ```
+///
+/// ## 三个必须遵守的点
+///
+/// 1. **`npm` 必须是 `@ai-sdk/anthropic`**：MiniMax Code 用 Vercel AI SDK 的
+///    provider 适配器决定走哪种协议。本网关同时提供 OpenAI 与 Anthropic 两个
+///    入口，但只有 Anthropic 适配器与 `options.baseURL` 的组合是实测可用的。
+/// 2. **`defaultModel` 用 `providerId/modelId` 单串**：写成嵌套映射或只写模型名
+///    都不会被读取，会话仍落到 MiniMax 官方路由。
+/// 3. **只覆盖托管字段**：`provider` 下我们自己的 key、以及 `defaultModel`。
+///    用户原有的 `provider.minimax`（官方登录态）、`logLevel`、`permissionMode`
+///    等一律保留 —— 直接重建整个文件会让用户丢掉官方账号的登录态。
+pub fn build_minimax_config(
+    existing: Option<&str>,
+    base: &str,
+    api_key: &str,
+    models: &[String],
+) -> Result<String, String> {
+    let mut root = parse_yaml_map(existing, "MiniMax Code")?;
+
+    // 空模型列表必须兜底：空映射会被渲染成 `{}` 字符串字面量，那是**非法 YAML**，
+    // MiniMax Code 读不了；而且 `defaultModel` 也需要一个真实模型名。
+    // 调用方（import_target）本就会兜底，这里再兜一次是因为本函数是 pub fn ——
+    // 不能依赖调用方守规矩。
+    let effective: Vec<String> = if models.is_empty() {
+        vec!["MiniMax-M3".to_string()]
+    } else {
+        models.to_vec()
+    };
+    let primary = effective
+        .first()
+        .map(String::as_str)
+        .unwrap_or("MiniMax-M3");
+
+    // 模型条目：对齐 MiniMax 官方条目的最小必要字段集。
+    // 刻意不写 limit/thinking_config 等：那些是官方模型特有的能力声明，
+    // 对本网关代理的模型不一定成立，写错反而会让客户端按错误能力调用。
+    let mut models_map = Map::new();
+    for m in &effective {
+        models_map.insert(
+            m.clone(),
+            json!({
+                "name": m,
+                "reasoning": true,
+                "tool_call": true,
+            }),
+        );
+    }
+
+    let provider = ensure_yaml_map(&mut root, "provider");
+    provider.insert(
+        MINIMAX_PROVIDER_KEY.to_string(),
+        json!({
+            "name": PROVIDER_NAME,
+            "npm": "@ai-sdk/anthropic",
+            "options": {
+                "authMode": "api-key",
+                "baseURL": base,
+                "apiKey": api_key,
+            },
+            "models": Value::Object(models_map),
+        }),
+    );
+
+    // defaultModel 是「providerId/modelId」单串
+    root.insert(
+        "defaultModel".to_string(),
+        json!(format!("{MINIMAX_PROVIDER_KEY}/{primary}")),
+    );
+
+    render_yaml(Value::Object(root))
+}
+
 // ---------------------------------------------------------------------------
 // 内部工具
 // ---------------------------------------------------------------------------
@@ -1713,15 +1880,18 @@ fn render_json(value: Value) -> Result<String, String> {
     serde_json::to_string_pretty(&value).map_err(|e| format!("序列化 JSON 失败: {e}"))
 }
 
-fn parse_yaml_map(existing: Option<&str>) -> Result<Map<String, Value>, String> {
+/// 解析既有 YAML 配置为映射；空/缺失返回空映射。
+///
+/// `label` 用于错误文案 —— 解析失败时会**放弃写入**（调用方保留用户原文件），
+/// 报错必须指明是哪个客户端的配置出了问题，否则用户无从排查。
+fn parse_yaml_map(existing: Option<&str>, label: &str) -> Result<Map<String, Value>, String> {
     let Some(text) = existing.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(Map::new());
     };
 
-    match crate::modules::yaml_lite::parse_mapping(text) {
-        Ok(map) => Ok(map),
-        Err(_) => Err("DSH 配置文件解析失败（已备份原文件，未做修改）".to_string()),
-    }
+    crate::modules::yaml_lite::parse_mapping(text).map_err(|e| {
+        format!("{label} 配置文件解析失败（已备份原文件，未做修改）: {e}")
+    })
 }
 
 fn render_yaml(value: Value) -> Result<String, String> {
@@ -2000,5 +2170,145 @@ mod tests {
         assert!(out.contains("- name: workbuddy"));
         assert!(out.contains("m1:"));
         assert!(out.contains("m2:"));
+    }
+
+    // ---- MiniMax Code ----
+
+    /// 真实 MiniMax Code 配置的节选（含官方 provider 与 `defaultModel` 组合串）。
+    const MINIMAX_EXISTING: &str = "\
+logLevel: info
+provider:
+  minimax:
+    name: MiniMax
+    npm: '@ai-sdk/anthropic'
+    options:
+      authMode: managed-login
+      apiKey: official-key
+      baseURL: https://agent.minimax.cn/mavis/api/v1/llm/v1
+    models:
+      MiniMax-M3:
+        name: MiniMax-M3
+        reasoning: true
+defaultModel: minimax/MiniMax-M3
+permissionMode: bypassPermissions
+";
+
+    #[test]
+    fn minimax_config_registers_provider_and_default_model() {
+        let models = vec!["deepseek-v4-flash".to_string(), "glm-5.2".to_string()];
+        let out = build_minimax_config(
+            Some(MINIMAX_EXISTING),
+            "http://127.0.0.1:7863",
+            "sk-test",
+            &models,
+        )
+        .unwrap();
+        let v = crate::modules::yaml_lite::parse_mapping(&out).expect("parse");
+
+        let ours = &v["provider"]["ai-gateway"];
+        assert_eq!(ours["name"], "AI Gateway");
+        assert_eq!(
+            ours["npm"], "@ai-sdk/anthropic",
+            "协议适配器必须是 Anthropic，否则 MiniMax Code 会按 OpenAI 协议发请求"
+        );
+        assert_eq!(ours["options"]["baseURL"], "http://127.0.0.1:7863");
+        assert_eq!(ours["options"]["apiKey"], "sk-test");
+        assert_eq!(ours["models"]["deepseek-v4-flash"]["name"], "deepseek-v4-flash");
+        assert_eq!(ours["models"]["glm-5.2"]["name"], "glm-5.2");
+
+        assert_eq!(
+            v["defaultModel"], "ai-gateway/deepseek-v4-flash",
+            "defaultModel 必须是 providerId/modelId 单串"
+        );
+    }
+
+    /// **关键**：必须保留用户原有的官方 provider 与其余顶层设置。
+    ///
+    /// 直接重建整个文件会让用户丢掉 MiniMax 官方账号的登录态
+    /// （`authMode: managed-login` 指向 `auth/` 目录里的凭证）。
+    #[test]
+    fn minimax_config_preserves_official_provider_and_settings() {
+        let models = vec!["m1".to_string()];
+        let out = build_minimax_config(Some(MINIMAX_EXISTING), "http://127.0.0.1:7863", "k", &models)
+            .unwrap();
+        let v = crate::modules::yaml_lite::parse_mapping(&out).expect("parse");
+
+        // 官方 provider 完整保留
+        assert_eq!(v["provider"]["minimax"]["name"], "MiniMax");
+        assert_eq!(v["provider"]["minimax"]["options"]["authMode"], "managed-login");
+        assert_eq!(v["provider"]["minimax"]["options"]["apiKey"], "official-key");
+        assert_eq!(v["provider"]["minimax"]["models"]["MiniMax-M3"]["reasoning"], true);
+
+        // 其余顶层设置保留
+        assert_eq!(v["logLevel"], "info");
+        assert_eq!(v["permissionMode"], "bypassPermissions");
+    }
+
+    /// 幂等：重复接入不产生重复条目，且指向最新的 base/key。
+    #[test]
+    fn minimax_config_is_idempotent() {
+        let models = vec!["m1".to_string(), "m2".to_string()];
+        let first =
+            build_minimax_config(Some(MINIMAX_EXISTING), "http://127.0.0.1:7863", "k1", &models)
+                .unwrap();
+        let second = build_minimax_config(Some(&first), "http://127.0.0.1:9999", "k2", &models)
+            .unwrap();
+        let v = crate::modules::yaml_lite::parse_mapping(&second).expect("parse");
+
+        let providers = v["provider"].as_object().expect("provider map");
+        assert_eq!(providers.len(), 2, "只应有 minimax 与 ai-gateway 两个 provider");
+        assert_eq!(v["provider"]["ai-gateway"]["options"]["baseURL"], "http://127.0.0.1:9999");
+        assert_eq!(v["provider"]["ai-gateway"]["options"]["apiKey"], "k2");
+        assert_eq!(
+            v["provider"]["ai-gateway"]["models"].as_object().unwrap().len(),
+            2
+        );
+    }
+
+    /// 空/缺失配置也能生成可用的最小配置。
+    #[test]
+    fn minimax_config_from_scratch() {
+        let out = build_minimax_config(None, "http://127.0.0.1:7863", "k", &["MiniMax-M3".into()])
+            .unwrap();
+        let v = crate::modules::yaml_lite::parse_mapping(&out).expect("parse");
+        assert_eq!(v["defaultModel"], "ai-gateway/MiniMax-M3");
+        assert_eq!(v["provider"]["ai-gateway"]["npm"], "@ai-sdk/anthropic");
+    }
+
+    /// 模型列表为空时回退到默认模型，不生成空 models 块。
+    #[test]
+    fn minimax_config_falls_back_to_default_model() {
+        let out = build_minimax_config(None, "http://127.0.0.1:7863", "k", &[]).unwrap();
+        let v = crate::modules::yaml_lite::parse_mapping(&out).expect("parse");
+        assert_eq!(v["defaultModel"], "ai-gateway/MiniMax-M3");
+        assert!(v["provider"]["ai-gateway"]["models"].as_object().unwrap().len() >= 1);
+    }
+
+    /// 损坏的既有配置必须**拒绝写入**（宁可不动，也不能写坏用户的官方登录态）。
+    ///
+    /// 用缩进突变触发解析失败：`a: 1` 之后紧跟更深缩进的 `b: 2` 是非法 YAML。
+    #[test]
+    fn minimax_config_refuses_to_write_on_parse_failure() {
+        let broken = "logLevel: info\n  provider: oops\n";
+        let err = build_minimax_config(Some(broken), "http://127.0.0.1:7863", "k", &["m".into()])
+            .unwrap_err();
+        assert!(
+            err.contains("MiniMax Code"),
+            "错误信息应指明是哪个客户端的配置出了问题: {err}"
+        );
+        assert!(
+            err.contains("未做修改"),
+            "错误信息应说明未改动原文件，否则用户会担心配置已被破坏: {err}"
+        );
+    }
+
+    #[test]
+    fn minimax_target_is_registered() {
+        assert!(TARGETS.contains(&"minimax-code"));
+        // 探测结果必须出现在 detect_all 的输出里（UI 列表据此渲染）
+        let statuses = detect_all("http://127.0.0.1:7863", "k");
+        let found = statuses.iter().find(|s| s.id == "minimax-code");
+        assert!(found.is_some(), "detect_all 必须包含 minimax-code");
+        assert_eq!(found.unwrap().label, "MiniMax Code");
     }
 }

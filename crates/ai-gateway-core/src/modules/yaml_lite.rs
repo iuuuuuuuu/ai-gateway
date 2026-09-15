@@ -164,6 +164,14 @@ fn next_indent(lines: &[&str], index: usize) -> Option<usize> {
 }
 
 /// 拆分 `key: value`，正确处理引号内的冒号。
+///
+/// 难点：裸 URL 标量（如 `- https://x.com/v1`）的第一个冒号在 scheme 之后，
+/// 会被误当成 `key: value`。判据必须用 **`//` 前缀**而不是单个 `/`：
+/// `scheme://` 的 rest 一定以 `//` 开头，而合法路径值（如
+/// `files_api_upload_endpoint: /v1/files/upload`）只以单个 `/` 开头。
+///
+/// 早期实现用单 `/` 判定，把 MiniMax Code 的配置整体判成解析失败
+/// （该文件里就有以 `/` 开头的路径值），调用方会因此放弃写入。
 fn split_key_value(line: &str) -> Option<(&str, &str)> {
     let mut in_single = false;
     let mut in_double = false;
@@ -172,13 +180,13 @@ fn split_key_value(line: &str) -> Option<(&str, &str)> {
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
             ':' if !in_single && !in_double => {
-                // `key:` 或 `key: value`；排除 `http://` 这类值内冒号
                 let key = line[..i].trim();
                 if key.is_empty() || key.contains(char::is_whitespace) && key.contains('/') {
                     return None;
                 }
                 let rest = line[i + 1..].trim();
-                if rest.starts_with('/') {
+                // `scheme://host` 是标量而不是键值对
+                if rest.starts_with("//") {
                     return None;
                 }
                 return Some((key, rest));
@@ -402,5 +410,75 @@ llm-pi-ai:
         let map = parse_mapping(text).expect("flow map becomes string");
         // 当前实现把 `{b: 1}` 当字符串保留，确认没有丢键。
         assert_eq!(map["root"]["a"], "{b: 1}");
+    }
+
+    /// **回归测试**：以单个 `/` 开头的路径值是合法标量，不是键值对分隔。
+    ///
+    /// 早期实现用「rest 以 `/` 开头就判为 URL」的规则，把
+    /// `files_api_upload_endpoint: /v1/files/upload` 这类行判成解析失败 ——
+    /// 于是整个 MiniMax Code 配置（实测含此类路径值）解析不了，
+    /// 调用方会因此**放弃写入**，用户看到的是「接入失败」而不知原因。
+    /// 正确判据是 `//`（`scheme://` 的特征），单 `/` 是普通路径。
+    #[test]
+    fn accepts_path_values_starting_with_single_slash() {
+        let text = "\
+capabilities:
+  support_files_api: true
+  files_api_upload_endpoint: /v1/files/upload
+  max_attachments_count: 4
+";
+        let map = parse_mapping(text).expect("含路径值的配置必须能解析");
+        assert_eq!(map["capabilities"]["support_files_api"], true);
+        assert_eq!(
+            map["capabilities"]["files_api_upload_endpoint"],
+            "/v1/files/upload"
+        );
+        assert_eq!(map["capabilities"]["max_attachments_count"], 4);
+    }
+
+    /// 裸 URL 标量仍应被识别为标量（不能被当成 `key: value`）。
+    #[test]
+    fn bare_url_scalar_is_not_treated_as_key_value() {
+        let text = "endpoints:\n  - https://api.example.com/v1\n  - /local/path\n";
+        let map = parse_mapping(text).expect("parse");
+        let list = map["endpoints"].as_array().expect("array");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0], "https://api.example.com/v1");
+        assert_eq!(list[1], "/local/path");
+    }
+
+    /// MiniMax Code 配置的关键结构（provider 块 + baseURL + models）。
+    #[test]
+    fn parses_minimax_style_provider_block() {
+        let text = "\
+logLevel: info
+provider:
+  minimax:
+    name: MiniMax
+    npm: '@ai-sdk/anthropic'
+    options:
+      authMode: managed-login
+      baseURL: https://agent.minimax.cn/mavis/api/v1/llm/v1
+    models:
+      MiniMax-M3:
+        name: MiniMax-M3
+        reasoning: true
+defaultModel: minimax/MiniMax-M3
+";
+        let map = parse_mapping(text).expect("parse");
+        let provider = &map["provider"]["minimax"];
+        assert_eq!(provider["name"], "MiniMax");
+        assert_eq!(provider["npm"], "@ai-sdk/anthropic");
+        assert_eq!(
+            provider["options"]["baseURL"],
+            "https://agent.minimax.cn/mavis/api/v1/llm/v1"
+        );
+        assert_eq!(provider["models"]["MiniMax-M3"]["reasoning"], true);
+        assert_eq!(map["defaultModel"], "minimax/MiniMax-M3");
+
+        // 往返后结构不变（写入前必须能保证不损坏用户原配置）
+        let rendered = render_mapping(&Value::Object(map.clone())).expect("render");
+        let reparsed = parse_mapping(&rendered).expect("reparse");
+        assert_eq!(Value::Object(map), Value::Object(reparsed));
     }
 }
