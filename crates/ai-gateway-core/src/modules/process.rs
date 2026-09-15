@@ -96,9 +96,15 @@ fn image_name_from_path_str(s: &str) -> &str {
 }
 
 /// 本工具自身的映像名（忽略 .exe、大小写）。
+///
+/// 三个名字都要认：更名后仍可能有旧版进程在跑（覆盖升级期间），
+/// 漏掉旧名会让自排除失效 —— 于是本工具会把自己的进程当成 WorkBuddy 客户端
+/// 去关闭/统计，表现为「状态显示客户端在运行」或「切换时把自己关掉」。
 pub(crate) fn is_self_image_name(name: &str) -> bool {
     let stem = image_stem(image_name_from_path_str(name));
-    stem.eq_ignore_ascii_case("ai-gateway") || stem.eq_ignore_ascii_case("ai-gateway")
+    ["ai-gateway", "wb-switch", "workbuddy-switch"]
+        .iter()
+        .any(|candidate| stem.eq_ignore_ascii_case(candidate))
 }
 
 /// 区域客户端映像名（stem，忽略 .exe）。

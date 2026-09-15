@@ -211,9 +211,65 @@ pub fn app_settings_file() -> PathBuf {
     store_dir().join("app_settings.json")
 }
 
+/// 把数据目录隔离到临时目录，供单元测试使用。
+///
+/// 为什么需要一把全局锁：`AI_GATEWAY_HOME` 是**进程级**环境变量，而 cargo 默认
+/// 多线程跑测试。两个测试同时改它，会让其中一个读到另一个的目录 ——
+/// 表现为「刚写入的账号查不到」这类看似随机的失败。
+/// 所有依赖数据目录的测试都必须先拿这把锁。
+#[cfg(test)]
+pub mod test_isolation {
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// 隔离守卫：持有期间数据目录指向临时目录，释放时清理。
+    ///
+    /// 用 `MutexGuard` 而非 `Drop` 实现清理：这样即使测试 panic，锁也会释放，
+    /// 后续测试不会被永久阻塞（poisoned 锁用 `into_inner` 兜底）。
+    pub struct Isolated {
+        _guard: MutexGuard<'static, ()>,
+        dir: PathBuf,
+    }
+
+    impl Isolated {
+        pub fn new(tag: &str) -> Self {
+            let guard = lock().lock().unwrap_or_else(|e| e.into_inner());
+            let dir = std::env::temp_dir().join(format!(
+                "ai-gateway-test-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::create_dir_all(&dir);
+            std::env::set_var("AI_GATEWAY_HOME", &dir);
+            Self { _guard: guard, dir }
+        }
+
+        /// 隔离出的数据目录路径。
+        pub fn dir(&self) -> &std::path::Path {
+            &self.dir
+        }
+    }
+
+    impl Drop for Isolated {
+        fn drop(&mut self) {
+            std::env::remove_var("AI_GATEWAY_HOME");
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+
 /// 读取应用设置（缺失或损坏返回空对象）。
-pub fn load_app_settings() -> Value {
-    std::fs::read_to_string(app_settings_file())
+pub fn load_app_settings() -> Value {    std::fs::read_to_string(app_settings_file())
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .filter(Value::is_object)
