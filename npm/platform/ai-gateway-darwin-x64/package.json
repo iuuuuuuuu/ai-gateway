@@ -1,6 +1,6 @@
 {
   "name": "ai-gateway-darwin-x64",
-  "version": "0.8.4",
+  "version": "1.0.0",
   "description": "ai-gateway platform binary (darwin-x64)",
   "os": [
     "darwin"

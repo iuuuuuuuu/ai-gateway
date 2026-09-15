@@ -1047,6 +1047,16 @@ Copyright (c) 2026 momo0410          （本项目整合部分）
 
 ---
 
+## 赞赏
+
+如果这个项目对你有帮助，欢迎请作者喝杯快乐水 ☕
+
+<div align="center">
+<img src="src/assets/donate-qr.jpg" alt="赞赏码" width="220" />
+</div>
+
+---
+
 ## 免责声明
 
 - 本项目为**非官方**工具，与腾讯公司及 CodeBuddy / WorkBuddy 官方无任何关联。
