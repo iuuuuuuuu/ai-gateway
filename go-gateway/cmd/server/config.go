@@ -44,6 +44,9 @@ type Config struct {
 		// SchoolHours 开学季活动任务时点，默认 [12]。该活动限时，
 		// 服务端下发 in_period，下线后自动跳过；只领取已达标的奖励，不伪造完成动作。
 		SchoolHours []int `json:"school_hours"`
+		// TrialHours 国际版 trial 加油包领取时点，默认 [9, 21]（与签到同步）。
+		// 国际版没有签到/任务中心，trial 是其唯一积分增益动作；幂等可每天重试。
+		TrialHours []int `json:"trial_hours"`
 		// CheckinEnabled/KeepaliveEnabled/ActivityEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -57,6 +60,7 @@ type Config struct {
 		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 关活跃上报
 		NightOwlEnabled  bool `json:"nightowl_enabled"`  // 缺省 true；false = 关夜猫子任务
 		SchoolEnabled   bool `json:"school_enabled"`   // 缺省 true；false = 关开学季活动
+		TrialEnabled    bool `json:"trial_enabled"`    // 缺省 true；false = 关 trial 领取
 		// ActivityReportCount 每号每日上报条数，默认 3。
 		//
 		// 取 3 而非 1：单条上报偶发被服务端丢弃（缺 userId 时 200 但静默丢弃），
@@ -160,6 +164,7 @@ func Default() *Config {
 	c.Schedule.ActivityHours = []int{10}
 	c.Schedule.NightOwlHours = []int{1}
 	c.Schedule.SchoolHours = []int{12}
+	c.Schedule.TrialHours = []int{9, 21}
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 	c.Schedule.CheckinEnabled = true
@@ -167,6 +172,7 @@ func Default() *Config {
 	c.Schedule.ActivityEnabled = true
 	c.Schedule.NightOwlEnabled = true
 	c.Schedule.SchoolEnabled = true
+	c.Schedule.TrialEnabled = true
 	c.Schedule.ActivityReportCount = 3
 	c.Schedule.CheckinScope = "cn"
 	c.Upstream.TimeoutSeconds = 120
@@ -303,6 +309,7 @@ func (c *Config) normalize() error {
 		c.Schedule.ActivityHours = []int{10}
 	c.Schedule.NightOwlHours = []int{1}
 	c.Schedule.SchoolHours = []int{12}
+	c.Schedule.TrialHours = []int{9, 21}
 	}
 	if c.Schedule.ActivityReportCount <= 0 {
 		c.Schedule.ActivityReportCount = 3

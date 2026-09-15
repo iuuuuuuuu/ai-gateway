@@ -278,6 +278,7 @@ func TestActivityDisabledNoCalls(t *testing.T) {
 		ActivityDisabled:  true,
 		NightOwlDisabled:  true,
 		SchoolDisabled:  true,
+		TrialDisabled:  true,
 		ActivityHours:     []int{10},
 	})
 

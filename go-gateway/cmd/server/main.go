@@ -137,11 +137,13 @@ func main() {
 		ActivityHours:       cfg.Schedule.ActivityHours,
 		NightOwlHours:       cfg.Schedule.NightOwlHours,
 		SchoolHours:         cfg.Schedule.SchoolHours,
+		TrialHours:          cfg.Schedule.TrialHours,
 		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
 		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
 		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
 		NightOwlDisabled:    !cfg.Schedule.NightOwlEnabled,
 		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
+		TrialDisabled:       !cfg.Schedule.TrialEnabled,
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		CheckinScope:        cfg.Schedule.CheckinScope,
 	})
@@ -177,6 +179,11 @@ func main() {
 		log.Printf("开学季活动任务已启用（%v 点）：只领取已达标的奖励", cfg.Schedule.SchoolHours)
 	} else {
 		log.Printf("开学季活动任务已禁用（schedule.school_enabled=false）")
+	}
+	if cfg.Schedule.TrialEnabled {
+		log.Printf("trial 加油包领取已启用（%v 点，仅国际版）：已领过的账号幂等跳过", cfg.Schedule.TrialHours)
+	} else {
+		log.Printf("trial 加油包领取已禁用（schedule.trial_enabled=false）")
 	}
 
 	h := server.NewHandler(server.Config{
