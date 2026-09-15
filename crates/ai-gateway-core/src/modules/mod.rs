@@ -9,8 +9,9 @@ pub mod codebuddy_cn_ide;
 pub mod config;
 pub mod credit_usage;
 pub mod credits;
-// 豆包：账号池与凭证 / 会话保活 / 会员额度 / 对话备份
+// 豆包：账号池与凭证 / 会话保活 / 会员额度 / 对话备份导出
 pub mod doubao_account;
+pub mod doubao_chats;
 pub mod doubao_quota;
 pub mod doubao_session;
 pub mod export_import;
