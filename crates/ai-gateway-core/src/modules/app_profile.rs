@@ -129,9 +129,23 @@ impl AppProfile {
     }
 }
 
+/// 取路径的文件名，**同时识别 `\` 与 `/` 两种分隔符**。
+///
+/// 为什么不能直接用 `Path::file_name()`：在非 Windows 平台上，`Path` 只把 `/`
+/// 当分隔符，`C:\x\Trae.exe` 会被整体当成一个文件名，白名单比对必然失败。
+/// 而档案里的路径**永远是 Windows 形式**（Trae / 豆包是 Windows 客户端），
+/// 单测也要能在 Linux / macOS 上跑（CI 三平台都会编译并跑本 crate）。
+fn portable_file_name(path: &Path) -> Option<&str> {
+    let s = path.to_str()?;
+    s.rsplit(['\\', '/'])
+        .next()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
 /// 路径文件名是否属于该应用（防 lnk/注册表/进程回退解析到另一个应用；大小写不敏感）。
 pub fn exe_matches(path: &Path, prof: &AppProfile) -> bool {
-    match path.file_name().and_then(|n| n.to_str()) {
+    match portable_file_name(path) {
         Some(name) => prof
             .exe_names
             .iter()

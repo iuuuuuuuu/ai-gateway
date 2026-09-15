@@ -240,6 +240,25 @@ pub fn set_current_account(sess: &Session, uid: &str) -> Result<(), String> {
         .map_err(|e| format!("写入当前账号标记失败: {e}"))
 }
 
+/// 把档案里的 **Windows 相对路径**（`User\globalStorage\storage.json`）拼到根目录上。
+///
+/// 为什么不能直接 `root.join(rel)`：`Path::join` 在非 Windows 平台上**不把 `\`
+/// 当分隔符**，于是 `root/User\globalStorage\storage.json` 会被当成一个文件名 ——
+/// 快照会写出一个名为 `User\globalStorage\storage.json` 的**单层文件**，
+/// 恢复时也找不到真实路径。单测在 Linux / macOS 上就会失败（CI 三平台都跑）。
+///
+/// 这里按 `\` 与 `/` 逐段拆分后逐级 join，得到平台正确的路径。
+pub fn join_windows_rel(root: &std::path::Path, rel: &str) -> PathBuf {
+    let mut path = root.to_path_buf();
+    for segment in rel.split(['\\', '/']) {
+        let segment = segment.trim();
+        if !segment.is_empty() {
+            path.push(segment);
+        }
+    }
+    path
+}
+
 /// 把一步进度同时写日志文件与 sink。
 pub fn log_step(sess: &Session, sink: &dyn ProgressSink, stage: &str, status: StepStatus, msg: &str) {
     sink.step(stage, status, msg);

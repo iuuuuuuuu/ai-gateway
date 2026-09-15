@@ -488,15 +488,24 @@ mod tests {
     #[test]
     fn skips_when_nothing_urgent() {
         // 所有账号 5 天后才过期：最紧迫剩余 > 72h → 不切
+        //
+        // 断言不能硬编码「还剩 5 天」：`now_ms()` 取的是**当前时刻**，而候选时间戳
+        // 是 `now + 5*24h`，两者之间存在几毫秒的构造耗时；整数除法向下取整后，
+        // `5*24h - 3ms` 会算成 4 天 —— 于是这个断言会随时钟漂移随机失败
+        // （实测本机偶发、CI 上稳定复现）。
+        // 改为只验证语义（「到期还早」+「不切换」），不绑定具体天数。
         let now = now_ms();
         let candidates = vec![
             cand("a", Some(now + 6 * 24 * 3600_000), 100.0, true),
             cand("b", Some(now + 5 * 24 * 3600_000), 50.0, true),
         ];
-        assert_eq!(
-            dt(&candidates, Some("a")),
-            Decision::Skip("所有账号到期都还早（最紧迫的还剩 5 天），无需切换".to_string())
-        );
+        match dt(&candidates, Some("a")) {
+            Decision::Skip(reason) => assert!(
+                reason.starts_with("所有账号到期都还早"),
+                "应给出「到期还早」的跳过原因，实际: {reason}"
+            ),
+            other => panic!("到期还早时不应切换，实际: {other:?}"),
+        }
     }
 
     #[test]

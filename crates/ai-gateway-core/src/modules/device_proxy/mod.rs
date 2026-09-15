@@ -887,8 +887,17 @@ fn bind_exclusive(port: u16) -> Result<std::net::TcpListener, String> {
 
 #[cfg(not(target_os = "windows"))]
 fn bind_exclusive(port: u16) -> Result<std::net::TcpListener, String> {
-    std::net::TcpListener::bind(("127.0.0.1", port))
-        .map_err(|e| format!("绑定 127.0.0.1:{port} 失败: {e}"))
+    // 必须显式设为非阻塞：tokio 的 `TcpListener::from_std` 拒绝注册阻塞套接字，
+    // 会 panic「Registering a blocking socket with the tokio runtime is unsupported」。
+    //
+    // Windows 分支不受影响：它走 `from_raw_socket`，而 `from_raw_socket` 与
+    // `from_std` 不同，不做阻塞检查（这也是为什么本问题只在 Linux/macOS 暴露）。
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("绑定 127.0.0.1:{port} 失败: {e}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("设置非阻塞模式失败: {e}"))?;
+    Ok(listener)
 }
 
 async fn bind_listener(port: u16) -> Result<TcpListener, String> {
@@ -991,9 +1000,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn exclusive_bind_rejects_double_bind() {
-        // 测试进程可能尚未初始化 WinSock（WSASocketW 需 WSAStartup，否则 10093）：
-        // 先建一个 std 套接字触发进程级初始化，再测独占绑定
-        drop(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        ensure_winsock_ready();
         let first = bind_exclusive(0).expect("首次绑定(临时端口)应成功");
         let port = first.local_addr().unwrap().port();
         assert!(bind_exclusive(port).is_err(), "同端口二次绑定应失败");
@@ -1058,9 +1065,26 @@ mod tests {
         assert_eq!(cfg.targets, vec!["trae.cn".to_string(), "doubao.com".to_string()]);
     }
 
+    /// 确保当前进程已初始化 WinSock。
+    ///
+    /// `WSASocketW` 要求进程先调用过 `WSAStartup`，否则返回 **10093
+    /// WSANOTINITIALISED**。Rust 标准库在首次创建套接字时会隐式完成初始化，
+    /// 因此「整套测试一起跑」时通常已被别的用例触发；但**单独运行**本模块的
+    /// 用例时无人触发，就会以「创建监听 socket 失败: WSA错误 10093」失败 ——
+    /// 表现为「全量跑绿、单跑变红」这种最难排查的形态。
+    ///
+    /// 这里显式建一个 std 套接字来触发进程级初始化（非 Windows 上是空操作）。
+    fn ensure_winsock_ready() {
+        #[cfg(target_os = "windows")]
+        {
+            drop(std::net::TcpListener::bind("127.0.0.1:0"));
+        }
+    }
+
     /// 端到端生命周期：启动 → 独占绑定端口 → stop() → 退出事件上报为「主动停止」
     #[tokio::test]
     async fn server_starts_binds_and_reports_intentional_stop() {
+        ensure_winsock_ready();
         // 守卫必须活到测试结束（持有全局锁 + AI_GATEWAY_HOME 指向临时目录），
         // 故用命名绑定而非 `_`（`_` 会立即析构，隔离随即失效）
         let _iso = Isolated::new("proxy-lifecycle");
@@ -1096,6 +1120,7 @@ mod tests {
     /// 启动时自动生成 CA 三件套（否则宿主无法提示用户安装证书）
     #[tokio::test]
     async fn server_start_generates_ca_files() {
+        ensure_winsock_ready();
         let iso = Isolated::new("proxy-ca");
         let cfg = ProxyConfig::new(0);
         let certs = cfg.certs_dir.clone();

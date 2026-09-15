@@ -74,7 +74,10 @@ pub fn backup_icube(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Resu
 
     let mut copied = 0usize;
     for item in ICUBE_ITEMS {
-        if copy::copy_snapshot_item(&src.join(item.rel()), &dest.join(item.rel())) {
+        if copy::copy_snapshot_item(
+            &super::join_windows_rel(src, item.rel()),
+            &super::join_windows_rel(&dest, item.rel()),
+        ) {
             copied += 1;
         }
     }
@@ -109,8 +112,8 @@ pub fn restore_icube(sess: &mut Session, slot: &str, sink: &dyn ProgressSink) ->
     // 槽位内容，不携带上一账号的残留（如槽位缺 state.vscdb.backup 而现场有旧账号的）。
     let mut restored = 0usize;
     for item in ICUBE_ITEMS {
-        let src_item = src.join(item.rel());
-        let dst_item = dest.join(item.rel());
+        let src_item = super::join_windows_rel(&src, item.rel());
+        let dst_item = super::join_windows_rel(&dest, item.rel());
         if src_item.exists() {
             if copy::copy_snapshot_item(&src_item, &dst_item) {
                 restored += 1;
