@@ -49,6 +49,7 @@ pub fn router() -> Router {
     Router::new()
         .route("/api/status", get(api_status))
         .route("/api/accounts", get(api_accounts))
+        .route("/api/accounts/note", post(api_set_account_note))
         .route("/api/codebuddy-cli/status", get(api_codebuddy_cli_status))
         .route(
             "/api/codebuddy-cli/install-helper",
@@ -108,6 +109,7 @@ pub fn router() -> Router {
         .route("/api/gateway/status", get(api_gateway_status))
         .route("/api/gateway/config", get(api_gateway_config).post(api_save_gateway_config))
         .route("/api/gateway/mode", post(api_switch_gateway_mode))
+        .route("/api/gateway/allowed-model", post(api_set_allowed_model))
         .route("/api/gateway/start", post(api_gateway_start))
         .route("/api/gateway/port-check", post(api_gateway_port_check))
         .route("/api/gateway/stop", post(api_gateway_stop))
@@ -169,6 +171,26 @@ async fn api_accounts() -> Response {
         "current": auth_file::read_auth_file()
             .and_then(|a| a.get("account").and_then(|x| x.get("uid")).and_then(|x| x.as_str()).map(String::from)),
     }))
+}
+
+/// POST /api/accounts/note —— 设置账号备注（空串 = 清除）。
+///
+/// body: `{ "accountId": "...", "note": "公司号" }`
+async fn api_set_account_note(Json(body): Json<Value>) -> Response {
+    let id = body
+        .get("accountId")
+        .or_else(|| body.get("account_id"))
+        .or_else(|| body.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if id.trim().is_empty() {
+        return json_err("缺少账号 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let note = body.get("note").and_then(Value::as_str).unwrap_or("");
+    match account::set_account_note(id, note) {
+        Ok(acc) => json_ok(json!({ "ok": true, "account": account::account_meta(&acc) })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
 }
 
 async fn api_codebuddy_cli_status() -> Response {
@@ -819,6 +841,28 @@ async fn api_switch_gateway_mode(Json(body): Json<Value>) -> Response {
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("切换模式失败")
+            .to_string();
+        return json_err(msg, StatusCode::BAD_REQUEST);
+    }
+    json_ok(result)
+}
+
+/// POST /api/gateway/allowed-model —— 设置「单一模型 + 积分轮转」的目标模型。
+///
+/// body: `{ "model": "deepseek-v4.1-flash" }`；空串 = 清除锁定。
+/// 网关运行时自动重启以生效（模型锁定由网关启动时读取）。
+async fn api_set_allowed_model(Json(body): Json<Value>) -> Response {
+    let model = body
+        .get("model")
+        .or_else(|| body.get("allowedModel"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let result = wb_switch_core::modules::gateway::set_allowed_model(model).await;
+    if result.get("ok").and_then(Value::as_bool) == Some(false) {
+        let msg = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("设置模型失败")
             .to_string();
         return json_err(msg, StatusCode::BAD_REQUEST);
     }

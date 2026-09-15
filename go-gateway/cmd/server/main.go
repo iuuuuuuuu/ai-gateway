@@ -67,6 +67,17 @@ func main() {
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 
+	// 「单一模型 + 积分轮转」模式（缺省关闭 = 负载均衡，老配置行为不变）。
+	if cfg.Pool.Rotation {
+		p.SetRotation(true)
+		if m := strings.TrimSpace(cfg.Pool.AllowedModel); m != "" {
+			log.Printf("pool: 已启用「单一模型 + 积分轮转」模式，锁定模型 %s（其他模型一律拒绝）", m)
+		} else {
+			// 未锁模型时轮转仍可用，但语义不完整：客户端可换模型绕过额度控制。
+			log.Printf("pool: 已启用「单一模型 + 积分轮转」模式，但未指定模型（pool.allowed_model 为空）—— 建议在界面选择模型")
+		}
+	}
+
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
 	redisMode := "noop"
@@ -153,6 +164,13 @@ func main() {
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
 		Usage:        usageStore,
+		// 单一模型锁定：仅轮转模式下生效（负载均衡不限制模型，保持原有行为）。
+		AllowedModel: func() string {
+			if cfg.Pool.Rotation {
+				return strings.TrimSpace(cfg.Pool.AllowedModel)
+			}
+			return ""
+		}(),
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -6,10 +6,13 @@ import {
   Bot,
   CheckCircle2,
   Copy,
+  LayoutGrid,
   Loader2,
   Play,
+  Recycle,
   RefreshCw,
   RotateCw,
+  Rows3,
   Save,
   Server,
   Shuffle,
@@ -26,15 +29,19 @@ import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
 import { useVisibilityInterval } from "@/lib/use-visibility-interval";
 import type {
+  CreditStatistics,
   GatewayConfig,
   GatewayMode,
   GatewayPoolAccount,
   GatewayPortCheck,
   GatewayStatus,
+  GatewayUsageGroup,
   GatewayUsageResult,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -121,6 +128,32 @@ const USAGE_RANGE_OPTIONS: { key: UsageRangeKey; label: string; days?: number }[
 ];
 
 const exactTokenFormatter = new Intl.NumberFormat("en-US");
+
+/**
+ * 网关页布局，持久化到 localStorage。
+ *
+ * - `classic`（默认）：**旧版布局** —— 账号池与「Token 用量」各自独立成块，
+ *   账号卡片只显示池运行态。保持原样是为了「不改变既有习惯」：升级后打开
+ *   看到的仍是熟悉的样子。
+ * - `merged`：**新版布局** —— 把用量数据直接并进账号卡片（每张卡片多出
+ *   「消耗积分 / 消耗 Token / 调用次数」），顶上一行日期筛选统一控制；
+ *   看「谁在跑、各烧了多少」时不必在上下两块之间来回对照。
+ *
+ * 默认旧版 + 需要手动点击才切换：新布局信息密度高，属可选偏好，
+ * 不该在用户没要求时改变默认观感。
+ */
+type GatewayLayout = "classic" | "merged";
+
+const LAYOUT_STORAGE_KEY = "wb-switch.gateway-layout";
+
+/**
+ * Radix Select 的「空值」哨兵。
+ *
+ * Radix 明确不允许 `SelectItem value=""`（会抛错导致整页白屏），但业务上
+ * 「未选择 / 不限制」是合法状态，因此用这个哨兵占位，在 onValueChange 里
+ * 映射回空串 —— 组件外的 state 语义保持为「空串 = 未设置」。
+ */
+const NONE_VALUE = "__none__";
 
 /** 大数紧凑展示（与 Token 统计页的 K/M/B 风格一致）。 */
 function formatUsageCompact(value: number): string {
@@ -235,9 +268,39 @@ function queuedReasonText(acc: GatewayPoolAccount): string {
   );
 }
 
-/** 网关账号池账号卡片：展示冷却/熔断/在途等运行态。 */
-function PoolAccountRow({ acc }: { acc: GatewayPoolAccount }) {
+/**
+ * 网关账号池账号卡片：展示冷却/熔断/在途等运行态，以及该账号在所选范围内的
+ * Token 用量与积分消耗。
+ *
+ * 为什么会话把用量也放在卡片上：这三类信息原本分处「账号池」「Token 用量」
+ * 「积分统计」三块，想回答「这个正在冷却的账号今天烧了多少」得来回对照。
+ * 合到一张卡片后信息一次看全，且仍是方块展示（不引入表格，避免大片留白）。
+ */
+function PoolAccountRow({
+  acc,
+  usage,
+  creditUsed,
+  usageRangeLabel,
+  showUsage,
+}: {
+  acc: GatewayPoolAccount;
+  /** 该账号在所选范围内的 Token 用量（undefined = 零消耗）。 */
+  usage?: GatewayUsageGroup;
+  /** 该账号在所选范围内的积分消耗（0 = 无消耗或无从得知）。 */
+  creditUsed: number;
+  /** 当前日期筛选的中文名，用于 tooltip。 */
+  usageRangeLabel: string;
+  /**
+   * 是否展示用量列（新版布局 = true）。
+   *
+   * 旧版布局下卡片只呈现池运行态，「消耗积分 / 消耗 Token / 调用次数」留在
+   * 页面下方的「Token 用量」区块里 —— 保持用户已习惯的样子不变。
+   */
+  showUsage: boolean;
+}) {
   const modelCools = acc.model_cooling ?? [];
+  const usageToken = usage?.total ?? 0;
+  const usageRecords = usage?.records ?? 0;
   // 状态标签的优先级：禁用 > 账号级冷却 > 排队 > 健康。
   //
   // 「排队」单独作为一档，因为它最容易让人误判：账号本身完全健康、积分充足，
@@ -274,18 +337,61 @@ function PoolAccountRow({ acc }: { acc: GatewayPoolAccount }) {
         </span>
       </div>
 
-      {/* 运行数据行：到期档位 + 成功/失败/在途。数值为 0 时不渲染，避免占位抖动。 */}
-      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] tabular-nums text-muted-foreground">
-        <span className="text-muted-foreground/70" title={expiry.title}>
-          {expiry.label}
-        </span>
-        {typeof acc.success_count === "number" && acc.success_count > 0 ? (
-          <span>成功 {acc.success_count}</span>
+      {/* 运行数据：3 列网格。
+          旧版布局只有「剩余积分 / 到期档位 / 成功·在途」三个池运行态字段；
+          新版布局（showUsage）额外并进「消耗积分 / 消耗 Token / 调用次数」，
+          信息一次看全。列数随内容变化，避免旧版留下空列。 */}
+      <div className="mt-2.5 grid grid-cols-3 gap-x-2 gap-y-2 border-t border-border/50 pt-2.5 text-[11px]">
+        <div className="min-w-0">
+          <div className="text-[10px] text-muted-foreground/70">剩余积分</div>
+          <div className="truncate text-[13px] font-medium tabular-nums" title="网关侧记录的最新积分余额">
+            {typeof acc.credits === "number" ? exactTokenFormatter.format(acc.credits) : "—"}
+          </div>
+        </div>
+        {/* 消耗积分：仅新版布局展示（旧版在下方「Token 用量」区块里） */}
+        {showUsage ? (
+          <div className="min-w-0">
+            <div className="text-[10px] text-muted-foreground/70" title={`${usageRangeLabel}内该账号消耗的积分（本地积分快照差分，已排除签到补发等余额上升）`}>
+              消耗积分
+            </div>
+            <div className={cn("truncate text-[13px] font-medium tabular-nums", creditUsed > 0 && "text-amber-700 dark:text-amber-400")}>
+              {creditUsed > 0 ? exactTokenFormatter.format(Math.round(creditUsed)) : <span className="font-normal text-muted-foreground/60">—</span>}
+            </div>
+          </div>
         ) : null}
-        {typeof acc.err_total === "number" && acc.err_total > 0 ? <span>失败 {acc.err_total}</span> : null}
-        {typeof acc.in_flight === "number" && acc.in_flight > 0 ? (
-          <span className="text-foreground/80">在途 {acc.in_flight}</span>
+        <div className="min-w-0">
+          <div className="text-[10px] text-muted-foreground/70">到期档位</div>
+          <div className="truncate text-[13px] font-medium tabular-nums" title={expiry.title}>
+            {acc.expire_day ? acc.expire_day.slice(5) : "未知"}
+          </div>
+        </div>
+
+        {showUsage ? (
+          <>
+            <div className="min-w-0">
+              <div className="text-[10px] text-muted-foreground/70">消耗 Token</div>
+              <div className="truncate text-[12px] tabular-nums">
+                {usageToken > 0 ? formatUsageCompact(usageToken) : <span className="text-muted-foreground/60">—</span>}
+              </div>
+            </div>
+            <div className="min-w-0">
+              <div className="text-[10px] text-muted-foreground/70">调用次数</div>
+              <div className="truncate text-[12px] tabular-nums">
+                {usageRecords > 0 ? exactTokenFormatter.format(usageRecords) : <span className="text-muted-foreground/60">—</span>}
+              </div>
+            </div>
+          </>
         ) : null}
+        <div className="min-w-0">
+          <div className="text-[10px] text-muted-foreground/70">成功 / 在途</div>
+          <div className="truncate text-[12px] tabular-nums text-muted-foreground">
+            <span className={cn(typeof acc.success_count === "number" && acc.success_count > 0 && "text-foreground/80")}>
+              {typeof acc.success_count === "number" && acc.success_count > 0 ? exactTokenFormatter.format(acc.success_count) : "—"}
+            </span>
+            {" / "}
+            <span className={cn(acc.in_flight ? "text-foreground/80" : "")}>{acc.in_flight ?? 0}</span>
+          </div>
+        </div>
       </div>
 
       {/* 冷却明细：区分「余额欠费」（账号级）与「模型冷却」（仅单个模型）。
@@ -353,9 +459,47 @@ export default function GatewayPage() {
   const [port, setPort] = useState(7863);
   const [apiKey, setApiKey] = useState("");
   const [autoStart, setAutoStart] = useState(false);
-  /** 网关工作模式：balance 负载均衡 / pinned 指定账号 */
+  /** 网关工作模式：balance 负载均衡 / rotation 积分轮转 / pinned 指定账号 */
   const [mode, setMode] = useState<GatewayMode>("balance");
   const [pinnedUid, setPinnedUid] = useState<string>("");
+  /**
+   * 「单一模型 + 积分轮转」锁定的模型名（空串 = 未锁定）。
+   *
+   * 轮转的语义是「把这个账号的指定模型额度烧干净再换号」，模型是策略的一部分，
+   * 因此必须锁定：否则客户端换个模型就绕过了轮转与额度控制。网关侧会拒绝
+   * 非该模型的请求（400 model_not_allowed）。
+   */
+  const [allowedModel, setAllowedModel] = useState<string>("");
+  /** 网关支持的模型列表（用于模型下拉；取不到时退化为自由输入）。 */
+  const [modelOptions, setModelOptions] = useState<string[]>([]);
+  /** 模型列表是否正在加载（驱动刷新按钮的转圈）。 */
+  const [modelsLoading, setModelsLoading] = useState(false);
+
+  /**
+   * 页面布局，持久化到 localStorage（与账号页「紧凑模式」同一套做法：
+   * 惰性初始化 + try/catch —— 受限 WebView 里 localStorage 可能不可写）。
+   * 默认 `classic`（旧版），用户点击页头按钮才切到 `merged`（新版）。
+   */
+  const [layout, setLayout] = useState<GatewayLayout>(() => {
+    if (typeof window === "undefined") return "classic";
+    try {
+      return window.localStorage.getItem(LAYOUT_STORAGE_KEY) === "merged" ? "merged" : "classic";
+    } catch {
+      return "classic";
+    }
+  });
+
+  function toggleLayout() {
+    setLayout((current) => {
+      const next: GatewayLayout = current === "classic" ? "merged" : "classic";
+      try {
+        window.localStorage.setItem(LAYOUT_STORAGE_KEY, next);
+      } catch {
+        /* 存储不可用时静默：仅本次生效 */
+      }
+      return next;
+    });
+  }
   /** 端口可用性检测结果（null = 尚未检测/正在检测）。 */
   const [portCheck, setPortCheck] = useState<GatewayPortCheck | null>(null);
   const [checkingPort, setCheckingPort] = useState(false);
@@ -372,6 +516,31 @@ export default function GatewayPage() {
   const [nowTick, setNowTick] = useState(() => Date.now());
 
   /**
+   * 积分消耗统计（按账号给 今日 / 近 7 天 / 本月 三个时间窗）。
+   *
+   * 复用宿主既有的 `/api/credits/stats`（`credit_usage.rs`），**不自己造口径**：
+   * 该实现已正确处理「签到/补发导致余额上升不算消耗」这类边界。
+   *
+   * 独立于网关状态：只要宿主服务在跑就能拿到，与网关是否启动无关。
+   * 拿不到（如旧版后端无此接口）就不显示消耗列，其余功能不受影响。
+   */
+  const [creditStats, setCreditStats] = useState<CreditStatistics | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getCreditStatistics()
+      .then((res) => {
+        if (!cancelled) setCreditStats(res);
+      })
+      .catch(() => {
+        if (!cancelled) setCreditStats(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
    * 端口 / API Key 是否存在「已编辑但未保存」的内容。
    *
    * 5 秒轮询会用后端配置刷新界面；若无条件覆盖，用户正在输入的内容会被
@@ -386,8 +555,9 @@ export default function GatewayPage() {
       setApiKey(cfg.api_key || "");
     }
     setAutoStart(Boolean(cfg.auto_start));
-    setMode(cfg.mode === "pinned" ? "pinned" : "balance");
+    setMode(cfg.mode === "pinned" ? "pinned" : cfg.mode === "rotation" ? "rotation" : "balance");
     setPinnedUid(cfg.pinned_uid ?? "");
+    setAllowedModel(cfg.allowed_model ?? "");
   }, []);
 
   /**
@@ -414,7 +584,16 @@ export default function GatewayPage() {
     try {
       const res = await api.switchGatewayMode(next, uid);
       if (res.reloaded) {
-        toast.success(next === "pinned" ? "已切换为指定账号并重启网关" : "已切换为负载均衡并重启网关");
+        toast.success(
+          next === "pinned"
+            ? "已切换为指定账号并重启网关"
+            : next === "rotation"
+              ? "已切换为积分轮转并重启网关"
+              : "已切换为负载均衡并重启网关",
+          next === "rotation"
+            ? { description: "将只用一个账号，烧到不可用才轮转到下一个" }
+            : undefined,
+        );
       }
       await refresh();
     } catch (e) {
@@ -450,6 +629,40 @@ export default function GatewayPage() {
     }
   }
 
+  /**
+   * 设置/清除「单一模型」锁定并立即生效。
+   *
+   * 后端在网关运行时会自动重启它（模型锁定由网关启动时读取），因此这里
+   * 只需一次调用；失败时 refresh() 回滚为后端真实值，避免界面显示与实际不符。
+   */
+  async function changeAllowedModel(model: string) {
+    setAllowedModel(model);
+    try {
+      const res = await api.setAllowedModel(model);
+      toast.success(
+        model ? `已锁定模型 ${model}，网关只放行该模型` : "已解除模型锁定（客户端可调任意模型）",
+        res.reloaded ? { description: "网关已重启以生效" } : undefined,
+      );
+      await refresh();
+    } catch (e) {
+      toast.error(api.asError(e));
+      await refresh();
+    }
+  }
+
+  /** 拉取网关支持的模型列表（供「单一模型」下拉使用）。 */
+  const loadModels = useCallback(async () => {
+    setModelsLoading(true);
+    try {
+      const list = await api.getGatewayModels();
+      setModelOptions(list.map((m) => m.id).filter(Boolean).sort());
+    } catch {
+      // 取不到就保留原列表：模型锁定仍可手填（下拉里已有「当前」兜底项）
+    } finally {
+      setModelsLoading(false);
+    }
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
       const s = await api.getGatewayStatus();
@@ -471,6 +684,13 @@ export default function GatewayPage() {
 
   // Token 用量按所选范围拉取。
   //
+  // 首次挂载拉一次模型列表，供「单一模型」下拉使用。
+  // 只在挂载时拉：模型列表来自网关动态接口，5 秒轮询里重复请求没有意义；
+  // 用户需要最新列表时可点旁边的刷新按钮。
+  useEffect(() => {
+    void loadModels();
+  }, [loadModels]);
+
   // 自动刷新：用量区块需要周期更新（网关在持续接请求），但**不**适合挤进 status 的
   // 5 秒轮询 —— 聚合响应可能较大。这里用独立的 30 秒周期，既能自动跟进，
   // 又不会让「切页即请求」把开销放大。
@@ -637,6 +857,41 @@ export default function GatewayPage() {
     return map;
   }, [status?.accounts]);
 
+  /** uid → 该账号在所选范围内的 Token 用量（卡片直接取用）。 */
+  const usageByUid = useMemo(
+    () => new Map(usageAccounts.map((u) => [u.key, u])),
+    [usageAccounts],
+  );
+
+  /**
+   * uid → 该账号在所选范围内的**积分消耗**。
+   *
+   * 后端的 `/api/credits/stats` 直接给了三个时间窗（usageToday / usage7Days /
+   * usageThisMonth），与本页的日期筛选一一对应，因此这里按当前筛选取值即可，
+   * 不需要前端再做时间切分 —— 口径统一交给 `credit_usage.rs`，避免两处算法不一致。
+   *
+   * 注意「全部」没有对应字段：积分快照本身只保留 30 天（retentionDays），
+   * 取 usageThisMonth 会低估，故「全部」不显示消耗（用 0 表示无数据）。
+   */
+  const creditUsedByUid = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const a of creditStats?.accounts ?? []) {
+      const used =
+        usageRange === "today"
+          ? a.usageToday
+          : usageRange === "7d"
+            ? a.usage7Days
+            : usageRange === "30d"
+              ? a.usageThisMonth
+              : 0; // 「全部」：快照只留 30 天，给不出可信值，故不显示
+      map.set(a.accountId, used ?? 0);
+    }
+    return map;
+  }, [creditStats, usageRange]);
+
+  /** 当前日期筛选的中文名，用于卡片列头的 tooltip。 */
+  const usageRangeLabel = USAGE_RANGE_OPTIONS.find((o) => o.key === usageRange)?.label ?? "统计范围";
+
   const endpoint = status?.openaiBase ?? "";
   const endpointHint = useMemo(() => {
     if (!endpoint) return "";
@@ -663,6 +918,9 @@ export default function GatewayPage() {
     // 结论：只要保留居中定宽，宽屏上必然有大片留白；网关页的内容
     //（状态块、设置行、账号池卡片、用量表）本身都适合变宽，故直接放开。
     // 仍保留 max-w-[1800px] 作为超宽屏（4K/带鱼屏）兜底，避免单行文字过长难扫读。
+    // Radix Tooltip 必须有 TooltipProvider 祖先，否则抛错导致整页白屏
+    //（本页此前没有 Tooltip，故一直没有该 Provider；本轮新增了页头 tooltip）。
+    <TooltipProvider delayDuration={250}>
     <div className="mx-auto w-full max-w-[1800px] space-y-6 px-5 py-6 sm:px-8 sm:py-8">
       <header className="flex min-w-0 items-start justify-between gap-3">
         <div className="min-w-0">
@@ -674,16 +932,38 @@ export default function GatewayPage() {
             把账号库里的账号变成 OpenAI 兼容接口，供任意 SDK / 客户端使用。
           </p>
         </div>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="shrink-0"
-          onClick={() => void refresh()}
-          aria-label="刷新"
-          disabled={busy !== null}
-        >
-          <RefreshCw className={cn("size-4", busy === "refresh" && "animate-spin")} />
-        </Button>
+        <div className="flex shrink-0 items-center gap-1">
+          {/* 布局切换：旧版（账号池与用量分块）↔ 新版（用量并进账号卡片）。
+              图标按钮 + tooltip，与账号页「紧凑/宽松」同一范式，避免页头变宽。 */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="shrink-0"
+                onClick={toggleLayout}
+                aria-label={layout === "classic" ? "切换到新版布局（用量并进账号卡片）" : "切换到旧版布局"}
+              >
+                {layout === "classic" ? <LayoutGrid className="size-4" /> : <Rows3 className="size-4" />}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="left">
+              {layout === "classic"
+                ? "新版布局：用量直接并进账号卡片，看「谁在跑、烧了多少」不用上下对照（会记住选择）"
+                : "旧版布局：账号池与 Token 用量各自独立成块（会记住选择）"}
+            </TooltipContent>
+          </Tooltip>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="shrink-0"
+            onClick={() => void refresh()}
+            aria-label="刷新"
+            disabled={busy !== null}
+          >
+            <RefreshCw className={cn("size-4", busy === "refresh" && "animate-spin")} />
+          </Button>
+        </div>
       </header>
 
       {error ? (
@@ -817,7 +1097,9 @@ export default function GatewayPage() {
             <div className="mt-0.5 text-[11px] text-muted-foreground">
               {mode === "balance"
                 ? "先打最近到期的积分，同一天到期的账号平均分摊（点击即时生效）"
-                : "只使用下方指定的这一个账号（点击即时生效）"}
+                : mode === "rotation"
+                  ? "只用一个账号烧到不可用，再换按到期日排序的下一个（点击即时生效）"
+                  : "只使用下方指定的这一个账号（点击即时生效）"}
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
@@ -830,6 +1112,24 @@ export default function GatewayPage() {
               <Shuffle className="size-3.5" />
               负载均衡
             </Button>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant={mode === "rotation" ? "default" : "outline"}
+                  size="sm"
+                  className="h-8 gap-1.5 px-2.5 text-xs"
+                  onClick={() => void changeMode("rotation")}
+                >
+                  <Recycle className="size-3.5" />
+                  积分轮转
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="max-w-[280px]">
+                单一模型 + 积分轮转：始终只用一个账号，把它烧到不可用
+                （余额耗尽 / 被限流 / 熔断）才换下一个 ——
+                换的是按积分到期日排序的下一个，仍然优先烧最快过期的额度。
+              </TooltipContent>
+            </Tooltip>
             <Button
               variant={mode === "pinned" ? "default" : "outline"}
               size="sm"
@@ -855,20 +1155,71 @@ export default function GatewayPage() {
                   : "账号库为空"}
               </div>
             </div>
-            <select
-              id="gw-account"
-              value={pinnedUid}
-              onChange={(e) => void changePinnedUid(e.target.value)}
-              className="h-8 w-44 shrink-0 rounded-md border border-input bg-background px-2 text-xs"
+            {/* Radix Select 不允许 value="" （会抛错），「未选择」用哨兵值表示，
+                再在 onValueChange 里映射回空串 —— 保证 state 里仍是空串语义。 */}
+            <Select
+              value={pinnedUid || NONE_VALUE}
+              onValueChange={(v) => void changePinnedUid(v === NONE_VALUE ? "" : v)}
             >
-              <option value="">（未选择）</option>
-              {(status?.accounts ?? []).map((a) => (
-                <option key={a.uid} value={a.uid}>
-                  {a.nickname || a.uid.slice(0, 8)}
-                  {a.needsRelogin ? "（需重新登录）" : ""}
-                </option>
-              ))}
-            </select>
+              <SelectTrigger id="gw-account" size="sm" className="w-44 shrink-0" aria-label="使用账号">
+                <SelectValue placeholder="（未选择）" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={NONE_VALUE}>（未选择）</SelectItem>
+                {(status?.accounts ?? []).map((a) => (
+                  <SelectItem key={a.uid} value={a.uid}>
+                    {a.nickname || a.uid.slice(0, 8)}
+                    {a.needsRelogin ? "（需重新登录）" : ""}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Row>
+        ) : null}
+
+        {/* 积分轮转模式下选择「单一模型」 —— 选定后网关只放行这一个模型 */}
+        {mode === "rotation" ? (
+          <Row className="flex-col items-stretch gap-2 sm:flex-row sm:items-center">
+            <div className="min-w-0">
+              <Label htmlFor="gw-model" className="text-[13px] font-normal">
+                单一模型
+              </Label>
+              <div className="mt-0.5 text-[11px] text-muted-foreground">
+                {allowedModel
+                  ? `只放行 ${allowedModel}，其他模型会被网关拒绝`
+                  : "未指定 —— 客户端可调任意模型，轮转将无法约束额度消耗"}
+              </div>
+            </div>
+            <Select
+              value={allowedModel || NONE_VALUE}
+              onValueChange={(v) => void changeAllowedModel(v === NONE_VALUE ? "" : v)}
+            >
+              <SelectTrigger id="gw-model" size="sm" className="w-56 shrink-0" aria-label="单一模型">
+                <SelectValue placeholder="（不限制模型）" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={NONE_VALUE}>（不限制模型）</SelectItem>
+                {/* 已锁定但不在当前列表里时补一项，否则触发器会显示空白 */}
+                {allowedModel && !modelOptions.includes(allowedModel) ? (
+                  <SelectItem value={allowedModel}>{allowedModel}（当前）</SelectItem>
+                ) : null}
+                {modelOptions.map((m) => (
+                  <SelectItem key={m} value={m}>
+                    {m}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-8 shrink-0"
+              onClick={() => void loadModels()}
+              disabled={modelsLoading}
+              aria-label="刷新模型列表"
+            >
+              <RefreshCw className={cn("size-3.5", modelsLoading && "animate-spin")} />
+            </Button>
           </Row>
         ) : null}
 
@@ -992,10 +1343,58 @@ export default function GatewayPage() {
       <Section title="账号池" description={pool ? `网关侧运行态（redis=${pool.redis_mode ?? "noop"}）` : "启动网关后可见"}>
         {poolAccounts.length > 0 ? (
           <>
+            {/* 日期筛选：**仅新版布局**放在这里。
+                新版把用量并进了账号卡片，所以筛选器必须紧邻卡片；
+                旧版布局下用量仍在页面下方的「Token 用量」区块里，
+                筛选器留在那里 —— 保持用户已习惯的位置不变。 */}
+            {layout === "merged" ? (
+            <div className="mx-4 mt-3 flex flex-wrap items-center justify-between gap-2 sm:mx-5">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                <span className="text-[11px] text-muted-foreground">用量范围</span>
+                {usageUpdatedAt ? (
+                  <span
+                    className="text-[11px] tabular-nums text-muted-foreground/80"
+                    title={`上次更新：${new Date(usageUpdatedAt).toLocaleString("zh-CN")}`}
+                  >
+                    · 上次更新 {formatRelativeTime(nowTick - usageUpdatedAt)}
+                    {usageLoading ? " · 更新中…" : ""}
+                  </span>
+                ) : null}
+                {creditStats ? null : (
+                  <span className="text-[11px] text-muted-foreground/70" title="积分消耗来自本地积分快照，需宿主服务提供 /api/credits/stats">
+                    · 积分消耗不可用
+                  </span>
+                )}
+              </div>
+              <div className="flex shrink-0 items-center gap-1.5">
+                {USAGE_RANGE_OPTIONS.map((option) => (
+                  <Button
+                    key={option.key}
+                    variant={usageRange === option.key ? "default" : "outline"}
+                    size="sm"
+                    className="h-7 px-2 text-xs"
+                    onClick={() => setUsageRange(option.key)}
+                  >
+                    {option.label}
+                  </Button>
+                ))}
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-7"
+                  onClick={() => setUsageNonce((value) => value + 1)}
+                  disabled={usageLoading}
+                  aria-label="刷新用量"
+                >
+                  <RefreshCw className={cn("size-3.5", usageLoading && "animate-spin")} />
+                </Button>
+              </div>
+            </div>
+            ) : null}
             {/* 全局说明只写一次。此前每个账号都重复渲染「模型冷却只影响上述模型…」，
                 14 个账号就是 14 遍相同文案，是纯噪音。 */}
             {poolModelCooledCount > 0 ? (
-              <div className="mx-4 mt-3 rounded-lg bg-sky-500/10 px-3 py-2 text-[11px] leading-5 text-sky-800 dark:text-sky-300 sm:mx-5">
+              <div className="mx-4 mt-2 rounded-lg bg-sky-500/10 px-3 py-2 text-[11px] leading-5 text-sky-800 dark:text-sky-300 sm:mx-5">
                 有 {poolModelCooledCount} 个账号处于<strong className="font-medium">模型冷却</strong>
                 ：仅下列标出的模型暂不可用，这些账号的<strong className="font-medium">其他模型仍会正常参与负载均衡</strong>，
                 冷却到期后自动恢复。
@@ -1013,7 +1412,16 @@ export default function GatewayPage() {
             ) : null}
             {/* 卡片网格：auto-rows-fr 让同一排的卡片等高，避免因冷却明细行数不同而参差。 */}
             <div className="grid auto-rows-fr grid-cols-1 gap-3 p-3 sm:grid-cols-2 sm:p-4 xl:grid-cols-3 2xl:grid-cols-4">
-              {poolAccounts.map((acc) => <PoolAccountRow key={acc.uid} acc={acc} />)}
+              {poolAccounts.map((acc) => (
+                <PoolAccountRow
+                  key={acc.uid}
+                  acc={acc}
+                  usage={usageByUid.get(acc.uid)}
+                  creditUsed={creditUsedByUid.get(acc.uid) ?? 0}
+                  usageRangeLabel={usageRangeLabel}
+                  showUsage={layout === "merged"}
+                />
+              ))}
             </div>
           </>
         ) : (
@@ -1035,6 +1443,10 @@ export default function GatewayPage() {
         )}
       </Section>
 
+      {/* Token 用量区块：**仅旧版布局**展示。
+          新版布局（merged）已把用量并进账号卡片，再重复一整块会让页面冗长，
+          且同一份数据出现两处、日期筛选也要跟着放两份 —— 故新版下隐藏。 */}
+      {layout === "classic" ? (
       <Section
         title="Token 用量"
         description="经网关成功请求的上游用量，按模型 / 账号 / 日期聚合（网关重启后保留）"
@@ -1235,6 +1647,7 @@ export default function GatewayPage() {
           </Row>
         )}
       </Section>
+      ) : null}
 
       <Section title="客户端接入" description="把网关接入本机已安装的 AI 客户端，或按标准环境变量接入">
         <div className="space-y-4 p-4 sm:p-5">
@@ -1318,5 +1731,6 @@ ANTHROPIC_AUTH_TOKEN=${apiKey || "<你的 api_key>"}`}</code>
         </Row>
       </Section>
     </div>
+    </TooltipProvider>
   );
 }

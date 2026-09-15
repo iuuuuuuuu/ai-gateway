@@ -66,3 +66,6 @@ NAVIGATION.md
 # Python 缓存（仓库根出现过 __pycache__/*.pyc 被误加进暂存区）
 __pycache__/
 *.pyc
+
+# 本地隔离测试实例的 Tauri 配置（独立 identifier + 数据目录，仅供开发调试）
+src-tauri/tauri.dev-sandbox.conf.json

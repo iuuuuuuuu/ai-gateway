@@ -150,6 +150,16 @@ pub fn delete_account(account_id: String) -> Result<Value, String> {
     Ok(json!({ "ok": true }))
 }
 
+/// POST /api/accounts/note —— 设置账号备注（空串 = 清除）。
+///
+/// 备注是用户自定义标签（如「公司号」「备用」），用于认出「这是谁的号」；
+/// 只存本地账号库，不参与登录、不触碰任何凭证字段。
+#[tauri::command]
+pub fn set_account_note(account_id: String, note: String) -> Result<Value, String> {
+    let acc = account::set_account_note(&account_id, &note)?;
+    Ok(json!({ "ok": true, "account": account::account_meta(&acc) }))
+}
+
 /// POST /api/oauth/start —— 发起 OAuth 扫码登录。
 ///
 /// `region` 为 `"cn"`（缺省）或 `"intl"`：决定取 state 的域名与平台标识
@@ -732,6 +742,23 @@ pub async fn switch_gateway_mode(mode: String, pinned_uid: Option<String>) -> Re
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("切换模式失败")
+            .to_string();
+        return Err(msg);
+    }
+    Ok(result)
+}
+
+/// 设置「单一模型 + 积分轮转」的目标模型；空串 = 清除锁定。
+///
+/// 网关运行时自动重启以生效（模型锁定由网关启动时读取，与切换模式同理）。
+#[tauri::command]
+pub async fn set_allowed_model(model: String) -> Result<Value, String> {
+    let result = wb_switch_core::modules::gateway::set_allowed_model(&model).await;
+    if result.get("ok").and_then(Value::as_bool) == Some(false) {
+        let msg = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("设置模型失败")
             .to_string();
         return Err(msg);
     }
