@@ -35,6 +35,12 @@ type Config struct {
 		// 签到只恢复余额；**连登天数**与领养资格靠对话活跃上报点亮
 		//（一条 chat_request_send 同时点亮连登 + 解锁 first_buddy 任务）。
 		ActivityHours []int `json:"activity_hours"`
+		// NightOwlHours 夜猫子任务时点，默认 [1]。
+		//
+		// growth 有个时段敏感任务只在夜猫窗口（23:00–08:00 CST）内计入，
+		// 故单独排一个落在窗口内的时点（01 点避开 22 点的 token 保活）。
+		// 窗口外执行会被自动跳过，手工触发也不会做无用请求。
+		NightOwlHours []int `json:"nightowl_hours"`
 		// CheckinEnabled/KeepaliveEnabled/ActivityEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -46,6 +52,7 @@ type Config struct {
 		CheckinEnabled   bool `json:"checkin_enabled"`   // 缺省 true；false = 关签到（旅行随之停）
 		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 关活跃上报
+		NightOwlEnabled  bool `json:"nightowl_enabled"`  // 缺省 true；false = 关夜猫子任务
 		// ActivityReportCount 每号每日上报条数，默认 3。
 		//
 		// 取 3 而非 1：单条上报偶发被服务端丢弃（缺 userId 时 200 但静默丢弃），
@@ -147,11 +154,13 @@ func Default() *Config {
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Schedule.ActivityHours = []int{10}
+	c.Schedule.NightOwlHours = []int{1}
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 	c.Schedule.CheckinEnabled = true
 	c.Schedule.KeepaliveEnabled = true
 	c.Schedule.ActivityEnabled = true
+	c.Schedule.NightOwlEnabled = true
 	c.Schedule.ActivityReportCount = 3
 	c.Schedule.CheckinScope = "cn"
 	c.Upstream.TimeoutSeconds = 120
@@ -286,6 +295,7 @@ func (c *Config) normalize() error {
 	}
 	if len(c.Schedule.ActivityHours) == 0 {
 		c.Schedule.ActivityHours = []int{10}
+	c.Schedule.NightOwlHours = []int{1}
 	}
 	if c.Schedule.ActivityReportCount <= 0 {
 		c.Schedule.ActivityReportCount = 3

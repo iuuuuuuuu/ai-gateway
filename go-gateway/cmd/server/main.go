@@ -135,9 +135,11 @@ func main() {
 		CheckinHours:        cfg.Schedule.CheckinHours,
 		KeepaliveHours:      cfg.Schedule.KeepaliveHours,
 		ActivityHours:       cfg.Schedule.ActivityHours,
+		NightOwlHours:       cfg.Schedule.NightOwlHours,
 		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
 		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
 		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
+		NightOwlDisabled:    !cfg.Schedule.NightOwlEnabled,
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		CheckinScope:        cfg.Schedule.CheckinScope,
 	})
@@ -162,6 +164,12 @@ func main() {
 			cfg.Schedule.ActivityHours, cfg.Schedule.ActivityReportCount)
 	} else {
 		log.Printf("活跃上报已禁用（schedule.activity_enabled=false）：连登天数将不再增长")
+	}
+	if cfg.Schedule.NightOwlEnabled {
+		log.Printf("夜猫子任务已启用（%v 点）：夜猫窗口 23:00-08:00 CST 内补一次任务",
+			cfg.Schedule.NightOwlHours)
+	} else {
+		log.Printf("夜猫子任务已禁用（schedule.nightowl_enabled=false）")
 	}
 
 	h := server.NewHandler(server.Config{

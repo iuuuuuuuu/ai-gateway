@@ -57,7 +57,13 @@ func TestNextWakeKeepaliveOnly(t *testing.T) {
 
 // TestNextWakeSameInstantFiresAll 签到与保活配到同一整点时两类任务都要执行。
 func TestNextWakeSameInstantFiresAll(t *testing.T) {
-	s := New(Config{CheckinHours: []int{9, 22}, KeepaliveHours: []int{22}})
+	// 关掉与本次断言无关的任务，避免它们抢占最近时点。
+	s := New(Config{
+		CheckinHours:     []int{9, 22},
+		KeepaliveHours:   []int{22},
+		ActivityDisabled: true,
+		NightOwlDisabled: true,
+	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
 		t.Errorf("next=%v want %v", at, want)
@@ -115,9 +121,11 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 		CheckinDisabled:   true,
 		KeepaliveDisabled: true,
 		ActivityDisabled:  true,
+		NightOwlDisabled:  true,
 		CheckinHours:      []int{9, 21},
 		KeepaliveHours:    []int{22},
 		ActivityHours:     []int{10},
+		NightOwlHours:     []int{1},
 	})
 	at, kinds := s.nextWake(time.Now())
 	if !at.IsZero() || len(kinds) != 0 {

@@ -30,6 +30,11 @@ type Config struct {
 	// 一条 chat_request_send 同时点亮连登 + 解锁 first_buddy（领养前置），
 	// 因此它是「能领养」的前提。
 	ActivityHours []int
+	// NightOwlHours 夜猫子任务时点，默认 [1]。
+	//
+	// growth 有个时段敏感任务只在夜猫窗口（23:00–08:00 CST）内计入，
+	// 故单独排一个落在窗口内的时点（01 点避开 22 点的 token 保活）。
+	NightOwlHours []int
 
 	// CheckinDisabled 显式关闭签到排程（对应 config 的 schedule.checkin_enabled=false）。
 	// 禁用后不再有任何签到时点，搭签到便车的猫猫旅行也随之停摆。
@@ -38,6 +43,8 @@ type Config struct {
 	KeepaliveDisabled bool
 	// ActivityDisabled 显式关闭活跃上报排程（schedule.activity_enabled=false）。
 	ActivityDisabled bool
+	// NightOwlDisabled 显式关闭夜猫子排程（schedule.nightowl_enabled=false）。
+	NightOwlDisabled bool
 
 	// ActivityReportCount 每个账号每日上报条数，默认 3（与官方客户端行为接近）。
 	// 多条共用同一 conversationId，requestId 各自独立。
@@ -79,6 +86,9 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.ActivityHours) == 0 {
 		cfg.ActivityHours = []int{10}
 	}
+	if len(cfg.NightOwlHours) == 0 {
+		cfg.NightOwlHours = []int{1}
+	}
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = defaultActivityReportCount
 	}
@@ -107,6 +117,7 @@ const (
 	taskCheckin taskKind = iota
 	taskKeepalive
 	taskActivity
+	taskNightOwl
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -126,6 +137,9 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	if !s.cfg.ActivityDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.ActivityHours), taskActivity})
+	}
+	if !s.cfg.NightOwlDisabled {
+		slots = append(slots, slot{nextFire(now, s.cfg.NightOwlHours), taskNightOwl})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -172,6 +186,8 @@ func (s *Scheduler) Run(ctx context.Context) {
 					s.RunKeepaliveNow()
 				case taskActivity:
 					s.runActivity(ctx)
+				case taskNightOwl:
+					s.runNightOwl(ctx)
 				}
 			}
 		}

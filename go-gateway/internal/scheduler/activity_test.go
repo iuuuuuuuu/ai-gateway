@@ -271,12 +271,13 @@ func TestActivityDisabledNoCalls(t *testing.T) {
 	defer srv.Close()
 
 	s := New(Config{
-		Pool:             newPool(&auth.Auth{UID: "u1", AccessToken: "tok"}),
-		Upstream:         &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL},
-		CheckinDisabled:  true,
+		Pool:              newPool(&auth.Auth{UID: "u1", AccessToken: "tok"}),
+		Upstream:          &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL},
+		CheckinDisabled:   true,
 		KeepaliveDisabled: true,
-		ActivityDisabled: true,
-		ActivityHours:    []int{10},
+		ActivityDisabled:  true,
+		NightOwlDisabled:  true,
+		ActivityHours:     []int{10},
 	})
 
 	// nextWake 不应把 activity 排进去
