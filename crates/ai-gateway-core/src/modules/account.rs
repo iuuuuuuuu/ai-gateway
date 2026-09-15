@@ -236,18 +236,53 @@ pub fn save_collected_account(collected: Value) -> std::io::Result<Value> {
 }
 
 /// 按 id 覆盖写入账号库（不存在则追加）。对照 server.py `_upsert_account`。
+///
+/// **匹配不能只看 `id`**：账号库里可能存在只有 `uid` / `email` 而没有 `id` 的条目
+/// （手工导入、旧版本遗留、测试数据都会这样）。只按 `id` 匹配时这些条目永远匹配
+/// 不上，于是每次刷新 token 都会**再追加一条** —— 账号列表随刷新次数不断长出
+/// 重复项（实测：一个只有 `{email, uid}` 的条目在应用启动后被复制成两条）。
+///
+/// 因此匹配顺序为：`id` → `uid`（同区域）→ `email`（同区域）。
+/// 区域必须参与判断：国服与国际版的 uid / 邮箱是相互独立的命名空间，
+/// 同一串 uid 在两个区域可以同时存在，跨区域匹配会互相覆盖。
 pub fn upsert_account(updated: &Value) -> std::io::Result<()> {
     let mut accounts = load_accounts();
     let id = updated.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let mut replaced = false;
-    for a in accounts.iter_mut() {
-        if a.get("id").and_then(|v| v.as_str()) == Some(id) {
-            *a = updated.clone();
-            replaced = true;
-            break;
+    let uid = get_str(updated, "uid");
+    let email = identity_email(updated);
+
+    let matches = |a: &Value| -> bool {
+        // 1) id 精确匹配（最准，且不受区域字段缺失影响）
+        if !id.is_empty() && a.get("id").and_then(|v| v.as_str()) == Some(id) {
+            return true;
         }
-    }
-    if !replaced {
+        // 2) 区域必须一致，否则跨区域会互相覆盖
+        if !same_region(a, updated) {
+            return false;
+        }
+        // 3) uid 匹配
+        if let Some(uid) = uid.as_deref() {
+            if get_str(a, "uid").as_deref() == Some(uid) {
+                return true;
+            }
+        }
+        // 4) 真实邮箱兜底（仅当双方都有可用邮箱）
+        match (email.as_deref(), identity_email(a)) {
+            (Some(left), Some(right)) => left == right,
+            _ => false,
+        }
+    };
+
+    if let Some(existing) = accounts.iter_mut().find(|a| matches(a)) {
+        // 保留原有 id（与 `upsert_collected_account` 同款约定）：调用方可能仍持有
+        // 基于旧 id 的引用，换掉会让界面上的选中态、备注编辑目标等全部失效。
+        // 用 `insert` 而非 `or_insert`：传入值带的 id 与库里不一致时，以库里为准。
+        let mut merged = updated.clone();
+        if let (Some(obj), Some(prev_id)) = (merged.as_object_mut(), existing.get("id").cloned()) {
+            obj.insert("id".to_string(), prev_id);
+        }
+        *existing = merged;
+    } else {
         accounts.push(updated.clone());
     }
     save_accounts(&accounts)
@@ -568,6 +603,87 @@ mod tests {
     }
 
     // ---- 本机历史账号发现与导入 ----
+
+    /// **回归测试**：只有 uid 没有 id 的账号不得被反复追加。
+    ///
+    /// 实测事故：账号库里存在一条 `{email, uid}`（无 `id`）的条目，`upsert_account`
+    /// 只按 `id` 匹配，于是每次刷新 token 都追加一条新的 —— 应用启动一次，
+    /// 账号列表就多出一个重复项。
+    #[test]
+    fn upsert_account_对无_id_的账号按_uid_去重() {
+        let dir = crate::modules::config::test_isolation::Isolated::new("upsert-no-id");
+        let _ = dir;
+
+        // 账号库里先有一条只有 uid + email 的条目（无 id）
+        let mut accounts = vec![json!({"uid": "legacy-user", "email": "old@example.com"})];
+        save_accounts(&accounts).expect("seed");
+
+        // 刷新流程回写同一个账号（带上了 id）
+        upsert_account(&json!({
+            "uid": "legacy-user",
+            "email": "old@example.com",
+            "id": "generated-id",
+            "needs_relogin": true,
+        }))
+        .expect("upsert");
+
+        accounts = load_accounts();
+        assert_eq!(
+            accounts.len(),
+            1,
+            "同 uid 的账号不得被重复追加，实际 {} 条",
+            accounts.len()
+        );
+        assert_eq!(accounts[0]["needs_relogin"], true, "刷新结果应被写入");
+        assert_eq!(
+            accounts[0]["id"], "generated-id",
+            "原有条目没有 id，应补上新 id"
+        );
+    }
+
+    /// 已有 id 的账号按 id 匹配，且**保留原有 id**（调用方可能仍持有旧引用）。
+    #[test]
+    fn upsert_account_保留原有_id() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("upsert-keep-id");
+        save_accounts(&[json!({"id": "keep-me", "uid": "u1", "email": "a@b.c"})]).expect("seed");
+
+        upsert_account(&json!({
+            "id": "a-different-id",
+            "uid": "u1",
+            "email": "a@b.c",
+            "nickname": "改过的名字",
+        }))
+        .expect("upsert");
+
+        let accounts = load_accounts();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0]["id"], "keep-me", "原有 id 必须保留");
+        assert_eq!(accounts[0]["nickname"], "改过的名字");
+    }
+
+    /// 跨区域的同 uid 不得互相覆盖（两区域身份命名空间独立）。
+    #[test]
+    fn upsert_account_跨区域不互相覆盖() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("upsert-region");
+        save_accounts(&[json!({
+            "uid": "same-uid",
+            "domain": "www.workbuddy.cn",
+            "nickname": "国服号",
+        })])
+        .expect("seed");
+
+        upsert_account(&json!({
+            "uid": "same-uid",
+            "domain": "www.workbuddy.ai",
+            "nickname": "国际版号",
+        }))
+        .expect("upsert");
+
+        let accounts = load_accounts();
+        assert_eq!(accounts.len(), 2, "两区域身份独立，应各留一条");
+        assert!(accounts.iter().any(|a| a["nickname"] == "国服号"));
+        assert!(accounts.iter().any(|a| a["nickname"] == "国际版号"));
+    }
 
     /// 同区域同 uid 出现多份文件时，只留凭证最新的一份。
     #[test]

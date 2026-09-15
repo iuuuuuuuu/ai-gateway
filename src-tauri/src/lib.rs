@@ -151,18 +151,24 @@ pub fn run() {
                     tray::is_silent_startup(std::env::args()),
                 );
             }
-            // README 截图模式只渲染前端虚构数据，禁止读取账号后执行签到、轮换或保活。
-            if !is_screenshot_demo() {
-                // 数据目录迁移必须**最先**执行：改名后旧版数据在 `~/.wb-switch`，
-                // 若不先搬过来，后续所有读写都会落到空的 `~/.ai-gateway`，
-                // 用户看到的是「账号全没了」。
-                //
-                // 幂等且复制式（旧目录保留），因此重复启动安全、也支持回退旧版。
+            // 数据目录迁移必须**最先**执行，且**不受截图演示模式影响**。
+            //
+            // 为什么不能放进下面的 `if !is_screenshot_demo()` 里：改名后旧版数据在
+            // `~/.wb-switch`。若演示模式跳过迁移，本次运行就会在空的 `~/.ai-gateway`
+            // 下建出一份**不完整**的账号库 —— 而「目标目录已有数据」正是迁移的跳过
+            // 条件，于是真实数据从此再也搬不过来（实测踩到过：演示运行写出 2 个账号，
+            // 把旧目录的 8 个账号永久挡在门外）。
+            //
+            // 迁移本身只做文件拷贝、不读账号、不触网，因此在演示模式下执行同样安全。
+            {
                 let migration = modules::migrate_store::migrate_store_dir();
                 if migration.migrated() {
                     eprintln!("[migrate] {}", migration.describe());
                 }
+            }
 
+            // README 截图模式只渲染前端虚构数据，禁止读取账号后执行签到、轮换或保活。
+            if !is_screenshot_demo() {
                 spawn_background_loops();
                 // 网关「随 App 启动」：读 auto_start，为真则在此拉起网关子进程。
                 //
