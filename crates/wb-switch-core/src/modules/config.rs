@@ -751,10 +751,19 @@ fn http_client_builder() -> reqwest::ClientBuilder {
         .user_agent(DEFAULT_HTTP_USER_AGENT);
     match proxy_url() {
         Some(proxy) => match reqwest::Proxy::all(&proxy) {
-            // no_proxy：本机回环（网关 /healthz、/status、/v1/models）绝不能走代理 ——
+            // 本机回环（网关 /healthz、/status、/v1/models）不能走代理 ——
             // 否则「探测本地网关是否在跑」会被转发到远端代理而失败，
             // 表现为网关明明活着却显示未就绪。
-            Ok(p) => builder.proxy(p).no_proxy(),
+            //
+            // 注意必须用 `Proxy::no_proxy`（排除指定主机），**不能**用
+            // `ClientBuilder::no_proxy()` —— 后者的语义是「清空所有代理 +
+            // 关闭系统代理」，会把上面刚设的代理一起删掉。实测踩过：
+            // `builder.proxy(p).no_proxy()` 导致代理完全不生效，
+            // 国际版积分查询仍报 error sending request。
+            Ok(p) => {
+                let no_proxy = reqwest::NoProxy::from_string("localhost,127.0.0.1,::1");
+                builder.proxy(p.no_proxy(no_proxy))
+            }
             Err(_) => builder, // 地址非法：不挂代理，回落直连（由调用方报错）
         },
         None => builder,
