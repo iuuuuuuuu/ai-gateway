@@ -1712,31 +1712,36 @@ pub fn build_minimax_config(
 
     // 空模型列表必须兜底：空映射会被渲染成 `{}` 字符串字面量，那是**非法 YAML**，
     // MiniMax Code 读不了；而且 `defaultModel` 也需要一个真实模型名。
+    //
+    // 兜底值用 `deepseek-v4-flash`（本网关的通用默认模型，与其余 11 个 builder 一致），
+    // **不用** MiniMax 官方模型名：那是官方 provider 的模型，写进我们自己的
+    // provider 里会指向一个本网关并不提供的模型，客户端选中后必然 404。
+    //
     // 调用方（import_target）本就会兜底，这里再兜一次是因为本函数是 pub fn ——
     // 不能依赖调用方守规矩。
     let effective: Vec<String> = if models.is_empty() {
-        vec!["MiniMax-M3".to_string()]
+        vec!["deepseek-v4-flash".to_string()]
     } else {
         models.to_vec()
     };
     let primary = effective
         .first()
         .map(String::as_str)
-        .unwrap_or("MiniMax-M3");
+        .unwrap_or("deepseek-v4-flash");
 
-    // 模型条目：对齐 MiniMax 官方条目的最小必要字段集。
-    // 刻意不写 limit/thinking_config 等：那些是官方模型特有的能力声明，
-    // 对本网关代理的模型不一定成立，写错反而会让客户端按错误能力调用。
+    // 模型条目：只声明**所有上游模型都成立**的能力。
+    //
+    // 刻意不写 `reasoning: true` / `tool_call: true`：这两个字段是能力声明，
+    // 客户端会据此决定是否发送 thinking 参数、是否下发工具。而本网关背后是
+    // 账号池（国服/国际版模型能力不同），对某个模型声称支持推理、实际不支持时，
+    // 客户端会发出带 thinking 的请求并收到上游报错 —— 表现为「接入后对话就报错」。
+    // 保守地不声明，客户端会退回到通用路径，行为最稳。
+    //
+    // 同理不写 `limit` / `thinking_config` / `capabilities`：那些是 MiniMax 官方
+    // 模型特有的声明，对本网关代理的模型不一定成立。
     let mut models_map = Map::new();
     for m in &effective {
-        models_map.insert(
-            m.clone(),
-            json!({
-                "name": m,
-                "reasoning": true,
-                "tool_call": true,
-            }),
-        );
+        models_map.insert(m.clone(), json!({ "name": m }));
     }
 
     let provider = ensure_yaml_map(&mut root, "provider");
@@ -2275,13 +2280,38 @@ permissionMode: bypassPermissions
         assert_eq!(v["provider"]["ai-gateway"]["npm"], "@ai-sdk/anthropic");
     }
 
-    /// 模型列表为空时回退到默认模型，不生成空 models 块。
+    /// 模型列表为空时回退到**本网关的**默认模型，且不生成空的 models 块。
+    ///
+    /// 兜底值必须是本网关提供的模型（`deepseek-v4-flash`），不能是 MiniMax 官方
+    /// 模型名 —— 后者写进我们的 provider 会指向一个网关不提供的模型，选中即 404。
     #[test]
-    fn minimax_config_falls_back_to_default_model() {
+    fn minimax_config_falls_back_to_gateway_default_model() {
         let out = build_minimax_config(None, "http://127.0.0.1:7863", "k", &[]).unwrap();
         let v = crate::modules::yaml_lite::parse_mapping(&out).expect("parse");
-        assert_eq!(v["defaultModel"], "ai-gateway/MiniMax-M3");
-        assert!(v["provider"]["ai-gateway"]["models"].as_object().unwrap().len() >= 1);
+        assert_eq!(
+            v["defaultModel"], "ai-gateway/deepseek-v4-flash",
+            "兜底模型必须是本网关提供的，否则客户端选中后必然 404"
+        );
+        let models = v["provider"]["ai-gateway"]["models"]
+            .as_object()
+            .expect("models 必须是映射而不是 {} 字符串");
+        assert_eq!(models.len(), 1);
+        assert!(models.contains_key("deepseek-v4-flash"));
+    }
+
+    /// 不声明未经证实的能力（reasoning / tool_call）。
+    ///
+    /// 本网关背后是账号池，模型能力因区域而异。声称支持推理而实际不支持时，
+    /// 客户端会发出带 thinking 的请求并收到上游报错（表现为「接入后一对话就报错」）。
+    #[test]
+    fn minimax_config_does_not_claim_unverified_capabilities() {
+        let out = build_minimax_config(None, "http://127.0.0.1:7863", "k", &["m1".into()]).unwrap();
+        let v = crate::modules::yaml_lite::parse_mapping(&out).expect("parse");
+        let entry = &v["provider"]["ai-gateway"]["models"]["m1"];
+        assert_eq!(entry["name"], "m1");
+        assert!(entry.get("reasoning").is_none(), "不得声明未证实的推理能力");
+        assert!(entry.get("tool_call").is_none(), "不得声明未证实的工具调用能力");
+        assert!(entry.get("limit").is_none(), "不得声明上游特有的上下文限制");
     }
 
     /// 损坏的既有配置必须**拒绝写入**（宁可不动，也不能写坏用户的官方登录态）。
