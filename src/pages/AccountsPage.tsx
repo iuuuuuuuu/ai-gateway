@@ -43,6 +43,7 @@ import { ImportLocalDialog } from "@/components/import-local-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
+import { useVisibilityInterval } from "@/lib/use-visibility-interval";
 import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, TravelConfig, TravelStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
@@ -319,7 +320,21 @@ export default function AccountsPage() {
     }
   }
 
-  // 账号列表变化后并行查询旅行状态；后台领取后每 60 秒再拉一次，避免卡片停在「旅行中」。
+  // 旅行状态轮询（60 秒一轮）。
+  //
+  // 用 useVisibilityInterval：窗口隐藏 / 收进托盘时**销毁**定时器，不在后台空转。
+  // 原先的裸 setInterval 只在组件卸载时清理，隐藏期间仍每 60 秒打一轮请求。
+  // onResume 让切回来时立刻补一次，卡片不会停在过期状态。
+  const travelScopedIds = travelScopedAccounts.map((account) => account.id);
+  useVisibilityInterval(() => void loadTravelMap(travelScopedIds), 60_000, {
+    enabled: travelScopedIds.length > 0,
+    // 首次加载由下方 useEffect 负责（它还要处理「无账号时清空」），
+    // 这里传 false 避免挂载时重复请求一次。
+    immediate: false,
+    onResume: () => void loadTravelMap(travelScopedIds),
+  });
+
+  // 账号列表变化后立刻查一次旅行状态（周期轮询由上面的 hook 负责）。
   // 同样只查国服账号：国际版的旅行接口无数据，查了只会一直显示「未旅行」。
   useEffect(() => {
     if (!travelScopedAccounts.length) {
@@ -329,12 +344,8 @@ export default function AccountsPage() {
     let cancelled = false;
     const ids = travelScopedAccounts.map((account) => account.id);
     void loadTravelMap(ids, () => cancelled);
-    const timer = window.setInterval(() => {
-      void loadTravelMap(ids, () => cancelled);
-    }, 60_000);
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
     };
   }, [accounts]);
 

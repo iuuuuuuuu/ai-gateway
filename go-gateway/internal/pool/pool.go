@@ -80,6 +80,17 @@ type Status struct {
 	SoonestExpireAt int64  `json:"soonest_expire_at,omitempty"`
 	ExpireDay       string `json:"expire_day,omitempty"`
 
+	// Queued 该账号是否正因「到期档位更晚」而排队等待（当前轮不到它）。
+	//
+	// 由后端按与选号**完全相同**的档位口径算出，前端直接展示即可 ——
+	// 前端无法自行判断：它既拿不到 healthy/模型冷却/在途 这三套判定，
+	// 也没有「当前生效档位」这个池级信息。用 success_count==0 之类近似会误判
+	//（新导入或持续失败的账号同样是 0，但它们不是排队）。
+	//
+	// 语义：只表示「按分层规则现在轮不到」，不代表故障。前面的档位被消耗或冷却后，
+	// 它会自动进入路由。
+	Queued bool `json:"queued,omitempty"`
+
 	// ModelCooling 该账号当前因「模型级限流」而冷却的模型列表（按到期时间升序）。
 	//
 	// 与 CoolKind 的区别（前端据此区分两种冷却）：
@@ -1346,16 +1357,64 @@ func (p *Pool) ServableNow() bool {
 func (p *Pool) List() []Status {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid := range p.byUID {
 		uids = append(uids, uid)
 	}
 	sort.Strings(uids)
+
+	// 先算出「当前会被路由的那一档」，供每个账号标注是否在排队。
+	//
+	// 为什么必须由后端算：前端拿不到档位规则（要复刻 healthy + 模型冷却 + 到期分层
+	// 三套判定），而用「success_count == 0」之类的近似会误判 —— 新导入的账号、
+	// 或一直失败的账号同样是 0，但它们不是排队。只有用与选号**完全相同**的口径，
+	// 「排队中」才是可信的事实而非猜测。
+	routedDay := p.routedTierDayLocked(now)
 	out := make([]Status, 0, len(uids))
 	for _, uid := range uids {
-		out = append(out, p.statusOf(uid, p.byUID[uid]))
+		st := p.statusOf(uid, p.byUID[uid])
+		if routedDay != "" && st.ExpireDay > routedDay {
+			// 到期日更晚 ⇒ 不在当前档位 ⇒ 排队等待
+			st.Queued = true
+		}
+		out = append(out, st)
 	}
 	return out
+}
+
+// routedTierDayLocked 返回当前实际会被路由的到期日档位（空串 = 无法确定）。
+//
+// 口径与 pick 保持一致：剔除禁用、账号级冷却、在途占满的账号，取「最早到期日」那一档。
+//
+// 关于**模型冷却**（这里是本实现踩过的坑，务必保留这条排除）：
+// 档位本身是账号级属性，但「当前是否轮得到」取决于**本次请求的模型**。实测现场：
+// 4 个更早档位的账号对主力模型 deepseek-v4.1-flash 处于模型冷却，网关于是跳过它们、
+// 把流量给了更晚档位的 8 个账号。若这里不排除模型冷却账号，就会算出「最早档位是
+// 10-01」，进而把真正在服务的 8 个账号全标成「排队」，还把冷却中的账号标成「会路由」
+// —— 与事实完全相反。已由 TestQueuedFlagMatchesLiveScenario 锁定。
+//
+// 以「是否存在至少一个模型处于冷却」作为排除依据：只要有模型在冷却，该账号对那个
+// 模型就不可用，不能代表「轮得到」。这是保守估计，对单模型为主的用法足够准确。
+func (p *Pool) routedTierDayLocked(now time.Time) string {
+	best := ""
+	for _, e := range p.byUID {
+		if e.disabled || !e.healthy(now) || p.inFlightFull(e) {
+			continue
+		}
+		// 有任一模型在冷却 ⇒ 该账号当前可能整体不可用，不参与档位判定
+		if len(e.modelCoolingList(now)) > 0 {
+			continue
+		}
+		key := e.expiryDayKey()
+		if key == "" {
+			continue // 到期日未知：排最后，不参与档位判定
+		}
+		if best == "" || key < best {
+			best = key
+		}
+	}
+	return best
 }
 
 func (p *Pool) statusOf(uid string, e *entry) Status {

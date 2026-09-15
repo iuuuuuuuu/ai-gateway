@@ -383,6 +383,7 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 |---|---|
 | Windows 10 / 11（x64） | 需 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)（一般已内置） |
 | macOS（Apple Silicon） | 直接运行，首次打开需 `xattr -cr` 放行（见下） |
+| macOS（Intel） | 同上，下载 `_x64.dmg` |
 | 磁盘 | 约 50 MB |
 | 其他 | 无需安装 Docker、Node.js 或 Go（从安装包运行时） |
 
@@ -393,6 +394,7 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 | 文件 | 说明 |
 |---|---|
 | `workbuddy-switch_<版本>_aarch64.dmg` | macOS（Apple Silicon）磁盘映像，拖入「应用程序」即安装 |
+| `workbuddy-switch_<版本>_x64.dmg` | macOS（Intel）磁盘映像，同上 |
 | `WorkBuddy.Switch.Gateway_<版本>_x64-setup.exe` | Windows 安装向导，自动创建开始菜单与卸载项 |
 | `WorkBuddy.Switch.Gateway_<版本>_x64_en-US.msi` | Windows MSI 包，适合批量部署 |
 | `WorkBuddy_Switch_Gateway_<版本>_portable.zip` | Windows 便携版，解压即用，不写入注册表 |

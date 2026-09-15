@@ -1,24 +1,35 @@
 // workbuddy-switch postinstall：从「平台包」复制本平台二进制。
 //
-// Windows-only：二进制发布在独立 npm 包 workbuddy-switch-win32-x64，
-// 主包声明为 optionalDependencies，安装时 npm 自动装好平台包，postinstall 只需复制——
+// 二进制发布在独立平台包（workbuddy-switch-<platform>-<arch>），主包在
+// optionalDependencies 里声明，安装时 npm 自动装好本机对应的那个，postinstall 只需复制——
 // 不依赖 GitHub，国内镜像（npmmirror）也能稳定安装。
+//
+// 支持的平台见下方 FILE 映射。注意 optionalDependencies 是「按 os/cpu 字段择优安装」，
+// 平台包必须同时声明 os 与 cpu，否则在别的架构上也会被装上。
 //
 // 环境变量覆盖：
 //   WB_SWITCH_BINARY=<本地二进制路径>  本地开发/离线安装（直接复制，不联网）
 const fs = require("fs");
 const path = require("path");
 
+// 平台 → 平台包内二进制文件名。
+//
+// macOS 有两个架构：Intel(x64) 与 Apple Silicon(arm64)，二者二进制不通用，
+// 必须分别发布（release 工作流里对应 macos-x64 与 macos-arm64 两个 job）。
 const FILE = {
   "win32-x64": "wb-switch-win32-x64.exe",
+  "darwin-x64": "wb-switch-darwin-x64",
+  "darwin-arm64": "wb-switch-darwin-arm64",
+  "linux-x64": "wb-switch-linux-x64",
+  "linux-arm64": "wb-switch-linux-arm64",
 }[`${process.platform}-${process.arch}`];
 
 const PLATFORM_PKG = `workbuddy-switch-${process.platform}-${process.arch}`;
 
 if (!FILE) {
   console.warn(
-    `workbuddy-switch: 跳过平台 ${process.platform}-${process.arch}（仅支持 Windows x64），` +
-      `可手动下载二进制后放置到 bin/ 目录`,
+    `workbuddy-switch: 跳过平台 ${process.platform}-${process.arch}（暂无对应平台包），` +
+      `可设置 WB_SWITCH_BINARY 指向本地二进制，或手动放置到 bin/ 目录`,
   );
   process.exit(0);
 }

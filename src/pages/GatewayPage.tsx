@@ -28,6 +28,7 @@ import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
+import { useVisibilityInterval } from "@/lib/use-visibility-interval";
 import type {
   GatewayConfig,
   GatewayMode,
@@ -219,16 +220,36 @@ function coolReasonText(acc: GatewayPoolAccount): string {
   return acc.reason || "冷却中";
 }
 
+/**
+ * 「排队中」的说明文案。
+ *
+ * 这一档最容易被误读成故障：账号健康、积分充足，只是到期档位比当前生效档位晚，
+ * 因此暂时轮不到。必须把机制说清楚，否则用户会以为账号丢了或没生效。
+ */
+function queuedReasonText(acc: GatewayPoolAccount): string {
+  const day = acc.expire_day ? `（本账号到期 ${acc.expire_day}）` : "";
+  return (
+    `账号本身健康、积分充足，但到期档位${day}晚于当前正在使用的那一档。` +
+    `网关按「先烧快过期额度」分层选号，只把流量给最早到期的那一组；` +
+    `前面档位被用尽或冷却后，本账号会自动开始承接流量。`
+  );
+}
+
 /** 网关账号池账号卡片：展示冷却/熔断/在途等运行态。 */
 function PoolAccountRow({ acc }: { acc: GatewayPoolAccount }) {
   const modelCools = acc.model_cooling ?? [];
-  // 「冷却中」只表示**账号级**不可用（余额欠费/被限速/熔断）。
-  // 模型级限流不影响整号可用性，故单独在下方区域呈现，不占用这个状态标签。
+  // 状态标签的优先级：禁用 > 账号级冷却 > 排队 > 健康。
+  //
+  // 「排队」单独作为一档，因为它最容易让人误判：账号本身完全健康、积分充足，
+  // 只是到期档位比当前生效档位晚，所以暂时轮不到（用户看到「健康」却在用量里
+  // 找不到它，就会以为账号丢了）。
   const state = acc.disabled
     ? { label: "已禁用", cls: "bg-destructive/10 text-destructive" }
     : acc.cooling
       ? { label: "冷却中", cls: "bg-amber-500/10 text-amber-600 dark:text-amber-400" }
-      : { label: "健康", cls: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" };
+      : acc.queued
+        ? { label: "排队中", cls: "bg-muted text-muted-foreground" }
+        : { label: "健康", cls: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" };
   // 到期日就是选号分层档位：同一 expire_day 的账号在均衡时同级（平均分摊）。
   const expiry = acc.expire_day
     ? { label: `到期 ${acc.expire_day.slice(5)}`, title: `最近到期积分：${acc.expire_day}（同一天的账号同级平均分摊）` }
@@ -239,7 +260,7 @@ function PoolAccountRow({ acc }: { acc: GatewayPoolAccount }) {
     // 原因：此前是无边框的行，靠 border-b 分隔；分两列后在列与列之间没有视觉边界，
     // 且行高随冷却内容参差（有模型冷却的行高一倍），整体看起来像未对齐的拼贴。
     // 独立卡片 + 栅格 auto-rows-fr 后，同排卡片等高、边界清晰。
-    <div className="flex min-w-0 flex-col rounded-xl border border-border/60 bg-card/40 p-3">
+    <div className={cn("flex min-w-0 flex-col rounded-xl border p-3", acc.queued && !acc.cooling && !acc.disabled ? "border-dashed border-border/60 bg-muted/20" : "border-border/60 bg-card/40")}>
       <div className="flex min-w-0 items-start gap-3">
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-medium">{acc.nickname || acc.uid}</div>
@@ -247,7 +268,7 @@ function PoolAccountRow({ acc }: { acc: GatewayPoolAccount }) {
         </div>
         <span
           className={cn("shrink-0 rounded-md px-1.5 py-0.5 text-[11px] font-medium", state.cls)}
-          title={coolReasonText(acc)}
+          title={acc.queued && !acc.cooling && !acc.disabled ? queuedReasonText(acc) : coolReasonText(acc)}
         >
           {state.label}
         </span>
@@ -442,11 +463,11 @@ export default function GatewayPage() {
     }
   }, [applyConfig]);
 
-  useEffect(() => {
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 5000);
-    return () => window.clearInterval(timer);
-  }, [refresh]);
+  // 网关状态轮询（5 秒）。
+  //
+  // 用 useVisibilityInterval 而非裸 setInterval：窗口隐藏/收进托盘时**销毁**定时器，
+  // 避免后台空转（裸 setInterval 只在组件卸载时被清理，隐藏时仍在跑）。
+  useVisibilityInterval(() => void refresh(), 5000, { onResume: () => void refresh() });
 
   // Token 用量按所选范围拉取。
   //
@@ -485,19 +506,23 @@ export default function GatewayPage() {
   // 只在网关确实在跑时才轮询：未启动时数据不会变，白打请求。
   // 这里直接读 status?.running 而不用下面的 `running` 变量 —— 后者在组件更下方
   // 才声明，在此处引用会命中 TDZ。
-  // usageNonce 变化（手动刷新）会重置定时器，避免刚手动刷完又立刻自动刷一次。
-  useEffect(() => {
-    if (!status?.running) return;
-    const timer = window.setInterval(() => setUsageNonce((n) => n + 1), 30_000);
-    return () => window.clearInterval(timer);
-  }, [status?.running, usageRange, usageNonce]);
+  // 隐藏时由 useVisibilityInterval 销毁定时器；恢复可见时立刻补一次（onResume），
+  // 让用户切回来就能看到最新用量，而不必再等 30 秒。
+  // immediate: false —— 首次拉取由上面依赖 usageNonce 的 effect 负责
+  //（它挂载即跑），这里只做周期轮询，否则会重复请求一次。
+  useVisibilityInterval(() => setUsageNonce((n) => n + 1), 30_000, {
+    enabled: Boolean(status?.running),
+    immediate: false,
+    onResume: () => setUsageNonce((n) => n + 1),
+  });
 
   // 每秒 tick 一次，只为让「上次更新 x 秒前」这类相对时间保持新鲜。
   // 与用量请求解耦：不额外发请求，仅触发一次廉价的重渲染。
-  useEffect(() => {
-    const timer = window.setInterval(() => setNowTick(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, []);
+  //
+  // 隐藏时一并停掉：看不见的界面不需要刷新相对时间，1 秒一次的定时器
+  // 在后台长期空转属于纯浪费。
+  // immediate 无所谓（只影响初始值），保持默认 true 让时间戳立刻对齐。
+  useVisibilityInterval(() => setNowTick(Date.now()), 1000);
 
   // 端口变化后防抖检测可用性。
   // 网关正跑在自己的端口上时该端口必然「被占用」，此时不报冲突。
@@ -582,6 +607,15 @@ export default function GatewayPage() {
   const poolAccounts = pool?.accounts ?? [];
   /** 处于模型冷却的账号数（用于区块顶部的统一说明，替代逐账号重复提示）。 */
   const poolModelCooledCount = poolAccounts.filter((a) => (a.model_cooling?.length ?? 0) > 0).length;
+  /**
+   * 正因档位更晚而排队、但本身健康的账号数。
+   *
+   * 排除已禁用/账号级冷却的：它们的不可用另有原因，混进来会让「N 个在排队」
+   * 这个数字无法解释（用户会以为排队是它们不可用的原因）。
+   */
+  const poolQueuedCount = poolAccounts.filter(
+    (a) => a.queued && !a.disabled && !a.cooling,
+  ).length;
   const running = Boolean(status?.running);
   /** 因需重新登录被排除出账号池的账号（后端同步时不导出其凭证）。 */
   const excludedAccounts = status?.excludedAccounts ?? [];
@@ -965,6 +999,16 @@ export default function GatewayPage() {
                 有 {poolModelCooledCount} 个账号处于<strong className="font-medium">模型冷却</strong>
                 ：仅下列标出的模型暂不可用，这些账号的<strong className="font-medium">其他模型仍会正常参与负载均衡</strong>，
                 冷却到期后自动恢复。
+              </div>
+            ) : null}
+            {/* 排队汇总：回答「N 个账号为什么没有流量」。
+                这些账号本身健康、积分充足，只是到期档位更晚 —— 不说明的话，
+                用户会以为账号丢了或没生效。 */}
+            {poolQueuedCount > 0 ? (
+              <div className="mx-4 mt-2 rounded-lg bg-muted/50 px-3 py-2 text-[11px] leading-5 text-muted-foreground sm:mx-5">
+                另有 {poolQueuedCount} 个账号<strong className="font-medium">排队中</strong>
+                ：它们健康且积分充足，只是到期档位晚于当前正在使用的档位。
+                分层选号会优先消耗最快过期的额度，前面档位用尽或冷却后它们会自动承接流量。
               </div>
             ) : null}
             {/* 卡片网格：auto-rows-fr 让同一排的卡片等高，避免因冷却明细行数不同而参差。 */}
