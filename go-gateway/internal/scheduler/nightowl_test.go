@@ -231,6 +231,7 @@ func TestNightOwlDisabledNoSchedule(t *testing.T) {
 		KeepaliveDisabled: true,
 		ActivityDisabled:  true,
 		NightOwlDisabled:  true,
+		SchoolDisabled:  true,
 		NightOwlHours:     []int{1},
 	})
 

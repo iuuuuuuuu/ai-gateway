@@ -30,6 +30,11 @@ type Config struct {
 	// 一条 chat_request_send 同时点亮连登 + 解锁 first_buddy（领养前置），
 	// 因此它是「能领养」的前提。
 	ActivityHours []int
+	// SchoolHours 开学季活动任务时点，默认 [12]。
+	//
+	// 该活动是**限时**的：服务端下发 in_period，下线后自动跳过，
+	// 代码无需人工清理。只领取已达标的奖励，不伪造完成动作。
+	SchoolHours []int
 	// NightOwlHours 夜猫子任务时点，默认 [1]。
 	//
 	// growth 有个时段敏感任务只在夜猫窗口（23:00–08:00 CST）内计入，
@@ -45,6 +50,8 @@ type Config struct {
 	ActivityDisabled bool
 	// NightOwlDisabled 显式关闭夜猫子排程（schedule.nightowl_enabled=false）。
 	NightOwlDisabled bool
+	// SchoolDisabled 显式关闭开学季活动排程（schedule.school_enabled=false）。
+	SchoolDisabled bool
 
 	// ActivityReportCount 每个账号每日上报条数，默认 3（与官方客户端行为接近）。
 	// 多条共用同一 conversationId，requestId 各自独立。
@@ -89,6 +96,9 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.NightOwlHours) == 0 {
 		cfg.NightOwlHours = []int{1}
 	}
+	if len(cfg.SchoolHours) == 0 {
+		cfg.SchoolHours = []int{12}
+	}
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = defaultActivityReportCount
 	}
@@ -118,6 +128,7 @@ const (
 	taskKeepalive
 	taskActivity
 	taskNightOwl
+	taskSchool
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -140,6 +151,9 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	if !s.cfg.NightOwlDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.NightOwlHours), taskNightOwl})
+	}
+	if !s.cfg.SchoolDisabled {
+		slots = append(slots, slot{nextFire(now, s.cfg.SchoolHours), taskSchool})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -188,6 +202,8 @@ func (s *Scheduler) Run(ctx context.Context) {
 					s.runActivity(ctx)
 				case taskNightOwl:
 					s.runNightOwl(ctx)
+				case taskSchool:
+					s.runSchool(ctx)
 				}
 			}
 		}

@@ -63,6 +63,7 @@ func TestNextWakeSameInstantFiresAll(t *testing.T) {
 		KeepaliveHours:   []int{22},
 		ActivityDisabled: true,
 		NightOwlDisabled: true,
+		SchoolDisabled: true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -122,6 +123,7 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 		KeepaliveDisabled: true,
 		ActivityDisabled:  true,
 		NightOwlDisabled:  true,
+		SchoolDisabled:  true,
 		CheckinHours:      []int{9, 21},
 		KeepaliveHours:    []int{22},
 		ActivityHours:     []int{10},

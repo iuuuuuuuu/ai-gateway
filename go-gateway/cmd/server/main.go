@@ -136,10 +136,12 @@ func main() {
 		KeepaliveHours:      cfg.Schedule.KeepaliveHours,
 		ActivityHours:       cfg.Schedule.ActivityHours,
 		NightOwlHours:       cfg.Schedule.NightOwlHours,
+		SchoolHours:         cfg.Schedule.SchoolHours,
 		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
 		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
 		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
 		NightOwlDisabled:    !cfg.Schedule.NightOwlEnabled,
+		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		CheckinScope:        cfg.Schedule.CheckinScope,
 	})
@@ -170,6 +172,11 @@ func main() {
 			cfg.Schedule.NightOwlHours)
 	} else {
 		log.Printf("夜猫子任务已禁用（schedule.nightowl_enabled=false）")
+	}
+	if cfg.Schedule.SchoolEnabled {
+		log.Printf("开学季活动任务已启用（%v 点）：只领取已达标的奖励", cfg.Schedule.SchoolHours)
+	} else {
+		log.Printf("开学季活动任务已禁用（schedule.school_enabled=false）")
 	}
 
 	h := server.NewHandler(server.Config{
