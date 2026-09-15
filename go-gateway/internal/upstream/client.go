@@ -614,10 +614,49 @@ type ModelInfo struct {
 	Efforts       []string // reasoning.supportedEfforts（空=未知/固定档）
 }
 
-// FetchModels 调上游动态模型接口。
-// 字段名与上游实际返回对齐：maxInputTokens（非 contextWindow）、maxOutputTokens（非 maxTokens）。
+// modelsConfigUA 拉模型配置用的 User-Agent。
+//
+// **必须**用 WorkBuddy 前缀（实测 2026-09-15）：
+//
+//	WorkBuddy/... → 200，返回 WorkBuddy 产品的模型清单
+//	CLI/...       → 200，但返回的是 **CodeBuddy** 产品的清单（另一套模型）
+//	其他任意 UA    → 400
+//
+// 两个清单差异很大且各自都"看起来合理"，很容易误判成上游数据错误：
+//
+//	国际版 WorkBuddy 20 个 / CodeBuddy 17 个
+//	  仅 WorkBuddy 有：gpt-6-astra、deepseek-v4.1-flash、hy4-preview-f、kimi-k2.8-preview
+//	  仅 CodeBuddy 有：gpt-5.3-codex、minimax-m3
+//
+// 其中 gpt-6-astra / deepseek-v4.1-flash / kimi-k2.8-preview 实测在国际版**均可正常调用**，
+// 说明 WorkBuddy 前缀拿到的才是本产品真实可用集。
+//
+// 另：UA 只影响本接口的返回内容，不影响 /v2/chat/completions（实测两者 chat 结果一致），
+// 因此这里单独覆盖，不动全局 clientUA。
+const modelsConfigUA = "WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/2.137.1"
+
+// modelsConfigPath 模型配置接口路径。
+//
+// 为什么不用 /console/enterprises/personal/models：
+// 该接口在国际版恒返回 500（openresty 错误页，实测 5/5 账号，
+// 与认证方式/请求头无关），导致国际版永远只能靠硬编码静态表。
+// /v3/config 返回同一份模型数据且两个区域都可用（实测国际版 21、国服 52）。
+const modelsConfigPath = "/v3/config"
+
+// FetchModels 调上游模型配置接口，返回该账号所在区域的可用模型。
+//
+// 数据来源是 data.agents[name=="cli"].models（**不是** data.models）：
+//
+//	data.models        = 产品全部模型池，含图片/视频生成、lite 辅助模型等
+//	agents[cli].models = CLI agent 真正可用的子集（正是客户端选模型时看到的）
+//
+// 实测（国际版）：models 21 个，其中 cli.models 20 个；被排除的是
+// gemini-3.0-pro-image（图片生成）、hunyuan-video-art（视频生成）、default-model-lite（内部 lite）等。
+// 若直接返回 data.models，客户端会看到一批根本不能用于对话的模型。
+//
+// 元数据（contextWindow/maxOutputTokens/efforts）从 data.models 按 id 关联补齐。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
-	url := c.chatBase(a) + "/console/enterprises/personal/models"
+	url := c.chatBase(a) + modelsConfigPath
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -627,7 +666,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	origin := originRefererFor(a)
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
-	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("User-Agent", modelsConfigUA)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -663,20 +702,71 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if env.Code != 0 {
 		return nil, fmt.Errorf("models api code=%d", env.Code)
 	}
-	out := make([]ModelInfo, 0, len(env.Data.Models))
-	seen := make(map[string]bool, len(env.Data.Models))
+
+	// 先按 id 建索引，便于给 cli 清单补元数据。
+	// disabled 单独记一份：agents[cli].models 是「这个 agent 允许用哪些模型」的白名单，
+	// 而 disabled 是模型级的停用开关，被停用的模型可以仍留在白名单里。
+	// 两者都不看会把已停用的模型下发给客户端（选中即报错）。
+	meta := make(map[string]ModelInfo, len(env.Data.Models))
+	disabled := make(map[string]bool, len(env.Data.Models))
 	for _, m := range env.Data.Models {
-		if m.Disabled || m.ID == "" || seen[m.ID] {
+		if m.ID == "" {
 			continue
 		}
-		seen[m.ID] = true
-		out = append(out, ModelInfo{
+		if _, dup := meta[m.ID]; dup {
+			continue
+		}
+		meta[m.ID] = ModelInfo{
 			ID:            m.ID,
 			Name:          m.Name,
 			ContextWindow: m.MaxInputTokens,
 			MaxTokens:     m.MaxOutputTokens,
 			Efforts:       m.Reasoning.SupportedEfforts,
-		})
+		}
+		if m.Disabled {
+			disabled[m.ID] = true
+		}
+	}
+
+	// 取 cli agent 的可用清单（这是客户端真正能选的模型）。
+	var cliModels []string
+	for _, ag := range env.Data.Agents {
+		if ag.Name == "cli" {
+			cliModels = ag.Models
+			break
+		}
+	}
+
+	out := make([]ModelInfo, 0, len(cliModels))
+	seen := make(map[string]bool, len(cliModels))
+	for _, id := range cliModels {
+		if id == "" || seen[id] {
+			continue
+		}
+		if mi, ok := meta[id]; ok {
+			// 上游显式标了 disabled 的不下发（与旧实现一致）。
+			// 池里查不到该 id 时无从判断，按「宁可多」返回。
+			if disabled[id] {
+				continue
+			}
+			seen[id] = true
+			out = append(out, mi)
+			continue
+		}
+		// cli 清单里有、models 池里没有：仍要返回（它确实可用），只是元数据未知。
+		seen[id] = true
+		out = append(out, ModelInfo{ID: id})
+	}
+
+	// 兜底：上游没给 cli agent 时退回全量池（宁可多不可少，保持旧行为）。
+	if len(out) == 0 {
+		for _, m := range env.Data.Models {
+			if m.Disabled || m.ID == "" || seen[m.ID] {
+				continue
+			}
+			seen[m.ID] = true
+			out = append(out, meta[m.ID])
+		}
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")

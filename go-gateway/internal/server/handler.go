@@ -196,11 +196,19 @@ var staticModels = []map[string]any{
 	{"id": "deepseek-v4-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 }
 
-// staticModelsIntl 国际版静态模型表。
+// staticModelsIntl 国际版静态模型表（动态接口失败时的回退）。
 //
-// 国际版的 /console/enterprises/personal/models 在当前版本返回 500
-// （openresty 错误页），无法动态拉取，因此这里内置一份。
-// 取自国际版客户端本地缓存 acc-product-config-v3.json 的 agents[0].models。
+// 取自 /v3/config 的 data.agents[name=="cli"].models（实测 2026-09-15），
+// 即客户端选模型时真正看到的清单，另加 hy4-preview（见下）。
+//
+// 历史：此前该表抄自本地缓存 acc-product-config-v3.json，其中
+//   - gpt-5.3-codex 属于 CodeBuddy 产品清单，不在 WorkBuddy 的 cli 清单里；
+//   - 缺 kimi-k2.8-preview、hy4-preview-f。
+// 现已按 /v3/config 校正。
+//
+// 关于 hy4-preview：它不在 cli 清单里，但**实测可用**（HTTP 200 正常出流），
+// 且出现在 /v3/config 的 data.models 与 productFeaturesConfig.ModelTrialBanner 中
+// （作为 hy4-preview-f 的试用目标模型）。保留它，避免用户手动指定时报「模型不存在」。
 //
 // 注意与国服的差异（这也是客户端选模型时最易踩的坑）：
 //
@@ -208,25 +216,26 @@ var staticModels = []map[string]any{
 //	国际版 deepseek-v4.1-flash / glm-5.3 / kimi-k3   / gpt-5.6-* / gemini-3.5-flash
 var staticModelsIntl = []map[string]any{
 	{"id": "default-model", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 200000},
-	{"id": "fast-model", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 176000},
-	{"id": "balanced-model", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 176000},
-	{"id": "primary-model", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 176000},
-	{"id": "deep-model", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 176000},
-	{"id": "hy4-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 131072},
-	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 131072},
-	{"id": "deepseek-v4.1-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 131072},
-	{"id": "gpt-6-astra", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 131072},
-	{"id": "gpt-5.6-sol", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 131072},
-	{"id": "gpt-5.6-terra", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 131072},
-	{"id": "gpt-5.6-luna", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 131072},
-	{"id": "gpt-5.5", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 131072},
-	{"id": "gpt-5.4", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 131072},
-	{"id": "gpt-5.3-codex", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 131072},
-	{"id": "gemini-3.5-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 131072},
-	{"id": "glm-5.3", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 131072},
-	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 131072},
-	{"id": "kimi-k3", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 131072},
-	{"id": "kimi-k2.6", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 131072},
+	{"id": "fast-model", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 200000},
+	{"id": "balanced-model", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 256000},
+	{"id": "primary-model", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 272000},
+	{"id": "deep-model", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 200000},
+	{"id": "hy4-preview-f", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 300000},
+	{"id": "hy4-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 200000},
+	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 192000},
+	{"id": "deepseek-v4.1-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 300000},
+	{"id": "gpt-6-astra", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 400000},
+	{"id": "gpt-5.6-sol", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 1000000},
+	{"id": "gpt-5.6-terra", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 1000000},
+	{"id": "gpt-5.6-luna", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 1000000},
+	{"id": "gpt-5.5", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 1000000},
+	{"id": "gpt-5.4", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 272000},
+	{"id": "gemini-3.5-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 1000000},
+	{"id": "glm-5.3", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 1000000},
+	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 1000000},
+	{"id": "kimi-k3", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 1000000},
+	{"id": "kimi-k2.8-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 300000},
+	{"id": "kimi-k2.6", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 256000},
 }
 
 // staticModelsAll 合并两个区域的模型（按 id 去重，国服优先）。
@@ -289,9 +298,11 @@ func (h *Handler) modelList() []map[string]any {
 			seen[mi.ID] = true
 			out = append(out, entry)
 		}
-		// 动态列表来自实际取到账号的那个区域（通常是国服）；国际版的模型列表
-		// 接口本身不可用（500），只能靠静态表补齐。不补的话，混合账号池下
-		// 客户端看不到国际版模型名，也就无法主动选用。
+		// 动态列表只来自「被抽中的那个账号」所在区域（通常是国服），
+		// 另一个区域的模型名不会出现在里面。不补的话，混合账号池下客户端
+		// 看不到国际版独有模型（如 hy4-preview），也就无法主动选用。
+		// 注意：国际版的拉取接口已改用 /v3/config（两区域都可用），
+		// 这里保留静态表补齐是为了覆盖「抽到国服账号」这一情况，属兜底。
 		for _, m := range staticModelsIntl {
 			if id, _ := m["id"].(string); id != "" && !seen[id] {
 				seen[id] = true
