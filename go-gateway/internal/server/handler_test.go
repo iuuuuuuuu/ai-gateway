@@ -566,7 +566,19 @@ func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 	}
 }
 
-func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
+// TestModelsFetchFailureDoesNotPenalizeAccount 模型探测失败**不惩罚**账号。
+//
+// 本用例曾名为 TestModelsFetchFailurePenalizesAccount，断言「一次 fetch 失败即熔断」。
+// 该行为已被认定为缺陷并修正，原因（2026-09 实测）：
+//
+//   - /console/enterprises/personal/models 是**能力探测**接口（拿 contextWindow /
+//     supportedEfforts），失败不代表该账号不能聊天；
+//   - 国际版账号该端点恒返回 HTTP 500，而同账号的 chat 完全正常（实测 200）；
+//   - 国际版账号恰好占据最早到期档位，分层选号会优先选它 → 客户端每次启动探模型
+//     都记一次失败 → 累计 3 次触发 30 分钟熔断 → 表现为「国际版账号莫名熔断」。
+//
+// 防止反复打上游的职责由失败负缓存（modelsFetchFailCooldown）承担，与账号健康无关。
+func TestModelsFetchFailureDoesNotPenalizeAccount(t *testing.T) {
 	// 清缓存
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.ids = nil
@@ -575,7 +587,7 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 	dynamicModelsCache.Unlock()
 
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：一次 fetch 失败即熔断
+	p.SetBreaker(1, time.Hour, time.Hour) // 阈值设为 1：若仍会记账，一次失败即暴露
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 500, `boom`, false
 	})
@@ -586,8 +598,12 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 		t.Fatalf("code=%d (static fallback)", rec.Code)
 	}
 	st, _ := p.Status("u1")
-	if !st.Cooling {
-		t.Fatalf("fetch failure should trip breaker with threshold=1: %+v", st)
+	// 关键断言：既不熔断，也不累计失败计数。
+	if st.Cooling {
+		t.Fatalf("模型探测失败不应熔断账号（该端点失败与账号能否聊天无关）: %+v", st)
+	}
+	if st.BreakerFails != 0 {
+		t.Fatalf("模型探测失败不应累计失败计数: BreakerFails=%d", st.BreakerFails)
 	}
 }
 
