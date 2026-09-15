@@ -1064,6 +1064,218 @@ function AppEnvCard() {
   );
 }
 
+/**
+ * 本地代理：设备身份隔离与凭证抓取。
+ *
+ * 代理会**改写系统代理设置**，停止时还原为用户原有的值。因此界面必须把
+ * 「当前是否在运行」「原有代理是什么」明确展示出来 —— 用户最怕的是
+ * 「用了这个功能之后网断了，还不知道为什么」。
+ */
+function ProxyCard() {
+  const [config, setConfig] = useState<api.ProxyConfigView | null>(null);
+  const [running, setRunning] = useState(false);
+  const [port, setPort] = useState("");
+  const [domains, setDomains] = useState("");
+  const [cert, setCert] = useState<Awaited<ReturnType<typeof api.proxyCertStatus>> | null>(null);
+  const [logs, setLogs] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const [cfg, status, certStatus] = await Promise.all([
+        api.proxyConfig(),
+        api.proxyStatus(),
+        api.proxyCertStatus(),
+      ]);
+      setConfig(cfg);
+      setRunning(status.running);
+      setCert(certStatus);
+      setPort((current) => current || String(cfg.port));
+      setDomains((current) => current || cfg.domains);
+    } catch (e) {
+      // 代理状态读取失败不打扰用户（可能是首次运行、证书目录还没建）
+      console.error(api.asError(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // 代理日志实时推送：只保留最近 200 行，避免长时间运行把内存吃满
+  useEffect(() => {
+    if (!api.isDesktop()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void import("@tauri-apps/api/event").then(async ({ listen }) => {
+      const stop = await listen<{ line: string }>("proxy-log", (event) => {
+        if (disposed) return;
+        setLogs((prev) => [...prev, event.payload.line].slice(-200));
+      });
+      if (disposed) stop();
+      else unlisten = stop;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  const start = async () => {
+    setBusy(true);
+    try {
+      const parsed = Number(port);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+        throw new Error("端口必须是 1-65535 之间的整数");
+      }
+      await api.proxyStart(parsed, domains);
+      toast.success(`代理已启动，系统代理已指向 127.0.0.1:${parsed}`);
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const stop = async () => {
+    setBusy(true);
+    try {
+      await api.proxyStop();
+      toast.success("代理已停止，系统代理已还原");
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const genCert = async () => {
+    setBusy(true);
+    try {
+      const res = await api.proxyCertGenerate();
+      toast.success(`CA 证书已就绪：${res.caCerPath}`);
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const captureLocal = async () => {
+    setBusy(true);
+    try {
+      const res = await api.proxyCaptureLocal();
+      if (res.ok) toast.success(res.message ?? "已从本机捕获凭证");
+      else toast.warning(res.message ?? "未在本机找到可捕获的凭证");
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const existing = config?.existingSystemProxy;
+
+  return (
+    <SettingsGroup id="settings-proxy" title="本地代理">
+      <CardContent className="space-y-0 p-0">
+        <p className="px-4 pt-4 text-xs text-muted-foreground sm:px-5">
+          拦截目标域名的请求，为每个账号注入独立设备标识，并自动抓取登录凭证。
+          代理运行期间会接管系统代理设置，停止时还原。
+        </p>
+
+        <SettingsFieldRow
+          label="运行状态"
+          description={
+            existing && existing[0]
+              ? `检测到系统原有代理：${existing[1]}（停止时会还原为它）`
+              : "当前未检测到系统代理，停止时会清空代理设置"
+          }
+        >
+          <Badge variant={running ? "secondary" : "outline"}>{running ? "运行中" : "已停止"}</Badge>
+        </SettingsFieldRow>
+
+        <SettingsFieldRow label="监听端口" description="仅监听 127.0.0.1，不对局域网开放">
+          <Input
+            value={port}
+            onChange={(e) => setPort(e.target.value)}
+            disabled={running}
+            className="w-full sm:w-32"
+            aria-label="代理端口"
+          />
+        </SettingsFieldRow>
+
+        <SettingsFieldRow
+          label="拦截域名"
+          description="逗号分隔，按后缀匹配；未命中的请求透明转发，不影响其他应用上网"
+        >
+          <Input
+            value={domains}
+            onChange={(e) => setDomains(e.target.value)}
+            disabled={running}
+            className="w-full font-mono text-xs sm:w-80"
+            aria-label="拦截域名"
+          />
+        </SettingsFieldRow>
+
+        <SettingsFieldRow
+          label="CA 证书"
+          description={
+            cert?.caExists
+              ? "已生成。需在系统中信任后 HTTPS 拦截才生效"
+              : "尚未生成。首次启动代理时会自动创建"
+          }
+        >
+          <div className="flex gap-2">
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => void genCert()}>
+              生成
+            </Button>
+          </div>
+        </SettingsFieldRow>
+
+        {cert && !cert.caExists && (
+          <Alert className="!w-auto mx-4 my-3 sm:mx-5">
+            <AlertDescription className="text-xs">{cert.hint}</AlertDescription>
+          </Alert>
+        )}
+
+        <div className="flex flex-wrap gap-2 px-4 py-4 sm:px-5">
+          {running ? (
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => void stop()}>
+              <Loader2 className={cn("size-3.5", busy && "animate-spin")} />
+              停止代理
+            </Button>
+          ) : (
+            <Button size="sm" disabled={busy} onClick={() => void start()}>
+              <Loader2 className={cn("size-3.5", busy && "animate-spin")} />
+              启动代理
+            </Button>
+          )}
+          <Button size="sm" variant="outline" disabled={busy} onClick={() => void captureLocal()}>
+            从本机捕获凭证
+          </Button>
+          <Button size="sm" variant="ghost" disabled={busy} onClick={() => void load()}>
+            <RefreshCw className="size-3.5" />
+            刷新状态
+          </Button>
+        </div>
+
+        {logs.length > 0 && (
+          <div className="px-4 pb-4 sm:px-5">
+            <div className="mb-1 text-xs font-medium">代理日志</div>
+            <pre className="max-h-40 overflow-auto rounded-lg border border-border/60 bg-muted/40 p-2 text-[11px] leading-5">
+              {logs.join("\n")}
+            </pre>
+          </div>
+        )}
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
 /** 设置页：自动签到配置 / 权限检测 / 更新配置。 */
 export default function SettingsPage() {
   return (
@@ -1076,6 +1288,7 @@ export default function SettingsPage() {
       <div className="min-w-0 space-y-12">
         <AppearanceCard />
         <AppEnvCard />
+        <ProxyCard />
         <PermissionCheckCard />
         <AutoCheckinCard />
         <AutoRotateCard />
