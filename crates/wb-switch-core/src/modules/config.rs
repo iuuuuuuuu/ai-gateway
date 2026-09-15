@@ -174,7 +174,23 @@ pub fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 本软件自身的数据目录（`~/.wb-switch`）。
+///
+/// 可用环境变量 `WB_SWITCH_HOME` 覆盖到任意目录，用于**开发/测试隔离**：
+/// 起一个独立实例、指向空目录，就不会动到正在使用的那份账号库与网关状态。
+///
+/// 为什么需要这个开关：Windows 上 `dirs::home_dir()` 走 `SHGetKnownFolderPath`，
+/// **不读 `USERPROFILE`**（实测：把 USERPROFILE 指到临时目录后，宿主服务仍然读到
+/// 真实的 ~/.wb-switch），因此光靠环境变量没法隔离数据目录。
+///
+/// 不设该变量时行为与之前完全一致（仍为 `~/.wb-switch`），对正常使用零影响。
 pub fn store_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("WB_SWITCH_HOME") {
+        let p = PathBuf::from(dir);
+        if !p.as_os_str().is_empty() {
+            return p;
+        }
+    }
     home_dir().join(".wb-switch")
 }
 

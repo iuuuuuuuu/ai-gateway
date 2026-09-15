@@ -56,6 +56,12 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 	var lastErr error
 	var lastUID string
 	lastStatus := http.StatusServiceUnavailable
+	// lastKind/lastBody 记录最后一次上游失败的分类与原始响应体，
+	// 用于在全部账号失败时给客户端一句**可读**的原因（见函数末尾的 FriendlyMessage）。
+	var lastKind upstream.ErrKind
+	var lastBody string
+	// lastTransportErr 非 nil 表示最后一次失败是传输层（无上游响应体）。
+	var lastTransportErr error
 
 	var stickyUID string
 	if sessKey != "" && h.cfg.Session != nil {
@@ -142,12 +148,21 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 		if terr != nil {
 			lastStatus = http.StatusServiceUnavailable
 			lastErr = terr
+			// 传输层失败（超时/连接被拒/DNS）没有上游业务体，Classify 不适用；
+			// 单独标记，使末尾的错误文案也能给出可读原因而不是原始 Go 报错
+			// （实测：原始文案会把 tcp 四元组与 wsarecv 细节直接抛给客户端）。
+			lastKind = upstream.ErrNone
+			lastBody = ""
+			lastTransportErr = terr
 			fail(acct.UID)
 			continue
 		}
 		if status >= 400 {
 			lastStatus = status
 			kind := upstream.Classify(status, string(respBody))
+			lastKind = kind
+			lastBody = string(respBody)
+			lastTransportErr = nil
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			h.applyErrorPolicy(acct.UID, model, kind, string(respBody))
 			fail(acct.UID)
@@ -180,7 +195,15 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 
 	msg := "all accounts unavailable (cooling/disabled)"
 	if lastErr != nil {
-		msg += ": " + lastErr.Error()
+		// 客户端可读性：优先用提炼后的原因（如「账号额度已耗尽…」），
+		// 拿不到再用原始文案 —— 原始文案含整段上游 JSON 或 tcp 底层细节，又长又难懂。
+		if friendly := upstream.FriendlyMessage(lastKind, lastStatus, lastBody); friendly != "" {
+			msg = friendly
+		} else if lastTransportErr != nil {
+			msg = "无法连接上游（网络超时 / 连接被拒）：请检查本机网络或代理设置后重试"
+		} else {
+			msg += ": " + lastErr.Error()
+		}
 	}
 	// 失败时也带上最后尝试过的账号，请求日志据此仍能显示 uid（与原实现一致）。
 	return &chatResult{UID: lastUID}, lastStatus, errors.New(msg)
