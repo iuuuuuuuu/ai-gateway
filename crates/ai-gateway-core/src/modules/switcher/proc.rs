@@ -40,6 +40,12 @@ pub fn strip_exe_suffix(name: &str) -> &str {
 }
 
 /// 枚举所有匹配该档案的进程（按 `proc_names` 精确匹配，大小写不敏感）。
+///
+/// 非 Windows 平台返回空：进程枚举走的是 Windows 的 `tasklist`，
+/// 而本切换器只服务 Windows 桌面端（Trae / 豆包客户端的登录态布局也是
+/// Windows 路径）。返回空而不是编译失败，是为了让 workspace 能在
+/// Linux / macOS 上完成 `cargo check` 与单测（CI 三平台都会编译本 crate）。
+#[cfg(target_os = "windows")]
 pub fn list_procs(prof: &AppProfile) -> Vec<ProcRow> {
     let mut out = Vec::new();
     for image in prof.proc_names {
@@ -55,6 +61,12 @@ pub fn list_procs(prof: &AppProfile) -> Vec<ProcRow> {
     out.sort_by_key(|r| r.pid);
     out.dedup_by_key(|r| r.pid);
     out
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn list_procs(prof: &AppProfile) -> Vec<ProcRow> {
+    let _ = prof;
+    Vec::new()
 }
 
 /// 应用是否正在运行。
