@@ -2,6 +2,8 @@
 mod commands;
 // Trae / 豆包 的命令层（与 WorkBuddy 系分开，便于独立演进）
 mod commands_apps;
+// 本地 MITM 代理的命令层（系统代理编排 + 事件转发）
+mod commands_proxy;
 #[cfg(desktop)]
 mod tray;
 
@@ -281,6 +283,16 @@ pub fn run() {
             commands_apps::doubao_export_chats,
             commands_apps::get_app_settings,
             commands_apps::save_app_settings,
+            // ---- 本地 MITM 代理（设备身份隔离 + 凭证抓取） ----
+            commands_proxy::proxy_config,
+            commands_proxy::proxy_status,
+            commands_proxy::proxy_start,
+            commands_proxy::proxy_stop,
+            commands_proxy::proxy_cert_status,
+            commands_proxy::proxy_cert_generate,
+            commands_proxy::proxy_capture_local,
+            commands_proxy::proxy_cleanup_stale,
+            commands_proxy::proxy_parse_upstream,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

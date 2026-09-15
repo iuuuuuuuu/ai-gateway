@@ -15,7 +15,8 @@ use ai_gateway_core::modules::{checkin, gateway, update};
 
 const TRAY_ID: &str = "main-menu-bar";
 const MAIN_WINDOW_LABEL: &str = "main";
-const DEFAULT_TOOLTIP: &str = "ai-gateway";
+/// 托盘悬停提示：用产品显示名而不是可执行文件名，用户看到的是品牌名。
+const DEFAULT_TOOLTIP: &str = "AI Gateway";
 const CHECKIN_TOOLTIP_RESTORE_SECS: u64 = 8;
 
 /// 系统自启注册的启动参数：仅携带该精确参数的启动进入静默托盘模式。

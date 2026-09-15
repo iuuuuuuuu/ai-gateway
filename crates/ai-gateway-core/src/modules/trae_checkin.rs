@@ -448,6 +448,11 @@ pub async fn checkin_account(
         outcome.message = format!("{}今日已签到", outcome.message);
         return outcome;
     }
+    // 预检失败不阻断 claim（预检只是优化，claim 才是权威），但要把原因带上 ——
+    // 否则「签到失败」时用户看不到是预检网络异常还是真的被拒。
+    if !pre.ok {
+        outcome.message = format!("{}预检未通过（{}）；", outcome.message, pre.message);
+    }
     let credits_before = pre.credits;
 
     // 2. claim

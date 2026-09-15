@@ -193,6 +193,16 @@ const ROUTES: Record<string, Route> = {
   doubao_chatdata_info: { method: "GET", path: "/api/doubao/chatdata/info" },
   doubao_export_chats: { method: "POST", path: "/api/doubao/chats/export" },
   get_app_settings: { method: "GET", path: "/api/apps/settings" },
+  // ---- 本地 MITM 代理 ----
+  proxy_config: { method: "GET", path: "/api/proxy/config" },
+  proxy_status: { method: "GET", path: "/api/proxy/status" },
+  proxy_start: { method: "POST", path: "/api/proxy/start" },
+  proxy_stop: { method: "POST", path: "/api/proxy/stop" },
+  proxy_cert_status: { method: "GET", path: "/api/proxy/cert" },
+  proxy_cert_generate: { method: "POST", path: "/api/proxy/cert/generate" },
+  proxy_capture_local: { method: "POST", path: "/api/proxy/capture-local" },
+  proxy_cleanup_stale: { method: "POST", path: "/api/proxy/cleanup" },
+  proxy_parse_upstream: { method: "POST", path: "/api/proxy/parse-upstream" },
   save_app_settings: { method: "POST", path: "/api/apps/settings" },
 };
 
@@ -1284,4 +1294,102 @@ export function saveAppSettings(
   patch: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   return call<Record<string, unknown>>("save_app_settings", { patch });
+}
+
+// ---------------------------------------------------------------------------
+// 本地 MITM 代理（设备身份隔离 + 凭证抓取）
+// ---------------------------------------------------------------------------
+
+/** 代理配置。 */
+export interface ProxyConfigView {
+  port: number;
+  domains: string;
+  defaultDomains: string;
+  lastPort: number | null;
+  /** 用户原有的系统代理 [启用, 地址, 绕过列表]，停止时会原样还原。 */
+  existingSystemProxy: [boolean, string, string] | null;
+}
+
+/** 读取代理配置。 */
+export function proxyConfig(): Promise<ProxyConfigView> {
+  return call<ProxyConfigView>("proxy_config");
+}
+
+/** 代理运行状态。 */
+export function proxyStatus(): Promise<{ running: boolean; port: number | null; captured: number }> {
+  return call<{ running: boolean; port: number | null; captured: number }>("proxy_status");
+}
+
+/**
+ * 启动代理并接管系统代理。
+ *
+ * 代理会改写系统代理设置；停止时还原为用户原有的值。启动前会先记下原值，
+ * 因此不会把「上一次自己设的」误当成用户设置。
+ */
+export function proxyStart(
+  port?: number,
+  domains?: string,
+): Promise<{ ok: boolean; port: number; domains: string }> {
+  return call<{ ok: boolean; port: number; domains: string }>("proxy_start", {
+    port: port ?? null,
+    domains: domains ?? null,
+  });
+}
+
+/** 停止代理并还原系统代理。 */
+export function proxyStop(): Promise<{ ok: boolean; alreadyStopped?: boolean }> {
+  return call<{ ok: boolean; alreadyStopped?: boolean }>("proxy_stop");
+}
+
+/** CA 证书状态。 */
+export function proxyCertStatus(): Promise<{
+  certsDir: string;
+  caCerPath: string;
+  caPemPath: string;
+  caExists: boolean;
+  hint: string;
+}> {
+  return call<{
+    certsDir: string;
+    caCerPath: string;
+    caPemPath: string;
+    caExists: boolean;
+    hint: string;
+  }>("proxy_cert_status");
+}
+
+/** 生成自签 CA（已存在则复用）。 */
+export function proxyCertGenerate(): Promise<{
+  ok: boolean;
+  certsDir: string;
+  caCerPath: string;
+}> {
+  return call<{ ok: boolean; certsDir: string; caCerPath: string }>("proxy_cert_generate");
+}
+
+/** 从本机离线捕获 Trae 的 Cloud-IDE-JWT（代理抓不到时的兜底）。 */
+export function proxyCaptureLocal(): Promise<{
+  ok: boolean;
+  captured?: number;
+  accounts?: { userId: string; source: string }[];
+  message?: string;
+}> {
+  return call<{
+    ok: boolean;
+    captured?: number;
+    accounts?: { userId: string; source: string }[];
+    message?: string;
+  }>("proxy_capture_local");
+}
+
+/** 清理上一次异常退出残留的系统代理设置。 */
+export function proxyCleanupStale(): Promise<{ ok: boolean; restored: string | null }> {
+  return call<{ ok: boolean; restored: string | null }>("proxy_cleanup_stale");
+}
+
+/** 解析上游代理地址（供界面校验输入）。 */
+export function proxyParseUpstream(
+  spec: string,
+): Promise<{ ok: boolean; addr?: string; error?: string }> {
+  return call<{ ok: boolean; addr?: string; error?: string }>("proxy_parse_upstream", { spec });
 }

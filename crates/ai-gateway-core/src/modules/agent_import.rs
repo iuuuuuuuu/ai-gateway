@@ -43,8 +43,8 @@ pub const TARGETS: [&str; 11] = [
     "hermes",
 ];
 
-/// 托管配置在客户端侧使用的提供方名称。
-const PROVIDER_NAME: &str = "WorkBuddy Switch";
+/// 托管配置在客户端侧使用的提供方名称（显示名，会写进各客户端配置文件）。
+const PROVIDER_NAME: &str = "AI Gateway";
 /// Codex 的 provider key（必须是合法 TOML 表名）。
 const CODEX_PROVIDER_KEY: &str = "workbuddy";
 /// DSH 的 provider key。

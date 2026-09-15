@@ -287,7 +287,7 @@ jobs:
           else:
               readme = f"""AI Gateway {ver} —— 免安装版
 
-          【运行】双击 WorkBuddy-Switch-Gateway.exe
+          【运行】双击 AI-Gateway.exe
              WebView2Loader.dll 必须与 exe 同目录，请勿删除
 
           【依赖】需系统已装 WebView2 Runtime（Win10/11 一般自带）
@@ -296,7 +296,7 @@ jobs:
           """
 
           with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-              z.write(stage / "app.exe", "WorkBuddy-Switch-Gateway.exe")
+              z.write(stage / "app.exe", "AI-Gateway.exe")
               z.write(stage / "WebView2Loader.dll", "WebView2Loader.dll")
               z.writestr("使用说明.txt", readme)
           print(f"已生成 {out}")

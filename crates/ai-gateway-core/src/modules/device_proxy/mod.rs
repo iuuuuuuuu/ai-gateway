@@ -1061,7 +1061,9 @@ mod tests {
     /// 端到端生命周期：启动 → 独占绑定端口 → stop() → 退出事件上报为「主动停止」
     #[tokio::test]
     async fn server_starts_binds_and_reports_intentional_stop() {
-        let iso = Isolated::new("proxy-lifecycle");
+        // 守卫必须活到测试结束（持有全局锁 + AI_GATEWAY_HOME 指向临时目录），
+        // 故用命名绑定而非 `_`（`_` 会立即析构，隔离随即失效）
+        let _iso = Isolated::new("proxy-lifecycle");
         let sink = Arc::new(VecSink::new());
         let cfg = ProxyConfig::new(0) // 0 = 让内核分配临时端口，避免与真实代理抢 8899
             .with_events(sink.clone());

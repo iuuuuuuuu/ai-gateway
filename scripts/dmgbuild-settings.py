@@ -1,4 +1,4 @@
-"""dmgbuild settings for the WorkBuddy Switch drag-to-Applications image.
+"""dmgbuild settings for the AI Gateway drag-to-Applications image.
 
 This file is evaluated by ``dmgbuild``.  Keep the image contents deliberately
 small: the app bundle and one Applications symlink are the only user-facing
