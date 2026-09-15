@@ -64,6 +64,20 @@ jobs:
             goos: darwin
             goarch: arm64
             arch_label: aarch64
+          # Intel Mac（x64）。
+          #
+          # runner 标签必须是 macos-15-intel：Intel 的旧标签已不可用 ——
+          # macos-13 早已下线，而 macos-14 现在是 **arm64**（用它只会产出 arm64 二进制）。
+          # 据 GitHub 官方 runner 文档，标准 Intel macOS runner 现为
+          # macos-15-intel / macos-26-intel（4 CPU / 14GB，公开仓库免费不限量）。
+          # 注意别写成 macos-15-large / -xlarge —— 那些是付费大机型。
+          - name: macos-x64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: app
+            goos: darwin
+            goarch: amd64
+            arch_label: x64
           - name: linux-x64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu

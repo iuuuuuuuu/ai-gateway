@@ -90,6 +90,8 @@ pub fn router() -> Router {
         )
         .route("/api/checkin/logs", get(api_checkin_logs))
         .route("/api/travel/status", get(api_travel_status))
+        .route("/api/travel/run", post(api_travel_run))
+        .route("/api/travel/adopt", post(api_travel_adopt))
         .route(
             "/api/travel/config",
             get(api_travel_config).post(api_save_travel_config),
@@ -567,6 +569,20 @@ async fn api_checkin(Json(body): Json<Value>) -> Response {
 
 async fn api_checkin_all() -> Response {
     json_ok(checkin::run_checkin_all().await)
+}
+
+/// 一键旅行：全部账号走一趟巡检。手动触发不检查「自动旅行」开关。
+async fn api_travel_run() -> Response {
+    json_ok(travel::run_travel_now().await)
+}
+
+/// 单账号领养：只领养，不派猫、不领奖。
+async fn api_travel_adopt(Json(body): Json<Value>) -> Response {
+    let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
+    let Some(acc) = account::find_account(id) else {
+        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    json_ok(travel::adopt_for_account(&acc).await)
 }
 
 async fn api_checkin_config() -> Response {

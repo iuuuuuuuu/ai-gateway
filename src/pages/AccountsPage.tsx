@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
+  ChevronDown,
   Columns3,
   Download,
   FileDown,
@@ -9,6 +10,7 @@ import {
   QrCode,
   RefreshCw,
   Rows3,
+  Sparkles,
   Terminal,
 } from "lucide-react";
 
@@ -18,6 +20,12 @@ import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/p
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -35,6 +43,7 @@ import { ImportLocalDialog } from "@/components/import-local-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
+import { useVisibilityInterval } from "@/lib/use-visibility-interval";
 import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, TravelConfig, TravelStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
@@ -165,6 +174,8 @@ export default function AccountsPage() {
   const [installingCodebuddyCli, setInstallingCodebuddyCli] = useState(false);
   /** 刷新按钮触发的批量签到进行中 */
   const [checkinAllRunning, setCheckinAllRunning] = useState(false);
+  /** 一键旅行进行中（下拉菜单项） */
+  const [travelRunning, setTravelRunning] = useState(false);
   /** 接入/升级 CLI helper 确认框 */
   const [installConfirmOpen, setInstallConfirmOpen] = useState(false);
   /** 删除账号确认目标（null=关闭） */
@@ -309,7 +320,21 @@ export default function AccountsPage() {
     }
   }
 
-  // 账号列表变化后并行查询旅行状态；后台领取后每 60 秒再拉一次，避免卡片停在「旅行中」。
+  // 旅行状态轮询（60 秒一轮）。
+  //
+  // 用 useVisibilityInterval：窗口隐藏 / 收进托盘时**销毁**定时器，不在后台空转。
+  // 原先的裸 setInterval 只在组件卸载时清理，隐藏期间仍每 60 秒打一轮请求。
+  // onResume 让切回来时立刻补一次，卡片不会停在过期状态。
+  const travelScopedIds = travelScopedAccounts.map((account) => account.id);
+  useVisibilityInterval(() => void loadTravelMap(travelScopedIds), 60_000, {
+    enabled: travelScopedIds.length > 0,
+    // 首次加载由下方 useEffect 负责（它还要处理「无账号时清空」），
+    // 这里传 false 避免挂载时重复请求一次。
+    immediate: false,
+    onResume: () => void loadTravelMap(travelScopedIds),
+  });
+
+  // 账号列表变化后立刻查一次旅行状态（周期轮询由上面的 hook 负责）。
   // 同样只查国服账号：国际版的旅行接口无数据，查了只会一直显示「未旅行」。
   useEffect(() => {
     if (!travelScopedAccounts.length) {
@@ -319,12 +344,8 @@ export default function AccountsPage() {
     let cancelled = false;
     const ids = travelScopedAccounts.map((account) => account.id);
     void loadTravelMap(ids, () => cancelled);
-    const timer = window.setInterval(() => {
-      void loadTravelMap(ids, () => cancelled);
-    }, 60_000);
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
     };
   }, [accounts]);
 
@@ -438,6 +459,45 @@ export default function AccountsPage() {
     }
   }
 
+  /**
+   * 单账号领养 Buddy：只领养，不派猫、不消耗当日派出次数。
+   *
+   * 各结果的文案要分开 —— 尤其「对话轮次不够」是上游的**预期**门槛，
+   * 不该报成失败，否则用户会以为功能坏了。
+   */
+  async function onAdopt(a: AccountMeta) {
+    const who = a.nickname || a.email || a.id;
+    const toastId = toast.loading("正在领养 Buddy…", { description: who });
+    try {
+      const res = await api.travelAdopt(a.id);
+      switch (res.skip) {
+        case "has-buddy":
+          toast.info("已有 Buddy", { id: toastId, description: who });
+          break;
+        case "adopted":
+          toast.success("领养成功", { id: toastId, description: `${who} 已领养，通常赠送 300 分` });
+          break;
+        case "adopt-threshold":
+          toast.info("暂不能领养", {
+            id: toastId,
+            description: `${who} 需先积累足够的对话轮次，之后可再试`,
+          });
+          break;
+        case "buddy-unknown":
+          toast.error("查询失败", { id: toastId, description: `${who}：${res.message || "无法查询 Buddy 状态"}` });
+          break;
+        default:
+          if (res.ok) toast.success("领养成功", { id: toastId, description: who });
+          else toast.error("领养失败", { id: toastId, description: `${who}：${res.message || "请稍后重试"}` });
+      }
+      // 领养会改变旅行状态与积分，回读一次
+      void loadTravelMap([a.id]);
+      if (res.skip === "adopted") void refreshCredits([a.id]);
+    } catch (e) {
+      toast.error("领养失败", { id: toastId, description: api.asError(e) });
+    }
+  }
+
   async function onRefresh(a: AccountMeta) {
     try {
       const res = await api.refreshAccountToken(a.id);
@@ -490,8 +550,53 @@ export default function AccountsPage() {
     }
   }
 
-  async function onSwitchCodebuddyCli(account: AccountMeta) {
-    if (codebuddyCliSwitchingId !== null) return;
+  /**
+   * 一键旅行：对所有国服账号走一趟巡检（领养 → 派出 → 领奖）。
+   *
+   * 与「刷新」按钮的区别：刷新跑的是签到，这里跑旅行，两者互不包含。
+   * 手动触发不走「自动旅行」开关（后端 `run_travel_now` 同样不检查），
+   * 否则用户没开自动旅行时点它会毫无反应。
+   */
+  async function onTravelRun() {
+    if (!accounts.length || travelRunning || checkinAllRunning) return;
+    setTravelRunning(true);
+    const toastId = toast.loading("正在派猫猫旅行…", { description: "包含领养、派出与领取奖励" });
+    try {
+      const res = await api.travelRun();
+      if (res.status === "skipped") {
+        toast.info("旅行正在进行中", { id: toastId, description: "请稍候，上一轮尚未结束" });
+        return;
+      }
+      if (res.status === "no_accounts") {
+        toast.info("没有可旅行的账号", { id: toastId, description: "仅国服账号参与" });
+        return;
+      }
+      const entries = res.accounts ?? [];
+      const adopted = entries.filter((e) => e.skip === "adopted").length;
+      const departed = entries.filter((e) => e.result === "success").length;
+      const threshold = entries.filter((e) => e.skip === "adopt-threshold").length;
+      const failed = entries.filter((e) => e.result === "error").length;
+      const parts: string[] = [];
+      if (adopted > 0) parts.push(`${adopted} 个已领养`);
+      if (departed > 0) parts.push(`${departed} 个已派出/已领奖`);
+      if (threshold > 0) parts.push(`${threshold} 个需先积累对话`);
+      if (failed > 0) parts.push(`${failed} 个失败`);
+      const summary = parts.length > 0 ? parts.join("，") : "本轮无动作";
+      if (entries.length > 0 && failed === entries.length) {
+        toast.error("旅行失败", { id: toastId, description: summary });
+      } else {
+        toast.success("旅行完成", { id: toastId, description: summary });
+      }
+      // 立刻回读旅行状态，让卡片不必等下一轮轮询
+      await loadTravelMap(travelScopedAccounts.map((account) => account.id));
+    } catch (e) {
+      toast.error("一键旅行失败", { id: toastId, description: api.asError(e) });
+    } finally {
+      setTravelRunning(false);
+    }
+  }
+
+  async function onSwitchCodebuddyCli(account: AccountMeta) {    if (codebuddyCliSwitchingId !== null) return;
     setCodebuddyCliSwitchingId(account.id);
     const toastId = toast.loading("正在切换 CodeBuddy CLI…", {
       description: `正在将默认账号设为 ${account.nickname || account.email || account.id}`,
@@ -837,6 +942,49 @@ export default function AccountsPage() {
                 </TooltipTrigger>
                 <TooltipContent side="top">{api.isDemoMode() ? "演示模式下不可操作" : "签到并刷新全部账号积分"}</TooltipContent>
               </Tooltip>
+              {/* 一键操作：签到与旅行合并成一个下拉，避免工具栏继续横向膨胀。
+                  这里刻意**不**套 Tooltip —— 双层 asChild（TooltipTrigger + DropdownMenuTrigger）
+                  会在 ref 与事件处理上互相覆盖，属于已知的脆弱组合；按钮本身已有
+                  可见文案与 aria-label，不再需要 tooltip。 */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <span className="inline-flex">
+                    <DemoAction>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-9 gap-1.5 rounded-lg px-2.5"
+                        disabled={accounts.length === 0 || checkinAllRunning || travelRunning}
+                        aria-label="一键操作：批量签到或旅行"
+                      >
+                        {checkinAllRunning || travelRunning ? (
+                          <Loader2 className="animate-spin" />
+                        ) : (
+                          <Sparkles />
+                        )}
+                        一键操作
+                        <ChevronDown className="size-3.5 opacity-60" />
+                      </Button>
+                    </DemoAction>
+                  </span>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-56">
+                  <DropdownMenuItem
+                    disabled={checkinAllRunning || travelRunning}
+                    onSelect={() => void onRefreshCredits()}
+                  >
+                    <RefreshCw />
+                    一键签到
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={checkinAllRunning || travelRunning}
+                    onSelect={() => void onTravelRun()}
+                  >
+                    <Sparkles />
+                    一键旅行（含领养）
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
           </TooltipProvider>
         </div>
@@ -860,6 +1008,7 @@ export default function AccountsPage() {
                 onSwitch={setSwitchAccount}
                 onCheckin={onCheckin}
                 onRefresh={onRefresh}
+                onAdopt={onAdopt}
                 todayCheckedIn={checkinMap[a.id]}
                 travelStatus={travelMap[a.id]}
                 credit={creditMap[a.id]}

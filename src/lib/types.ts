@@ -214,13 +214,17 @@ export interface TravelConfig {
   region_scope?: "cn" | "all";
 }
 
-export type TravelStatusLabel = "untraveled" | "no-buddy" | "traveling" | "finished";
+export type TravelStatusLabel = "untraveled" | "no-buddy" | "traveling" | "finished" | "adopted" | "adopt-threshold";
 
 export interface TravelStatus {
   label: TravelStatusLabel;
   rewardCredit: number | null;
   locationName?: string | null;
   arriveAt?: number | null;
+  /** 后端给出的具体说明（如「领养需先积累对话轮次」），供卡片直接展示原因。 */
+  message?: string | null;
+  /** 跳过/结果原因，用于区分细分状态（adopt-threshold / no-buddy / daily-limit 等）。 */
+  skip?: string | null;
 }
 
 export interface AutoRotateConfig {
@@ -562,6 +566,13 @@ export interface GatewayPoolAccount {
   soonest_expire_at?: number;
   /** 到期日（YYYY-MM-DD），即选号分层档位键；同一天的账号同级。 */
   expire_day?: string;
+  /**
+   * 是否正因「到期档位更晚」而排队等待（当前轮不到它）。
+   *
+   * 由网关按与选号**完全相同**的档位口径算出。语义是「现在轮不到」，
+   * **不是故障** —— 前面档位被消耗或冷却后会自动进入路由。
+   */
+  queued?: boolean;
   /**
    * 该账号当前因「模型级限流」而冷却的模型（按到期时间升序）。
    *

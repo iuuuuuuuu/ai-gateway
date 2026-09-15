@@ -19,6 +19,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { demoModeEnabled, pagesDemoHostingEnabled } from "@/lib/demo-mode";
 import { useCreditAutoRefresh } from "@/lib/use-credit-auto-refresh";
+import { useVisibilityInterval } from "@/lib/use-visibility-interval";
 import { useWorkbuddyStatusRefresh } from "@/lib/use-workbuddy-status-refresh";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -27,25 +28,30 @@ function UpdateCenter({ running }: { running: boolean | undefined }) {
   const [info, setInfo] = useState<UpdateInfo | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
 
+  // 首次进入立刻检查一次。周期检查交给下面的 useVisibilityInterval ——
+  // UpdateCenter 挂在根组件上、**永不卸载**，用裸 setInterval 的话定时器
+  // 会一直存在：窗口收进托盘 / 隐藏时仍在后台每 30 分钟打一次网络请求。
+  const [checkNonce, setCheckNonce] = useState(0);
   useEffect(() => {
     let disposed = false;
-
-    async function checkForUpdate() {
-      try {
-        const result = await api.checkUpdate();
+    api
+      .checkUpdate()
+      .then((result) => {
         if (!disposed) setInfo(result.ok ? result : null);
-      } catch {
+      })
+      .catch(() => {
         // 左下角只展示可操作的升级状态，网络错误不打扰正常使用。
-      }
-    }
-
-    void checkForUpdate();
-    const timer = window.setInterval(() => void checkForUpdate(), 30 * 60 * 1000);
+      });
     return () => {
       disposed = true;
-      window.clearInterval(timer);
     };
-  }, []);
+  }, [checkNonce]);
+
+  // immediate: false —— 首次检查已由上面的 effect 负责（它挂载即跑），
+  // 这里只做周期轮询，否则启动时会重复打一次 checkUpdate。
+  useVisibilityInterval(() => setCheckNonce((n) => n + 1), 30 * 60 * 1000, {
+    immediate: false,
+  });
 
   const hasUpdate = Boolean(info?.ok && info.hasUpdate && info.latest);
 

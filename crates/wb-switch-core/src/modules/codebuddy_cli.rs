@@ -1205,9 +1205,19 @@ mod tests {
         )
         .unwrap();
 
+        // 必须把 helper 落成**文件**再执行，不能用 `node -e <脚本内容>`。
+        //
+        // 这既贴近真实用法（产品把 apiKeyHelper 配成文件绝对路径，由 CLI 直接执行），
+        // 也是**唯一在本机与 CI 都成立**的写法：实测 Windows 下 `node -e` 只执行
+        // 传入内容的**第一行**，其余行静默丢弃且退出码仍为 0 —— helper 首行是
+        // `#!/usr/bin/env node` 注释，于是整个脚本什么都没做、stdout 为空，
+        // 断言便以"期望 Bearer xxx，实际空串"失败（本用例此前正是如此红灯，
+        // 而 CI 三个平台却是绿的，属于测试写法依赖平台行为，不是产品缺陷）。
+        let helper_script = test_dir.join("helper.cjs");
+        fs::write(&helper_script, STANDARD_HELPER).unwrap();
+
         let output = Command::new("node")
-            .arg("-e")
-            .arg(STANDARD_HELPER)
+            .arg(&helper_script)
             .env("CODEBUDDY_ROTATE_DIR", &rotate_dir)
             .env("WB_SWITCH_ACCOUNTS_FILE", &accounts_file)
             .output()
@@ -1225,8 +1235,7 @@ mod tests {
         )
         .unwrap();
         let output = Command::new("node")
-            .arg("-e")
-            .arg(STANDARD_HELPER)
+            .arg(&helper_script)
             .env("CODEBUDDY_ROTATE_DIR", &rotate_dir)
             .env("WB_SWITCH_ACCOUNTS_FILE", &accounts_file)
             .output()

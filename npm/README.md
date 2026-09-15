@@ -1,8 +1,8 @@
 # workbuddy-switch
 
-WorkBuddy（腾讯 AI 编程助手）账号切换工具，**仅支持 Windows x64**。两种形态：
+WorkBuddy（腾讯 AI 编程助手）账号切换工具，支持 Windows x64、macOS（Apple Silicon / Intel）与 Linux x64。两种形态：
 
-- **桌面 App**：下载 Windows 安装包运行（Tauri，推荐日常使用）
+- **桌面 App**：下载对应平台安装包运行（Tauri，推荐日常使用）
 - **npm / webui**：`npm i -g workbuddy-switch` 后运行 `workbuddy-switch`，浏览器打开操作界面
 
 多账号共享登录态（`workbuddy-desktop.info`），一键切换 WorkBuddy 登录账号，并支持将当前账号的会话复制给目标账号（云端归属目标）。
@@ -19,15 +19,24 @@ workbuddy-switch status       # 终端查看当前账号
 
 webui 界面与桌面 App 一致：账号管理、切换、会话复制、自动签到、token 保活、更新检查。
 
-> 本包通过平台子包 `workbuddy-switch-win32-x64` 分发二进制：它声明为 `optionalDependencies`，
-> 安装时由 npm 自动装好，postinstall 再从平台包复制二进制到 `bin/`，**不依赖 GitHub**，
-> 国内镜像（npmmirror）也能稳定安装。目前只提供 `win32-x64` 一个平台包。
+> 本包通过**平台子包**分发二进制（`workbuddy-switch-<platform>-<arch>`）：它们声明为
+> `optionalDependencies`，安装时由 npm 按本机 `os`/`cpu` 自动挑一个装好，postinstall
+> 再从平台包复制二进制到 `bin/`，**不依赖 GitHub**，国内镜像（npmmirror）也能稳定安装。
+> 目前提供 `win32-x64`、`darwin-arm64`、`darwin-x64`、`linux-x64`、`linux-arm64` 五个平台包。
 
 ### 桌面 App
 
-从 GitHub Releases 下载 Windows x64 安装包（`*_x64-setup.exe`）双击运行。
+从 GitHub Releases 下载对应平台的安装包：
 
-> 本项目**仅支持 Windows x64**；macOS 与 Linux 支持已移除，不再提供对应安装包。
+| 平台 | 产物 |
+|---|---|
+| Windows x64 | `*_x64-setup.exe` / `*.msi` |
+| macOS（Apple Silicon） | `workbuddy-switch_<版本>_aarch64.dmg` |
+| macOS（Intel） | `workbuddy-switch_<版本>_x64.dmg` |
+| Linux x64 | `*.deb` / `*.AppImage` |
+
+> macOS 产物为 adhoc 签名（无 Apple 开发者证书），首次打开若提示「已损坏」，
+> 执行 `xattr -cr "/Applications/WorkBuddy Switch Gateway.app"` 放行即可。
 
 ## 功能
 
