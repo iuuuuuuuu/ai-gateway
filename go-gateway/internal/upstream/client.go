@@ -704,7 +704,11 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 
 	// 先按 id 建索引，便于给 cli 清单补元数据。
+	// disabled 单独记一份：agents[cli].models 是「这个 agent 允许用哪些模型」的白名单，
+	// 而 disabled 是模型级的停用开关，被停用的模型可以仍留在白名单里。
+	// 两者都不看会把已停用的模型下发给客户端（选中即报错）。
 	meta := make(map[string]ModelInfo, len(env.Data.Models))
+	disabled := make(map[string]bool, len(env.Data.Models))
 	for _, m := range env.Data.Models {
 		if m.ID == "" {
 			continue
@@ -718,6 +722,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			ContextWindow: m.MaxInputTokens,
 			MaxTokens:     m.MaxOutputTokens,
 			Efforts:       m.Reasoning.SupportedEfforts,
+		}
+		if m.Disabled {
+			disabled[m.ID] = true
 		}
 	}
 
@@ -736,12 +743,18 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		if id == "" || seen[id] {
 			continue
 		}
-		seen[id] = true
 		if mi, ok := meta[id]; ok {
+			// 上游显式标了 disabled 的不下发（与旧实现一致）。
+			// 池里查不到该 id 时无从判断，按「宁可多」返回。
+			if disabled[id] {
+				continue
+			}
+			seen[id] = true
 			out = append(out, mi)
 			continue
 		}
 		// cli 清单里有、models 池里没有：仍要返回（它确实可用），只是元数据未知。
+		seen[id] = true
 		out = append(out, ModelInfo{ID: id})
 	}
 

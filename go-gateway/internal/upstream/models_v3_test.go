@@ -187,6 +187,33 @@ func TestFetchModelsCachesEfforts(t *testing.T) {
 	}
 }
 
+// TestFetchModelsSkipsDisabledModels 上游标了 disabled 的模型不下发。
+//
+// agents[cli].models 是「这个 agent 允许用哪些模型」的白名单，disabled 是模型级
+// 停用开关，被停用的模型可以仍留在白名单里。只看白名单会把已停用的模型下发给
+// 客户端（客户端选中即报错），因此仍要按 models 池的 disabled 过滤。
+func TestFetchModelsSkipsDisabledModels(t *testing.T) {
+	const body = `{"code":0,"data":{
+		"agents":[{"name":"cli","models":["m-ok","m-off","m-unlisted"]}],
+		"models":[
+			{"id":"m-ok","maxInputTokens":100,"maxOutputTokens":10},
+			{"id":"m-off","maxInputTokens":200,"maxOutputTokens":20,"disabled":true}
+		]}}`
+	got, _, _, _ := fetchModelsCapturing(t, body, 200)
+	ids := idsOf(got)
+
+	if has(ids, "m-off") {
+		t.Errorf("上游标了 disabled 的模型不应下发（客户端选中即报错），实际 %v", ids)
+	}
+	// 池里查不到 id 时无从判断是否停用，按「宁可多」返回。
+	if !has(ids, "m-ok") || !has(ids, "m-unlisted") {
+		t.Errorf("应下发 m-ok 与 m-unlisted，实际 %v", ids)
+	}
+	if len(got) != 2 {
+		t.Errorf("应恰好 2 个模型，实际 %d 个: %v", len(got), ids)
+	}
+}
+
 // TestFetchModelsFallsBackToFullPool 上游没给 cli agent 时退回全量池。
 //
 // 宁可多不可少：退回旧行为总比返回空列表导致客户端看不到任何模型好。
