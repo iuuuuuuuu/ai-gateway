@@ -130,13 +130,16 @@ func main() {
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
 
 	sch := scheduler.New(scheduler.Config{
-		Pool:              p,
-		Upstream:          up,
-		CheckinHours:      cfg.Schedule.CheckinHours,
-		KeepaliveHours:    cfg.Schedule.KeepaliveHours,
-		CheckinDisabled:   !cfg.Schedule.CheckinEnabled,
-		KeepaliveDisabled: !cfg.Schedule.KeepaliveEnabled,
-		CheckinScope:      cfg.Schedule.CheckinScope,
+		Pool:                p,
+		Upstream:            up,
+		CheckinHours:        cfg.Schedule.CheckinHours,
+		KeepaliveHours:      cfg.Schedule.KeepaliveHours,
+		ActivityHours:       cfg.Schedule.ActivityHours,
+		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
+		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
+		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
+		ActivityReportCount: cfg.Schedule.ActivityReportCount,
+		CheckinScope:        cfg.Schedule.CheckinScope,
 	})
 	if normalizeCheckinScope(cfg.Schedule.CheckinScope) == "all" {
 		log.Printf("签到与猫猫旅行范围：国服 + 国际版（schedule.checkin_scope=all）")
@@ -153,6 +156,12 @@ func main() {
 	}
 	if !cfg.Schedule.KeepaliveEnabled {
 		log.Printf("token 保活已禁用（schedule.keepalive_enabled=false）")
+	}
+	if cfg.Schedule.ActivityEnabled {
+		log.Printf("活跃上报已启用（%v 点，每号 %d 条）：点亮连登天数并解锁领养前置",
+			cfg.Schedule.ActivityHours, cfg.Schedule.ActivityReportCount)
+	} else {
+		log.Printf("活跃上报已禁用（schedule.activity_enabled=false）：连登天数将不再增长")
 	}
 
 	h := server.NewHandler(server.Config{

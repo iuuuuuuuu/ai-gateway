@@ -30,7 +30,12 @@ type Config struct {
 	Schedule struct {
 		CheckinHours   []int `json:"checkin_hours"`   // [9,21]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
-		// CheckinEnabled/KeepaliveEnabled 显式禁用开关（缺省 true）。
+		// ActivityHours 活跃上报时点，默认 [10]。
+		//
+		// 签到只恢复余额；**连登天数**与领养资格靠对话活跃上报点亮
+		//（一条 chat_request_send 同时点亮连登 + 解锁 first_buddy 任务）。
+		ActivityHours []int `json:"activity_hours"`
+		// CheckinEnabled/KeepaliveEnabled/ActivityEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
 		//   - 空数组与 null 在老语义里已被"未配置 → 回落默认"占用，改判会静默翻转
@@ -40,7 +45,13 @@ type Config struct {
 		//   - 无需猜测哨兵（[-1] 之类），非法小时一律报错并提示改用本开关。
 		CheckinEnabled   bool `json:"checkin_enabled"`   // 缺省 true；false = 关签到（旅行随之停）
 		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
-		// CheckinScope 签到 + 猫猫旅行覆盖的账号区域："cn"（缺省，仅国服）/ "all"。
+		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 关活跃上报
+		// ActivityReportCount 每号每日上报条数，默认 3。
+		//
+		// 取 3 而非 1：单条上报偶发被服务端丢弃（缺 userId 时 200 但静默丢弃），
+		// 多条提高点亮成功率；也不宜过多，避免被风控当成异常流量。
+		ActivityReportCount int `json:"activity_report_count"`
+		// CheckinScope 签到 + 猫猫旅行 + 活跃上报覆盖的账号区域："cn"（缺省，仅国服）/ "all"。
 		//
 		// 为什么默认只做国服：国际版（workbuddy.ai）的 billing 与 growth 接口目前
 		// 不返回真实数据（签到状态恒 active=false，travel/status 恒为空 data），
@@ -135,10 +146,13 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "60s"
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.KeepaliveHours = []int{22}
-	// 开关「缺省 true」靠这两行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
+	c.Schedule.ActivityHours = []int{10}
+	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 	c.Schedule.CheckinEnabled = true
 	c.Schedule.KeepaliveEnabled = true
+	c.Schedule.ActivityEnabled = true
+	c.Schedule.ActivityReportCount = 3
 	c.Schedule.CheckinScope = "cn"
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
@@ -270,6 +284,12 @@ func (c *Config) normalize() error {
 	if len(c.Schedule.KeepaliveHours) == 0 {
 		c.Schedule.KeepaliveHours = []int{22}
 	}
+	if len(c.Schedule.ActivityHours) == 0 {
+		c.Schedule.ActivityHours = []int{10}
+	}
+	if c.Schedule.ActivityReportCount <= 0 {
+		c.Schedule.ActivityReportCount = 3
+	}
 	// 签到区域范围：只接受 cn / all，其余（含缺省空串）一律回落 cn。
 	c.Schedule.CheckinScope = normalizeCheckinScope(c.Schedule.CheckinScope)
 	if err := c.validateScheduleHours(); err != nil {
@@ -303,7 +323,10 @@ func (c *Config) validateScheduleHours() error {
 	if err := checkHourRange("schedule.checkin_hours", "checkin_enabled", c.Schedule.CheckinHours); err != nil {
 		return err
 	}
-	return checkHourRange("schedule.keepalive_hours", "keepalive_enabled", c.Schedule.KeepaliveHours)
+	if err := checkHourRange("schedule.keepalive_hours", "keepalive_enabled", c.Schedule.KeepaliveHours); err != nil {
+		return err
+	}
+	return checkHourRange("schedule.activity_hours", "activity_enabled", c.Schedule.ActivityHours)
 }
 
 func checkHourRange(field, switchKey string, hours []int) error {

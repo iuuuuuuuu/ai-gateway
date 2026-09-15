@@ -24,14 +24,26 @@ type Config struct {
 	Upstream       *upstream.Client
 	CheckinHours   []int // 默认 [9, 21]
 	KeepaliveHours []int // 默认 [22]
+	// ActivityHours 活跃上报时点，默认 [10]。
+	//
+	// 为什么要单独一个任务：签到只恢复余额，**连登天数**要靠对话活跃上报点亮。
+	// 一条 chat_request_send 同时点亮连登 + 解锁 first_buddy（领养前置），
+	// 因此它是「能领养」的前提。
+	ActivityHours []int
 
 	// CheckinDisabled 显式关闭签到排程（对应 config 的 schedule.checkin_enabled=false）。
 	// 禁用后不再有任何签到时点，搭签到便车的猫猫旅行也随之停摆。
 	CheckinDisabled bool
 	// KeepaliveDisabled 显式关闭 token 保活排程（schedule.keepalive_enabled=false）。
 	KeepaliveDisabled bool
+	// ActivityDisabled 显式关闭活跃上报排程（schedule.activity_enabled=false）。
+	ActivityDisabled bool
 
-	// CheckinScope 签到 + 猫猫旅行覆盖的账号区域："cn"（缺省，仅国服）/ "all"。
+	// ActivityReportCount 每个账号每日上报条数，默认 3（与官方客户端行为接近）。
+	// 多条共用同一 conversationId，requestId 各自独立。
+	ActivityReportCount int
+
+	// CheckinScope 签到 + 猫猫旅行 + 活跃上报覆盖的账号区域："cn"（缺省，仅国服）/ "all"。
 	//
 	// 国际版（workbuddy.ai）的 billing 与 growth 接口暂无真实数据，默认跳过；
 	// token 保活不受此限制（两个区域都需要刷新）。
@@ -64,6 +76,12 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.KeepaliveHours) == 0 {
 		cfg.KeepaliveHours = []int{22}
 	}
+	if len(cfg.ActivityHours) == 0 {
+		cfg.ActivityHours = []int{10}
+	}
+	if cfg.ActivityReportCount <= 0 {
+		cfg.ActivityReportCount = defaultActivityReportCount
+	}
 	return &Scheduler{cfg: cfg, adoptTried: make(map[string]string)}
 }
 
@@ -88,10 +106,11 @@ type taskKind int
 const (
 	taskCheckin taskKind = iota
 	taskKeepalive
+	taskActivity
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
-// 签到与保活若配到同一小时（如都含 22），该时刻两类任务需一并执行。
+// 多类任务若配到同一小时（如签到与旅行都含 9），该时刻需一并执行。
 // 已显式禁用的任务不进候选（nextFire 对其零值返回零时间，nextWake 再跳过零时点）。
 func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	type slot struct {
@@ -104,6 +123,9 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	if !s.cfg.KeepaliveDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.KeepaliveHours), taskKeepalive})
+	}
+	if !s.cfg.ActivityDisabled {
+		slots = append(slots, slot{nextFire(now, s.cfg.ActivityHours), taskActivity})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -131,7 +153,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
-			// 两类任务全部禁用：不空转，只等退出信号。
+			// 所有任务全部禁用：不空转，只等退出信号。
 			<-ctx.Done()
 			return
 		}
@@ -148,6 +170,8 @@ func (s *Scheduler) Run(ctx context.Context) {
 					s.RunCheckinNow()
 				case taskKeepalive:
 					s.RunKeepaliveNow()
+				case taskActivity:
+					s.runActivity(ctx)
 				}
 			}
 		}
