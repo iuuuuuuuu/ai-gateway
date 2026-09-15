@@ -144,7 +144,12 @@ VS Code fork，**共用同一份账号库**，但登录态快照互相独立 —
 | 历史回滚 | 每次写入生成时间戳备份，页面内一键恢复至任意历史版本 |
 
 支持的客户端：Claude Code / Claude Desktop / Codex / DeepSeek Harness / OpenCode /
-Pi / Grok Build / ZCode / Kimi Code / OpenClaw / Hermes Agent。
+Pi / Grok Build / ZCode / Kimi Code / OpenClaw / Hermes Agent / MiniMax Code。
+
+> **MiniMax Code** 走 Anthropic Messages 协议（其配置用 `@ai-sdk/anthropic` 适配器）。
+> 接入时在 `~/.minimax/config.yaml` 的 `provider` 块注册本网关并把 `defaultModel`
+> 指向它；**原有的 MiniMax 官方 provider（含 `managed-login` 登录态）原样保留** ——
+> 官方账号与本网关可同时存在、随时切换。
 
 ### 兼容网关
 
