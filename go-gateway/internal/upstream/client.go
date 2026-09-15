@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -270,6 +271,10 @@ type Client struct {
 	// BaseIntl 国际版基址。与国服不同，国际版所有端点（chat / billing /
 	// 签到 / 旅行 / token 刷新）都在同一域名下，因此只需一个 base。
 	BaseIntl string
+
+	// proxyURL 当前生效的显式代理（空串 = 未设置，回落环境变量）。
+	// 由 SetProxy 维护；国际版（workbuddy.ai）在国内直连不稳定，通常需要它。
+	proxyURL string
 }
 
 // IsIntl 判断账号是否属于国际版（供签到/旅行的区域范围过滤复用）。
@@ -291,6 +296,28 @@ func isIntl(a *auth.Auth) bool { return IsIntl(a) }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
 func New() *Client {
+	// HTTP 与 ChatHTTP **共享同一个 Transport**：连接池不重复，
+	// 两者只差总时长（ChatHTTP.Timeout=0，首字节由 ResponseHeaderTimeout 约束）。
+	tr := newTransport(nil)
+	return &Client{
+		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr},
+		SanitizeFingerprints: true,
+		ChatBaseCN:           "https://copilot.tencent.com",
+			BillingBaseCN:        "https://www.codebuddy.cn",
+			BaseIntl:             "https://www.workbuddy.ai",
+	}
+}
+
+// newTransport 构造共用的 http.Transport。
+//
+// 关键：显式设置 Proxy 而不是依赖 http.ProxyFromEnvironment 的默认行为 ——
+// 后者只读 HTTPS_PROXY 等**环境变量**，而用户在软件「设置 → 更新代理」里填的
+// 代理是写在配置文件里的，环境变量通常是空的。于是国内直连
+// workbuddy.ai 会失败（实测 12 次全部 ECONNRESET），而浏览器因为读系统代理却正常。
+//
+// proxyURL 为 nil 时退回 ProxyFromEnvironment（仍尊重环境变量，行为与之前一致）。
+func newTransport(proxyURL *url.URL) *http.Transport {
 	tr := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
@@ -298,14 +325,53 @@ func New() *Client {
 		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
-	return &Client{
-		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
-		SanitizeFingerprints: true,
-		ChatBaseCN:           "https://copilot.tencent.com",
-			BillingBaseCN:        "https://www.codebuddy.cn",
-			BaseIntl:             "https://www.workbuddy.ai",
+	if proxyURL != nil {
+		tr.Proxy = http.ProxyURL(proxyURL)
+	} else {
+		tr.Proxy = http.ProxyFromEnvironment
 	}
+	return tr
+}
+
+// SetProxy 设置出站代理（空串 = 不使用显式代理，回落环境变量）。
+//
+// 与 New() 一致：HTTP 与 ChatHTTP 共享**同一个** Transport（连接池不重复），
+// 两者只差总时长。既有连接不会被打断，由旧 Transport 自行回收；
+// 新请求立即走新代理。启动时调用一次即可。
+func (c *Client) SetProxy(raw string) error {
+	raw = strings.TrimSpace(raw)
+	var proxyURL *url.URL
+	if raw != "" {
+		// 容忍用户只填 host:port（如 127.0.0.1:7890）：补 http:// 前缀。
+		if !strings.Contains(raw, "://") {
+			raw = "http://" + raw
+		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("代理地址无效: %w", err)
+		}
+		// 注意 url.Parse 对 "http://:8080" 不报错（Host 为 ":8080"、Hostname() 为空），
+		// 必须用 Hostname() 判空，否则会把一个连不上主机的地址当成合法配置。
+		if u.Hostname() == "" {
+			return fmt.Errorf("代理地址缺少主机名: %s", raw)
+		}
+		proxyURL = u
+	}
+	tr := newTransport(proxyURL)
+	// 保留调用方已设的调优值（SetProxy 常在 New 之后、调优之前调用，
+	// 但测试/其它调用顺序不确定，故这里从旧 Transport 继承可继承的字段）。
+	if old, ok := c.ChatHTTP.Transport.(*http.Transport); ok && old != nil {
+		tr.ResponseHeaderTimeout = old.ResponseHeaderTimeout
+	}
+	c.HTTP = &http.Client{Timeout: 120 * time.Second, Transport: tr}
+	c.ChatHTTP = &http.Client{Timeout: 0, Transport: tr}
+	c.proxyURL = raw
+	return nil
+}
+
+// ProxyURL 返回当前生效的显式代理（空串 = 未设置）。
+func (c *Client) ProxyURL() string {
+	return c.proxyURL
 }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。

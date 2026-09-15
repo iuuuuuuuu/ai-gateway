@@ -735,10 +735,48 @@ pub fn norm_ts(v: Option<&Value>) -> Option<i64> {
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+/// 构造宿主 HTTP 客户端。
+///
+/// **必须显式挂代理**：reqwest 与 Go 一样，默认只读 `HTTPS_PROXY` 等环境变量，
+/// 不看 Windows 注册表里的系统代理。实测（2026-09）：国际版 `www.workbuddy.ai`
+/// 在国内直连 12/12 全部 `ECONNRESET`，走代理 12/12 成功 —— 所以「浏览器能打开」
+/// 不代表宿主能调通，积分查询与 token 刷新都会失败，界面显示
+/// `error sending request for url (https://www.w…)`。
+///
+/// 代理地址**复用**「设置 → 更新代理」里已填的值（`github_config.json` 的 `proxy`），
+/// 用户无需配两遍。未配置时不挂代理（保持原有直连行为）。
 fn http_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent(DEFAULT_HTTP_USER_AGENT)
+        .user_agent(DEFAULT_HTTP_USER_AGENT);
+    match proxy_url() {
+        Some(proxy) => match reqwest::Proxy::all(&proxy) {
+            // no_proxy：本机回环（网关 /healthz、/status、/v1/models）绝不能走代理 ——
+            // 否则「探测本地网关是否在跑」会被转发到远端代理而失败，
+            // 表现为网关明明活着却显示未就绪。
+            Ok(p) => builder.proxy(p).no_proxy(),
+            Err(_) => builder, // 地址非法：不挂代理，回落直连（由调用方报错）
+        },
+        None => builder,
+    }
+}
+
+/// 读取「设置 → 更新代理」里配置的代理地址；未配置返回 None。
+///
+/// 与网关的 `upstream_proxy()` 同源（都读 `github_config.json` 的 `proxy`），
+/// 保证宿主与网关走同一个出口。
+fn proxy_url() -> Option<String> {
+    let raw = crate::modules::update::load_github_config()
+        .get("proxy")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw)
+    }
 }
 
 fn http_client() -> &'static reqwest::Client {
