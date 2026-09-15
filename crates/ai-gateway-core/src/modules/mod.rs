@@ -9,6 +9,9 @@ pub mod codebuddy_cn_ide;
 pub mod config;
 pub mod credit_usage;
 pub mod credits;
+// MITM 设备身份代理（hyper 协议栈自建，不依赖 Tauri）：CA 签发 / 抓包改写 /
+// 豆包与 Trae 凭证捕获 / 系统代理编排 / OAuth 直连豁免 / WS 桥接。
+pub mod device_proxy;
 // 豆包：账号池与凭证 / 会话保活 / 会员额度 / 对话备份导出
 pub mod doubao_account;
 pub mod doubao_chats;
@@ -17,6 +20,8 @@ pub mod doubao_session;
 pub mod export_import;
 pub mod gateway;
 pub mod gateway_embed;
+// 数据目录迁移（~/.wb-switch → ~/.ai-gateway，复制式、幂等）
+pub mod migrate_store;
 pub mod oauth;
 pub mod official_usage;
 pub mod process;

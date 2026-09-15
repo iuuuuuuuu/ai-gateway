@@ -422,7 +422,7 @@ pub async fn trae_discover_accounts() -> Result<Value, String> {
 #[tauri::command(rename_all = "camelCase")]
 pub async fn trae_entitlement(app_kind: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        Ok(trae_discover::read_entitlement(&app_kind).unwrap_or(json!({})))
+        trae_discover::read_entitlement(&app_kind).unwrap_or_else(|| json!({}))
     })
     .await
     .map_err(|e| format!("读取套餐信息失败: {e}"))
@@ -630,26 +630,24 @@ pub async fn doubao_set_credential(
 /// 读取最近一次抓包凭证（供「从代理抓包自动填充」按钮）。
 #[tauri::command]
 pub async fn doubao_captured_credential() -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        Ok(match doubao_account::load_captured() {
-            Some(captured) => {
-                let sid = captured
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                json!({
-                    "available": true,
-                    "uid": captured.get("uid"),
-                    "host": captured.get("host"),
-                    "capturedAt": captured.get("captured_at"),
-                    // 回填按钮需要明文才能填进输入框；仅本机、仅此一处
-                    "sessionId": sid,
-                    "sidGuard": captured.get("sid_guard"),
-                    "ttwid": captured.get("ttwid"),
-                })
-            }
-            None => json!({ "available": false }),
-        })
+    tauri::async_runtime::spawn_blocking(|| match doubao_account::load_captured() {
+        Some(captured) => {
+            let sid = captured
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            json!({
+                "available": true,
+                "uid": captured.get("uid"),
+                "host": captured.get("host"),
+                "capturedAt": captured.get("captured_at"),
+                // 回填按钮需要明文才能填进输入框；仅本机、仅此一处
+                "sessionId": sid,
+                "sidGuard": captured.get("sid_guard"),
+                "ttwid": captured.get("ttwid"),
+            })
+        }
+        None => json!({ "available": false }),
     })
     .await
     .map_err(|e| format!("读取抓包凭证失败: {e}"))

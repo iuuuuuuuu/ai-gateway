@@ -151,6 +151,16 @@ pub fn run() {
             }
             // README 截图模式只渲染前端虚构数据，禁止读取账号后执行签到、轮换或保活。
             if !is_screenshot_demo() {
+                // 数据目录迁移必须**最先**执行：改名后旧版数据在 `~/.wb-switch`，
+                // 若不先搬过来，后续所有读写都会落到空的 `~/.ai-gateway`，
+                // 用户看到的是「账号全没了」。
+                //
+                // 幂等且复制式（旧目录保留），因此重复启动安全、也支持回退旧版。
+                let migration = modules::migrate_store::migrate_store_dir();
+                if migration.migrated() {
+                    eprintln!("[migrate] {}", migration.describe());
+                }
+
                 spawn_background_loops();
                 // 网关「随 App 启动」：读 auto_start，为真则在此拉起网关子进程。
                 //
