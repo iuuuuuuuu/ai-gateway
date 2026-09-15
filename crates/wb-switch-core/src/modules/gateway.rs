@@ -778,6 +778,22 @@ pub fn inspect_port(port: u16) -> Value {
     })
 }
 
+/// 出站代理地址：复用「设置 → 更新代理」里已填的值（`github_config.json` 的 `proxy`）。
+///
+/// 设计取舍：**不新增一个「网关代理」配置项**。用户在设置页填的更新代理，
+/// 目的就是访问被墙的服务；国际版 workbuddy.ai 属于同类需求，让用户配两遍
+/// 既啰嗦又容易只配一处导致「浏览器能用、网关不能用」的困惑。
+///
+/// 返回空串表示未配置（网关将直连，并在日志里提示国际版可能超时）。
+fn upstream_proxy() -> String {
+    crate::modules::update::load_github_config()
+        .get("proxy")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
 /// 生成网关需要的 config.json（网关原生格式）。
 fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
     let dir = gateway_dir();
@@ -812,6 +828,13 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
         },
         "features": { "sanitize_blacklist_fingerprints": true },
         "upstash": { "url": "", "token": "" },
+        // 出站代理：**复用**「设置 → 更新代理」里已填的地址，用户无需配两遍。
+        //
+        // 为什么网关需要它：国际版（workbuddy.ai）在国内直连不稳定（实测
+        // 12 次全部 ECONNRESET），走代理 12/12 成功。而 Go 的
+        // http.ProxyFromEnvironment **只读环境变量**、不读 Windows 注册表，
+        // 所以「浏览器能走系统代理」不代表网关也能。
+        "proxy": upstream_proxy(),
         "pool": {
             "max_in_flight": 3,
             "breaker_threshold": 3,

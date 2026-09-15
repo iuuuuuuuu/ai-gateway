@@ -84,6 +84,16 @@ type Config struct {
 		CreditRefreshEnabled bool `json:"credit_refresh_enabled"`
 	} `json:"pool"`
 
+	// Proxy 出站 HTTP 代理，形如 "http://127.0.0.1:7890"（缺省空 = 不用显式代理）。
+	//
+	// 为什么需要：国际版（workbuddy.ai）在国内直连不稳定（实测 wsarecv 超时），
+	// 走代理才稳。宿主会把「设置 → 更新代理」里已填的地址复用到此处，
+	// 用户无需配两遍。
+	//
+	// 注意 Go 的 http.ProxyFromEnvironment **只读环境变量**、不读 Windows 注册表，
+	// 所以「浏览器能走系统代理」不代表网关也能 —— 必须显式配置。
+	Proxy string `json:"proxy"`
+
 	SessionSticky struct {
 		Enabled    bool   `json:"enabled"`     // 默认 true
 		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
