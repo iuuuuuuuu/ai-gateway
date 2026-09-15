@@ -69,10 +69,25 @@ func (e *Error) Error() string {
 }
 
 // hardMarkers 余额不足关键词（小写比较 + 中文原文比较双通道）。
+// hardMarkers 「余额/额度耗尽」的文案特征（命中即 ErrHardCredit → 长冷却）。
+//
+// 为什么要收单复数两种写法：上游国际版（workbuddy.ai）实际返回的是
+// "Credits exhausted. Please visit the link below to purchase add-on packs
+// and get more credits: …"（**复数** Credits），而早期只登记了单数
+// "credit exhausted"，于是 strings.Contains 恒不命中 → 被判成 ErrSoftRate
+// （软冷却 60 秒）→ 60 秒后重试同一个已耗尽账号，形成无限重试。
+// 实测该响应体 15 个关键词全部未命中，故补齐复数形态。
 var hardMarkers = []string{
-	"insufficient credit", "no credit", "credit exhausted", "out of credit",
-	"quota exceeded", "quota exhaust", "payment required", "credit not enough",
-	"not enough credit",
+	"insufficient credit", "insufficient credits",
+	"no credit", "no credits",
+	"credit exhausted", "credits exhausted",
+	"credit exhaustion", "credits exhaustion",
+	"out of credit", "out of credits",
+	"quota exceeded", "quota exhaust",
+	"payment required",
+	"credit not enough", "credits not enough",
+	"not enough credit", "not enough credits",
+	"credit used up", "credits used up",
 	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",
 }
 
@@ -200,9 +215,65 @@ func IsModelRateLimited(body string) bool {
 	return false
 }
 
+// creditExhaustedCode 上游「额度耗尽」的业务码。
+//
+// 与 modelRateCode(6004) 的关键区别在于**嵌套层级**：6004 在顶层 `code`，
+// 而 14018 藏在 `error.data.code`：
+//
+//	{"error":{"data":{"code":14018,"msg":"Credits exhausted. …"}}}
+//
+// 因此不能用 apiEnvelope（它只解顶层 code）。实测该响应的 HTTP 状态是 **429**，
+// 而 429 分支若不识别它就会落进 ErrSoftRate → 只冷却 60 秒 → 无限重试。
+const creditExhaustedCode = 14018
+
+// isCreditExhaustedCode 报告响应体是否为「额度耗尽」业务码（含嵌套层级）。
+func isCreditExhaustedCode(body string) bool {
+	var env struct {
+		Error struct {
+			Data struct {
+				Code int `json:"code"`
+			} `json:"data"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		return false
+	}
+	return env.Error.Data.Code == creditExhaustedCode
+}
+
+// FriendlyMessage 把上游的原始错误体提炼成一句可读的原因，供客户端展示。
+//
+// 背景：此前直接把整段上游 JSON 拼进 OpenAI 错误体的 message，客户端看到的是
+// 「all accounts unavailable (cooling/disabled): upstream soft_rate (http 429):
+// {"error":{"data":{"code":14018,"msg":"Credits exhausted. …"}}}」—— 又长又难懂。
+//
+// 返回空串表示没有更优的表述，调用方应回退到原始文案。
+func FriendlyMessage(kind ErrKind, status int, body string) string {
+	switch {
+	case kind == ErrHardCredit || isCreditExhaustedCode(body):
+		return "账号额度已耗尽（上游 " + strconv.Itoa(creditExhaustedCode) + "）：请为该账号充值，或等待签到 / 免费额度恢复后重试"
+	case kind == ErrModelRate:
+		return "该账号在此模型上已达频率上限，已按上游给出的重置时间冷却；同一账号的其他模型仍可用"
+	case kind == ErrSoftRate:
+		return "账号被上游限流（HTTP 429），已短暂冷却，稍后会自动重试"
+	case kind == ErrSessionDead:
+		return "账号登录态已失效，需在「账号管理」页重新登录"
+	case kind == ErrNotFound:
+		return "上游返回 404（接口或模型不存在），已短暂冷却并切换账号"
+	case kind == ErrServer && status > 0:
+		return "上游服务异常（HTTP " + strconv.Itoa(status) + "），已切换到其他账号"
+	}
+	return ""
+}
+
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 func Classify(status int, body string) ErrKind {
 	if status == http.StatusPaymentRequired {
+		return ErrHardCredit
+	}
+	// 额度耗尽的业务码优先判定：它的 HTTP 状态是 429，若不先拦，
+	// 会落进下面的 429 分支被判成 ErrSoftRate（仅 60 秒冷却）→ 无限重试。
+	if isCreditExhaustedCode(body) {
 		return ErrHardCredit
 	}
 	lower := strings.ToLower(body)
@@ -328,8 +399,11 @@ func (c *Client) chatBase(a *auth.Auth) string {
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
-func (c *Client) prepareBody(body []byte) []byte {
-	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot())
+//
+// intl 为该账号是否国际版（workbuddy.ai）：国际版要求 messages 首条必须是
+// system（实测首条 user → HTTP 400 code=11128），需要在此补一条。
+func (c *Client) prepareBody(body []byte, intl bool) []byte {
+	return PrepareBodyForRegion(body, c.SanitizeFingerprints, c.effortsSnapshot(), intl)
 }
 
 // effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
@@ -431,7 +505,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 // 只有传输层失败才返回 err。
 func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(body)))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(body, isIntl(a))))
 	if err != nil {
 		return nil, 0, nil, err
 	}

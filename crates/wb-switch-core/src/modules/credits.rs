@@ -530,6 +530,16 @@ async fn fetch_new_resource_responses(account: &Value) -> NewResourceResponses {
     }
 }
 
+/// 旧接口（`get-user-resource`）的完整 URL。
+///
+/// 单独抽成函数，是为了让「域名是否跟随账号区域」这件事**可被单测覆盖** ——
+/// 缺陷曾经出在这里的调用点硬编码了 WORKBUDDY_API_ENDPOINT（国服域名），
+/// 而调用点本身要发真实 HTTP、在无 mock 设施的仓库里无法直接断言 URL。
+/// 现在 URL 的决策只存在于本函数，测试断言它即等价于断言调用点行为。
+fn legacy_user_resource_url(account: &Value) -> String {
+    new_resource_url(account, USER_RESOURCE_PATH)
+}
+
 async fn fetch_legacy_user_resource(account: &Value) -> Value {
     let now = Local::now();
     let begin = now.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -544,7 +554,13 @@ async fn fetch_legacy_user_resource(account: &Value) -> Value {
         "PackageEndTimeRangeBegin": begin,
         "PackageEndTimeRangeEnd": end,
     });
-    let url = format!("{WORKBUDDY_API_ENDPOINT}{USER_RESOURCE_PATH}");
+    // 域名必须跟随账号区域：国际版 token 打到国服域名会被网关直接拒绝，
+    // 返回 `<html><center><h1>401 Authorization Required</h1></center>…APISIX` 页面
+    //（实测复现：国际版 token → www.codebuddy.cn = 401；→ www.workbuddy.ai = 200）。
+    //
+    // 此前这里硬编码 WORKBUDDY_API_ENDPOINT，导致国际版账号的积分查询恒定失败，
+    // 界面上表现为「积分包 0 个」且错误信息是一整段 HTML（用户截图中的现象）。
+    let url = legacy_user_resource_url(account);
     // 新接口编排已经统一执行过惰性刷新，并在任一路未授权时只刷新一次。
     // 旧接口回退必须直接复用该账号，不能重新进入 authenticated_post，
     // 否则可能重复刷新并用旧 refresh token 覆盖刚落盘的新 token。
@@ -1130,5 +1146,53 @@ mod tests {
             .map(|resource| resource["remaining"].as_f64().unwrap())
             .sum();
         assert_eq!(expiring, 80.0);
+    }
+
+    // 回归：旧接口（fetch_legacy_user_resource）的域名必须**跟随账号区域**。
+    //
+    // 缺陷背景（实测复现）：该函数曾硬编码 WORKBUDDY_API_ENDPOINT（www.codebuddy.cn），
+    // 导致国际版账号的积分查询把 .ai 的 token 打到国服域名，被网关直接拒绝并返回
+    // `<html><center><h1>401 Authorization Required</h1></center>…APISIX` 页面。
+    // 界面上表现为两个国际版账号都显示一整段 HTML 错误、积分包恒为 0。
+    //
+    // 实测对照（同一 token）：
+    //   国际版 → www.codebuddy.cn  = 401（APISIX 页面）
+    //   国际版 → www.workbuddy.ai  = 200（TotalCount=2）
+    #[test]
+    fn legacy_user_resource_url_follows_account_region() {
+        let intl = json!({
+            "domain": "www.workbuddy.ai",
+            "access_token": "redacted",
+            "uid": "intl-1"
+        });
+        let cn = json!({
+            "domain": "copilot.tencent.com",
+            "access_token": "redacted",
+            "uid": "cn-1"
+        });
+
+        // 国际版必须打国际版域名 —— 这是本次修复的核心断言。
+        // 断言的是 legacy_user_resource_url（调用点真正使用的那个函数），
+        // 而不是底层 helper，否则调用点写死域名时测试仍会通过（实测踩过）。
+        assert_eq!(
+            legacy_user_resource_url(&intl),
+            "https://www.workbuddy.ai/v2/billing/meter/get-user-resource",
+            "国际版账号的旧接口 URL 不能打到国服域名（会被 401 拒绝）"
+        );
+
+        // 国服保持原样。
+        assert_eq!(
+            legacy_user_resource_url(&cn),
+            "https://www.codebuddy.cn/v2/billing/meter/get-user-resource"
+        );
+
+        // Origin 必须与目标域名一致，否则同样会被网关拒绝。
+        let intl_url = legacy_user_resource_url(&intl);
+        assert_eq!(request_origin(&intl_url), WORKBUDDY_API_ENDPOINT_INTL);
+        let intl_headers = resource_auth_headers(&intl, request_origin(&intl_url));
+        assert_eq!(
+            intl_headers.get("Origin").map(String::as_str),
+            Some("https://www.workbuddy.ai")
+        );
     }
 }

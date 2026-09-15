@@ -18,6 +18,18 @@ func PrepareBodyOpt(src []byte, sanitize bool) []byte {
 // 仅当请求显式携带且模型不支持该档位时，改为 ≤请求档位的最高支持档；支持档全部高于请求档时取最低档；
 // 未知模型/未知档位/未携带该字段一律透传。efforts 为 nil 表示未知（不降级）。
 func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]string) []byte {
+	return PrepareBodyForRegion(src, sanitize, efforts, false)
+}
+
+// PrepareBodyForRegion 在 PrepareBodyOptWithEfforts 基础上按账号区域做协议适配。
+//
+// intl=true（国际版 workbuddy.ai）时额外保证 messages 首条是 system ——
+// 实测国际版对首条非 system 的请求返回 HTTP 400 code=11128
+// "first message is not system prompt"（同一账号补上 system 首条即 200）。
+//
+// 只对国际版做这件事：国服的 11128 是另一种含义（渠道指纹未批准，见 sanitize.go），
+// 国服并无「首条必须 system」的要求，不能混为一谈。
+func PrepareBodyForRegion(src []byte, sanitize bool, efforts map[string][]string, intl bool) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -28,6 +40,11 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 	obj["stream"] = true
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
+	// 归一化之后再做国际版适配：developer 已被改写成 system，
+	// 此时首条若已是 system 就不必补（否则会给 Codex 之类客户端多插一条）。
+	if intl {
+		ensureSystemFirst(obj)
+	}
 	normalizeReasoningEffort(obj, efforts)
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
@@ -39,6 +56,31 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 		return src
 	}
 	return out
+}
+
+// ensureSystemFirst 保证 messages[0] 是 system（国际版协议要求）。
+//
+// 仅在首条不是 system 时补一条**最小**的 system，不改动任何既有消息，也不合并 ——
+// 合并会改变模型看到的对话结构，风险大于收益。空 messages（或缺失）时不动：
+// 那种请求本就缺少上下文，交给上游报错更诚实。
+//
+// 补的内容刻意保持中性（"You are a helpful assistant."），因为这里无法得知
+// 调用方想要的系统提示；它只为满足协议前提，不承载业务语义。
+func ensureSystemFirst(obj map[string]any) {
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return
+	}
+	first, ok := msgs[0].(map[string]any)
+	if !ok {
+		return
+	}
+	if role, _ := first["role"].(string); strings.EqualFold(strings.TrimSpace(role), "system") {
+		return
+	}
+	sys := map[string]any{"role": "system", "content": "You are a helpful assistant."}
+	obj["messages"] = append([]any{sys}, msgs...)
+	log.Printf("intl payload: messages 首条非 system（原 role=%v），已补一条 system", first["role"])
 }
 
 // effortRank 档位从低到高。
