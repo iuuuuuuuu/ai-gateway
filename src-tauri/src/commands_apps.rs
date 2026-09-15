@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 
 use ai_gateway_core::modules::{
     app_profile::{profile_for, TargetApp},
-    config, doubao_account, doubao_chats, doubao_quota, doubao_session, switcher, trae_account,
-    trae_checkin, trae_device, trae_discover,
+    config, doubao_account, doubao_chats, doubao_quota, doubao_session, scheduler, switcher,
+    trae_account, trae_checkin, trae_device, trae_discover,
 };
 
 // ---------------------------------------------------------------------------
@@ -800,4 +800,68 @@ pub fn get_app_settings() -> Value {
 #[tauri::command]
 pub fn save_app_settings(patch: Value) -> Result<Value, String> {
     config::save_app_settings(&patch).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// 计划任务（Windows schtasks）
+// ---------------------------------------------------------------------------
+
+/// 把界面传来的任务标识解析成 [`scheduler::TaskKind`]。
+fn parse_task_kind(kind: &str) -> Result<scheduler::TaskKind, String> {
+    scheduler::TaskKind::ALL
+        .iter()
+        .find(|k| k.launcher_name() == kind.trim() || k.task_name() == kind.trim())
+        .copied()
+        .ok_or_else(|| format!("未知任务: {kind}"))
+}
+
+/// 查询全部计划任务的注册状态。
+#[tauri::command]
+pub async fn task_status() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        // schtasks 是子进程调用（可达数秒），必须离开主线程，
+        // 否则设置页一打开界面就卡住。
+        Ok(json!({ "tasks": scheduler::all_task_status() }))
+    })
+    .await
+    .map_err(|e| format!("查询计划任务失败: {e}"))?
+}
+
+/// 注册（或覆盖）一个每日计划任务。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_register(kind: String, time: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let task = parse_task_kind(&kind)?;
+        let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
+        let message = scheduler::register_daily_task(task, &time, &exe, &config::store_dir())?;
+        Ok(json!({ "ok": true, "message": message }))
+    })
+    .await
+    .map_err(|e| format!("注册计划任务失败: {e}"))?
+}
+
+/// 删除计划任务。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_unregister(kind: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let task = parse_task_kind(&kind)?;
+        scheduler::unregister_task(task)?;
+        Ok(json!({ "ok": true }))
+    })
+    .await
+    .map_err(|e| format!("删除计划任务失败: {e}"))?
+}
+
+/// 立即执行一次任务（不依赖计划任务，用于验证配置是否正确）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn task_run_now(kind: String) -> Result<Value, String> {
+    let task = parse_task_kind(&kind)?;
+    let key = task.cli_key().to_string();
+    // 任务内部会跑 HTTP 请求或启停客户端，必须在 blocking 线程里同步跑完
+    tauri::async_runtime::spawn_blocking(move || {
+        let code = ai_gateway_core::modules::cli_task::run_cli_task(&key);
+        Ok(json!({ "ok": code == 0, "exitCode": code }))
+    })
+    .await
+    .map_err(|e| format!("执行任务失败: {e}"))?
 }

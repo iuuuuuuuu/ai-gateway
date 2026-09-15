@@ -4,6 +4,8 @@ pub mod agent_import;
 pub mod app_profile;
 pub mod auth_file;
 pub mod checkin;
+// CLI 任务模式（--task-run <key>，刻意不启动 Tauri）
+pub mod cli_task;
 pub mod codebuddy_cli;
 pub mod codebuddy_cn_ide;
 pub mod config;
@@ -27,6 +29,8 @@ pub mod official_usage;
 pub mod process;
 pub mod refresh;
 pub mod rotate;
+// Windows 计划任务（Trae 签到 / 豆包保活 / 额度巡检）
+pub mod scheduler;
 pub mod session;
 pub mod switch;
 // 登录态切换器（Trae 系 icube 布局 / 豆包 chromium 布局）

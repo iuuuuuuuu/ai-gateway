@@ -283,6 +283,11 @@ pub fn run() {
             commands_apps::doubao_export_chats,
             commands_apps::get_app_settings,
             commands_apps::save_app_settings,
+            // ---- 计划任务（schtasks 双轨：应用内调度 + 系统计划任务） ----
+            commands_apps::task_status,
+            commands_apps::task_register,
+            commands_apps::task_unregister,
+            commands_apps::task_run_now,
             // ---- 本地 MITM 代理（设备身份隔离 + 凭证抓取） ----
             commands_proxy::proxy_config,
             commands_proxy::proxy_status,

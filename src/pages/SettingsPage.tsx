@@ -1276,6 +1276,161 @@ function ProxyCard() {
   );
 }
 
+/**
+ * 计划任务：把签到 / 保活 / 额度巡检注册为 Windows 计划任务。
+ *
+ * 为什么需要系统级计划任务而不只靠应用内调度：应用内调度只在应用运行时有效。
+ * 用户不会 24 小时开着这个工具，而「每天签到」必须每天都发生。
+ */
+function ScheduledTaskCard() {
+  const [tasks, setTasks] = useState<api.TaskStatusItem[]>([]);
+  const [times, setTimes] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await api.taskStatus();
+      setTasks(res.tasks);
+      setTimes((prev) => {
+        const next = { ...prev };
+        for (const task of res.tasks) {
+          if (next[task.kind] === undefined) {
+            // 已注册的沿用系统里的时间；未注册的给个合理默认
+            next[task.kind] = task.registered && task.time ? task.time : defaultTimeFor(task.kind);
+          }
+        }
+        return next;
+      });
+    } catch (e) {
+      toast.error(api.asError(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const register = async (kind: string) => {
+    setBusy(true);
+    try {
+      const res = await api.taskRegister(kind, times[kind] ?? "09:00");
+      toast.success(res.message);
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const unregister = async (kind: string) => {
+    setBusy(true);
+    try {
+      await api.taskUnregister(kind);
+      toast.success("已删除计划任务");
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runNow = async (kind: string) => {
+    setBusy(true);
+    try {
+      const res = await api.taskRunNow(kind);
+      if (res.ok) toast.success("任务执行完成");
+      else toast.warning(`任务执行结束但返回非零（退出码 ${res.exitCode}），请查看日志`);
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <SettingsGroup id="settings-tasks" title="计划任务">
+      <CardContent className="space-y-0 p-0">
+        <p className="px-4 pt-4 text-xs text-muted-foreground sm:px-5">
+          注册为 Windows 计划任务后，即使应用没在运行也会按时执行。
+          应用内调度仍然生效，两者互补。
+        </p>
+        {tasks.map((task, index) => (
+          <div
+            key={task.kind}
+            className={cn(
+              "space-y-2 px-4 py-4 sm:px-5",
+              index < tasks.length - 1 && "border-b border-border/60",
+            )}
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm font-medium">{task.label}</span>
+              <Badge variant={task.registered ? "secondary" : "outline"}>
+                {task.registered ? `已注册 ${task.time || ""}`.trim() : "未注册"}
+              </Badge>
+            </div>
+            {task.error && (
+              <p className="text-xs text-destructive">{task.error}</p>
+            )}
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                value={times[task.kind] ?? ""}
+                onChange={(e) =>
+                  setTimes((prev) => ({ ...prev, [task.kind]: e.target.value }))
+                }
+                placeholder="09:00"
+                className="w-24"
+                aria-label={`${task.label} 执行时间`}
+              />
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={busy}
+                onClick={() => void register(task.kind)}
+              >
+                {task.registered ? "更新时间" : "注册"}
+              </Button>
+              {task.registered && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={busy}
+                  onClick={() => void unregister(task.kind)}
+                >
+                  删除
+                </Button>
+              )}
+              <Button size="sm" variant="ghost" disabled={busy} onClick={() => void runNow(task.kind)}>
+                立即执行
+              </Button>
+            </div>
+          </div>
+        ))}
+        {tasks.length === 0 && (
+          <p className="px-4 py-4 text-xs text-muted-foreground sm:px-5">
+            正在读取计划任务状态…
+          </p>
+        )}
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/** 各任务的默认执行时间。 */
+function defaultTimeFor(kind: string): string {
+  switch (kind) {
+    case "trae_checkin":
+      return "09:00";
+    case "doubao_renew":
+      return "09:00";
+    case "doubao_quota":
+      return "09:30";
+    default:
+      return "09:00";
+  }
+}
+
 /** 设置页：自动签到配置 / 权限检测 / 更新配置。 */
 export default function SettingsPage() {
   return (
@@ -1289,6 +1444,7 @@ export default function SettingsPage() {
         <AppearanceCard />
         <AppEnvCard />
         <ProxyCard />
+        <ScheduledTaskCard />
         <PermissionCheckCard />
         <AutoCheckinCard />
         <AutoRotateCard />

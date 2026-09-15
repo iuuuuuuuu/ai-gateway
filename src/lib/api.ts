@@ -203,6 +203,10 @@ const ROUTES: Record<string, Route> = {
   proxy_capture_local: { method: "POST", path: "/api/proxy/capture-local" },
   proxy_cleanup_stale: { method: "POST", path: "/api/proxy/cleanup" },
   proxy_parse_upstream: { method: "POST", path: "/api/proxy/parse-upstream" },
+  task_status: { method: "GET", path: "/api/tasks/status" },
+  task_register: { method: "POST", path: "/api/tasks/register" },
+  task_unregister: { method: "POST", path: "/api/tasks/unregister" },
+  task_run_now: { method: "POST", path: "/api/tasks/run" },
   save_app_settings: { method: "POST", path: "/api/apps/settings" },
 };
 
@@ -1392,4 +1396,42 @@ export function proxyParseUpstream(
   spec: string,
 ): Promise<{ ok: boolean; addr?: string; error?: string }> {
   return call<{ ok: boolean; addr?: string; error?: string }>("proxy_parse_upstream", { spec });
+}
+
+// ---------------------------------------------------------------------------
+// 计划任务（Windows schtasks）
+// ---------------------------------------------------------------------------
+
+/** 计划任务状态。 */
+export interface TaskStatusItem {
+  kind: string;
+  name: string;
+  label: string;
+  cliKey: string;
+  registered: boolean;
+  time: string;
+  error: string | null;
+}
+
+/** 查询全部计划任务的注册状态。 */
+export function taskStatus(): Promise<{ tasks: TaskStatusItem[] }> {
+  return call<{ tasks: TaskStatusItem[] }>("task_status");
+}
+
+/** 注册（或覆盖）一个每日计划任务。时间格式 HH:MM。 */
+export function taskRegister(
+  kind: string,
+  time: string,
+): Promise<{ ok: boolean; message: string }> {
+  return call<{ ok: boolean; message: string }>("task_register", { kind, time });
+}
+
+/** 删除计划任务（不存在也算成功）。 */
+export function taskUnregister(kind: string): Promise<{ ok: boolean }> {
+  return call<{ ok: boolean }>("task_unregister", { kind });
+}
+
+/** 立即执行一次任务（不依赖计划任务，用于验证配置）。 */
+export function taskRunNow(kind: string): Promise<{ ok: boolean; exitCode: number }> {
+  return call<{ ok: boolean; exitCode: number }>("task_run_now", { kind });
 }
