@@ -34,6 +34,14 @@ type Config struct {
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
 	// Usage Token 用量统计器（可选；nil = 不统计，/usage 返回 enabled=false）。
 	Usage *usage.Stats
+	// AllowedModel 「单一模型」锁定：非空时**只放行这一个模型**，其余一律拒绝。
+	//
+	// 用于「单一模型 + 积分轮转」模式：轮转的语义是「把这个账号的某个模型额度
+	// 烧干净再换下一个账号」，因此必须锁定模型 —— 否则客户端换个模型就能绕过
+	// 轮转策略，账号选择与额度消耗都会变得不可预期。
+	//
+	// 空串 = 不限制（默认，向后兼容）。大小写不敏感比较。
+	AllowedModel string
 }
 
 // ServiceName 网关身份标识。经 /healthz 响应体 service 字段与 X-Service 头同时透出：
@@ -357,7 +365,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if ferr != nil {
 		st.status = status
 		st.uid = result.UID
-		writeOpenAIError(w, status, "no_healthy_account", errText(ferr))
+		writeOpenAIError(w, status, errorCodeFor(ferr), errText(ferr))
 		return
 	}
 	st.uid = result.UID
@@ -541,3 +549,16 @@ var anthropicBodyCodes = bodyErrorCodes{tooLarge: "request_too_large", badReques
 
 // responsesBodyCodes OpenAI Responses 的错误码。
 var responsesBodyCodes = bodyErrorCodes{tooLarge: "payload_too_large", badRequest: "invalid_request"}
+
+// errorCodeFor 把 forwardChat 的错误映射成面向客户端的错误码。
+//
+// 区分「模型被单一模型模式拒绝」与「账号都不可用」很重要：前者是**调用方
+// 需要改的东西**（换模型或换模式），后者是**服务端状态**。都报
+// no_healthy_account 会把用户引向排查账号，而真正的原因在请求里。
+func errorCodeFor(err error) string {
+	var locked *modelLockedError
+	if errors.As(err, &locked) {
+		return "model_not_allowed"
+	}
+	return "no_healthy_account"
+}

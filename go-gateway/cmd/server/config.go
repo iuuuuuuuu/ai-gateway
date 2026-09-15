@@ -82,6 +82,20 @@ type Config struct {
 		CreditRefreshInterval string `json:"credit_refresh_interval"`
 		// CreditRefreshEnabled 积分到期巡检开关（缺省 true）。
 		CreditRefreshEnabled bool `json:"credit_refresh_enabled"`
+		// Rotation 是否启用「单一模型 + 积分轮转」模式（缺省 false = 负载均衡）。
+		//
+		// 语义差异：负载均衡在最早到期的那一档**内部分摊**（多号并行承接流量）；
+		// 轮转则**串行烧号** —— 始终只用一个账号，把它烧到不可用才换下一个，
+		// 换的仍是按到期日排序的下一个。见 pool.PickForModel / SetRotation。
+		//
+		// 缺省 false 保证老配置行为不变；该字段由宿主写入网关配置。
+		Rotation bool `json:"rotation"`
+		// AllowedModel 「单一模型」锁定（配合 rotation）：非空时只放行该模型。
+		//
+		// 轮转的语义是「把这个账号的指定模型额度烧干净再换号」，模型是策略的
+		// 一部分，因此必须锁定 —— 否则客户端换个模型就绕过了轮转与额度控制，
+		// 也让「当前烧的是哪个模型」变得不可预期。空串 = 不限制（默认）。
+		AllowedModel string `json:"allowed_model"`
 	} `json:"pool"`
 
 	// Proxy 出站 HTTP 代理，形如 "http://127.0.0.1:7890"（缺省空 = 不用显式代理）。

@@ -708,7 +708,12 @@ function UpdateCard() {
       const saved = await api.saveGithubConfig({ ...githubConfig, proxy: value });
       setGithubConfig(saved);
       setProxyUrl(saved.proxy ?? "");
-      setMsg({ type: "ok", text: value ? "更新代理已保存" : "已关闭更新代理" });
+      setMsg({
+        type: "ok",
+        text: value
+          ? "代理已保存（更新检查、网关与账号请求均会使用）"
+          : "已关闭代理（更新检查与网关请求将直连）",
+      });
     } catch (e) {
       setMsg({ type: "err", text: api.asError(e) });
     } finally {
@@ -742,8 +747,12 @@ function UpdateCard() {
         </div>
 
         <SettingsFieldRow
-          label="更新代理地址"
-          description="仅用于 GitHub 更新检查和安装包下载；留空表示关闭显式代理。"
+          label="网络代理地址"
+          // 该代理的适用范围在「网关支持出站代理」之后扩大了：
+          // 以前只服务 GitHub 更新，现在网关与账号相关的上游请求也复用它
+          // （国际版 workbuddy.ai 在国内直连不通，必须走代理）。
+          // 文案必须说实话，否则用户不会想到「国际版账号报错要来这里配」。
+          description="GitHub 更新检查、安装包下载，以及网关与账号的上游请求（国际版账号在国内直连不通时尤其需要）。留空表示直连。"
           htmlFor="update-proxy"
           className="bg-muted/25"
           operational

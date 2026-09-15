@@ -279,6 +279,18 @@ type Pool struct {
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 
+	// rotationOn 是否启用「单一模型 + 积分轮转」模式（见 SetRotation）。
+	//
+	// 不持久化：它由网关启动时从配置读取，属于部署配置而非运行态；
+	// 落盘反而会让「配置改成负载均衡后重启」被旧状态覆盖。
+	rotationOn bool
+
+	// rotationUID 轮转模式下当前正在烧的那个账号（空串 = 尚未选定）。
+	//
+	// 这是轮转模式的全部状态：只要它仍可用就继续用，不可用才换下一个。
+	// 不持久化：重启后重新按到期日挑一个即可，语义上无损失（都是"挑最早的"）。
+	rotationUID string
+
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -579,7 +591,117 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 // model 为空时等价于 PickExcluding（不做模型过滤）——调用方拿不到模型名时
 // 退化为原有行为，不会因为新特性而选不出账号。
 func (p *Pool) PickForModel(model string, tried map[string]bool) *auth.Auth {
+	p.mu.RLock()
+	rot := p.rotationOn
+	p.mu.RUnlock()
+	if rot {
+		return p.pickRotation(tried, model)
+	}
 	return p.pick(tried, model)
+}
+
+// SetRotation 开关「单一模型 + 积分轮转」模式。
+//
+// 该模式与「负载均衡」的差别：负载均衡在最早到期的那一档**内部分摊**，
+// 同一时刻多个账号并行承接流量；轮转模式则是**串行烧号** —— 始终只用**一个**
+// 账号，把它烧到不可用（余额耗尽 / 被限流 / 熔断）才换下一个，且换的仍是
+// 按到期紧迫度排序的下一个。适合「把某个账号的额度用干净再走」的用法。
+func (p *Pool) SetRotation(on bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.rotationOn = on
+}
+
+// RotationOn 报告当前是否处于轮转模式。
+func (p *Pool) RotationOn() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.rotationOn
+}
+
+// pickRotation 轮转选号：锁定一个账号，直到它不可用才换下一个。
+//
+// 与 pick 的关键差异：
+//   - **不做档位内分摊**，而是确定性取「按到期日升序的第一个可用账号」；
+//   - 已有在用的账号（rotationUID）只要仍然可用就继续用它，不随机、不轮换；
+//   - 只有当它变成不可用（冷却/熔断/余额耗尽/该模型被限流/在途占满）时，
+//     才按同样的顺序挑下一个。
+//
+// tried 仍被尊重（请求级轮换：同一请求内换过号就不再回头），
+// 这样上层 forward 的重试逻辑无需改动。
+func (p *Pool) pickRotation(tried map[string]bool, model string) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+
+	// 1) 仍在用的账号若还可用，直接续用 —— 这是「串行烧号」的核心。
+	if p.rotationUID != "" {
+		if e, ok := p.byUID[p.rotationUID]; ok && p.rotationUsableLocked(e, now, model, tried) {
+			p.markUsed(e)
+			return e.a
+		}
+	}
+
+	// 2) 需要换号：按「到期日升序 + 同级按 uid」确定性排序，取第一个可用者。
+	//    确定性排序（而非随机）是刻意的：轮转模式的语义就是「有明确的下一个」，
+	//    随机会让「烧完 A 该轮到谁」变得不可预期。
+	cands := make([]*entry, 0, len(p.byUID))
+	for uid, e := range p.byUID {
+		if tried != nil && tried[uid] {
+			continue
+		}
+		if !p.rotationUsableLocked(e, now, model, nil) {
+			continue
+		}
+		cands = append(cands, e)
+	}
+	if len(cands) == 0 {
+		// 无可用账号：沿用既有兜底（取最早截止的冷却账号试一次）。
+		p.rotationUID = ""
+		return p.pickEarliestExpiryLocked(tried, now, model)
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		ki, kj := cands[i].expiryDayKey(), cands[j].expiryDayKey()
+		if ki != kj {
+			// 到期日未知（空串）排最后：与分层选号的口径一致。
+			if ki == "" {
+				return false
+			}
+			if kj == "" {
+				return true
+			}
+			return ki < kj
+		}
+		return cands[i].a.UID < cands[j].a.UID
+	})
+	chosen := cands[0]
+	prev := p.rotationUID
+	p.rotationUID = chosen.a.UID
+	if prev != chosen.a.UID {
+		log.Printf("pool: rotation_switch %s -> %s (expire=%s)", prev, chosen.a.UID, chosen.expiryDayKey())
+	}
+	p.markUsed(chosen)
+	return chosen.a
+}
+
+// rotationUsableLocked 报告账号在轮转模式下是否可用。调用方必须已持锁。
+//
+// 判定与普通 pick 的候选过滤保持一致（健康 / 该模型未被限流 / 未占满在途），
+// 额外尊重 tried：轮转模式在一个请求内换号时也不该回头。
+func (p *Pool) rotationUsableLocked(e *entry, now time.Time, model string, tried map[string]bool) bool {
+	if tried != nil && tried[e.a.UID] {
+		return false
+	}
+	if !e.healthy(now) {
+		return false
+	}
+	if e.modelCooled(model, now) {
+		return false
+	}
+	if p.inFlightFull(e) {
+		return false
+	}
+	return true
 }
 
 // pick 选出本次请求使用的账号，并记录 lastUsed（防并发撞号）。

@@ -103,6 +103,7 @@ const ROUTES: Record<string, Route> = {
   switch_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/switch" },
   detect_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/detect" },
   delete_account: { method: "POST", path: "/api/delete" },
+  set_account_note: { method: "POST", path: "/api/accounts/note" },
   oauth_start: { method: "POST", path: "/api/oauth/start" },
   oauth_status: { method: "POST", path: "/api/oauth/status" },
   import_local: { method: "POST", path: "/api/import-local" },
@@ -144,6 +145,7 @@ const ROUTES: Record<string, Route> = {
   get_gateway_config: { method: "GET", path: "/api/gateway/config" },
   save_gateway_config: { method: "POST", path: "/api/gateway/config" },
   switch_gateway_mode: { method: "POST", path: "/api/gateway/mode" },
+  set_allowed_model: { method: "POST", path: "/api/gateway/allowed-model" },
   start_gateway: { method: "POST", path: "/api/gateway/start" },
   check_gateway_port: { method: "POST", path: "/api/gateway/port-check" },
   stop_gateway: { method: "POST", path: "/api/gateway/stop" },
@@ -265,6 +267,19 @@ export function detectCodebuddyCnIdeAccount(): Promise<{
 
 export function deleteAccount(accountId: string): Promise<{ ok: boolean }> {
   return call("delete_account", { accountId });
+}
+
+/**
+ * 设置账号备注（空串 = 清除）。
+ *
+ * 备注只存本地账号库，不参与登录；用于认出「这是谁的号、干什么用的」。
+ * 返回更新后的 AccountMeta，调用方可直接用它刷新界面。
+ */
+export function setAccountNote(
+  accountId: string,
+  note: string,
+): Promise<{ ok: boolean; account: AccountMeta }> {
+  return call("set_account_note", { accountId, note });
 }
 
 /**
@@ -659,6 +674,15 @@ export function switchGatewayMode(
     mode,
     pinnedUid: pinnedUid ?? null,
   });
+}
+
+/**
+ * 设置「单一模型 + 积分轮转」的目标模型；传空串清除锁定。
+ *
+ * 网关运行时后端会自动重启它以生效（模型锁定由网关启动时读取）。
+ */
+export function setAllowedModel(model: string): Promise<GatewayModeSwitchResult> {
+  return call<GatewayModeSwitchResult>("set_allowed_model", { model });
 }
 
 // ---------------------------------------------------------------------------

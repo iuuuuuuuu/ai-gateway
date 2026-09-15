@@ -494,7 +494,13 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
 	if ferr != nil {
 		stat.status = status
 		stat.uid = result.UID
-		writeJSON(w, status, anthropicError(status, "api_error", errText(ferr)))
+		// 单一模型模式拒绝时用 invalid_request_error（400，属调用方需修正的请求问题）；
+		// 其余（账号都不可用等）保持 api_error。
+		code := "api_error"
+		if errorCodeFor(ferr) != "no_healthy_account" {
+			code = "invalid_request_error"
+		}
+		writeJSON(w, status, anthropicError(status, code, errText(ferr)))
 		return
 	}
 	stat.uid = result.UID

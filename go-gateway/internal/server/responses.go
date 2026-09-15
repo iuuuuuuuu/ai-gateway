@@ -497,7 +497,12 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	if ferr != nil {
 		stat.status = status
 		stat.uid = result.UID
-		writeJSON(w, status, responsesError(status, "upstream_error", errText(ferr)))
+		// 同 messages：模型被单一模型模式拒绝属请求侧问题，用 invalid_request_error。
+		code := "upstream_error"
+		if errorCodeFor(ferr) != "no_healthy_account" {
+			code = "invalid_request_error"
+		}
+		writeJSON(w, status, responsesError(status, code, errText(ferr)))
 		return
 	}
 	stat.uid = result.UID

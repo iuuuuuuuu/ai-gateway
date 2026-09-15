@@ -18,11 +18,30 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
+
+// modelLockedError 「单一模型」模式拒绝了非目标模型的请求。
+//
+// 单独成型（而不是拼一个字符串）是为了让调用方能识别它并回以 400 +
+// 明确的错误码，而不是当成「账号不可用」的 503 —— 后者会误导用户去查账号。
+type modelLockedError struct {
+	requested string // 客户端请求的模型（可能为空，表示请求体未带 model）
+	allowed   string // 当前锁定的模型
+}
+
+func (e *modelLockedError) Error() string {
+	got := e.requested
+	if got == "" {
+		got = "(未指定)"
+	}
+	return "当前为「单一模型」模式，只允许调用 " + e.allowed + "；收到的是 " + got +
+		"。请在客户端把模型改为 " + e.allowed + "，或切换网关的工作模式。"
+}
 
 // chatResult 一次成功的上游调用结果。
 //
@@ -95,6 +114,20 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 	// 请求的目标模型：用于「模型级限流」的选号过滤与冷却记账。
 	// 取不到时为空串，各环节自动退化为原有行为（不做模型过滤）。
 	model := modelOf(body)
+
+	// 「单一模型」锁定：非空时只放行该模型。
+	//
+	// 为什么在选号之前就拒绝（而不是换个模型重试）：轮转模式的语义是
+	// 「把这个账号的指定模型额度烧干净再换号」，模型是策略的一部分。
+	// 若允许其他模型通过，客户端换个模型就能绕过轮转与额度控制，
+	// 也让「当前烧的是哪个模型」变得不可预期 —— 因此明确拒绝并说明原因，
+	// 比静默改写模型（用户以为在用 A、实际用了 B）更安全。
+	if allowed := h.cfg.AllowedModel; allowed != "" && !strings.EqualFold(model, allowed) {
+		// 返回非 nil 的 result：调用方会在错误分支里读 result.UID 记日志，
+		// 返回 nil 会 panic。UID 留空即可（本次没有选中任何账号）。
+		return &chatResult{Model: model}, http.StatusBadRequest,
+			&modelLockedError{requested: model, allowed: allowed}
+	}
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		var acct *auth.Auth

@@ -19,6 +19,19 @@ export interface AccountMeta {
   createdAt: number | null;
   needsRelogin: boolean;
   needsReloginReason: string | null;
+  /**
+   * 用户自定义备注（如「公司号」「备用」）。
+   *
+   * 为什么需要：授权进来的账号往往只带邮箱/手机号/随机 uid，光看这些认不出
+   * 「这是谁的号、干什么用的」。备注只存本地，不参与登录。
+   */
+  note?: string | null;
+  /** 原始域名（如 www.workbuddy.ai / copilot.tencent.com）—— 排查时比区域标签更具体。 */
+  domain?: string | null;
+  /** 手机号（国服账号的真实身份线索；其 email 常为空）。 */
+  phoneNumber?: string | null;
+  /** 账号类型（personal / enterprise）—— 影响可用模型与额度口径。 */
+  accountType?: string | null;
 }
 
 export interface AppStatus {
@@ -513,8 +526,10 @@ export interface CodeBuddyCnIdeSwitchResult {
 /** 网关配置（持久化在 ~/.wb-switch/gateway/gateway_config.json）。 */
 /* 网关工作模式：
  * balance —— 负载均衡（默认）：账号池加权随机选号，自动避开冷却/熔断账号
- * pinned  —— 指定账号：只使用 pinned_uid 对应的那一个账号            */
-export type GatewayMode = "balance" | "pinned";
+ * pinned  —— 指定账号：只使用 pinned_uid 对应的那一个账号
+ * rotation —— 单一模型 + 积分轮转：只用一个账号烧到不可用，再换按到期日
+ *             排序的下一个（仍优先烧最快过期的额度）                      */
+export type GatewayMode = "balance" | "pinned" | "rotation";
 
 export interface GatewayConfig {
   /** 是否已启用（启动过即为 true）。 */
@@ -523,6 +538,13 @@ export interface GatewayConfig {
   mode?: GatewayMode;
   /** 指定账号模式下锁定的账号 uid。 */
   pinned_uid?: string | null;
+  /**
+   * 「单一模型 + 积分轮转」锁定的模型名（仅 rotation 模式生效）。
+   *
+   * 非空时网关**只放行该模型**，其余模型返回 400 model_not_allowed ——
+   * 轮转的语义是「把这个账号的指定模型额度烧干净再换号」，模型是策略的一部分。
+   */
+  allowed_model?: string | null;
   /** 服务端口（权威字段，前端口选择器直接编辑它）。 */
   port: number;
   /** 监听地址，由 port 派生，如 ":7863"。 */
