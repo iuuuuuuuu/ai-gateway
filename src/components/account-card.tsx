@@ -1,5 +1,6 @@
-import { ArrowRight, Cat, Check, CircleCheck, Clock3, Coins, Ellipsis, Globe, Loader2, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2 } from "lucide-react";
+import { ArrowRight, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Globe, Info, Loader2, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2 } from "lucide-react";
 import { useState } from "react";
+import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -8,12 +9,15 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
+import * as api from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { demoModeEnabled } from "@/lib/demo-mode";
 import type { AccountMeta, CreditExpiry, CreditResource, TravelStatus } from "@/lib/types";
@@ -84,6 +88,41 @@ function accountIdentity(account: AccountMeta): string {
     return `${local.slice(0, 1)}${"*".repeat(Math.max(3, local.length - 1))}@${domain}`;
   }
   return account.uid ? `UID · ${account.uid}` : `ID · ${account.id}`;
+}
+
+/**
+ * 账号详情弹窗的字段行：[标签, 值, 悬停说明]。
+ *
+ * 目的：回答「我授权进来的到底是哪个号」。此前卡片只显示昵称与 uid/邮箱，
+ * 而实际数据里还有手机号（国服账号的真实线索，其 email 常为空）、原始域名、
+ * 账号类型、创建时间等 —— 这些恰好是辨认账号的关键。
+ *
+ * 值缺失时返回空串，由调用方渲染成「—」，保证行高与字段顺序稳定
+ * （不因某个字段缺失而跳行）。
+ */
+function accountDetailRows(account: AccountMeta): [string, string, string?][] {
+  const fmt = (ts: number | null | undefined) =>
+    typeof ts === "number" && ts > 0 ? new Date(ts).toLocaleString("zh-CN") : "";
+  return [
+    ["备注", account.note ?? "", "你自己填的标签，用于区分这是谁的号"],
+    ["昵称", account.nickname ?? ""],
+    ["邮箱", account.email ?? "", "国际版账号通常靠它辨认"],
+    ["手机号", account.phoneNumber ?? "", "国服账号的邮箱常为空，手机号是主要线索"],
+    ["UID", account.uid ?? ""],
+    ["账号 ID", account.id, "本地账号库的主键（与上游 UID 不同）"],
+    ["所属区域", account.region ?? "", "由登录域名推导：国服 / 国际版"],
+    ["登录域名", account.domain ?? "", "排查问题时的确切域名，比区域标签更具体"],
+    ["账号类型", account.accountType === "personal" ? "个人版" : account.accountType === "enterprise" ? "企业版" : (account.accountType ?? "")],
+    ["企业 / 组织", account.enterpriseName ?? ""],
+    ["Token 到期", fmt(account.expiresAt)],
+    ["Refresh 到期", fmt(account.refreshExpiresAt), "超过此时间需重新登录"],
+    ["上次刷新", fmt(account.refreshedAt)],
+    ["加入时间", fmt(account.createdAt)],
+    // 仅在异常时出现，避免平时多一行无意义的「正常」。
+    ...(account.needsRelogin
+      ? ([["状态", `需重新登录${account.needsReloginReason ? `（${account.needsReloginReason}）` : ""}`]] as [string, string, string?][])
+      : []),
+  ];
 }
 
 const chipClass = "rounded-md px-1.5 py-0 text-[11px] font-medium";
@@ -231,6 +270,8 @@ function regionChip(account: AccountMeta) {
 interface Props {
   account: AccountMeta;
   onDelete: (a: AccountMeta) => void;
+  /** 备注保存成功后触发，供父级重新拉取账号列表（卡片自身不持有列表状态）。 */
+  onNoteSaved?: () => void;
   onCheckin?: (a: AccountMeta) => void;
   onRefresh?: (a: AccountMeta) => void;
   /** 领养 Buddy（仅领养，不派猫；与「一键旅行」的重叠部分单独暴露出来） */
@@ -292,8 +333,14 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
   );
 }
 
-export function AccountCard({ account, onDelete, onCheckin, onRefresh, onAdopt, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefresh, onAdopt, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
+  /** 备注编辑弹窗；`noteDraft` 是受控输入（打开时用当前备注初始化）。 */
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [noteSaving, setNoteSaving] = useState(false);
+  /** 账号详情弹窗：展示本地记录里能看出「这是谁的号」的全部字段。 */
+  const [detailOpen, setDetailOpen] = useState(false);
   const name = account.nickname || account.uid || "未命名账号";
   const expired = typeof account.expiresAt === "number" && account.expiresAt < Date.now();
   const avatarClass = avatarTone(name);
@@ -313,8 +360,31 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onAdopt, 
 
   const activeProductCount = [workbuddyActive, codebuddyCliActive, codebuddyCnIdeActive].filter(Boolean).length;
 
+  /** 保存备注（空串 = 清除），成功后关闭弹窗并让父级刷新列表。 */
+  async function submitNote() {
+    setNoteSaving(true);
+    try {
+      await api.setAccountNote(account.id, noteDraft.trim());
+      toast.success(noteDraft.trim() ? "备注已保存" : "备注已清除");
+      setNoteOpen(false);
+      onNoteSaved?.();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setNoteSaving(false);
+    }
+  }
+
   const statusChips = (
     <>
+      {/* 备注放在最前面：它是用户自己起的标签，正是用来「一眼认出这是谁的号」的，
+          排在区域/签到等自动状态之前才符合使用意图。 */}
+      {account.note ? (
+        <Badge variant="outline" className={cn(chipClass, "max-w-[12rem] gap-1")} title={`备注：${account.note}`}>
+          <PencilLine className="size-3 shrink-0" />
+          <span className="truncate">{account.note}</span>
+        </Badge>
+      ) : null}
       {regionChip(account)}
       {todayCheckedIn !== undefined && (
         <Badge variant={todayCheckedIn ? "success" : "secondary"} className={cn(chipClass, !todayCheckedIn && "text-muted-foreground")}><CircleCheck /> {todayCheckedIn ? "已签到" : "未签到"}</Badge>
@@ -397,6 +467,17 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onAdopt, 
                     : travelStatus?.label === "adopt-threshold"
                       ? "领养 Buddy（需先攒对话）"
                       : "领养 Buddy"}
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                {/* 备注：授权进来的账号常只带邮箱/手机号/随机 uid，看不出「这是谁的号」，
+                    因此给一个自定义标签。文案随是否已有备注变化，避免用户以为要重填。 */}
+                <DropdownMenuItem onSelect={() => setNoteOpen(true)}>
+                  <PencilLine />
+                  {account.note ? "修改备注" : "添加备注"}
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => setDetailOpen(true)}>
+                  <Info />
+                  查看账号详情
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>
@@ -628,6 +709,90 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onAdopt, 
               })}
             </div>
           )}
+        </DialogContent>
+      </Dialog>
+
+      {/* 备注编辑：让用户给账号起个自己认得出的名字。
+          空串 = 清除（后端会删掉该字段，而不是留一个空值）。 */}
+      <Dialog
+        open={noteOpen}
+        onOpenChange={(open) => {
+          if (open) setNoteDraft(account.note ?? "");
+          setNoteOpen(open);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>账号备注</DialogTitle>
+            <DialogDescription>
+              {name} · 备注只存在本机，用于区分「这是谁的号」；留空即清除。
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            value={noteDraft}
+            onChange={(event) => setNoteDraft(event.target.value)}
+            placeholder="例如：公司号 / 备用 / 张三"
+            maxLength={40}
+            spellCheck={false}
+            autoComplete="off"
+            onKeyDown={(event) => {
+              // 回车即保存：备注是短文本，多一步点按钮没有意义。
+              if (event.key === "Enter" && !noteSaving) {
+                event.preventDefault();
+                void submitNote();
+              }
+            }}
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setNoteOpen(false)} disabled={noteSaving}>
+              取消
+            </Button>
+            <Button onClick={() => void submitNote()} disabled={noteSaving || noteDraft.trim() === (account.note ?? "")}>
+              {noteSaving ? <Loader2 className="animate-spin" /> : <Save />}
+              保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 账号详情：把本地记录里能回答「这是谁的号」的字段集中展示。
+          此前卡片只显示昵称 + uid/邮箱，用户看不出授权的是哪个账号。 */}
+      <Dialog open={detailOpen} onOpenChange={setDetailOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>账号详情</DialogTitle>
+            <DialogDescription>{name}</DialogDescription>
+          </DialogHeader>
+          <div className="min-w-0 divide-y divide-border/60">
+            {accountDetailRows(account).map(([label, value, hint]) => (
+              <div key={label} className="flex min-w-0 items-start justify-between gap-4 py-2.5 first:pt-0 last:pb-0">
+                <div className="shrink-0 text-xs text-muted-foreground" title={hint}>
+                  {label}
+                </div>
+                <div className="min-w-0 flex-1 text-right">
+                  {value ? (
+                    <span className="break-all font-mono text-xs">{value}</span>
+                  ) : (
+                    <span className="text-xs text-muted-foreground/60">—</span>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+          <DialogFooter>
+            {/* 复制 UID：排查问题时常要把它贴给别人，比手抄可靠。 */}
+            <Button
+              variant="outline"
+              onClick={() => {
+                void navigator.clipboard.writeText(account.uid || account.id);
+                toast.success("已复制账号标识");
+              }}
+            >
+              <Copy />
+              复制 UID
+            </Button>
+            <Button onClick={() => setDetailOpen(false)}>关闭</Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </TooltipProvider>

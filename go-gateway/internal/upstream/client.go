@@ -385,7 +385,7 @@ func New() *Client {
 // 关键：显式设置 Proxy 而不是依赖 http.ProxyFromEnvironment 的默认行为 ——
 // 后者只读 HTTPS_PROXY 等**环境变量**，而用户在软件「设置 → 更新代理」里填的
 // 代理是写在配置文件里的，环境变量通常是空的。于是国内直连
-// workbuddy.ai 会失败（实测 12 次全部 ECONNRESET），而浏览器因为读系统代理却正常。
+// workbuddy.ai 会超时（实测 wsarecv timeout），而浏览器因为读系统代理却正常。
 //
 // proxyURL 为 nil 时退回 ProxyFromEnvironment（仍尊重环境变量，行为与之前一致）。
 func newTransport(proxyURL *url.URL) *http.Transport {

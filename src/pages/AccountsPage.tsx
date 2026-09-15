@@ -1005,6 +1005,9 @@ export default function AccountsPage() {
                 account={a}
                 compact={compact}
                 onDelete={onDelete}
+                // 备注改完后重新拉列表：备注存在账号库里，卡片本身不持有列表状态，
+                // 不刷新的话关闭弹窗后卡片上仍是旧备注。
+                onNoteSaved={() => void fetchAll()}
                 onSwitch={setSwitchAccount}
                 onCheckin={onCheckin}
                 onRefresh={onRefresh}

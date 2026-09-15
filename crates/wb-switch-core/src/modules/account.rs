@@ -70,6 +70,39 @@ pub fn account_display_name(acc: &Value) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// 账号备注：用户自己写的标签（如「公司号」「备用」「张三的号」）。
+///
+/// 为什么需要：授权进来的账号往往只带邮箱/手机号/随机 uid，光看这些认不出
+/// 「这是谁的号、干什么用的」。备注由用户定义、只存本地账号库，不参与登录。
+pub fn account_note(acc: &Value) -> String {
+    get_str(acc, "note").unwrap_or_default()
+}
+
+/// 设置账号备注并落盘；返回更新后的账号。
+///
+/// 传空串 = 清除备注。备注是纯展示信息，不触碰任何凭证字段。
+pub fn set_account_note(account_id: &str, note: &str) -> Result<Value, String> {
+    let mut accounts = load_accounts();
+    let trimmed = note.trim();
+    let acc = accounts
+        .iter_mut()
+        .find(|a| get_str(a, "id").as_deref() == Some(account_id))
+        .ok_or_else(|| "账号不存在".to_string())?;
+    if trimmed.is_empty() {
+        // 清除：删字段而不是写空串，保持账号库干净（也避免导出时残留）。
+        if let Some(obj) = acc.as_object_mut() {
+            obj.remove("note");
+        }
+    } else {
+        if let Some(obj) = acc.as_object_mut() {
+            obj.insert("note".to_string(), json!(trimmed));
+        }
+    }
+    let updated = acc.clone();
+    save_accounts(&accounts).map_err(|e| e.to_string())?;
+    Ok(updated)
+}
+
 /// 账号的展示元数据（不泄露 token）。对照 server.py `account_meta`。
 pub fn account_meta(acc: &Value) -> Value {
     // 区域由 domain 后缀推导（国服 .cn / 国际版 .ai），供界面区分展示。
@@ -91,6 +124,23 @@ pub fn account_meta(acc: &Value) -> Value {
         "createdAt": acc.get("createdAt"),
         "needsRelogin": acc.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true),
         "needsReloginReason": acc.get("needs_relogin_reason"),
+        // 备注：用户自定义标签，用于认出「这是谁的号」。
+        "note": acc.get("note"),
+        // 原始域名（如 www.workbuddy.ai / copilot.tencent.com）：
+        // 区域标签只给「国服/国际版」，排查问题时常需要看确切域名。
+        "domain": acc.get("domain"),
+        // 手机号（国服账号的真实身份线索，邮箱常为空）。
+        "phoneNumber": acc
+            .get("profile_raw")
+            .and_then(|p| p.get("phoneNumber"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        // 账号类型（personal / enterprise）：影响可用模型与额度口径。
+        "accountType": acc
+            .get("profile_raw")
+            .and_then(|p| p.get("type"))
+            .cloned()
+            .unwrap_or(Value::Null),
     })
 }
 
@@ -256,6 +306,50 @@ mod tests {
         assert_eq!(meta["needsReloginReason"], "刷新失败");
         assert!(meta.get("access_token").is_none(), "不得泄露 token");
         assert!(meta.get("refresh_token").is_none(), "不得泄露 token");
+    }
+
+    /// 账号详情所需字段必须透出（供「查看账号详情」弹窗回答「这是谁的号」）。
+    ///
+    /// 此前 account_meta 只有昵称/uid/邮箱，而实际能辨认账号的线索还包括
+    /// 手机号（国服账号邮箱常为空）、原始域名、账号类型 —— 都不在返回值里。
+    #[test]
+    fn account_meta_exposes_identity_fields() {
+        let acc = json!({
+            "id": "a1",
+            "uid": "u1",
+            "nickname": "小明",
+            "email": "",
+            "domain": "copilot.tencent.com",
+            "note": "公司号",
+            "profile_raw": {"phoneNumber": "13800138000", "type": "personal"},
+            "access_token": "SECRET",
+        });
+        let meta = account_meta(&acc);
+        assert_eq!(meta["note"], "公司号");
+        assert_eq!(meta["domain"], "copilot.tencent.com");
+        assert_eq!(meta["phoneNumber"], "13800138000", "手机号是国服账号的主要身份线索");
+        assert_eq!(meta["accountType"], "personal");
+        assert!(meta.get("access_token").is_none(), "新增字段不得带出 token");
+    }
+
+    /// 字段缺失时不应 panic，也不应伪造值（界面渲染成「—」）。
+    #[test]
+    fn account_meta_tolerates_missing_optional_fields() {
+        let meta = account_meta(&json!({"id": "a1", "uid": "u1"}));
+        assert!(meta["note"].is_null(), "无备注应为 null，而非空串");
+        assert!(meta["domain"].is_null());
+        assert!(meta["phoneNumber"].is_null(), "无 profile_raw 时不应 panic");
+        assert!(meta["accountType"].is_null());
+    }
+
+    /// 备注读取：有则取值，无则空串（区别于 account_meta 的 null 语义）。
+    #[test]
+    fn account_note_reads_and_defaults_empty() {
+        assert_eq!(account_note(&json!({"note": "备用"})), "备用");
+        assert_eq!(account_note(&json!({"note": "  备用  "})), "备用", "应去掉首尾空白");
+        assert_eq!(account_note(&json!({})), "");
+        assert_eq!(account_note(&json!({"note": ""})), "");
+        assert_eq!(account_note(&json!({"note": "   "})), "", "纯空白视为无备注");
     }
 
     #[test]

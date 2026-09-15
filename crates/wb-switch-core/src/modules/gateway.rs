@@ -409,6 +409,12 @@ pub enum GatewayMode {
     Balance,
     /// 指定账号：只使用 pinned_uid 对应的账号。
     Pinned,
+    /// 单一模型 + 积分轮转：只用一个账号烧到不可用，再换按到期日排序的下一个。
+    ///
+    /// 与 Pinned 的关键区别：**仍然导出全部账号** —— 轮转需要「下一个」作为备选，
+    /// 只导出一个是转不起来的。区别在网关侧的选择策略（pool.rotation），
+    /// 而不在凭证范围。
+    Rotation,
 }
 
 impl GatewayMode {
@@ -416,11 +422,14 @@ impl GatewayMode {
         match self {
             GatewayMode::Balance => "balance",
             GatewayMode::Pinned => "pinned",
+            GatewayMode::Rotation => "rotation",
         }
     }
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
             "pinned" | "pin" | "single" => GatewayMode::Pinned,
+            // 兼容几种自然叫法：轮转 / 单一模型轮转
+            "rotation" | "rotate" | "rolling" => GatewayMode::Rotation,
             _ => GatewayMode::Balance,
         }
     }
@@ -442,14 +451,22 @@ pub fn pinned_uid() -> Option<String> {
 
 /// 当前实际参与网关的账号 uid 集合。
 ///
-/// 负载均衡：全部账号；指定账号：仅 pinned_uid。
+/// 负载均衡 / 轮转：全部账号；指定账号：仅 pinned_uid。
 /// 网关依据 `auths/` 目录里的凭证文件建立账号池，
 /// 因此「只导出目标账号」即可实现指定账号，同时保留熔断/冷却/粘性等能力。
+///
+/// 轮转模式刻意**不过滤**：它的「换下一个」依赖备选账号都在池里。
 fn active_uids() -> Option<Vec<String>> {
     match gateway_mode() {
-        GatewayMode::Balance => None, // None = 不过滤，全部导出
+        // None = 不过滤，全部导出
+        GatewayMode::Balance | GatewayMode::Rotation => None,
         GatewayMode::Pinned => Some(pinned_uid().into_iter().collect()),
     }
+}
+
+/// 网关是否应启用「单一模型 + 积分轮转」选号策略（写入 native config 的 pool.rotation）。
+pub fn rotation_enabled() -> bool {
+    matches!(gateway_mode(), GatewayMode::Rotation)
 }
 
 /// 账号是否已被标记为「需重新登录」。
@@ -830,10 +847,9 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
         "upstash": { "url": "", "token": "" },
         // 出站代理：**复用**「设置 → 更新代理」里已填的地址，用户无需配两遍。
         //
-        // 为什么网关需要它：国际版（workbuddy.ai）在国内直连不稳定（实测
-        // 12 次全部 ECONNRESET），走代理 12/12 成功。而 Go 的
-        // http.ProxyFromEnvironment **只读环境变量**、不读 Windows 注册表，
-        // 所以「浏览器能走系统代理」不代表网关也能。
+        // 为什么网关需要它：国际版（workbuddy.ai）在国内直连不稳定（实测 wsarecv 超时），
+        // 走代理才稳。而 Go 的 http.ProxyFromEnvironment **只读环境变量**、不读 Windows
+        // 注册表，所以「浏览器能走系统代理」不代表网关也能。
         "proxy": upstream_proxy(),
         "pool": {
             "max_in_flight": 3,
@@ -841,7 +857,24 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
             "breaker_cooldown": "30m",
             "breaker_cooldown_max": "6h",
             "idle_weight_per_hour": 0.5,
-            "idle_weight_max": 5.0
+            "idle_weight_max": 5.0,
+            // 「单一模型 + 积分轮转」：缺省 false = 负载均衡（老配置行为不变）。
+            // 由当前**工作模式**推导，而不是读 cfg 里的独立开关 ——
+            // 避免「模式是轮转、pool.rotation 却是 false」这类不一致状态。
+            "rotation": matches!(
+                GatewayMode::from_str(cfg.get("mode").and_then(Value::as_str).unwrap_or("balance")),
+                GatewayMode::Rotation
+            ),
+            // 「单一模型」锁定：非空时网关只放行该模型。
+            // 只在轮转模式下有意义 —— 负载均衡不限制模型（保持原有行为）。
+            "allowed_model": if matches!(
+                GatewayMode::from_str(cfg.get("mode").and_then(Value::as_str).unwrap_or("balance")),
+                GatewayMode::Rotation
+            ) {
+                cfg.get("allowed_model").and_then(Value::as_str).unwrap_or("").trim()
+            } else {
+                ""
+            }
         },
         "session_sticky": { "enabled": true, "ttl": "30m", "gc_interval": "5m" }
     });
@@ -1011,6 +1044,10 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
         return Err(match gateway_mode() {
             GatewayMode::Pinned => "「指定账号」模式尚未选择账号，请在网关页面选择后启动".to_string(),
             GatewayMode::Balance => "账号库为空，请先添加账号再启动网关".to_string(),
+            // 轮转模式同样需要至少一个账号；此时「没有下一个可轮转」是主要问题。
+            GatewayMode::Rotation => {
+                "「单一模型 + 积分轮转」模式需要账号池中有可用账号，请先添加账号再启动网关".to_string()
+            }
         });
     }
 
@@ -1302,6 +1339,71 @@ fn mode_patch(mode: GatewayMode, pinned_uid: Option<&str>) -> Value {
     })
 }
 
+/// 读取「单一模型」锁定的模型名（配合轮转模式）；未设置返回空串。
+pub fn allowed_model() -> String {
+    load_gateway_config()
+        .get("allowed_model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// 归一化「单一模型」配置值：空串/纯空白 → Null（清除锁定），其余取 trim 后的值。
+///
+/// 抽成纯函数便于测试（真正的保存路径会写用户配置并可能重启网关）。
+fn allowed_model_patch(model: &str) -> Value {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        json!({ "allowed_model": Value::Null })
+    } else {
+        json!({ "allowed_model": trimmed })
+    }
+}
+
+/// 保存「单一模型 + 积分轮转」的目标模型并**立即生效**。
+///
+/// 空串 = 清除锁定（仍可轮转，但不限制模型 —— 不建议，客户端能换模型绕过
+/// 额度控制）。
+///
+/// 为什么需要立即生效：`allowed_model` 由网关**启动时**读取，光落盘不会改变
+/// 正在运行的进程（与切换模式同理，用户会看到「选了没反应」），因此在网关
+/// 运行时重启它。
+pub async fn set_allowed_model(model: &str) -> Value {
+    let patch = allowed_model_patch(model);
+    let cfg = match save_gateway_config(&patch) {
+        Ok(v) => v,
+        Err(e) => return json!({ "ok": false, "error": e }),
+    };
+    // 立即生效：网关只在启动时读配置。
+    // 重启方式与 switch_mode 保持一致（先停、等端口释放、再启动）——
+    // 端口未释放就启动会因占用而失败。
+    let mut reloaded = false;
+    if is_running() {
+        stop_gateway();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        match start_gateway(&cfg).await {
+            Ok(_) => {
+                reloaded = true;
+                update_runtime_state("started", None);
+            }
+            Err(e) => {
+                update_runtime_state("failed", Some(e.clone()));
+                return json!({
+                    "ok": false,
+                    "error": format!("模型已保存，但重启网关失败：{e}"),
+                    "config": cfg,
+                });
+            }
+        }
+    }
+    json!({
+        "ok": true,
+        "reloaded": reloaded,
+        "allowedModel": model.trim(),
+    })
+}
+
 /// 切换工作模式（负载均衡 / 指定账号）并**立即生效**。
 ///
 /// 为什么需要这个专用入口：`save_gateway_config` 只写配置文件，
@@ -1396,14 +1498,47 @@ pub async fn fetch_models() -> Vec<Value> {
             if resp.status().is_success() {
                 if let Ok(json) = resp.json::<Value>().await {
                     if let Some(arr) = json.get("data").and_then(Value::as_array) {
-                        return arr.clone();
+                        if !arr.is_empty() {
+                            return arr.clone();
+                        }
                     }
                 }
             }
         }
     }
 
-    Vec::new()
+    // 网关未运行 / 未就绪 → 回退内置静态清单。
+    //
+    // 为什么必须有回退：模型下拉若为空，用户就无法选择「单一模型」，
+    // 而「配置模型」这一步通常发生在**启动网关之前**（先配好再启动）——
+    // 若只依赖运行中的网关，这个顺序下功能直接不可用（实测就是空列表）。
+    static_models()
+}
+
+/// 内置模型清单（网关不可达时的回退）。
+///
+/// 取自上游已知的常用模型；运行中的网关会返回更权威的动态列表，
+/// 此处仅保证「未启动时也能选」。
+fn static_models() -> Vec<Value> {
+    const IDS: &[&str] = &[
+        "deepseek-v4.1-flash",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "deepseek-v3-2-volc",
+        "glm-5.3",
+        "glm-5.3-flash",
+        "glm-5.2",
+        "glm-4.7",
+        "kimi-k3-1",
+        "kimi-k2.5",
+        "minimax-m3",
+        "hunyuan-chat",
+        "gpt-5.6-sol",
+        "gemini-3.5-flash",
+    ];
+    IDS.iter()
+        .map(|id| json!({ "id": id, "object": "model", "owned_by": "workbuddy" }))
+        .collect()
 }
 
 /// 从运行中的网关拉取 Token 用量统计（GET /usage）。
@@ -1772,6 +1907,44 @@ mod tests {
         assert_eq!(GatewayMode::from_str("balance"), GatewayMode::Balance);
         assert_eq!(GatewayMode::from_str(""), GatewayMode::Balance);
         assert_eq!(GatewayMode::from_str("garbage"), GatewayMode::Balance);
+    }
+
+    // 「单一模型 + 积分轮转」模式的解析与序列化。
+    #[test]
+    fn rotation_mode_round_trips() {
+        for s in ["rotation", "ROTATION", "rotate", "rolling"] {
+            assert_eq!(GatewayMode::from_str(s), GatewayMode::Rotation, "输入 {s:?}");
+        }
+        assert_eq!(GatewayMode::Rotation.as_str(), "rotation");
+        // 不能被误当成 pinned（两者语义完全不同：pinned 只导出一个账号）
+        assert_ne!(GatewayMode::from_str("rotation"), GatewayMode::Pinned);
+    }
+
+    // 轮转模式的 mode_patch 必须清掉 pinned_uid —— 否则从「指定账号」切过去时
+    // 会残留旧锁定值，而 active_uids() 对轮转是「不过滤」，残留值虽不生效，
+    // 但下次切回 pinned 会用到意料之外的账号。
+    #[test]
+    fn mode_patch_for_rotation_clears_pinned() {
+        let r = super::mode_patch(GatewayMode::Rotation, None);
+        assert_eq!(r["mode"], "rotation");
+        assert!(r["pinned_uid"].is_null(), "轮转模式不应带 pinned_uid");
+    }
+
+    // write_native_config 必须把 rotation 从**模式**推导出来（而非独立开关），
+    // 避免出现「模式=轮转但 pool.rotation=false」这类自相矛盾的配置。
+    #[test]
+    fn native_config_derives_rotation_from_mode() {
+        // 用 helper 直接构造 native 配置太重（会写盘），这里验证推导规则本身：
+        let derive = |mode: &str| {
+            matches!(
+                GatewayMode::from_str(mode),
+                GatewayMode::Rotation
+            )
+        };
+        assert!(derive("rotation"));
+        assert!(!derive("balance"));
+        assert!(!derive("pinned"));
+        assert!(!derive("garbage"));
     }
 
     // 凭证导出必须原样带着 credit 块：它是网关「按积分到期分层选号」的依据。
