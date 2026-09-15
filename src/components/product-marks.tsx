@@ -100,3 +100,57 @@ export function StatusDot({ on, className }: { on: boolean; className?: string }
     />
   );
 }
+
+/**
+ * Trae 系（Trae Work / Trae）图标。
+ *
+ * 用矢量字形而不是位图：官方图标是受版权保护的美术资源，本仓库不内置；
+ * 且两个 Trae 应用只需按配色区分，矢量在任何缩放下都清晰。
+ */
+export function TraeMark({
+  size = 32,
+  className,
+  variant = "work",
+}: MarkProps & { variant?: "work" | "cn" }) {
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        "inline-flex shrink-0 items-center justify-center rounded-[22%] text-white shadow-sm",
+        variant === "work"
+          ? "bg-gradient-to-br from-indigo-500 to-violet-600"
+          : "bg-gradient-to-br from-sky-500 to-cyan-600",
+        className,
+      )}
+      style={{ width: size, height: size }}
+    >
+      <svg viewBox="0 0 24 24" fill="none" className="size-[62%]" aria-hidden="true">
+        <path d="M4.5 7h15" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" />
+        <path d="M12 7v11" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" />
+      </svg>
+    </span>
+  );
+}
+
+/** 豆包图标。 */
+export function DoubaoMark({ size = 32, className }: MarkProps) {
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        "inline-flex shrink-0 items-center justify-center rounded-[22%] bg-gradient-to-br from-blue-500 to-indigo-600 text-white shadow-sm",
+        className,
+      )}
+      style={{ width: size, height: size }}
+    >
+      <svg viewBox="0 0 24 24" fill="none" className="size-[62%]" aria-hidden="true">
+        <path
+          d="M12 4.2c-3.6 0-6.4 2.5-6.4 5.9 0 1.9.9 3.4 2.3 4.5v2.9l2.7-1.6c.45.1.92.15 1.4.15 3.6 0 6.4-2.5 6.4-5.95S15.6 4.2 12 4.2Z"
+          stroke="currentColor"
+          strokeWidth="1.9"
+          strokeLinejoin="round"
+        />
+      </svg>
+    </span>
+  );
+}

@@ -1,5 +1,7 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod commands;
+// Trae / 豆包 的命令层（与 WorkBuddy 系分开，便于独立演进）
+mod commands_apps;
 #[cfg(desktop)]
 mod tray;
 
@@ -234,6 +236,41 @@ pub fn run() {
             commands::batch_import_agent_clients,
             commands::restore_agent_client,
             commands::list_agent_backups,
+            // ---- Trae / 豆包 多应用支持 ----
+            commands_apps::app_env_check,
+            commands_apps::app_set_manual_path,
+            commands_apps::switch_action,
+            commands_apps::current_account,
+            commands_apps::list_snapshots,
+            commands_apps::delete_snapshot,
+            commands_apps::trae_list_accounts,
+            commands_apps::trae_add_account,
+            commands_apps::trae_delete_account,
+            commands_apps::trae_discover_accounts,
+            commands_apps::trae_entitlement,
+            commands_apps::trae_device_info,
+            commands_apps::trae_checkin_run,
+            commands_apps::trae_credits_history,
+            commands_apps::trae_clear_cooldown,
+            commands_apps::doubao_list_accounts,
+            commands_apps::doubao_save_account,
+            commands_apps::doubao_delete_account,
+            commands_apps::doubao_get_credential,
+            commands_apps::doubao_set_credential,
+            commands_apps::doubao_captured_credential,
+            commands_apps::doubao_credential_auto_apply,
+            commands_apps::doubao_keepalive,
+            commands_apps::doubao_renew,
+            commands_apps::doubao_diagnose,
+            commands_apps::doubao_fetch_quota,
+            commands_apps::doubao_quota_batch,
+            commands_apps::doubao_probe_account,
+            commands_apps::doubao_backup_chatdata,
+            commands_apps::doubao_restore_chatdata,
+            commands_apps::doubao_chatdata_info,
+            commands_apps::doubao_export_chats,
+            commands_apps::get_app_settings,
+            commands_apps::save_app_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

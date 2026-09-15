@@ -8,7 +8,8 @@ description = "ai-gateway 核心逻辑（账号/切换/会话/签到/更新）�
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+# net/io-util 供 MITM 代理监听、TLS 与 accept 循环使用（device_proxy）
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 chrono = "0.4"
@@ -31,6 +32,28 @@ sha2 = "0.10"
 urlencoding = "2"
 # 豆包对话导出走官方 IM API，需要随机指纹字段
 rand = "0.8"
+
+# device_proxy（MITM 设备身份代理）：hyper 1.x 协议栈自建
+# —— 为什么不用 hudsucker：其非拦截 CONNECT 隧道硬编码直连，无法透传用户 VPN 上游。
+# flate2 另用于抓包日志 gzip/deflate 解压与 WS permessage-deflate 尽力解压。
+hyper = { version = "1", features = ["client", "server", "http1"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["client-legacy", "server", "server-auto", "http1", "tokio", "service"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "tls12", "webpki-tokio", "ring"] }
+# 刻意关掉默认特性里的 aws_lc_rs，改用 ring：
+# 本仓库其余部分（reqwest 的 rustls-tls）已经是 ring 后端，若此处再引入 aws-lc-rs，
+# 会同时激活两个 CryptoProvider 并额外拉入 aws-lc-sys（需 cmake/nasm，本机没有，
+# 会直接编译失败）。ring 与 reqwest 保持一致，也避免构建期 C 工具链依赖。
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+# 自签 CA 与按域名即时签发叶子证书（私钥不落盘）
+rcgen = { version = "0.14", features = ["x509-parser"] }
+time = "0.3"
+# upstream.rs：UpstreamConnector 实现 tower::Service<Uri>（hyper legacy Client 连接器接口）
+tower-service = "0.3"
+webpki-roots = "0.26"
+bytes = "1"
+# 脱敏正则（体级凭证键值掩码）与本地登录态扫描
+regex = "1"
 
 [target.'cfg(windows)'.dependencies]
 # Win32_System_JobObjects / Win32_System_Threading / Win32_Security 供网关子进程的
