@@ -497,12 +497,8 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	if ferr != nil {
 		stat.status = status
 		stat.uid = result.UID
-		// 同 messages：模型被单一模型模式拒绝属请求侧问题，用 invalid_request_error。
-		code := "upstream_error"
-		if errorCodeFor(ferr) != "no_healthy_account" {
-			code = "invalid_request_error"
-		}
-		writeJSON(w, status, responsesError(status, code, errText(ferr)))
+		code, msg := responsesFailure(ferr)
+		writeJSON(w, status, responsesError(status, code, msg))
 		return
 	}
 	stat.uid = result.UID
@@ -521,13 +517,6 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		stat.setUsageMap(toks)
 	}
 	writeJSON(w, http.StatusOK, chatToResponses(result.Response, req.Model))
-}
-
-func errText(err error) string {
-	if err == nil {
-		return "unknown error"
-	}
-	return err.Error()
 }
 
 var _ = upstream.ErrNone
