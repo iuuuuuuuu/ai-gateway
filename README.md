@@ -656,6 +656,50 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 
 > 关闭积分巡检后，分层选号将只依赖签到与本应用同步的数据，到期档位更新会明显滞后。
 
+### Trae / 豆包 使用指南
+
+#### Trae
+
+1. 进入「Trae 账号」页面，用顶部标签切换 **Trae Work** / **Trae**
+2. 添加账号二选一：
+   - **粘贴 JWT**：从客户端登录态里取出 `Cloud-IDE-JWT` 贴进去，账号 id 自动解析
+   - **发现本机账号**：从客户端使用痕迹推导。标记为「无法确认」的候选**不会**入池
+     （它的编号属于账户中心体系，与账号库不是同一套编号）
+3. 账号列表里可执行：**切换**、**保存登录态**、**重置设备指纹**、**清除冷却**
+4. 点「一键签到」跑一轮；失败的账号按错误类型落冷却，不会反复撞限流
+
+> **保存登录态** = 把客户端当前的登录状态存进该账号的快照槽。
+> **切换** = 先备份现场、再恢复目标账号的快照，并保留一代备份可回退。
+
+#### 豆包
+
+1. 进入「豆包账号」页面
+2. 获取凭证（二选一）：
+   - **本地代理抓包**（推荐）：在「设置 → 本地代理」启动代理并信任 CA，
+     然后用豆包客户端访问一次，凭证会自动抓取并回写（页面每 20 秒轮询一次）
+   - **手动录入**：点「编辑」填写 `sessionid` / `sid_guard` / `ttwid`
+3. 账号列表里可执行：**探活**、**查询额度**、**备份/恢复对话状态**、
+   **导出对话**（markdown + json，输出到 `~/.ai-gateway/exports/`）
+4. 顶部按钮：「保活」（启动客户端触发会话续期）、「探活续期」（HTTP 探测）、
+   「额度巡检」（批量查询）、「诊断」（排查为什么读不到凭证）
+
+> 抓包回写**只认抓包文件自己的 uid**，且**绝不自动创建账号** ——
+> 浏览器网页版与其他字节系应用也会产生豆包 cookie，无差别建号会污染账号池。
+
+#### 本地代理
+
+代理拦截目标域名的请求，为每个账号注入独立设备标识，并自动抓取登录凭证。
+
+- **启动前会记下你原有的系统代理**，停止时原样还原；界面会显示检测到的原值
+- **CA 证书**需安装到「受信任的根证书颁发机构」，否则 HTTPS 拦截会因证书不受信而失败
+- 代理**意外崩溃**时会立刻还原系统代理（否则应用还在但系统代理指向死端口，本机断网）
+- 未命中的域名透明转发，不影响其他应用上网
+
+#### 计划任务
+
+「设置 → 计划任务」可把 Trae 签到 / 豆包保活 / 额度巡检注册为 Windows 计划任务，
+**即使应用没在运行也会按时执行**。可设置执行时间、随时删除，或点「立即执行」验证配置。
+
 ### 托盘与单实例
 
 - **关闭窗口**：隐藏到托盘而非退出，后台任务与网关继续运行
@@ -669,14 +713,36 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 | 内容 | 路径 | 说明 |
 |---|---|---|
 | 账号库 | `~/.ai-gateway/accounts.json` | **唯一真源**，含所有账号凭证，建议单独备份 |
+| Trae 账号库 | `~/.ai-gateway/trae_accounts.json` | Trae Work 与 Trae 共用（两者登录态独立） |
+| 豆包账号库 | `~/.ai-gateway/doubao_accounts.json` | 含会话凭证（等价于密码，勿分享） |
 | 网关凭证 | `~/.ai-gateway/gateway/gateway_auths/` | 由账号库派生，删除后可自动重建 |
 | 网关配置 | `~/.ai-gateway/gateway/gateway_config.json` | 端口、API Key、模式等 |
 | 网关原生配置 | `~/.ai-gateway/gateway/gateway_native_config.json` | 转换后交给网关进程的配置 |
 | 内嵌网关副本 | `~/.ai-gateway/gateway/bin/` | 按内容指纹命名，版本升级后自动更新 |
+| 登录态快照 | `~/.ai-gateway/profiles*/` | Trae 系与豆包各一套，含一代 `.bak` 回退 |
+| 豆包对话备份 | `~/.ai-gateway/doubao_chats/` | 客户端状态（对话正文在云端） |
+| 对话导出 | `~/.ai-gateway/exports/` | markdown + json |
+| 代理抓包日志 | `~/.ai-gateway/logs/` | 凭证已脱敏，但可能含其他请求信息 |
+| CA 证书 | `~/.ai-gateway/certs/` | 自签 CA，安装后请妥善保管私钥 |
 | 智能体配置备份 | `~/.ai-gateway/agent-backups/` | 一键接入前自动备份，可随时回滚 |
 | 签到 / 轮换日志 | `~/.ai-gateway/*_logs.json` | 最多保留 30 天 |
 
-> `accounts.json` 包含可直接登录的凭证，请勿分享或提交到版本库。
+> `accounts.json` 与 `doubao_accounts.json` 包含可直接登录的凭证，请勿分享或提交到版本库。
+
+### 从更名前的版本升级
+
+旧版本（`WorkBuddy Switch Gateway`）的数据在 `~/.wb-switch`。新版本首次启动会**自动迁移**：
+
+- **复制式**迁移：旧目录**原样保留**，新旧两版可并存，也可随时回退旧版
+- **并集合并**：账号库按 `(区域, uid)` 去重合并，新库里的条目优先（不会用旧值覆盖你后来的修改）
+- **只迁移一次**：完成标记写在 `~/.ai-gateway/.migrated-from-wb-switch`，
+  之后你在新版里删除的账号不会被旧目录「复活」
+- 设了 `AI_GATEWAY_HOME` 时不迁移（隔离环境不该被真实数据污染）
+
+> 签名私钥仍在旧路径 `~/.wb-switch/wb-switch-updater.key`。
+> `scripts/build-signed.ps1` 会**自动回退**到旧路径并提示；
+> 如需迁移请手动复制到 `%USERPROFILE%\.ai-gateway\` 并改名为 `ai-gateway-updater.*`
+> —— 脚本刻意不自动搬运私钥。
 
 ---
 
@@ -760,6 +826,7 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 ```
 crates/ai-gateway-core/        核心逻辑（不依赖 Tauri，可被桌面端与 HTTP 服务复用）
   src/modules/account.rs        账号存储
+  src/modules/app_profile.rs    5 应用 × 3 快照布局的档案表（多应用扩展）
   src/modules/auth_file.rs      认证文件读写 + 本机历史登录态扫描（本项目扩展）
   src/modules/refresh.rs        Token 刷新与保活（含传输层失败与凭证失效的区分）
   src/modules/agent_import.rs   智能体一键接入与配置生成（本项目新增）
@@ -767,15 +834,49 @@ crates/ai-gateway-core/        核心逻辑（不依赖 Tauri，可被桌面端�
   src/modules/gateway_embed.rs  内嵌网关的释放与缓存（本项目新增）
   src/modules/travel.rs         猫猫旅行（App 侧）
   src/modules/yaml_lite.rs      轻量 YAML 读写（本项目新增）
+  src/modules/switcher/         登录态切换器（多应用扩展）
+    mod.rs                       动作编排 + 进度回调 + 防误覆盖守卫
+    copy.rs                      替换语义拷贝 + 单代回滚 + 槽位解析
+    icube.rs                     Trae 系快照（15 项白名单、WAL 边车、对称恢复）
+    chromium.rs                  豆包快照（多 Profile、版本校验、活跃 Profile 修复）
+    proc.rs                      三层优雅关闭（WM_CLOSE → 温和 taskkill → 强制）
+    locate.rs                    6 级 exe 发现回退链
+    machine.rs                   6 层设备标识重置
+  src/modules/trae_account.rs   Trae 账号库与 JWT 解析（多应用扩展）
+  src/modules/trae_device.rs    Trae 账号级设备指纹确定性派生（多应用扩展）
+  src/modules/trae_checkin.rs   Trae 签到（错误分类、冷却、积分三层兜底）
+  src/modules/trae_discover.rs  双应用本机账号发现（两套 uid 体系）
+  src/modules/doubao_account.rs 豆包账号池与凭证（含抓包回写）（多应用扩展）
+  src/modules/doubao_session.rs 豆包保活与两段式探活（多应用扩展）
+  src/modules/doubao_quota.rs   豆包会员额度（精确解析 + 宽容兜底）
+  src/modules/doubao_chats.rs   豆包对话备份与官方 IM API 导出
+  src/modules/device_proxy/     MITM 设备代理（多应用扩展）
+    mod.rs                       代理生命周期 + 事件 trait
+    handler.rs                   请求拦截、JWT 与豆包凭证捕获
+    ca.rs                        自签 CA 与按域名签发叶子证书
+    upstream.rs                  上游连接（透传用户 VPN）
+    sys_proxy.rs                 Windows 系统代理编排（停止时原样还原）
+    bypass.rs                    OAuth 域名直连豁免
+    logger.rs                    抓包日志（凭证脱敏）
+    ws.rs                        WebSocket 观测桥接
+    local_capture.rs             本机离线凭证捕获
+  src/modules/scheduler.rs      Windows 计划任务（多应用扩展）
+  src/modules/cli_task.rs       CLI 任务模式（--task-run，刻意不启动 Tauri）
+  src/modules/migrate_store.rs  数据目录迁移（复制式、幂等）（多应用扩展）
   build.rs                      构建期压缩内嵌网关（本项目新增）
+crates/ai-gateway-router/      网关内核（Rust 版）
 crates/ai-gateway-server/      HTTP 服务形态（npm / webui）
 src/                          React 前端
   src/pages/GatewayPage.tsx     兼容网关页面（本项目新增）
   src/pages/AgentsPage.tsx      智能体管理页面（本项目新增）
+  src/pages/TraePage.tsx        Trae 账号页面（多应用扩展）
+  src/pages/DoubaoPage.tsx      豆包账号页面（多应用扩展）
   src/components/import-local-dialog.tsx  从本机批量导入账号（本项目新增）
 src-tauri/                    桌面壳（Tauri 2）
   src/tray.rs                   托盘与单实例行为
-  src/commands.rs               前端可调用的命令
+  src/commands.rs               WorkBuddy 系命令
+  src/commands_apps.rs          Trae / 豆包 / 计划任务命令（多应用扩展）
+  src/commands_proxy.rs         本地代理命令（多应用扩展）
 scripts/build-single.ps1      构建单一可执行文件（本项目新增）
 ```
 
@@ -786,7 +887,7 @@ cargo test --workspace          # 核心逻辑 + 桌面端单元测试
 npm run build                   # 前端类型检查与构建
 ```
 
-> Windows x64 上实测 `cargo test --workspace` 全部通过（229 个核心用例 + 55 个网关用例）。
+> Windows x64 上实测 `cargo test --workspace` 全部通过（454 个核心用例 + 55 个网关用例）。
 > 构建需要 **MSVC 工具链**（`stable-x86_64-pc-windows-msvc`，Tauri 依赖它链接
 > WebView2）；若需安装，可用
 > `winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`。
