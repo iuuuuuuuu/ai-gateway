@@ -557,10 +557,9 @@ func openAIFailure(err error) (code, msg string) {
 	if f := failureOf(err); f != nil && f.Kind == FailureContextTooLong {
 		return "context_length_exceeded", f.Message
 	}
-	if code := errorCodeFor(err); code != "no_healthy_account" {
-		return code, errText(err)
-	}
-	return "no_healthy_account", errText(err)
+	// 其余交给 errorCodeFor（当前只有 model_not_allowed 与 no_healthy_account），
+	// 即 chat/completions 一直以来的行为。
+	return errorCodeFor(err), errText(err)
 }
 
 // anthropicFailure 同上，Anthropic 词汇表。
@@ -578,12 +577,19 @@ func anthropicFailure(err error) (code, msg string) {
 }
 
 // responsesFailure 同上，Responses API 的上游失败码是 upstream_error。
+//
+// 单一模型拒绝沿用 #14 为该协议定的 invalid_request_error，**不**把
+// errorCodeFor 的 model_not_allowed 直接透出：model_not_allowed 是本网关给
+// chat/completions 形状定的码，不属于 Responses 词汇表（见 responsesBodyCodes
+// ——该协议用 invalid_request / payload_too_large）。同理 anthropicFailure 保持
+// invalid_request_error。三个入口共享的是「谁来判定失败类别」这条映射链，
+// 不是同一个码面值；把码面值也一起统一会让各协议的词汇表互相串味。
 func responsesFailure(err error) (code, msg string) {
 	if f := failureOf(err); f != nil && f.Kind == FailureContextTooLong {
 		return "context_length_exceeded", f.Message
 	}
-	if code := errorCodeFor(err); code != "no_healthy_account" {
-		return code, errText(err)
+	if errorCodeFor(err) != "no_healthy_account" {
+		return "invalid_request_error", errText(err)
 	}
 	return "upstream_error", errText(err)
 }
