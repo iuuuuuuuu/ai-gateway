@@ -16,12 +16,39 @@
 #>
 [CmdletBinding()]
 param(
-    [switch]$DryRun
+    [switch]$DryRun,
+    # 明知风险仍要强制执行（默认拒绝，见下方守卫）
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
+
+# ── 二次执行守卫（重要）────────────────────────────────────────────────────
+#
+# 更名**已完成**，本脚本现在是历史记录，不是可重复运行的工具。
+#
+# 再次实际运行会破坏三处**故意保留**的旧名引用：
+#   - `migrate_store.rs` 的 `.wb-switch`：迁移来源目录，改了就读不到旧数据
+#   - `build-signed.ps1` 的 `wb-switch-updater.*`：已发布密钥的实际文件名，改了签不了名
+#   - README 的上游归属链接（changexbc/workbuddy-switch）：许可证合规要求保留
+#
+# 这些引用**看起来**正是脚本要清理的「残留」，因此误跑一次就会静默破坏迁移与签名。
+# 默认拒绝执行，必须显式 `-Force` 才继续。
+if (-not $DryRun -and -not $Force) {
+    throw @"
+拒绝执行：更名已完成，本脚本仅作历史记录保留。
+
+再次实际运行会破坏三处故意保留的旧名引用：
+  - crates/ai-gateway-core/src/modules/migrate_store.rs 的 `.wb-switch`（迁移来源目录）
+  - scripts/build-signed.ps1 的 `wb-switch-updater.*`（已发布密钥的实际文件名）
+  - README 的上游归属链接（许可证合规要求保留）
+
+如需查看「当年改了哪些标识」，用 -DryRun（只统计不写盘）。
+确实要强制执行请显式加 -Force。
+"@
+}
 
 # ── 扫描范围：源码与文档；排除构建产物与工具记忆 ────────────────────────────
 $includeExt = @(
