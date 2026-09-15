@@ -999,17 +999,98 @@ async fn sync_account_for_dispatch(account: &Value, prior: Option<&Value>) -> Va
     }
 }
 
+/// 自动巡检是否被「自动旅行」开关允许（纯函数，便于单测）。
+///
+/// 只有显式 `enabled: true` 才算开启；缺字段/类型不对都按关闭处理
+/// （与 `load_travel_config` 的默认值一致）。
+fn auto_travel_enabled(cfg: &Value) -> bool {
+    cfg.get("enabled").and_then(Value::as_bool) == Some(true)
+}
+
 /// 对所有账号依次派猫猫旅行（每日缓存幂等；存在可重试项时不标记当日完成）。
 ///
 /// 只覆盖配置允许的区域（默认仅国服，见 [`accounts_in_scope`]）。
+///
+/// 受「自动旅行」开关门控：关闭时自动巡检不跑（`status: "disabled"`）。
+/// **手动触发请用 [`run_travel_now`]** —— 用户主动点击才不管自动开关。
 pub async fn run_travel_cycle() -> Value {
+    if !auto_travel_enabled(&load_travel_config()) {
+        return json!({"status": "disabled"});
+    }
+    run_travel_pass().await
+}
+
+/// 手动触发一趟旅行巡检（一键旅行按钮）：**忽略「自动旅行」开关**。
+///
+/// 为什么不门控：开关的语义是「要不要让它在后台自动跑」，而手动点击是用户的
+/// 明确意图。若也去检查开关，用户没开自动旅行时点按钮会毫无反应（返回 disabled），
+/// 表现为「按钮坏了」。这与「一键签到」的既有行为一致 —— `run_checkin_all`
+/// 同样不检查自动签到开关。
+pub async fn run_travel_now() -> Value {
+    run_travel_pass().await
+}
+
+/// 单账号领养（账号卡片的「领养」菜单项）：只领养，不派猫、不领奖。
+///
+/// 与「一键旅行」的关系：旅行巡检会先领养再派猫，领养是它的子集。这里独立出来，
+/// 是为了让用户能**只**完成领养（拿到 300 分）而不消耗当日派出次数。
+///
+/// 返回 `{ok, skip, message}`：
+///   - `ok=true`                领养成功，或本来就有猫
+///   - `skip="has-buddy"`       已有猫，无需领养
+///   - `skip="adopted"`         本次领养成功
+///   - `skip="adopt-threshold"` 对话轮次不够（上游预期行为，当日不必重试）
+///   - `skip="no-buddy"`        领养失败（可重试）
+///   - `skip="buddy-unknown"`   查询失败，未做任何写操作
+pub async fn adopt_for_account(account: &Value) -> Value {
+    let cfg = load_checkin_config();
+    let acc = ensure_fresh_token(account.clone(), &cfg).await;
+    let uid = acc.get("uid").and_then(Value::as_str).map(String::from);
+    let uid_ref = uid.as_deref();
+
+    match fetch_has_buddy(&acc).await {
+        Some(true) => depart_result(&acc, uid_ref, true, false, Some("has-buddy"), None, "已有 Buddy"),
+        Some(false) => match adopt_buddy(&acc).await {
+            AdoptOutcome::Adopted => {
+                depart_result(&acc, uid_ref, true, false, Some("adopted"), Some("idle"), "领养成功")
+            }
+            AdoptOutcome::ThresholdNotReached => depart_result(
+                &acc,
+                uid_ref,
+                false,
+                false,
+                Some("adopt-threshold"),
+                None,
+                "领养需先积累对话轮次",
+            ),
+            AdoptOutcome::Failed => depart_result(
+                &acc,
+                uid_ref,
+                false,
+                false,
+                Some("no-buddy"),
+                None,
+                "领养失败，请稍后重试",
+            ),
+        },
+        // 查询失败时不做任何写操作：绝不把「查不到」当成「没猫」去盲目领养。
+        None => depart_result(
+            &acc,
+            uid_ref,
+            false,
+            false,
+            Some("buddy-unknown"),
+            None,
+            "查询 Buddy 状态失败",
+        ),
+    }
+}
+
+/// 一趟旅行巡检的实际实现（自动与手动共用）。
+async fn run_travel_pass() -> Value {
     let Some(_guard) = RunFlagGuard::try_acquire(&TRAVEL_RUNNING) else {
         return json!({"status": "skipped", "reason": "already_running"});
     };
-    let cfg = load_travel_config();
-    if cfg.get("enabled").and_then(Value::as_bool) != Some(true) {
-        return json!({"status": "disabled"});
-    }
     let accounts = accounts_in_scope(&load_accounts());
     if accounts.is_empty() {
         return json!({"status": "no_accounts"});
@@ -1115,18 +1196,32 @@ fn display_record(label: &str, result: &Value) -> Value {
         "locationName": nonempty_str(result.get("locationName").unwrap_or(&Value::Null))
             .map(str::to_string),
         "arriveAt": if arrive_at > 0 { json!(arrive_at) } else { Value::Null },
+        // 后端的原始说明（如「无 Buddy（领养需先积累对话轮次）」）。
+        // 透出给前端是为了让卡片能直接显示**具体原因**，而不是只给一个笼统标签
+        // —— 用户不必点开菜单、跑一次请求才知道为什么领不了。
+        "message": nonempty_str(result.get("message").unwrap_or(&Value::Null))
+            .map(str::to_string),
+        // 跳过原因也透出：前端可据此区分「轮次不够」「查询失败」等细分状态。
+        "skip": nonempty_str(result.get("skip").unwrap_or(&Value::Null))
+            .map(str::to_string),
     })
 }
 
 fn display_label(same_day: bool, result: &Value) -> &'static str {
+    let skip = result.get("skip").and_then(Value::as_str);
     // 刚领养（本轮刚同意协议 + buddy/first 成功）：尚未派出，既不是 traveling
     // 也不该显示成"今日已完成旅行"，单独给一个标签让用户知道猫已经到手了。
-    if same_day && result.get("skip").and_then(Value::as_str) == Some("adopted") {
+    if same_day && skip == Some("adopted") {
         "adopted"
     } else if result_in_flight(result) {
         "traveling"
-    } else if same_day && result.get("skip").and_then(Value::as_str) == Some("no-buddy") {
+    } else if same_day && skip == Some("no-buddy") {
         "no-buddy"
+    } else if same_day && skip == Some("adopt-threshold") {
+        // 领养被上游以「对话轮次不够」拒绝。这是一个**有信息量**的状态，
+        // 必须与"未旅行"区分：否则用户看到"未旅行"会以为是没派猫，
+        // 反复点领养却始终失败，却不知道卡在门槛上。
+        "adopt-threshold"
     } else if same_day && result_claimed(result) {
         "finished"
     } else {
@@ -1231,6 +1326,33 @@ mod tests {
         assert!(is_retryable_skip(Some("no-buddy")));
     }
 
+    /// 「自动旅行」开关只认显式 true —— 缺字段或类型不对都算关闭。
+    #[test]
+    fn auto_travel_gate_requires_explicit_true() {
+        assert!(auto_travel_enabled(&json!({"enabled": true})));
+        assert!(!auto_travel_enabled(&json!({"enabled": false})));
+        assert!(!auto_travel_enabled(&json!({})));
+        // 类型不对（字符串 / null）不能当成开启，否则门控会被绕过
+        assert!(!auto_travel_enabled(&json!({"enabled": "true"})));
+        assert!(!auto_travel_enabled(&json!({"enabled": null})));
+    }
+
+    /// 手动触发路径不经过开关门控 —— 这是「一键旅行」在未开自动旅行时
+    /// 仍能正常工作的前提（回归保护：若有人给 run_travel_now 也加上门控，这里会失败）。
+    #[test]
+    fn manual_travel_path_has_no_gate() {
+        // 源码级断言：run_travel_now 的函数体不得出现 auto_travel_enabled 调用。
+        let src = include_str!("travel.rs");
+        let start = src.find("pub async fn run_travel_now").expect("run_travel_now 应存在");
+        let body = &src[start..];
+        let end = body.find("\n}").expect("应能找到函数结尾");
+        let fn_body = &body[..end];
+        assert!(
+            !fn_body.contains("auto_travel_enabled"),
+            "run_travel_now 不应检查自动旅行开关，否则用户未开启时点按钮会毫无反应"
+        );
+    }
+
     /// 领养门槛关键词判定：必须能识别上游 400 的文案，且不误伤其他错误。
     #[test]
     fn detects_buddy_task_incomplete_marker() {
@@ -1262,6 +1384,48 @@ mod tests {
         assert_eq!(display_label(true, &adopted), "adopted");
         // 跨天后不再是"刚领养"，回落为普通未旅行
         assert_eq!(display_label(false, &adopted), "untraveled");
+    }
+
+    /// 领养门槛未达必须有独立标签，不能混进 "untraveled"。
+    ///
+    /// 回归保护：`display_label` 若漏掉 adopt-threshold，卡片会把「已尝试领养但
+    /// 轮次不够」显示成「未旅行」—— 用户会以为是没派猫，反复点领养却始终失败，
+    /// 而不知道卡在上游的对话轮次门槛上。
+    #[test]
+    fn adopt_threshold_has_its_own_label() {
+        let threshold = json!({
+            "ok": false,
+            "claimed": false,
+            "skip": "adopt-threshold",
+            "message": "无 Buddy（领养需先积累对话轮次）",
+        });
+        assert_eq!(
+            display_label(true, &threshold),
+            "adopt-threshold",
+            "轮次不够不能被当成未旅行，否则用户无法知道失败原因"
+        );
+        // 跨日后缓存滚动，重新开始尝试
+        assert_eq!(display_label(false, &threshold), "untraveled");
+    }
+
+    /// display_record 必须把 message / skip 透出给前端，卡片才能直接显示原因。
+    #[test]
+    fn display_record_exposes_message_and_skip() {
+        let r = display_record(
+            "adopt-threshold",
+            &json!({
+                "skip": "adopt-threshold",
+                "message": "无 Buddy（领养需先积累对话轮次）",
+                "claimed": false,
+            }),
+        );
+        assert_eq!(r["label"], "adopt-threshold");
+        assert_eq!(r["skip"], "adopt-threshold");
+        assert_eq!(r["message"], "无 Buddy（领养需先积累对话轮次）");
+        // 缺字段时不应报错，也不应产生空串噪音
+        let empty = display_record("untraveled", &json!({}));
+        assert!(empty["message"].is_null());
+        assert!(empty["skip"].is_null());
     }
 
     #[test]

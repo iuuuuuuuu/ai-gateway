@@ -125,6 +125,8 @@ const ROUTES: Record<string, Route> = {
   save_auto_checkin_config: { method: "POST", path: "/api/checkin/config" },
   get_checkin_logs: { method: "GET", path: "/api/checkin/logs" },
   get_travel_status: { method: "GET", path: "/api/travel/status" },
+  travel_run: { method: "POST", path: "/api/travel/run" },
+  travel_adopt: { method: "POST", path: "/api/travel/adopt" },
   get_auto_travel_config: { method: "GET", path: "/api/travel/config" },
   save_auto_travel_config: { method: "POST", path: "/api/travel/config" },
   get_auto_rotate_config: { method: "GET", path: "/api/rotate/config" },
@@ -452,6 +454,25 @@ export function checkinAll(): Promise<{
   reason?: string;
 }> {
   return call("checkin_all");
+}
+
+/** 一键旅行：全部账号走一趟巡检（含领养、派出、领奖）。不受「自动旅行」开关限制。 */
+export function travelRun(): Promise<{
+  status: string;
+  reason?: string;
+  completed?: boolean;
+  accounts?: { accountId: string; email: string; result: string; skip?: string | null; message?: string | null }[];
+}> {
+  return call("travel_run");
+}
+
+/** 单账号领养：只领养 Buddy，不派猫、不领奖。 */
+export function travelAdopt(accountId: string): Promise<{
+  ok: boolean;
+  skip?: string;
+  message?: string;
+}> {
+  return call("travel_adopt", { accountId });
 }
 
 export function getAutoCheckinConfig(): Promise<CheckinConfig> {

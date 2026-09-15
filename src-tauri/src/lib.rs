@@ -194,6 +194,8 @@ pub fn run() {
             commands::get_token_statistics,
             commands::checkin,
             commands::checkin_all,
+            commands::travel_run,
+            commands::travel_adopt,
             commands::get_auto_checkin_config,
             commands::save_auto_checkin_config,
             commands::get_checkin_logs,

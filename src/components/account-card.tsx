@@ -1,4 +1,4 @@
-import { ArrowRight, Check, CircleCheck, Clock3, Coins, Ellipsis, Globe, Loader2, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2 } from "lucide-react";
+import { ArrowRight, Cat, Check, CircleCheck, Clock3, Coins, Ellipsis, Globe, Loader2, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2 } from "lucide-react";
 import { useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -137,16 +137,64 @@ function travelTooltip(status: TravelStatus): string {
     if (points) return `已结束 · ${points}`;
     return "已结束";
   }
-  if (status.label === "no-buddy") return "无 Buddy";
+  // 领养相关状态：把**具体原因**说清楚，而不是只说"无 Buddy"让用户猜。
+  if (status.label === "adopted") {
+    return status.rewardCredit != null
+      ? `已领养 Buddy，获得 ${status.rewardCredit} 分；今日尚未派出`
+      : "已领养 Buddy；今日尚未派出";
+  }
+  if (status.label === "adopt-threshold") {
+    return "已尝试领养，但上游要求先积累足够的对话轮次；攒够后可再次领养（约 +300 分）";
+  }
+  if (status.label === "no-buddy") {
+    return "尚无 Buddy，且本次领养未成功（可稍后重试）";
+  }
   return "未旅行";
 }
 
-/** 按旅行状态渲染标签：无 Buddy / 未旅行 / 旅行中 / 已结束。 */
+/** 按旅行状态渲染标签：领养状态 / 无 Buddy / 未旅行 / 旅行中 / 已结束。 */
 function travelChip(status: TravelStatus | undefined) {
   if (!status) return null;
   switch (status.label) {
+    // 领养相关状态一律用**带文字**的标签（而非旅行状态的纯图标）：
+    // 「有没有猫」「为什么领不了」是用户要主动处理的信息，藏在 tooltip 里
+    // 等于没说 —— 用户会反复点领养却不知道为什么失败。
+    case "adopted":
+      return (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Badge variant="success" className={chipClass} aria-label="已领养 Buddy">
+              <Cat className="size-3.5" />
+              已领养
+            </Badge>
+          </TooltipTrigger>
+          <TooltipContent side="top">{travelTooltip(status)}</TooltipContent>
+        </Tooltip>
+      );
+    case "adopt-threshold":
+      return (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Badge variant="secondary" className={cn(chipClass, "text-muted-foreground")} aria-label="待攒对话后可领养">
+              <Cat className="size-3.5" />
+              待攒对话
+            </Badge>
+          </TooltipTrigger>
+          <TooltipContent side="top">{travelTooltip(status)}</TooltipContent>
+        </Tooltip>
+      );
     case "no-buddy":
-      return <Badge variant="secondary" className={cn(chipClass, "text-muted-foreground")}>无 Buddy</Badge>;
+      return (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Badge variant="secondary" className={cn(chipClass, "text-muted-foreground")} aria-label="无 Buddy">
+              <Cat className="size-3.5" />
+              无 Buddy
+            </Badge>
+          </TooltipTrigger>
+          <TooltipContent side="top">{travelTooltip(status)}</TooltipContent>
+        </Tooltip>
+      );
     case "traveling":
       return travelIconChip({ label: travelTooltip(status), tooltip: travelTooltip(status), variant: "secondary" });
     case "finished":
@@ -185,6 +233,8 @@ interface Props {
   onDelete: (a: AccountMeta) => void;
   onCheckin?: (a: AccountMeta) => void;
   onRefresh?: (a: AccountMeta) => void;
+  /** 领养 Buddy（仅领养，不派猫；与「一键旅行」的重叠部分单独暴露出来） */
+  onAdopt?: (a: AccountMeta) => void;
   onSwitch?: (a: AccountMeta) => void;
   todayCheckedIn?: boolean;
   /** 今日旅行状态（undefined=查询中/未知，不渲染标签） */
@@ -242,7 +292,7 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
   );
 }
 
-export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onCheckin, onRefresh, onAdopt, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
   const name = account.nickname || account.uid || "未命名账号";
   const expired = typeof account.expiresAt === "number" && account.expiresAt < Date.now();
@@ -338,6 +388,16 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                     <CircleCheck />手动签到
                   </DropdownMenuItem>
                 )}
+                {/* 领养：措辞随已知状态变化，避免用户点了才发现"已经有猫"或"还不够轮次"。
+                    「旅行巡检也会顺带领养」这点保留在菜单里说清，因为一键旅行确实覆盖它。 */}
+                <DropdownMenuItem disabled={featuresDisabled || !onAdopt} onSelect={() => onAdopt?.(account)}>
+                  <Cat />
+                  {travelStatus?.label === "adopted"
+                    ? "重新检查 Buddy"
+                    : travelStatus?.label === "adopt-threshold"
+                      ? "领养 Buddy（需先攒对话）"
+                      : "领养 Buddy"}
+                </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>
                   <Trash2 />删除账号

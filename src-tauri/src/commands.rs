@@ -410,6 +410,22 @@ pub async fn checkin_all() -> Value {
     checkin::run_checkin_all().await
 }
 
+/// POST /api/travel/run —— 全部账号立即走一趟旅行巡检（一键旅行）。
+///
+/// 手动触发**不**检查「自动旅行」开关：该开关只管后台是否自动跑，
+/// 用户主动点击就该执行（与 `checkin_all` 的既有行为一致）。
+#[tauri::command]
+pub async fn travel_run() -> Value {
+    travel::run_travel_now().await
+}
+
+/// POST /api/travel/adopt —— 单账号领养 Buddy（账号卡片的「领养」菜单项）。
+#[tauri::command]
+pub async fn travel_adopt(account_id: String) -> Result<Value, String> {
+    let acc = account::find_account(&account_id).ok_or("账号不存在")?;
+    Ok(travel::adopt_for_account(&acc).await)
+}
+
 /// GET /api/checkin/config —— 自动签到配置。
 #[tauri::command]
 pub fn get_auto_checkin_config() -> Value {

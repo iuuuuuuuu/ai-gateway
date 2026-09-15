@@ -214,13 +214,17 @@ export interface TravelConfig {
   region_scope?: "cn" | "all";
 }
 
-export type TravelStatusLabel = "untraveled" | "no-buddy" | "traveling" | "finished";
+export type TravelStatusLabel = "untraveled" | "no-buddy" | "traveling" | "finished" | "adopted" | "adopt-threshold";
 
 export interface TravelStatus {
   label: TravelStatusLabel;
   rewardCredit: number | null;
   locationName?: string | null;
   arriveAt?: number | null;
+  /** 后端给出的具体说明（如「领养需先积累对话轮次」），供卡片直接展示原因。 */
+  message?: string | null;
+  /** 跳过/结果原因，用于区分细分状态（adopt-threshold / no-buddy / daily-limit 等）。 */
+  skip?: string | null;
 }
 
 export interface AutoRotateConfig {
