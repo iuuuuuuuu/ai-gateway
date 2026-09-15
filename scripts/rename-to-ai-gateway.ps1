@@ -1,23 +1,18 @@
 <#
 .SYNOPSIS
-    把本仓库从 "AI Gateway / ai-gateway" 彻底更名为 "AI Gateway"。
+    把本仓库从 "WorkBuddy Switch Gateway / wb-switch" 彻底更名为 "AI Gateway"。
 
-.DESCRIPTION
-    分两阶段执行：
-      ① 文本内容替换（按「最长优先」顺序，避免前缀互相吞噬）；
-      ② 路径/文件重命名（crate 目录、npm 包目录、npm bin 入口）。
+.NOTES
+    **本脚本已于 2026-09-15 执行完毕，仓库当前已是更名后的状态。**
+    保留它是为了留存完整的替换规则清单（便于审计「哪些标识被改了、哪些刻意没改」），
+    重复执行是幂等的（找不到旧名就什么都不做），但正常情况下不需要再跑。
 
-    刻意保留的标识（改名会破坏兼容或语义）：
-      - `WorkBuddy` / `CodeBuddy` / `copilot.tencent.com` 等**上游产品名**；
-      - `~/.codebuddy`、`workbuddy-desktop.info` 等**官方客户端**的路径与文件名；
-      - 网关凭证目录、账号库 JSON 的**内部字段名**（如 `workbuddy_desktop`）；
-      - `is_workbuddy_image_name` 等函数名（描述的是官方客户端，不是本软件）。
-
-    注意：`.ai-gateway` → `.ai-gateway` 由规则 `ai-gateway` → `ai-gateway` 自然覆盖
-    （`.ai-gateway` 含子串 `ai-gateway`），无需单独规则。
-
-.PARAMETER DryRun
-    只打印将要发生的替换统计，不写盘。
+    已知的遗漏与补救（脚本未覆盖，已单独修复）：
+      - 侧边栏硬编码标题 "WorkBuddy Switch"（改为 AI Gateway）
+      - 托盘 tooltip "ai-gateway"（改为显示名 AI Gateway）
+      - agent_import 的 PROVIDER_NAME（改为 AI Gateway）
+      - 构建脚本/发布工作流里的产品显示名残留
+      - 上游归属链接被误替换（已还原，许可证合规要求保留原作者与原始仓库）
 #>
 [CmdletBinding()]
 param(
@@ -36,43 +31,47 @@ $includeExt = @(
 $excludeDir = '\\(target|node_modules|dist|dist-single|_rel|__pycache__|\.git|\.workbuddy)\\'
 
 $files = Get-ChildItem -Path $root -Recurse -File -Include $includeExt |
-    Where-Object { $_.FullName -notmatch $excludeDir }
+    Where-Object { $_.FullName -notmatch $excludeDir } |
+    # **必须排除脚本自身**：否则它会用自己的规则表改写自己 ——
+    # 第一版实测把规则表的左列全部替换成了右列，规则退化成
+    # 「AI_GATEWAY_HOME -> AI_GATEWAY_HOME」这种空操作，历史记录被抹掉。
+    Where-Object { $_.FullName -ne $PSCommandPath }
 
 # ── 替换规则（顺序敏感：长串必须排在短串之前）──────────────────────────────
 # 用「扁平数组 + 步长 2」而不是嵌套数组/哈希表：
-#   - 哈希表：PowerShell 的键默认大小写不敏感，`ai-gateway` 与 `AI-GATEWAY` 会判定为
+#   - 哈希表：PowerShell 的键默认大小写不敏感，`wb-switch` 与 `WB-SWITCH` 会判定为
 #     重复键直接报错；
 #   - 嵌套数组：`@(@('a','b'), @('c','d'))` 会被 `@()` 展平成一维，`$pair[0]` 退化成
 #     单个字符——本脚本第一版就踩了这个坑，表现为「把 W 替换成 B」这种灾难性结果。
 # 字符串的 .Replace() 是大小写敏感的，正是这里需要的语义。
 $rulePairs = @(
     # 环境变量
-    'AI_GATEWAY_ROUTER_BIN',         'AI_GATEWAY_ROUTER_BIN'
-    'AI_GATEWAY_SCREENSHOT_DEMO',     'AI_GATEWAY_SCREENSHOT_DEMO'
-    'AI_GATEWAY_ACCOUNTS_FILE',       'AI_GATEWAY_ACCOUNTS_FILE'
-    'AI_GATEWAY_BINARY',              'AI_GATEWAY_BINARY'
-    'AI_GATEWAY_HOME',                'AI_GATEWAY_HOME'
-    'AI_GATEWAY_PROBE_TIMEOUT_SEC',          'AI_GATEWAY_PROBE_TIMEOUT_SEC'
+    'WB_SWITCH_GATEWAY_BIN',         'AI_GATEWAY_ROUTER_BIN'
+    'WB_SWITCH_SCREENSHOT_DEMO',     'AI_GATEWAY_SCREENSHOT_DEMO'
+    'WB_SWITCH_ACCOUNTS_FILE',       'AI_GATEWAY_ACCOUNTS_FILE'
+    'WB_SWITCH_BINARY',              'AI_GATEWAY_BINARY'
+    'WB_SWITCH_HOME',                'AI_GATEWAY_HOME'
+    'WB_PROBE_TIMEOUT_SEC',          'AI_GATEWAY_PROBE_TIMEOUT_SEC'
     # Rust 标识符（下划线形）
-    'ai_gateway_lib',            'ai_gateway_lib'
-    'ai_gateway_core',                'ai_gateway_core'
-    'ai_gateway_router',             'ai_gateway_router'
-    'ai_gateway_test_',               'ai_gateway_test_'
-    'ai_gateway',                     'ai_gateway'
+    'wb_switch_rust_lib',            'ai_gateway_lib'
+    'wb_switch_core',                'ai_gateway_core'
+    'wb_switch_gateway',             'ai_gateway_router'
+    'wb_switch_test_',               'ai_gateway_test_'
+    'wb_switch',                     'ai_gateway'
     # crate / 包名（连字符形）——长名优先
-    'ai-gateway',      'ai-gateway'
-    'ai-gateway-core',                'ai-gateway-core'
-    'ai-gateway-router',             'ai-gateway-router'
-    'ai-gateway-server',              'ai-gateway-server'
-    'ai-gateway',                'ai-gateway'
-    'ai-gateway',              'ai-gateway'
-    'ai-gateway',                     'ai-gateway'
+    'workbuddy-switch-gateway',      'ai-gateway'
+    'wb-switch-core',                'ai-gateway-core'
+    'wb-switch-gateway',             'ai-gateway-router'
+    'wb-switch-server',              'ai-gateway-server'
+    'wb-switch-rust',                'ai-gateway'
+    'workbuddy-switch',              'ai-gateway'
+    'wb-switch',                     'ai-gateway'
     # 大写/显示名形态
-    'AI-GATEWAY',                     'AI-GATEWAY'
-    'AI Gateway',      'AI Gateway'
-    'AI_Gateway',      'AI_Gateway'
-    'AI.Gateway',      'AI.Gateway'
-    'com.momo0410.aigateway', 'com.momo0410.aigateway'
+    'WB-SWITCH',                     'AI-GATEWAY'
+    'WorkBuddy Switch Gateway',      'AI Gateway'
+    'WorkBuddy_Switch_Gateway',      'AI_Gateway'
+    'WorkBuddy.Switch.Gateway',      'AI.Gateway'
+    'com.momo0410.wbswitch.gateway', 'com.momo0410.aigateway'
 )
 
 if ($rulePairs.Count % 2 -ne 0) { throw "规则数组必须成对出现（当前 $($rulePairs.Count) 项）" }
