@@ -97,10 +97,11 @@ pub trait ProxyEventSink: Send + Sync {
 
     /// 代理任务退出（对应上游 `proxy-crashed` 看门狗；默认忽略）。
     ///
-    /// `crashed = true` 表示**非主动停止**的退出 —— 此时系统代理仍指向死端口，
-    /// 宿主必须立即还原，否则本机全局断网。
-    fn exited(&self, crashed: bool) {
-        let _ = crashed;
+    /// `intentional = true` 表示调用方主动 [`ProxyServer::stop`] 过；`false` 表示
+    /// accept 循环自己结束了（意外崩溃 / panic）。**只有 `false` 才需要还原系统代理** ——
+    /// 主动停止路径由宿主自己还原，重复还原会覆盖用户刚改回去的设置。
+    fn exited(&self, intentional: bool) {
+        let _ = intentional;
     }
 }
 
@@ -162,9 +163,9 @@ impl ProxyEventSink for VecSink {
         }
     }
 
-    fn exited(&self, crashed: bool) {
+    fn exited(&self, intentional: bool) {
         if let Ok(mut v) = self.exited.lock() {
-            v.push(crashed);
+            v.push(intentional);
         }
     }
 }
@@ -323,14 +324,21 @@ impl ProxyServer {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         // 退出通知：accept 循环结束（无论主动 stop 还是意外崩溃）时置 true，
-        // 供宿主看门狗监听并还原系统代理（对齐 Python 版 stdout EOF 看门狗语义）
+        // 供宿主看门狗监听并还原系统代理（对齐 Python 版 stdout EOF 看门狗语义）。
+        //
+        // 同时记录「是否主动停止」并随退出事件一并上报：宿主据此区分
+        // 「用户点了停止（宿主自己还原）」与「代理崩了（必须立刻还原，
+        // 否则系统代理仍指向死端口 → 本机全局断网）」。看门狗拿到的信号
+        // 与 `intentional` 之间存在极小的竞态窗口，但两种情况下的处置都是
+        // 「还原系统代理」，误判代价仅为一次冗余还原，可接受。
         let (exit_tx, exit_rx) = watch::channel(false);
         let events = cfg.events.clone();
+        let shutdown_probe = shutdown_tx.clone();
         let task = tokio::spawn(async move {
             accept_loop(listener, ctx, ca, cfg.upstream.clone(), shutdown_rx).await;
             let _ = exit_tx.send(true);
             if let Some(sink) = events {
-                sink.exited(false);
+                sink.exited(shutdown_probe.borrow().to_owned());
             }
         });
         Ok(ProxyServer { port: cfg.port, captured, shutdown_tx, exit_rx, task })
@@ -1048,5 +1056,52 @@ mod tests {
     fn config_targets_csv_parsing() {
         let cfg = ProxyConfig::new(1).with_targets_csv(" trae.cn , ,doubao.com, ");
         assert_eq!(cfg.targets, vec!["trae.cn".to_string(), "doubao.com".to_string()]);
+    }
+
+    /// 端到端生命周期：启动 → 独占绑定端口 → stop() → 退出事件上报为「主动停止」
+    #[tokio::test]
+    async fn server_starts_binds_and_reports_intentional_stop() {
+        let iso = Isolated::new("proxy-lifecycle");
+        let sink = Arc::new(VecSink::new());
+        let cfg = ProxyConfig::new(0) // 0 = 让内核分配临时端口，避免与真实代理抢 8899
+            .with_events(sink.clone());
+        let server = ProxyServer::start(cfg).await.expect("代理应能启动");
+        assert!(server.is_running());
+        assert_eq!(server.captured_count(), 0);
+
+        // 启动横幅必须已经落到操作日志（宿主面板依赖这些行）
+        let lines = sink.lines();
+        assert!(
+            lines.iter().any(|l| l.contains("代理已启动")),
+            "缺少启动横幅: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("监听 TRAE 域名")));
+
+        server.stop();
+        // 等 accept 循环退出并上报（watch 信号 + 事件在同一任务内顺序发出）
+        let mut exit_rx = server.exit_signal();
+        let _ = tokio::time::timeout(Duration::from_secs(5), exit_rx.changed()).await;
+        for _ in 0..100 {
+            if !sink.exits().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(sink.exits(), vec![true], "stop() 后应上报「主动停止」");
+        assert!(sink.lines().iter().any(|l| l.contains("代理已停止")));
+    }
+
+    /// 启动时自动生成 CA 三件套（否则宿主无法提示用户安装证书）
+    #[tokio::test]
+    async fn server_start_generates_ca_files() {
+        let iso = Isolated::new("proxy-ca");
+        let cfg = ProxyConfig::new(0);
+        let certs = cfg.certs_dir.clone();
+        let server = ProxyServer::start(cfg).await.expect("代理应能启动");
+        assert!(certs.join("ca.crt").exists(), "启动应生成 ca.crt");
+        assert!(certs.join("ca.key").exists(), "启动应生成 ca.key");
+        assert!(certs.join("ca.cer").exists(), "启动应生成 ca.cer（供 certutil 安装）");
+        server.stop();
+        let _ = iso;
     }
 }

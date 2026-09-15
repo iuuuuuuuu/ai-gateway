@@ -81,7 +81,10 @@ const HOP_BY_HOP_RESP: &[&str] = &["transfer-encoding", "connection", "keep-aliv
 /// 本仓库的 [`crate::modules::trae_account`] 是无锁的 load/save，因此这把锁是
 /// 「读-改-写」原子性的唯一保证，JWT 与 refresh_token 的合并写必须持同一把锁。
 static ACCOUNTS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-/// 豆包凭证进程内去重缓存 + 落盘锁（对齐 Python `_doubao_captured_cache`/`_capture_lock`）
+/// 豆包凭证进程内去重缓存 + 落盘锁（对齐 Python `_doubao_captured_cache`/`_capture_lock`）。
+///
+/// 初值取磁盘上已有的抓包凭证：代理重启后第一次抓到的凭证若与磁盘一致，
+/// 就不该再写一遍（否则每次重启都会刷一次文件时间戳）。
 static DOUBAO_LOCK: OnceLock<Mutex<Option<serde_json::Value>>> = OnceLock::new();
 
 pub(crate) fn accounts_lock() -> &'static Mutex<()> {
@@ -89,7 +92,7 @@ pub(crate) fn accounts_lock() -> &'static Mutex<()> {
 }
 
 fn doubao_cache() -> &'static Mutex<Option<serde_json::Value>> {
-    DOUBAO_LOCK.get_or_init(|| Mutex::new(None))
+    DOUBAO_LOCK.get_or_init(|| Mutex::new(crate::modules::doubao_account::load_captured()))
 }
 
 /// 代理共享上下文：路径/开关/日志句柄，由 `mod.rs` 主循环构造并贯穿各模块
@@ -1341,5 +1344,78 @@ mod tests {
             .and_then(|m| m.modified())
             .ok();
         assert_eq!(before, after, "同值抓包不得重复落盘");
+    }
+
+    /// 真实设备指纹捕获：抓到客户端真值必须覆盖派生值，写进设备表
+    /// （服务端把 JWT 与签发时指纹绑定，真值一定匹配，派生值只是推断）
+    #[test]
+    fn captured_device_identity_overrides_derived() {
+        let _iso = Isolated::new("handler-device");
+        let ctx = test_ctx("device");
+        let jwt = make_jwt(1893456000);
+        let req = RawRequest {
+            method: "GET".into(),
+            path: "/api/x".into(),
+            headers: vec![
+                ("Authorization".into(), jwt.clone()),
+                ("x-device-id".into(), "987654321098765".into()),
+                ("vscode-sessionid".into(), "f".repeat(32)),
+                ("x-market-user-id".into(), "11111111-2222-4333-8444-555555555555".into()),
+            ],
+            body: Bytes::new(),
+        };
+        try_capture_device_identity(&ctx, &req);
+
+        let map = crate::modules::trae_device::load_device_map();
+        let entry = map.get("u-test").expect("设备表应写入 u-test");
+        assert_eq!(entry["device_id"].as_str(), Some("987654321098765"));
+        assert_eq!(entry["session_id"].as_str(), Some("f".repeat(32).as_str()));
+        assert_eq!(
+            entry["market_user_id"].as_str(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+
+        // 后续 resolve_device 必须返回抓到的真值（签到注入用这条路径）
+        let dev = crate::modules::trae_device::resolve_device("u-test");
+        assert_eq!(dev.device_id, "987654321098765");
+    }
+
+    /// 缺少 uid 或 x-device-id 时不写设备表（没有归属的指纹无处安放）
+    #[test]
+    fn device_capture_requires_uid_and_device_id() {
+        let _iso = Isolated::new("handler-device-gate");
+        let ctx = test_ctx("device-gate");
+        // 只有 x-device-id，没有鉴权头 → 不写
+        let no_auth = RawRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            headers: vec![("x-device-id".into(), "111111111111111".into())],
+            body: Bytes::new(),
+        };
+        try_capture_device_identity(&ctx, &no_auth);
+        assert!(crate::modules::trae_device::load_device_map().is_empty());
+
+        // 有鉴权头但缺 x-device-id → 不写
+        let no_dev = RawRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            headers: vec![("Authorization".into(), make_jwt(1893456000))],
+            body: Bytes::new(),
+        };
+        try_capture_device_identity(&ctx, &no_dev);
+        assert!(crate::modules::trae_device::load_device_map().is_empty());
+
+        // 空值 x-device-id → 不写（空值头非法，写进去会污染设备表）
+        let empty_dev = RawRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            headers: vec![
+                ("Authorization".into(), make_jwt(1893456000)),
+                ("x-device-id".into(), "   ".into()),
+            ],
+            body: Bytes::new(),
+        };
+        try_capture_device_identity(&ctx, &empty_dev);
+        assert!(crate::modules::trae_device::load_device_map().is_empty());
     }
 }

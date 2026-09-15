@@ -1,7 +1,9 @@
-import { useEffect, useState, type ReactElement, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactElement, type ReactNode } from "react";
+import { toast } from "sonner";
 import { ArrowUpCircle, CircleCheck, ExternalLink, Loader2, RefreshCw, Save } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -943,6 +945,125 @@ function AppearanceCard() {
   );
 }
 
+/**
+ * 多应用环境配置：Trae Work / Trae / 豆包 的安装路径与豆包端点。
+ *
+ * 为什么需要手动指定路径：客户端安装位置五花八门（自定义盘符、绿色版），
+ * exe 发现链的 6 级回退仍可能在部分机器上落空。此时让用户直接给出路径，
+ * 比让他反复重装客户端现实得多。
+ */
+function AppEnvCard() {
+  const APPS = [
+    { kind: "TraeWork", label: "Trae Work", hint: "TRAE SOLO CN.exe" },
+    { kind: "Trae", label: "Trae", hint: "Trae CN.exe" },
+    { kind: "Doubao", label: "豆包", hint: "Doubao.exe" },
+  ] as const;
+
+  const [envs, setEnvs] = useState<Record<string, api.AppEnvStatus | null>>({});
+  const [paths, setPaths] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    const results = await Promise.all(
+      APPS.map(async (app) => {
+        try {
+          return [app.kind, await api.appEnvCheck(app.kind)] as const;
+        } catch {
+          return [app.kind, null] as const;
+        }
+      }),
+    );
+    const nextEnvs: Record<string, api.AppEnvStatus | null> = {};
+    const nextPaths: Record<string, string> = {};
+    for (const [kind, status] of results) {
+      nextEnvs[kind] = status;
+      nextPaths[kind] = status?.manualPath ?? "";
+    }
+    setEnvs(nextEnvs);
+    setPaths(nextPaths);
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const savePath = async (kind: string) => {
+    setBusy(true);
+    try {
+      await api.appSetManualPath(kind, paths[kind] ?? "");
+      toast.success("已保存安装路径");
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <SettingsGroup id="settings-app-env" title="应用环境">
+      <CardContent className="space-y-0 p-0">
+        <p className="px-4 pt-4 text-xs text-muted-foreground sm:px-5">
+          Trae Work / Trae / 豆包的安装路径。自动探测失败时可在此手动指定。
+        </p>
+        {APPS.map((app, index) => {
+          const env = envs[app.kind];
+          return (
+            <div
+              key={app.kind}
+              className={cn(
+                "space-y-2 px-4 py-4 sm:px-5",
+                index < APPS.length - 1 && "border-b border-border/60",
+              )}
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm font-medium">{app.label}</span>
+                {env ? (
+                  <>
+                    <Badge variant={env.installed ? "secondary" : "outline"}>
+                      {env.installed ? "已安装" : "未检测到"}
+                    </Badge>
+                    <Badge variant={env.running ? "secondary" : "outline"}>
+                      {env.running ? "运行中" : "未运行"}
+                    </Badge>
+                    <span className="text-xs text-muted-foreground">
+                      快照 {env.snapshotCount} 个
+                    </span>
+                  </>
+                ) : (
+                  <Badge variant="outline">检测失败</Badge>
+                )}
+              </div>
+              {env?.exePath && (
+                <p className="break-all font-mono text-xs text-muted-foreground">{env.exePath}</p>
+              )}
+              <div className="flex gap-2">
+                <Input
+                  value={paths[app.kind] ?? ""}
+                  onChange={(e) =>
+                    setPaths((prev) => ({ ...prev, [app.kind]: e.target.value }))
+                  }
+                  placeholder={`手动指定路径，例如 D:\\Programs\\${app.hint}`}
+                  className="font-mono text-xs"
+                  aria-label={`${app.label} 安装路径`}
+                />
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => void savePath(app.kind)}
+                >
+                  保存
+                </Button>
+              </div>
+            </div>
+          );
+        })}
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
 /** 设置页：自动签到配置 / 权限检测 / 更新配置。 */
 export default function SettingsPage() {
   return (
@@ -954,6 +1075,7 @@ export default function SettingsPage() {
 
       <div className="min-w-0 space-y-12">
         <AppearanceCard />
+        <AppEnvCard />
         <PermissionCheckCard />
         <AutoCheckinCard />
         <AutoRotateCard />

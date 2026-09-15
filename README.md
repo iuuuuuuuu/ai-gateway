@@ -9,7 +9,7 @@
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB.svg)](https://tauri.app)
 [![Gateway](https://img.shields.io/badge/API-OpenAI%20Compatible-412991.svg)](#兼容网关)
 
-把 [ai-gateway](https://github.com/changexbc/ai-gateway) 的账号管理能力
+把 [workbuddy-switch](https://github.com/changexbc/workbuddy-switch) 的账号管理能力
 与 [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的 OpenAI 兼容网关，
 整合进同一个桌面应用：**一个安装包、一个界面、一个进程树**。
 
@@ -46,7 +46,7 @@
 
 ### 账号管理
 
-源自 [ai-gateway](https://github.com/changexbc/ai-gateway)。
+源自 [workbuddy-switch](https://github.com/changexbc/workbuddy-switch)。
 
 | 模块 | 能力 |
 |---|---|
@@ -59,6 +59,76 @@
 | Token 统计 | WorkBuddy / WorkBuddy AI（国际版）/ CodeBuddy CLI / CodeBuddy CN IDE 四个来源独立统计输入、输出、缓存读写、调用次数 |
 | 会话复制 | 将当前账号的会话以新 ID 复制给目标账号（含 jsonl 正文、数据库索引、edge-sync 注册） |
 | 自动轮换 | 定时把「积分最紧迫」的账号设为后续会话默认账号，避免额度过期浪费 |
+
+### Trae 账号管理
+
+支持 **Trae Work** 与 **Trae**（Trae CN IDE）两个应用。两者是同一套 icube 内核的
+VS Code fork，**共用同一份账号库**，但登录态快照互相独立 —— 同一账号可以在两个
+应用里分别切换，互不影响。
+
+| 模块 | 能力 |
+|---|---|
+| 账号入库 | 粘贴 Cloud-IDE-JWT、本机使用痕迹自动发现（双应用合并） |
+| 账号切换 | 备份现场 → 关闭客户端 → 恢复目标快照 → 启动；保留一代备份可回退 |
+| 一键签到 | `status` 预检 → `claim`（仅网络异常重试）→ 错误分类 → 冷却落盘 |
+| 积分归属 | 三层兜底：claim 奖励字段 → 复查余额差值 → 旧行为 |
+| 设备指纹 | 按 uid 确定性派生 `device_id` / `session_id` / `market_user_id`，实现账号间设备隔离 |
+| 设备重置 | 6 层机器标识重置（`machineid` / 遥测 / aha 设备 / TinyStorage / 注册表 MachineGuid / webview 追踪） |
+
+**两套 uid 体系（最容易踩的坑）**：`storage.json` 里
+`iCubeAuthInfo://icube-dc:<uid>` 的 uid 属于**账户中心编号体系**，而账号库与 JWT
+`data.id` 属于 **Cloud-IDE 编号体系**。实测同一账号两者完全不同
+（`dc=199439841787403` vs `Cloud-IDE=2328112497170937`）。因此本机发现必须由
+**使用痕迹**（`icube_gtm.users`、`state.vscdb` 的 `solo.mobile.allowControl` 等）
+推导 Cloud-IDE uid；推导失败时明确标记「无法确认」并**拒绝入池** ——
+宁可不给候选，也不产生一个永远登录不上的重复账号。
+
+**登录态快照覆盖 15 个物理路径**（README 常说的「9 类核心文件」）：
+`storage.json`、`state.vscdb` 及其 WAL/SHM/backup 边车、`machineid`、`aha/`、
+`Preferences`、`Local State`、`Local Storage/leveldb`、`Network/`、
+`Partitions/trae-webview`、`Session Storage` 等。两个细节是硬性要求：
+
+- **恢复前必须删除现场残留的 `state.vscdb-wal` / `-shm`**：客户端强杀后 WAL 未
+  checkpoint，恢复时若保留，SQLite 启动会把**切换前账号**的登录证据回放回新库 ——
+  表现为「切换后账号没变」
+- **备份必须包含 WAL/SHM 边车**：客户端常被强杀，最新登录写入可能还在边车里，
+  漏拷会丢数据
+
+### 豆包账号管理
+
+| 模块 | 能力 |
+|---|---|
+| 账号入库 | 手动录入、本地代理抓包自动回写 |
+| 登录态切换 | 多 Profile 快照（Chromium 布局），含版本校验、单代回滚、防误覆盖守卫 |
+| 会话保活 | 启动客户端 → 等待落盘 → 优雅关闭，触发服务端 30 天滑动续期 |
+| 会话探活 | 两段式：权威探活（会员额度接口）+ 保活探活（回收服务端下发的新凭证） |
+| 会员额度 | 精确解析 + 宽容兜底两段式；支持单账号查询与全量巡检 |
+| 对话备份 | 客户端状态备份/恢复（IndexedDB + DoubaoStorage） |
+| 对话导出 | 官方 IM API 拉取正文，输出 markdown + json |
+
+**为什么保活靠「启动客户端」而不是 HTTP**：实测（豆包 Chromium 147）
+`Local State` 的 `os_crypt.encrypted_key` 经 DPAPI + AES-256-GCM 解出的**仍是
+二进制密文** —— 客户端在 Chromium 的 `v10` 之外还有一层客户端级加密，离线拿不到
+明文 `sessionid`。而字节 passport 是 30 天**滑动**续期：客户端带有效会话上线一次，
+服务端就顺延。所以保活 = 启动 → 等待 → 优雅关闭；cookie 解密只用于诊断。
+
+**抓包凭证回写有三条硬约束**（都来自实测踩坑）：
+
+- **目标账号取抓包文件自己的 uid**：早期用「uid 探测链」定位目标，而凭证来自抓包
+  文件，两者来源不同，实测导致两个账号拿到了**同一个** sessionid（跨账号污染）
+- **绝不自动建号**：浏览器网页版与其他字节系应用也会产生豆包 cookie，
+  无差别建号会污染账号池
+- **幂等**：`session_id`、`sid_guard`、`ttwid` 三者都没变时不写盘，
+  否则每 20 秒的轮询会把文件时间戳刷得毫无意义
+
+**多 Profile 遍历不可省**：豆包自带账号隔离，登录会话可能位于**任意** Profile。
+只抓 `Default` 会漏掉活跃会话，恢复后客户端打开的活跃 Profile 未登录 ——
+这是实测根因，不是理论担忧。恢复前还会校验快照 `schemaVersion` 与 leveldb 的
+`CURRENT` → `MANIFEST` 完整性，并修复 `Local State` 的活跃 Profile 指针。
+
+> **对话正文存在豆包云端**，按账号归属。本地备份的是客户端状态（会话列表缓存、
+> 技能配置）；恢复并重新登录后完整历史会从云端重新同步。需要把对话带走时用
+> 「导出对话」，它直接调官方接口拉取正文。
 
 ### 智能体管理
 
@@ -844,7 +914,7 @@ cd path/to/workbuddy2api && go test ./...
 
 | 项目 | 作者 | 提供的部分 | 许可证 |
 |---|---|---|---|
-| [ai-gateway](https://github.com/changexbc/ai-gateway) | [changexbc](https://github.com/changexbc) | 桌面 GUI 外壳、账号管理、签到、积分与 Token 统计、托盘、CLI 切换等全部界面与核心逻辑 | **MIT** |
+| [workbuddy-switch](https://github.com/changexbc/workbuddy-switch) | [changexbc](https://github.com/changexbc) | 桌面 GUI 外壳、账号管理、签到、积分与 Token 统计、托盘、CLI 切换等全部界面与核心逻辑 | **MIT** |
 | [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | [Sliverkiss](https://github.com/Sliverkiss) | OpenAI 兼容网关（账号池轮转、熔断冷却、会话粘性、SSE 规范化、猫猫旅行等） | **MIT** |
 
 两个上游项目均采用 **MIT 许可证**，允许使用、修改与再分发。本仓库已保留其原始
@@ -886,7 +956,7 @@ Copyright (c) 2026 momo0410          （本项目整合部分）
 
 如果这个项目对你有帮助，欢迎给上游项目点个 Star ⭐
 
-[ai-gateway](https://github.com/changexbc/ai-gateway) ·
+[workbuddy-switch](https://github.com/changexbc/workbuddy-switch) ·
 [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)
 
 </div>
