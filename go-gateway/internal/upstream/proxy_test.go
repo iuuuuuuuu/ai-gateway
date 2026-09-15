@@ -77,6 +77,20 @@ func TestSetProxyTolerateHostPortOnly(t *testing.T) {
 // TestSetProxyEmptyFallsBackToEnv 空串 = 不用显式代理，回落环境变量（保持旧行为）。
 func TestSetProxyEmptyFallsBackToEnv(t *testing.T) {
 	c := New()
+	// 先设一个显式代理，再清空 —— 这样才有一个**确定性**可断言的对象：
+	// 「清空之后不得再指向刚设的那个地址」。
+	//
+	// 不能用 t.Setenv 清空 HTTPS_PROXY 后断言「必然直连」：httpproxy 的配置在
+	// 进程内**首次读取即缓存**（net/http 的 envProxyOnce），t.Setenv 无法生效；
+	// 而且开发机常有 HTTP_PROXY/HTTPS_PROXY（实测 127.0.0.1:7897），
+	// 断言「直连」会让用例依赖运行环境（CI 绿、本机红）。
+	const explicit = "http://127.0.0.1:1"
+	if err := c.SetProxy(explicit); err != nil {
+		t.Fatal(err)
+	}
+	if c.ProxyURL() != explicit {
+		t.Fatalf("ProxyURL()=%q，应为 %q", c.ProxyURL(), explicit)
+	}
 	if err := c.SetProxy(""); err != nil {
 		t.Fatal(err)
 	}
@@ -87,12 +101,23 @@ func TestSetProxyEmptyFallsBackToEnv(t *testing.T) {
 	if tr.Proxy == nil {
 		t.Fatal("仍应有 Proxy 函数（回落 ProxyFromEnvironment）")
 	}
-	// 环境变量为空时应返回 nil（= 直连）
-	t.Setenv("HTTPS_PROXY", "")
-	t.Setenv("HTTP_PROXY", "")
 	req, _ := http.NewRequest("GET", "https://www.workbuddy.ai", nil)
-	if got, err := tr.Proxy(req); err != nil || got != nil {
-		t.Errorf("环境变量为空时应直连，实际 proxy=%v err=%v", got, err)
+	got, err := tr.Proxy(req)
+	if err != nil {
+		t.Fatalf("Proxy(req) 报错: %v", err)
+	}
+	if got != nil && got.String() == explicit {
+		t.Fatalf("清空后仍指向刚设的显式代理 %s —— SetProxy(\"\") 没有回落环境变量", explicit)
+	}
+	// 与标准库行为一致即可（环境变量可能有值，且被首次读取缓存，故不断言必然为 nil）。
+	want, werr := http.ProxyFromEnvironment(req)
+	if werr != nil {
+		t.Fatalf("ProxyFromEnvironment 报错: %v", werr)
+	}
+	if (got == nil) != (want == nil) {
+		t.Errorf("空串应回落 ProxyFromEnvironment：got=%v want=%v", got, want)
+	} else if got != nil && got.String() != want.String() {
+		t.Errorf("空串应回落 ProxyFromEnvironment：got=%v want=%v", got, want)
 	}
 }
 

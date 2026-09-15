@@ -222,7 +222,8 @@ function formatRelativeTime(deltaMs: number): string {
 }
 
 /** 把剩余秒数格式化成「1 小时 5 分钟」这类中文时长。 */
-function formatRemaining(sec: number): string {  if (sec <= 0) return "即将恢复";
+function formatRemaining(sec: number): string {
+  if (sec <= 0) return "即将恢复";
   const totalMinutes = Math.max(1, Math.ceil(sec / 60));
   const hours = Math.floor(totalMinutes / 60);
   const minutes = totalMinutes % 60;

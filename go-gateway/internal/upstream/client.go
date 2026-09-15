@@ -250,9 +250,15 @@ func isCreditExhaustedCode(body string) bool {
 //
 // 返回空串表示没有更优的表述，调用方应回退到原始文案。
 func FriendlyMessage(kind ErrKind, status int, body string) string {
-	switch {
-	case kind == ErrHardCredit || isCreditExhaustedCode(body):
+	// 业务码优先，但**只有响应体里真的带 14018 时才把该码写进文案**：
+	// ErrHardCredit 也可能来自 HTTP 402 或关键词命中，此时硬写「上游 14018」
+	// 会让用户拿着一个与响应不符的码去排查。
+	if isCreditExhaustedCode(body) {
 		return "账号额度已耗尽（上游 " + strconv.Itoa(creditExhaustedCode) + "）：请为该账号充值，或等待签到 / 免费额度恢复后重试"
+	}
+	switch {
+	case kind == ErrHardCredit:
+		return "账号额度已耗尽：请为该账号充值，或等待签到 / 免费额度恢复后重试"
 	case kind == ErrModelRate:
 		return "该账号在此模型上已达频率上限，已按上游给出的重置时间冷却；同一账号的其他模型仍可用"
 	case kind == ErrSoftRate:

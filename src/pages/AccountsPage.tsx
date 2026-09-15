@@ -596,7 +596,8 @@ export default function AccountsPage() {
     }
   }
 
-  async function onSwitchCodebuddyCli(account: AccountMeta) {    if (codebuddyCliSwitchingId !== null) return;
+  async function onSwitchCodebuddyCli(account: AccountMeta) {
+    if (codebuddyCliSwitchingId !== null) return;
     setCodebuddyCliSwitchingId(account.id);
     const toastId = toast.loading("正在切换 CodeBuddy CLI…", {
       description: `正在将默认账号设为 ${account.nickname || account.email || account.id}`,

@@ -164,6 +164,16 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
 				lastErr = err
 				var ue *upstream.Error
+				// 末尾的可读文案读的是 lastKind/lastBody/lastTransportErr，三者必须
+				// 与 lastErr 同步更新 —— 否则会沿用**上一个账号**留下的分类，例如把
+				// 「刷新失败」报成「额度已耗尽」，把用户引向错误的排查方向。
+				if errors.As(err, &ue) {
+					lastKind, lastTransportErr = ue.Kind, nil
+				} else {
+					// 非 upstream.Error 的失败基本都是传输层（超时 / 连接被拒）
+					lastKind, lastTransportErr = upstream.ErrNone, err
+				}
+				lastBody = ""
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
 				} else {
