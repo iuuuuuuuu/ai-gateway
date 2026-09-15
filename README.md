@@ -464,7 +464,7 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 
 ### 安装方式一：安装包（推荐）
 
-从 [Releases](https://github.com/momo0410/ai-gateway/releases/latest) 下载：
+从 [Releases](https://github.com/momo0410/workbuddy-switch-gateway/releases/latest) 下载：
 
 | 文件 | 说明 |
 |---|---|

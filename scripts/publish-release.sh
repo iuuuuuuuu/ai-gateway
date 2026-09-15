@@ -22,7 +22,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
 OWNER="${RELEASE_OWNER:-momo0410}"
-REPO="${RELEASE_REPO:-ai-gateway}"
+# 仓库名与应用显示名不同：显示名是 AI Gateway，GitHub 仓库仍是
+# workbuddy-switch-gateway（未改名）。这里写错会让自动更新 404。
+REPO="${RELEASE_REPO:-workbuddy-switch-gateway}"
 SETUP_NAME="ai-gateway-windows-x86_64-setup.exe"
 WORK_DIR="$REPO_ROOT/.release-staging"
 

@@ -19,9 +19,12 @@ use crate::modules::config::{
 
 /// 应用当前版本（来自 Cargo.toml package.version）。
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-/// 本整合版仓库所有者（与上游 changexbc/ai-gateway 区分开）。
+/// 本整合版仓库所有者（与上游 changexbc/workbuddy-switch 区分开）。
 pub const GITHUB_OWNER: &str = "momo0410";
-pub const GITHUB_REPO: &str = "ai-gateway";
+/// 仓库名必须与 git 远端一致。应用显示名已改为 AI Gateway，但 GitHub 仓库
+/// **没有**改名，仍叫 workbuddy-switch-gateway —— 这里写 "ai-gateway" 会让
+/// 检查更新与自动更新全部 404（v1.0.0 就踩过这个坑，见下方单测）。
+pub const GITHUB_REPO: &str = "workbuddy-switch-gateway";
 
 /// 成功结果缓存有效期（6 小时）。自动轮询（30 分钟）命中缓存，不发网络请求；
 /// 设置页手动检查传 force=true 绕过缓存强制刷新。
@@ -320,13 +323,44 @@ mod tests {
 
     #[test]
     fn updater_manifest_urls_lists_merged_then_platform_specific() {
-        let urls = updater_manifest_urls("momo0410", "ai-gateway", "windows", "x86_64");
+        let urls = updater_manifest_urls("momo0410", "workbuddy-switch-gateway", "windows", "x86_64");
         assert_eq!(
             urls,
             vec![
-                "https://github.com/momo0410/ai-gateway/releases/latest/download/latest.json",
-                "https://github.com/momo0410/ai-gateway/releases/latest/download/latest-windows-x86_64.json",
+                "https://github.com/momo0410/workbuddy-switch-gateway/releases/latest/download/latest.json",
+                "https://github.com/momo0410/workbuddy-switch-gateway/releases/latest/download/latest-windows-x86_64.json",
             ]
+        );
+    }
+
+    /// 仓库名写错会让「检查更新」与自动更新同时 404，而这类错误**不会**在
+    /// 构建或运行时报错，只会在用户点更新时静默失败（v1.0.0 发布后才发现
+    /// 端点指向并不存在的 momo0410/ai-gateway）。所以把三处仓库名钉在一起：
+    /// 本模块常量、tauri.conf.json 的 updater endpoints、前端的 update.ts。
+    #[test]
+    fn repo_name_stays_in_sync_across_config_and_frontend() {
+        const TAURI_CONF: &str = include_str!("../../../../src-tauri/tauri.conf.json");
+        const FRONTEND_UPDATE_TS: &str = include_str!("../../../../src/lib/update.ts");
+        let expected = format!("github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest/download/");
+
+        assert!(
+            TAURI_CONF.contains(&expected),
+            "tauri.conf.json 的 updater endpoints 必须指向 {expected}，否则客户端自动更新会 404"
+        );
+        assert!(
+            FRONTEND_UPDATE_TS.contains(&format!("GITHUB_REPO = \"{GITHUB_REPO}\"")),
+            "src/lib/update.ts 的 GITHUB_REPO 必须与 update.rs 的 GITHUB_REPO 一致（{GITHUB_REPO}）"
+        );
+    }
+
+    /// 仓库**已改名**时这个断言会失败，提醒同步 scripts/gen-update-json.sh 与
+    /// scripts/publish-release.sh 里同为 "ai-gateway" 的默认 REPO 值。
+    #[test]
+    fn gen_update_json_default_repo_matches_constant() {
+        const GEN_UPDATE_JSON: &str = include_str!("../../../../scripts/gen-update-json.sh");
+        assert!(
+            GEN_UPDATE_JSON.contains(&format!("REPO=\"${{2:-{GITHUB_REPO}}}\"")),
+            "scripts/gen-update-json.sh 的默认 REPO 必须与 GITHUB_REPO（{GITHUB_REPO}）一致"
         );
     }
 

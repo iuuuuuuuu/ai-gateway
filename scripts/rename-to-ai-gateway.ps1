@@ -13,6 +13,18 @@
       - agent_import 的 PROVIDER_NAME（改为 AI Gateway）
       - 构建脚本/发布工作流里的产品显示名残留
       - 上游归属链接被误替换（已还原，许可证合规要求保留原作者与原始仓库）
+
+    **已知的过度替换（重要，v1.0.0 发布后才发现）：**
+      规则表里的 `workbuddy-switch-gateway -> ai-gateway` 把**GitHub 仓库 URL**
+      也一起改了，而仓库当时并没有改名。于是 tauri.conf.json 的 updater
+      endpoints、update.rs / update.ts 的 GITHUB_REPO、gen-update-json.sh 与
+      publish-release.sh 的默认 REPO 全部指向不存在的 momo0410/ai-gateway，
+      导致检查更新与自动更新一律 404（构建期完全看不出来）。已全部改回
+      workbuddy-switch-gateway，并由 update.rs 的
+      `repo_name_stays_in_sync_across_config_and_frontend` 单测钉住。
+
+      教训：**应用显示名与仓库名是两件事**。仓库确实要改名时，除上述四处外
+      还要同步 README 的 Releases 链接，并确认 GitHub 的旧名重定向仍然生效。
 #>
 [CmdletBinding()]
 param(
