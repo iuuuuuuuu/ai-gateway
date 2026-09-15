@@ -523,7 +523,7 @@ export interface CodeBuddyCnIdeSwitchResult {
 // 网关（workbuddy2api）集成
 // ---------------------------------------------------------------------------
 
-/** 网关配置（持久化在 ~/.wb-switch/gateway/gateway_config.json）。 */
+/** 网关配置（持久化在 ~/.ai-gateway/gateway/gateway_config.json）。 */
 /* 网关工作模式：
  * balance —— 负载均衡（默认）：账号池加权随机选号，自动避开冷却/熔断账号
  * pinned  —— 指定账号：只使用 pinned_uid 对应的那一个账号

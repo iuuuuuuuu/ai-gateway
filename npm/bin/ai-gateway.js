@@ -1,0 +1,30 @@
+#!/usr/bin/env node
+// ai-gateway npm 入口：spawn 平台二进制（postinstall 下载，见 scripts/install.js）。
+const { spawnSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+
+const binDir = path.join(__dirname, "..", "bin");
+
+// Windows-only 平台 → 二进制文件名（与 install.js 保持一致）
+const FILE = {
+  "win32-x64": "ai-gateway-win32-x64.exe",
+}[`${process.platform}-${process.arch}`];
+
+if (!FILE) {
+  console.error(
+    `ai-gateway: 不支持平台 ${process.platform}-${process.arch}（本包仅支持 Windows x64）`,
+  );
+  process.exit(1);
+}
+
+const binPath = path.join(binDir, FILE);
+if (!fs.existsSync(binPath)) {
+  console.error(
+    "ai-gateway: 未找到平台二进制，请重新安装（npm install -g ai-gateway 触发下载）",
+  );
+  process.exit(1);
+}
+
+const result = spawnSync(binPath, process.argv.slice(2), { stdio: "inherit" });
+process.exit(result.status ?? 1);

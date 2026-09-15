@@ -1,6 +1,6 @@
 <div align="center">
 
-# WorkBuddy Switch Gateway
+# AI Gateway
 
 **账号管理 + OpenAI 兼容网关，一个桌面应用搞定**
 
@@ -9,7 +9,7 @@
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB.svg)](https://tauri.app)
 [![Gateway](https://img.shields.io/badge/API-OpenAI%20Compatible-412991.svg)](#兼容网关)
 
-把 [workbuddy-switch](https://github.com/changexbc/workbuddy-switch) 的账号管理能力
+把 [ai-gateway](https://github.com/changexbc/ai-gateway) 的账号管理能力
 与 [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的 OpenAI 兼容网关，
 整合进同一个桌面应用：**一个安装包、一个界面、一个进程树**。
 
@@ -46,7 +46,7 @@
 
 ### 账号管理
 
-源自 [workbuddy-switch](https://github.com/changexbc/workbuddy-switch)。
+源自 [ai-gateway](https://github.com/changexbc/ai-gateway)。
 
 | 模块 | 能力 |
 |---|---|
@@ -286,7 +286,7 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 |---|---|---|
 | 当前登录态 | `auth/workbuddy-desktop.info`、`workbuddy-desktop-ai.info` | 每区域各 1 个（固定文件名） |
 | 历史登录快照 | `auth/workbuddy-desktop[-ai].<时间>.<pid>.<uuid>.info` | 客户端每次登录/切换时留存 |
-| 切换备份 | `~/.wb-switch/backups/*.info` | 本工具每次切换账号前的备份 |
+| 切换备份 | `~/.ai-gateway/backups/*.info` | 本工具每次切换账号前的备份 |
 
 弹框里可勾选任意多个账号批量导入，并标注每个候选的来源、区域与凭证可用性
 （可保活 / 仅 access 有效 / 凭证已过期），已在账号库中的会标出「已在账号库」或「将更新」。
@@ -328,7 +328,7 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 > 数据，留着开关只会让用户切到 `all` 后得到一堆无意义的失败日志，故已移除。
 > 历史配置里残留的 `region_scope` 会被忽略。
 >
-> 若上游日后补齐了国际版接口，可手动把 `~/.wb-switch/gateway/gateway_native_config.json`
+> 若上游日后补齐了国际版接口，可手动把 `~/.ai-gateway/gateway/gateway_native_config.json`
 > 的 `schedule.checkin_scope` 改成 `"all"`，让**网关侧**的签到与旅行覆盖国际版
 > （默认 `"cn"`，不在界面上暴露）。App 侧无此开关。
 
@@ -340,25 +340,25 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 ## 架构设计
 
 ```
-┌──────────────────── wb-switch.exe（单一可执行文件）────────────────────┐
+┌──────────────────── ai-gateway.exe（单一可执行文件）────────────────────┐
 │                                                                        │
 │  桌面壳（Tauri 2 / Rust）                                               │
 │  ├─ 主窗口：内嵌 React 前端（账号管理 · Token 统计 · 积分统计 · 兼容网关）│
 │  ├─ 系统托盘与单实例保护                                                │
 │  └─ 后台任务：签到 · 保活 · 自动轮换 · 旅行 · 账号同步                   │
 │                                                                        │
-│  wb-switch-core（Rust 库）                                              │
+│  ai-gateway-core（Rust 库）                                              │
 │  ├─ account / auth_file / switch / session …   账号与登录态             │
 │  ├─ checkin / refresh / rotate / travel …      定时任务                 │
 │  ├─ gateway.rs                                 网关托管与账号桥接        │
 │  └─ gateway_embed.rs                           内嵌网关的释放与缓存      │
 │                                                                        │
 │  内嵌网关二进制（Go，gzip 压缩，构建期写入）                              │
-│  └─ 运行时释放为 ~/.wb-switch/gateway/bin/gateway-<指纹>.exe            │
+│  └─ 运行时释放为 ~/.ai-gateway/gateway/bin/gateway-<指纹>.exe            │
 └────────────────────────────────────────────────────────────────────────┘
             │                                        │
             ▼                                        ▼
-  ~/.wb-switch/accounts.json              ~/.wb-switch/gateway/
+  ~/.ai-gateway/accounts.json              ~/.ai-gateway/gateway/
      （账号库 · 唯一真源）                    └─ gateway_auths/
                                                  （网关凭证 · 派生素材）
 ```
@@ -389,31 +389,31 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 
 ### 安装方式一：安装包（推荐）
 
-从 [Releases](https://github.com/momo0410/workbuddy-switch-gateway/releases/latest) 下载：
+从 [Releases](https://github.com/momo0410/ai-gateway/releases/latest) 下载：
 
 | 文件 | 说明 |
 |---|---|
-| `workbuddy-switch_<版本>_aarch64.dmg` | macOS（Apple Silicon）磁盘映像，拖入「应用程序」即安装 |
-| `workbuddy-switch_<版本>_x64.dmg` | macOS（Intel）磁盘映像，同上 |
-| `WorkBuddy.Switch.Gateway_<版本>_x64-setup.exe` | Windows 安装向导，自动创建开始菜单与卸载项 |
-| `WorkBuddy.Switch.Gateway_<版本>_x64_en-US.msi` | Windows MSI 包，适合批量部署 |
-| `WorkBuddy_Switch_Gateway_<版本>_portable.zip` | Windows 便携版，解压即用，不写入注册表 |
-| `WorkBuddy.Switch.Gateway_<版本>_amd64.deb` | Linux（Debian/Ubuntu）安装包 |
-| `WorkBuddy.Switch.Gateway_<版本>_amd64.AppImage` | Linux 免安装可执行文件 |
+| `ai-gateway_<版本>_aarch64.dmg` | macOS（Apple Silicon）磁盘映像，拖入「应用程序」即安装 |
+| `ai-gateway_<版本>_x64.dmg` | macOS（Intel）磁盘映像，同上 |
+| `AI.Gateway_<版本>_x64-setup.exe` | Windows 安装向导，自动创建开始菜单与卸载项 |
+| `AI.Gateway_<版本>_x64_en-US.msi` | Windows MSI 包，适合批量部署 |
+| `AI_Gateway_<版本>_portable.zip` | Windows 便携版，解压即用，不写入注册表 |
+| `AI.Gateway_<版本>_amd64.deb` | Linux（Debian/Ubuntu）安装包 |
+| `AI.Gateway_<版本>_amd64.AppImage` | Linux 免安装可执行文件 |
 
 ### 安装方式二：便携版（Windows，免安装）
 
-下载 `WorkBuddy_Switch_Gateway_<版本>_portable.zip`，解压后双击 `wb-switch-rust.exe`
+下载 `AI_Gateway_<版本>_portable.zip`，解压后双击 `ai-gateway.exe`
 即可运行，不写入注册表。
 
-> `WebView2Loader.dll` 必须与 `wb-switch-rust.exe` 位于同一目录，请勿删除。
+> `WebView2Loader.dll` 必须与 `ai-gateway.exe` 位于同一目录，请勿删除。
 
 ### 更新到新版本
 
 - **安装版（推荐）**：直接双击新版安装包即可**覆盖更新** —— 安装器不会询问是否
   卸载，安装目录沿用上次位置（自定义目录同样适用），只更新程序文件并把注册表版本
   提升到新版本；安装前会自动结束正在运行的旧版本。
-- **便携版**：解压新版便携包，把 `wb-switch-rust.exe` 覆盖到程序目录
+- **便携版**：解压新版便携包，把 `ai-gateway.exe` 覆盖到程序目录
   （`WebView2Loader.dll` 无需更换），重启应用即可。
 - **应用内更新**：应用检测到新版本后会提示下载并运行安装包，流程与双击安装包一致。
 
@@ -427,7 +427,7 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 > 网关源码随仓库分发在 `go-gateway/`，无需另行 clone 上游、也不需要打补丁。
 
 ```bash
-# 1) 构建网关（Go）—— 产物落到 crates/wb-switch-core/embedded/，
+# 1) 构建网关（Go）—— 产物落到 crates/ai-gateway-core/embedded/，
 #    cargo build 时由 build.rs 压缩内嵌进主程序
 sh scripts/build-gateway.sh                              # 当前平台
 GOOS=windows GOARCH=amd64 sh scripts/build-gateway.sh    # 交叉编译到指定平台
@@ -440,11 +440,11 @@ npm run tauri -- build --bundles nsis,msi                # Windows
 
 # 3) macOS 额外产出 dmg（无头环境也能打，不依赖 Finder）
 sh scripts/make-dmg.sh <版本> <aarch64|x86_64> \
-  "target/release/bundle/macos/WorkBuddy Switch Gateway.app"
+  "target/release/bundle/macos/AI Gateway.app"
 ```
 
 > macOS 产物为 adhoc 签名（无 Apple 开发者证书），首次打开若提示「已损坏」，执行
-> `xattr -cr "/Applications/WorkBuddy Switch Gateway.app"` 放行。
+> `xattr -cr "/Applications/AI Gateway.app"` 放行。
 
 开发调试命令：
 
@@ -462,17 +462,17 @@ Linux x64 三个平台并建 Release。日常 push 走 `.github/workflows/ci.yml
 
 **npm 版（webui）发布**：
 
-1. CI 在 tag 发布时编译 server 二进制，作为平台包 `workbuddy-switch-win32-x64` 发布到 npm registry
-2. `cd npm && npm publish`（包名 `workbuddy-switch`，postinstall 从平台包复制二进制到 `bin/`，不依赖 GitHub）
+1. CI 在 tag 发布时编译 server 二进制，作为平台包 `ai-gateway-win32-x64` 发布到 npm registry
+2. `cd npm && npm publish`（包名 `ai-gateway`，postinstall 从平台包复制二进制到 `bin/`，不依赖 GitHub）
 
 ### 目录结构
 
 ```
 src-tauri/src/       # Tauri command 薄包装与托盘
 crates/
-  wb-switch-core/    # 核心逻辑：账号/认证/切换/会话/签到/刷新/更新/配置/智能体接入
-  wb-switch-server/  # HTTP server + CLI：axum API + rust-embed 前端
-  wb-switch-gateway/ # 网关内核（Rust 移植版，chat_completions 仍为占位）
+  ai-gateway-core/    # 核心逻辑：账号/认证/切换/会话/签到/刷新/更新/配置/智能体接入
+  ai-gateway-server/  # HTTP server + CLI：axum API + rust-embed 前端
+  ai-gateway-router/ # 网关内核（Rust 移植版，chat_completions 仍为占位）
 src/                 # 前端：components/pages/lib（api.ts 双通道：Tauri invoke / HTTP fetch）
 go-gateway/          # Go 版网关源码（当前实际构建依赖，编译后内嵌）
 npm/                 # npm 包：package.json + bin + scripts/install.js
@@ -508,7 +508,7 @@ scripts/             # 构建与发布脚本
    Claude 系客户端按 Sonnet / Opus / Haiku / Fable 四个槽位顺序映射
 3. 单卡片「一键接入」只写入该客户端；顶部「一键更新所有已安装智能体」逐客户端执行，
    单个失败不会影响其他客户端
-4. 每次写入前自动备份到 `~/.wb-switch/agent-backups/<客户端>/<时间戳>/`，
+4. 每次写入前自动备份到 `~/.ai-gateway/agent-backups/<客户端>/<时间戳>/`，
    卡片「备份历史」中可查看并一键回滚
 
 > 接入会覆盖各客户端现有网关配置（每次均自动备份）。以 Claude Desktop 为例，
@@ -560,7 +560,7 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 
 ### 网关配置项
 
-配置文件位于 `~/.wb-switch/gateway/gateway_config.json`，也可在界面中修改：
+配置文件位于 `~/.ai-gateway/gateway/gateway_config.json`，也可在界面中修改：
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
@@ -598,13 +598,13 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 
 | 内容 | 路径 | 说明 |
 |---|---|---|
-| 账号库 | `~/.wb-switch/accounts.json` | **唯一真源**，含所有账号凭证，建议单独备份 |
-| 网关凭证 | `~/.wb-switch/gateway/gateway_auths/` | 由账号库派生，删除后可自动重建 |
-| 网关配置 | `~/.wb-switch/gateway/gateway_config.json` | 端口、API Key、模式等 |
-| 网关原生配置 | `~/.wb-switch/gateway/gateway_native_config.json` | 转换后交给网关进程的配置 |
-| 内嵌网关副本 | `~/.wb-switch/gateway/bin/` | 按内容指纹命名，版本升级后自动更新 |
-| 智能体配置备份 | `~/.wb-switch/agent-backups/` | 一键接入前自动备份，可随时回滚 |
-| 签到 / 轮换日志 | `~/.wb-switch/*_logs.json` | 最多保留 30 天 |
+| 账号库 | `~/.ai-gateway/accounts.json` | **唯一真源**，含所有账号凭证，建议单独备份 |
+| 网关凭证 | `~/.ai-gateway/gateway/gateway_auths/` | 由账号库派生，删除后可自动重建 |
+| 网关配置 | `~/.ai-gateway/gateway/gateway_config.json` | 端口、API Key、模式等 |
+| 网关原生配置 | `~/.ai-gateway/gateway/gateway_native_config.json` | 转换后交给网关进程的配置 |
+| 内嵌网关副本 | `~/.ai-gateway/gateway/bin/` | 按内容指纹命名，版本升级后自动更新 |
+| 智能体配置备份 | `~/.ai-gateway/agent-backups/` | 一键接入前自动备份，可随时回滚 |
+| 签到 / 轮换日志 | `~/.ai-gateway/*_logs.json` | 最多保留 30 天 |
 
 > `accounts.json` 包含可直接登录的凭证，请勿分享或提交到版本库。
 
@@ -666,7 +666,7 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 **Q：「从本机导入」能找回历史登录过的账号吗？**
 > 能。它会扫描当前登录态（每区域 1 个固定文件）、客户端留存的历史登录快照
 > （`workbuddy-desktop[-ai].<时间>.<pid>.<uuid>.info`）以及本工具的切换备份
-> （`~/.wb-switch/backups/`），可在弹框里一次勾选多个账号导入。
+> （`~/.ai-gateway/backups/`），可在弹框里一次勾选多个账号导入。
 >
 > 同一 `(区域, uid)` 的多份文件只保留**凭证最新**的一份（按可用性 → 到期时间 →
 > 文件修改时间取优），避免旧快照里已被轮换的 refresh token 顶掉有效凭证。
@@ -678,7 +678,7 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 > 因此国际版模型来自内置静态表（取自客户端本地配置 `acc-product-config-v3.json`）。
 > 上游新增模型时需要同步更新该表。
 
-**Q：能同时运行上游的 workbuddy-switch 吗？**
+**Q：能同时运行上游的 ai-gateway 吗？**
 > 可以。两者的应用标识与安装目录不同，互不冲突。
 
 ---
@@ -688,7 +688,7 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 ### 项目结构
 
 ```
-crates/wb-switch-core/        核心逻辑（不依赖 Tauri，可被桌面端与 HTTP 服务复用）
+crates/ai-gateway-core/        核心逻辑（不依赖 Tauri，可被桌面端与 HTTP 服务复用）
   src/modules/account.rs        账号存储
   src/modules/auth_file.rs      认证文件读写 + 本机历史登录态扫描（本项目扩展）
   src/modules/refresh.rs        Token 刷新与保活（含传输层失败与凭证失效的区分）
@@ -698,7 +698,7 @@ crates/wb-switch-core/        核心逻辑（不依赖 Tauri，可被桌面端�
   src/modules/travel.rs         猫猫旅行（App 侧）
   src/modules/yaml_lite.rs      轻量 YAML 读写（本项目新增）
   build.rs                      构建期压缩内嵌网关（本项目新增）
-crates/wb-switch-server/      HTTP 服务形态（npm / webui）
+crates/ai-gateway-server/      HTTP 服务形态（npm / webui）
 src/                          React 前端
   src/pages/GatewayPage.tsx     兼容网关页面（本项目新增）
   src/pages/AgentsPage.tsx      智能体管理页面（本项目新增）
@@ -844,7 +844,7 @@ cd path/to/workbuddy2api && go test ./...
 
 | 项目 | 作者 | 提供的部分 | 许可证 |
 |---|---|---|---|
-| [workbuddy-switch](https://github.com/changexbc/workbuddy-switch) | [changexbc](https://github.com/changexbc) | 桌面 GUI 外壳、账号管理、签到、积分与 Token 统计、托盘、CLI 切换等全部界面与核心逻辑 | **MIT** |
+| [ai-gateway](https://github.com/changexbc/ai-gateway) | [changexbc](https://github.com/changexbc) | 桌面 GUI 外壳、账号管理、签到、积分与 Token 统计、托盘、CLI 切换等全部界面与核心逻辑 | **MIT** |
 | [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | [Sliverkiss](https://github.com/Sliverkiss) | OpenAI 兼容网关（账号池轮转、熔断冷却、会话粘性、SSE 规范化、猫猫旅行等） | **MIT** |
 
 两个上游项目均采用 **MIT 许可证**，允许使用、修改与再分发。本仓库已保留其原始
@@ -862,7 +862,7 @@ cd path/to/workbuddy2api && go test ./...
 ```
 MIT License
 
-Copyright (c) 2026 wb-switch        （workbuddy-switch 原作者）
+Copyright (c) 2026 ai-gateway        （ai-gateway 原作者）
 Copyright (c) 2026 Sliverkiss        （workbuddy2api 原作者）
 Copyright (c) 2026 momo0410          （本项目整合部分）
 ```
@@ -886,7 +886,7 @@ Copyright (c) 2026 momo0410          （本项目整合部分）
 
 如果这个项目对你有帮助，欢迎给上游项目点个 Star ⭐
 
-[workbuddy-switch](https://github.com/changexbc/workbuddy-switch) ·
+[ai-gateway](https://github.com/changexbc/ai-gateway) ·
 [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)
 
 </div>

@@ -4,8 +4,8 @@
 # 为什么需要这个脚本：
 #   tauri updater 客户端从 releases/latest/download/latest.json 拉取版本清单，
 #   清单里的 signature 是对「下载 URL 对应的那个文件名」做的签名。
-#   安装包在原始 bundle 目录里叫 workbuddy-switch_<版本>_x64-setup.exe，
-#   而 Release 上为了固定 URL 重命名为 workbuddy-switch-windows-x86_64-setup.exe，
+#   安装包在原始 bundle 目录里叫 ai-gateway_<版本>_x64-setup.exe，
+#   而 Release 上为了固定 URL 重命名为 ai-gateway-windows-x86_64-setup.exe，
 #   两者字节相同但文件名不同 —— 必须对重命名后的文件重新签名，否则客户端校验失败。
 #
 # 用法：
@@ -16,14 +16,14 @@
 #
 # 私钥来源（按优先级）：
 #   1. 环境变量 TAURI_SIGNING_PRIVATE_KEY（内容或路径）
-#   2. ~/.wb-switch/wb-switch-updater.key
+#   2. ~/.ai-gateway/ai-gateway-updater.key
 set -e
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
 OWNER="${RELEASE_OWNER:-momo0410}"
-REPO="${RELEASE_REPO:-workbuddy-switch-gateway}"
-SETUP_NAME="workbuddy-switch-windows-x86_64-setup.exe"
+REPO="${RELEASE_REPO:-ai-gateway}"
+SETUP_NAME="ai-gateway-windows-x86_64-setup.exe"
 WORK_DIR="$REPO_ROOT/.release-staging"
 
 # ── 1. 解析版本与 tag ─────────────────────────────────────────────
@@ -39,7 +39,7 @@ fi
 echo "发布目标：$TAG（版本 $VER）"
 
 # ── 2. 定位签名私钥 ──────────────────────────────────────────────
-KEY_FILE="${HOME}/.wb-switch/wb-switch-updater.key"
+KEY_FILE="${HOME}/.ai-gateway/ai-gateway-updater.key"
 if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ] && [ -f "$KEY_FILE" ]; then
   TAURI_SIGNING_PRIVATE_KEY="$(cat "$KEY_FILE")"
   export TAURI_SIGNING_PRIVATE_KEY
@@ -58,10 +58,10 @@ fi
 mkdir -p "$WORK_DIR"
 SRC_SETUP=""
 for cand in \
-  "$REPO_ROOT/target/release/bundle/nsis/workbuddy-switch_${VER}_x64-setup.exe" \
-  "$REPO_ROOT/target/x86_64-pc-windows-msvc/release/bundle/nsis/workbuddy-switch_${VER}_x64-setup.exe" \
-  "$REPO_ROOT/src-tauri/target/release/bundle/nsis/workbuddy-switch_${VER}_x64-setup.exe" \
-  "$REPO_ROOT/target/release/bundle/nsis/WorkBuddy Switch Gateway_${VER}_x64-setup.exe"; do
+  "$REPO_ROOT/target/release/bundle/nsis/ai-gateway_${VER}_x64-setup.exe" \
+  "$REPO_ROOT/target/x86_64-pc-windows-msvc/release/bundle/nsis/ai-gateway_${VER}_x64-setup.exe" \
+  "$REPO_ROOT/src-tauri/target/release/bundle/nsis/ai-gateway_${VER}_x64-setup.exe" \
+  "$REPO_ROOT/target/release/bundle/nsis/AI Gateway_${VER}_x64-setup.exe"; do
   [ -f "$cand" ] && { SRC_SETUP="$cand"; break; }
 done
 

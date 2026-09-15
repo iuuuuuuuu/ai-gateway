@@ -11,7 +11,7 @@ import os
 
 application = defines.get("app")  # noqa: F821 - provided by dmgbuild
 if not application:
-    raise ValueError("dmgbuild requires -D app=/path/to/workbuddy-switch.app")
+    raise ValueError("dmgbuild requires -D app=/path/to/ai-gateway.app")
 
 application = os.path.abspath(application)
 if not os.path.isdir(application):

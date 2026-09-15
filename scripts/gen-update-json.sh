@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.." || exit 1
 # 默认值必须与 src-tauri/tauri.conf.json 的 updater endpoints 一致，
 # 否则生成的 URL 会指向别的仓库，客户端永远拉不到更新。
 OWNER="${1:-momo0410}"
-REPO="${2:-workbuddy-switch-gateway}"
+REPO="${2:-ai-gateway}"
 VERSION="${UPDATE_VERSION:-$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')}"
 UPDATE_OS="${UPDATE_OS:-windows}"
 UPDATE_ARCH="${UPDATE_ARCH:-x86_64}"

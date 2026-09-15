@@ -144,7 +144,7 @@ const exactTokenFormatter = new Intl.NumberFormat("en-US");
  */
 type GatewayLayout = "classic" | "merged";
 
-const LAYOUT_STORAGE_KEY = "wb-switch.gateway-layout";
+const LAYOUT_STORAGE_KEY = "ai-gateway.gateway-layout";
 
 /**
  * Radix Select 的「空值」哨兵。
@@ -980,8 +980,8 @@ export default function GatewayPage() {
           <AlertTriangle />
           <AlertTitle>未找到网关可执行文件</AlertTitle>
           <AlertDescription>
-            请把 <code className="font-mono">gateway.exe</code> 放到 workbuddy-switch
-            同目录，或用环境变量 <code className="font-mono">WB_SWITCH_GATEWAY_BIN</code> 指定路径。
+            请把 <code className="font-mono">gateway.exe</code> 放到 ai-gateway
+            同目录，或用环境变量 <code className="font-mono">AI_GATEWAY_ROUTER_BIN</code> 指定路径。
           </AlertDescription>
         </Alert>
       ) : null}

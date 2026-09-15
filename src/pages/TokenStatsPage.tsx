@@ -49,7 +49,7 @@ type RangeKey = "30d" | "today" | "7d" | "month";
 type OverviewRangeKey = "today" | "7d" | "30d" | "total";
 type DistributionKey = "projects" | "models";
 
-const TOKEN_SOURCE_STORAGE_KEY = "wb-switch:token-stats:source";
+const TOKEN_SOURCE_STORAGE_KEY = "ai-gateway:token-stats:source";
 const RANKING_LIMIT = 10;
 
 function isSourceKey(value: unknown): value is SourceKey {

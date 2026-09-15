@@ -11,11 +11,11 @@ use tauri::{
 };
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
-use wb_switch_core::modules::{checkin, gateway, update};
+use ai_gateway_core::modules::{checkin, gateway, update};
 
 const TRAY_ID: &str = "main-menu-bar";
 const MAIN_WINDOW_LABEL: &str = "main";
-const DEFAULT_TOOLTIP: &str = "workbuddy-switch";
+const DEFAULT_TOOLTIP: &str = "ai-gateway";
 const CHECKIN_TOOLTIP_RESTORE_SECS: u64 = 8;
 
 /// 系统自启注册的启动参数：仅携带该精确参数的启动进入静默托盘模式。
@@ -363,7 +363,7 @@ fn notify_checkin<R: Runtime>(app: &AppHandle<R>, body: &str) {
     let _ = app
         .notification()
         .builder()
-        .title("workbuddy-switch")
+        .title("ai-gateway")
         .body(body)
         .show();
 }
@@ -508,19 +508,19 @@ mod tests {
     #[test]
     fn silent_startup_matches_exact_hidden_arg() {
         assert!(is_silent_startup(["--hidden"]));
-        assert!(is_silent_startup(["wb-switch-rust", "--hidden"]));
-        assert!(is_silent_startup(["wb-switch-rust", "--hidden", "--debug"]));
+        assert!(is_silent_startup(["ai-gateway", "--hidden"]));
+        assert!(is_silent_startup(["ai-gateway", "--hidden", "--debug"]));
     }
 
     #[test]
     fn silent_startup_rejects_unrelated_and_substring_args() {
         assert!(!is_silent_startup(Vec::<&str>::new()));
-        assert!(!is_silent_startup(["wb-switch-rust"]));
-        assert!(!is_silent_startup(["wb-switch-rust", "--debug"]));
-        assert!(!is_silent_startup(["wb-switch-rust", "--hidden=true"]));
-        assert!(!is_silent_startup(["wb-switch-rust", "-hidden"]));
-        assert!(!is_silent_startup(["wb-switch-rust", "--hidden-x"]));
-        assert!(!is_silent_startup(["wb-switch-rust", "x--hidden"]));
+        assert!(!is_silent_startup(["ai-gateway"]));
+        assert!(!is_silent_startup(["ai-gateway", "--debug"]));
+        assert!(!is_silent_startup(["ai-gateway", "--hidden=true"]));
+        assert!(!is_silent_startup(["ai-gateway", "-hidden"]));
+        assert!(!is_silent_startup(["ai-gateway", "--hidden-x"]));
+        assert!(!is_silent_startup(["ai-gateway", "x--hidden"]));
     }
 
     #[test]
@@ -582,10 +582,10 @@ mod tests {
     #[test]
     fn app_bundle_path_from_packaged_exe() {
         use std::path::Path;
-        let exe = Path::new("/Applications/workbuddy-switch.app/Contents/MacOS/wb-switch-rust");
+        let exe = Path::new("/Applications/ai-gateway.app/Contents/MacOS/ai-gateway");
         assert_eq!(
             super::app_bundle_path_from_exe(exe),
-            Some(Path::new("/Applications/workbuddy-switch.app"))
+            Some(Path::new("/Applications/ai-gateway.app"))
         );
     }
 
@@ -594,11 +594,11 @@ mod tests {
         use std::path::Path;
         assert!(super::app_bundle_path_from_exe(Path::new("/tmp/exec")).is_none());
         assert!(
-            super::app_bundle_path_from_exe(Path::new("/Users/x/target/debug/wb-switch-rust"))
+            super::app_bundle_path_from_exe(Path::new("/Users/x/target/debug/ai-gateway"))
                 .is_none()
         );
         assert!(super::app_bundle_path_from_exe(Path::new(
-            "/Applications/workbuddy-switch.app/Contents/Resources/icon.icns"
+            "/Applications/ai-gateway.app/Contents/Resources/icon.icns"
         ))
         .is_none());
     }

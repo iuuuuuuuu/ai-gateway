@@ -17,17 +17,17 @@
     不匹配就秒级失败，绝不浪费一次完整构建。
 
     私钥与口令的固定位置（均在仓库外，公开仓库零提交风险）：
-      %USERPROFILE%\.wb-switch\wb-switch-updater.key       minisign 私钥
-      %USERPROFILE%\.wb-switch\wb-switch-updater.password  私钥口令
+      %USERPROFILE%\.ai-gateway\ai-gateway-updater.key       minisign 私钥
+      %USERPROFILE%\.ai-gateway\ai-gateway-updater.password  私钥口令
 
 .PARAMETER Bundles
     要构建的 bundle 类型，默认 "nsis"（Windows 安装包）。多平台用逗号分隔，如 "nsis,msi"。
 
 .PARAMETER KeyFile
-    私钥文件路径，默认 %USERPROFILE%\.wb-switch\wb-switch-updater.key。
+    私钥文件路径，默认 %USERPROFILE%\.ai-gateway\ai-gateway-updater.key。
 
 .PARAMETER PasswordFile
-    口令文件路径，默认 %USERPROFILE%\.wb-switch\wb-switch-updater.password。
+    口令文件路径，默认 %USERPROFILE%\.ai-gateway\ai-gateway-updater.password。
 
 .PARAMETER CheckOnly
     只做密钥预检（路径、口令、keyid 与 tauri.conf.json 公钥是否配对），不执行构建。
@@ -48,8 +48,8 @@
 [CmdletBinding()]
 param(
     [string]$Bundles = "nsis",
-    [string]$KeyFile = (Join-Path $env:USERPROFILE ".wb-switch\wb-switch-updater.key"),
-    [string]$PasswordFile = (Join-Path $env:USERPROFILE ".wb-switch\wb-switch-updater.password"),
+    [string]$KeyFile = (Join-Path $env:USERPROFILE ".ai-gateway\ai-gateway-updater.key"),
+    [string]$PasswordFile = (Join-Path $env:USERPROFILE ".ai-gateway\ai-gateway-updater.password"),
     [switch]$CheckOnly
 )
 
@@ -136,7 +136,7 @@ $prevKey = $env:TAURI_SIGNING_PRIVATE_KEY
 $prevPw = $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 try {
     Push-Location $probeDir
-    Set-Content -LiteralPath (Join-Path $probeDir "probe.txt") -Value "wb-switch signing probe" -Encoding ascii
+    Set-Content -LiteralPath (Join-Path $probeDir "probe.txt") -Value "ai-gateway signing probe" -Encoding ascii
     $env:TAURI_SIGNING_PRIVATE_KEY = $keyContent
     $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $password
 

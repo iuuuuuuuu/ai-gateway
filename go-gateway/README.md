@@ -281,7 +281,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 |---|---|---|
 | 积分到期巡检 | 每 `pool.credit_refresh_interval`（默认 `15m`） | 独立于签到的高频刷新，让分层跟上消费变化；可用 `pool.credit_refresh_enabled=false` 关闭 |
 | 签到 | 每日 `checkin_hours` | 签到后查余额时一并更新 |
-| 宿主同步 | 账号库变更时 | workbuddy-switch 写入凭证 `credit` 块 |
+| 宿主同步 | 账号库变更时 | ai-gateway 写入凭证 `credit` 块 |
 
 到期日持久化在 `state_file`，重启后无需等首轮巡检即可继续按到期分层选号。
 
@@ -386,7 +386,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 ### 宿主健康探测指引
 
-宿主程序（如 workbuddy-switch 托管网关子进程）探活时，**"端口通 + 返回 2xx" 不足以
+宿主程序（如 ai-gateway 托管网关子进程）探活时，**"端口通 + 返回 2xx" 不足以
 证明打到了自己的网关**：同端口可能残留旧版本进程或别的服务，对方返回 2xx 会造成假成功。
 按校验强度从高到低有两种做法：
 

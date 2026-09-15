@@ -20,7 +20,7 @@ target-*/
 src-tauri/target/
 
 # npm 包 postinstall 下载的平台二进制
-npm/bin/wb-switch-*
+npm/bin/ai-gateway-*
 
 # 本地运行时数据
 accounts.json
@@ -46,7 +46,7 @@ npm/platform/*/bin/
 /.workbuddy/
 
 # 内嵌网关二进制（构建产物，由 scripts/build-gateway 生成）
-crates/wb-switch-core/embedded/
+crates/ai-gateway-core/embedded/
 
 # 单文件构建产物（不入库，改由 CI/本地构建生成）
 dist-single/

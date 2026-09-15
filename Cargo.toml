@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "crates/wb-switch-core",
-    "crates/wb-switch-gateway",
-    "crates/wb-switch-server",
+    "crates/ai-gateway-core",
+    "crates/ai-gateway-router",
+    "crates/ai-gateway-server",
     "src-tauri",
 ]
 resolver = "2"

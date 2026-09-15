@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "WorkBuddy Switch Gateway",
+  "productName": "AI Gateway",
   "version": "0.8.4",
-  "identifier": "com.momo0410.wbswitch.gateway",
+  "identifier": "com.momo0410.aigateway",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:14200",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "WorkBuddy Switch Gateway · 账号管理 + 兼容网关",
+        "title": "AI Gateway · 账号管理 + 兼容网关",
         "width": 1000,
         "height": 720,
         "minWidth": 720,
@@ -50,8 +50,8 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIxN0MwRTJCNDMyMUQ4NDEKUldSQjJDRkRLdzU4SVY1d2d5azNhcjlKODZOVGJhTDZLK2Z3K3ZTcG5RVmlOZ29UMWNkYk5uQ3AK",
       "endpoints": [
-        "https://github.com/momo0410/workbuddy-switch-gateway/releases/latest/download/latest.json",
-        "https://github.com/momo0410/workbuddy-switch-gateway/releases/latest/download/latest-{{target}}-{{arch}}.json"
+        "https://github.com/momo0410/ai-gateway/releases/latest/download/latest.json",
+        "https://github.com/momo0410/ai-gateway/releases/latest/download/latest-{{target}}-{{arch}}.json"
       ]
     }
   }
