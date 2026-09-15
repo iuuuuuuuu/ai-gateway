@@ -132,6 +132,57 @@ func TestErrorCodeForDistinguishesLock(t *testing.T) {
 	}
 }
 
+// TestModelLockOtherProtocolsKeepTheirVocabulary 另外两个协议入口的模型锁定错误码
+// 必须保持各自词汇表，不能把 chat/completions 的 model_not_allowed 透出去。
+//
+// 为什么专门锁：三个入口共用 errorCodeFor 做判定，很容易在「抽公共映射函数」时
+// 顺手把码面值一起统一 —— 但 Responses 用 invalid_request_error / upstream_error，
+// Anthropic 用 invalid_request_error / api_error，model_not_allowed 只属于
+// chat/completions 形状。协议词汇表串味同样是破坏性变更，只是不易被察觉。
+func TestModelLockOtherProtocolsKeepTheirVocabulary(t *testing.T) {
+	cases := []struct {
+		name     string
+		path     string
+		body     string
+		wantCode string
+	}{
+		{
+			"responses",
+			"/v1/responses",
+			`{"model":"glm-5.3","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`,
+			"invalid_request_error",
+		},
+		{
+			"messages",
+			"/v1/messages",
+			`{"model":"glm-5.3","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`,
+			"invalid_request_error",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newLockedHandler(t, "deepseek-v4.1-flash")
+			req := httptest.NewRequest(http.MethodPost, c.path, strings.NewReader(c.body))
+			rec := httptest.NewRecorder()
+			h.mux.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("锁定模型应返回 400，实际 %d（body=%s）", rec.Code, rec.Body)
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, c.wantCode) {
+				t.Errorf("应含 %q，实际: %s", c.wantCode, body)
+			}
+			if strings.Contains(body, "model_not_allowed") {
+				t.Errorf("model_not_allowed 只属于 chat/completions 形状，不该出现在 %s: %s", c.name, body)
+			}
+			if strings.Contains(body, "no_healthy_account") {
+				t.Errorf("这是请求侧错误，不该报账号故障: %s", body)
+			}
+		})
+	}
+}
+
 // errString 简易 error 实现，避免引入 errors.New 之外的依赖。
 type errString string
 
