@@ -116,6 +116,7 @@ pub fn router() -> Router {
         .route("/api/gateway/allowed-model", post(api_set_allowed_model))
         .route("/api/gateway/start", post(api_gateway_start))
         .route("/api/gateway/port-check", post(api_gateway_port_check))
+        .route("/api/gateway/port-kill", post(api_gateway_port_kill))
         .route("/api/gateway/stop", post(api_gateway_stop))
         .route("/api/gateway/sync", post(api_gateway_sync))
         .route("/api/gateway/restart", post(api_gateway_restart))
@@ -969,6 +970,23 @@ async fn api_gateway_port_check(Json(body): Json<Value>) -> Response {
         return json_err("端口号需在 1-65535 之间".to_string(), StatusCode::BAD_REQUEST);
     }
     json_ok(ai_gateway_core::modules::gateway::inspect_port(port as u16))
+}
+
+/// POST /api/gateway/port-kill —— 结束占用端口的进程，让本网关接管该端口。
+///
+/// body: { "port": 7863 }
+///
+/// 由前端在用户**明确确认**后调用；后端仍会拒绝几类危险目标
+///（自身进程、本程序启动的网关），因此误调用不会造成状态不一致。
+async fn api_gateway_port_kill(Json(body): Json<Value>) -> Response {
+    let port = body.get("port").and_then(Value::as_u64).unwrap_or(0);
+    if port == 0 || port > 65535 {
+        return json_err("端口号需在 1-65535 之间".to_string(), StatusCode::BAD_REQUEST);
+    }
+    match ai_gateway_core::modules::gateway::kill_port_holder(port as u16) {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
 }
 
 // ---------------------------------------------------------------------------

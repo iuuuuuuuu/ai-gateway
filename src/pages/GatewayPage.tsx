@@ -16,6 +16,7 @@ import {
   Save,
   Server,
   Shuffle,
+  Skull,
   Square,
   UserRound,
   Wand2,
@@ -26,6 +27,14 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
@@ -504,6 +513,13 @@ export default function GatewayPage() {
   /** 端口可用性检测结果（null = 尚未检测/正在检测）。 */
   const [portCheck, setPortCheck] = useState<GatewayPortCheck | null>(null);
   const [checkingPort, setCheckingPort] = useState(false);
+  /**
+   * 待确认「结束占用进程」的目标（null = 对话框关闭）。
+   *
+   * 刻意做成两步：杀进程是不可逆操作，必须先让用户看到
+   * 「是哪个进程（名字 + PID + 路径）」再确认，而不是点一下就直接杀。
+   */
+  const [killTarget, setKillTarget] = useState<GatewayPortCheck | null>(null);
 
   /** 网关 Token 用量：范围选择、数据与加载态。默认「今日」——看用量多为盯当天消耗。 */
   const [usageRange, setUsageRange] = useState<UsageRangeKey>("today");
@@ -791,6 +807,30 @@ export default function GatewayPage() {
       toast.error(api.asError(e));
     } finally {
       setCheckingPort(false);
+    }
+  }
+
+  /**
+   * 结束占用端口的进程（由确认对话框调用）。
+   *
+   * 成功后立刻重新检测端口：让用户直接看到「已可用」，
+   * 而不是自己再点一次「检测」才知道结果。
+   */
+  async function killPortHolder() {
+    const target = killTarget;
+    if (!target) return;
+    setBusy("kill-port");
+    try {
+      const res = await api.killGatewayPortHolder(target.port);
+      toast.success(res.message || `端口 ${target.port} 已释放`);
+      setKillTarget(null);
+      const check = await api.checkGatewayPort(target.port);
+      setPortCheck(check);
+    } catch (e) {
+      // 失败时保留对话框：用户可能需要换个端口，或去看权限问题
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -1292,6 +1332,24 @@ export default function GatewayPage() {
                 用 {portCheck.suggest}
               </Button>
             ) : null}
+            {/*
+              端口被占用时提供「结束占用进程」：用户看到「已被占用」的下一步
+              必然是「谁占着？能不能关掉？」，不给入口就只能自己去翻任务管理器。
+              仅在确实被占用、且不是本网关自己在用时显示（后者应走「停止网关」）。
+            */}
+            {portCheck && !portCheck.available && !portCheck.inUseByGateway ? (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1.5 px-2 text-xs text-destructive hover:text-destructive"
+                onClick={() => setKillTarget(portCheck)}
+                disabled={busy !== null}
+                title="结束占用该端口的进程，然后由本网关接管"
+              >
+                <Skull className="size-3.5" />
+                结束占用进程
+              </Button>
+            ) : null}
           </div>
         </Row>
         <Row>
@@ -1733,6 +1791,63 @@ ANTHROPIC_AUTH_TOKEN=${apiKey || "<你的 api_key>"}`}</code>
         </Row>
       </Section>
     </div>
+    {/*
+      端口占用确认对话框：杀进程不可逆，必须先展示「谁占着」再让用户决定。
+      第三方进程（非本项目）给出更强的警告 —— 用户可能正在用那个程序。
+    */}
+    <Dialog open={killTarget !== null} onOpenChange={(open) => { if (!open) setKillTarget(null); }}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>结束占用进程？</DialogTitle>
+          <DialogDescription>
+            端口 <span className="font-mono font-medium">{killTarget?.port}</span> 正被以下进程占用。
+            结束它之后，本网关即可接管该端口。
+          </DialogDescription>
+        </DialogHeader>
+        {killTarget?.holder ? (
+          <div className="min-w-0 space-y-1.5 rounded-lg border bg-muted/40 px-3 py-2.5 text-xs">
+            <div className="flex min-w-0 items-baseline gap-2">
+              <span className="shrink-0 text-muted-foreground">进程</span>
+              <span className="min-w-0 truncate font-medium">{killTarget.holder.name}</span>
+            </div>
+            <div className="flex min-w-0 items-baseline gap-2">
+              <span className="shrink-0 text-muted-foreground">PID</span>
+              <span className="font-mono">{killTarget.holder.pid}</span>
+            </div>
+            {killTarget.holder.path ? (
+              <div className="flex min-w-0 items-baseline gap-2">
+                <span className="shrink-0 text-muted-foreground">路径</span>
+                <span className="min-w-0 break-all font-mono text-[11px]">{killTarget.holder.path}</span>
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            无法识别占用该端口的进程（可能需要管理员权限）。结束操作可能失败。
+          </p>
+        )}
+        {killTarget?.holder && !killTarget.holder.ours ? (
+          <p className="text-xs text-destructive">
+            该进程不属于本程序，可能是你正在使用的其他软件。结束它可能导致那个程序异常退出。
+          </p>
+        ) : null}
+        <DialogFooter className="gap-2">
+          <Button variant="outline" size="sm" onClick={() => setKillTarget(null)} disabled={busy !== null}>
+            取消
+          </Button>
+          <Button
+            variant="destructive"
+            size="sm"
+            className="gap-1.5"
+            onClick={() => void killPortHolder()}
+            disabled={busy !== null}
+          >
+            {busy === "kill-port" ? <Loader2 className="size-3.5 animate-spin" /> : <Skull className="size-3.5" />}
+            确认结束进程
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
     </TooltipProvider>
   );
 }

@@ -711,6 +711,23 @@ export interface GatewayPortCheck {
   inUseByGateway: boolean;
   /** 端口被占用时给出的可用建议端口。 */
   suggest: number | null;
+  /** 占用该端口的进程；查不到时为 null（权限不足或进程已退出）。 */
+  holder: GatewayPortHolder | null;
+}
+
+/** 占用端口的进程信息。 */
+export interface GatewayPortHolder {
+  pid: number;
+  name: string;
+  /** 可执行文件完整路径；权限不足时为空串。 */
+  path: string;
+  /**
+   * 是否为本项目自己的进程（网关 / 宿主 GUI）。
+   *
+   * 前端据此调整提示措辞：清理自己的旧进程是常见操作，
+   * 而结束第三方进程需要更强的警告。
+   */
+  ours: boolean;
 }
 
 /** 网关 Token 用量中的一组计量（口径与本地 Token 统计页一致）。 */

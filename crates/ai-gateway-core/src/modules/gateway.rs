@@ -792,7 +792,200 @@ pub fn inspect_port(port: u16) -> Value {
         "suggest": if available { Value::Null } else {
             find_free_port(port.saturating_add(1), 50).map(|p| json!(p)).unwrap_or(Value::Null)
         },
+        // 占用者信息：让前端能明确告诉用户「是哪个进程占着」，
+        // 而不是只给一句「已被占用」让用户自己猜。
+        "holder": if available { Value::Null } else {
+            port_holder(port).unwrap_or(Value::Null)
+        },
     })
+}
+
+/// 判断进程是否属于本项目（网关 / 宿主 GUI）。
+///
+/// 只按进程名与路径特征判断，不做签名校验 —— 这是「提示措辞」的依据，
+/// 不是安全边界；真正能否杀死由操作系统权限决定。
+fn is_our_process(name: &str, path: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let p = path.to_ascii_lowercase();
+    n.starts_with("gateway-")
+        || n == "gateway.exe"
+        || n == "gateway"
+        || n == "ai-gateway.exe"
+        || n == "ai-gateway"
+        || n == "wb-switch-rust.exe"
+        || p.contains("ai-gateway")
+        || p.contains("wb-switch")
+        || p.contains("gateway\\bin\\")
+}
+
+/// 查询占用指定端口的进程，返回其 JSON 描述。
+///
+/// 返回 None 表示「查不到」：可能是端口其实空闲、进程已退出、或权限不足。
+/// 调用方应把 None 当作「无法提供占用者信息」，而不是「没有占用」。
+pub fn port_holder(port: u16) -> Option<Value> {
+    let (pid, name, path) = find_port_holder(port)?;
+    Some(json!({
+        "pid": pid,
+        "name": name,
+        "path": path,
+        "ours": is_our_process(&name, &path),
+    }))
+}
+
+/// 主动结束占用指定端口的进程。
+///
+/// 安全约束（刻意的）：
+///   1. 端口必须**确实被占用** —— 空闲端口直接拒绝，避免误杀无关进程；
+///   2. 不允许杀死当前进程自己（自杀会让调用方拿不到返回值）；
+///   3. 不允许杀死本程序启动的网关 —— 那种情况应走「停止网关」，
+///      直接杀掉会让宿主与网关的状态不一致。
+///
+/// 不限制「只能杀自己人」：用户明确要求「把占用端口的进程杀死」，
+/// 第三方进程（如误开的其他服务）也是合法目标，但前端会给出更强的警告。
+pub fn kill_port_holder(port: u16) -> Result<Value, String> {
+    if port == 0 {
+        return Err("端口号无效".to_string());
+    }
+    if port_free(port) {
+        return Err(format!("端口 {port} 当前空闲，无需清理"));
+    }
+    let Some((pid, name, _path)) = find_port_holder(port) else {
+        return Err(format!(
+            "端口 {port} 被占用，但无法识别占用进程（可能需要管理员权限）"
+        ));
+    };
+
+    if pid == std::process::id() {
+        return Err("占用该端口的是本程序自身，请改用「停止网关」".to_string());
+    }
+    let lower = name.to_ascii_lowercase();
+    if is_running() && lower.starts_with("gateway-") {
+        return Err("占用该端口的是本程序启动的网关，请改用「停止网关」".to_string());
+    }
+
+    terminate_process(pid)?;
+    // 等待端口真正释放：进程退出与端口释放之间有短暂窗口，
+    // 立刻返回成功会让前端紧接着的「启动」失败，体验很差。
+    for _ in 0..40 {
+        if port_free(port) {
+            return Ok(json!({
+                "ok": true,
+                "pid": pid,
+                "name": name,
+                "message": format!("已结束进程 {name} (PID {pid})，端口 {port} 已释放"),
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(format!(
+        "已请求结束进程 {name} (PID {pid})，但端口 {port} 仍被占用（可能未完全退出）"
+    ))
+}
+
+/// 查找占用端口的进程：返回 (pid, 进程名, 可执行文件路径)。
+///
+/// Windows 用 `netstat -ano` 找 PID 再用 `tasklist` 换名字；
+/// 其它平台暂不支持（返回 None），前端会退化为「无法识别占用者」的提示。
+#[cfg(windows)]
+fn find_port_holder(port: u16) -> Option<(u32, String, String)> {
+    use std::process::Command;
+
+    // netstat 的输出解析：只认 LISTENING 行，避免把「已建立的连接」误判为占用
+    let out = Command::new("netstat").args(["-ano", "-p", "TCP"]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let needle_v4 = format!(":{port} ");
+    let needle_v6 = format!("]:{port} ");
+    let mut pid: Option<u32> = None;
+    for line in text.lines() {
+        let t = line.trim();
+        if !t.starts_with("TCP") || !t.contains("LISTENING") {
+            continue;
+        }
+        // 形如：TCP    0.0.0.0:7864    0.0.0.0:0    LISTENING    33708
+        if !(t.contains(&needle_v4) || t.contains(&needle_v6)) {
+            continue;
+        }
+        if let Some(last) = t.split_whitespace().last() {
+            if let Ok(p) = last.parse::<u32>() {
+                pid = Some(p);
+                break;
+            }
+        }
+    }
+    let pid = pid?;
+
+    // tasklist 换进程名与路径（CSV 便于解析，避免中文列宽对齐问题）
+    let out = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().next()?.trim();
+    // 形如："gateway-xxx.exe","33708","Console","1","8,543 K"
+    let name = line
+        .split("\",\"")
+        .next()
+        .map(|s| s.trim_matches('"').to_string())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return None;
+    }
+
+    // 路径需要 wmic 或 PowerShell；用 PowerShell 更可靠（wmic 在新系统已移除）。
+    // 取不到不影响主流程（名字已足够提示用户），因此失败时留空。
+    let path = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).Path"),
+        ])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    Some((pid, name, path))
+}
+
+#[cfg(not(windows))]
+fn find_port_holder(_port: u16) -> Option<(u32, String, String)> {
+    // 非 Windows 平台暂不实现：前端会提示「无法识别占用进程」，
+    // 用户仍可手动处理。留出接口便于后续按平台补 lsof/ss 实现。
+    None
+}
+
+/// 强制结束进程。
+#[cfg(windows)]
+fn terminate_process(pid: u32) -> Result<(), String> {
+    use std::process::Command;
+    let out = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F", "/T"])
+        .output()
+        .map_err(|e| format!("调用 taskkill 失败: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let msg = String::from_utf8_lossy(&out.stderr);
+    let msg = msg.trim();
+    Err(if msg.is_empty() {
+        format!("结束进程 {pid} 失败（可能需要管理员权限）")
+    } else {
+        format!("结束进程 {pid} 失败: {msg}")
+    })
+}
+
+#[cfg(not(windows))]
+fn terminate_process(pid: u32) -> Result<(), String> {
+    use std::process::Command;
+    let out = Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .output()
+        .map_err(|e| format!("调用 kill 失败: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("结束进程 {pid} 失败（可能需要权限）"))
+    }
 }
 
 /// 出站代理地址：复用「设置 → 更新代理」里已填的值（`github_config.json` 的 `proxy`）。
@@ -2071,5 +2264,131 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    // -----------------------------------------------------------------------
+    // 端口占用者识别与清理
+    //
+    // 真实链路（起进程占端口 → 识别 → 结束）已由 uitest/verify-port-kill.cjs
+    // 端到端验证；这里只覆盖**纯逻辑**与**安全约束**，
+    // 避免单元测试去起真实进程（慢且不稳定）。
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn our_process_detection_covers_own_binaries() {
+        // 本项目的三类进程都应被认出来
+        assert!(is_our_process("gateway-35538d-2c4b5c2ff3726ad1.exe", ""));
+        assert!(is_our_process("gateway.exe", ""));
+        assert!(is_our_process("ai-gateway.exe", ""));
+        assert!(is_our_process("wb-switch-rust.exe", ""));
+        // 按路径兜底（进程名被改名时仍能认出）
+        assert!(is_our_process("whatever.exe", r"C:\Users\x\.ai-gateway\gateway\bin\a.exe"));
+        assert!(is_our_process("whatever.exe", r"D:\proj\ai-gateway\target\release\a.exe"));
+    }
+
+    #[test]
+    fn our_process_detection_rejects_third_party() {
+        // 第三方进程不能误判成自己的（否则提示措辞会误导用户）
+        assert!(!is_our_process("node.exe", r"C:\Program Files\nodejs\node.exe"));
+        assert!(!is_our_process("chrome.exe", r"C:\Program Files\Google\Chrome\chrome.exe"));
+        assert!(!is_our_process("nginx.exe", r"C:\nginx\nginx.exe"));
+        assert!(!is_our_process("", ""));
+    }
+
+    #[test]
+    fn kill_rejects_zero_port() {
+        // 端口 0 无意义，必须拒绝而不是去查占用者
+        let err = kill_port_holder(0).expect_err("端口 0 应被拒绝");
+        assert!(err.contains("无效"), "错误文案应说明端口无效，实际: {err}");
+    }
+
+    #[test]
+    fn kill_rejects_free_port() {
+        // 关键安全约束：端口空闲时绝不能去杀任何进程。
+        // 用一个极不可能被占用的高位端口，保证「空闲」前提成立。
+        let port = 59_873u16;
+        if !port_free(port) {
+            return; // 环境异常（真被占用），跳过而不是误报
+        }
+        let err = kill_port_holder(port).expect_err("空闲端口应被拒绝");
+        // 必须断言**具体原因**是「空闲」，而不是「找不到占用进程」——
+        // 否则把空闲检查那道防线删掉，测试照样通过（本测试第一版就踩了这个坑：
+        // 删掉防线后仍走 find_port_holder 返回 None 的分支，同样是 Err）。
+        assert!(
+            err.contains("空闲"),
+            "错误文案应说明端口空闲（而非无法识别进程），实际: {err}"
+        );
+        assert!(
+            !err.contains("无法识别"),
+            "不应走到「无法识别占用进程」分支 —— 说明空闲检查被绕过了，实际: {err}"
+        );
+    }
+
+    #[test]
+    fn inspect_port_reports_null_holder_when_free() {
+        let port = 59_874u16;
+        if !port_free(port) {
+            return;
+        }
+        let v = inspect_port(port);
+        assert_eq!(v.get("available").and_then(Value::as_bool), Some(true));
+        assert!(
+            v.get("holder").map(Value::is_null).unwrap_or(false),
+            "空闲端口的 holder 应为 null，实际: {v}"
+        );
+    }
+
+    #[test]
+    fn inspect_port_reports_holder_when_occupied() {
+        // 自己占一个端口，然后让 inspect_port 认出占用者。
+        // 这样不必依赖外部进程，测试稳定。
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let port = match listener.local_addr() {
+            Ok(a) => a.port(),
+            Err(_) => return,
+        };
+        let v = inspect_port(port);
+        assert_eq!(
+            v.get("available").and_then(Value::as_bool),
+            Some(false),
+            "正在监听的端口应判定为不可用"
+        );
+        let holder = v.get("holder");
+        assert!(
+            holder.map(|h| !h.is_null()).unwrap_or(false),
+            "应能识别占用者（本测试进程），实际: {v}"
+        );
+        if let Some(h) = holder {
+            // 占用者就是本测试进程
+            assert_eq!(
+                h.get("pid").and_then(Value::as_u64),
+                Some(std::process::id() as u64),
+                "占用者 PID 应是本进程"
+            );
+        }
+        drop(listener);
+    }
+
+    #[test]
+    fn kill_refuses_to_kill_itself() {
+        // 自己占住端口，然后尝试「清理」它 —— 必须被拒绝，
+        // 否则自杀会让调用方拿不到返回值，前端表现为请求悬挂。
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let port = match listener.local_addr() {
+            Ok(a) => a.port(),
+            Err(_) => return,
+        };
+        let err = kill_port_holder(port).expect_err("不应允许杀死自身进程");
+        assert!(
+            err.contains("自身") || err.contains("停止网关"),
+            "错误文案应说明是自身/应走停止网关，实际: {err}"
+        );
+        drop(listener);
     }
 }

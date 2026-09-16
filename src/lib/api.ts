@@ -151,6 +151,7 @@ const ROUTES: Record<string, Route> = {
   set_allowed_model: { method: "POST", path: "/api/gateway/allowed-model" },
   start_gateway: { method: "POST", path: "/api/gateway/start" },
   check_gateway_port: { method: "POST", path: "/api/gateway/port-check" },
+  kill_gateway_port_holder: { method: "POST", path: "/api/gateway/port-kill" },
   stop_gateway: { method: "POST", path: "/api/gateway/stop" },
   restart_gateway: { method: "POST", path: "/api/gateway/restart" },
   sync_gateway_accounts: { method: "POST", path: "/api/gateway/sync" },
@@ -710,9 +711,16 @@ export function startGateway(port?: number): Promise<GatewayStartResult> {
   return call<GatewayStartResult>("start_gateway", port ? { port } : {});
 }
 
-/** 检测端口是否可用；被占用时返回建议端口。 */
+/** 检测端口是否可用；被占用时返回建议端口与占用进程。 */
 export function checkGatewayPort(port: number): Promise<GatewayPortCheck> {
   return call<GatewayPortCheck>("check_gateway_port", { port });
+}
+
+/** 结束占用端口的进程，让网关接管该端口。需用户明确确认后调用。 */
+export function killGatewayPortHolder(
+  port: number,
+): Promise<{ ok: boolean; pid: number; name: string; message: string }> {
+  return call("kill_gateway_port_holder", { port });
 }
 
 /** 停止网关。 */

@@ -766,6 +766,16 @@ pub fn check_gateway_port(port: u16) -> Result<Value, String> {
     Ok(ai_gateway_core::modules::gateway::inspect_port(port))
 }
 
+/// 结束占用指定端口的进程，让本网关可以接管该端口。
+///
+/// 由前端在用户**明确确认**后调用（提示里会展示占用进程名与 PID）。
+/// 后端仍会拒绝几类危险目标（自身进程、本程序启动的网关），
+/// 因此前端即便误调用也不会造成「网关被自己杀掉」的状态不一致。
+#[tauri::command]
+pub fn kill_gateway_port_holder(port: u16) -> Result<Value, String> {
+    ai_gateway_core::modules::gateway::kill_port_holder(port)
+}
+
 /// 切换网关工作模式并立即生效（重导出凭证 + 按需重启）。
 ///
 /// 与 `save_gateway_config` 的区别：后者只写配置文件，而网关的账号池是
