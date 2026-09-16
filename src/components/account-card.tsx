@@ -429,7 +429,10 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
 
   return (
     <TooltipProvider>
-      <article className="flex min-w-0 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-[0_1px_2px_rgba(15,23,42,.025),0_10px_28px_rgba(15,23,42,.035)] transition-shadow hover:shadow-[0_2px_4px_rgba(15,23,42,.04),0_14px_34px_rgba(15,23,42,.055)]">
+      {/* h-full：撑满栅格行高。配合父级 grid 的 auto-rows-fr，让同一排的卡片
+          无论有几个积分包都等高（详情区是 flex-1，多余空间落在底部，
+          底部操作栏因此始终对齐）。 */}
+      <article className="flex h-full min-w-0 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-[0_1px_2px_rgba(15,23,42,.025),0_10px_28px_rgba(15,23,42,.035)] transition-shadow hover:shadow-[0_2px_4px_rgba(15,23,42,.04),0_14px_34px_rgba(15,23,42,.055)]">
       <header
         className={cn(
           "relative flex items-center border-b border-border",

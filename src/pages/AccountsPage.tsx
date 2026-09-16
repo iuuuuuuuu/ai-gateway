@@ -1009,7 +1009,12 @@ export default function AccountsPage() {
             暂无账号。点击上方按钮导入本机账号或 OAuth 登录。
           </div>
         ) : (
-          <div className={cn("grid min-w-0 items-start gap-5", compact ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]" : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]")}>
+          /* 卡片网格：auto-rows-fr 让同一排的卡片等高。
+             此前用 items-start，每张卡片按自身内容高度渲染，于是「只有 1 个积分包」
+             的账号会比同排「有 2 个积分包」的账号矮一截（实测 171px vs 208px）。
+             等高后资源包列表的差异只体现为卡片内留白，不再破坏整排对齐。
+             注意不要保留 items-start：它会让卡片不拉伸，auto-rows-fr 就失效了。 */
+          <div className={cn("grid auto-rows-fr min-w-0 gap-5", compact ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]" : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]")}>
             {orderedAccounts.map((a) => (
               <AccountCard
                 key={a.id}

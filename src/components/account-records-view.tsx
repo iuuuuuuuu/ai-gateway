@@ -225,8 +225,10 @@ export function AccountRecordsView({
               key={o.key}
               type="button"
               size="sm"
+              // 选中态 = `default`（绿色实心）；与类型筛选按钮保持同一视觉语言。
               variant={rangeKey === o.key ? "default" : "outline"}
               className="h-8 px-2.5 text-xs"
+              aria-pressed={rangeKey === o.key}
               onClick={() => setRangeKey(o.key)}
             >
               {o.label}
@@ -237,17 +239,29 @@ export function AccountRecordsView({
           {(Object.keys(KIND_META) as RecordKind[]).map((k) => {
             const meta = KIND_META[k];
             const Icon = meta.icon;
+            // 选中态用 `default`（绿色实心），与日期范围按钮、以及项目里其它
+            // 切换型按钮（GatewayPage 的模式/用量范围、SettingsPage 的保留天数）
+            // 保持同一套「选中 = 绿色」的视觉语言。
+            //
+            // 此前用 `secondary`（浅灰 bg-secondary）表示选中：它和未选中的
+            // `outline`（白底描边）只差 4% 亮度，肉眼几乎分不出，于是点「任务 /
+            // 积分 / Token」看起来毫无反应；屏幕上唯一明显的绿色只来自日期范围
+            // 那一组（例如停在「全部」），这正是「选中态一直停在全部」的由来。
+            const active = kinds.includes(k);
             return (
               <Button
                 key={k}
                 type="button"
                 size="sm"
-                variant={kinds.includes(k) ? "secondary" : "outline"}
+                variant={active ? "default" : "outline"}
                 className="h-8 gap-1 px-2.5 text-xs"
+                aria-pressed={active}
                 onClick={() => toggleKind(k)}
-                title={kinds.includes(k) ? "点击取消筛选" : "点击加入筛选"}
+                title={active ? "点击取消筛选" : "点击加入筛选"}
               >
-                <Icon className={cn("size-3.5", kinds.includes(k) && meta.tone)} />
+                {/* 未选中时才上类别色：选中后底色是绿色实心，
+                    再叠 sky/amber/violet 会糊成一团，此时用按钮前景色（近白）更清楚。 */}
+                <Icon className={cn("size-3.5", !active && meta.tone)} />
                 {meta.label}
               </Button>
             );
