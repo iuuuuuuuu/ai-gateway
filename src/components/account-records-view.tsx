@@ -3,6 +3,7 @@ import {
   CircleAlert,
   CircleCheck,
   Coins,
+  Layers,
   Loader2,
   RefreshCw,
   ScrollText,
@@ -31,6 +32,20 @@ import { cn } from "@/lib/utils";
  * 最近发生了什么，而全部记录在小屏上会刷出几百条。
  */
 export type RecordKind = "task" | "credit" | "token";
+
+/**
+ * 类型筛选的取值：`"all"` 表示不按类型过滤。
+ *
+ * 为什么要引入显式的「全部」而不是保留 `RecordKind[]` 多选：多选时默认三类全中，
+ * 三个按钮同时是绿色实心，看起来像「什么都选中了」而不是「没有过滤」，
+ * 用户反而读不出当前到底筛了什么。类型之间本来就是互斥的观察视角（看任务、
+ * 看积分、看 Token），所以单选 + 一个「全部」比多选更贴合意图，也让选中态
+ * 与日期范围那组一样「永远只有一个绿」。
+ */
+type KindFilter = RecordKind | "all";
+
+/** 类型筛选的按钮顺序；`all` 必须排在最前，与日期范围的语义对齐。 */
+const KIND_FILTERS: KindFilter[] = ["all", "task", "credit", "token"];
 
 /** 日期区间预设。 */
 const RANGE_OPTIONS: { key: string; label: string; days: number | null }[] = [
@@ -76,6 +91,9 @@ function formatNumber(n: number): string {
 }
 
 const KIND_META: Record<string, { label: string; icon: typeof Zap; tone: string }> = {
+  // 「全部」不是记录类型，只是筛选器的一个取值；放进同一张表是为了让
+  // 按钮的图标/文案与其它三项共用一份数据，避免两处各写一套标签而漂移。
+  all: { label: "全部", icon: Layers, tone: "text-muted-foreground" },
   task: { label: "任务", icon: ScrollText, tone: "text-sky-600 dark:text-sky-400" },
   credit: { label: "积分", icon: Coins, tone: "text-amber-600 dark:text-amber-400" },
   token: { label: "Token", icon: Zap, tone: "text-violet-600 dark:text-violet-400" },
@@ -99,7 +117,9 @@ export function AccountRecordsView({
   const [fromDate, setFromDate] = useState(() => dateKey(new Date()));
   const [toDate, setToDate] = useState(() => dateKey(new Date()));
   const [accountId, setAccountId] = useState(fixedAccountId ?? "");
-  const [kinds, setKinds] = useState<RecordKind[]>(["task", "credit", "token"]);
+  // 默认「全部」：不做类型过滤即等价于原先「三类全选」，但界面上只有一个绿，
+  // 用户一眼能看出当前没有按类型筛。
+  const [kind, setKind] = useState<KindFilter>("all");
   const [data, setData] = useState<api.AccountRecordsResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -136,7 +156,9 @@ export function AccountRecordsView({
         accountId: accountId || undefined,
         from: from || undefined,
         to: to || undefined,
-        kinds: kinds.length === 0 || kinds.length === 3 ? undefined : kinds,
+        // 后端的契约是「kinds 为空数组 = 全部类型」（account_records.rs:213），
+        // 所以「全部」传 undefined（api.ts 会转成 null → 空数组），具体某一类传单元素。
+        kinds: kind === "all" ? undefined : [kind],
         limit: 500,
       });
       setData(res);
@@ -145,7 +167,7 @@ export function AccountRecordsView({
     } finally {
       setLoading(false);
     }
-  }, [accountId, fromDate, toDate, kinds]);
+  }, [accountId, fromDate, toDate, kind]);
 
   useEffect(() => {
     void load();
@@ -164,10 +186,6 @@ export function AccountRecordsView({
     // 只在挂载时执行一次
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  function toggleKind(k: RecordKind) {
-    setKinds((prev) => (prev.includes(k) ? prev.filter((x) => x !== k) : [...prev, k]));
-  }
 
   const records = data?.records ?? [];
 
@@ -235,8 +253,11 @@ export function AccountRecordsView({
             </Button>
           ))}
         </div>
+        {/* 类型筛选：单选。组内恒有且只有一个绿色实心（默认最左的「全部」）。
+            它与右边日期范围组各自最多一个绿 —— 两块绿同时出现是正常的，
+            因为那确实是两个互不影响的筛选维度。 */}
         <div className="flex flex-wrap items-center gap-1">
-          {(Object.keys(KIND_META) as RecordKind[]).map((k) => {
+          {KIND_FILTERS.map((k) => {
             const meta = KIND_META[k];
             const Icon = meta.icon;
             // 选中态用 `default`（绿色实心），与日期范围按钮、以及项目里其它
@@ -247,7 +268,7 @@ export function AccountRecordsView({
             // `outline`（白底描边）只差 4% 亮度，肉眼几乎分不出，于是点「任务 /
             // 积分 / Token」看起来毫无反应；屏幕上唯一明显的绿色只来自日期范围
             // 那一组（例如停在「全部」），这正是「选中态一直停在全部」的由来。
-            const active = kinds.includes(k);
+            const active = kind === k;
             return (
               <Button
                 key={k}
@@ -256,8 +277,8 @@ export function AccountRecordsView({
                 variant={active ? "default" : "outline"}
                 className="h-8 gap-1 px-2.5 text-xs"
                 aria-pressed={active}
-                onClick={() => toggleKind(k)}
-                title={active ? "点击取消筛选" : "点击加入筛选"}
+                onClick={() => setKind(k)}
+                title={k === "all" ? "不按类型筛选" : `只看${meta.label}`}
               >
                 {/* 未选中时才上类别色：选中后底色是绿色实心，
                     再叠 sky/amber/violet 会糊成一团，此时用按钮前景色（近白）更清楚。 */}

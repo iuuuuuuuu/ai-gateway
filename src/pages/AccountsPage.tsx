@@ -44,7 +44,7 @@ import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
 import { useVisibilityInterval } from "@/lib/use-visibility-interval";
-import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, TravelConfig, TravelStatus } from "@/lib/types";
+import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, GatewayTaskName, TravelConfig, TravelStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -176,6 +176,13 @@ export default function AccountsPage() {
   const [checkinAllRunning, setCheckinAllRunning] = useState(false);
   /** 一键旅行进行中（下拉菜单项） */
   const [travelRunning, setTravelRunning] = useState(false);
+  /**
+   * 正在执行的养号任务名（卡片菜单的「本账号养护 → 养号任务」组）。
+   *
+   * 单一状态而非按卡片分组：这些任务是**整轮**触发（作用于全部账号），
+   * 同一时刻只应有一个在跑；按卡片分组反而会让人以为每个号各跑各的。
+   */
+  const [taskRunning, setTaskRunning] = useState<GatewayTaskName>();
   /** 接入/升级 CLI helper 确认框 */
   const [installConfirmOpen, setInstallConfirmOpen] = useState(false);
   /** 删除账号确认目标（null=关闭） */
@@ -510,6 +517,36 @@ export default function AccountsPage() {
       void fetchAll();
     } catch (e) {
       toast.error("Token 刷新失败", { description: api.asError(e) });
+    }
+  }
+
+  /**
+   * 手动触发一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
+   *
+   * 与卡片上其它动作的关键区别：这是**整轮**触发，Go 侧 `RunTaskByName`
+   * 会遍历账号池，作用于全部符合区域条件的账号，而不是当前这张卡片。
+   * 菜单里用分组标题写明了这一点，避免用户以为只是跑了这一个号。
+   *
+   * `ran=false` 是正常结果（夜猫子不在时段、开学季不在活动期），
+   * 按说明展示而非报错 —— 否则用户会把「上游不计入」当成功能坏了。
+   */
+  async function onRunTask(task: GatewayTaskName) {
+    setTaskRunning(task);
+    try {
+      const res = await api.runGatewayTask(task);
+      if (!res.ok) {
+        toast.error("任务执行失败", { description: res.error || "未知错误" });
+      } else if (!res.ran) {
+        toast.info("本次未执行", { description: res.message || "前置条件不满足" });
+      } else {
+        toast.success("已触发一轮", { description: res.message || "任务已开始执行" });
+      }
+      // 任务会写账号记录与积分，回读一次让「账号记录」立刻反映
+      if (res.ok && res.ran) void fetchAll();
+    } catch (e) {
+      toast.error("任务执行失败", { description: api.asError(e) });
+    } finally {
+      setTaskRunning(undefined);
     }
   }
 
@@ -1046,6 +1083,8 @@ export default function AccountsPage() {
                 onCheckin={onCheckin}
                 onRefresh={onRefresh}
                 onAdopt={onAdopt}
+                onRunTask={onRunTask}
+                taskRunning={taskRunning}
                 todayCheckedIn={checkinMap[a.id]}
                 travelStatus={travelMap[a.id]}
                 credit={creditMap[a.id]}

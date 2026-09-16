@@ -48,4 +48,22 @@ function DropdownMenuSeparator({ className, ...props }: React.ComponentProps<typ
   return <DropdownMenuPrimitive.Separator data-slot="dropdown-menu-separator" className={cn("-mx-1 my-1 h-px bg-border", className)} {...props} />;
 }
 
-export { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger };
+/**
+ * 菜单分组标题。
+ *
+ * 为什么需要它：账号菜单里现在既有「只作用于这个号」的动作，也有
+ * 「触发一整轮、作用于全部账号」的动作。两者混在一起排成一条竖列时，
+ * 用户会默认每一项都只影响当前卡片 —— 点完却动了所有号，属于误导。
+ * 分组标题是区分它们最轻的手段（不额外增加点击层级）。
+ */
+function DropdownMenuLabel({ className, ...props }: React.ComponentProps<typeof DropdownMenuPrimitive.Label>) {
+  return (
+    <DropdownMenuPrimitive.Label
+      data-slot="dropdown-menu-label"
+      className={cn("px-2.5 py-1.5 text-[11px] font-semibold text-muted-foreground", className)}
+      {...props}
+    />
+  );
+}
+
+export { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger };

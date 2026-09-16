@@ -825,6 +825,17 @@ export interface GatewayUsageSnapshot {
   summary?: GatewayUsageTotals;
   models?: GatewayUsageGroup[];
   accounts?: GatewayUsageGroup[];
+  /**
+   * 账号 → 该账号用过的模型明细（键 = 池 uid）。
+   *
+   * 为什么不能由 `models` 与 `accounts` 前端现算：这两个维度各自聚合后，
+   * 交叉关系已经丢失 —— 只知道「甲账号共 3 万」「glm-5.2 共 4 万」，
+   * 无法还原「甲账号的 glm-5.2 用了多少」。由网关侧记录时直接累计，
+   * 界面「按账号筛选看用了哪些模型」才有可信数据。
+   *
+   * 缺失（老版本网关）时按「无明细」处理，不回退到假的交叉结果。
+   */
+  accountModels?: Record<string, GatewayUsageGroup[]>;
   /** 按日期升序的日聚合。 */
   daily?: GatewayUsageGroup[];
   dailyByModel?: Record<string, GatewayUsageGroup[]>;
