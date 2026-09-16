@@ -123,6 +123,22 @@ func (r *Recorder) Path() string {
 	return r.path
 }
 
+// IdentityIndex 返回 uid → Identity 映射的副本（供需要「宿主 id ↔ 网关 uid」
+// 双向翻译的调用方使用，如成长任务入口按 accountId 找账号）。
+//
+// 为什么返回副本而不是直接暴露 map：调用方多为并发路径，暴露内部 map
+// 会让它在别人写入时读到半更新的状态。账号是几十级规模，复制代价可忽略。
+func (r *Recorder) IdentityIndex() map[string]Identity {
+	if r == nil {
+		return nil
+	}
+	out := make(map[string]Identity, len(r.identities))
+	for uid, id := range r.identities {
+		out[uid] = id
+	}
+	return out
+}
+
 // Task 追加一条任务记录（每次都写）。
 //
 // uid 用于解析宿主的 accountId / accountName；成功后调用（有新变化时）。

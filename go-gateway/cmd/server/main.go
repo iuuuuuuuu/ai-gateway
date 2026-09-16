@@ -216,6 +216,12 @@ func main() {
 		// 养号任务手动触发：宿主（GUI/webui）的「立即执行」按钮经此转到调度器。
 		// 传方法值而非 *Scheduler —— server 包只需这一个能力，不必知道调度器结构。
 		RunTask: sch.RunTaskByName,
+		// 成长任务「一键完成」：17 个可自动任务的列表 / 单账号执行 / 全账号执行。
+		//
+		// 必须有这个入口，否则 growtask 包会被链接器的死代码消除剔出二进制
+		// —— 表现为「代码写了、测试也过了，但运行时根本调不到」。
+		// 实测验证方式：`strings gateway.exe | findstr growth/tasks` 应有命中。
+		GrowthTasks: newGrowthTaskAPI(p, up, recorder),
 		// 单一模型锁定：仅轮转模式下生效（负载均衡不限制模型，保持原有行为）。
 		AllowedModel: func() string {
 			if cfg.Pool.Rotation {

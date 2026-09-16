@@ -43,6 +43,17 @@ type Config struct {
 	// 内部结构（Config 字段、排程循环），只借一个「按名字跑一轮」的入口，
 	// 依赖方向仍是 main 组装、server 消费。nil = 该能力不可用（如单测）。
 	RunTask func(name string) (scheduler.TaskRunResult, error)
+
+
+	// GrowthTasks 成长任务「一键完成」能力的回调。
+	//
+	// 与 RunTask 同样的依赖倒置理由：server 包不该依赖 growtask 的内部结构
+	// （Runner 的编排、动作注册表），只借三个入口。nil = 该能力不可用（如单测）。
+	//
+	// 为什么需要它：这 17 个成长任务的实现此前只存在于库里、没有任何对外入口，
+	// 因此被链接器的死代码消除剔出了二进制 —— 表现为「代码写了但根本调不到」。
+	GrowthTasks *GrowthTaskAPI
+
 	// AllowedModel 「单一模型」锁定：非空时**只放行这一个模型**，其余一律拒绝。
 	//
 	// 用于「单一模型 + 积分轮转」模式：轮转的语义是「把这个账号的某个模型额度
@@ -104,6 +115,7 @@ func NewHandler(cfg Config) *Handler {
 	// 养号任务手动触发：与 /status 同用 withAuth —— 它会向上游发真实请求，
 	// 未鉴权暴露等于给人一个刷账号活跃度的开关。
 	h.mux.HandleFunc("POST /tasks/run", h.withAuth(h.tasksRun))
+	h.mux.HandleFunc("POST /tasks/growth", h.withAuth(h.growthTasks))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
 }
@@ -176,6 +188,87 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
 	})
+}
+
+// GrowthTaskAPI 成长任务能力的最小接口面。
+//
+// 刻意用回调/窄接口而不是 import growtask 的具体类型：与 RunTask 同一条
+// 依赖倒置原则 —— server 只负责 HTTP 编解码与错误映射，编排逻辑留在 growtask 包。
+// 字段全是函数，main 组装时按需注入；nil 字段对应「该能力不可用」。
+type GrowthTaskAPI struct {
+	// List 列出某账号的成长任务（只读，无副作用）。参数是宿主账号库的 id。
+	List func(accountID string) (any, error)
+	// RunOne 对单账号执行单个任务。code 为空表示「跑该账号的全部待办」。
+	RunOne func(accountID, code string) (any, error)
+	// RunAll 对所有国服账号跑一轮（整轮，耗时可到分钟级）。
+	RunAll func() (any, error)
+}
+
+// growthTasks 成长任务入口（POST /tasks/growth，body: {"action":"list|run","accountId":"...","taskCode":"..."}）。
+//
+// 为什么用单一路由 + action 而不是三条路由：这三个动作共享同一个账号解析与
+// 忙碌判定，拆开会把「账号没找到 / 账号正忙」的错误映射抄三遍，
+// 而它们必须完全一致（否则三个入口对同一状况给出不同提示）。
+func (h *Handler) growthTasks(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.GrowthTasks == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "growth_tasks_unavailable",
+			"growth task runner not configured on this gateway instance")
+		return
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	var req struct {
+		Action    string `json:"action"`
+		AccountID string `json:"accountId"`
+		TaskCode  string `json:"taskCode"`
+	}
+	if err := jsonUnmarshal(string(body), &req); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+		return
+	}
+
+	api := h.cfg.GrowthTasks
+	var (
+		res any
+		err error
+	)
+	switch strings.TrimSpace(req.Action) {
+	case "list":
+		if api.List == nil {
+			writeOpenAIError(w, http.StatusServiceUnavailable, "growth_tasks_unavailable", "list not configured")
+			return
+		}
+		if strings.TrimSpace(req.AccountID) == "" {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "missing accountId")
+			return
+		}
+		res, err = api.List(strings.TrimSpace(req.AccountID))
+	case "run":
+		if api.RunOne == nil {
+			writeOpenAIError(w, http.StatusServiceUnavailable, "growth_tasks_unavailable", "run not configured")
+			return
+		}
+		if strings.TrimSpace(req.AccountID) == "" {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "missing accountId")
+			return
+		}
+		res, err = api.RunOne(strings.TrimSpace(req.AccountID), strings.TrimSpace(req.TaskCode))
+	case "run-all":
+		if api.RunAll == nil {
+			writeOpenAIError(w, http.StatusServiceUnavailable, "growth_tasks_unavailable", "run-all not configured")
+			return
+		}
+		res, err = api.RunAll()
+	default:
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			`unknown action (want "list" | "run" | "run-all")`)
+		return
+	}
+
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "growth_task_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // tasksRun 手动触发一轮养号任务（POST /tasks/run，body: {"task":"activity"}）。
