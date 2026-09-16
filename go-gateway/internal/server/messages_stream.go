@@ -58,6 +58,16 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, result *chatResult, mod
 			}
 		}
 		if err != nil {
+			// 非 EOF 的读错误 = 上游中途断流。必须发 error 并**返回**：
+			// 往下走会照常发 message_stop，而它在 Anthropic 协议里表示「本轮
+			// 正常结束」，客户端会把截断的半截回复当成完整回答收下 ——
+			// 表现为「输出莫名断了且无任何报错」。
+			// io.EOF 是正常结束（上游发完 [DONE] 后关连接），落到成功收尾。
+			if err != io.EOF {
+				_ = out.write("error", anthropicError(200, "upstream_error",
+					"upstream stream error: "+err.Error()))
+				return
+			}
 			break
 		}
 	}

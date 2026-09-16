@@ -482,12 +482,10 @@ type Client struct {
 //   *.workbuddy.ai / *.codebuddy.ai -> 国际版
 //
 // domain 缺失时按国服处理：历史上只存在国服账号，保持向后兼容。
-func IsIntl(a *auth.Auth) bool {
-	if a == nil {
-		return false
-	}
-	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(a.Domain)), ".ai")
-}
+//
+// 判据已下沉到 auth.Auth.IsIntl（账号池做区域路由时也要用同一口径，
+// 两处各写一份迟早会漂移）。这里保留函数是为了不打断既有调用点。
+func IsIntl(a *auth.Auth) bool { return a.IsIntl() }
 
 // isIntl 包内简写，保持既有调用点不变。
 func isIntl(a *auth.Auth) bool { return IsIntl(a) }

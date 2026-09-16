@@ -214,16 +214,38 @@ fn hour(value: &Value) -> Option<String> {
     })
 }
 
-fn model(value: &Value) -> String {
-    value
-        .get("providerData")
-        .and_then(|data| data.get("model"))
-        .or_else(|| value.get("model"))
-        .and_then(Value::as_str)
+/// `providerData` 里一组模型字段的解析结果：`model` → `requestModelName` → `requestModelId`。
+///
+/// `model` 是**本次请求实际落到的模型**，也是三个字段里唯一带 provider 前缀的
+/// （本地自定义模型写作 `custom-local:deepseek-v4-flash`）。当用户把 Claude Code
+/// 通过代理接到别的模型上时（ocgo、自建网关等），harness 会请求 `claude-opus-5`，
+/// 而 `model` 记录的是真正应答的模型 —— 这恰好是「我选的模型」想要表达的东西。
+///
+/// 只有 `model` 缺失或为空时才回落到请求名：早期记录里 `model` 会是空串，
+/// 此时 `requestModelId` 是唯一线索。注意**不能反过来**：`requestModelId` 是
+/// 请求侧的槽位名，在 `auto` / `balanced-model` 这类路由档位下它只写着档位，
+/// 优先采用会把真实模型抹成「Auto」，正是要避免的失真。
+const MODEL_KEYS: [&str; 3] = ["model", "requestModelName", "requestModelId"];
+
+fn model_fields(data: Option<&Value>) -> String {
+    let Some(data) = data else {
+        return "未知模型".to_string();
+    };
+    MODEL_KEYS
+        .into_iter()
+        .filter_map(|key| data.get(key).and_then(Value::as_str))
         .map(str::trim)
-        .filter(|model| !model.is_empty())
+        .find(|value| !value.is_empty())
         .unwrap_or("未知模型")
         .to_string()
+}
+
+fn model(value: &Value) -> String {
+    match value.get("providerData") {
+        Some(data) => model_fields(Some(data)),
+        // `providerData` 缺席时退回裸 `model` 字段。
+        None => model_fields(Some(value)),
+    }
 }
 
 fn files(root: &Path, output: &mut Vec<PathBuf>) {
@@ -607,6 +629,32 @@ fn ide_project_by_session() -> HashMap<String, String> {
     map
 }
 
+/// IDE 会话的展示名称：`modelMap` → `model` → `requestModelId` → `selectedModelId` → `modelId`。
+///
+/// 新版 IDE 把模型存在 `modelMap` 里，按会话类型（`craft` / `chat` …）分槽位，
+/// 例如 `{"craft": "kimi-k2.6"}`。所以取值要先看会话自身的 `type` 命中哪个槽位，
+/// 再看 `craft`，最后才退到任意一个槽位 —— 老记录只有单个槽位时也能取到。
+///
+/// `model` 排在 `selectedModelId` 之前：与 CLI 来源一致，被用户选中的那个具体
+/// 模型比路由档位名（`auto` / `balanced-model`）更能说明「用的是什么模型」。
+fn ide_conversation_model(conversation: &Value) -> Option<String> {
+    let model_map = conversation.get("modelMap").and_then(Value::as_object);
+    let from_map = || {
+        let map = model_map?;
+        let conversation_type = non_empty_text(conversation.get("type"));
+        conversation_type
+            .as_deref()
+            .and_then(|key| non_empty_text(map.get(key)))
+            .or_else(|| non_empty_text(map.get("craft")))
+            .or_else(|| map.values().find_map(|value| non_empty_text(Some(value))))
+    };
+    from_map()
+        .or_else(|| non_empty_text(conversation.get("model")))
+        .or_else(|| non_empty_text(conversation.get("requestModelId")))
+        .or_else(|| non_empty_text(conversation.get("selectedModelId")))
+        .or_else(|| non_empty_text(conversation.get("modelId")))
+}
+
 fn ide_workspace_meta(conv_index: &Path, conv_id: &str) -> (Option<String>, String) {
     let Some(ws_index) = conv_index
         .parent()
@@ -630,10 +678,9 @@ fn ide_workspace_meta(conv_index: &Path, conv_id: &str) -> (Option<String>, Stri
         }
         let title = non_empty_text(conversation.get("name"))
             .or_else(|| non_empty_text(conversation.get("title")));
-        let model = non_empty_text(conversation.get("selectedModelId"))
-            .or_else(|| non_empty_text(conversation.get("modelId")))
-            .or_else(|| non_empty_text(conversation.get("model")))
-            .unwrap_or_else(|| "未知模型".to_string());
+        // model 优于 requestModelId：后者在 auto / balanced-model 这类路由档位下
+        // 只写着档位名，与 CLI 来源保持同一优先级。
+        let model = ide_conversation_model(conversation).unwrap_or_else(|| "未知模型".to_string());
         return (title, model);
     }
     (None, "未知模型".to_string())
@@ -899,6 +946,102 @@ mod tests {
             })
         );
 
+    }
+
+    #[test]
+    fn ide_conversation_model_reads_model_map_by_conversation_type() {
+        // 新版 IDE：模型按会话类型分槽位，会话自身是 craft 槽位。
+        let craft = json!({
+            "type": "craft",
+            "modelMap": { "craft": "kimi-k2.6", "chat": "hy3" }
+        });
+        assert_eq!(ide_conversation_model(&craft).as_deref(), Some("kimi-k2.6"));
+
+        // 会话类型在 map 里没有对应槽位时退到 craft。
+        let chat = json!({
+            "type": "chat",
+            "modelMap": { "craft": "glm-5.1" }
+        });
+        assert_eq!(ide_conversation_model(&chat).as_deref(), Some("glm-5.1"));
+
+        // 没有 type 时同样退到 craft。
+        let untyped = json!({ "modelMap": { "craft": "kimi-k2.5" } });
+        assert_eq!(ide_conversation_model(&untyped).as_deref(), Some("kimi-k2.5"));
+
+        // 只有未知槽位时仍取得到值，而不是显示未知模型。
+        let unknown_slot = json!({ "modelMap": { "delegate": "deepseek-v4-pro" } });
+        assert_eq!(
+            ide_conversation_model(&unknown_slot).as_deref(),
+            Some("deepseek-v4-pro")
+        );
+
+        // 老记录没有 modelMap：退回平铺字段，model 优先于选型槽位。
+        let legacy = json!({ "model": "glm-5.2", "selectedModelId": "auto" });
+        assert_eq!(ide_conversation_model(&legacy).as_deref(), Some("glm-5.2"));
+
+        let slots_only = json!({ "selectedModelId": "deepseek-v4-flash" });
+        assert_eq!(
+            ide_conversation_model(&slots_only).as_deref(),
+            Some("deepseek-v4-flash")
+        );
+
+        assert_eq!(ide_conversation_model(&json!({})), None);
+        assert_eq!(ide_conversation_model(&json!({ "modelMap": {} })), None);
+    }
+
+    #[test]
+    fn model_prefers_served_model_over_request_slots() {
+        // Claude Code 经代理接到别的模型上：harness 请求 claude-opus-5，
+        // 实际应答的是 glm-5.2 —— 统计应显示后者。
+        let proxied = json!({
+            "providerData": {
+                "model": "glm-5.2",
+                "requestModelId": "claude-opus-5",
+                "requestModelName": "Claude Opus 5"
+            }
+        });
+        assert_eq!(model(&proxied), "glm-5.2");
+
+        // 路由档位：requestModelId 只写着 auto，未路由前 providerData.model 也记 auto
+        let unrouted = json!({
+            "providerData": {
+                "model": "auto",
+                "requestModelId": "auto",
+                "requestModelName": "Auto"
+            }
+        });
+        assert_eq!(model(&unrouted), "auto");
+
+        // 本地自定义模型带 provider 前缀，是部署层面最有信息量的写法
+        let custom = json!({
+            "providerData": {
+                "model": "custom-local:deepseek-v4-flash",
+                "requestModelId": "deepseek-v4-flash",
+                "requestModelName": "deepseek-v4-flash"
+            }
+        });
+        assert_eq!(model(&custom), "custom-local:deepseek-v4-flash");
+    }
+
+    #[test]
+    fn model_falls_back_when_served_model_is_missing() {
+        // 早期记录里 model 是空串，requestModelName / Id 是唯一线索。
+        let blank = json!({
+            "providerData": { "model": "", "requestModelId": "hy3" }
+        });
+        assert_eq!(model(&blank), "hy3");
+
+        let name_only = json!({
+            "providerData": { "model": " ", "requestModelName": "Hy3" }
+        });
+        assert_eq!(model(&name_only), "Hy3");
+
+        // providerData 里一个模型字段都没有时才退回裸 model。
+        let bare = json!({ "model": "legacy-model" });
+        assert_eq!(model(&bare), "legacy-model");
+
+        assert_eq!(model(&json!({})), "未知模型");
+        assert_eq!(model(&json!({ "providerData": {} })), "未知模型");
     }
 
     #[test]

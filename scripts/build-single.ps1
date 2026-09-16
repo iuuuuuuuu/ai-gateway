@@ -1,4 +1,4 @@
-﻿﻿﻿# build-single.ps1 —— 构建单文件 AI Gateway（内含 OpenAI 兼容网关）
+# build-single.ps1 —— 构建单文件 AI Gateway（内含 OpenAI 兼容网关）
 #
 # 产物：dist/ai-gateway.exe （一个文件，无需额外的 gateway.exe）
 #
@@ -12,7 +12,11 @@
 param(
     [string]$GatewaySource = "",
     [string]$OutputDir = "dist-single",
-    [switch]$SkipFrontend
+    [switch]$SkipFrontend,
+    # 跳过 Go 网关重建，直接沿用 embedded/ 下已有的产物。
+    # 网关内容没变时，重建会刷新文件 mtime，进而让 ai-gateway-core 重编一次（约 25s）——
+    # 只想改 Rust/前端时用这个开关省掉这一轮。
+    [switch]$SkipGateway
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,6 +31,8 @@ try {
     if ($GatewaySource) {
         Copy-Item $GatewaySource (Join-Path $embedded "gateway.exe") -Force
         Write-Host "    直接使用: $GatewaySource"
+    } elseif ($SkipGateway -and (Test-Path (Join-Path $embedded "gateway.exe"))) {
+        Write-Host "    跳过（-SkipGateway，沿用现有 embedded/gateway.exe）"
     } elseif (Test-Path (Join-Path $embedded "gateway.exe")) {
         $age = (Get-Date) - (Get-Item (Join-Path $embedded "gateway.exe")).LastWriteTime
         Write-Host ("    已有 embedded/gateway.exe（{0:N0} 小时前构建），如需重建请加 -GatewaySource" -f $age.TotalHours)

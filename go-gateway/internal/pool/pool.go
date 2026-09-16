@@ -120,6 +120,14 @@ type entry struct {
 	// cands[0] —— 100 并发下实测 91/100 全部撞同一个账号（惊群）。
 	// 序号由 Pool 在持锁下自增，因此「平局时先选中者优先」= 严格的 LRU 顺序。
 	lastUsedSeq int64
+	// sessionDeadFails 连续 ErrSessionDead（12153）计数，达到阈值才禁用。
+	//
+	// 为什么需要它：12153 会被**临时性**触发（网络抖动 / 上游闪断 / refresh 竞态），
+	// 旧行为一次即 Disable，把健康账号永久杀掉 —— 实测发现一批 disabled 账号
+	// 其实 refresh 完全正常，是历史误判的受害者。
+	// 改为「连续 N 次才禁用」后，偶发失败不会杀号；
+	// 任何证明账号未死的时刻（refresh 成功 / chat 成功 / 手工复活）都清零。
+	sessionDeadFails int
 
 	// breakerUntil / fails / retryCount 为熔断器运行态（不持久化）。
 	// fails 是唯一的"连续失败"计数器：任何错误喂入，达到 breakerThreshold 触发熔断（指数退避），
@@ -130,15 +138,6 @@ type entry struct {
 
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
-
-	// sessionDeadFails 连续 ErrSessionDead（12153）计数，达到阈值才禁用。
-	//
-	// 为什么需要它：12153 会被**临时性**触发（网络抖动 / 上游闪断 / refresh 竞态），
-	// 旧行为一次即 Disable，把健康账号永久杀掉 —— 实测发现一批 disabled 账号
-	// 其实 refresh 完全正常，是历史误判的受害者。
-	// 改为「连续 N 次才禁用」后，偶发失败不会杀号；
-	// 任何证明账号未死的时刻（refresh 成功 / chat 成功 / 手工复活）都清零。
-	sessionDeadFails int
 
 	// expireAt 该账号「最近到期积分」的到期时刻（Unix 秒）；0 = 未知。
 	//
@@ -315,18 +314,6 @@ const (
 	defaultBreakerCooldown    = 30 * time.Minute
 	defaultBreakerCooldownMax = 6 * time.Hour
 )
-
-// sessionDeadThreshold 连续 ErrSessionDead（12153）达到该次数才永久禁用。
-//
-// 取 3 的理由：12153 会被临时性触发（网络抖动 / 上游闪断 / refresh 竞态），
-// 单次即杀号会误杀健康账号。连续 3 次（跨多次保活周期）才认为是真的 session 死亡。
-const sessionDeadThreshold = 3
-
-// sessionDeadReason 禁用原因（与旧文案保持一致，便于既有运维脚本匹配）。
-const sessionDeadReason = "12153 session dead"
-
-// SessionDeadThreshold 暴露阈值（供 scheduler 日志 / 运维文档引用）。
-func SessionDeadThreshold() int { return sessionDeadThreshold }
 
 // StoreSnapshotter 池状态快照镜像的最小接口（redisstore.Store 满足；Noop 空实现安全）。
 // 与本地 state.json 并存，作启动恢复备份：快照比本地新才采用，否则本地优先。
@@ -604,7 +591,7 @@ func (p *Pool) Pick() *auth.Auth {
 
 // PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	return p.pick(tried, "", "")
+	return p.pick(tried, "")
 }
 
 // PickForModel 选出一个**该模型当前未被限流**的可用账号；无可用返回 nil。
@@ -612,69 +599,126 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 // model 为空时等价于 PickExcluding（不做模型过滤）——调用方拿不到模型名时
 // 退化为原有行为，不会因为新特性而选不出账号。
 func (p *Pool) PickForModel(model string, tried map[string]bool) *auth.Auth {
-	return p.PickForModelRealm(model, "", tried)
+	return p.PickForModelRegion(model, tried, auth.RegionAny)
 }
 
-// PickForModelRealm 同上，但把候选限制在指定区域。
+// PickForModelRegion 在 PickForModel 之上叠加**区域偏好**。
 //
-// realm 语义（与模型名前缀协议一致）：
+// 为什么需要：同名模型在两个区域可能是不同的后端模型，能力并不一致
+// （见 auth.Region 的注释：国服 glm-5.3 能读图，国际版同名模型读不到）。
+// 不指定区域时选号是随机的，于是「同一个 glm-5.3」会时好时坏 ——
+// 用户看到的是模型不稳定，实际是命中了两个不同后端。
 //
-//	""       不限制区域（默认；保持既有行为）
-//	"cn"     只选国服账号
-//	"global" 只选国际版账号
+// prefer 语义是**偏好而非强制**：
+//   - prefer=RegionAny，或该区域没有可用账号 → 与 PickForModel 完全一致；
+//   - 有该区域的可用账号 → 只在其中挑；挑不到才回退到全池。
 //
-// 为什么需要它：同一个模型名在两个区域可能是不同的服务
-//（如 gpt-6-astra 只在国际版存在、deepseek-v4-flash 只在国服存在）。
-// 客户端用 `cn:模型名` / `global:模型名` 前缀显式指定区域时，
-// 选号必须尊重该约束，否则会把请求发给不支持该模型的区域，
-// 上游返回 11102 model service info not found。
+// 之所以不做强制：宁可回退到一个「区域不符但能用」的账号，也不要因为
+// 该区域账号恰好都在冷却/在途占满而直接 503 —— 后者会让本来能成功的请求失败。
+// 上层（server）只对**确知存在区域差异**的场景才传具体区域。
+func (p *Pool) PickForModelRegion(model string, tried map[string]bool, prefer auth.Region) *auth.Auth {
+	if prefer == auth.RegionAny {
+		return p.pickForModelAny(model, tried)
+	}
+	// 先按区域收窄候选；收窄后选不出（返回 nil）再放开，保证不因偏好而失败。
+	if acct := p.pickForModelInRegion(model, tried, prefer); acct != nil {
+		return acct
+	}
+	return p.pickForModelAny(model, tried)
+}
+
+// PickForModelRegionStrict 同 PickForModelRegion，但区域是**强制**约束：
+// 该区域没有可用账号时返回 nil，**不**回退到其它区域。
 //
-// realm 无匹配账号时返回 nil（而非回退到不限区域）——
-// 回退会让「显式指定区域」失效，客户端拿到的是难以理解的模型不存在错误。
-func (p *Pool) PickForModelRealm(model, realm string, tried map[string]bool) *auth.Auth {
-	realm = normalizeRealm(realm)
+// 与偏好版的适用场景不同，不要互相替代：
+//
+//	偏好版（PickForModelRegion）—— 「用这个区域更好，但其它区域也能用」。
+//	  例：负载均衡时希望优先烧某个区域的额度。回退是合理的。
+//	强制版（本函数）—— 「只在这个区域才对」。例：带图片的 glm-5.x 只有国服
+//	  后端能读图，跨区会让图片被静默替换成占位符，模型回「我看不见图片」；
+//	  此时回退不是「降级可用」，而是「静默地做错事」。
+//
+// 返回 nil 让上层给出**可读的错误**（缺哪个区域的账号），而不是让用户
+// 对着一个看似成功的响应里模型说「无法查看图片」发愣。
+func (p *Pool) PickForModelRegionStrict(model string, tried map[string]bool, region auth.Region) *auth.Auth {
+	if region == auth.RegionAny {
+		return p.pickForModelAny(model, tried)
+	}
+	return p.pickForModelInRegion(model, tried, region)
+}
+
+// pickForModelAny 原有行为：不做区域过滤。
+func (p *Pool) pickForModelAny(model string, tried map[string]bool) *auth.Auth {
 	p.mu.RLock()
 	rot := p.rotationOn
 	p.mu.RUnlock()
 	if rot {
-		return p.pickRotation(tried, model, realm)
+		return p.pickRotation(tried, model)
 	}
-	return p.pick(tried, model, realm)
+	return p.pick(tried, model)
 }
 
-// normalizeRealm 归一化区域值；无法识别时返回 ""（不限制）。
+// pickForModelInRegion 只在指定区域的账号里挑。
 //
-// 大小写敏感：前缀协议要求精确的小写枚举（见 server.resolveModel），
-// 这里保持一致，避免 "GLOBAL:" 被当成合法前缀。
-func normalizeRealm(realm string) string {
-	switch realm {
-	case realmCN, realmGlobal:
-		return realm
-	default:
-		return ""
+// 复用 pick/pickRotation 的整套策略（到期分层、加权、在途、冷却），
+// 只是把候选集先按区域过滤 —— 这样区域偏好不会绕过任何既有保护，
+// 也不会因为多一套选号实现而产生行为漂移。
+//
+// **关键**：区域内选不出号时返回 nil，**不做全冷却兜底**。
+// 兜底（pickEarliestExpiryLocked）会选「冷却中但截止最早」的账号，
+// 于是「偏好国服」会变成「把一个正在冷却的国服号塞进来」——冷却被绕过。
+// 实测用例 TestImageRequestSkipsCooledCNAccount 锁住这一点：
+// 国服号在冷却、国际版号健康时，必须选国际版号，而不是回头用冷却的国服号。
+//
+// 返回 nil 让上层（PickForModelRegion）决定是否放开区域 —— 那是**跨区域**的
+// 降级，与「在同一区域内绕过冷却」是完全不同性质的退让。
+func (p *Pool) pickForModelInRegion(model string, tried map[string]bool, region auth.Region) *auth.Auth {
+	p.mu.RLock()
+	rot := p.rotationOn
+	scoped := make(map[string]bool, len(tried))
+	for uid := range tried {
+		scoped[uid] = true
 	}
+	// 把所有非本区域账号塞进排除集，等价于「只在区域内挑」。
+	// 构造与加锁在同一次 RLock 内完成，避免两次加锁之间账号池变化
+	// 导致排除集与实际池子不一致（那会让筛选条件随并发悄悄失效）。
+	for uid, e := range p.byUID {
+		if e.a.Region() != region {
+			scoped[uid] = true
+		}
+	}
+	p.mu.RUnlock()
+
+	if rot {
+		return p.pickRotationStrict(scoped, model)
+	}
+	return p.pickStrict(scoped, model)
 }
 
-// 区域枚举（与模型名前缀协议、auth 的域名判定保持一致）。
-const (
-	realmCN     = "cn"
-	realmGlobal = "global"
-)
-
-// accountRealm 返回账号所属区域。
-func accountRealm(a *auth.Auth) string {
-	if a.IsIntl() {
-		return realmGlobal
-	}
-	return realmCN
+// pickStrict 与 pick 相同，但**不做全冷却兜底**：没有可用候选时返回 nil。
+//
+// 单独抽出来而不是给 pick 加参数，是为了让「要不要兜底」在调用点一眼可见 ——
+// 兜底会绕过冷却，是个需要显式决定的语义。
+func (p *Pool) pickStrict(tried map[string]bool, model string) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pickLocked(tried, model, false)
 }
 
-// realmAllows 该账号是否满足区域约束（realm 为空 = 不限制）。
-func realmAllows(a *auth.Auth, realm string) bool {
-	if realm == "" {
-		return true
+// pickRotationStrict 轮转模式下的严格版（不兜底），见 pickStrict。
+//
+// 另外必须处理「当前轮转锁定的账号不在本区域」：pickRotation 会优先续用
+// p.rotationUID，而它可能已被排除在 scoped 之外。若不管，续用逻辑会绕过
+// 区域约束（用国际版号接图片请求）—— 正是本特性要避免的。
+func (p *Pool) pickRotationStrict(tried map[string]bool, model string) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if tried != nil && tried[p.rotationUID] {
+		// 锁定的账号被本区域排除：本轮不用它，也不改 rotationUID（它可能
+		// 只是不满足这次的区域要求，其它请求仍在正常用它）。
+		return p.pickRotationLockedSkipCurrent(tried, model)
 	}
-	return accountRealm(a) == realm
+	return p.pickRotationLocked(tried, model, false)
 }
 
 // SetRotation 开关「单一模型 + 积分轮转」模式。
@@ -706,9 +750,17 @@ func (p *Pool) RotationOn() bool {
 //
 // tried 仍被尊重（请求级轮换：同一请求内换过号就不再回头），
 // 这样上层 forward 的重试逻辑无需改动。
-func (p *Pool) pickRotation(tried map[string]bool, model, realm string) *auth.Auth {
+func (p *Pool) pickRotation(tried map[string]bool, model string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.pickRotationLocked(tried, model, true)
+}
+
+// pickRotationLocked 轮转选号的实现。调用方必须已持 p.mu。
+//
+// allowFallback=false 时不做全冷却兜底（无可用候选返回 nil），供区域收窄后
+// 的调用路径使用 —— 兜底会把「冷却中的账号」选回来，绕过区域约束。
+func (p *Pool) pickRotationLocked(tried map[string]bool, model string, allowFallback bool) *auth.Auth {
 	now := time.Now()
 
 	// 1) 仍在用的账号若还可用，直接续用 —— 这是「串行烧号」的核心。
@@ -727,20 +779,20 @@ func (p *Pool) pickRotation(tried map[string]bool, model, realm string) *auth.Au
 		if tried != nil && tried[uid] {
 			continue
 		}
-		// 区域约束（realm 为空 = 不限制）：客户端用 cn:/global: 前缀
-		// 显式指定区域时，不能把请求发给另一区域的账号。
-		if !realmAllows(e.a, realm) {
-			continue
-		}
 		if !p.rotationUsableLocked(e, now, model, nil) {
 			continue
 		}
 		cands = append(cands, e)
 	}
 	if len(cands) == 0 {
+		if !allowFallback {
+			// 区域收窄后无可用候选：不改 rotationUID（锁定号可能只是不满足
+			// 本次的区域要求，其它请求仍该继续用它），交给上层决定是否放开区域。
+			return nil
+		}
 		// 无可用账号：沿用既有兜底（取最早截止的冷却账号试一次）。
 		p.rotationUID = ""
-		return p.pickEarliestExpiryLocked(tried, now, model, realm)
+		return p.pickEarliestExpiryLocked(tried, now, model)
 	}
 	sort.Slice(cands, func(i, j int) bool {
 		ki, kj := cands[i].expiryDayKey(), cands[j].expiryDayKey()
@@ -764,6 +816,29 @@ func (p *Pool) pickRotation(tried map[string]bool, model, realm string) *auth.Au
 	}
 	p.markUsed(chosen)
 	return chosen.a
+}
+
+// pickRotationLockedSkipCurrent 轮转模式下**跳过当前锁定的账号**挑一个。
+//
+// 用于「锁定的账号不满足本次约束（如区域不符）」的场景：此时不能续用它，
+// 但也不该清掉 rotationUID —— 它可能只是对本次请求不合适（例如带图片的
+// glm-5.3 偏好国服，而锁定号是国际版），对不要求区域的普通请求仍然是
+// 正确的「当前号」。清掉会让轮转语义变成「被一次图片请求打乱」。
+//
+// 实现上把锁定号并入 tried 后走正常路径：tried 语义正是「本次不选它」，
+// 与这里要表达的意思一致，因此无需再写一套挑选逻辑。
+func (p *Pool) pickRotationLockedSkipCurrent(tried map[string]bool, model string) *auth.Auth {
+	skip := make(map[string]bool, len(tried)+1)
+	for uid := range tried {
+		skip[uid] = true
+	}
+	skip[p.rotationUID] = true
+	locked := p.rotationUID
+	acct := p.pickRotationLocked(skip, model, false)
+	// pickRotationLocked 换号时会改写 rotationUID；本次「跳过」不应改变
+	// 轮转的持久状态，因此原样还原（它仍代表那个账号，只是本次不用）。
+	p.rotationUID = locked
+	return acct
 }
 
 // rotationUsableLocked 报告账号在轮转模式下是否可用。调用方必须已持锁。
@@ -804,19 +879,23 @@ func (p *Pool) rotationUsableLocked(e *entry, now time.Time, model string, tried
 // 并发防雪崩：跳过 lastUsed 距今 < minPickGap 的账号（除非候选全部刚被用过，
 // 此时退回最近最少使用 LRU 账号），迫使高并发请求发散。
 // minPickGap=0（测试用）时过滤恒通过，退化为纯加权随机。
-func (p *Pool) pick(tried map[string]bool, model, realm string) *auth.Auth {
+func (p *Pool) pick(tried map[string]bool, model string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.pickLocked(tried, model, true)
+}
+
+// pickLocked 选号的实现。调用方必须已持 p.mu。
+//
+// allowFallback=false 时不做全冷却兜底（无可用候选返回 nil），供区域收窄后的
+// 调用路径使用。兜底会选「冷却中但截止最早」的账号，若区域收窄后仍走兜底，
+// 「偏好国服」就退化成「把冷却中的国服号塞回来」—— 冷却被静默绕过。
+func (p *Pool) pickLocked(tried map[string]bool, model string, allowFallback bool) *auth.Auth {
 	now := time.Now()
 
 	var cands []*entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
-			continue
-		}
-		// 区域约束（realm 为空 = 不限制）：客户端用 cn:/global: 前缀
-		// 显式指定区域时，不能把请求发给另一区域的账号。
-		if !realmAllows(e.a, realm) {
 			continue
 		}
 		// 顺手清理已过期的模型冷却，避免 map 随模型种类无限增长。
@@ -836,9 +915,12 @@ func (p *Pool) pick(tried map[string]bool, model, realm string) *auth.Auth {
 		cands = append(cands, e)
 	}
 	if len(cands) == 0 {
+		if !allowFallback {
+			return nil
+		}
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now, model, realm)
+		return p.pickEarliestExpiryLocked(tried, now, model)
 	}
 
 	// 到期分层：只保留最早到期的一档。
@@ -970,16 +1052,10 @@ func (p *Pool) earliestExpiryTierLocked(cands []*entry) ([]*entry, bool) {
 // model 非空时同样排除"该模型正被限流"的账号：否则兜底会把刚被 6004 拒掉的账号
 // 立刻再选一次，既浪费轮换又让用户看到重复报错。若排除后无候选则返回 nil，
 // 由调用方报告"全部账号该模型均受限"（比继续撞限流更有信息量）。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, model, realm string) *auth.Auth {
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, model string) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
-			continue
-		}
-		// 区域约束同样适用于兜底：显式指定区域时，
-		// 宁可不选（返回 nil，上层报「该区域无可用账号」）
-		// 也不要把请求发给错误区域的账号。
-		if !realmAllows(e.a, realm) {
 			continue
 		}
 		if e.disabled {
@@ -1398,17 +1474,28 @@ func (p *Pool) Disable(uid, reason string) {
 	}
 }
 
+// sessionDeadThreshold 连续 ErrSessionDead（12153）达到该次数才永久禁用。
+//
+// 取 3 的理由：12153 会被临时性触发（网络抖动 / 上游闪断 / refresh 竞态），
+// 单次即杀号会误杀健康账号。连续 3 次（跨多次保活周期）才认为是真的 session 死亡。
+const sessionDeadThreshold = 3
+
+// sessionDeadReason 禁用原因（与旧文案保持一致，便于既有运维脚本匹配）。
+const sessionDeadReason = "12153 session dead"
+
+// SessionDeadThreshold 暴露阈值（供 scheduler 日志 / 运维文档引用）。
+func SessionDeadThreshold() int { return sessionDeadThreshold }
+
 // NoteSessionDead 记录一次 ErrSessionDead（12153）——**不立即禁用**。
 //
-// 旧行为是「一次 12153 即 Disable」，但该错误会被临时性触发（网络抖动 / 上游闪断 /
-// refresh 竞态），一次失败就永久杀号会误杀健康账号 —— 实测发现一批 disabled 账号
-// 其实 refresh 完全正常，是历史误判的受害者。
+// 旧行为是「一次 12153 即 Disable」，但该错误会被临时性触发（网络抖动 /
+// 上游闪断 / refresh 竞态），一次失败就永久杀号会误杀健康账号 ——
+// 实测发现一批 disabled 账号其实 refresh 完全正常，是历史误判的受害者。
 //
 // 现改为连续 sessionDeadThreshold 次才禁用：计数 +1，达阈值则 Disable 并清计数。
 // 返回 true 表示本次已达阈值并完成禁用。
 //
-// 注意：即使账号已 disabled，计数仍会累计 —— 但保活循环会跳过 disabled 账号，
-// 因此只有「禁用后复活且计数未清」这类边界才会走到。
+// 清零时机见 ClearSessionDead（refresh 成功 / chat 成功 / 手工复活）。
 func (p *Pool) NoteSessionDead(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1417,29 +1504,30 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 		return false
 	}
 	e.sessionDeadFails++
+	p.dirty.Store(true)
 	if e.sessionDeadFails < sessionDeadThreshold {
-		p.dirty.Store(true)
 		return false
 	}
 	e.sessionDeadFails = 0
 	e.disabled = true
 	e.reason = sessionDeadReason
-	p.dirty.Store(true)
 	return true
 }
 
-// ClearSessionDead 清零连续 12153 计数 —— 任何证明账号未死的时刻都该调用：
-// refresh 成功（保活）、chat 成功（NoteSuccess）、手工复活。
+// ClearSessionDead 清零连续 12153 计数。
+//
+// 任何「证明账号没死」的时刻都应调用它：refresh 成功、chat 成功、手工复活。
+// 不清零的话，一个月的偶发抖动累计到 3 次照样会杀号 —— 而「连续」正是本修复
+// 的语义核心，累计计数会让它退化成「累计 3 次即杀」。
 func (p *Pool) ClearSessionDead(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok && e.sessionDeadFails != 0 {
+	if e, ok := p.byUID[uid]; ok {
 		e.sessionDeadFails = 0
-		p.dirty.Store(true)
 	}
 }
 
-// SessionDeadFails 查询当前连续 12153 计数（运维/测试用）。
+// SessionDeadFails 当前连续 12153 计数（供 scheduler 日志与测试断言）。
 func (p *Pool) SessionDeadFails(uid string) int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -1490,7 +1578,6 @@ func (p *Pool) NoteError(uid string) {
 
 // NoteSuccess 成功请求累加成功计数、刷新 lastSuccess，并清空连续失败与熔断运行态。
 // 二进制模型：清 fails + retryCount + breakerUntil；不碰 until/coolKind（那些是即时冷却，各自到期）。
-// 同时清零连续 12153 计数：一次成功即证明账号未死（误判防护的复活路径）。
 func (p *Pool) NoteSuccess(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1500,6 +1587,9 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.fails = 0
 		e.retryCount = 0
 		e.breakerUntil = time.Time{}
+		// 一次 chat 成功就证明 session 没死，连续 12153 计数必须清零：
+		// 不清零的话，一个月的偶发抖动会累计到阈值照样杀号 ——
+		// 而「连续」正是该修复的语义核心，累计计数会让它退化成「累计 N 次即杀」。
 		e.sessionDeadFails = 0
 		p.dirty.Store(true)
 	}
@@ -1524,6 +1614,22 @@ func (p *Pool) AuthByUID(uid string) *auth.Auth {
 		return e.a
 	}
 	return nil
+}
+
+// AllUIDs 返回池中**全部**账号的 UID（含冷却/熔断/禁用），按 UID 排序。
+//
+// 与 AvailableUIDs 的区别是只读观测用途：区域诊断要能看到「池里到底有哪些
+// 账号、各自属于哪个区域」，若只列 healthy 账号，故障排查时最需要看的那几个
+// （正在冷却的）恰好不可见。
+func (p *Pool) AllUIDs() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	uids := make([]string, 0, len(p.byUID))
+	for uid := range p.byUID {
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	return uids
 }
 
 // AvailableUIDs 返回当前 healthy 且未占满在途名额的账号 UID 列表（按 UID 排序，稳定输出）。
@@ -1577,6 +1683,30 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	// 统一走 markUsed：与 pick() 共用同一序号空间，保证 LRU 排序跨入口一致。
 	p.markUsed(e)
 	return e.a
+}
+
+// PickByUIDForModelRegion 同 PickByUIDForModel，但额外要求账号属于 prefer 区域。
+//
+// 存在的意义：粘性会话会把后续请求固定到首次绑定的账号上，而区域偏好
+// 只在「重新选号」时生效 —— 若不做这个检查，一个已绑定到国际版账号的会话
+// 发图片时仍会走国际版后端，区域偏好形同虚设。
+//
+// 返回 nil 会让上层解绑并重新分配（与「绑定号不可用即失效」的既有约定一致）。
+// prefer=RegionAny 时与 PickByUIDForModel 完全一致。
+func (p *Pool) PickByUIDForModelRegion(uid, model string, prefer auth.Region) *auth.Auth {
+	if prefer != auth.RegionAny {
+		p.mu.RLock()
+		e, ok := p.byUID[uid]
+		var got auth.Region
+		if ok {
+			got = e.a.Region()
+		}
+		p.mu.RUnlock()
+		if !ok || got != prefer {
+			return nil
+		}
+	}
+	return p.PickByUIDForModel(uid, model)
 }
 
 // CountsDetailed 返回 total/healthy/cooling/disabled/inFlightFull 五类计数。

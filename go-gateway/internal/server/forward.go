@@ -115,12 +115,15 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 	// 请求的目标模型：用于「模型级限流」的选号过滤与冷却记账。
 	// 取不到时为空串，各环节自动退化为原有行为（不做模型过滤）。
 	//
-	// 同时解析可选的区域前缀 `cn:` / `global:`：指定后选号被限制在该区域，
-	// 避免把请求发给不支持该模型的区域（上游会返回 11102）。
-	// 无前缀时 realm 为空 = 不限制区域，保持既有行为。
+	// 同时解析可选的区域前缀 `cn:` / `global:`：前缀只是给网关的**选号指令**，
+	// 上游不认识它，故必须把请求体里的 model 改写成裸名（见下方 rewriteModel）。
 	// 注意返回顺序是 (realm, bare) —— 写反会把区域当成模型名，
 	// 表现为「单一模型锁定」报「收到的是 (未指定)」。
-	realm, model := resolveModel(modelOf(body))
+	//
+	// realm 不再参与选号：上游已把区域约束升级为 route/preferRegion
+	//（含「按区域的模型能力真值」），比字符串 realm 更完整且能区分
+	// 「偏好」与「强制」。这里只取 bare 用于改写请求体。
+	_, model := resolveModel(modelOf(body))
 
 	// 前缀只是给网关的**选号指令**，上游不认识它 —— 必须把请求体里的
 	// model 改写成裸名，否则上游返回 400 code=11102 model [cn:xxx] not found
@@ -142,6 +145,12 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 
 	body = rewriteModel(body, model)
 
+	// 区域路由：仅对「图像能力两区不同」的模型 + 带图片的请求生效，
+	// 其余情况返回 RegionAny，行为与引入本特性之前完全一致。
+	// 详见 imageRouteFor 的注释。
+	route := imageRouteFor(model, requestHasImage(body))
+	preferRegion := route.Region
+
 	// 「单一模型」锁定：非空时只放行该模型。
 	//
 	// 为什么在选号之前就拒绝（而不是换个模型重试）：轮转模式的语义是
@@ -162,12 +171,7 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, model)
-			// 粘性账号也必须满足区域约束：否则会话粘性会把请求
-			// 一直钉在错误区域的账号上，前缀指定形同虚设。
-			if acct != nil && realm != "" && acct.Realm() != realm {
-				acct = nil
-			}
+			acct = h.cfg.Pool.PickByUIDForModelRegion(stickyUID, model, preferRegion)
 			if acct == nil {
 				if h.cfg.Session != nil {
 					h.cfg.Session.Unbind(sessKey)
@@ -176,9 +180,20 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickForModelRealm(model, realm, tried)
+			acct = h.pickAccount(model, tried, route)
 		}
 		if acct == nil {
+			// 区域受限且选不出号：**不降级**，明确告诉用户缺哪个区域的账号。
+			// 静默跨区会让图片被后端换成占位符，模型回「我看不见图片」——
+			// 用户完全无从判断是网络、模型还是网关的问题。
+			if route.Required {
+				return &chatResult{Model: model}, http.StatusServiceUnavailable,
+					&forwardFailure{
+						Kind:    FailureImageRegionUnavailable,
+						Status:  http.StatusServiceUnavailable,
+						Message: imageRegionUnavailableMessage(route.Region),
+					}
+			}
 			lastStatus = http.StatusServiceUnavailable
 			break
 		}
@@ -325,7 +340,29 @@ const (
 	FailureUpstream FailureKind = iota
 	// FailureContextTooLong 请求上下文超出模型窗口：请求侧错误，换号无用。
 	FailureContextTooLong
+	// FailureImageRegionUnavailable 带图片的请求需要一个特定区域的账号，
+	// 而账号池里该区域此刻没有可用账号。
+	//
+	// 单独成型是为了让错误文案说清「缺什么、该怎么办」—— 与账号池耗尽的
+	// 503 不同，这不是「稍后重试就好」，而是「你得加一个那个区域的账号」。
+	FailureImageRegionUnavailable
 )
+
+// imageRegionUnavailableMessage 生成「带图片请求缺少该区域账号」的说明。
+//
+// 必须同时给出**原因**与**出路**：这类失败用户第一次遇到时完全无法自行判断
+// （网关返回 503，客户端只显示「服务不可用」），而原因（上游两区同名模型的
+// 图像能力不同）与出路（补一个那个区域的账号）都只有网关知道。
+func imageRegionUnavailableMessage(region auth.Region) string {
+	name := "国服"
+	if region == auth.RegionIntl {
+		name = "国际版"
+	}
+	return "该模型带图片的请求需要" + name + "账号（实测只有" + name +
+		"后端能读取图片，另一个区域会把图片替换成占位符后交给模型，" +
+		"表现为模型回复「无法查看图片」），但账号池里此刻没有可用的" + name +
+		"账号。请添加/启用一个" + name + "账号，或去掉图片后重试。"
+}
 
 // forwardFailure 一次需要特殊上报的转发失败。
 //
@@ -338,6 +375,25 @@ type forwardFailure struct {
 }
 
 func (e *forwardFailure) Error() string { return e.Message }
+
+// pickAccount 按 imageRoute 选号。
+//
+// 与旧的 PickForModelRegion（偏好语义）的区别在于 Required：
+//
+//	Required=false → 偏好：先在该区域挑，挑不到放开到全池（旧行为）。
+//	                 「区域不符但能用」好过因为该区域没号而失败。
+//	Required=true  → 强制：只在该区域挑，挑不到返回 nil，由调用方报错。
+//	                 此时跨区降级**不是**「能用就行」—— 后端会静默丢弃图片，
+//	                 用户拿到的是「模型说它看不见图片」，无从排查。
+func (h *Handler) pickAccount(model string, tried map[string]bool, route imageRoute) *auth.Auth {
+	if route.Region == auth.RegionAny {
+		return h.cfg.Pool.PickForModelRegion(model, tried, auth.RegionAny)
+	}
+	if route.Required {
+		return h.cfg.Pool.PickForModelRegionStrict(model, tried, route.Region)
+	}
+	return h.cfg.Pool.PickForModelRegion(model, tried, route.Region)
+}
 
 // failureOf 取出 *forwardFailure（若有），供各协议入口按类别选错误码。
 func failureOf(err error) *forwardFailure {
@@ -410,6 +466,101 @@ func rewriteModel(body []byte, bare string) []byte {
 		return body
 	}
 	return out
+}
+
+// requestHasImage 报告 OpenAI Chat 请求体里是否携带图片分片。
+//
+// 三种协议入口最终都会把图片归一成 `{"type":"image_url", ...}` 分片
+// （responses.go 的 input_image、messages.go 的 Anthropic image 块），
+// 因此只需在这里认这一种形状。
+//
+// 判据用「分片里存在 image_url 键」而不是「type == image_url」：
+// 上游/客户端对 image 分片的 type 写法不止一种（实测有 image_url、
+// input_image），按 type 精确匹配会漏判，而漏判的后果是请求被路由到
+// 读不到图片的后端 —— 正是本函数要避免的。
+func requestHasImage(body []byte) bool {
+	var probe struct {
+		Messages []struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return false
+	}
+	for _, m := range probe.Messages {
+		if len(m.Content) == 0 {
+			continue
+		}
+		// content 可能是字符串（纯文本）或分片数组；只有数组才可能含图片。
+		var parts []map[string]any
+		if err := json.Unmarshal(m.Content, &parts); err != nil {
+			continue
+		}
+		for _, p := range parts {
+			if _, ok := p["image_url"]; ok {
+				return true
+			}
+			if t, _ := p["type"].(string); t == "image_url" || t == "input_image" || t == "image" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// imageRoute 带图片的请求该如何选号。
+type imageRoute struct {
+	// Region 应使用的区域；RegionAny = 不做区域约束。
+	Region auth.Region
+	// Required 为 true 时**只**在该区域选号，选不出就报错，绝不跨区降级。
+	//
+	// 与「偏好」的区别是本特性的核心：偏好会在该区域没号时静默回退到读不到图的
+	// 后端，用户拿到一句「抱歉，我无法查看图片」却毫不知情；Required 则明确
+	// 告诉用户「需要哪个区域的账号」，可排查、可行动。
+	Required bool
+}
+
+// imageRouteFor 报告「带图片的该模型请求」应使用的区域。
+//
+// 背景（实测 2026-09-16，逐账号 × 逐模型发图验证，见 measured.go 的实测表）：
+//
+//	glm-5.3 / glm-5.2 是**两区共有**的模型名，但两区是**不同的后端模型**。
+//	国服后端能读图；国际版后端把图片替换成固定占位符（prompt_tokens 增量
+//	恒为 +33，与图片体积无关），模型只能回「无法查看图片」。
+//
+// 池里国服与国际版账号混用，选号又只看到期日与冷却、不看区域，
+// 于是同一个 glm-5.3 会随机命中两个后端 —— 用户看到「时好时坏」。
+//
+// 三种情形：
+//
+//	不带图片                  → 不约束（RegionAny）。两个区域的文本能力都正常，
+//	                            没必要为纯文本放弃一半账号的额度。
+//	带图片 + 该模型**只在一区**可读 → Required：迁移到那个区域，选不出就报错。
+//	带图片 + 两区都能读        → 不约束（RegionAny）。例如 hy3 / kimi-k2.6
+//	                            实测两区都能读，对它们偏好只会白白损失一半额度。
+//
+// 与 measured.go 的分工：那里给的是「某模型在某区域能不能读图」的**事实**，
+// 这里把它翻译成**路由决策**。两者共用同一份实测表，不会各自漂移。
+func imageRouteFor(model string, hasImage bool) imageRoute {
+	if !hasImage {
+		return imageRoute{Region: auth.RegionAny}
+	}
+	cn := measuredImageCapability(model, auth.RegionCN) == measSupported
+	intl := measuredImageCapability(model, auth.RegionIntl) == measSupported
+	switch {
+	case cn && intl:
+		// 两区都能读：不约束。对它们做偏好只会放弃一半账号的额度而无任何收益。
+		return imageRoute{Region: auth.RegionAny}
+	case cn && !intl:
+		return imageRoute{Region: auth.RegionCN, Required: true}
+	case intl && !cn:
+		return imageRoute{Region: auth.RegionIntl, Required: true}
+	default:
+		// 两区都读不到，或该模型没有实测结论：不约束，交给运行时按原策略处理。
+		// 这里**不**直接报错 —— 「没实测过」不等于「不行」，把没验过的模型
+		// 一律拒掉会误伤本可用的图片能力。
+		return imageRoute{Region: auth.RegionAny}
+	}
 }
 
 // buildSessKey 为没有原生会话字段的协议（如 Anthropic Messages）合成粘性键。

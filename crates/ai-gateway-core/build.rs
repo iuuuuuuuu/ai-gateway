@@ -31,10 +31,31 @@ fn candidate_paths() -> Vec<PathBuf> {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=AI_GATEWAY_ROUTER_BIN");
-    // 无条件注册所有候选路径的监听：这样「先构建时没有网关、后来补上」
-    // 也能触发 build.rs 重跑。只在命中路径上注册会导致永远内嵌不进去。
+    // 监听网关二进制，但**只监听真正存在的那一条**。
+    //
+    // 这里有两个都实测踩过的坑，改动前务必读完：
+    //
+    // 坑 1（吃掉每次构建 25 秒的根因）：对**不存在**的路径调用 `rerun-if-changed`，
+    //   cargo 会认为它**永远脏**（缺失本身即视为一次变更），于是每次 `cargo build`
+    //   都重跑 build.rs，并无条件重编 ai-gateway-core 及其全部下游。
+    //   实测：连续两次「无任何改动」的 release 构建，两次都输出
+    //   `Compiling ai-gateway-core` + `Compiling ai-gateway-server`，各约 25s ——
+    //   缓存**从未**生效过。而 `dist/gateway.exe` 恰恰从来不存在（构建脚本只把
+    //   网关写到 embedded/ 下），所以这条 bug 一直在触发。
+    //
+    // 坑 2（修坑 1 时新引入的）：改为监听缺失路径的**父目录**同样不行 ——
+    //   `dist/` 每次前端构建都会变，于是「改前端 → 重编 ai-gateway-core」，
+    //   而 core 与前端毫无关系。实测同样约 26s。
+    //
+    // 正确做法：存在则监听该文件；不存在则**什么都不注册**。
+    // 代价是「构建时没有网关、之后再补上」不会自动触发重编 —— 但这没关系：
+    // scripts/build-gateway.sh 先产出网关，scripts/build-single.ps1 也总是在
+    // cargo build 之前构建网关，两者都不会依赖这条自动触发。真要补内嵌，
+    // touch 一下 core 的源码或 `cargo clean -p ai-gateway-core` 即可。
     for c in candidate_paths() {
-        println!("cargo:rerun-if-changed={}", c.display());
+        if c.exists() {
+            println!("cargo:rerun-if-changed={}", c.display());
+        }
     }
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default());
     let gen_file = out_dir.join("gateway_embed.rs");
