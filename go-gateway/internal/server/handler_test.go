@@ -466,11 +466,7 @@ func TestModelsEndpoint(t *testing.T) {
 
 func TestModelsDynamic(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	// 假上游返回动态模型（含 agents + maxInputTokens/maxOutputTokens）
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -530,9 +526,7 @@ func TestModelsDynamic(t *testing.T) {
 	}
 
 	// 第二次调用走缓存（把上游关掉也成功）
-	dynamicModelsCache.RLock()
-	cached := len(dynamicModelsCache.ids)
-	dynamicModelsCache.RUnlock()
+	cached := cachedModelCount()
 	if cached != 3 {
 		t.Errorf("cache not populated: %d", cached)
 	}
@@ -540,11 +534,7 @@ func TestModelsDynamic(t *testing.T) {
 
 func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	// 假上游 500
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -580,11 +570,7 @@ func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 // 防止反复打上游的职责由失败负缓存（modelsFetchFailCooldown）承担，与账号健康无关。
 func TestModelsFetchFailureDoesNotPenalizeAccount(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	p.SetBreaker(1, time.Hour, time.Hour) // 阈值设为 1：若仍会记账，一次失败即暴露
@@ -609,11 +595,7 @@ func TestModelsFetchFailureDoesNotPenalizeAccount(t *testing.T) {
 
 func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -637,9 +619,7 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	}
 
 	// 冷却期结束（把失败时间戳拨回 10 分钟前）→ 应重新 fetch。
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.lastFail = time.Now().Add(-10 * time.Minute)
-	dynamicModelsCache.Unlock()
+	ageModelsCacheFailure(10 * time.Minute)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
 	if rec.Code != 200 {
