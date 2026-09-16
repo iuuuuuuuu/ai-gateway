@@ -829,6 +829,17 @@ pub fn find_free_port(start: u16, span: u16) -> Option<u16> {
 }
 
 /// 端口占用检测结果（供前端即时反馈）。
+///
+/// **刻意不查占用进程**（`holder` 恒为 null）。
+///
+/// 原因：本函数跑在**同步 Tauri 命令**里（即主线程），而查占用者要 spawn
+/// netstat + tasklist + powershell 三个控制台进程。页面一挂载就会调它，
+/// 于是「打开页面」变成「主线程卡住数秒」—— 实测表现为界面未响应，
+/// 并因频繁创建控制台进程耗尽 desktop heap，弹出
+/// 「应用程序无法正常启动 (0xc0000142)」。
+///
+/// 查占用者改为**按需**触发：用户点了「结束占用进程」才走
+/// `kill_port_holder` 的路径（见 `port_holder`），那时才值得付出进程开销。
 pub fn inspect_port(port: u16) -> Value {
     // 注意：若网关自身正跑在该端口上，这里会判定为「被占用」。
     // 调用方（前端）需结合 status.running 判断，避免误报。
@@ -842,11 +853,9 @@ pub fn inspect_port(port: u16) -> Value {
         "suggest": if available { Value::Null } else {
             find_free_port(port.saturating_add(1), 50).map(|p| json!(p)).unwrap_or(Value::Null)
         },
-        // 占用者信息：让前端能明确告诉用户「是哪个进程占着」，
-        // 而不是只给一句「已被占用」让用户自己猜。
-        "holder": if available { Value::Null } else {
-            port_holder(port).unwrap_or(Value::Null)
-        },
+        // 保持字段存在（前端类型要求），但不在热路径上填充。
+        // 真正需要时由前端调 kill 接口，那边会查并回显实际占用者。
+        "holder": Value::Null,
     })
 }
 
@@ -872,6 +881,11 @@ fn is_our_process(name: &str, path: &str) -> bool {
 ///
 /// 返回 None 表示「查不到」：可能是端口其实空闲、进程已退出、或权限不足。
 /// 调用方应把 None 当作「无法提供占用者信息」，而不是「没有占用」。
+///
+/// **慎用**：本函数会 spawn netstat + tasklist + powershell 三个控制台进程，
+/// 开销是毫秒到秒级。不要在轮询或页面挂载路径上调用（见 `inspect_port` 的说明）。
+/// 目前只在「用户确认要结束占用进程」这条按需路径上使用。
+#[allow(dead_code)]
 pub fn port_holder(port: u16) -> Option<Value> {
     let (pid, name, path) = find_port_holder(port)?;
     Some(json!({
@@ -934,41 +948,32 @@ pub fn kill_port_holder(port: u16) -> Result<Value, String> {
 
 /// 查找占用端口的进程：返回 (pid, 进程名, 可执行文件路径)。
 ///
-/// Windows 用 `netstat -ano` 找 PID 再用 `tasklist` 换名字；
+/// Windows 用 `netstat -ano` 找 PID，再用 `tasklist` 换进程名、`powershell` 取路径。
 /// 其它平台暂不支持（返回 None），前端会退化为「无法识别占用者」的提示。
+///
+/// **必须走 `process::run_cmd_timeout` 而不是裸 `Command::output()`**：
+///  1. 它带 `CREATE_NO_WINDOW`。裸 spawn 控制台程序会闪出 cmd 黑窗口
+///     （项目里多处注释指出这是「GUI 卡顿/跳动的主因」）。
+///  2. 它有超时。netstat 在连接数多的机器上可能长时间不返回，
+///     裸调用会让调用方（HTTP 请求线程）一直挂着。
+///  3. 它把 stdout/stderr 与等待**并发**读取，避免输出超过管道缓冲
+///     （约 64KB）时子进程写满阻塞、双方互等的死锁。
+///
+/// 实现初期用的是裸 `Command::new(..).output()`，三样保障一个都没有；
+/// 打包后实测表现为弹「应用程序无法正常启动 (0xc0000142)」——
+/// 即子进程创建/DLL 初始化失败，且异常未受控地向上传播。
 #[cfg(windows)]
 fn find_port_holder(port: u16) -> Option<(u32, String, String)> {
-    use std::process::Command;
+    use crate::modules::process::run_cmd_timeout;
 
-    // netstat 的输出解析：只认 LISTENING 行，避免把「已建立的连接」误判为占用
-    let out = Command::new("netstat").args(["-ano", "-p", "TCP"]).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let needle_v4 = format!(":{port} ");
-    let needle_v6 = format!("]:{port} ");
-    let mut pid: Option<u32> = None;
-    for line in text.lines() {
-        let t = line.trim();
-        if !t.starts_with("TCP") || !t.contains("LISTENING") {
-            continue;
-        }
-        // 形如：TCP    0.0.0.0:7864    0.0.0.0:0    LISTENING    33708
-        if !(t.contains(&needle_v4) || t.contains(&needle_v6)) {
-            continue;
-        }
-        if let Some(last) = t.split_whitespace().last() {
-            if let Ok(p) = last.parse::<u32>() {
-                pid = Some(p);
-                break;
-            }
-        }
-    }
-    let pid = pid?;
+    let pid = find_port_pid(port)?;
 
-    // tasklist 换进程名与路径（CSV 便于解析，避免中文列宽对齐问题）
-    let out = Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .output()
-        .ok()?;
+    // tasklist 换进程名（CSV 便于解析，避免中文列宽对齐问题）
+    let out = run_cmd_timeout(
+        "tasklist",
+        &["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"],
+        5,
+    )?;
     let text = String::from_utf8_lossy(&out.stdout);
     let line = text.lines().next()?.trim();
     // 形如："gateway-xxx.exe","33708","Console","1","8,543 K"
@@ -981,20 +986,51 @@ fn find_port_holder(port: u16) -> Option<(u32, String, String)> {
         return None;
     }
 
-    // 路径需要 wmic 或 PowerShell；用 PowerShell 更可靠（wmic 在新系统已移除）。
-    // 取不到不影响主流程（名字已足够提示用户），因此失败时留空。
-    let path = Command::new("powershell")
-        .args([
+    // 路径需要 PowerShell（wmic 在新系统已移除）。取不到不影响主流程
+    // （进程名已足够提示用户），因此失败时留空而不是整条失败。
+    let path = run_cmd_timeout(
+        "powershell",
+        &[
             "-NoProfile",
             "-Command",
             &format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).Path"),
-        ])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+        ],
+        8,
+    )
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    .unwrap_or_default();
 
     Some((pid, name, path))
+}
+
+/// 从 `netstat -ano -p TCP` 的输出里解析出监听指定端口的 PID。
+///
+/// 只认 `LISTENING` 行：否则会把「已建立的连接」（客户端侧临时端口恰好
+/// 等于目标端口）误判成占用者，进而让用户去杀一个无关进程。
+#[cfg(windows)]
+fn find_port_pid(port: u16) -> Option<u32> {
+    use crate::modules::process::run_cmd_timeout;
+
+    let out = run_cmd_timeout("netstat", &["-ano", "-p", "TCP"], 8)?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let needle_v4 = format!(":{port} ");
+    let needle_v6 = format!("]:{port} ");
+    for line in text.lines() {
+        let t = line.trim();
+        if !t.starts_with("TCP") || !t.contains("LISTENING") {
+            continue;
+        }
+        // 形如：TCP    0.0.0.0:7864    0.0.0.0:0    LISTENING    33708
+        if !(t.contains(&needle_v4) || t.contains(&needle_v6)) {
+            continue;
+        }
+        if let Some(last) = t.split_whitespace().last() {
+            if let Ok(p) = last.parse::<u32>() {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(not(windows))]
@@ -1007,11 +1043,9 @@ fn find_port_holder(_port: u16) -> Option<(u32, String, String)> {
 /// 强制结束进程。
 #[cfg(windows)]
 fn terminate_process(pid: u32) -> Result<(), String> {
-    use std::process::Command;
-    let out = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F", "/T"])
-        .output()
-        .map_err(|e| format!("调用 taskkill 失败: {e}"))?;
+    use crate::modules::process::run_cmd_timeout;
+    let out = run_cmd_timeout("taskkill", &["/PID", &pid.to_string(), "/F", "/T"], 10)
+        .ok_or_else(|| format!("调用 taskkill 失败或超时（PID {pid}）"))?;
     if out.status.success() {
         return Ok(());
     }
@@ -2441,9 +2475,15 @@ mod tests {
     }
 
     #[test]
-    fn inspect_port_reports_holder_when_occupied() {
-        // 自己占一个端口，然后让 inspect_port 认出占用者。
-        // 这样不必依赖外部进程，测试稳定。
+    fn inspect_port_never_spawns_processes_to_find_holder() {
+        // 回归：inspect_port 跑在**同步 Tauri 命令**（主线程）里，
+        // 且页面挂载/端口变化时就会被调用。它**不得**去 spawn
+        // netstat/tasklist/powershell —— 那会把「打开页面」变成主线程卡顿，
+        // 并因频繁创建控制台进程耗尽 desktop heap，
+        // 实测表现为「应用程序无法正常启动 (0xc0000142)」。
+        //
+        // 因此无论端口是否被占用，holder 都必须是 null；
+        // 真正需要占用者信息时走按需接口（port_holder / kill_port_holder）。
         let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
             Ok(l) => l,
             Err(_) => return,
@@ -2452,25 +2492,51 @@ mod tests {
             Ok(a) => a.port(),
             Err(_) => return,
         };
+
         let v = inspect_port(port);
         assert_eq!(
             v.get("available").and_then(Value::as_bool),
             Some(false),
             "正在监听的端口应判定为不可用"
         );
-        let holder = v.get("holder");
         assert!(
-            holder.map(|h| !h.is_null()).unwrap_or(false),
-            "应能识别占用者（本测试进程），实际: {v}"
+            v.get("holder").map(Value::is_null).unwrap_or(false),
+            "inspect_port 不得查占用者（会 spawn 进程阻塞主线程），实际: {v}"
+        );
+        // 字段本身必须存在：前端类型要求它，缺失会让界面报错
+        assert!(
+            v.get("holder").is_some(),
+            "holder 字段必须存在（可为 null），实际: {v}"
+        );
+
+        drop(listener);
+    }
+
+    #[test]
+    fn port_holder_finds_self_when_listening() {
+        // 按需接口本身要能正常工作（这条路径允许 spawn 进程）
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let port = match listener.local_addr() {
+            Ok(a) => a.port(),
+            Err(_) => return,
+        };
+
+        let holder = port_holder(port);
+        assert!(
+            holder.as_ref().map(|h| !h.is_null()).unwrap_or(false),
+            "按需查询应能识别占用者（本测试进程），实际: {holder:?}"
         );
         if let Some(h) = holder {
-            // 占用者就是本测试进程
             assert_eq!(
                 h.get("pid").and_then(Value::as_u64),
                 Some(std::process::id() as u64),
                 "占用者 PID 应是本进程"
             );
         }
+
         drop(listener);
     }
 

@@ -50,6 +50,7 @@ import type {
   GatewayMode,
   GatewayPoolAccount,
   GatewayPortCheck,
+  GatewayPortHolder,
   GatewayStatus,
   GatewayUsageGroup,
   GatewayUsageResult,
@@ -527,6 +528,9 @@ export default function GatewayPage() {
    * 「是哪个进程（名字 + PID + 路径）」再确认，而不是点一下就直接杀。
    */
   const [killTarget, setKillTarget] = useState<GatewayPortCheck | null>(null);
+  /** 对话框里展示的占用者：点开对话框后按需查询（不在热路径上查）。 */
+  const [killHolder, setKillHolder] = useState<GatewayPortHolder | null>(null);
+  const [killHolderLoading, setKillHolderLoading] = useState(false);
 
   /** 网关 Token 用量：范围选择、数据与加载态。默认「今日」——看用量多为盯当天消耗。 */
   const [usageRange, setUsageRange] = useState<UsageRangeKey>("today");
@@ -851,6 +855,29 @@ export default function GatewayPage() {
       toast.error(api.asError(e));
     } finally {
       setCheckingPort(false);
+    }
+  }
+
+  /**
+   * 打开「结束占用进程」对话框，并**按需**查询占用者。
+   *
+   * 为什么不在端口检测时就查：那是页面挂载/端口变化的路径，会 spawn
+   * netstat+tasklist+powershell 三个控制台进程，把「打开页面」变成主线程卡顿
+   *（实测导致界面未响应，并因频繁创建控制台进程耗尽 desktop heap 而抛
+   * 0xc0000142）。这里改成用户显式点击后才查，开销只付一次。
+   */
+  async function openKillDialog(target: GatewayPortCheck) {
+    setKillTarget(target);
+    setKillHolderLoading(true);
+    setKillHolder(null);
+    try {
+      const res = await api.getGatewayPortHolder(target.port);
+      setKillHolder(res.holder);
+    } catch {
+      // 查不到占用者不阻断：对话框会提示「无法识别」，用户仍可尝试结束
+      setKillHolder(null);
+    } finally {
+      setKillHolderLoading(false);
     }
   }
 
@@ -1430,7 +1457,7 @@ export default function GatewayPage() {
                 variant="outline"
                 size="sm"
                 className="h-8 gap-1.5 px-2 text-xs text-destructive hover:text-destructive"
-                onClick={() => setKillTarget(portCheck)}
+                onClick={() => void openKillDialog(portCheck)}
                 disabled={busy !== null}
                 title="结束占用该端口的进程，然后由本网关接管"
               >
@@ -1892,20 +1919,25 @@ ANTHROPIC_AUTH_TOKEN=${apiKey || "<你的 api_key>"}`}</code>
             结束它之后，本网关即可接管该端口。
           </DialogDescription>
         </DialogHeader>
-        {killTarget?.holder ? (
+        {killHolderLoading ? (
+          <div className="flex items-center gap-2 rounded-lg border bg-muted/40 px-3 py-3 text-xs text-muted-foreground">
+            <Loader2 className="size-3.5 animate-spin" />
+            正在识别占用进程…
+          </div>
+        ) : killHolder ? (
           <div className="min-w-0 space-y-1.5 rounded-lg border bg-muted/40 px-3 py-2.5 text-xs">
             <div className="flex min-w-0 items-baseline gap-2">
               <span className="shrink-0 text-muted-foreground">进程</span>
-              <span className="min-w-0 truncate font-medium">{killTarget.holder.name}</span>
+              <span className="min-w-0 truncate font-medium">{killHolder.name}</span>
             </div>
             <div className="flex min-w-0 items-baseline gap-2">
               <span className="shrink-0 text-muted-foreground">PID</span>
-              <span className="font-mono">{killTarget.holder.pid}</span>
+              <span className="font-mono">{killHolder.pid}</span>
             </div>
-            {killTarget.holder.path ? (
+            {killHolder.path ? (
               <div className="flex min-w-0 items-baseline gap-2">
                 <span className="shrink-0 text-muted-foreground">路径</span>
-                <span className="min-w-0 break-all font-mono text-[11px]">{killTarget.holder.path}</span>
+                <span className="min-w-0 break-all font-mono text-[11px]">{killHolder.path}</span>
               </div>
             ) : null}
           </div>
@@ -1914,7 +1946,7 @@ ANTHROPIC_AUTH_TOKEN=${apiKey || "<你的 api_key>"}`}</code>
             无法识别占用该端口的进程（可能需要管理员权限）。结束操作可能失败。
           </p>
         )}
-        {killTarget?.holder && !killTarget.holder.ours ? (
+        {killHolder && !killHolder.ours ? (
           <p className="text-xs text-destructive">
             该进程不属于本程序，可能是你正在使用的其他软件。结束它可能导致那个程序异常退出。
           </p>

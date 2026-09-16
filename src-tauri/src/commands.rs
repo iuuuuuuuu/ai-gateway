@@ -836,14 +836,39 @@ pub fn check_gateway_port(port: u16) -> Result<Value, String> {
     Ok(ai_gateway_core::modules::gateway::inspect_port(port))
 }
 
+/// 查询占用指定端口的进程（供「结束占用进程」对话框展示）。
+///
+/// **按需调用**：会 spawn netstat/tasklist/powershell，不要在页面挂载或轮询里调
+///（那正是热路径 `check_gateway_port` 刻意不查进程的原因）。
+/// 同样用 async + spawn_blocking：进程调用是阻塞的，不该占用主线程或异步运行时线程。
+#[tauri::command]
+pub async fn get_gateway_port_holder(port: u16) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(json!({
+            "port": port,
+            "holder": ai_gateway_core::modules::gateway::port_holder(port).unwrap_or(Value::Null),
+        }))
+    })
+    .await
+    .map_err(|e| format!("执行失败: {e}"))?
+}
+
 /// 结束占用指定端口的进程，让本网关可以接管该端口。
 ///
 /// 由前端在用户**明确确认**后调用（提示里会展示占用进程名与 PID）。
 /// 后端仍会拒绝几类危险目标（自身进程、本程序启动的网关），
 /// 因此前端即便误调用也不会造成「网关被自己杀掉」的状态不一致。
+///
+/// **必须是 async**：本命令要 spawn 3 个控制台进程查占用者，并轮询等待端口释放
+///（最长 4 秒）。同步 Tauri 命令跑在主线程，会把这些开销直接变成界面卡死。
 #[tauri::command]
-pub fn kill_gateway_port_holder(port: u16) -> Result<Value, String> {
-    ai_gateway_core::modules::gateway::kill_port_holder(port)
+pub async fn kill_gateway_port_holder(port: u16) -> Result<Value, String> {
+    // 放到阻塞线程池：内部是 std::process + sleep 轮询，不占异步运行时线程
+    tauri::async_runtime::spawn_blocking(move || {
+        ai_gateway_core::modules::gateway::kill_port_holder(port)
+    })
+    .await
+    .map_err(|e| format!("执行失败: {e}"))?
 }
 
 /// 切换网关工作模式并立即生效（重导出凭证 + 按需重启）。

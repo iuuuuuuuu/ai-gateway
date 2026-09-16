@@ -125,6 +125,7 @@ pub fn router() -> Router {
         .route("/api/gateway/allowed-model", post(api_set_allowed_model))
         .route("/api/gateway/start", post(api_gateway_start))
         .route("/api/gateway/port-check", post(api_gateway_port_check))
+        .route("/api/gateway/port-holder", post(api_gateway_port_holder))
         .route("/api/gateway/port-kill", post(api_gateway_port_kill))
         .route("/api/gateway/stop", post(api_gateway_stop))
         .route("/api/gateway/sync", post(api_gateway_sync))
@@ -1122,6 +1123,22 @@ async fn api_gateway_port_check(Json(body): Json<Value>) -> Response {
         return json_err("端口号需在 1-65535 之间".to_string(), StatusCode::BAD_REQUEST);
     }
     json_ok(ai_gateway_core::modules::gateway::inspect_port(port as u16))
+}
+
+/// POST /api/gateway/port-holder —— 查询占用端口的进程。
+///
+/// body: { "port": 7863 }
+///
+/// 与 port-check 的分工：port-check 在页面挂载/端口变化时就会被调用（热路径），
+/// 因此**不查进程**；本接口由用户主动点开「结束占用进程」对话框时才调用，
+/// 此时才值得付出 spawn netstat/tasklist/powershell 的开销。
+async fn api_gateway_port_holder(Json(body): Json<Value>) -> Response {
+    let port = body.get("port").and_then(Value::as_u64).unwrap_or(0);
+    if port == 0 || port > 65535 {
+        return json_err("端口号需在 1-65535 之间".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let holder = ai_gateway_core::modules::gateway::port_holder(port as u16);
+    json_ok(json!({ "port": port, "holder": holder.unwrap_or(Value::Null) }))
 }
 
 /// POST /api/gateway/port-kill —— 结束占用端口的进程，让本网关接管该端口。

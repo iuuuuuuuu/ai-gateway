@@ -30,6 +30,7 @@ import type {
   GatewayStartResult,
   GatewayStatus,
   GatewayPortCheck,
+  GatewayPortHolder,
   GatewaySyncResult,
   GatewayUsageResult,
   GithubConfig,
@@ -155,6 +156,7 @@ const ROUTES: Record<string, Route> = {
   start_gateway: { method: "POST", path: "/api/gateway/start" },
   check_gateway_port: { method: "POST", path: "/api/gateway/port-check" },
   kill_gateway_port_holder: { method: "POST", path: "/api/gateway/port-kill" },
+  get_gateway_port_holder: { method: "POST", path: "/api/gateway/port-holder" },
   stop_gateway: { method: "POST", path: "/api/gateway/stop" },
   restart_gateway: { method: "POST", path: "/api/gateway/restart" },
   sync_gateway_accounts: { method: "POST", path: "/api/gateway/sync" },
@@ -778,6 +780,19 @@ export function killGatewayPortHolder(
   port: number,
 ): Promise<{ ok: boolean; pid: number; name: string; message: string }> {
   return call("kill_gateway_port_holder", { port });
+}
+
+/**
+ * 查询占用端口的进程（供确认对话框展示）。
+ *
+ * 与 checkGatewayPort 的分工：后者在页面挂载/端口变化时就会调用（热路径），
+ * 因此**不查进程**；本函数只在用户点开对话框时调用，那时才值得付出
+ * spawn netstat/tasklist/powershell 的开销。
+ */
+export function getGatewayPortHolder(
+  port: number,
+): Promise<{ port: number; holder: GatewayPortHolder | null }> {
+  return call("get_gateway_port_holder", { port });
 }
 
 /** 停止网关。 */
