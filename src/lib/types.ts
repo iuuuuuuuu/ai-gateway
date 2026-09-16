@@ -594,6 +594,23 @@ export interface GatewayConfig {
   trial_enabled?: boolean;
   /** 每号每日活跃上报条数（默认 3，上限 20）。 */
   activity_report_count?: number;
+
+  // ---- 自定义系统提示词（写进网关 config.json 的 prompt 块）----
+  //
+  // 由宿主转写到网关 native config 的 prompt 块（Go 侧 Config.Prompt）。
+  // 与 features.sanitize_blacklist_fingerprints 是**两层叠加、互不替代**：
+  // 那个清洗消息里的指纹串，这个把 system/developer 消息整体替换。
+
+  /**
+   * 提示词模式；缺省 `"passthrough"` = 透传客户端原始 system（既有行为不变）。
+   *
+   * `"custom"` = 用网关自有提示词替换客户端的 system/developer 消息。
+   * 缺省刻意不是 custom：老配置没有这个键，若缺省 custom，既有用户升级后
+   * system 会被静默替换（人设、项目约定、工具说明全丢）。
+   */
+  prompt_mode?: "passthrough" | "custom";
+  /** 自定义提示词文件路径；空 = 用网关内置默认提示词。 */
+  prompt_file?: string;
 }
 
 /** 手动触发养号任务的结果（POST /api/gateway/task-run）。 */
@@ -721,8 +738,46 @@ export interface GatewayStatus {
   authDir: string;
   accountsInLibrary: number;
   config: GatewayConfig;
+  /**
+   * 正在执行的养号任务（含进度）。
+   *
+   * 所有者明确要求「账号卡片上要能看到正在执行的任务」—— 此前点「立即执行」
+   * 只有一个按钮转圈，看不到在跑什么、跑到哪、哪些账号在跑。
+   */
+  taskRuntime?: GatewayTaskRuntime;
   health: { reachable?: boolean; healthy?: boolean; detail?: unknown } | null;
   pool: GatewayPool | null;
+}
+
+/**
+ * 正在执行的养号任务的运行态（来自 `GET /api/gateway/status` 的 `taskRuntime`）。
+ *
+ * 进度是**近似值**，口径如下（见 Rust 侧 `task_runtime`）：
+ *   - `total` 是按账号库 + 任务区域规则算出的**预计**账号数；
+ *   - `processed` / `processedIds` 来自统一事件流的**实际**已记录账号。
+ * 两者可能短暂不等（网关账号池与账号库有极小时差），因此文案写成
+ * 「已记录 N / M」而不是断言性的「已完成」。
+ */
+export interface GatewayTaskRuntime {
+  /** false = 当前没有任务在跑；此时其余字段不保证存在。 */
+  running: boolean;
+  /** 任务标识（与 `GatewayTaskName` 对应）。 */
+  task?: GatewayTaskName;
+  /** 面向用户的任务中文名，可直接显示。 */
+  label?: string;
+  /** 开始时刻（毫秒时间戳）。 */
+  startedAt?: number;
+  /** 已运行毫秒数（后端算好，避免前后端时钟偏差）。 */
+  elapsedMs?: number;
+  /** 本轮预计遍历的账号数（进度分母）。 */
+  total?: number;
+  /** 已留下记录的账号数（进度分子）。 */
+  processed?: number;
+  /**
+   * 已留下记录的账号在**宿主账号库里的 id**（不是网关 uid）。
+   * 供账号卡片标记「这个号正在跑」。
+   */
+  processedIds?: string[];
 }
 
 /** GET /api/gateway/config 响应。 */

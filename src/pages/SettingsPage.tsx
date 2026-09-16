@@ -18,6 +18,7 @@ import type {
   CheckinLog,
   GatewayConfig,
   GatewayTaskName,
+  GatewayTaskRuntime,
   GithubConfig,
   RotateLog,
   RotateStatus,
@@ -25,6 +26,7 @@ import type {
 } from "@/lib/types";
 import { GITHUB_RELEASE_URL, GITHUB_REPOSITORY_URL, openReleaseUrl } from "@/lib/update";
 import { cn } from "@/lib/utils";
+import { useVisibilityInterval } from "@/lib/use-visibility-interval";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { DemoAction } from "@/components/demo-action";
 import { useAccountsStore } from "@/stores/accounts";
@@ -319,6 +321,259 @@ function AutoCheckinCard() {
 }
 
 /**
+ * 一次「立即执行」之后留给用户看的结果。
+ *
+ * 为什么需要它，而不只是一条 toast：`ran=true` 只说明**网关的入口被调到了**，
+ * 完全没说这一轮跑了几个账号、成了几个、跳过了什么。所有者点 trial 时看到的
+ * 就是「已触发过一轮」这一句 —— 既不知道是不是真执行了，也不知道结果，
+ * 而 toast 几秒后消失，回头再看什么都没有。所以结果要**留在卡片上**。
+ */
+type TaskRunOutcome = {
+  /** 与 ran 严格对应：真的跑了一轮 / 被前置条件挡下。 */
+  ran: boolean;
+  /** 一句话结论（用户只需要读这一行）。 */
+  headline: string;
+  /** 结论的依据，逐条列出（账号数、跳过原因、失败原因）。 */
+  details: string[];
+  /** 结果基调：ok=跑了且无失败；warn=跑了但有失败，或没跑（正常跳过）；err=调用失败。 */
+  tone: "ok" | "warn" | "err";
+  at: number;
+};
+
+/**
+ * 任务名 → 该任务写进「账号记录」的标题。
+ *
+ * 必须与 Go 侧**逐字一致**，否则回读不到任何记录，界面就会永远显示
+ * 「没有写入记录」——而且不报错。出处：
+ *   - `activity.go`   `Records.Task(a.UID, "活跃上报", ...)`
+ *   - `nightowl.go`   `Records.Task(a.UID, "夜猫子任务", ...)`
+ *   - `school.go`     `Records.Task(a.UID, "开学季活动", ...)`
+ *   - `trial.go`      `Records.Task(a.UID, "trial 加油包", ...)`
+ *
+ * 注意与设置页显示名**不同**（那边叫「国际版 trial 加油包」）：
+ * 显示名面向用户，这个面向数据，混用会静默回读失败。
+ */
+const TASK_RECORD_TITLE: Record<GatewayTaskName, string> = {
+  activity: "活跃上报",
+  nightowl: "夜猫子任务",
+  school: "开学季活动",
+  trial: "trial 加油包",
+};
+
+/** 跳过原因码 → 面向用户的解释（与 Go `scheduler.TaskRunResult.Skip` 一一对应）。 */
+function skipExplanation(skip: string | null | undefined): string | null {
+  switch (skip) {
+    case "already_running":
+      // 纯文本，不用 Markdown 记号：这里渲染进 Alert 正文，`**x**` 会原样显示成
+      // 两个星号（实测确认），看起来像没写完的富文本。
+      return "该任务上一轮还在执行，本次没有重复触发（这是防重入，不是故障）。一轮活跃上报按「账号数 × 条数」串行跑，大账号池下可达数分钟。";
+    case "outside_window":
+      return "当前不在该任务的生效时段内，上游不会计入本次执行。";
+    default:
+      return null;
+  }
+}
+
+/**
+ * 回读本轮任务真正写下的记录，换算成「跑了几个账号、结果如何」。
+ *
+ * 为什么要回读记录而不是只看 `ran`：`ran` 是**入口级**的布尔值（`RunTaskByName`
+ * 执行完就返回 true），它不携带任何账号维度信息。而用户问的是「跑了几个 / 结果」。
+ * 记录文件是唯一有账号粒度、且网关与宿主**同一个文件**（`account_records.json`）
+ * 的出处，不必新增接口。
+ *
+ * 时间的处理：网关与宿主各有自己的时钟，`since` 往前放宽 2 分钟吸收偏差，
+ * 宁可多带进上一轮的记录（下面按标题严格过滤），也不能漏掉本轮刚写的。
+ *
+ * 返回 null 表示「查不到」——与「查到了但为空」是两件事，界面必须分开说：
+ * 前者是接口不可用，后者是本轮确实没有需要记录的变化（记录按天去重、
+ * 且仅在成功/失败/重要跳过时才写）。
+ */
+async function loadRunRecords(
+  task: GatewayTaskName,
+  since: number,
+): Promise<{ title: string; result: string; accountName: string; detail: string }[] | null> {
+  try {
+    const res = await api.getAccountRecords({
+      from: Math.max(0, since - 120_000),
+      kinds: ["task"],
+      limit: 500,
+    });
+    // `records` 不是数组时必须返回 null（= 拿不到），**不能**退化成空数组。
+    // 空数组在调用方那里等于「本轮没有账号产生新记录」——那是一个**结论**；
+    // 而接口返回了形状不对的东西时我们其实什么都不知道。用 `?? []` 会把
+    // 「读不到」谎报成「确实没有」，正是本次要修的那类问题。
+    if (!Array.isArray(res?.records)) return null;
+    const title = TASK_RECORD_TITLE[task];
+    return res.records
+      .filter((r) => (r.title ?? "").trim() === title)
+      .map((r) => ({
+        title: r.title ?? "",
+        result: r.result ?? "",
+        accountName: r.accountName ?? "",
+        detail: r.detail ?? "",
+      }));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把回读到的记录归纳成一句结论 + 若干明细。
+ *
+ * 结果码的取值来自 `records.go`：`success` / `failed` / `already` / `info`。
+ * 其中 `already` 是**幂等成功**（如 trial「本周期已领取过」）——所有者明确要求
+ * 这种情况要如实说「无需重复执行」，而不是含糊地说「已触发一轮」。
+ */
+function summarizeRunRecords(
+  records: { result: string; accountName: string; detail: string }[],
+): { headline: string; details: string[] } {
+  const success = records.filter((r) => r.result === "success");
+  const already = records.filter((r) => r.result === "already");
+  const failed = records.filter((r) => r.result === "failed");
+  const total = records.length;
+
+  const details: string[] = [];
+  if (failed.length > 0) {
+    // 失败必须点名到账号 + 原因，否则用户不知道该去处理谁。
+    for (const r of failed.slice(0, 3)) {
+      details.push(`失败 · ${r.accountName || "未知账号"}${r.detail ? `：${r.detail}` : ""}`);
+    }
+    if (failed.length > 3) details.push(`…另有 ${failed.length - 3} 个账号失败`);
+  }
+  if (already.length > 0) {
+    const sample = already[0];
+    details.push(
+      `幂等跳过 ${already.length} 个（无需重复执行）${sample.detail ? `：${sample.detail}` : ""}`,
+    );
+  }
+  if (success.length > 0) {
+    details.push(`成功 ${success.length} 个${success[0].detail ? `：${success[0].detail}` : ""}`);
+  }
+
+  // 结论的措辞按「有没有真的产生变化」分级 —— 这正是所有者要区分的东西。
+  let headline: string;
+  if (failed.length > 0) {
+    headline = `已执行：${total} 个账号有结果，其中 ${failed.length} 个失败`;
+  } else if (success.length > 0) {
+    headline = `已执行：${success.length} 个账号有新结果`;
+  } else if (already.length > 0) {
+    headline = `已执行，但无需重复执行：${already.length} 个账号此前已完成`;
+  } else {
+    headline = `已执行：${total} 个账号有记录`;
+  }
+  return { headline, details };
+}
+
+/**
+ * 「正在执行」面板：任务跑起来之后，界面要一直能看到「在跑什么、跑到哪了」。
+ *
+ * 为什么必须补这块（所有者明确要求「账号卡片上要能看到正在执行的任务」）：
+ * 此前点「立即执行」只有按钮上转一个圈，跑一轮活跃上报要 40 秒以上（实测
+ * 19 个账号 41.7s），期间用户完全不知道跑到第几个号、还要等多久，
+ * 只能盯着一个没有信息量的 loading 干等。
+ *
+ * 数据来自 `gateway_status().taskRuntime`，进度取自**网关自己写的账号记录**
+ * （`account_records.json`）—— 不为进度另造一套账本，理由见 Rust 侧
+ * `task_processed_ids` 的注释。
+ *
+ * 进度文案刻意写成「已记录 N / M」而不是「已完成 N / M」：
+ * 记录只在「成功且有新变化 / 失败 / 重要跳过」时写（且按天去重），
+ * 因此 N 是**下界**，说成「已完成」会在没新记录时显示成卡住不动，反而误导。
+ */
+function TaskRunningPanel({ runtime, taskLabel }: { runtime: GatewayTaskRuntime; taskLabel: string }) {
+  const elapsed = Math.max(0, Math.round((runtime.elapsedMs ?? 0) / 1000));
+  const elapsedText = elapsed >= 60 ? `${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒` : `${elapsed} 秒`;
+  const total = runtime.total ?? 0;
+  const processed = runtime.processed ?? 0;
+  // 百分比只在有分母时算：total=0（如账号全被禁用）时给 0 而不是 NaN 宽度
+  const percent = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+
+  return (
+    <div className="px-4 pb-3 sm:px-5">
+      <div
+        className="rounded-lg border border-primary/25 bg-primary/5 px-3 py-2.5"
+        role="status"
+        aria-live="polite"
+        aria-label={`正在执行：${taskLabel}`}
+      >
+        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+          <Loader2 className="size-3.5 shrink-0 animate-spin text-primary" aria-hidden="true" />
+          <span className="text-[13px] font-medium text-foreground">正在执行：{taskLabel}</span>
+          <span className="text-[11px] tabular-nums text-muted-foreground">已运行 {elapsedText}</span>
+        </div>
+        {total > 0 ? (
+          <>
+            <div className="mt-2 flex items-baseline justify-between gap-2">
+              <span className="text-[11px] tabular-nums text-muted-foreground">
+                已记录 {processed} / {total} 个账号
+              </span>
+              <span className="text-[11px] tabular-nums text-muted-foreground">{percent}%</span>
+            </div>
+            {/* 进度条用既有主题 token（bg-primary/bg-muted），不自造配色 */}
+            <div className="mt-1 h-1 overflow-hidden rounded-full bg-muted" aria-hidden="true">
+              <div className="h-full rounded-full bg-primary transition-[width]" style={{ width: `${percent}%` }} />
+            </div>
+          </>
+        ) : null}
+        <p className="mt-1.5 text-[11px] leading-4 text-muted-foreground">
+          任务在网关侧逐账号串行执行。执行期间后台自动同步会**推迟**重启网关，
+          以免打断本轮任务；期间的账号变更会在任务结束后生效。
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 自动养号任务卡片：4 个任务的开关 / 执行时刻 / 立即执行。
+ *
+ * 「立即执行」的结果反馈是本卡片的核心难点（所有者实测反馈）：
+ * 他点 trial 后只看到「已触发过一轮」，既不知道是否真的执行、也不知道结果。
+ * 因此这里把 `ran`（真的跑了没有）、`skip`（跳过原因码）与**回读到的账号级记录**
+ * 三者拼成一条留在界面上的结论，而不是一句转瞬即逝的 toast。
+ */
+/**
+ * 「立即执行」的结果面板：一行结论 + 若干明细，留在卡片上直到下次执行。
+ *
+ * 为什么不用 toast 承担这件事：toast 是**瞬时**的，而「跑了几个账号、跳过几个、
+ * 为什么跳过」是需要边看边核对的（用户往往要切到网关页或账号记录页去对照）。
+ * 用既有 shadcn `Alert` 而不是自造样式块：本页的保存/错误反馈一直用它，
+ * 卡片/尺寸/配色因此与全站一致（所有者多次强调「不要自创风格」）。
+ *
+ * `at` 显示具体时刻：用户据此判断这条结果是不是自己刚点的那一次
+ *（尤其是等了很久之后回到本页时）。
+ */
+function TaskOutcomePanel({ outcome, taskLabel }: { outcome: TaskRunOutcome; taskLabel: string }) {
+  const time = new Date(outcome.at).toLocaleTimeString("zh-CN", { hour12: false });
+  return (
+    <div className="px-4 pb-3 sm:px-5">
+      <Alert
+        variant={outcome.tone === "err" ? "destructive" : "default"}
+        className="!w-auto"
+        aria-label={`${taskLabel} 的执行结果`}
+      >
+        <AlertDescription>
+          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+            <span className="text-[13px] font-medium">{outcome.headline}</span>
+            <span className="text-[11px] tabular-nums text-muted-foreground">
+              {time} · {outcome.ran ? "已执行" : "未执行"}
+            </span>
+          </div>
+          {outcome.details.length > 0 ? (
+            <ul className="mt-1 list-disc space-y-0.5 pl-4 text-[11px] leading-4 text-muted-foreground">
+              {outcome.details.map((line, index) => (
+                <li key={index}>{line}</li>
+              ))}
+            </ul>
+          ) : null}
+        </AlertDescription>
+      </Alert>
+    </div>
+  );
+}
+
+/**
  * 自动养号任务：活跃上报 / 夜猫子 / 开学季 / 国际版 trial。
  *
  * 为什么单独一张卡而不塞进「自动签到」：这 4 个任务跑在**网关**里（不是宿主里），
@@ -328,6 +583,8 @@ function AutoCheckinCard() {
  * 为什么每个任务都写明前置条件：它们都会在条件不满足时静默跳过
  *（夜猫子限时段、开学季限活动期、活跃上报与开学季只跑国服、trial 只跑国际版）。
  * 不写清楚，用户点「立即执行」看不到任何变化，只会以为功能坏了。
+ *
+ * 「立即执行」结果反馈的设计见上方 TaskRunOutcome / loadRunRecords 的说明。
  */
 function AutoCareTasksCard() {
   const [cfg, setCfg] = useState<GatewayConfig | null>(null);
@@ -335,6 +592,22 @@ function AutoCareTasksCard() {
   /** 正在「立即执行」的任务名（用于按任务显示 loading）。 */
   const [running, setRunning] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ type: "ok" | "err" | "warn"; text: string } | null>(null);
+  /**
+   * 每个任务最近一次「立即执行」的结果，**留在卡片上**直到下次执行。
+   *
+   * 用 map 而不是单个值：4 个任务各有各的结果，用户常常连着点几个再回头对比。
+   * 单值会让先前那个任务的结果凭空消失，看起来像「没执行过」。
+   */
+  const [outcomes, setOutcomes] = useState<Partial<Record<GatewayTaskName, TaskRunOutcome>>>({});
+
+  /**
+   * 网关侧正在执行的养号任务（含进度）。
+   *
+   * 为什么不能只靠本地 `running` state：那个状态只覆盖「本页发起的这次请求」，
+   * 一旦用户切走页面再切回来、或任务由别处（账号卡片菜单）触发，本地状态就是空的，
+   * 而任务其实还在跑。网关侧状态是唯一权威来源。
+   */
+  const [runtime, setRuntime] = useState<GatewayTaskRuntime | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -345,9 +618,35 @@ function AutoCareTasksCard() {
     }
   }, []);
 
+  /**
+   * 拉取任务运行态。
+   *
+   * 失败**静默**：这是旁路观测数据，网关没起来时它本来就查不到，
+   * 为此弹错误提示只会制造噪音（配置读取失败已经由 load() 报过了）。
+   */
+  const loadRuntime = useCallback(async () => {
+    try {
+      const status = await api.getGatewayStatus();
+      setRuntime(status.taskRuntime ?? null);
+    } catch {
+      setRuntime(null);
+    }
+  }, []);
+
   useEffect(() => {
     void load();
   }, [load]);
+
+  // 任务运行态轮询（2 秒）。
+  //
+  // 周期取 2 秒的取舍：进度来自网关写的账号记录，账号之间本就间隔 400ms～
+  // 数秒（刻意防风控），更密的轮询只会白打请求、并不会让进度更准。
+  //
+  // 用 useVisibilityInterval：窗口隐藏/收进托盘时**销毁**定时器，不在后台空转
+  //（与账号页、网关页同一做法）。
+  useVisibilityInterval(() => void loadRuntime(), 2000, {
+    onResume: () => void loadRuntime(),
+  });
 
   async function save() {
     if (!cfg) return;
@@ -364,6 +663,11 @@ function AutoCareTasksCard() {
         school_enabled: cfg.school_enabled,
         trial_enabled: cfg.trial_enabled,
         activity_report_count: cfg.activity_report_count,
+        // 自定义系统提示词：与养号任务排程同一份配置、同一个保存按钮。
+        // 漏传这两个字段的话，用户在这里的改动会在保存时被**静默丢弃**
+        //（save_gateway_config 只覆盖传入的键），表现为「改了没用」。
+        prompt_mode: cfg.prompt_mode,
+        prompt_file: cfg.prompt_file,
       });
       setCfg(res.config);
       // 说清楚「还要重启」：网关只在启动时读一次 config.json，
@@ -376,21 +680,129 @@ function AutoCareTasksCard() {
     }
   }
 
+  /**
+   * 立即执行一轮任务，并把**可复核的结果**留在卡片上。
+   *
+   * 三条分支各自说清「发生了什么」，而不是笼统地报「已触发」：
+   *   1. 调用失败（网关没起来等）→ err，给出后端原文；
+   *   2. `ran=false` + `skip` → **正常结果**，如实说明为什么没执行
+   *      （夜猫子不在时段 / 上一轮还在跑），这是所有者明确点出的语义；
+   *   3. `ran=true` → 回读账号记录，得出「跑了几个账号、成了几个、跳过几个」。
+   *
+   * 为什么要回读（第 3 步）而不能只信 `ran`：`ran` 是入口级布尔值，
+   * `RunTaskByName` 执行完就返回 true，**不含任何账号维度信息**。而用户问的
+   * 恰恰是「跑了几个 / 结果如何」。记录文件是唯一有账号粒度、且网关与宿主
+   * 读写**同一个文件**的出处，因此不需要新增接口。
+   */
   async function runNow(task: GatewayTaskName) {
     setRunning(task);
     setMsg(null);
+    // 记录起点时间：执行完据此回读**本轮新写**的记录，而不是把历史全都算进来。
+    const startedAt = Date.now();
     try {
       const res = await api.runGatewayTask(task);
       if (!res.ok) {
-        setMsg({ type: "err", text: res.error || "执行失败" });
-      } else if (!res.ran) {
-        // 被前置条件挡下是正常结果，用 warning 而非 error —— 否则用户会以为坏了
-        setMsg({ type: "warn", text: res.message || "本次未执行（前置条件不满足）" });
-      } else {
-        setMsg({ type: "ok", text: `已触发一轮：${res.message || "执行完成"}` });
+        const text = res.error || "执行失败";
+        setOutcomes((prev) => ({
+          ...prev,
+          [task]: {
+            ran: false,
+            headline: "执行失败",
+            details: [text],
+            tone: "err",
+            at: Date.now(),
+          },
+        }));
+        setMsg({ type: "err", text });
+        return;
       }
+
+      if (!res.ran) {
+        // 被前置条件挡下是**正常结果**而非错误：用 warn 而不是 err，
+        // 否则用户会以为功能坏了。原因码翻成人话，后端 message 优先。
+        const explain = skipExplanation(res.skip);
+        const headline = res.message || "本次未执行（前置条件不满足）";
+        setOutcomes((prev) => ({
+          ...prev,
+          [task]: {
+            ran: false,
+            headline: `未执行：${headline}`,
+            details: [
+              // 说清「没执行」不等于「没触发」：请求确实到了网关，是它决定不跑。
+              "请求已送达网关，网关按前置条件主动跳过（不是失败）。",
+              ...(explain ? [explain] : []),
+              ...(res.skip ? [`跳过原因码：${res.skip}`] : []),
+            ],
+            tone: "warn",
+            at: Date.now(),
+          },
+        }));
+        setMsg({ type: "warn", text: headline });
+        return;
+      }
+
+      // ran=true：回读本轮真正写下的账号级记录。
+      const records = await loadRunRecords(task, startedAt);
+      if (records === null) {
+        setOutcomes((prev) => ({
+          ...prev,
+          [task]: {
+            ran: true,
+            headline: "已执行一轮（结果明细读取失败）",
+            details: [
+              res.message || "网关已跑完这一轮。",
+              "无法读取账号记录，因此看不到本轮跑了哪些账号；结果可能已经写入，请到「账号管理 → 查看记录」确认。",
+            ],
+            tone: "warn",
+            at: Date.now(),
+          },
+        }));
+        setMsg({ type: "ok", text: res.message || "已执行一轮" });
+        return;
+      }
+
+      if (records.length === 0) {
+        // 网关确实跑了，但没有写任何记录。这是**正常**的：记录只在
+        // 成功且无变化 / 失败 / 重要跳过时才写，且按天去重（TaskDaily）。
+        // 必须说清楚，否则用户会以为「跑了但没生效」。
+        setOutcomes((prev) => ({
+          ...prev,
+          [task]: {
+            ran: true,
+            headline: "已执行一轮：本轮没有账号产生新记录",
+            details: [
+              res.message || "网关已跑完这一轮。",
+              "记录只在「成功且有新变化 / 失败 / 重要跳过」时写入，同一账号同一结果每天最多一条 —— 因此这里为空通常表示本周期该做的都已完成。",
+            ],
+            tone: "ok",
+            at: Date.now(),
+          },
+        }));
+        setMsg({ type: "ok", text: res.message || "已执行一轮" });
+        return;
+      }
+
+      const { headline, details } = summarizeRunRecords(records);
+      const hasFailure = records.some((r) => r.result === "failed");
+      setOutcomes((prev) => ({
+        ...prev,
+        [task]: {
+          ran: true,
+          headline,
+          details,
+          // 有失败时降级成 warn：结论行仍然是「已执行」，但基调要提醒用户去看明细。
+          tone: hasFailure ? "warn" : "ok",
+          at: Date.now(),
+        },
+      }));
+      setMsg({ type: hasFailure ? "warn" : "ok", text: headline });
     } catch (e) {
-      setMsg({ type: "err", text: api.asError(e) });
+      const text = api.asError(e);
+      setOutcomes((prev) => ({
+        ...prev,
+        [task]: { ran: false, headline: "执行失败", details: [text], tone: "err", at: Date.now() },
+      }));
+      setMsg({ type: "err", text });
     } finally {
       setRunning(null);
     }
@@ -409,6 +821,11 @@ function AutoCareTasksCard() {
   /** 时点列表 → 输入框文本。 */
   function hoursText(hours?: number[]): string {
     return (hours ?? []).join(", ");
+  }
+
+  /** 取某个任务最近一次的执行结果（没有则 undefined，不渲染结果面板）。 */
+  function outcomeFor(task: GatewayTaskName): TaskRunOutcome | undefined {
+    return outcomes[task];
   }
 
   const tasks: {
@@ -524,17 +941,95 @@ function AutoCareTasksCard() {
                     <Button
                       size="sm"
                       variant="outline"
-                      disabled={running !== null}
+                      // 任一任务在跑就禁用全部按钮：这些任务是**整轮**触发
+                      //（作用于全部账号），并发触发只会被网关的防重入挡下。
+                      // 这里同时看本地 running 与网关侧 runtime —— 后者才能覆盖
+                      //「任务由别处触发 / 本页刚刷新」的情况。
+                      disabled={running !== null || Boolean(runtime?.running)}
                       onClick={() => void runNow(task.name)}
                     >
-                      {running === task.name ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                      {running === task.name || runtime?.task === task.name ? (
+                        <Loader2 className="animate-spin" />
+                      ) : (
+                        <RefreshCw />
+                      )}
                       立即执行
                     </Button>
                   </DemoAction>
                   <span className="text-xs leading-4 text-muted-foreground/75">{task.note}</span>
                 </div>
+
+                {/* 「正在执行」面板紧跟按钮行：它是**当下**的状态，
+                    与下方「上一次的结果」是两件事（一个是进行中、一个是已结束）。
+                    只在本任务正在跑时渲染 —— 放在每个任务下会让 4 个任务各显示一遍
+                    同一个全局状态，用户会误以为「4 个任务在同时跑」。 */}
+                {runtime?.running && runtime.task === task.name ? (
+                  <TaskRunningPanel runtime={runtime} taskLabel={task.label} />
+                ) : null}
+
+                {/* 执行结果留在卡片上（而非只在 toast 里）：所有者反馈「点了之后
+                    不知道是否真的执行了、也不知道结果」，而 toast 几秒后消失，
+                    回头再想核对就什么都没有了。
+                    放在按钮行**下方**、属于本任务的块内 —— 每个任务各有各的结果，
+                    不能合并成一条全局提示（那样 4 个任务的结果会互相覆盖）。 */}
+                {outcomeFor(task.name) ? (
+                  <TaskOutcomePanel
+                    outcome={outcomeFor(task.name) as TaskRunOutcome}
+                    taskLabel={task.label}
+                  />
+                ) : null}
               </div>
             ))}
+
+            {/* ---- 自定义系统提示词 ----
+                与上面 4 个「养号任务」是**两件不同的事**（那个改的是排程，
+                这个改的是网关转发请求时的 system 消息），但同属「网关配置」、
+                共用同一个保存按钮与同一份 gateway_config，因此放在同一张卡里，
+                用一条分隔线划清边界。
+
+                必须做成显式开关而不是「填了路径就自动启用」：缺省必须是
+                透传（passthrough），否则既有用户升级后 system 会被静默替换 ——
+                人设、项目约定、工具说明全丢，且从请求上看不出是网关动的手。 */}
+            <div className="border-t border-border/60">
+              <SettingsFieldRow
+                label="使用自定义系统提示词"
+                description="开启后用网关自带的提示词替换客户端发出的 system 消息；关闭时原样透传（默认）"
+                htmlFor="gateway-prompt-mode"
+                operational
+              >
+                <Switch
+                  id="gateway-prompt-mode"
+                  checked={cfg.prompt_mode === "custom"}
+                  onCheckedChange={(v) =>
+                    setCfg({ ...cfg, prompt_mode: v ? "custom" : "passthrough" })
+                  }
+                />
+              </SettingsFieldRow>
+
+              <SettingsFieldRow
+                label="提示词文件"
+                description="留空 = 用网关内置的默认提示词；填了但读不到会导致网关启动失败"
+                htmlFor="gateway-prompt-file"
+                operational
+              >
+                <Input
+                  id="gateway-prompt-file"
+                  className="w-full sm:w-96"
+                  placeholder="D:\\prompts\\mine.md"
+                  // 关闭时仍允许编辑：这样「先填好文件、稍后再开启」是可行的。
+                  // 置灰的话用户得先开开关（那一刻文件还是空的 → 网关起不来）。
+                  value={cfg.prompt_file ?? ""}
+                  onChange={(e) => setCfg({ ...cfg, prompt_file: e.target.value })}
+                />
+              </SettingsFieldRow>
+
+              {cfg.prompt_mode === "custom" ? (
+                <p className="border-b border-border/60 bg-muted/25 px-4 py-2.5 text-[11px] leading-4 text-muted-foreground sm:px-5">
+                  开启后客户端的 system / developer 消息会被<b className="text-foreground">整体替换</b>。
+                  文件留空则使用网关内置提示词；填了路径但文件不存在或内容为空时，网关会拒绝启动。
+                </p>
+              ) : null}
+            </div>
 
             <div className="flex flex-wrap gap-2 px-4 py-3 sm:px-5">
               <DemoAction>

@@ -641,13 +641,35 @@ export async function getTravelStatus(accountId: string): Promise<TravelStatus> 
     return screenshotDemoResponse("get_travel_status", { accountId }) as TravelStatus;
   }
   if (isWebui()) {
-    // webui 端为批量接口，按 accountId 过滤
+    // webui 端为批量接口，按 accountId 过滤。
+    //
+    // message / skip 必须一并带出：后端 `travel_display` 会把「无 Buddy（领养需先
+    // 积累对话轮次）」这类**具体原因**放在 message 里（travel.rs::display_record），
+    // 而这里原先只映射 4 个字段，把原因丢掉了 —— 卡片菜单因此只能靠 label 反推，
+    // 可 label 描述的是**旅行**状态、不是**领养**状态（详见 account-card 里
+    // buddyKnowledge 的说明）。少透出这两个字段，界面就只能猜。
     const all = await httpCall<{
-      accounts: { accountId: string; email: string; label: TravelStatus["label"]; rewardCredit: number | null; locationName?: string | null; arriveAt?: number | null }[];
+      accounts: {
+        accountId: string;
+        email: string;
+        label: TravelStatus["label"];
+        rewardCredit: number | null;
+        locationName?: string | null;
+        arriveAt?: number | null;
+        message?: string | null;
+        skip?: string | null;
+      }[];
     }>("get_travel_status");
     const one = all.accounts.find((a) => a.accountId === accountId);
     return one
-      ? { label: one.label, rewardCredit: one.rewardCredit, locationName: one.locationName ?? null, arriveAt: one.arriveAt ?? null }
+      ? {
+          label: one.label,
+          rewardCredit: one.rewardCredit,
+          locationName: one.locationName ?? null,
+          arriveAt: one.arriveAt ?? null,
+          message: one.message ?? null,
+          skip: one.skip ?? null,
+        }
       : { label: "untraveled", rewardCredit: null, locationName: null, arriveAt: null };
   }
   return call("get_travel_status", { accountId });
@@ -789,6 +811,10 @@ export function saveGatewayConfig(config: Partial<GatewayConfig>): Promise<{ con
   if (config.activity_report_count !== undefined) {
     args.activityReportCount = config.activity_report_count;
   }
+  // 自定义系统提示词：同样显式转 camelCase，否则 Tauri 会静默丢弃
+  //（表现为「配了自定义提示词却总被重置」，且看不出是传参被丢）。
+  if (config.prompt_mode !== undefined) args.promptMode = config.prompt_mode;
+  if (config.prompt_file !== undefined) args.promptFile = config.prompt_file;
   return call<{ config: GatewayConfig }>("save_gateway_config", args);
 }
 

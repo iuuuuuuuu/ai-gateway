@@ -810,6 +810,8 @@ pub fn save_gateway_config(
     school_enabled: Option<bool>,
     trial_enabled: Option<bool>,
     activity_report_count: Option<i64>,
+    prompt_mode: Option<String>,
+    prompt_file: Option<String>,
 ) -> Result<Value, String> {
     let mut patch = serde_json::Map::new();
     if let Some(p) = port {
@@ -859,6 +861,14 @@ pub fn save_gateway_config(
     }
     if let Some(n) = activity_report_count {
         patch.insert("activity_report_count".to_string(), json!(n));
+    }
+    // 自定义系统提示词：同样「传了才覆盖」，未传则保留磁盘上的现有值 ——
+    // 旧客户端不传这两个字段，绝不能把它们重置（那会把用户已配好的提示词抹掉）。
+    if let Some(m) = prompt_mode {
+        patch.insert("prompt_mode".to_string(), json!(m));
+    }
+    if let Some(f) = prompt_file {
+        patch.insert("prompt_file".to_string(), json!(f));
     }
     let v = ai_gateway_core::modules::gateway::save_gateway_config(&Value::Object(patch))?;
     Ok(json!({ "config": v }))

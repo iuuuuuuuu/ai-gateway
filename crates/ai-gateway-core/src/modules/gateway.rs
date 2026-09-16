@@ -17,7 +17,7 @@
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::modules::account;
@@ -159,6 +159,17 @@ pub fn default_gateway_config() -> Value {
         "checkin_enabled": true,
         "keepalive_enabled": true,
         "checkin_scope": "cn",
+        // ---- 自定义系统提示词（转写进网关 config.json 的 prompt 块）----
+        //
+        // 默认必须是 passthrough（透传客户端原始 system）：这是**新增能力**，
+        // 老配置里没有这两个键。缺省成 custom 的话，既有用户升级后 system 会被
+        // 静默替换 —— 人设、项目约定、工具说明全丢，且从请求上看不出是网关动的手。
+        // 保守缺省 + 显式开启，用户改配置时才知道自己换掉了什么。
+        "prompt_mode": "passthrough",
+        // 自定义提示词文件路径；空 = 用网关内置默认提示词（Go 侧 prompt.Load 回落）。
+        // 刻意不在宿主侧 substitute 默认路径：两边各有一份默认值迟早会分叉，
+        // 而分叉表现为「界面显示的路径与实际加载的不是同一个」。
+        "prompt_file": "",
     })
 }
 
@@ -373,24 +384,289 @@ pub fn sync_if_changed() -> bool {
     }
 }
 
-/// 后台自动同步：账号库变化 → 推送凭证；网关运行中且账号有变动 → 重启使新账号生效。
+// ---------------------------------------------------------------------------
+// 任务执行期间的互斥：自动同步不得打断在途任务
+// ---------------------------------------------------------------------------
+//
+// 缺陷背景（所有者反馈：「立即执行」弹出
+// `error sending request for url (http://127.0.0.1:7864/tasks/run)`）：
+//
+//   `run_task_now` 是一次**同步**等待的 HTTP 请求，而任务本身按
+//   「账号数 × 条数 × 800ms」串行跑（实测：19 个账号的活跃上报 41.7s、
+//   开学季 9.3s）。同一时刻 `run_auto_sync_loop` 每 30s 就可能在账号库指纹
+//   变化时 `stop_gateway()` + 重启 —— 那会**切断在途连接**，宿主侧 reqwest
+//   于是报出上面那条传输层错误（不是 HTTP 状态码错误）。
+//
+//   更要紧的是它会**自激**：养号任务调上游会触发 token 刷新并写回账号库，
+//   指纹（含 expiresAt / access_token 尾部）随之变化，下一个周期就把网关重启掉。
+//   即「用户点一次立即执行」与「自动同步」互相触发，撞上就失败。
+//
+// 修法：任务执行期间置「忙」标志，自动同步**推迟**本轮重启（下一轮再试），
+// 并设推迟上限防止无限期不生效。注意标志必须在所有退出路径上复位，
+// 因此用 RAII 守卫而不是手工 set/clear（见 `TaskBusyGuard`）。
+
+/// 正在执行的养号任务数（**计数**而非布尔）。
 ///
-/// 由 GUI / server 的启动流程调用，永续运行。
-pub async fn run_auto_sync_loop(interval_secs: u64) {
-    let interval = std::time::Duration::from_secs(interval_secs.max(5));
-    // 启动先同步一次，保证首屏即是最新
-    if sync_if_changed() && is_running() {
-        let cfg = load_gateway_config();
-        stop_gateway();
-        let _ = start_gateway(&cfg).await;
+/// 为什么是计数：`run_task_now` 可以被并发调用（设置页与账号菜单各有一个入口，
+/// 用户可能先后触发两个不同任务）。用布尔时先结束的那个会把标志清掉，
+/// 另一个仍在执行的任务就重新暴露在「自动同步重启」的窗口里 ——
+/// 正是本标志要消除的那个竞态。
+static TASK_BUSY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// 自动同步已连续推迟的轮数。
+static SYNC_DEFER_ROUNDS: AtomicUsize = AtomicUsize::new(0);
+
+/// 「已检测到账号变化、但还没通过重启生效」的待办标志。
+///
+/// **必须单独记这个标志**，这是本修复最容易写错的一处：
+/// `sync_if_changed()` 在检测到变化的**当轮就把指纹更新掉**，因此「本轮跳过重启」
+/// 之后，下一轮它返回 false —— 如果只靠返回值判断，重启就永远不会发生，
+/// 自动同步会静默停摆（账号变更长时间不生效，正是需求明确禁止的）。
+/// 用待办标志把「已经检测到变化」与「还没重启」分开记，推迟才真的只是推迟。
+static SYNC_RESTART_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// 任务忙时最多推迟的自动同步轮数（一轮 = interval 秒）。
+///
+/// 取值理由：间隔 30s，10 轮 = 最多推迟 5 分钟。实测最长的活跃上报在 19 个账号下
+/// 41.7s（约 2 轮），实时上报按「账号数 × 条数 × 800ms」串行，账号更多的用户
+/// 会明显更久。给到 5 分钟既能覆盖正常任务，又不会让「新增账号」这类变更
+/// 被无限期压住 —— 超过上限就强制执行，宁可打断一次任务也不能让同步停摆。
+const MAX_SYNC_DEFER_ROUNDS: usize = 10;
+
+/// 自动同步某一轮该做什么。
+///
+/// 抽成纯函数是为了让「忙时推迟 / 超限强制 / 无变更时空转」三条分支可被单测直接覆盖
+/// —— 真正的循环会启停网关子进程，不适合在单测里跑。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncAction {
+    /// 无需重启（没有待生效的变更，或网关没在跑）。
+    Idle,
+    /// 有变更但任务正在执行：本轮推迟，下轮再看。
+    Defer,
+    /// 执行重启（无任务在跑，或推迟已达上限）。
+    Restart,
+}
+
+/// 决定自动同步本轮的动作。判定顺序即优先级，不可调换：
+///   1. 没有待生效的变更 → 空转（绝大多数轮次走这里）
+///   2. 网关没在跑 → 无需重启（下次启动自然读到新凭证）
+///   3. 任务在跑且未达上限 → 推迟（**不重启**，避免切断在途请求）
+///   4. 其余（含推迟超限）→ 重启
+fn decide_sync_action(
+    pending_restart: bool,
+    gateway_running: bool,
+    task_running: bool,
+    deferred_rounds: usize,
+    max_defer_rounds: usize,
+) -> SyncAction {
+    if !pending_restart {
+        return SyncAction::Idle;
     }
-    loop {
-        tokio::time::sleep(interval).await;
-        if !sync_if_changed() {
-            continue;
+    if !gateway_running {
+        return SyncAction::Idle;
+    }
+    if task_running && deferred_rounds < max_defer_rounds {
+        return SyncAction::Defer;
+    }
+    SyncAction::Restart
+}
+
+/// 养号任务标识 → 界面中文名。
+///
+/// 必须与 Go 侧写账号记录用的标题**逐字一致**（`scheduler/activity.go` 的
+/// 「活跃上报」等）：进度是从统一事件流里按标题数出来的，两边文案一旦分叉，
+/// 进度就恒为 0 且不会有任何报错。
+pub fn task_label(task: &str) -> &'static str {
+    match task.trim() {
+        "activity" => "活跃上报",
+        "nightowl" => "夜猫子任务",
+        "school" => "开学季活动",
+        "trial" => "trial 加油包",
+        _ => "养号任务",
+    }
+}
+
+/// 任务本轮预计遍历的账号数（进度分母）。
+///
+/// 口径刻意与 Go 侧各任务的过滤条件对齐（见 `scheduler/activity.go`、
+/// `trial.go`、`school.go`）：非禁用、非「需重登」、有 access token，
+/// 再按区域筛（活跃上报 / 夜猫子 / 开学季默认只跑国服，trial 只跑国际版；
+/// `checkin_scope=all` 时前三个放开）。
+///
+/// 这是**预计值**：网关账号池由导出的凭证文件建立，与账号库存在极小的时差
+/// （刚授权/刚禁用的账号可能还没同步过去）。用作进度分母足够，
+/// 界面文案也据此写成「已记录 N / M」而不是断言性的「已完成」。
+fn task_target_total(task: &str) -> usize {
+    let scope_all = load_gateway_config()
+        .get("checkin_scope")
+        .and_then(Value::as_str)
+        .unwrap_or("cn")
+        .eq_ignore_ascii_case("all");
+    let want_intl = task.trim() == "trial";
+    account::load_accounts()
+        .iter()
+        .filter(|a| !needs_relogin(a))
+        .filter(|a| !account::account_disabled(a))
+        .filter(|a| account::get_str(a, "access_token").is_some())
+        .filter(|a| {
+            let intl = crate::modules::config::Region::of(a) == crate::modules::config::Region::Intl;
+            if want_intl { intl } else { scope_all || !intl }
+        })
+        .count()
+}
+
+/// 任务开始后，统一事件流里已留下记录的账号 id 列表（进度分子 + 逐卡片标记）。
+///
+/// 为什么从 `account_records.json` 数而不是在宿主另记一份进度：
+/// Go 侧每个任务在**处理完一个账号后**就会写一条账号记录（`records.Recorder`），
+/// 那本来就是「跑到哪了」的唯一真实来源。另立一套进度账本等于把同一件事记两遍，
+/// 两边的口径迟早会分叉（而且分叉时不会有任何报错）。
+///
+/// 按 accountId 去重：个别任务对同一账号可能写多条（如「领取失败」逐条写），
+/// 直接数记录条数会虚高，得出「已记录 30/19 个账号」这种自相矛盾的进度。
+fn task_processed_ids(title: &str, since_ms: i64) -> Vec<String> {
+    use crate::modules::account_records;
+    let snapshot = account_records::query_records(
+        "",
+        since_ms,
+        0,
+        &[account_records::KIND_TASK.to_string()],
+        0,
+    );
+    let mut ids: Vec<String> = snapshot
+        .get("records")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|r| r.get("title").and_then(Value::as_str) == Some(title))
+                // 汇总记录（accountId 为空，如「活动不在期」）不代表任何一个账号，
+                // 计进去会让进度凭空 +1。
+                .filter_map(|r| r.get("accountId").and_then(Value::as_str))
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// 正在执行的任务的运行态（供界面显示「在跑什么、跑到哪了」）。
+#[derive(Debug, Clone)]
+struct TaskRuntimeState {
+    task: String,
+    label: String,
+    started_at: i64,
+    total: usize,
+}
+
+static TASK_RUNTIME: Mutex<Option<TaskRuntimeState>> = Mutex::new(None);
+
+/// 任务忙标志的 RAII 守卫：置位即计数 +1，Drop 即 -1。
+///
+/// 为什么必须是 RAII 而不是手工配对 set/clear：`run_task_now` 有多条提前返回路径
+/// （任务名为空、HTTP 客户端构造失败、网关未启动…），将来还会有更多。
+/// 手工复位漏掉任意一条，自动同步就会**永久停摆**（`decide_sync_action` 恒返回 Defer，
+/// 超过上限后变成每轮都重启 —— 两种都是故障），而且 panic 时更是必然漏掉。
+/// 交给 Drop 则「正常返回、提前 return、panic 展开」三种路径自动覆盖。
+struct TaskBusyGuard;
+
+impl TaskBusyGuard {
+    fn acquire(task: &str) -> Self {
+        let label = task_label(task);
+        TASK_BUSY_COUNT.fetch_add(1, Ordering::SeqCst);
+        *TASK_RUNTIME.lock().unwrap_or_else(|e| e.into_inner()) = Some(TaskRuntimeState {
+            task: task.trim().to_string(),
+            label: label.to_string(),
+            started_at: now_ms(),
+            total: task_target_total(task),
+        });
+        Self
+    }
+}
+
+impl Drop for TaskBusyGuard {
+    fn drop(&mut self) {
+        let _prev = TASK_BUSY_COUNT.fetch_sub(1, Ordering::SeqCst);
+        *TASK_RUNTIME.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // **刻意不在这里清零 SYNC_DEFER_ROUNDS**。
+        //
+        // 推迟额度属于「这次待生效的账号变更」，不属于某个具体任务。
+        // 若在任务结束时就清零，连续点几次「立即执行」就能把额度一次次续满，
+        // 上限形同虚设 —— 那正是需求要防的「无限期推迟自动同步」。
+        //
+        // 额度由 `apply_pending_restart` 统一管理：只要待办还在，
+        // 要么继续累加（任务在跑），要么在 Restart/Idle 分支一并清零。
+        // 任务结束后网关即空闲，下一轮 tick 走 Restart 分支，额度自然归零。
+    }
+}
+
+/// 是否有养号任务正在执行（自动同步据此推迟重启）。
+pub fn task_busy() -> bool {
+    TASK_BUSY_COUNT.load(Ordering::SeqCst) > 0
+}
+
+/// 当前运行态快照（供 `gateway_status` 透出给界面）。
+///
+/// 无任务时只回 `{ running: false }`：界面据 `running` 分支，
+/// 不给它一堆空字段去猜（那正是「看不到在跑什么」的成因之一）。
+///
+/// `processedIds` 是**宿主账号库的 id**（不是网关 uid）：
+/// 界面按 `AccountMeta.id` 给卡片打标记，用 uid 会一个都对不上，
+/// 且不会有任何报错（与 `gateway_account_identities` 是同一口径）。
+pub fn task_runtime() -> Value {
+    // 先把状态**克隆出来再放锁**：算进度要读并解析整个 account_records.json
+    // （上限 2 万条），持锁做文件 I/O 会让同刻想置位/复位的任务干等。
+    let state = {
+        let guard = TASK_RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+        guard.clone()
+    };
+    let Some(st) = state else {
+        return json!({ "running": false });
+    };
+    let processed_ids = task_processed_ids(&st.label, st.started_at);
+    json!({
+        "running": true,
+        "task": st.task,
+        "label": st.label,
+        "startedAt": st.started_at,
+        "elapsedMs": (now_ms() - st.started_at).max(0),
+        "total": st.total,
+        "processed": processed_ids.len(),
+        "processedIds": processed_ids,
+    })
+}
+
+/// 把「有待生效的变更」落成实际重启（受忙标志与推迟上限约束）。
+async fn apply_pending_restart() {
+    let action = decide_sync_action(
+        SYNC_RESTART_PENDING.load(Ordering::SeqCst),
+        is_running(),
+        task_busy(),
+        SYNC_DEFER_ROUNDS.load(Ordering::SeqCst),
+        MAX_SYNC_DEFER_ROUNDS,
+    );
+    match action {
+        SyncAction::Idle => {
+            // 网关没在跑时待办已无意义（下次启动自然是新凭证），清掉避免
+            // 它一直挂着、等网关被用户手动启动后立刻吃一发无谓的重启。
+            SYNC_RESTART_PENDING.store(false, Ordering::SeqCst);
+            SYNC_DEFER_ROUNDS.store(0, Ordering::SeqCst);
         }
-        // 账号库有变化：网关在跑才需要重启才能加载新凭证
-        if is_running() {
+        SyncAction::Defer => {
+            let round = SYNC_DEFER_ROUNDS.fetch_add(1, Ordering::SeqCst) + 1;
+            // 留日志：这是「账号变更为什么没立刻生效」的唯一线索，
+            // 没有它，用户只会看到同步莫名其妙地慢了几分钟。
+            eprintln!(
+                "[gateway] 养号任务执行中，本轮推迟自动重启（{round}/{MAX_SYNC_DEFER_ROUNDS}），\
+                 避免切断在途任务请求"
+            );
+        }
+        SyncAction::Restart => {
+            SYNC_DEFER_ROUNDS.store(0, Ordering::SeqCst);
+            SYNC_RESTART_PENDING.store(false, Ordering::SeqCst);
             let cfg = load_gateway_config();
             stop_gateway();
             match start_gateway(&cfg).await {
@@ -398,6 +674,30 @@ pub async fn run_auto_sync_loop(interval_secs: u64) {
                 Err(e) => eprintln!("[gateway] 账号变化后重启网关失败: {e}"),
             }
         }
+    }
+}
+
+/// 后台自动同步：账号库变化 → 推送凭证；网关运行中且账号有变动 → 重启使新账号生效。
+///
+/// 由 GUI / server 的启动流程调用，永续运行。
+///
+/// 重启一律经 `apply_pending_restart`：那里统一处理「任务在跑就先别重启」，
+/// 本函数不再自己调 stop/start（分散写会让忙标志被绕过）。
+pub async fn run_auto_sync_loop(interval_secs: u64) {
+    let interval = std::time::Duration::from_secs(interval_secs.max(5));
+    // 启动先同步一次，保证首屏即是最新
+    if sync_if_changed() {
+        SYNC_RESTART_PENDING.store(true, Ordering::SeqCst);
+    }
+    apply_pending_restart().await;
+    loop {
+        tokio::time::sleep(interval).await;
+        // 注意：不能写成 `if !sync_if_changed() { continue; }` ——
+        // 指纹在检测到变化的当轮就被更新了，被推迟的重启需要靠待办标志活到下一轮。
+        if sync_if_changed() {
+            SYNC_RESTART_PENDING.store(true, Ordering::SeqCst);
+        }
+        apply_pending_restart().await;
     }
 }
 
@@ -1161,6 +1461,29 @@ fn gateway_account_identities() -> Value {
     json!(items)
 }
 
+/// 归一化自定义提示词模式。
+///
+/// 只认 `custom`（大小写与首尾空白不敏感），其余一律回落 `passthrough`。
+/// 为什么要这层兜底而不是直接透传用户填的值：Go 侧 `normalizePrompt` 对无法识别的
+/// mode 是**启动即报错**（刻意的 fail fast，见其注释）—— 用户在前端把 `custom`
+/// 拼错，整个网关会起不来。在宿主先滤掉，坏值退化为「该功能不生效」而不是「网关挂掉」，
+/// 与 `schedule_hours` 对脏时点的处理是同一取舍。
+///
+/// 缺省值是 passthrough：老配置没有这个键，必须保持既有行为（透传原始 system）。
+fn prompt_mode_of(cfg: &Value) -> &'static str {
+    match cfg
+        .get("prompt_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "custom" => "custom",
+        _ => "passthrough",
+    }
+}
+
 /// 生成网关需要的 config.json（网关原生格式）。
 fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
     let dir = gateway_dir();
@@ -1226,6 +1549,22 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
             "idle_timeout_seconds": 300
         },
         "features": { "sanitize_blacklist_fingerprints": true },
+        // ---- 自定义系统提示词（Go 侧 Config.Prompt，json tag 逐字对齐）----
+        //
+        // 为什么必须由宿主写在这里：本函数在**每次启动网关时全量重写**
+        // gateway_native_config.json。不写这个块的话，任何落在该文件里的
+        // prompt.mode / prompt.file 都会被下次启动抹掉 —— 用户只能在宿主之外
+        //（直接改 config.json 或设 WB2A_PROMPT_* 环境变量）启用这个功能，
+        // 从界面上看就是「配了却总被重置」。
+        //
+        // 与 features.sanitize_blacklist_fingerprints 是**两层叠加、互不替代**：
+        // 那个清洗消息里的指纹串，这个把 system/developer 消息整体替换。
+        "prompt": {
+            // 缺省 passthrough = 透传客户端原始 system（既有行为不变）。
+            "mode": prompt_mode_of(cfg),
+            // 空串 = 用网关内置默认提示词，由 Go 侧 prompt.Load 回落。
+            "file": cfg.get("prompt_file").and_then(Value::as_str).unwrap_or("").trim(),
+        },
         "upstash": { "url": "", "token": "" },
         // 出站代理：**复用**「设置 → 更新代理」里已填的地址，用户无需配两遍。
         //
@@ -1655,6 +1994,13 @@ pub async fn gateway_status() -> Value {
         "portAvailable": port_free(port),
         "authDir": gateway_auth_dir().to_string_lossy(),
         "accountsInLibrary": account_count,
+        // 正在执行的养号任务（含进度）。所有者明确要求「账号卡片上要能看到
+        // 正在执行的任务」—— 此前点了「立即执行」只有一个按钮转圈，
+        // 看不到在跑什么、跑到哪、哪些账号在跑。
+        //
+        // 随 status 一起透出（而不是新开一个接口）：账号卡片所在的列表页
+        // 与网关页都在轮询 status，复用同一次请求不会引入第二套轮询。
+        "taskRuntime": task_runtime(),
         "config": cfg,
         "health": health,
         "pool": pool,
@@ -2047,6 +2393,11 @@ pub async fn fetch_usage(days: Option<i64>) -> Value {
 ///
 /// 注意 `ran=false` 且 `skip` 非空是**正常结果**（如夜猫子不在时段内），
 /// 界面要把它当说明展示，而不是错误。
+///
+/// **执行期间会置「网关忙」标志**（见 `TaskBusyGuard`），让后台自动同步推迟重启 ——
+/// 否则养号任务写回 token 造成的账号库变化会在下一个 30s 周期把网关重启掉，
+/// 直接切断本函数正在等待的这条 HTTP 请求（现象就是界面上的
+/// `error sending request for url (...)`）。
 pub async fn run_task_now(task: &str) -> Value {
     let task = task.trim();
     if task.is_empty() {
@@ -2055,6 +2406,10 @@ pub async fn run_task_now(task: &str) -> Value {
             "message": "", "error": "缺少任务名",
         });
     }
+
+    // 从这里到函数返回全程持有：Drop 即复位，覆盖所有提前 return 与 panic。
+    // 放在「任务名校验」之后：空任务名根本没跑，不该占用忙标志。
+    let _busy = TaskBusyGuard::acquire(task);
 
     let cfg = load_gateway_config();
     let port = cfg.get("port").and_then(Value::as_u64).unwrap_or(7863) as u16;
@@ -3279,6 +3634,361 @@ mod tests {
             vec!["uid-keep-1", "uid-keep-2"],
             "被拒绝的请求不得清空原有勾选（校验必须在写配置之前）"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 任务执行期间自动同步不得重启网关（本次修复的竞态）
+    //
+    // 缺陷现象：点「立即执行」弹出
+    //   error sending request for url (http://127.0.0.1:7864/tasks/run)
+    // —— reqwest 的**传输层**错误：自动同步在任务执行中途 stop_gateway()
+    //    重启，把在途请求切断了。养号任务写回 token 又会改变账号指纹，
+    //    于是「任务 → 重启 → 任务失败」自激。
+    // -----------------------------------------------------------------------
+
+    /// 串行化「碰进程级全局静态」的测试。
+    ///
+    /// `TASK_BUSY_COUNT` / `SYNC_DEFER_ROUNDS` / `SYNC_RESTART_PENDING` /
+    /// `GATEWAY_RUNNING` 都是 `static`，而 cargo 默认**多线程**跑测试 ——
+    /// 不串行化就会看到彼此写到一半的状态（表现为看似随机的失败，
+    /// 与 `config::test_isolation` 需要全局锁是同一个原因）。
+    fn sync_state_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 复位忙标志相关的全局状态，让每个测试从干净状态开始。
+    fn reset_sync_globals() {
+        TASK_BUSY_COUNT.store(0, Ordering::SeqCst);
+        SYNC_DEFER_ROUNDS.store(0, Ordering::SeqCst);
+        SYNC_RESTART_PENDING.store(false, Ordering::SeqCst);
+        GATEWAY_RUNNING.store(false, Ordering::SeqCst);
+        *TASK_RUNTIME.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    // 决策表：无条件覆盖三条分支的优先级。
+    #[test]
+    fn sync_decision_table() {
+        let d = |pending, running, busy, rounds| {
+            decide_sync_action(pending, running, busy, rounds, MAX_SYNC_DEFER_ROUNDS)
+        };
+
+        // 没有待生效变更：空转（绝大多数轮次）
+        assert_eq!(d(false, true, false, 0), SyncAction::Idle);
+        assert_eq!(d(false, true, true, 0), SyncAction::Idle);
+        // 有变更但网关没在跑：无需重启（下次启动自然是新凭证）
+        assert_eq!(d(true, false, false, 0), SyncAction::Idle);
+        assert_eq!(d(true, false, true, 0), SyncAction::Idle);
+        // 有变更、网关在跑、任务在跑：**推迟**而不是重启 —— 这就是本次修复的核心
+        assert_eq!(
+            d(true, true, true, 0),
+            SyncAction::Defer,
+            "任务执行期间必须推迟重启，否则会切断在途任务请求"
+        );
+        // 有变更、网关在跑、任务没跑：正常重启
+        assert_eq!(d(true, true, false, 0), SyncAction::Restart);
+    }
+
+    // 推迟有上限：不能让自动同步被一个长任务无限期压住
+    //（否则账号变更长时间不生效，正是需求明确禁止的）。
+    #[test]
+    fn defer_limit_forces_restart() {
+        let rounds = MAX_SYNC_DEFER_ROUNDS;
+        assert_eq!(
+            decide_sync_action(true, true, true, rounds - 1, rounds),
+            SyncAction::Defer,
+            "上限前的最后一轮仍应推迟"
+        );
+        assert_eq!(
+            decide_sync_action(true, true, true, rounds, rounds),
+            SyncAction::Restart,
+            "达到推迟上限后必须强制执行，宁可打断一次任务也不能让同步停摆"
+        );
+        // 上限之上同样强制（防御：计数器不该越界，但越界也不能变成永久推迟）
+        assert_eq!(
+            decide_sync_action(true, true, true, rounds + 5, rounds),
+            SyncAction::Restart
+        );
+    }
+
+    // 核心回归：任务在执行时，自动同步**不得**调 stop_gateway/start_gateway。
+    //
+    // 断言方式是看 `apply_pending_restart` 的动作：Defer 分支只累加计数，
+    // 不碰网关进程。这里刻意把 GATEWAY_RUNNING 置真 —— 否则会走
+    // 「网关没在跑 → Idle」，测不到忙时的分支。
+    #[test]
+    fn auto_sync_defers_while_task_running() {
+        let _serial = sync_state_lock();
+        reset_sync_globals();
+
+        GATEWAY_RUNNING.store(true, Ordering::SeqCst);
+        SYNC_RESTART_PENDING.store(true, Ordering::SeqCst);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        // 任务在跑：应推迟，且推迟计数递增
+        {
+            let _busy = TaskBusyGuard::acquire("school");
+            assert!(task_busy());
+            rt.block_on(apply_pending_restart());
+            assert_eq!(
+                SYNC_DEFER_ROUNDS.load(Ordering::SeqCst),
+                1,
+                "忙时应推迟一轮"
+            );
+            // 待办标志必须**保留**：否则下一轮 sync_if_changed 返回 false，
+            // 重启永远不会发生，自动同步静默停摆。
+            assert!(
+                SYNC_RESTART_PENDING.load(Ordering::SeqCst),
+                "推迟不等于放弃：待生效标志必须留到下一轮"
+            );
+            rt.block_on(apply_pending_restart());
+            assert_eq!(SYNC_DEFER_ROUNDS.load(Ordering::SeqCst), 2);
+        }
+
+        // 任务结束后恢复重启能力（此处会在真实实现里 stop/start 网关子进程，
+        // 因此只验证「不再推迟」这一判据，不真的执行重启路径）。
+        assert!(!task_busy());
+        assert_eq!(
+            decide_sync_action(true, true, task_busy(), 0, MAX_SYNC_DEFER_ROUNDS),
+            SyncAction::Restart,
+            "任务结束后下一轮应正常重启"
+        );
+
+        reset_sync_globals();
+    }
+
+    // 忙碌标志必须在**所有**退出路径上复位 —— 漏掉任何一条都会让自动同步
+    // 永久推迟（超过上限后变成每轮都重启），是比原缺陷更糟的故障。
+    #[test]
+    fn busy_flag_resets_on_early_return_and_panic() {
+        let _serial = sync_state_lock();
+        reset_sync_globals();
+
+        assert!(!task_busy(), "前置条件：初始应为空闲");
+
+        // 路径 1：提前 return（模拟 run_task_now 里「网关未启动」等分支）
+        fn early_return() {
+            let _busy = TaskBusyGuard::acquire("activity");
+            assert!(task_busy());
+            return; // 提前返回，未手工复位
+        }
+        early_return();
+        assert!(!task_busy(), "提前 return 后忙标志必须复位（靠 Drop，不靠手工配对）");
+        assert_eq!(SYNC_DEFER_ROUNDS.load(Ordering::SeqCst), 0);
+
+        // 路径 2：panic 展开（run_task_now 里任何 panic 都会走这里）
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // 静音预期内的 panic，避免污染测试输出
+        let caught = std::panic::catch_unwind(|| {
+            let _busy = TaskBusyGuard::acquire("nightowl");
+            assert!(task_busy());
+            panic!("模拟任务执行中 panic");
+        });
+        std::panic::set_hook(hook);
+        assert!(caught.is_err(), "前置条件：闭包应 panic");
+        assert!(
+            !task_busy(),
+            "panic 展开后忙标志必须复位 —— 否则自动同步永久停摆"
+        );
+
+        // 推迟额度**不随任务结束清零**：它是「这次待生效的账号变更」的额度，
+        // 不属于某个具体任务。若在任务结束就清零，连续点几次「立即执行」
+        // 就能把额度一次次续满，上限形同虚设 —— 那正是需求要防的
+        // 「无限期推迟自动同步」。额度只在 apply_pending_restart 的
+        // Restart / Idle 分支归零。
+        SYNC_DEFER_ROUNDS.store(3, Ordering::SeqCst);
+        {
+            let _busy = TaskBusyGuard::acquire("trial");
+        }
+        assert_eq!(
+            SYNC_DEFER_ROUNDS.load(Ordering::SeqCst),
+            3,
+            "任务结束不得续满推迟额度，否则连续手动触发可无限期推迟自动同步"
+        );
+
+        // 但网关空闲后的下一轮应当真的重启并把额度归零（deferral 是延迟而非停摆）
+        assert_eq!(
+            decide_sync_action(true, true, task_busy(), 3, MAX_SYNC_DEFER_ROUNDS),
+            SyncAction::Restart,
+            "任务结束后应立即回到重启分支"
+        );
+        SYNC_DEFER_ROUNDS.store(0, Ordering::SeqCst);
+
+        reset_sync_globals();
+    }
+
+    // 并发任务：计数而非布尔。
+    //
+    // 用布尔时先结束的那个会把标志清掉，另一个仍在执行的任务就重新暴露在
+    // 「自动同步重启」的窗口里 —— 正是本标志要消除的竞态。
+    #[test]
+    fn concurrent_tasks_keep_busy_until_last_one_finishes() {
+        let _serial = sync_state_lock();
+        reset_sync_globals();
+
+        let first = TaskBusyGuard::acquire("school");
+        let second = TaskBusyGuard::acquire("trial");
+        assert!(task_busy());
+
+        drop(first);
+        assert!(
+            task_busy(),
+            "还有一个任务在跑，忙标志不得提前清除（否则它会暴露在重启窗口里）"
+        );
+        assert_eq!(
+            decide_sync_action(true, true, task_busy(), 0, MAX_SYNC_DEFER_ROUNDS),
+            SyncAction::Defer
+        );
+
+        drop(second);
+        assert!(!task_busy());
+
+        reset_sync_globals();
+    }
+
+    // 运行态快照：界面「正在执行的任务」的数据来源。
+    #[test]
+    fn task_runtime_reports_label_and_progress() {
+        use crate::modules::config::test_isolation::Isolated;
+
+        let _serial = sync_state_lock();
+        reset_sync_globals();
+        let _iso = Isolated::new("gw-task-runtime");
+
+        // 空闲时只回 running=false：界面据此分支，不必猜一堆空字段
+        let idle = task_runtime();
+        assert_eq!(idle.get("running").and_then(Value::as_bool), Some(false));
+
+        // 账号库：2 个国服 + 1 个国际版，其中 1 个国服被禁用
+        crate::modules::account::save_accounts(&[
+            json!({"id": "a", "uid": "u1", "access_token": "at1", "domain": "www.workbuddy.cn"}),
+            json!({"id": "b", "uid": "u2", "access_token": "at2", "domain": "www.workbuddy.cn", "disabled": true}),
+            json!({"id": "c", "uid": "u3", "access_token": "at3", "domain": "www.workbuddy.ai"}),
+        ])
+        .expect("seed accounts");
+
+        let _busy = TaskBusyGuard::acquire("school");
+        let live = task_runtime();
+        assert_eq!(live.get("running").and_then(Value::as_bool), Some(true));
+        assert_eq!(live.get("task").and_then(Value::as_str), Some("school"));
+        assert_eq!(
+            live.get("label").and_then(Value::as_str),
+            Some("开学季活动"),
+            "标签必须与 Go 侧写账号记录的标题逐字一致，否则进度恒为 0"
+        );
+        // 开学季只跑国服：u1 合格，u2 被禁用，u3 是国际版
+        assert_eq!(
+            live.get("total").and_then(Value::as_u64),
+            Some(1),
+            "分母应与 Go 侧的区域 + 禁用过滤口径一致"
+        );
+        assert_eq!(live.get("processed").and_then(Value::as_u64), Some(0));
+
+        drop(_busy);
+        assert_eq!(
+            task_runtime().get("running").and_then(Value::as_bool),
+            Some(false)
+        );
+        reset_sync_globals();
+    }
+
+    // 未知任务名必须仍有一个可读标签（界面显示「养号任务」而不是空白）。
+    #[test]
+    fn task_label_falls_back_for_unknown_task() {
+        assert_eq!(task_label("school"), "开学季活动");
+        assert_eq!(task_label("  activity  "), "活跃上报", "应容忍首尾空白");
+        assert_eq!(task_label("nope"), "养号任务");
+    }
+
+    // -----------------------------------------------------------------------
+    // 自定义系统提示词：native config 的 prompt 块
+    //
+    // 缺陷背景：write_native_config 每次启动网关都**全量重写**
+    // gateway_native_config.json，而它此前不写 prompt 块 —— 用户落在该文件里的
+    // prompt.mode / prompt.file 会被下次启动静默抹掉，只能在宿主之外启用该功能。
+    // -----------------------------------------------------------------------
+
+    // 默认必须是 passthrough：老配置没有这两个键。若缺省成 custom，
+    // 既有用户升级后 system 会被静默替换（人设/项目约定/工具说明全丢）。
+    #[test]
+    fn native_config_prompt_defaults_to_passthrough() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-prompt-default");
+
+        let path = write_native_config(&load_gateway_config()).expect("write native config");
+        let text = std::fs::read_to_string(&path).expect("read native config");
+        let native: Value = serde_json::from_str(&text).expect("native config is json");
+
+        let prompt = native.get("prompt").expect("prompt 块必须存在，否则启动时会被抹掉");
+        assert_eq!(
+            prompt.get("mode").and_then(Value::as_str),
+            Some("passthrough"),
+            "缺省必须是 passthrough：缺省 custom 会在升级后静默替换用户的 system"
+        );
+        assert_eq!(
+            prompt.get("file").and_then(Value::as_str),
+            Some(""),
+            "未配置时 file 应为空串，由 Go 侧回落到内置默认提示词"
+        );
+    }
+
+    // 用户显式配置后必须逐字透传。
+    #[test]
+    fn native_config_writes_custom_prompt() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-prompt-custom");
+
+        let cfg = json!({
+            "prompt_mode": "custom",
+            "prompt_file": "D:\\prompts\\mine.md",
+        });
+        let path = write_native_config(&cfg).expect("write native config");
+        let native: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+
+        assert_eq!(
+            native.pointer("/prompt/mode").and_then(Value::as_str),
+            Some("custom")
+        );
+        assert_eq!(
+            native.pointer("/prompt/file").and_then(Value::as_str),
+            Some("D:\\prompts\\mine.md"),
+            "路径必须原样透传，宿主不得 substitute 默认路径"
+        );
+    }
+
+    // mode 归一化：大小写/空白容忍，坏值退化而不是让网关起不来。
+    //
+    // Go 侧 normalizePrompt 对无法识别的 mode 是**启动即报错**（刻意的 fail fast），
+    // 因此宿主必须先把脏值滤掉 —— 否则用户把 custom 拼错会让整个网关起不来。
+    #[test]
+    fn prompt_mode_normalization_is_defensive() {
+        let mode_of = |v: Value| super::prompt_mode_of(&v);
+
+        assert_eq!(mode_of(json!({"prompt_mode": "custom"})), "custom");
+        assert_eq!(mode_of(json!({"prompt_mode": "  CUSTOM  "})), "custom", "应容忍大小写与空白");
+        // 坏值 → passthrough（而不是把非法值透传给网关）
+        assert_eq!(mode_of(json!({"prompt_mode": "costom"})), "passthrough", "拼错应回落而非报错");
+        assert_eq!(mode_of(json!({"prompt_mode": ""})), "passthrough");
+        assert_eq!(mode_of(json!({"prompt_mode": null})), "passthrough");
+        assert_eq!(mode_of(json!({})), "passthrough", "键缺席 = 老配置，必须保持既有行为");
+        assert_eq!(mode_of(json!({"prompt_mode": 123})), "passthrough", "类型不对也不应 panic");
+    }
+
+    // 宿主配置默认值里必须有这两个键：否则界面写不进去（save_gateway_config
+    // 以默认值为基底合并，缺键时用户改的值会被丢弃）。
+    #[test]
+    fn default_config_exposes_prompt_fields() {
+        let cfg = default_gateway_config();
+        assert_eq!(
+            cfg.get("prompt_mode").and_then(Value::as_str),
+            Some("passthrough")
+        );
+        assert_eq!(cfg.get("prompt_file").and_then(Value::as_str), Some(""));
     }
 
 }

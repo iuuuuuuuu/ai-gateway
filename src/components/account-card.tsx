@@ -375,6 +375,108 @@ function trialAvailability(account: AccountMeta): TaskAvailability {
   return { enabled: true, reason: null };
 }
 
+/**
+ * 这个账号**有没有 Buddy**——菜单文案要回答的真正问题。
+ *
+ * 为什么不能直接读 `travelStatus.label`：那个标签回答的是「**今天旅行到哪一步**」，
+ * 与「有没有猫」是两件事，而 `TravelStatusLabel` 里只有 2 个值能证明没猫。
+ * 逐个对照后端 `travel.rs::display_label`（唯一出处）：
+ *
+ * | label | 后端判定 | 关于 Buddy 能推出什么 |
+ * |---|---|---|
+ * | `adopted` | `skip=="adopted"`（领养成功） | **有**（刚领到） |
+ * | `traveling` | `ok && !claimed`（已派出） | **有**（没猫派不出去） |
+ * | `finished` | `same_day && claimed`（含 daily-limit） | **有**（今天派过猫） |
+ * | `no-buddy` | `skip=="no-buddy"`（领养失败） | 没（今日记录） |
+ * | `adopt-threshold` | `skip=="adopt-threshold"`（轮次不够） | 没（今日记录） |
+ * | `untraveled` | 其余全部 | **不知道** |
+ *
+ * 关键在最后一行。`untraveled` 是 `display_label` 的兜底分支，它同时覆盖
+ * 「从来没有记录」「记录是昨天的」「查询报错（status-error / config-error /
+ * location-unavailable / claim-error）」——这些都**不能**推出没有猫。
+ * 尤其 `roll_cache_to_today` 跨日时只保留在途记录（`result_in_flight`），
+ * 于是**每个有猫的账号在第二天都会退化成 `untraveled`**：昨天领的猫、
+ * 昨天派完的猫，记录全被丢掉。此前界面正是在这里出错 —— 把 `untraveled`
+ * 当成「没有 Buddy」，于是一个养了几个月猫的账号在新的一天里又显示
+ * 「领养 Buddy」。
+ *
+ * `travelStatus === undefined` 同样是「不知道」，且它有三种成因（仍在查询 /
+ * 查询失败 / 国际版根本不查 —— `AccountsPage.accountsInScope` 只查国服），
+ * 三者都不该被当成「断言没有猫」。
+ *
+ * 结论：只有 `no-buddy` / `adopt-threshold` 敢说没有；`untraveled` 与
+ * undefined 一律按「未知」处理，界面保守表述。
+ */
+type BuddyKnowledge = "has" | "none" | "unknown";
+
+function buddyKnowledge(status: TravelStatus | undefined): BuddyKnowledge {
+  if (!status) return "unknown";
+  // skip 优先于 label：它是后端给的原值，而 label 是它的有损投影
+  //（例如 has-buddy 与 adopted 都会落成「有」）。两处都认，任一条成立即可。
+  if (status.skip === "has-buddy" || status.skip === "adopted" || status.skip === "daily-limit") {
+    return "has";
+  }
+  if (status.skip === "no-buddy" || status.skip === "adopt-threshold") {
+    return "none";
+  }
+  switch (status.label) {
+    case "adopted":
+    case "traveling":
+    case "finished":
+      return "has";
+    case "no-buddy":
+    case "adopt-threshold":
+      return "none";
+    default:
+      return "unknown";
+  }
+}
+
+/**
+ * 领养菜单项的文案。三态各有明确措辞，**未知态绝不断言**：
+ *
+ *   - `has`     → 「重新检查 Buddy」
+ *   - `none`    → 「领养 Buddy」（有依据，可以放心点）
+ *   - `unknown` → 「检查 / 领养 Buddy」
+ *
+ * 未知态为什么是「检查 / 领养」而不是「领养 Buddy（状态未知）」：菜单项的第一行
+ * 是用户扫视时的动作标识，把「领养」摆在最前面，对于一个**可能已经有猫**的账号
+ * 仍然是误导 —— 只是把误导从「断言」降级成了「暗示」。改成动词中性的
+ * 「检查 / 领养」，说的正是后端 `adopt_for_account` 的真实行为：它先
+ * `fetch_has_buddy`，已有猫就直接返回 `has-buddy`（**不做任何写操作**），
+ * 没有才领养。文案与行为因此严格对应。
+ *
+ * 「状态未知」这件事本身放在第二行小字里（见 `adoptMenuHint`）说清楚：第一行
+ * 要短且稳定，第二行才适合承载解释。
+ */
+function adoptMenuLabel(knowledge: BuddyKnowledge): string {
+  if (knowledge === "has") return "重新检查 Buddy";
+  if (knowledge === "none") return "领养 Buddy";
+  return "检查 / 领养 Buddy";
+}
+
+/**
+ * 领养项的悬停说明：把「我们现在知道什么」说清楚，把**后端原话**带上。
+ *
+ * 来源优先级：`message`（后端 `display_record` 透出的具体原因，如
+ * 「无 Buddy（领养需先积累对话轮次）」）> 本地按状态生成的兜底说明。
+ * 后端有话说时一律以后端为准 —— 它才知道真实原因，本地只能反推。
+ */
+function adoptMenuHint(status: TravelStatus | undefined, knowledge: BuddyKnowledge): string | undefined {
+  const backendMessage = status?.message?.trim();
+  if (backendMessage) return backendMessage;
+  if (knowledge === "has") {
+    return "该账号已有 Buddy（今天已派出过或刚领养），点这里会重新查询一次";
+  }
+  if (knowledge === "unknown") {
+    // 三种成因分开讲：用户据此判断「要不要等一等再点」。
+    return status
+      ? "该账号今天没有查到 Buddy 记录（本轮巡检可能未覆盖，或查询失败），不能据此断定它没有猫；点这里会先查询、没有才领养"
+      : "Buddy 状态尚未查询完成（或该账号不在旅行巡检范围内），不能据此断定它没有猫；点这里会先查询、没有才领养";
+  }
+  return undefined;
+}
+
 /** 刷新 Token：两个区域都需要，不受区域限制。 */
 function refreshTokenAvailability(): TaskAvailability {
   return { enabled: true, reason: null };
@@ -395,6 +497,7 @@ function careTaskItem({
   onSelect,
   disabled,
   busy,
+  hint,
 }: {
   icon: ReactNode;
   label: string;
@@ -404,16 +507,26 @@ function careTaskItem({
   disabled?: boolean;
   /** 该项正在执行中，临时不可点但**不**算「不适用」。 */
   busy?: boolean;
+  /**
+   * 可点项的补充说明（第二行小字）。
+   *
+   * 与 `availability.reason` 的分工：那个解释「为什么点不了」，这个在**能点**的
+   * 情况下补充「点下去会发生什么 / 我们目前知道什么」。两者都渲染在第二行，
+   * 因为位置上它们从不同时出现（不可用时只讲原因，可用时才轮到提示）。
+   */
+  hint?: string;
 }) {
   const blocked = disabled || !availability.enabled || busy;
   // 「执行中」与「不适用」是两种不同的置灰：前者是暂时的，必须说清楚，
   // 否则用户看到灰项会以为这个号不支持该任务。
   const reason = busy ? "正在执行，请稍候…" : availability.reason;
+  // 第二行的唯一出处：不可用讲原因，可用讲提示。共用一行避免菜单项高度乱跳。
+  const secondLine = reason ?? hint ?? null;
   return (
     <DropdownMenuItem
       className="items-start"
       disabled={blocked}
-      title={reason ?? undefined}
+      title={reason ?? hint ?? undefined}
       // aria-label 让读屏软件也读到原因，而不是只有视觉上的灰。
       aria-label={reason ? `${label}（不可用：${reason}）` : label}
       aria-disabled={blocked}
@@ -422,9 +535,9 @@ function careTaskItem({
       <span className="mt-0.5 flex shrink-0">{icon}</span>
       <span className="min-w-0 flex-1">
         <span className="block truncate">{label}</span>
-        {reason ? (
+        {secondLine ? (
           <span className="mt-0.5 block whitespace-normal text-[11px] leading-4 text-muted-foreground">
-            {reason}
+            {secondLine}
           </span>
         ) : null}
       </span>
@@ -676,19 +789,21 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   onSelect: () => onCheckin?.(account),
                   disabled: featuresDisabled || !onCheckin,
                 })}
-                {/* 领养：措辞随已知状态变化，避免用户点了才发现"已经有猫"或"还不够轮次"。
-                    「旅行巡检也会顺带领养」这点保留在菜单里说清，因为一键旅行确实覆盖它。 */}
+                {/* 领养：措辞随**已知的 Buddy 状态**变化，而不是随旅行状态变化。
+                    为什么不是直接读 travelStatus.label：见上方 buddyKnowledge 的
+                    完整对照表 —— `untraveled` 是后端兜底分支，跨日后有猫的账号
+                    也会落成它，把「尚未查询 / 今日无记录」当成「没有猫」正是
+                    所有者反馈的那个缺陷。未知态用「（状态未知）」如实说明，
+                    既不断言没有猫，也不假装已经有猫。
+                    「旅行巡检也会顺带领养」这点保留在菜单里说清，因为一键旅行
+                    确实覆盖它。 */}
                 {careTaskItem({
                   icon: <Cat />,
-                  label:
-                    travelStatus?.label === "adopted"
-                      ? "重新检查 Buddy"
-                      : travelStatus?.label === "adopt-threshold"
-                        ? "领养 Buddy（需先攒对话）"
-                        : "领养 Buddy",
+                  label: adoptMenuLabel(buddyKnowledge(travelStatus)),
                   availability: adoptAvailability(account),
                   onSelect: () => onAdopt?.(account),
                   disabled: featuresDisabled || !onAdopt,
+                  hint: adoptMenuHint(travelStatus, buddyKnowledge(travelStatus)),
                 })}
                 {/* 以下 4 项是养号任务，均由网关（Go 侧）按账号区域过滤：
                     活跃上报 / 夜猫子 / 开学季只跑国服，trial 只跑国际版。

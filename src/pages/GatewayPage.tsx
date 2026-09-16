@@ -4,10 +4,12 @@ import {
   Activity,
   AlertTriangle,
   Bot,
+  Check,
   CheckCircle2,
   Copy,
   Globe,
   LayoutGrid,
+  ListFilter,
   Loader2,
   Play,
   Recycle,
@@ -41,6 +43,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
@@ -215,6 +218,265 @@ function UsageBarRow({
 }
 
 /**
+ * 模型筛选控件：**多选**，默认「全部」。
+ *
+ * 与「单一模型」（`allowed_model`，仅积分轮转模式下出现）的分工 —— 这是两个
+ * 完全不同层面的东西，刻意做成两个互不影响的控件：
+ *
+ * | | 单一模型（allowed_model） | 模型筛选（本控件） |
+ * |---|---|---|
+ * | 作用面 | **服务端**：网关只放行这一个模型，其他被 400 拒绝 | **前端**：只改变这里展示哪些模型的用量 |
+ * | 影响范围 | 真实影响客户端能否调用 | 只影响本页的**阅读**，不改任何配置、不写盘 |
+ * | 生效方式 | 保存进 config，需重启网关 | 立即生效，仅本页 |
+ * | 模式 | 只有积分轮转有（轮转的语义就是烧单一模型） | **三个模式都有**（看用量与工作模式无关） |
+ *
+ * 因此这里的勾选**不会**、也不该被写进 `allowed_model`：把「我只想看 glm 的用量」
+ * 变成「网关拒绝其它模型」会静默掐断客户端请求，是最危险的一类耦合。
+ *
+ * 为什么用下拉 + 勾选列表而不是一排 toggle 按钮：所有者本机的 `/v1/models`
+ * 实测返回 **30 个模型**，全部铺开会把区块顶部挤成一面墙；而多选又必须能
+ * 一眼看出「当前选了哪些」，纯下拉单选做不到。
+ */
+function ModelFilter({
+  options,
+  selected,
+  onChange,
+  totalModels,
+}: {
+  /** 可选模型（取自当前范围内的用量数据，按用量降序）。 */
+  options: string[];
+  /** 已选模型；空数组 = 全部（默认）。 */
+  selected: string[];
+  onChange: (next: string[]) => void;
+  /** 全部模型数（未筛选时），用于「全部」行上的计数。 */
+  totalModels: number;
+}) {
+  const all = selected.length === 0;
+  const label = all
+    ? "全部模型"
+    : selected.length === 1
+      ? selected[0]
+      : `已选 ${selected.length} 个模型`;
+
+  function toggle(model: string) {
+    // 从「全部」开始勾一个 = **只看这一个**（把「全部」隐含的集合收窄成一项）。
+    //
+    // 为什么不做成「勾掉这一个、留下其余」：所有者本机 `/v1/models` 实测返回
+    // **30 个模型**，而「想看某一个模型的用量」是最常见的意图。若从「全部」点
+    // 一项等于把它排除，用户就得连点 29 次才能看到单个模型 —— 相反方向的
+    // 需求（「全部但除了某一个」）远没那么常见，且可以用一次「全部模型」+
+    // 逐个取消来达成。
+    //
+    // 视觉上仍然是勾选框（勾选态由 selected 决定），只是从「全部」这一步
+    // 走的是「收窄到此项」而不是「排除此项」。
+    if (all) {
+      onChange([model]);
+      return;
+    }
+    const next = selected.includes(model)
+      ? selected.filter((m) => m !== model)
+      : [...selected, model];
+    // 取消到空 = 回到「全部」，而不是「一个都不显示」——
+    // 后者在语义上等于把整页清零，几乎不会是用户想要的。
+    onChange(next.length === 0 ? [] : next);
+  }
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-7 shrink-0 gap-1.5 px-2 text-xs"
+          aria-label={`模型筛选：${label}`}
+          data-slot="usage-model-filter"
+        >
+          <ListFilter className="size-3.5" />
+          {label}
+          {!all ? <span className="text-muted-foreground">/ {totalModels}</span> : null}
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="max-h-80 w-60 overflow-y-auto">
+        <DropdownMenuItem
+          onSelect={(e) => {
+            // 勾选列表要连着点多项，选中后不关闭菜单。
+            e.preventDefault();
+            onChange([]);
+          }}
+          aria-label="模型筛选：全部模型"
+        >
+          <span className="flex size-4 shrink-0 items-center justify-center">
+            {all ? <Check className="size-3.5" /> : null}
+          </span>
+          <span className="min-w-0 flex-1 truncate">全部模型</span>
+          <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+            {totalModels} 个
+          </span>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        {options.length === 0 ? (
+          <div className="px-2.5 py-2 text-xs text-muted-foreground">该范围内暂无模型数据</div>
+        ) : (
+          options.map((model) => {
+            const checked = !all && selected.includes(model);
+            return (
+              <DropdownMenuItem
+                key={model}
+                onSelect={(e) => {
+                  e.preventDefault();
+                  toggle(model);
+                }}
+                aria-label={`模型筛选：${model}`}
+                aria-checked={checked}
+                // role=menuitemcheckbox 让读屏软件播报勾选态；Radix 的
+                // DropdownMenuCheckboxItem 语义相同，但本项目未引入该导出
+                //（ui/dropdown-menu.tsx 只导出了 6 个部件），故用既有部件 + 属性表达。
+                role="menuitemcheckbox"
+              >
+                <span className="flex size-4 shrink-0 items-center justify-center">
+                  {checked ? <Check className="size-3.5" /> : null}
+                </span>
+                <span className="min-w-0 flex-1 truncate font-mono text-xs">{model}</span>
+              </DropdownMenuItem>
+            );
+          })
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/**
+ * 「点账号 → 看该账号的模型 / Token 明细」面板（新版布局的**唯一**新增交互）。
+ *
+ * 所有者原话：「默认跟旧版的一样，只不过左侧可以通过点击账号的方式来显示…
+ * 的模型 token 信息」。因此这里只做一件事：把**这一个账号**在所选范围内的
+ * 模型构成讲清楚，不复述账号池已有的运行态（健康/冷却/在途都在卡片上）。
+ *
+ * 为什么与「Token 用量」区块并存而不是取代它：
+ *   - 区块回答「整体谁在烧」（按模型 / 按账号 / 每日趋势），是**全局**视图；
+ *   - 本面板回答「这一个号烧在哪些模型上」，是**单账号**视图，且紧贴被点的卡片。
+ *   两者粒度不同，且默认（未选账号）时本面板不出现 —— 观感与旧版一致。
+ */
+function AccountModelDetail({
+  uid,
+  nickname,
+  models,
+  total,
+  records,
+  rangeLabel,
+  creditUsed,
+  credits,
+  modelFilter,
+  onClose,
+}: {
+  uid: string;
+  nickname: string;
+  /** undefined = 网关未提供「账号 × 模型」明细（旧版网关），与「空数组」含义不同。 */
+  models: GatewayUsageGroup[] | undefined;
+  /** 该账号在当前范围内的 Token 合计。 */
+  total: number;
+  records: number;
+  rangeLabel: string;
+  /** 该账号在当前范围内的积分消耗（0 = 无数据）。 */
+  creditUsed: number;
+  /** 网关侧记录的剩余积分（可能为 undefined）。 */
+  credits?: number;
+  /** 生效中的模型筛选（空数组 = 未筛选），用于说明「这里为什么只有这几个模型」。 */
+  modelFilter: string[];
+  onClose: () => void;
+}) {
+  const max = maxOf((models ?? []).map((m) => m.total));
+  return (
+    <Card
+      // data-slot 是本项目标记「这个部件是什么」的既有约定（shadcn 用它，
+      // 既有用例也按 [data-slot="checkbox"] 取元素），不另造 data-testid。
+      data-slot="account-model-detail"
+      className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none xl:sticky xl:top-6"
+    >
+      <div className="flex min-w-0 items-start justify-between gap-2 border-b border-border/60 px-4 py-3 sm:px-5">
+        <div className="min-w-0">
+          <div className="flex items-center gap-1.5 text-[13px] font-medium">
+            <ListFilter className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+            <span className="truncate" title={nickname}>{nickname}</span>
+          </div>
+          <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground/80" title={uid}>
+            {uid}
+          </div>
+        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-7 shrink-0 px-2 text-xs"
+          onClick={onClose}
+          aria-label="取消选择该账号"
+        >
+          取消选择
+        </Button>
+      </div>
+
+      <div className="mx-4 grid grid-cols-3 gap-2 py-3 sm:mx-5">
+        <Stat
+          label="总 Token"
+          value={formatUsageCompact(total)}
+          hint={exactTokenFormatter.format(total)}
+        />
+        <Stat label="调用次数" value={exactTokenFormatter.format(records)} hint="成功请求" />
+        <Stat
+          label="消耗积分"
+          value={creditUsed > 0 ? exactTokenFormatter.format(Math.round(creditUsed)) : "—"}
+          hint={creditUsed > 0 ? rangeLabel : "无快照数据"}
+        />
+      </div>
+
+      <div className="border-t border-border/50 pb-3 pt-3">
+        <div className="px-4 text-[12px] font-medium text-muted-foreground sm:px-5">
+          该账号的模型明细
+          {modelFilter.length > 0 ? (
+            <span className="ml-1.5 font-normal text-muted-foreground/70">
+              （已按模型筛选，仅显示选中的 {modelFilter.length} 个）
+            </span>
+          ) : null}
+        </div>
+        <div className="mt-1 max-h-[22rem] overflow-y-auto">
+          {models === undefined ? (
+            // 与「该账号确实没用过」区分开：旧版网关给不出交叉聚合，
+            // 说清楚是「拿不到」而不是让用户对着空列表猜。
+            <div className="px-4 py-2 text-xs text-muted-foreground sm:px-5">
+              当前网关未提供「账号 × 模型」明细，请更新网关后重试
+            </div>
+          ) : models.length > 0 ? (
+            models.map((model) => (
+              <UsageBarRow
+                key={model.key}
+                label={model.key}
+                value={model.total}
+                max={max}
+                meta={`${exactTokenFormatter.format(model.records)} 次调用 · 输入 ${formatUsageCompact(model.input)} / 输出 ${formatUsageCompact(model.output)}`}
+              />
+            ))
+          ) : (
+            <div className="px-4 py-2 text-xs text-muted-foreground sm:px-5">
+              {modelFilter.length > 0
+                ? "该账号在所选模型上没有 Token 消耗"
+                : "该账号在此范围内没有 Token 消耗（调用可能都失败了，或还没被网关统计到）"}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 余额只作参考并标明口径：它是网关巡检写入的快照，与账号管理页的
+          实时查询不是同一时刻，两者混用会让同一个号在两页显示不同余额。 */}
+      <div className="border-t border-border/50 px-4 py-2.5 text-[11px] text-muted-foreground sm:px-5">
+        剩余积分 {typeof credits === "number" ? exactTokenFormatter.format(credits) : "—"}
+        <span className="text-muted-foreground/70">（网关侧快照）</span>
+        <span className="ml-2">统计范围：{rangeLabel}</span>
+      </div>
+    </Card>
+  );
+}
+
+/**
  * 「取不到用量」时该显示哪一句。
  *
  * 把这几档判定（读取中 / 未运行 / 不可达 / 网关不支持统计 / 真错误）抽出来，
@@ -264,29 +526,6 @@ function UsagePlaceholder({ text }: { text: string }) {
         {text}
       </div>
     </Row>
-  );
-}
-
-/**
- * 进度条（账号池卡片用）。
- *
- * 为什么高度取 1（h-1）而不是旧版用量行的 1.5：卡片里它要挤在 uid 与指标
- * 网格之间，1.5 会把「在途」徽标那行往下推，同排卡片因此错位；账号卡片的
- * 积分资源包进度条也是 h-1，取同一档才符合「卡片尺寸全站统一」。
- *
- * `aria-hidden` 与账号卡片同款：条本身是纯视觉冗余，数值已经在旁边以文本
- * 给出，读屏再念一遍「进度条 62%」只会让信息重复。
- */
-function UsageProgress({ percent, title }: { percent: number; title: string }) {
-  return (
-    <div
-      data-slot="usage-progress"
-      className="mt-2 h-1 overflow-hidden rounded-full bg-muted"
-      aria-hidden="true"
-      title={title}
-    >
-      <div className="h-full rounded-full bg-primary/75" style={{ width: `${percent}%` }} />
-    </div>
   );
 }
 
@@ -429,51 +668,27 @@ function queuedReasonText(acc: GatewayPoolAccount): string {
 }
 
 /**
- * 网关账号池账号卡片：展示冷却/熔断/在途等运行态，以及该账号在所选范围内的
- * Token 用量与积分消耗。
+ * 网关账号池账号卡片：展示冷却/熔断/在途等运行态。
  *
- * 为什么会话把用量也放在卡片上：这三类信息原本分处「账号池」「Token 用量」
- * 「积分统计」三块，想回答「这个正在冷却的账号今天烧了多少」得来回对照。
- * 合到一张卡片后信息一次看全，且仍是方块展示（不引入表格，避免大片留白）。
+ * 新旧两版**渲染同一张卡片**（所有者本轮的原话：「新版默认跟旧版的一样」）。
+ * 新版唯一的差别是卡片可以点：点一下就把该账号的模型 / Token 明细显示在下方。
+ * 此前新版往卡片里塞了进度条、在途徽标与「消耗积分 / 消耗 Token / 调用次数」
+ * 三列，等于换了一套布局 —— 那不是所有者要的，已全部移除。
  */
 function PoolAccountRow({
   acc,
-  usage,
-  creditUsed,
-  usageRangeLabel,
-  showUsage,
-  usagePercent,
-  usageRank,
+  selectable = false,
+  selected = false,
+  onSelect,
 }: {
   acc: GatewayPoolAccount;
-  /** 该账号在所选范围内的 Token 用量（undefined = 零消耗）。 */
-  usage?: GatewayUsageGroup;
-  /** 该账号在所选范围内的积分消耗（0 = 无消耗或无从得知）。 */
-  creditUsed: number;
-  /** 当前日期筛选的中文名，用于 tooltip。 */
-  usageRangeLabel: string;
-  /**
-   * 是否展示用量列（新版布局 = true）。
-   *
-   * 旧版布局下卡片只呈现池运行态，「消耗积分 / 消耗 Token / 调用次数」留在
-   * 页面下方的「Token 用量」区块里 —— 保持用户已习惯的样子不变。
-   */
-  showUsage: boolean;
-  /**
-   * 进度条占比（0-100，已按当前范围内的最大消耗归一）。
-   *
-   * 只在 `showUsage` 下使用：旧版布局不显示进度条，也就不需要这个值 ——
-   * 但仍作为必填项传入，避免「忘了传」被静默当成 0（那会渲染出一条空条）。
-   */
-  usagePercent: number;
-  /** 该账号在当前范围内的消耗排名（1 = 最高），用于进度条的悬停说明。 */
-  usageRank: number;
+  /** 新版布局：卡片可点，点击后把该账号的明细显示在下方。 */
+  selectable?: boolean;
+  /** 是否为当前选中的账号（仅有视觉反馈，不影响数据）。 */
+  selected?: boolean;
+  onSelect?: () => void;
 }) {
   const modelCools = acc.model_cooling ?? [];
-  const usageToken = usage?.total ?? 0;
-  const usageRecords = usage?.records ?? 0;
-  /** 该账号此刻正在处理的请求数（网关运行态，不持久化）。 */
-  const inFlight = acc.in_flight ?? 0;
   // 状态标签的优先级：禁用 > 账号级冷却 > 排队 > 健康。
   //
   // 「排队」单独作为一档，因为它最容易让人误判：账号本身完全健康、积分充足，
@@ -490,6 +705,19 @@ function PoolAccountRow({
   const expiry = acc.expire_day
     ? { label: `到期 ${acc.expire_day.slice(5)}`, title: `最近到期积分：${acc.expire_day}（同一天的账号同级平均分摊）` }
     : { label: "到期未知", title: "尚未取到积分到期信息：会排在其他账号之后，仅在它们不可用时才使用" };
+
+  // 可点时必须用真实的 <button>（而不是给 div 挂 onClick）：键盘 Tab / Enter
+  // 与读屏都依赖原生语义。卡片视觉不变，只去掉 button 的默认样式。
+  const Root = selectable ? "button" : "div";
+  const rootProps = selectable
+    ? {
+        type: "button" as const,
+        onClick: onSelect,
+        "aria-pressed": selected,
+        title: selected ? "再次点击可取消查看该账号的明细" : "点击查看该账号的模型与 Token 明细",
+      }
+    : {};
+
   return (
     // 每个账号是**独立卡片**而非长列表的一行。
     //
@@ -497,27 +725,22 @@ function PoolAccountRow({
     // 且行高随冷却内容参差（有模型冷却的行高一倍），整体看起来像未对齐的拼贴。
     // 独立卡片 + 栅格 auto-rows-fr 后，同排卡片等高、边界清晰。
     //
-    // 在途（in_flight>0）时整张卡片加一圈高亮描边：所有者要回答的是
-    // 「现在这个请求被分给哪个账号了」，这是**转瞬即逝**的运行态 ——
-    // 藏在数字格里的话，等视线扫到那一格时请求早就结束了。
-    <div className={cn("flex min-w-0 flex-col rounded-xl border p-3 transition-colors", acc.queued && !acc.cooling && !acc.disabled ? "border-dashed border-border/60 bg-muted/20" : "border-border/60 bg-card/40", showUsage && inFlight > 0 && "border-sky-500/50 bg-sky-500/[0.04] ring-1 ring-sky-500/25")}>
+    // 选中态用 ring 标注（与账号卡片「当前账号」同款做法）：用户点了哪个号，
+    // 下方的明细属于谁必须一眼可见，否则滚动后明细与卡片对不上号。
+    <Root
+      {...rootProps}
+      className={cn(
+        "flex min-w-0 flex-col rounded-xl border p-3 text-left transition-colors",
+        acc.queued && !acc.cooling && !acc.disabled ? "border-dashed border-border/60 bg-muted/20" : "border-border/60 bg-card/40",
+        selectable && "cursor-pointer hover:border-border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40",
+        selected && "border-sky-500/50 bg-sky-500/[0.04] ring-1 ring-sky-500/25",
+      )}
+    >
       <div className="flex min-w-0 items-start gap-3">
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-medium">{acc.nickname || acc.uid}</div>
           <div className="truncate font-mono text-[11px] text-muted-foreground/80">{acc.uid}</div>
         </div>
-        {/* 在途标记排在状态标签之前：它是「此刻正在用这个号」的唯一直接证据，
-            比健康/冷却这类稳态描述更需要一眼看到。
-            仅新版布局展示：旧版布局的观感必须保持不变（所有者明确要求）。 */}
-        {showUsage && inFlight > 0 ? (
-          <span
-            className="flex shrink-0 items-center gap-1 rounded-md bg-sky-500/15 px-1.5 py-0.5 text-[11px] font-medium text-sky-700 dark:text-sky-300"
-            title={`该账号正在处理 ${inFlight} 个请求（网关实时在途数，请求结束即归零）`}
-          >
-            <Activity className="size-3" aria-hidden="true" />
-            在途 {inFlight}
-          </span>
-        ) : null}
         <span
           className={cn("shrink-0 rounded-md px-1.5 py-0.5 text-[11px] font-medium", state.cls)}
           title={acc.queued && !acc.cooling && !acc.disabled ? queuedReasonText(acc) : coolReasonText(acc)}
@@ -526,26 +749,8 @@ function PoolAccountRow({
         </span>
       </div>
 
-      {/* 消耗进度条：以**当前筛选范围内本批账号的最大消耗**为满格。
-          为什么放在账号名与指标网格之间：它回答的是「这个号在这批里烧得多不多」，
-          属于对整张卡片的第一眼概括；放到网格下面就会变成某几格的附属物，
-          而它其实是排序依据（卡片正是按这个值降序排的）。
-          仅新版布局展示：旧版布局的观感必须保持不变。 */}
-      {showUsage ? (
-        <UsageProgress
-          percent={usagePercent}
-          title={
-            usageToken > 0
-              ? `${usageRangeLabel}消耗 ${formatUsageCompact(usageToken)} tokens · 在本批账号中排第 ${usageRank} 位（进度条以本批最高消耗为满格）`
-              : `${usageRangeLabel}暂无 Token 消耗（进度条以本批最高消耗为满格）`
-          }
-        />
-      ) : null}
-
-      {/* 运行数据：3 列网格。
-          旧版布局只有「剩余积分 / 到期档位 / 成功·在途」三个池运行态字段；
-          新版布局（showUsage）额外并进「消耗积分 / 消耗 Token / 调用次数」，
-          信息一次看全。列数随内容变化，避免旧版留下空列。 */}
+      {/* 运行数据：3 列网格（「剩余积分 / 到期档位 / 成功·在途」）。
+          新旧两版列数完全一致 —— 新版不再额外并入用量列。 */}
       <div className="mt-2.5 grid grid-cols-3 gap-x-2 gap-y-2 border-t border-border/50 pt-2.5 text-[11px]">
         <div className="min-w-0">
           <div className="text-[10px] text-muted-foreground/70">剩余积分</div>
@@ -553,40 +758,12 @@ function PoolAccountRow({
             {typeof acc.credits === "number" ? exactTokenFormatter.format(acc.credits) : "—"}
           </div>
         </div>
-        {/* 消耗积分：仅新版布局展示（旧版在下方「Token 用量」区块里） */}
-        {showUsage ? (
-          <div className="min-w-0">
-            <div className="text-[10px] text-muted-foreground/70" title={`${usageRangeLabel}内该账号消耗的积分（本地积分快照差分，已排除签到补发等余额上升）`}>
-              消耗积分
-            </div>
-            <div className={cn("truncate text-[13px] font-medium tabular-nums", creditUsed > 0 && "text-amber-700 dark:text-amber-400")}>
-              {creditUsed > 0 ? exactTokenFormatter.format(Math.round(creditUsed)) : <span className="font-normal text-muted-foreground/60">—</span>}
-            </div>
-          </div>
-        ) : null}
         <div className="min-w-0">
           <div className="text-[10px] text-muted-foreground/70">到期档位</div>
           <div className="truncate text-[13px] font-medium tabular-nums" title={expiry.title}>
             {acc.expire_day ? acc.expire_day.slice(5) : "未知"}
           </div>
         </div>
-
-        {showUsage ? (
-          <>
-            <div className="min-w-0">
-              <div className="text-[10px] text-muted-foreground/70">消耗 Token</div>
-              <div className="truncate text-[12px] tabular-nums">
-                {usageToken > 0 ? formatUsageCompact(usageToken) : <span className="text-muted-foreground/60">—</span>}
-              </div>
-            </div>
-            <div className="min-w-0">
-              <div className="text-[10px] text-muted-foreground/70">调用次数</div>
-              <div className="truncate text-[12px] tabular-nums">
-                {usageRecords > 0 ? exactTokenFormatter.format(usageRecords) : <span className="text-muted-foreground/60">—</span>}
-              </div>
-            </div>
-          </>
-        ) : null}
         <div className="min-w-0">
           <div className="text-[10px] text-muted-foreground/70">成功 / 在途</div>
           <div className="truncate text-[12px] tabular-nums text-muted-foreground">
@@ -651,7 +828,7 @@ function PoolAccountRow({
               此处不再逐账号重复（14 个账号会重复 14 遍，纯噪音）。 */}
         </div>
       ) : null}
-    </div>
+    </Root>
   );
 }
 
@@ -871,14 +1048,32 @@ export default function GatewayPage() {
   const [usageUpdatedAt, setUsageUpdatedAt] = useState<number | null>(null);
   /** 每秒自增，驱动「上次更新 xx 秒前」的相对时间重新渲染。 */
   const [nowTick, setNowTick] = useState(() => Date.now());
+
   /**
-   * 新版用量区块里选中的账号（空串 = 全部账号）。
+   * 用量展示的模型筛选（空数组 = 全部，默认）。
    *
-   * 与 `usageRange` 同级放在这里，而不是塞进区块内部：它要与日期筛选一起
-   * 决定「看的是哪个窗口的哪份明细」，且切换日期筛选时选择必须保留 ——
-   * 用户往往正是在对比同一个号的不同时间窗，重置选择会把对照关系打断。
+   * 与 `allowedModel` 的分工见上方 `ModelFilter` 的说明：那个是**服务端放行**
+   * 限制（写进配置、影响客户端能否调用），这个是**本页只读展示**的收窄。
+   * 两者刻意不共用状态 —— 合并会让「我只想看一眼 glm 的用量」变成
+   * 「网关拒绝其它模型」，静默掐断客户端请求。
+   *
+   * 放在页面级而不是区块内部：三个工作模式下都要有这个控件，且账号池卡片、
+   * 「按模型 / 按账号」、新版账号明细三处共用同一份筛选，状态必须唯一。
    */
-  const [usageAccountFilter, setUsageAccountFilter] = useState<string>("");
+  const [modelFilter, setModelFilter] = useState<string[]>([]);
+
+  /**
+   * 新版布局下被点选的账号（池 uid；空串 = 未选）。
+   *
+   * 这是新版**唯一**的交互差异（所有者原话：「默认跟旧版的一样，只不过左侧
+   * 可以通过点击账号的方式来显示左边的模型 token 信息」）：点卡片即把该账号
+   * 的模型 / Token 明细显示在下方。
+   *
+   * 不复用 `usageAccountFilter`（那是下拉筛选）：两者语义不同 —— 下拉是
+   * 「我要持续盯这个号」，卡片点选是「我随手点开看一眼」。共用一个状态会让
+   * 点卡片把下拉也改掉，用户在另一个区块的选择被悄悄覆盖。
+   */
+  const [selectedPoolUid, setSelectedPoolUid] = useState<string>("");
 
   /**
    * 积分消耗统计（按账号给 今日 / 近 7 天 / 本月 三个时间窗）。
@@ -1374,14 +1569,67 @@ export default function GatewayPage() {
   // 用量区块的派生数据。
   const usageSnapshot = usage?.usage ?? null;
   const usageSummary = usageSnapshot?.summary ?? null;
-  const usageModels = usageSnapshot?.models ?? [];
-  const usageAccounts = usageSnapshot?.accounts ?? [];
+  const usageModelsAll = usageSnapshot?.models ?? [];
+  const usageAccountsAll = usageSnapshot?.accounts ?? [];
   /** 账号 → 该账号用过的模型明细（网关 /usage 的 accountModels）。 */
   const usageAccountModels = usageSnapshot?.accountModels;
   const usageDaily = usageSnapshot?.daily ?? [];
+  const usageMaxDaily = maxOf(usageDaily.map((d) => d.total));
+
+  /**
+   * 模型筛选（多选，空 = 全部）作用到**三处**展示上，且只作用于展示：
+   *   1. 账号池卡片与进度条/排序（先按模型收窄每个账号的用量，再取最大值归一）
+   *   2. 「Token 用量」区块的按模型列表
+   *   3. 选中单账号时的模型明细
+   * 顶部 4 个汇总数字（总 Token / 输入 / 输出 / 调用次数）**不**跟着变：
+   * 它们是「网关总量」的概览，若跟着收窄，用户就再也看不到真实总量，
+   * 而且会与「共 N 次调用」这句自相矛盾。下面另给一行「已筛选」说明。
+   */
+  const modelFilterSet = useMemo(() => new Set(modelFilter), [modelFilter]);
+  const modelFilterActive = modelFilter.length > 0;
+
+  /** 可选的模型清单：取自当前范围内的数据（按用量降序，网关已排好）。 */
+  const modelFilterOptions = useMemo(
+    () => usageModelsAll.map((m) => m.key),
+    [usageModelsAll],
+  );
+
+  /** 按模型筛选后的账号用量：逐账号把不在筛选内的模型剔掉后重新合计。 */
+  const usageAccounts = useMemo(() => {
+    if (!modelFilterActive) return usageAccountsAll;
+    // 没有 accountModels（旧版网关）时无法做「账号 × 模型」收窄：
+    // 此时**原样返回**而不是清零 —— 清零会让所有账号看起来都没用量，
+    // 那是在编造一个「筛选后为空」的假结论。界面另给降级说明。
+    if (!usageAccountModels) return usageAccountsAll;
+    return usageAccountsAll.map((account) => {
+      const models = (usageAccountModels[account.key] ?? []).filter((m) =>
+        modelFilterSet.has(m.key),
+      );
+      if (models.length === 0) {
+        // 该账号在此筛选下确实没有任何选中模型的用量：归零（这是**真结论**，
+        // 与上面「拿不到明细」不同）。键必须保留，否则界面上这个账号会消失。
+        return { ...account, total: 0, records: 0, input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+      }
+      const pick = (field: "total" | "records" | "input" | "output" | "cacheWrite" | "cacheRead") =>
+        models.reduce((sum, m) => sum + (m[field] ?? 0), 0);
+      return {
+        ...account,
+        total: pick("total"),
+        records: pick("records"),
+        input: pick("input"),
+        output: pick("output"),
+        cacheWrite: pick("cacheWrite"),
+        cacheRead: pick("cacheRead"),
+      };
+    });
+  }, [usageAccountsAll, usageAccountModels, modelFilterActive, modelFilterSet]);
+
+  const usageModels = useMemo(
+    () => (modelFilterActive ? usageModelsAll.filter((m) => modelFilterSet.has(m.key)) : usageModelsAll),
+    [usageModelsAll, modelFilterActive, modelFilterSet],
+  );
   const usageMaxModel = maxOf(usageModels.map((m) => m.total));
   const usageMaxAccount = maxOf(usageAccounts.map((a) => a.total));
-  const usageMaxDaily = maxOf(usageDaily.map((d) => d.total));
   const usageNickname = useMemo(() => {
     const map = new Map<string, string>();
     for (const account of status?.accounts ?? []) {
@@ -1502,31 +1750,25 @@ export default function GatewayPage() {
   /**
    * 选中账号的模型明细。
    *
-   * 未选账号、或网关未提供 accountModels（旧版网关）时返回 null 而不是空数组：
+   * 未选账号、或网关未提供 accountModels（旧版网关）时返回 undefined 而不是空数组：
    * 「拿不到明细」与「这个号确实没调用过」是两件事，界面要给出不同的说法。
+   *
+   * 模型筛选在这里同样生效（与「按模型」列表口径一致）：筛选是「我想看哪些
+   * 模型」的全局意图，单账号明细没有理由例外。`modelFilterSet` 为空时不过滤。
    */
-  const filteredAccountModels = usageAccountFilter
-    ? (usageAccountModels?.[usageAccountFilter] ?? (usageAccountModels ? [] : null))
-    : null;
+  const selectedPoolModels = selectedPoolUid
+    ? usageAccountModels
+      ? (usageAccountModels[selectedPoolUid] ?? []).filter(
+          (m) => !modelFilterActive || modelFilterSet.has(m.key),
+        )
+      : undefined
+    : undefined;
 
   /** 选中账号在当前范围内的合计（用于明细区的标题行）。 */
-  const filteredAccountUsage =
-    usageAccounts.find((a) => a.key === usageAccountFilter) ?? null;
+  const selectedPoolUsage = usageAccounts.find((a) => a.key === selectedPoolUid) ?? null;
 
-  /** 选中账号的模型明细里最高的那个 —— 明细条的 100% 参照物。 */
-  const filteredAccountMaxModel = maxOf((filteredAccountModels ?? []).map((m) => m.total));
-
-  /**
-   * 本区块是否要自己渲染日期筛选控件。
-   *
-   * 新版布局下这个控件已经渲染在账号池顶部（那里紧邻卡片，才是用户切范围
-   * 的地方）。若这里再放一份，同一状态就出现两个控件 —— 改一个另一个也跟着
-   * 变，看起来像两套互不同步的筛选。
-   *
-   * 唯一例外是**账号池没渲染**（网关未运行 / 池为空）：那种情况下页面别处
-   * 没有任何日期筛选，本区块若不补上，用户就完全改不了统计范围。
-   */
-  const usageBlockShowsRange = poolAccounts.length === 0;
+  /** 选中的池账号对象（供明细区展示昵称 / 余额）。 */
+  const selectedPoolAccount = poolAccounts.find((a) => a.uid === selectedPoolUid) ?? null;
 
   const endpoint = status?.openaiBase ?? "";
   const endpointHint = useMemo(() => {
@@ -2027,54 +2269,6 @@ export default function GatewayPage() {
       <Section title="账号池" description={pool ? `网关侧运行态（redis=${pool.redis_mode ?? "noop"}）` : "启动网关后可见"}>
         {poolAccounts.length > 0 ? (
           <>
-            {/* 日期筛选：**仅新版布局**放在这里。
-                新版把用量并进了账号卡片，所以筛选器必须紧邻卡片；
-                旧版布局下用量仍在页面下方的「Token 用量」区块里，
-                筛选器留在那里 —— 保持用户已习惯的位置不变。 */}
-            {layout === "merged" ? (
-            <div className="mx-4 mt-3 flex flex-wrap items-center justify-between gap-2 sm:mx-5">
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                <span className="text-[11px] text-muted-foreground">用量范围</span>
-                {usageUpdatedAt ? (
-                  <span
-                    className="text-[11px] tabular-nums text-muted-foreground/80"
-                    title={`上次更新：${new Date(usageUpdatedAt).toLocaleString("zh-CN")}`}
-                  >
-                    · 上次更新 {formatRelativeTime(nowTick - usageUpdatedAt)}
-                    {usageLoading ? " · 更新中…" : ""}
-                  </span>
-                ) : null}
-                {creditStats ? null : (
-                  <span className="text-[11px] text-muted-foreground/70" title="积分消耗来自本地积分快照，需宿主服务提供 /api/credits/stats">
-                    · 积分消耗不可用
-                  </span>
-                )}
-              </div>
-              <div className="flex shrink-0 items-center gap-1.5">
-                {USAGE_RANGE_OPTIONS.map((option) => (
-                  <Button
-                    key={option.key}
-                    variant={usageRange === option.key ? "default" : "outline"}
-                    size="sm"
-                    className="h-7 px-2 text-xs"
-                    onClick={() => setUsageRange(option.key)}
-                  >
-                    {option.label}
-                  </Button>
-                ))}
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="size-7"
-                  onClick={() => setUsageNonce((value) => value + 1)}
-                  disabled={usageLoading}
-                  aria-label="刷新用量"
-                >
-                  <RefreshCw className={cn("size-3.5", usageLoading && "animate-spin")} />
-                </Button>
-              </div>
-            </div>
-            ) : null}
             {/* 全局说明只写一次。此前每个账号都重复渲染「模型冷却只影响上述模型…」，
                 14 个账号就是 14 遍相同文案，是纯噪音。 */}
             {poolModelCooledCount > 0 ? (
@@ -2094,27 +2288,26 @@ export default function GatewayPage() {
                 分层选号会优先消耗最快过期的额度，前面档位用尽或冷却后它们会自动承接流量。
               </div>
             ) : null}
-            {/* 排序说明：卡片顺序按 Token 消耗自动变化，不说清楚会让人以为
-                「账号列表自己乱跳」。只在有消耗时提示 —— 全 0 时顺序不变，
-                这时提「已按消耗排序」反而是假的。 */}
-            {layout === "merged" && poolMaxUsage > 1 ? (
+            {/* 新版布局的一句引导：卡片可以点。
+                不说明的话没人会去点一张看起来纯展示的卡片 —— 这个交互就白做了。
+                只在新版出现：旧版布局必须与既有观感逐字一致（有测试锁着）。 */}
+            {layout === "merged" ? (
               <div className="mx-4 mt-2 text-[11px] text-muted-foreground/80 sm:mx-5">
-                按「{usageRangeLabel}」的 Token 消耗<strong className="font-normal text-foreground/80">从高到低排列</strong>
-                ，进度条以本批最高消耗为满格（切换上面的用量范围会自动重排）。
+                点击任意账号卡片，可在下方查看<strong className="font-normal text-foreground/80">该账号的模型与 Token 明细</strong>；再次点击取消选择。
               </div>
             ) : null}
             {/* 卡片网格：auto-rows-fr 让同一排的卡片等高，避免因冷却明细行数不同而参差。 */}
             <div className="grid auto-rows-fr grid-cols-1 gap-3 p-3 sm:grid-cols-2 sm:p-4 xl:grid-cols-3 2xl:grid-cols-4">
-              {poolDisplayAccounts.map((acc) => (
+              {poolAccounts.map((acc) => (
                 <PoolAccountRow
                   key={acc.uid}
                   acc={acc}
-                  usage={usageByUid.get(acc.uid)}
-                  creditUsed={creditUsedByUid.get(acc.uid) ?? 0}
-                  usageRangeLabel={usageRangeLabel}
-                  showUsage={layout === "merged"}
-                  usagePercent={usagePercentByUid.get(acc.uid) ?? 0}
-                  usageRank={poolUsageRank.get(acc.uid) ?? 0}
+                  // 新版可点：点同一个账号第二次 = 取消选择（回到「全部账号」）。
+                  selectable={layout === "merged"}
+                  selected={layout === "merged" && selectedPoolUid === acc.uid}
+                  onSelect={() =>
+                    setSelectedPoolUid((current) => (current === acc.uid ? "" : acc.uid))
+                  }
                 />
               ))}
             </div>
@@ -2138,9 +2331,11 @@ export default function GatewayPage() {
         )}
       </Section>
 
-      {/* Token 用量区块（旧版）：账号池与用量各自独立成块。
-          新版布局下由下面那个「按账号看模型明细」的区块承担 —— 两者分工见其注释。 */}
-      {layout === "classic" ? (
+      {/* Token 用量区块：**新旧两版完全共用**。
+          所有者本轮明确否掉了「新版另做一套布局」的做法（原话：「默认跟旧版的
+          一样，只不过左侧可以通过点击账号的方式来显示…模型 token 信息」），
+          因此这里不再按 layout 分叉 —— 新版唯一的差异是下面那个**点账号看明细**
+          的面板，它默认不出现，观感因此与旧版逐字一致。 */}
       <Section
         title="Token 用量"
         description="经网关成功请求的上游用量，按模型 / 账号 / 日期聚合（网关重启后保留）"
@@ -2168,6 +2363,16 @@ export default function GatewayPage() {
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
+            {/* 模型筛选：默认「全部」、可多选，**三个工作模式下都在**。
+                与「单一模型」（allowed_model）的分工见 ModelFilter 的说明 ——
+                那个是服务端放行限制（写进配置、影响客户端能否调用），
+                这个是本页只读展示的收窄，不碰任何配置。 */}
+            <ModelFilter
+              options={modelFilterOptions}
+              selected={modelFilter}
+              onChange={setModelFilter}
+              totalModels={modelFilterOptions.length}
+            />
             {USAGE_RANGE_OPTIONS.map((option) => (
               <Button
                 key={option.key}
@@ -2192,35 +2397,25 @@ export default function GatewayPage() {
           </div>
         </Row>
 
-        {usageLoading && !usageSnapshot ? (
-          <Row className="justify-center">
-            <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
-              <Loader2 className="size-3.5 animate-spin" />
-              正在读取网关用量…
-            </div>
-          </Row>
-        ) : (usage && !usage.running) || !running ? (
-          <Row className="justify-center">
-            <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
-              <CheckCircle2 className="size-3.5" />
-              网关未运行，启动后这里会展示经网关请求的 Token 用量
-            </div>
-          </Row>
-        ) : !usage?.reachable ? (
-          <Row className="justify-center">
-            <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
-              <Activity className="size-3.5" />
-              网关已启动但暂时无法读取用量{usage?.error ? `：${usage.error}` : ""}
-            </div>
-          </Row>
-        ) : usageSnapshot?.enabled === false ? (
-          <Row className="justify-center">
-            <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
-              <AlertTriangle className="size-3.5" />
-              当前网关可执行文件不支持用量统计，请更新网关后重试
-            </div>
-          </Row>
-        ) : usageSnapshot && usageSummary ? (
+        {/* 筛选生效的说明：数字收窄了却不说清楚，用户会以为数据丢了。
+            同时点明「顶部汇总不随筛选变化」，避免与那句「合计 N tokens」冲突。 */}
+        {modelFilterActive ? (
+          <div className="mx-4 mt-2 rounded-lg bg-muted/50 px-3 py-2 text-[11px] leading-5 text-muted-foreground sm:mx-5">
+            已筛选 <strong className="font-medium text-foreground/80">{modelFilter.length}</strong> 个模型
+            （{modelFilter.join("、")}）：下方「按模型 / 按账号」与新版账号明细只统计这些模型；
+            上方的汇总数字与「每日用量」仍是网关全量，不随筛选变化。
+          </div>
+        ) : null}
+
+        {(() => {
+          // 判定顺序与占位文案统一走 usageUnavailableText，避免「新版一套、
+          // 旧版另一套」的措辞漂移（例如把「网关没开」说成「开了但坏了」）。
+          const unavailable = usageUnavailableText({ usageLoading, snapshot: usageSnapshot, running, usage });
+          if (unavailable) return <UsagePlaceholder text={unavailable} />;
+          if (!usageSnapshot || !usageSummary) {
+            return <UsagePlaceholder text={`无法读取网关用量${usage?.error ? `：${usage.error}` : ""}`} />;
+          }
+          return (
           <>
             <div className="mx-4 grid grid-cols-2 gap-2 py-3 sm:mx-5 sm:grid-cols-4">
               <Stat
@@ -2332,229 +2527,35 @@ export default function GatewayPage() {
               </div>
             ) : null}
           </>
-        ) : (
-          <Row className="justify-center">
-            <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
-              <AlertTriangle className="size-3.5" />
-              无法读取网关用量{usage?.error ? `：${usage.error}` : ""}
-            </div>
-          </Row>
-        )}
+          );
+        })()}
       </Section>
-      ) : null}
 
       {/*
-        新版布局的「Token 用量」区块：**按账号看模型明细**。
+        新版布局的**唯一**新增交互：点了账号池里的某张卡片后，这里显示该账号的
+        模型 / Token 明细。
 
-        与账号池卡片的分工（这是新版不直接复用旧版整块的原因）：
-          - 卡片回答「谁烧得多」：每个号的 Token 总量、调用次数，配合进度条排序。
-          - 本区块回答「烧在哪些模型上」：模型维度的拆分，且可按账号收窄到一个号。
-        两者是**不同粒度**而非重复：卡片上没有模型维度（14 个号 × N 个模型全塞进
-        卡片会把卡片撑爆），而模型维度又必须能落到单个账号上 —— 否则看到
-        「glm-5.2 用了 4 万」也无法知道是哪个号烧的。
+        为什么做成「点了才出现」而不是常驻一块：所有者要求新版默认与旧版一样
+        （原话「默认跟旧版的一样」）。常驻一块就等于改变了默认观感；点了才出现，
+        未点选时页面与旧版逐字一致。
 
-        因此这里刻意**不**再列一遍「按账号」的 Token 总量（那是卡片的活），
-        默认展示「按模型」；选中某个账号后换成该账号的模型明细。
-        每日用量是趋势、与账号无关，故新旧两版都保留。
+        为什么放在「Token 用量」**下方**而不是账号池旁边：点卡片时视线在账号池，
+        但明细内容比卡片宽（模型名 + 长度量），塞进卡片会把卡片撑爆；紧跟在
+        整块用量区块之后，用户顺着往下看就能找到，且不会打断默认布局。
       */}
-      {layout === "merged" ? (
-        <Section
-          title="Token 用量"
-          description="经网关成功请求的上游用量，按模型聚合（可按账号筛选到单个账号的模型明细）"
-        >
-          <Row>
-            <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                <span className="text-[13px]">按账号筛选</span>
-                {usageUpdatedAt ? (
-                  <span
-                    className="text-[11px] tabular-nums text-muted-foreground"
-                    title={`上次更新：${new Date(usageUpdatedAt).toLocaleString("zh-CN")}`}
-                  >
-                    上次更新 {formatRelativeTime(nowTick - usageUpdatedAt)}
-                    {usageLoading ? " · 更新中…" : ""}
-                  </span>
-                ) : null}
-              </div>
-              <div className="mt-0.5 text-[11px] tabular-nums text-muted-foreground">
-                {usageSummary
-                  ? `${usageRangeLabel}共 ${exactTokenFormatter.format(usageSummary.records)} 次调用 · 合计 ${exactTokenFormatter.format(usageSummary.total)} tokens`
-                  : "等待网关数据"}
-              </div>
-            </div>
-            <div className="flex shrink-0 items-center gap-1.5">
-              {/* 日期筛选在账号池顶部；这里只显示当前值，避免同一状态出现两个控件
-                  （改一个另一个也跟着变，看起来像两套互不同步的筛选）。 */}
-              {!usageBlockShowsRange ? (
-                <span className="text-[11px] text-muted-foreground">
-                  统计范围：{usageRangeLabel}
-                </span>
-              ) : null}
-              <Select
-                value={usageAccountFilter || NONE_VALUE}
-                onValueChange={(v) => setUsageAccountFilter(v === NONE_VALUE ? "" : v)}
-              >
-                <SelectTrigger
-                  size="sm"
-                  className="w-52 shrink-0"
-                  aria-label="按账号筛选用量"
-                  // data-slot 是本项目的既有约定（shadcn 用它标记部件身份，
-                  // 既有用例也按 [data-slot="checkbox"] 取元素），故不另造
-                  // data-testid 这类只服务于测试的属性。
-                  data-slot="usage-account-filter"
-                >
-                  <SelectValue placeholder="（全部账号）" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value={NONE_VALUE}>（全部账号）</SelectItem>
-                  {/* 选项取自**账号池**而非用量分组：池里有但该范围零消耗的账号
-                      也必须能选中 —— 否则用户想确认「这个号是不是真没用量」时
-                      在列表里根本找不到它，会误以为账号丢了。 */}
-                  {poolAccounts.map((account) => (
-                    <SelectItem key={account.uid} value={account.uid}>
-                      {account.nickname || account.uid.slice(0, 8)}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {usageBlockShowsRange ? (
-                <>
-                  {USAGE_RANGE_OPTIONS.map((option) => (
-                    <Button
-                      key={option.key}
-                      variant={usageRange === option.key ? "default" : "outline"}
-                      size="sm"
-                      className="h-7 px-2 text-xs"
-                      onClick={() => setUsageRange(option.key)}
-                    >
-                      {option.label}
-                    </Button>
-                  ))}
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="size-7"
-                    onClick={() => setUsageNonce((value) => value + 1)}
-                    disabled={usageLoading}
-                    aria-label="刷新用量"
-                  >
-                    <RefreshCw className={cn("size-3.5", usageLoading && "animate-spin")} />
-                  </Button>
-                </>
-              ) : null}
-            </div>
-          </Row>
-
-          {(() => {
-            const unavailable = usageUnavailableText({ usageLoading, snapshot: usageSnapshot, running, usage });
-            if (unavailable) return <UsagePlaceholder text={unavailable} />;
-            if (!usageSummary) {
-              return <UsagePlaceholder text={`无法读取网关用量${usage?.error ? `：${usage.error}` : ""}`} />;
-            }
-            return (
-              <>
-                <div className="mx-4 grid grid-cols-2 gap-2 py-3 sm:mx-5 sm:grid-cols-4">
-                  <Stat
-                    label="总 Token"
-                    value={formatUsageCompact(usageSummary.total)}
-                    hint={exactTokenFormatter.format(usageSummary.total)}
-                  />
-                  <Stat
-                    label="输入"
-                    value={formatUsageCompact(usageSummary.input)}
-                    hint={
-                      usageSummary.cacheHitRate != null
-                        ? `缓存命中率 ${(usageSummary.cacheHitRate * 100).toFixed(1)}%`
-                        : "无缓存读取数据"
-                    }
-                  />
-                  <Stat
-                    label="输出"
-                    value={formatUsageCompact(usageSummary.output)}
-                    hint={`缓存写入 ${formatUsageCompact(usageSummary.cacheWrite)}`}
-                  />
-                  <Stat
-                    label="调用次数"
-                    value={exactTokenFormatter.format(usageSummary.records)}
-                    hint="成功请求"
-                  />
-                </div>
-
-                <div className="border-t border-border/50 pb-2 pt-3">
-                  <div className="px-4 text-[12px] font-medium text-muted-foreground sm:px-5">
-                    {usageAccountFilter ? "该账号的模型明细" : "按模型"}
-                    {usageAccountFilter && filteredAccountUsage ? (
-                      <span className="ml-1.5 font-normal text-muted-foreground/70">
-                        {usageNickname.get(usageAccountFilter) ?? usageAccountFilter.slice(0, 8)}
-                        {" · "}
-                        {exactTokenFormatter.format(filteredAccountUsage.records)} 次调用 ·{" "}
-                        {exactTokenFormatter.format(filteredAccountUsage.total)} tokens
-                      </span>
-                    ) : !usageAccountFilter && usageModels.length > 0 ? (
-                      <span className="ml-1.5 font-normal text-muted-foreground/70">
-                        共 {usageModels.length} 个
-                      </span>
-                    ) : null}
-                  </div>
-                  <div className="mt-1 max-h-72 overflow-y-auto">
-                    {usageAccountFilter && filteredAccountModels === null ? (
-                      // 网关没返回 accountModels（旧版网关）：说清楚是「拿不到明细」，
-                      // 而不是让用户对着空列表猜「这个号是不是没用量」。
-                      <div className="px-4 py-2 text-xs text-muted-foreground sm:px-5">
-                        当前网关未提供「账号 × 模型」明细，请更新网关后重试
-                      </div>
-                    ) : (usageAccountFilter ? (filteredAccountModels ?? []) : usageModels).length > 0 ? (
-                      (usageAccountFilter ? (filteredAccountModels ?? []) : usageModels).map((model) => (
-                        <UsageBarRow
-                          key={model.key}
-                          label={model.key}
-                          value={model.total}
-                          max={usageAccountFilter ? filteredAccountMaxModel : usageMaxModel}
-                          meta={`${exactTokenFormatter.format(model.records)} 次调用 · 输入 ${formatUsageCompact(model.input)} / 输出 ${formatUsageCompact(model.output)}`}
-                        />
-                      ))
-                    ) : (
-                      <div className="px-4 py-2 text-xs text-muted-foreground sm:px-5">
-                        {usageAccountFilter
-                          ? "该账号在此范围内没有 Token 消耗（调用可能都失败了，或还没被网关统计到）"
-                          : "该范围内暂无数据"}
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                {usageDaily.length > 0 ? (
-                  <div className="border-t border-border/50 px-4 pb-3 pt-3 sm:px-5">
-                    <div className="text-[12px] font-medium text-muted-foreground">
-                      每日用量
-                      <span className="ml-1.5 font-normal text-muted-foreground/70">
-                        全部账号合计
-                      </span>
-                    </div>
-                    <div className="mt-2 flex h-16 items-end gap-1">
-                      {usageDaily.slice(-30).map((day) => (
-                        <div
-                          key={day.key}
-                          className="flex h-full flex-1 items-end"
-                          title={`${day.key} · ${exactTokenFormatter.format(day.total)} tokens · ${day.records} 次调用`}
-                        >
-                          <div
-                            className="w-full rounded-t-[3px] bg-primary/60 transition-colors hover:bg-primary"
-                            style={{ height: `${Math.max(4, Math.round((day.total / usageMaxDaily) * 100))}%` }}
-                          />
-                        </div>
-                      ))}
-                    </div>
-                    <div className="mt-1 flex justify-between text-[10px] text-muted-foreground">
-                      <span>{usageDaily[Math.max(0, usageDaily.length - 30)]?.key}</span>
-                      <span>{usageDaily[usageDaily.length - 1]?.key}</span>
-                    </div>
-                  </div>
-                ) : null}
-              </>
-            );
-          })()}
-        </Section>
+      {layout === "merged" && selectedPoolAccount ? (
+        <AccountModelDetail
+          uid={selectedPoolAccount.uid}
+          nickname={selectedPoolAccount.nickname || selectedPoolAccount.uid}
+          models={selectedPoolModels}
+          total={selectedPoolUsage?.total ?? 0}
+          records={selectedPoolUsage?.records ?? 0}
+          rangeLabel={usageRangeLabel}
+          creditUsed={creditUsedByUid.get(selectedPoolAccount.uid) ?? 0}
+          credits={selectedPoolAccount.credits}
+          modelFilter={modelFilter}
+          onClose={() => setSelectedPoolUid("")}
+        />
       ) : null}
 
       <Section title="客户端接入" description="把网关接入本机已安装的 AI 客户端，或按标准环境变量接入">
