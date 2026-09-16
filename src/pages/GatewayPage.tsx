@@ -6,6 +6,7 @@ import {
   Bot,
   CheckCircle2,
   Copy,
+  Globe,
   LayoutGrid,
   Loader2,
   Play,
@@ -43,8 +44,12 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
+import { useAccountsStore } from "@/stores/accounts";
 import { useVisibilityInterval } from "@/lib/use-visibility-interval";
 import type {
+  AccountMeta,
+  CreditExpiry,
+  CreditResource,
   CreditStatistics,
   GatewayConfig,
   GatewayMode,
@@ -52,6 +57,7 @@ import type {
   GatewayPortCheck,
   GatewayPortHolder,
   GatewayStatus,
+  GatewayStatusAccount,
   GatewayUsageGroup,
   GatewayUsageResult,
 } from "@/lib/types";
@@ -253,6 +259,66 @@ function formatUntil(iso?: string): string | null {
 }
 
 /**
+ * 积分格式化：与账号管理页卡片逐字一致的输出（最多两位小数 + 千分位）。
+ *
+ * 刻意不 import 账号卡片的同名函数：那个文件正在被并行修改，
+ * 跨文件引用会把两处改动耦合成一个编译单元；而「显示成什么样」必须一致，
+ * 因此这里保持同一实现而不是各写各的。
+ */
+const creditFormatter = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
+
+/** 积分的到期时间：`09/15 到期`；无到期时间 = 长期有效（与账号卡片同口径）。 */
+function formatCreditExpiry(ts: number | null | undefined): string {
+  if (!ts) return "长期有效";
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return "长期有效";
+  return `${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")} 到期`;
+}
+
+/**
+ * 只给日期的短格式（`09/15`）。
+ *
+ * 为什么与上面那个并存：勾选列表的指标行已经有「到期」这个列标签，
+ * 再用带后缀的版本会渲染成「到期 10/16 到期」—— 一句话里两个「到期」，
+ * 既啰嗦又容易读成两件事。
+ */
+function formatShortDate(ts: number | null | undefined): string {
+  if (!ts) return "长期有效";
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return "长期有效";
+  return `${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")}`;
+}
+
+/** 还有剩余的资源包，按到期时间升序（已用完的隐藏、同到期日按原序）—— 与账号卡片同一排序口径。 */
+function usableResources(credit?: CreditExpiry): CreditResource[] {
+  return (credit?.resources ?? [])
+    .filter((resource) => resource.remaining > 0)
+    .map((resource, index) => ({ resource, index }))
+    .sort((left, right) => {
+      const leftExpiry = left.resource.expireAt ?? Number.POSITIVE_INFINITY;
+      const rightExpiry = right.resource.expireAt ?? Number.POSITIVE_INFINITY;
+      return leftExpiry === rightExpiry ? left.index - right.index : leftExpiry - rightExpiry;
+    })
+    .map(({ resource }) => resource);
+}
+
+/**
+ * Token 到期时间：`09/15` 短格式，已过期标红。
+ *
+ * 用短格式是因为它要与「积分 / 到期 / 资源包」挤在同一行指标里；
+ * 精确时刻放 tooltip。这里查的是**登录 Token** 的到期（`AccountMeta.expiresAt`），
+ * 与上面那个「积分到期」不是一回事 —— 前者决定这个号还能不能被网关调用，
+ * 后者只决定额度什么时候作废，混在一列里会让人误判。
+ */
+function formatTokenExpiry(expiresAt: number | null | undefined): string {
+  if (typeof expiresAt !== "number" || expiresAt <= 0) return "未知";
+  const date = new Date(expiresAt);
+  if (Number.isNaN(date.getTime())) return "未知";
+  const text = `${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")}`;
+  return date.getTime() < Date.now() ? `${text} 已过期` : text;
+}
+
+/**
  * 冷却原因说明：区分「账号级（余额欠费）」与「模型级（单一模型限流）」。
  *
  * 这两种状态此前在界面上都只显示"冷却中"，用户无法判断是该充值还是换个模型就好。
@@ -313,6 +379,8 @@ function PoolAccountRow({
   const modelCools = acc.model_cooling ?? [];
   const usageToken = usage?.total ?? 0;
   const usageRecords = usage?.records ?? 0;
+  /** 该账号此刻正在处理的请求数（网关运行态，不持久化）。 */
+  const inFlight = acc.in_flight ?? 0;
   // 状态标签的优先级：禁用 > 账号级冷却 > 排队 > 健康。
   //
   // 「排队」单独作为一档，因为它最容易让人误判：账号本身完全健康、积分充足，
@@ -335,12 +403,28 @@ function PoolAccountRow({
     // 原因：此前是无边框的行，靠 border-b 分隔；分两列后在列与列之间没有视觉边界，
     // 且行高随冷却内容参差（有模型冷却的行高一倍），整体看起来像未对齐的拼贴。
     // 独立卡片 + 栅格 auto-rows-fr 后，同排卡片等高、边界清晰。
-    <div className={cn("flex min-w-0 flex-col rounded-xl border p-3", acc.queued && !acc.cooling && !acc.disabled ? "border-dashed border-border/60 bg-muted/20" : "border-border/60 bg-card/40")}>
+    //
+    // 在途（in_flight>0）时整张卡片加一圈高亮描边：所有者要回答的是
+    // 「现在这个请求被分给哪个账号了」，这是**转瞬即逝**的运行态 ——
+    // 藏在数字格里的话，等视线扫到那一格时请求早就结束了。
+    <div className={cn("flex min-w-0 flex-col rounded-xl border p-3 transition-colors", acc.queued && !acc.cooling && !acc.disabled ? "border-dashed border-border/60 bg-muted/20" : "border-border/60 bg-card/40", showUsage && inFlight > 0 && "border-sky-500/50 bg-sky-500/[0.04] ring-1 ring-sky-500/25")}>
       <div className="flex min-w-0 items-start gap-3">
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-medium">{acc.nickname || acc.uid}</div>
           <div className="truncate font-mono text-[11px] text-muted-foreground/80">{acc.uid}</div>
         </div>
+        {/* 在途标记排在状态标签之前：它是「此刻正在用这个号」的唯一直接证据，
+            比健康/冷却这类稳态描述更需要一眼看到。
+            仅新版布局展示：旧版布局的观感必须保持不变（所有者明确要求）。 */}
+        {showUsage && inFlight > 0 ? (
+          <span
+            className="flex shrink-0 items-center gap-1 rounded-md bg-sky-500/15 px-1.5 py-0.5 text-[11px] font-medium text-sky-700 dark:text-sky-300"
+            title={`该账号正在处理 ${inFlight} 个请求（网关实时在途数，请求结束即归零）`}
+          >
+            <Activity className="size-3" aria-hidden="true" />
+            在途 {inFlight}
+          </span>
+        ) : null}
         <span
           className={cn("shrink-0 rounded-md px-1.5 py-0.5 text-[11px] font-medium", state.cls)}
           title={acc.queued && !acc.cooling && !acc.disabled ? queuedReasonText(acc) : coolReasonText(acc)}
@@ -462,6 +546,142 @@ function PoolAccountRow({
   );
 }
 
+/**
+ * 手动模式勾选列表里的一行账号。
+ *
+ * 两行式布局的取舍：所有者要求「积分 / 是否国际版 / 到期时间 / 资源包」都要
+ * **直接看到**（明确否掉了藏在悬浮里），四项信息塞进原来的一行必然换行错乱。
+ * 因此改成「第一行 = 勾选框 + 账号名 + 状态标记」「第二行 = 四个指标」，
+ * 行高固定两行、指标用等宽数字右对齐，账号再多也是整齐的一列，不会参差。
+ *
+ * 指标一律「取不到就显示 —」而不是隐藏：同一列里有的行少一项时，
+ * 剩下的项会错位到别的列上，看起来像数据串了。
+ */
+function ManualAccountOption({
+  account,
+  checked,
+  onToggle,
+  meta,
+  credit,
+  creditLoading,
+}: {
+  account: GatewayStatusAccount;
+  checked: boolean;
+  onToggle: () => void;
+  /** 账号库元信息（区域 / Token 到期）—— 网关 /status 不提供这些。 */
+  meta?: AccountMeta;
+  /** 逐账号积分（与账号管理页卡片同源：`POST /api/credits`）。 */
+  credit?: CreditExpiry;
+  creditLoading?: boolean;
+}) {
+  const name = account.nickname || account.uid.slice(0, 8);
+  const isIntl = meta?.regionKey === "intl";
+  const resources = usableResources(credit);
+  // 积分只认账号卡片那一份 `totalRemaining`（`POST /api/credits`）——
+  // 刻意不拿网关 `/status` 的 `credits` 做兜底：那是网关启动/巡检时写入的
+  // 快照值，与账号页的实时查询**不是同一个时刻**，两者混用会让同一个号
+  // 在两页显示不同余额。宁可显示「—」也不显示一个口径不同的数。
+  const remaining = credit?.ok ? credit.totalRemaining : undefined;
+  const balanceText = typeof remaining === "number" ? creditFormatter.format(remaining) : "—";
+  // 最近到期的资源包：与账号卡片一样只取最快过期的那个，其余进 tooltip。
+  const soonest = resources[0];
+  const expiringText = soonest ? formatShortDate(soonest.expireAt) : "—";
+  const resourcesText = credit?.ok ? `${resources.length} 个积分包` : "—";
+  const detailTitle = [
+    `积分 ${balanceText}`,
+    credit?.ok ? `资源包 ${resources.length} 个` : "资源包未知",
+    ...resources.slice(0, 6).map((r) => {
+      const pkg = r.packageName || r.packageCode || "积分包";
+      return `${pkg}：${creditFormatter.format(r.remaining)}（${formatCreditExpiry(r.expireAt)}）`;
+    }),
+    meta?.expiresAt
+      ? `Token 到期 ${new Date(meta.expiresAt).toLocaleString("zh-CN")}`
+      : "Token 到期未知",
+    meta?.region ? `区域 ${meta.region}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return (
+    <label
+      className={cn(
+        "flex min-w-0 cursor-pointer flex-col gap-1 border-b border-border/50 px-3 py-2 last:border-b-0 hover:bg-accent/50",
+        checked && "bg-accent/30",
+      )}
+    >
+      <span className="flex min-w-0 items-center gap-2.5">
+        <Checkbox
+          checked={checked}
+          onCheckedChange={onToggle}
+          aria-label={`选择账号 ${name}`}
+        />
+        <span className="min-w-0 flex-1 truncate text-xs font-medium">{name}</span>
+        {/* 国际版用文字标签而不是纯图标：所有者要的是「是否国际版」可读，
+            图标需要先学会才能认，等于没说。
+            元信息还没加载出来时显示「—」而**不是**默认成「国服」——
+            区域是从登录域名推导的（`account_meta`），拿不到就无从判断，
+            把它写成「国服」是在断言一件没验证过的事，国际版账号会被标错。 */}
+        {!meta ? (
+          <Badge
+            variant="secondary"
+            className="h-4 shrink-0 px-1 text-[10px] text-muted-foreground/60"
+            title="账号元信息尚未加载，暂时无法判断区域"
+          >
+            —
+          </Badge>
+        ) : isIntl ? (
+          <Badge
+            variant="outline"
+            className="h-4 shrink-0 gap-1 border-sky-500/30 bg-sky-500/10 px-1 text-[10px] text-sky-700"
+            title={`国际版账号（${meta.region ?? "workbuddy.ai"}）`}
+          >
+            <Globe className="size-3" aria-hidden="true" />
+            国际版
+          </Badge>
+        ) : (
+          <Badge
+            variant="secondary"
+            className="h-4 shrink-0 px-1 text-[10px] text-muted-foreground"
+            title={`国服账号（${meta.region ?? "copilot.tencent.com"}）`}
+          >
+            国服
+          </Badge>
+        )}
+        {account.needsRelogin ? (
+          <Badge variant="outline" className="h-4 shrink-0 px-1 text-[10px] text-destructive">
+            需重新登录
+          </Badge>
+        ) : null}
+      </span>
+      {/* 指标行：4 项等宽网格。用 grid 而不是 flex-wrap —— 换行会让
+          「到期」跑到「资源包」下面，同一屏里两行的列位就对不齐了。 */}
+      <span
+        className="grid min-w-0 grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.3fr)] items-baseline gap-x-3 pl-[26px] text-[11px] tabular-nums"
+        title={detailTitle}
+      >
+        <span className="min-w-0 truncate">
+          <span className="text-muted-foreground/70">积分 </span>
+          <span className={cn("font-medium", creditLoading && "text-muted-foreground/60")}>
+            {creditLoading && !credit ? "…" : balanceText}
+          </span>
+        </span>
+        <span className="min-w-0 truncate text-muted-foreground">
+          <span className="text-muted-foreground/70">到期 </span>
+          {expiringText}
+        </span>
+        <span className="min-w-0 truncate text-muted-foreground">
+          <span className="text-muted-foreground/70">资源包 </span>
+          {resourcesText}
+        </span>
+        <span className="min-w-0 truncate text-muted-foreground">
+          <span className="text-muted-foreground/70">Token </span>
+          {formatTokenExpiry(meta?.expiresAt)}
+        </span>
+      </span>
+    </label>
+  );
+}
+
 export default function GatewayPage() {
   const [status, setStatus] = useState<GatewayStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -567,6 +787,88 @@ export default function GatewayPage() {
       cancelled = true;
     };
   }, []);
+
+  /**
+   * 账号元信息与逐账号积分，直接复用账号管理页那个 store。
+   *
+   * 为什么必须复用而不是在本页另拉一份：账号卡片（`account-card.tsx`）展示的
+   * 「剩余积分 / N 个积分包 / 到期时间」全部来自这里的 `creditMap`，其数据源是
+   * `POST /api/credits`（`credits.rs::get_credit_expiry`）。本页若自己算积分，
+   * 就会出现「同一个号在两页显示不同余额」这种最不可解释的偏差 ——
+   * 而积分又是选号分层与轮转的判据，两套口径会直接误导用户。
+   *
+   * 这里只读 store，不新增请求路径；`ensureCredits` 本身会跳过已缓存的账号。
+   */
+  const storeAccounts = useAccountsStore((s) => s.accounts);
+  const creditMap = useAccountsStore((s) => s.creditMap);
+  const creditLoadingMap = useAccountsStore((s) => s.creditLoadingMap);
+  const ensureCredits = useAccountsStore((s) => s.ensureCredits);
+  const fetchAllAccounts = useAccountsStore((s) => s.fetchAll);
+
+  // 直接打开网关页（未经过账号页）时 store 还是空的：补一次加载。
+  // 依赖里只有长度与 store 的稳定 action，因此账号库确实为空时也只会跑一次，
+  // 不会变成轮询。
+  useEffect(() => {
+    if (storeAccounts.length === 0) void fetchAllAccounts();
+  }, [storeAccounts.length, fetchAllAccounts]);
+
+  useEffect(() => {
+    if (storeAccounts.length === 0) return;
+    void ensureCredits(storeAccounts.map((account) => account.id));
+  }, [storeAccounts, ensureCredits]);
+
+  /**
+   * 网关池 uid → 账号库元信息。
+   *
+   * 两个 id 空间必须显式换算，不能想当然认为相等：
+   *  - 网关池的 uid = 账号库的 `uid`（`gateway.rs::build_auth_doc` 用 uid 命名
+   *    凭证文件 `workbuddy-{uid}.json`，Go 侧池也按 `Auth.UID` 建索引）
+   *  - 积分快照 / `/api/credits/stats` 的 `accountId` = 账号库的 `id`
+   *    （`credits.rs` 里 `account.get("id")` 落快照，实测本机 26 个快照账号
+   *    全部命中 `accounts[].id`、0 个命中 `uid`）
+   * 二者是不同的 uuid，混用会让所有按账号的查询静默返回空。
+   */
+  const accountByUid = useMemo(() => {
+    const map = new Map<string, AccountMeta>();
+    for (const account of storeAccounts) {
+      if (account.uid) map.set(account.uid, account);
+    }
+    return map;
+  }, [storeAccounts]);
+
+  /** 账号库 id → uid（把积分快照的 id 口径换算回网关池的 uid 口径）。 */
+  const uidByAccountId = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const account of storeAccounts) {
+      if (account.uid) map.set(account.id, account.uid);
+    }
+    return map;
+  }, [storeAccounts]);
+
+  /**
+   * 网关池 uid → 该账号的积分明细 / 加载态。
+   *
+   * 单独做一层 uid 索引而不是在渲染里链式查两次：列表每行都要用，
+   * 放在渲染函数里会变成 N 次 Map 构造，账号一多就是每帧的固定开销。
+   */
+  const creditByUid = useMemo(() => {
+    const map = new Map<string, CreditExpiry>();
+    for (const account of storeAccounts) {
+      if (!account.uid) continue;
+      const credit = creditMap[account.id];
+      if (credit) map.set(account.uid, credit);
+    }
+    return map;
+  }, [storeAccounts, creditMap]);
+
+  const creditLoadingByUid = useMemo(() => {
+    const map = new Map<string, boolean>();
+    for (const account of storeAccounts) {
+      if (!account.uid) continue;
+      map.set(account.uid, Boolean(creditLoadingMap[account.id]));
+    }
+    return map;
+  }, [storeAccounts, creditLoadingMap]);
 
   /**
    * 端口 / API Key 是否存在「已编辑但未保存」的内容。
@@ -976,7 +1278,7 @@ export default function GatewayPage() {
   );
 
   /**
-   * uid → 该账号在所选范围内的**积分消耗**。
+   * 网关池 uid → 该账号在所选范围内的**积分消耗**。
    *
    * 后端的 `/api/credits/stats` 直接给了三个时间窗（usageToday / usage7Days /
    * usageThisMonth），与本页的日期筛选一一对应，因此这里按当前筛选取值即可，
@@ -984,10 +1286,17 @@ export default function GatewayPage() {
    *
    * 注意「全部」没有对应字段：积分快照本身只保留 30 天（retentionDays），
    * 取 usageThisMonth 会低估，故「全部」不显示消耗（用 0 表示无数据）。
+   *
+   * 键必须换算成 uid：统计接口按账号库 `id` 分组，而卡片查的是池 `uid`。
+   * 此前直接 `map.set(a.accountId, ...)` 再按 uid 查，两个 uuid 空间对不上，
+   * 于是「消耗积分」恒为 0 —— 表现为整列都是「—」，看起来像「这些号都没消耗」，
+   * 而实际是查错了键。账号库尚未加载时映射为空，同样退化为不显示（而非显示 0）。
    */
   const creditUsedByUid = useMemo(() => {
     const map = new Map<string, number>();
     for (const a of creditStats?.accounts ?? []) {
+      const uid = uidByAccountId.get(a.accountId);
+      if (!uid) continue;
       const used =
         usageRange === "today"
           ? a.usageToday
@@ -996,10 +1305,10 @@ export default function GatewayPage() {
             : usageRange === "30d"
               ? a.usageThisMonth
               : 0; // 「全部」：快照只留 30 天，给不出可信值，故不显示
-      map.set(a.accountId, used ?? 0);
+      map.set(uid, used ?? 0);
     }
     return map;
-  }, [creditStats, usageRange]);
+  }, [creditStats, usageRange, uidByAccountId]);
 
   /** 当前日期筛选的中文名，用于卡片列头的 tooltip。 */
   const usageRangeLabel = USAGE_RANGE_OPTIONS.find((o) => o.key === usageRange)?.label ?? "统计范围";
@@ -1298,32 +1607,17 @@ export default function GatewayPage() {
               </div>
             ) : (
               <div className="max-h-56 min-w-0 overflow-y-auto rounded-lg border">
-                {availableAccounts.map((a) => {
-                  const checked = manualUids.includes(a.uid);
-                  return (
-                    <label
-                      key={a.uid}
-                      className={cn(
-                        "flex min-w-0 cursor-pointer items-center gap-2.5 border-b border-border/50 px-3 py-2 last:border-b-0 hover:bg-accent/50",
-                        checked && "bg-accent/30",
-                      )}
-                    >
-                      <Checkbox
-                        checked={checked}
-                        onCheckedChange={() => void toggleManualUid(a.uid)}
-                        aria-label={`选择账号 ${a.nickname || a.uid.slice(0, 8)}`}
-                      />
-                      <span className="min-w-0 flex-1 truncate text-xs">
-                        {a.nickname || a.uid.slice(0, 8)}
-                      </span>
-                      {a.needsRelogin ? (
-                        <Badge variant="outline" className="h-4 shrink-0 px-1 text-[10px] text-destructive">
-                          需重新登录
-                        </Badge>
-                      ) : null}
-                    </label>
-                  );
-                })}
+                {availableAccounts.map((a) => (
+                  <ManualAccountOption
+                    key={a.uid}
+                    account={a}
+                    checked={manualUids.includes(a.uid)}
+                    onToggle={() => void toggleManualUid(a.uid)}
+                    meta={accountByUid.get(a.uid)}
+                    credit={creditByUid.get(a.uid)}
+                    creditLoading={creditLoadingByUid.get(a.uid)}
+                  />
+                ))}
               </div>
             )}
             {manualUids.length === 0 ? (
