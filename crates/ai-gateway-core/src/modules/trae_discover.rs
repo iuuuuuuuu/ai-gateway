@@ -100,9 +100,18 @@ struct UidEvidence {
     count: i64,
 }
 
-/// 是否为 15~16 位纯数字 uid。
+/// 是否为合法 uid 形态的纯数字串（Cloud-IDE id 空间）。
+///
+/// 长度窗口是 **15~19 位**，不是更窄的范围：实测同一台机器上同时存在
+/// - 16 位（`icube_gtm.users` 键名、Cloud-IDE JWT `data.id`，如 `1883919207380040`）
+/// - 19 位（`solo.mobile.allowControl` 的 uid 键，如 `7679751654497928200`）
+///
+/// 早期只认 15~16 位，导致 19 位的账号在发现阶段被**静默丢弃**
+/// （`solo.mobile.allowControl` 正是最强证据来源，丢掉它等于漏掉整个账号）。
+/// 上限取 19 位：账号中心（dc）uid 同样是长数字串，靠长度区分不可靠，
+/// 因此这里只做「形态像 uid」的判断，跨体系去重由 [`discover_all`] 的证据排序负责。
 fn is_uid_token(token: &str) -> bool {
-    (15..=16).contains(&token.chars().count()) && token.chars().all(|c| c.is_ascii_digit())
+    (15..=19).contains(&token.chars().count()) && token.chars().all(|c| c.is_ascii_digit())
 }
 
 /// 把 `YYYY-MM` 转为近似时间戳（当月 1 日 0 点，毫秒），用于与毫秒时间戳同维度比较。
@@ -132,29 +141,39 @@ fn month_to_ts_ms(month: &str) -> i64 {
 /// - `*:user:<uid>[:YYYY-MM]`（如 `commercial-banner-popup:...:user:<uid>:2026-09`）
 fn vscdb_uid_evidence(app_kind: &str) -> HashMap<String, UidEvidence> {
     let mut out: HashMap<String, UidEvidence> = HashMap::new();
-    let Some(db_path) = app_data_dirs(app_kind)
+    // **必须遍历全部候选目录**，不能取第一个存在的就收工：客户端改名后
+    // （`TRAE SOLO` → `TRAE SOLO CN`）两个目录会**同时留在磁盘上**，各自存着
+    // 不同账号的使用痕迹。只读第一个会让另一个目录里的账号在发现阶段整体消失
+    // —— 实测本机 `TRAE SOLO CN` 有 16 位 uid、`TRAE SOLO` 有 19 位 uid，
+    // 早期实现只发现前者。
+    for db_path in app_data_dirs(app_kind)
         .into_iter()
         .map(|d| d.join(VSCDB_SUFFIX))
-        .find(|p| p.is_file())
-    else {
-        return out;
-    };
+        .filter(|p| p.is_file())
+    {
+        merge_vscdb_into(&mut out, &db_path);
+    }
+    out
+}
+
+/// 把单个 `state.vscdb` 的证据并入 `out`（同一 uid 取时间最大值、计数累加）。
+fn merge_vscdb_into(out: &mut HashMap<String, UidEvidence>, db_path: &std::path::Path) {
     // 只读打开：客户端可能正在运行并持有写锁
     let Ok(conn) = rusqlite::Connection::open_with_flags(
-        &db_path,
+        db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ) else {
-        return out;
+        return;
     };
     let Ok(mut stmt) = conn.prepare("SELECT key, value FROM ItemTable") else {
-        return out;
+        return;
     };
     let Ok(rows) = stmt.query_map([], |row| {
         let key: String = row.get(0)?;
         let value: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
         Ok((key, value))
     }) else {
-        return out;
+        return;
     };
 
     for (key, value) in rows.flatten() {
@@ -203,7 +222,6 @@ fn vscdb_uid_evidence(app_kind: &str) -> HashMap<String, UidEvidence> {
             }
         }
     }
-    out
 }
 
 /// 从 `storage.json` 的 `icube_gtm.users` 键名提取 Cloud-IDE uid（Trae CN 专用证据）。
@@ -275,6 +293,30 @@ pub fn read_entitlement(app_kind: &str) -> Option<Value> {
     }))
 }
 
+/// 合并全部候选目录的 `icube_gtm.users` 证据。
+///
+/// 与 [`vscdb_uid_evidence`] 同理：改名后的两个目录会并存且可能各自记录了
+/// 不同账号，只看第一个会把另一个目录的账号漏掉。
+fn gtm_users_evidence_all(app_kind: &str) -> HashMap<String, UidEvidence> {
+    let mut out: HashMap<String, UidEvidence> = HashMap::new();
+    for dir in app_data_dirs(app_kind) {
+        let path = dir.join(STORAGE_SUFFIX);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(storage) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}'))
+        else {
+            continue;
+        };
+        for (uid, ev) in gtm_users_evidence(&storage) {
+            let entry = out.entry(uid).or_default();
+            entry.latest_ts_ms = entry.latest_ts_ms.max(ev.latest_ts_ms);
+            entry.count += ev.count;
+        }
+    }
+    out
+}
+
 /// 发现指定应用的本机登录账号。
 pub fn discover_app(app_kind: &'static str, pool_uids: &[String]) -> Vec<DiscoveredAccount> {
     let mut results = Vec::new();
@@ -290,14 +332,12 @@ pub fn discover_app(app_kind: &'static str, pool_uids: &[String]) -> Vec<Discove
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    // 合并两路证据
+    // 合并两路证据（各自都已跨全部候选目录）
     let mut evidence: HashMap<String, UidEvidence> = vscdb_uid_evidence(app_kind);
-    if let Some(storage) = storage.as_ref() {
-        for (uid, ev) in gtm_users_evidence(storage) {
-            let entry = evidence.entry(uid).or_default();
-            entry.latest_ts_ms = entry.latest_ts_ms.max(ev.latest_ts_ms);
-            entry.count += ev.count;
-        }
+    for (uid, ev) in gtm_users_evidence_all(app_kind) {
+        let entry = evidence.entry(uid).or_default();
+        entry.latest_ts_ms = entry.latest_ts_ms.max(ev.latest_ts_ms);
+        entry.count += ev.count;
     }
 
     if evidence.is_empty() {
@@ -422,14 +462,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uid_token_判定_15_或_16_位纯数字() {
-        assert!(is_uid_token("2328112497170937"));
-        assert!(is_uid_token("123456789012345"));
-        assert!(is_uid_token("1234567890123456"));
+    fn uid_token_判定_15_到_19_位纯数字() {
+        assert!(is_uid_token("2328112497170937"), "16 位（JWT data.id / gtm 键名）");
+        assert!(is_uid_token("1883919207380040"), "16 位实测样本");
+        assert!(is_uid_token("123456789012345"), "15 位");
+        assert!(is_uid_token("12345678901234567"), "17 位");
+        assert!(is_uid_token("123456789012345678"), "18 位");
+        assert!(
+            is_uid_token("7679751654497928200"),
+            "19 位（solo.mobile.allowControl 实测样本）—— 早期只认 15~16 位时这个账号会被漏掉"
+        );
         assert!(!is_uid_token("12345678901234"), "14 位不是 uid");
-        assert!(!is_uid_token("12345678901234567"), "17 位不是 uid");
+        assert!(!is_uid_token("12345678901234567890"), "20 位超出上限");
         assert!(!is_uid_token("12345678901234a"));
         assert!(!is_uid_token(""));
+    }
+
+    #[test]
+    fn 十九位_uid_的证据能被收集() {
+        // 回归：solo.mobile.allowControl 里 19 位 uid 必须能进入证据表，
+        // 否则「本机发现账号」会整条漏掉该账号。
+        let storage = json!({
+            "icube_gtm.users": {
+                "7679751654497928200": {"updatedTime": 1788081577344i64},
+            }
+        });
+        let evidence = gtm_users_evidence(&storage);
+        assert!(
+            evidence.contains_key("7679751654497928200"),
+            "19 位 uid 必须被 gtm 证据收集，实际: {evidence:?}"
+        );
+        assert_eq!(evidence["7679751654497928200"].latest_ts_ms, 1788081577344);
     }
 
     #[test]
@@ -499,6 +562,49 @@ mod tests {
         assert_eq!(app_label("TraeWork"), "Trae Work");
         assert_eq!(app_label("Trae"), "Trae");
         assert_eq!(app_label("other"), "other");
+    }
+
+    #[test]
+    fn gtm_证据跨全部候选目录合并() {
+        // 回归：客户端改名后 `TRAE SOLO` 与 `TRAE SOLO CN` 会**并存**，
+        // 各自可能记录不同账号。只读第一个目录会让另一个目录的账号整体消失。
+        //
+        // 这里不依赖真实 APPDATA：直接构造两个目录，临时把 APPDATA 指过去。
+        let base = std::env::temp_dir().join(format!(
+            "ai-gateway-trae-gtm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let write_storage = |dir: &str, uid: &str, ts: i64| {
+            let p = base.join(dir).join(r"User\globalStorage");
+            std::fs::create_dir_all(&p).unwrap();
+            let body = json!({
+                "icube_gtm.users": { uid: {"updatedTime": ts} }
+            });
+            std::fs::write(
+                p.join("storage.json"),
+                serde_json::to_string(&body).unwrap(),
+            )
+            .unwrap();
+        };
+        write_storage("TRAE SOLO CN", "1883919207380040", 1_778_078_246_409);
+        write_storage("TRAE SOLO", "7679751654497928200", 1_788_081_577_344);
+
+        let old = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", &base);
+        let merged = gtm_users_evidence_all("TraeWork");
+        match old {
+            Some(v) => std::env::set_var("APPDATA", v),
+            None => std::env::remove_var("APPDATA"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(merged.len(), 2, "两个目录的账号都要被看到，实际: {merged:?}");
+        assert_eq!(merged["1883919207380040"].latest_ts_ms, 1_778_078_246_409);
+        assert_eq!(merged["7679751654497928200"].latest_ts_ms, 1_788_081_577_344);
     }
 
     #[test]
