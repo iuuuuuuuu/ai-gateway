@@ -19,6 +19,11 @@ target/
 target-*/
 src-tauri/target/
 
+# 本地 cargo 配置（sccache 等本机专属设置）。
+# 必须排除：rustc-wrapper 指向不存在的程序时 cargo 会**直接报错**而非降级，
+# 而 CI 三平台都没装 sccache —— 提交进去会让所有 job 构建失败。
+.cargo/config.toml
+
 # npm 包 postinstall 下载的平台二进制
 npm/bin/ai-gateway-*
 
