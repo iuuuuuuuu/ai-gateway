@@ -158,7 +158,15 @@ pub fn account_meta(acc: &Value) -> Value {
         "refreshExpiresAt": acc.get("refreshExpiresAt"),
         "refreshedAt": acc.get("refreshedAt"),
         "createdAt": acc.get("createdAt"),
-        "needsRelogin": acc.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true),
+        // 需重登判定必须复用 refresh::needs_relogin 这一处口径，不能直接读原始标记：
+        // 旧版本把传输层失败（code=-1，网络抖动/代理闪断）也写成 needs_relogin，
+        // 直接透传会让界面把健康账号显示成「需重新登录」—— 实测一批账号的
+        // refresh token 完全正常，是历史误报的受害者。
+        // 该函数的注释明确写了「界面展示都复用它」，此处即其中之一。
+        "needsRelogin": crate::modules::refresh::needs_relogin(acc),
+        // 原始标记仍单独透出：排查时要能区分「库里记了什么」（事实）
+        // 与「判定结论是什么」（结论），二者不一致正是误报的证据。
+        "needsReloginRaw": acc.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true),
         "needsReloginReason": acc.get("needs_relogin_reason"),
         // 备注：用户自定义标签，用于认出「这是谁的号」。
         "note": acc.get("note"),
@@ -403,6 +411,45 @@ mod tests {
         assert_eq!(meta["phoneNumber"], "13800138000", "手机号是国服账号的主要身份线索");
         assert_eq!(meta["accountType"], "personal");
         assert!(meta.get("access_token").is_none(), "新增字段不得带出 token");
+    }
+
+    /// 回归：`account_meta` 的 `needsRelogin` 必须复用 `refresh::needs_relogin` 的口径，
+    /// 不能直接透传原始标记。
+    ///
+    /// 背景：旧版本把传输层失败（code=-1，网络抖动/代理闪断）也写成 `needs_relogin`。
+    /// 直接透传会让界面把**健康账号**显示成「需重新登录」，用户以为要重新登录，
+    /// 实际上 refresh token 完全正常。`refresh::needs_relogin` 的注释明确写了
+    /// 「界面展示都复用它」，这条测试就是守住这句话。
+    #[test]
+    fn account_meta_treats_transport_error_relogin_as_healthy() {
+        // 历史误报：原因里含网络错误关键字 → 应判为「不需重登」
+        let false_alarm = json!({
+            "id": "a1",
+            "uid": "u1",
+            "needs_relogin": true,
+            "needs_relogin_reason": "刷新失败(code=-1): error sending request for url (https://www.workbuddy.ai/...)",
+        });
+        let meta = account_meta(&false_alarm);
+        assert_eq!(
+            meta["needsRelogin"], false,
+            "传输层失败属历史误报，不得让界面显示「需重新登录」"
+        );
+        assert_eq!(
+            meta["needsReloginRaw"], true,
+            "原始标记仍要透出：排查时要能区分「库里记了什么」与「判定结论」"
+        );
+
+        // 真实失效：服务端明确拒绝 → 应判为「需重登」
+        let real = json!({
+            "id": "a2",
+            "uid": "u2",
+            "needs_relogin": true,
+            "needs_relogin_reason": "刷新失败(code=12153): Offline user session not found",
+        });
+        assert_eq!(
+            account_meta(&real)["needsRelogin"], true,
+            "服务端明确拒绝才是真的需重登"
+        );
     }
 
     /// 字段缺失时不应 panic，也不应伪造值（界面渲染成「—」）。

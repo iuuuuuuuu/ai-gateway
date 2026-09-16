@@ -1643,7 +1643,11 @@ pub async fn gateway_status() -> Value {
                     "uid": uid,
                     "nickname": account::get_str(a, "nickname").unwrap_or_default(),
                     "expiresAt": a.get("expiresAt").and_then(Value::as_i64).unwrap_or(0),
-                    "needsRelogin": a.get("needs_relogin").and_then(Value::as_bool).unwrap_or(false),
+                    // 与 account_meta 同口径：复用 refresh::needs_relogin，
+                    // 不直接读原始标记（旧版本把网络抖动也写成 needs_relogin）。
+                    // 前端手动模式的「可选账号」过滤依赖这个字段，
+                    // 误报会让用户看到「明明能用的号却选不了」。
+                    "needsRelogin": crate::modules::refresh::needs_relogin(a),
                 }))
             })
             .collect::<Vec<Value>>(),

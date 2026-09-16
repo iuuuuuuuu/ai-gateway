@@ -1,5 +1,5 @@
-import { ArrowRight, Ban, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Globe, History, Info, Loader2, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { ArrowRight, Ban, CalendarCheck, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Gift, Globe, GraduationCap, History, Info, Loader2, Moon, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2, Zap } from "lucide-react";
+import { useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -13,15 +13,16 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
 import * as api from "@/lib/api";
+import { accountReloginAlarm } from "@/lib/account-expiry";
 import { cn } from "@/lib/utils";
 import { AccountRecordsView } from "@/components/account-records-view";
 import { demoModeEnabled } from "@/lib/demo-mode";
-import type { AccountMeta, CreditExpiry, CreditResource, TravelStatus } from "@/lib/types";
+import type { AccountMeta, CreditExpiry, CreditResource, GatewayTaskName, TravelStatus } from "@/lib/types";
 
 const AVATAR_TONES = [
   "bg-emerald-100 text-emerald-800",
@@ -268,6 +269,169 @@ function regionChip(account: AccountMeta) {
   );
 }
 
+/**
+ * 账号菜单里「养护任务」这一组的适用性判定。
+ *
+ * 为什么需要它：菜单此前只列了刷新 Token / 签到 / 领养三项，而项目里还有活跃上报、
+ * 夜猫子、开学季、国际版 trial 等养号动作；更要紧的是**这些动作并非对所有账号都成立**
+ * —— 国际版没有签到与任务中心，夜猫子只在 23:00–08:00 计入，开学季是限时活动。
+ * 菜单若照列不误，用户点下去只会得到一次无意义的失败请求，且不知道原因。
+ *
+ * 判定依据**取自后端真实门槛**，不是前端猜的：
+ *   - 区域：`config.rs::account_supported_by_auto_tasks`（`Region::of(account) == Cn`），
+ *     域名以 `.ai` 结尾即国际版；`travel.rs::accounts_in_scope` 与
+ *     `checkin.rs::accounts_in_scope` 都用它。
+ *   - 夜猫子时段：`nightowl.go` 的 `nightWindowStartHour/EndHour`（23:00–08:00 CST）。
+ *   - 签到状态：`checkin.rs::checkin_account` 返回的 `result: "already"`。
+ */
+type TaskAvailability = {
+  /** false = 置灰：该动作对此账号不成立。 */
+  enabled: boolean;
+  /**
+   * 置灰原因；启用时为 null。
+   *
+   * 渲染成菜单项下方的第二行小字，并同时进 `title` 与 `aria-label`
+   * （形如「手动签到（不可用：国际版没有签到接口，上游返回空数据）」）——
+   * 同一句话三处复用，视觉、悬停、读屏各取所需，不必维护多份文案。
+   */
+  reason: string | null;
+};
+
+/** 账号是否为国际版。只认 regionKey；它缺失时回退到域名后缀（与后端口径一致）。 */
+function isIntlAccount(account: AccountMeta): boolean {
+  if (account.regionKey) return account.regionKey === "intl";
+  return (account.domain ?? "").trim().toLowerCase().endsWith(".ai");
+}
+
+/** 当前是否处于夜猫时段（23:00–08:00 CST），与 Go 侧 `withinNightWindow` 同口径。 */
+function withinNightWindow(now = new Date()): boolean {
+  // 用 UTC+8 固定偏移换算，不依赖本机时区：窗口定义来自上游活动规则，
+  // 换台机器不应改变判定（Go 侧同样刻意避开 tzdata）。
+  const cstHour = (now.getUTCHours() + 8) % 24;
+  return cstHour >= 23 || cstHour < 8;
+}
+
+/** 手动签到：仅国服；已签到时仍列出但置灰，避免菜单项凭空消失。 */
+function checkinAvailability(account: AccountMeta, todayCheckedIn?: boolean): TaskAvailability {
+  if (isIntlAccount(account)) {
+    return { enabled: false, reason: "国际版没有签到接口，上游返回空数据" };
+  }
+  if (todayCheckedIn) {
+    return { enabled: false, reason: "今日已签到，明天再来" };
+  }
+  return { enabled: true, reason: null };
+}
+
+/** 领养 Buddy：国服才有猫猫旅行与 Buddy 体系。 */
+function adoptAvailability(account: AccountMeta): TaskAvailability {
+  if (isIntlAccount(account)) {
+    return { enabled: false, reason: "国际版没有 Buddy 领养入口" };
+  }
+  return { enabled: true, reason: null };
+}
+
+/**
+ * 活跃上报：只有国服 growth 接口有真实数据。
+ *
+ * 与签到的区别：这里**不**因「今日已跑」而置灰 —— 上报可重复执行（幂等，
+ * 且是连登的自检手段），没有「今日已做」这种终态。
+ */
+function activityAvailability(account: AccountMeta): TaskAvailability {
+  if (isIntlAccount(account)) {
+    return { enabled: false, reason: "国际版 growth 接口无数据，上报不会计入" };
+  }
+  return { enabled: true, reason: null };
+}
+
+/** 夜猫子：国服 + 仅在 23:00–08:00（北京时间）内由上游计入。 */
+function nightOwlAvailability(account: AccountMeta, now?: Date): TaskAvailability {
+  if (isIntlAccount(account)) {
+    return { enabled: false, reason: "国际版 growth 接口无数据，上报不会计入" };
+  }
+  if (!withinNightWindow(now)) {
+    return { enabled: false, reason: "仅 23:00–08:00（北京时间）计入，当前不在时段内" };
+  }
+  return { enabled: true, reason: null };
+}
+
+/**
+ * 开学季活动：国服限时活动（国际版返回 404），且活动下线后清单为空。
+ *
+ * 活动是否在期只有问上游才知道，前端**不猜**：这里只按区域置灰，
+ * 在期与否交给接口返回的中文说明（`school.go` 会写「活动不在期…」记录）。
+ */
+function schoolAvailability(account: AccountMeta): TaskAvailability {
+  if (isIntlAccount(account)) {
+    return { enabled: false, reason: "国际版无此活动（上游返回 404）" };
+  }
+  return { enabled: true, reason: null };
+}
+
+/** 国际版 trial 加油包：与其它任务相反，**只对国际版**成立。 */
+function trialAvailability(account: AccountMeta): TaskAvailability {
+  if (!isIntlAccount(account)) {
+    return { enabled: false, reason: "国际版专享，国服无此端点" };
+  }
+  return { enabled: true, reason: null };
+}
+
+/** 刷新 Token：两个区域都需要，不受区域限制。 */
+function refreshTokenAvailability(): TaskAvailability {
+  return { enabled: true, reason: null };
+}
+
+/**
+ * 渲染一个养护任务菜单项。
+ *
+ * 置灰项与可点项**渲染成同一个组件**（只是换文案与 aria 属性），原因：
+ *   - 需求要求「不显示或置灰给提示」，两者混用会让菜单长度随账号类型跳变；
+ *   - 置灰项一定要把原因说出来 —— 只置灰不解释，用户会当成 bug（这正是
+ *     所有者反馈的痛点）。原因既写进可见文案，也写进 title 与 aria-label。
+ */
+function careTaskItem({
+  icon,
+  label,
+  availability,
+  onSelect,
+  disabled,
+  busy,
+}: {
+  icon: ReactNode;
+  label: string;
+  availability: TaskAvailability;
+  onSelect: () => void;
+  /** 卡片级的统一禁用（如 featuresDisabled / 父级未接线）。 */
+  disabled?: boolean;
+  /** 该项正在执行中，临时不可点但**不**算「不适用」。 */
+  busy?: boolean;
+}) {
+  const blocked = disabled || !availability.enabled || busy;
+  // 「执行中」与「不适用」是两种不同的置灰：前者是暂时的，必须说清楚，
+  // 否则用户看到灰项会以为这个号不支持该任务。
+  const reason = busy ? "正在执行，请稍候…" : availability.reason;
+  return (
+    <DropdownMenuItem
+      className="items-start"
+      disabled={blocked}
+      title={reason ?? undefined}
+      // aria-label 让读屏软件也读到原因，而不是只有视觉上的灰。
+      aria-label={reason ? `${label}（不可用：${reason}）` : label}
+      aria-disabled={blocked}
+      onSelect={onSelect}
+    >
+      <span className="mt-0.5 flex shrink-0">{icon}</span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate">{label}</span>
+        {reason ? (
+          <span className="mt-0.5 block whitespace-normal text-[11px] leading-4 text-muted-foreground">
+            {reason}
+          </span>
+        ) : null}
+      </span>
+    </DropdownMenuItem>
+  );
+}
+
 interface Props {
   account: AccountMeta;
   onDelete: (a: AccountMeta) => void;
@@ -284,6 +448,15 @@ interface Props {
   onRefresh?: (a: AccountMeta) => void;
   /** 领养 Buddy（仅领养，不派猫；与「一键旅行」的重叠部分单独暴露出来） */
   onAdopt?: (a: AccountMeta) => void;
+  /**
+   * 手动触发一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
+   *
+   * 注意语义：这是**整轮**触发，作用于全部账号，不是只跑当前卡片这个号
+   *（Go 侧 `RunTaskByName` 遍历账号池）。菜单用分组标题把这一点说清楚。
+   */
+  onRunTask?: (task: GatewayTaskName) => void;
+  /** 正在执行的任务名；用于临时置灰并避免重复触发。 */
+  taskRunning?: GatewayTaskName;
   onSwitch?: (a: AccountMeta) => void;
   todayCheckedIn?: boolean;
   /** 今日旅行状态（undefined=查询中/未知，不渲染标签） */
@@ -341,7 +514,7 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
   );
 }
 
-export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, onCheckin, onRefresh, onAdopt, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, onCheckin, onRefresh, onAdopt, onRunTask, taskRunning, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
   /** 备注编辑弹窗；`noteDraft` 是受控输入（打开时用当前备注初始化）。 */
   const [noteOpen, setNoteOpen] = useState(false);
@@ -352,7 +525,9 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
   /** 账号记录弹窗：任务 / 积分 / Token 三类事件，带日期筛选。 */
   const [recordsOpen, setRecordsOpen] = useState(false);
   const name = account.nickname || account.uid || "未命名账号";
-  const expired = typeof account.expiresAt === "number" && account.expiresAt < Date.now();
+  /** 需重新登录时的报警内容；账号仍能自愈（access token 过期）时为 null。
+   *  判定口径集中在 `@/lib/account-expiry`，与兼容网关页共用同一套。 */
+  const reloginAlarm = accountReloginAlarm(account);
   const avatarClass = avatarTone(name);
   const resources = creditResources(credit);
   const visibleResources = resources.slice(0, 2);
@@ -412,7 +587,13 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
         <Badge variant={todayCheckedIn ? "success" : "secondary"} className={cn(chipClass, !todayCheckedIn && "text-muted-foreground")}><CircleCheck /> {todayCheckedIn ? "已签到" : "未签到"}</Badge>
       )}
       {travelChip(travelStatus)}
-      {(account.needsRelogin || expired) && <Badge variant="warning" className={chipClass}>{account.needsRelogin ? "需重新登录" : "Token 已过期"}</Badge>}
+      {/* 只在**无法自愈**时才报警：access token 过期会自动刷新，不该打扰用户；
+          真要人工介入的只有「上游拒绝」与「refresh token 也过期」两种。 */}
+      {reloginAlarm && (
+        <Badge variant="warning" className={chipClass} title={reloginAlarm.title}>
+          {reloginAlarm.label}
+        </Badge>
+      )}
       {creditPriority && (
         <Tooltip>
           <TooltipTrigger asChild>
@@ -474,25 +655,79 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   <Ellipsis />
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-40">
-                <DropdownMenuItem disabled={featuresDisabled || !onRefresh} onSelect={() => onRefresh?.(account)}>
-                  <RefreshCw />刷新 Token
-                </DropdownMenuItem>
-                {todayCheckedIn === false && (
-                  <DropdownMenuItem disabled={featuresDisabled || !onCheckin} onSelect={() => onCheckin?.(account)}>
-                    <CircleCheck />手动签到
-                  </DropdownMenuItem>
-                )}
+              <DropdownMenuContent align="end" className="w-64">
+                {/* 「本账号」组：每一项都只作用于这张卡片的账号。
+                    标题不可省 —— 下面还有一组是整轮触发，混在一起会被误读。 */}
+                <DropdownMenuLabel>本账号养护</DropdownMenuLabel>
+                {careTaskItem({
+                  icon: <RefreshCw />,
+                  label: "刷新 Token",
+                  availability: refreshTokenAvailability(),
+                  onSelect: () => onRefresh?.(account),
+                  disabled: featuresDisabled || !onRefresh,
+                })}
+                {/* 签到：国际版不适用 → 置灰说明原因；今日已签到 → 置灰但**保留**该项。
+                    此前是 `todayCheckedIn === false &&` 条件渲染，已签到时整项消失，
+                    用户会以为功能没了（详见报告的设计取舍）。 */}
+                {careTaskItem({
+                  icon: todayCheckedIn ? <CircleCheck /> : <CalendarCheck />,
+                  label: todayCheckedIn ? "手动签到（今日已完成）" : "手动签到",
+                  availability: checkinAvailability(account, todayCheckedIn),
+                  onSelect: () => onCheckin?.(account),
+                  disabled: featuresDisabled || !onCheckin,
+                })}
                 {/* 领养：措辞随已知状态变化，避免用户点了才发现"已经有猫"或"还不够轮次"。
                     「旅行巡检也会顺带领养」这点保留在菜单里说清，因为一键旅行确实覆盖它。 */}
-                <DropdownMenuItem disabled={featuresDisabled || !onAdopt} onSelect={() => onAdopt?.(account)}>
-                  <Cat />
-                  {travelStatus?.label === "adopted"
-                    ? "重新检查 Buddy"
-                    : travelStatus?.label === "adopt-threshold"
-                      ? "领养 Buddy（需先攒对话）"
-                      : "领养 Buddy"}
-                </DropdownMenuItem>
+                {careTaskItem({
+                  icon: <Cat />,
+                  label:
+                    travelStatus?.label === "adopted"
+                      ? "重新检查 Buddy"
+                      : travelStatus?.label === "adopt-threshold"
+                        ? "领养 Buddy（需先攒对话）"
+                        : "领养 Buddy",
+                  availability: adoptAvailability(account),
+                  onSelect: () => onAdopt?.(account),
+                  disabled: featuresDisabled || !onAdopt,
+                })}
+                {/* 以下 4 项是养号任务，均由网关（Go 侧）按账号区域过滤：
+                    活跃上报 / 夜猫子 / 开学季只跑国服，trial 只跑国际版。
+                    菜单项本身仍逐号列出 —— 目的是让用户看懂「这个号为什么不参与」，
+                    这一组的可点项触发的是**整轮**任务，故用分组标题明确边界。 */}
+                <DropdownMenuSeparator />
+                <DropdownMenuLabel>养号任务（触发一整轮，作用于全部账号）</DropdownMenuLabel>
+                {careTaskItem({
+                  icon: <Zap />,
+                  label: "活跃上报",
+                  availability: activityAvailability(account),
+                  onSelect: () => onRunTask?.("activity"),
+                  disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
+                  busy: taskRunning === "activity",
+                })}
+                {careTaskItem({
+                  icon: <Moon />,
+                  label: "夜猫子任务",
+                  availability: nightOwlAvailability(account),
+                  onSelect: () => onRunTask?.("nightowl"),
+                  disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
+                  busy: taskRunning === "nightowl",
+                })}
+                {careTaskItem({
+                  icon: <GraduationCap />,
+                  label: "开学季活动",
+                  availability: schoolAvailability(account),
+                  onSelect: () => onRunTask?.("school"),
+                  disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
+                  busy: taskRunning === "school",
+                })}
+                {careTaskItem({
+                  icon: <Gift />,
+                  label: "trial 加油包",
+                  availability: trialAvailability(account),
+                  onSelect: () => onRunTask?.("trial"),
+                  disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
+                  busy: taskRunning === "trial",
+                })}
                 <DropdownMenuSeparator />
                 {/* 备注：授权进来的账号常只带邮箱/手机号/随机 uid，看不出「这是谁的号」，
                     因此给一个自定义标签。文案随是否已有备注变化，避免用户以为要重填。 */}
