@@ -1,4 +1,4 @@
-import { ArrowRight, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Globe, Info, Loader2, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2 } from "lucide-react";
+import { ArrowRight, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Globe, History, Info, Loader2, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
@@ -19,6 +19,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
 import * as api from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { AccountRecordsView } from "@/components/account-records-view";
 import { demoModeEnabled } from "@/lib/demo-mode";
 import type { AccountMeta, CreditExpiry, CreditResource, TravelStatus } from "@/lib/types";
 
@@ -341,6 +342,8 @@ export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefre
   const [noteSaving, setNoteSaving] = useState(false);
   /** 账号详情弹窗：展示本地记录里能看出「这是谁的号」的全部字段。 */
   const [detailOpen, setDetailOpen] = useState(false);
+  /** 账号记录弹窗：任务 / 积分 / Token 三类事件，带日期筛选。 */
+  const [recordsOpen, setRecordsOpen] = useState(false);
   const name = account.nickname || account.uid || "未命名账号";
   const expired = typeof account.expiresAt === "number" && account.expiresAt < Date.now();
   const avatarClass = avatarTone(name);
@@ -478,6 +481,12 @@ export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefre
                 <DropdownMenuItem onSelect={() => setDetailOpen(true)}>
                   <Info />
                   查看账号详情
+                </DropdownMenuItem>
+                {/* 记录入口放在账号菜单里而不是单独一页：用户想知道「这个号昨天
+                    干了什么」时，视线就在这张卡片上，不该再去别处找。 */}
+                <DropdownMenuItem onSelect={() => setRecordsOpen(true)}>
+                  <History />
+                  查看记录
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>
@@ -793,6 +802,27 @@ export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefre
             </Button>
             <Button onClick={() => setDetailOpen(false)}>关闭</Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 单账号记录：任务执行 / 积分变化 / Token 消耗，带日期筛选。
+          用较宽的对话框（max-w-4xl）：这三类记录要在一屏里看清需要横向空间。 */}
+      <Dialog open={recordsOpen} onOpenChange={setRecordsOpen}>
+        <DialogContent className="sm:max-w-4xl">
+          <DialogHeader>
+            <DialogTitle>账号记录</DialogTitle>
+            <DialogDescription>
+              {name} 的任务执行、积分变化与 Token 消耗；可按日期区间筛选。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-w-0 max-h-[70vh] overflow-y-auto pr-1">
+            <AccountRecordsView
+              accounts={[]}
+              fixedAccountId={account.id}
+              defaultRange="30d"
+              compact
+            />
+          </div>
         </DialogContent>
       </Dialog>
     </TooltipProvider>

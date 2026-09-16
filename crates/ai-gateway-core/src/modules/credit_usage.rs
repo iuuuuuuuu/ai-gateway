@@ -165,6 +165,35 @@ pub fn record_snapshot(account_id: &str, account_name: &str, total: f64, remaini
         return false;
     }
 
+    // 记一条积分变化事件（供单账号记录视图）。
+    //
+    // 为什么在这里记而不是在调用方：本函数已经拿到了「上一快照」与「本次余额」，
+    // 差值就在这里最自然；调用方（签到、切换、巡检）各自算差值会口径不一。
+    // 只在**余额确实变化**时记录，避免每 15 分钟的巡检刷出一堆 amount=0 的噪音。
+    if let Some(prev) = snapshots
+        .iter()
+        .filter_map(snapshot_from_value)
+        .filter(|s| s.account_id == account_id)
+        .max_by_key(|s| s.ts)
+    {
+        // 四舍五入到整数：积分通常是整数，浮点误差会造出 -0.0000001 这类噪音
+        let delta = (remaining - prev.remaining).round() as i64;
+        if delta != 0 {
+            let (title, detail) = if delta > 0 {
+                ("积分增长", String::new())
+            } else {
+                ("积分消耗", String::new())
+            };
+            crate::modules::account_records::add_credit_record(
+                account_id,
+                account_name.trim(),
+                title,
+                delta,
+                &detail,
+            );
+        }
+    }
+
     let mut kept = normalize_snapshots(&snapshots, at_ms);
     kept.push(snapshot_value(
         at_ms,

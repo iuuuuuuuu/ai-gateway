@@ -94,6 +94,14 @@ pub fn router() -> Router {
             "/api/settings/retention",
             get(api_record_retention).post(api_save_record_retention),
         )
+        .route(
+            "/api/account-records",
+            get(api_account_records).post(api_account_records_query),
+        )
+        .route(
+            "/api/account-records/backfill",
+            post(api_backfill_account_records),
+        )
         .route("/api/travel/status", get(api_travel_status))
         .route("/api/travel/run", post(api_travel_run))
         .route("/api/travel/adopt", post(api_travel_adopt))
@@ -657,6 +665,87 @@ async fn api_save_record_retention(Json(body): Json<Value>) -> Response {
     };
     match config::set_record_retention_days(days) {
         Ok(applied) => json_ok(json!({ "days": applied })),
+        Err(e) => json_err(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// 把查询参数解析成 (account_id, from, to, kinds, limit)。
+///
+/// GET 走 query string、POST 走 JSON body，两者解析逻辑一致 ——
+/// 抽出来避免两处口径不一致（例如一处认 kinds=csv、另一处只认数组）。
+fn parse_record_query(
+    account_id: Option<&str>,
+    from: Option<i64>,
+    to: Option<i64>,
+    kinds: Option<&Value>,
+    limit: Option<i64>,
+) -> (String, i64, i64, Vec<String>, usize) {
+    let kinds_vec: Vec<String> = match kinds {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|s| s.to_string())
+            .collect(),
+        // 逗号分隔字符串同样接受：便于 curl / 浏览器直接拼 URL
+        Some(Value::String(s)) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+            .map(|x| x.to_string())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let limit = match limit.unwrap_or(500) {
+        n if n <= 0 => 500,
+        n => n.min(5000) as usize,
+    };
+    (
+        account_id.unwrap_or("").to_string(),
+        from.unwrap_or(0),
+        to.unwrap_or(0),
+        kinds_vec,
+        limit,
+    )
+}
+
+/// GET /api/account-records —— 按账号 / 日期 / 类型查询账号记录。
+///
+/// query: accountId=xxx&from=<ms>&to=<ms>&kinds=task,credit&limit=500
+async fn api_account_records(Query(q): Query<HashMap<String, String>>) -> Response {
+    let kinds_val = q
+        .get("kinds")
+        .map(|s| Value::String(s.clone()))
+        .unwrap_or(Value::Null);
+    let (account_id, from, to, kinds, limit) = parse_record_query(
+        q.get("accountId").map(String::as_str),
+        q.get("from").and_then(|v| v.parse::<i64>().ok()),
+        q.get("to").and_then(|v| v.parse::<i64>().ok()),
+        Some(&kinds_val),
+        q.get("limit").and_then(|v| v.parse::<i64>().ok()),
+    );
+    json_ok(ai_gateway_core::modules::account_records::query_records(
+        &account_id, from, to, &kinds, limit,
+    ))
+}
+
+/// POST /api/account-records —— 同上，但参数走 JSON body（便于传数组 kinds）。
+async fn api_account_records_query(Json(body): Json<Value>) -> Response {
+    let (account_id, from, to, kinds, limit) = parse_record_query(
+        body.get("accountId").and_then(Value::as_str),
+        body.get("from").and_then(Value::as_i64),
+        body.get("to").and_then(Value::as_i64),
+        body.get("kinds"),
+        body.get("limit").and_then(Value::as_i64),
+    );
+    json_ok(ai_gateway_core::modules::account_records::query_records(
+        &account_id, from, to, &kinds, limit,
+    ))
+}
+
+/// POST /api/account-records/backfill —— 把历史签到日志回填为账号记录（幂等）。
+async fn api_backfill_account_records() -> Response {
+    match ai_gateway_core::modules::account_records::backfill_from_checkin_logs() {
+        Ok(added) => json_ok(json!({ "added": added })),
         Err(e) => json_err(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
 }

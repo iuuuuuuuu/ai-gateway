@@ -128,6 +128,8 @@ const ROUTES: Record<string, Route> = {
   // 记录保留设置：Tauri 命令与 HTTP 路由同名映射，webui 模式下同样可用
   get_record_retention: { method: "GET", path: "/api/settings/retention" },
   save_record_retention: { method: "POST", path: "/api/settings/retention" },
+  get_account_records: { method: "POST", path: "/api/account-records" },
+  backfill_account_records: { method: "POST", path: "/api/account-records/backfill" },
   get_travel_status: { method: "GET", path: "/api/travel/status" },
   travel_run: { method: "POST", path: "/api/travel/run" },
   travel_adopt: { method: "POST", path: "/api/travel/adopt" },
@@ -573,6 +575,59 @@ export function getRecordRetention(): Promise<RecordRetentionSetting> {
 /** 保存保留天数；返回归一化后的实际生效值（越界值会被夹到合法区间）。 */
 export function saveRecordRetention(days: number): Promise<{ days: number }> {
   return call("save_record_retention", { days });
+}
+
+// ---------------------------------------------------------------------------
+// 账号记录（任务 / 积分 / Token 三类事件的统一流水）
+// ---------------------------------------------------------------------------
+
+/** 一条账号记录。 */
+export interface AccountRecordItem {
+  ts: number;
+  accountId: string;
+  accountName: string;
+  /** task | credit | token */
+  kind: string;
+  title: string;
+  /** success | failed | already | info */
+  result: string;
+  /** 积分增减或 Token 数量；无则为 0 */
+  amount: number;
+  detail: string;
+}
+
+export interface AccountRecordsResult {
+  records: AccountRecordItem[];
+  /** 过滤后的总条数（不受 limit 影响） */
+  total: number;
+  summary: {
+    taskCount: number;
+    creditNet: number;
+    tokenSum: number;
+  };
+  retentionDays: number;
+}
+
+/** 查询账号记录；accountId 为空表示全部账号。 */
+export function getAccountRecords(params: {
+  accountId?: string;
+  from?: number;
+  to?: number;
+  kinds?: string[];
+  limit?: number;
+}): Promise<AccountRecordsResult> {
+  return call("get_account_records", {
+    accountId: params.accountId ?? null,
+    from: params.from ?? null,
+    to: params.to ?? null,
+    kinds: params.kinds ?? null,
+    limit: params.limit ?? 500,
+  });
+}
+
+/** 把历史签到日志回填为账号记录（幂等，重复调用不产生重复）。 */
+export function backfillAccountRecords(): Promise<{ added: number }> {
+  return call("backfill_account_records");
 }
 
 export async function getTravelStatus(accountId: string): Promise<TravelStatus> {

@@ -222,6 +222,8 @@ pub fn run() {
             commands::get_checkin_logs,
             commands::get_record_retention,
             commands::save_record_retention,
+            commands::get_account_records,
+            commands::backfill_account_records,
             commands::get_travel_status,
             commands::get_auto_travel_config,
             commands::save_auto_travel_config,

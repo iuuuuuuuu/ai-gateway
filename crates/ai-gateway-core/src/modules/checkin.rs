@@ -248,6 +248,15 @@ pub async fn checkin_account(account: &Value) -> Value {
         entry_map["error"] = json!(e);
     }
     add_checkin_log(&entry_map);
+    // 同时写一条账号记录：签到日志只服务「签到」板块，
+    // 而账号记录视图要把三类事件（任务 / 积分 / Token）汇到一处。
+    {
+        use crate::modules::account_records;
+        let account_id = entry["accountId"].as_str().unwrap_or("");
+        let account_name = entry["email"].as_str().unwrap_or("");
+        let detail = error.clone().unwrap_or_default();
+        account_records::add_task_record(account_id, account_name, "自动签到", result, &detail);
+    }
     json!({"result": result, "error": error})
 }
 

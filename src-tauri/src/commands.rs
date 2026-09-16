@@ -494,6 +494,45 @@ pub fn save_record_retention(days: i64) -> Result<Value, String> {
 }
 
 // ---------------------------------------------------------------------------
+// 账号记录（任务 / 积分 / Token 三类事件的统一流水）
+// ---------------------------------------------------------------------------
+
+/// GET /api/account-records —— 查询账号记录。
+///
+/// 参数（全部可选）：
+///   - accountId：为空 = 全部账号
+///   - from / to：毫秒时间戳区间（含端点）；0 = 不限
+///   - kinds：事件类型数组（task / credit / token）；空 = 全部
+///   - limit：最多返回多少条；0 = 不限
+#[tauri::command]
+pub fn get_account_records(
+    account_id: Option<String>,
+    from: Option<i64>,
+    to: Option<i64>,
+    kinds: Option<Vec<String>>,
+    limit: Option<usize>,
+) -> Value {
+    crate::modules::account_records::query_records(
+        account_id.as_deref().unwrap_or(""),
+        from.unwrap_or(0),
+        to.unwrap_or(0),
+        &kinds.unwrap_or_default(),
+        limit.unwrap_or(500),
+    )
+}
+
+/// POST /api/account-records/backfill —— 把历史签到日志回填为账号记录。
+///
+/// 前端在首次打开「账号记录」时调用一次；幂等，重复调用不会产生重复记录。
+#[tauri::command]
+pub fn backfill_account_records() -> Result<Value, String> {
+    match crate::modules::account_records::backfill_from_checkin_logs() {
+        Ok(added) => Ok(json!({ "added": added })),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 派猫猫旅行
 // ---------------------------------------------------------------------------
 
