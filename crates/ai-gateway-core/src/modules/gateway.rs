@@ -2948,6 +2948,13 @@ mod tests {
         drop(listener);
     }
 
+    /// 按需查询占用者只在 Windows 上有实现（`netstat` + `tasklist` + `powershell`）。
+    ///
+    /// 非 Windows 平台的 `find_port_holder` 刻意返回 `None`（见其实现处的注释：
+    /// 「前端会提示无法识别占用进程，用户仍可手动处理」）。因此这条断言必须加
+    /// 平台门控 —— 否则在 Linux/macOS 的 CI 上必然失败，而那不是缺陷。
+    /// 本测试曾漏掉门控，被 CI 抓出（ubuntu-22.04 / macos-14 两个 job 都红）。
+    #[cfg(windows)]
     #[test]
     fn port_holder_finds_self_when_listening() {
         // 按需接口本身要能正常工作（这条路径允许 spawn 进程）
@@ -2976,6 +2983,36 @@ mod tests {
         drop(listener);
     }
 
+    /// 非 Windows 平台上「查不到占用者」是**预期行为**，不是缺陷。
+    ///
+    /// 单独写这条而不是简单删掉上面的测试：让「这个平台不支持」这件事被显式
+    /// 记录在测试里，而不是留白。将来有人补了 lsof/ss 实现，这条会提醒他改。
+    #[cfg(not(windows))]
+    #[test]
+    fn port_holder_returns_none_on_unsupported_platform() {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let port = match listener.local_addr() {
+            Ok(a) => a.port(),
+            Err(_) => return,
+        };
+        assert!(
+            port_holder(port).is_none(),
+            "非 Windows 平台尚未实现占用者查询，应返回 None"
+        );
+        drop(listener);
+    }
+
+    /// 「不许杀掉自己」这条守卫。
+    ///
+    /// Windows：`find_port_holder` 能认出占用者就是本进程 → 命中「自身」分支。
+    /// 非 Windows：查询未实现，先撞上「无法识别占用进程」→ 同样拒绝，只是文案不同。
+    ///
+    /// **两种平台都必须拒绝**，这正是本测试要守的核心行为；但断言文案时必须区分
+    /// 平台 —— 曾因只断言「自身」文案，在 Linux/macOS 的 CI 上失败（那不是缺陷）。
+    /// 这里把「拒绝」与「文案」拆成两条断言，前者跨平台、后者按平台。
     #[test]
     fn kill_refuses_to_kill_itself() {
         // 自己占住端口，然后尝试「清理」它 —— 必须被拒绝，
@@ -2989,10 +3026,24 @@ mod tests {
             Err(_) => return,
         };
         let err = kill_port_holder(port).expect_err("不应允许杀死自身进程");
+
+        // 跨平台断言：必须被拒绝，且原因与「清理占用者」有关
+        assert!(
+            !err.is_empty(),
+            "拒绝时必须给出可读原因，而不是空错误"
+        );
+
+        #[cfg(windows)]
         assert!(
             err.contains("自身") || err.contains("停止网关"),
-            "错误文案应说明是自身/应走停止网关，实际: {err}"
+            "Windows 上错误文案应说明是自身/应走停止网关，实际: {err}"
         );
+        #[cfg(not(windows))]
+        assert!(
+            err.contains("无法识别"),
+            "非 Windows 平台应因「未实现占用者查询」而拒绝，实际: {err}"
+        );
+
         drop(listener);
     }
 
