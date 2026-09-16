@@ -14,6 +14,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
@@ -50,6 +51,17 @@ type Config struct {
 	//
 	// 空串 = 不限制（默认，向后兼容）。大小写不敏感比较。
 	AllowedModel string
+
+	// PromptMode 系统提示词替换模式："passthrough"（缺省）/ "custom"。
+	//
+	// 空串按 passthrough 处理（NewHandler 里兜底）：这是**新增能力**，
+	// 既有的调用方与老配置都没有这个字段，必须保持「透传客户端原始 system」
+	// 的既有行为不变。
+	PromptMode string
+	// PromptText custom 模式下注入的自有系统提示词文本（来自 config.PromptText）。
+	//
+	// 在配置解析阶段一次性读盘并缓存，请求路径只做内存改写（不做文件 IO）。
+	PromptText string
 }
 
 // ServiceName 网关身份标识。经 /healthz 响应体 service 字段与 X-Service 头同时透出：
@@ -73,6 +85,12 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
+	}
+	// 缺省 passthrough：未显式配置时严格保持既有行为（透传客户端原始 system）。
+	// 直接在 Config 上兜底而不是依赖调用方传对，是为了让「忘记传」也不可能
+	// 变成「静默替换别人的 system」——后者的破坏性远大于一个默认值。
+	if strings.TrimSpace(cfg.PromptMode) == "" {
+		cfg.PromptMode = prompt.ModePassthrough
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))

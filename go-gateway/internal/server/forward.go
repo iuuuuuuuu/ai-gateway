@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
@@ -125,6 +126,20 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 	// model 改写成裸名，否则上游返回 400 code=11102 model [cn:xxx] not found
 	//（实测确认：前缀成功约束了选号，却让请求本身失败）。
 	// 无前缀时 model 与原值相同，rewriteModel 会原样返回，不做多余序列化。
+	// 系统提示词替换必须排在 rewriteModel **之前**：两者都会重新序列化请求体，
+	// 先做提示词替换可以少一次整体编码，也避免「模型已改写成裸名、提示词却没换」
+	// 这种半改状态的中间结果出现在日志/排查视野里。
+	//
+	// 放在 forwardChat 而不是各协议入口：三种协议（chat / messages / responses）
+	// 的请求体都在这里汇合成 OpenAI Chat 形态，在此改写只需一处，
+	// 也不会漏掉任何一条出站路径。
+	//
+	// mode=passthrough（缺省）时**完全不调用** Rewrite：既有行为必须逐字不变
+	//（不重新序列化、不动 messages），因此这里是显式分支而非「传空串让它空转」。
+	if h.cfg.PromptMode == prompt.ModeCustom && h.cfg.PromptText != "" {
+		body = prompt.Rewrite(body, h.cfg.PromptText)
+	}
+
 	body = rewriteModel(body, model)
 
 	// 「单一模型」锁定：非空时只放行该模型。

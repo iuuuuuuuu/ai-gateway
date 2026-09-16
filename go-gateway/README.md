@@ -164,6 +164,7 @@ curl -s http://localhost:7863/v1/chat/completions \
     "idle_timeout_seconds": 300
   },
   "features": { "sanitize_blacklist_fingerprints": true },
+  "prompt": { "mode": "passthrough", "file": "" },
   "upstash": { "url": "", "token": "" },
   "pool": {
     "max_in_flight": 3,
@@ -203,6 +204,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
+| `prompt.mode` | `passthrough` | 系统提示词替换模式：`passthrough` = 透传客户端原始 system；`custom` = 用网关自有提示词**整体替换**客户端的 system/developer 消息 |
+| `prompt.file` | 空 | `custom` 模式使用的提示词文件（**绝对路径**最稳妥）；空 = 用内置默认提示词。仅 `custom` 下校验：路径不可读或内容为空会在**启动时报错**（fail fast），`passthrough` 下该键不生效也不校验 |
 | `upstash.url` / `token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
@@ -230,7 +233,48 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE`（duration） · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_SANITIZE_FINGERPRINTS`（bool）
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE`（duration） · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_SANITIZE_FINGERPRINTS`（bool） · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+
+### 系统提示词替换（个性化提示词）
+
+**为什么需要**：客户端（Claude Code / Codex 等 CLI）会在 system 提示里注入固定模板句，
+上游内容审核按**逐字精确匹配**拦截，合法流量被误杀（表现为与账号无关的内容策略报错）。
+网关在出站前用自有系统提示词**整体替换**客户端的 system/developer 消息，
+从源头消灭 system 来源的指纹。
+
+**两层叠加、互不替代**：
+
+| 层 | 配置 | 作用对象 |
+|---|---|---|
+| 指纹脱敏 | `features.sanitize_blacklist_fingerprints` | user / assistant 消息里的指纹串 |
+| 提示词替换 | `prompt.mode` + `prompt.file` | system / developer 消息（整体替换） |
+
+**两种模式**：
+
+- `passthrough`（**缺省**）：透传客户端原始 system，行为与开启本功能前完全一致。
+  之所以缺省不是 `custom`：老配置里没有 `prompt` 键，若默认替换，升级后所有人的人设、
+  项目约定与工具说明会被静默换掉，且从请求上看不出是网关动的手。保守缺省、显式开启。
+- `custom`：用 `prompt.file`（为空则用内置默认提示词）替换 system/developer 消息，
+  其余字段与 user/assistant/tool 消息逐字不动。
+
+```json
+{
+  "prompt": {
+    "mode": "custom",
+    "file": "D:\\prompts\\my-prompt.md"
+  }
+}
+```
+
+**fail fast 的范围**：仅 `custom` 模式下校验 `file` —— 路径不可读或内容为空白时**启动即报错**。
+用户明确配了文件却读不到时静默回落别的文本，现象是「配了却像没配」，排查成本极高；
+而空白内容会让替换变成空操作（等价于 passthrough），同属「静默用错」。
+`passthrough` 下**不读也不校验** `file`：那段文本根本不会被使用，
+为不生效的配置拦住服务启动没有意义，也会让「先填好文件、稍后再切模式」变得不可行。
+
+替换发生在三种协议（`/v1/chat/completions`、`/v1/messages`、`/v1/responses`）
+汇合后的出站改写处，因此对所有入口一致生效；请求体解析失败时按原样转发，
+**不会**因改写失败而使请求失败。
 
 ## 🧠 账号池与流量治理
 

@@ -223,6 +223,11 @@ func main() {
 			}
 			return ""
 		}(),
+		// 系统提示词替换：mode 缺省 passthrough（透传客户端原始 system），
+		// custom 时用 PromptText（normalizePrompt 已读完盘并缓存）替换
+		// 客户端的 system/developer 消息。
+		PromptMode: cfg.Prompt.Mode,
+		PromptText: cfg.PromptText,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

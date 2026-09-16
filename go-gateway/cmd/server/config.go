@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/records"
 	"workbuddy2api/internal/upstream"
 )
@@ -92,6 +93,30 @@ type Config struct {
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 	} `json:"features"`
 
+	// Prompt 系统提示词替换（个性化提示词）。
+	//
+	// 与 features.sanitize_blacklist_fingerprints 是**两层叠加、互不替代**：
+	// sanitize 清洗 user/assistant 消息里的指纹串，本块则把客户端的
+	// system/developer 消息**整体替换**掉，从源头消灭 system 来源的指纹误报。
+	Prompt struct {
+		// Mode 缺省 "passthrough" = 透传客户端原始 system（**既有行为不变**）；
+		// "custom" = 用网关自有提示词替换客户端的 system/developer 消息。
+		//
+		// 为什么缺省是 passthrough 而不是 custom：这是**新增能力**，老配置里
+		// 没有这个键。若缺省 custom，所有既有用户升级后 system 会被静默换掉 ——
+		// 人设、项目约定、工具说明全丢，且从请求上看不出是网关动的手。
+		// 保守缺省 + 显式开启，用户改配置时才知道自己换掉了什么。
+		Mode string `json:"mode"`
+		// File 自定义提示词文件路径（**绝对路径**最稳妥，相对路径以网关工作目录为基准）。
+		// 空 = 用内置默认提示词（internal/prompt/defaultprompt.md）。
+		//
+		// 路径非空但不可读 / 内容为空 → 启动即报错（fail fast）：
+		// 用户明确配了文件却读不到时静默回落别的文本，现象是「配了却像没配」，
+		// 排查成本极高。注意该限制只作用于 custom 模式 —— passthrough 下
+		// 即使 file 填错也不该拦住启动（那段文本根本不会被使用）。
+		File string `json:"file"`
+	} `json:"prompt"`
+
 	Upstash struct {
 		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
 		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
@@ -172,6 +197,12 @@ type Config struct {
 	SessionGCInterval   time.Duration `json:"-"`
 	// CreditRefreshIntervalD 解析后的积分到期巡检周期。
 	CreditRefreshIntervalD time.Duration `json:"-"`
+	// PromptText custom 模式下**解析后**的系统提示词文本（passthrough 下恒空）。
+	//
+	// 在 normalize 阶段一次性读盘并缓存，而不是每个请求现读文件：
+	// 请求路径上做文件 IO 会引入可避免的延迟与失败面，且运行期改文件
+	// 本该由「改配置 + 重启」承载，语义更清晰（也避免读到写了一半的文件）。
+	PromptText string `json:"-"`
 }
 
 // RecordIdentities 把配置里的账号身份映射转成 records 包需要的形状
@@ -220,6 +251,9 @@ func Default() *Config {
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
 	c.Features.SanitizeBlacklistFingerprints = true
+	// 缺省 passthrough：透传客户端原始 system。老配置没有 prompt 块，
+	// 必须保持既有行为不变（见 Prompt.Mode 的注释）。
+	c.Prompt.Mode = "passthrough"
 	c.Pool.MaxInFlight = 3
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
@@ -289,6 +323,13 @@ func applyEnv(c *Config) {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.SanitizeBlacklistFingerprints = b
 		}
+	}
+	// 系统提示词替换：与参考实现同名（WB2A_PROMPT_*），便于两边配置互通。
+	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
+		c.Prompt.Mode = v
+	}
+	if v := os.Getenv("WB2A_PROMPT_FILE"); v != "" {
+		c.Prompt.File = v
 	}
 }
 
@@ -368,6 +409,38 @@ func (c *Config) normalize() error {
 	if err := c.validateScheduleHours(); err != nil {
 		return err
 	}
+	return c.normalizePrompt()
+}
+
+// normalizePrompt 校验 prompt.mode，并在 custom 模式下加载提示词文本。
+//
+// mode 只接受 custom / passthrough（大小写与首尾空白不敏感）；其余值**启动即报错**，
+// 而不是静默回落到某一个分支 —— 用户把 "costom" 拼错时，若静默按 passthrough 跑，
+// 表现为「按文档配了定制提示词却完全没生效」，是最难排查的一类配置错误。
+//
+// file 的 fail fast 范围**只限 custom 模式**：
+//   - custom：file 非空但不可读 / 内容为空 → 报错（用户明确要用它，读不到就是错）；
+//   - passthrough：**不读 file**，因此 file 写错也不会拦住启动 —— 该文本在
+//     passthrough 下根本不会被使用，为一段不生效的配置拦住服务启动没有意义，
+//     也会让「先填好文件、稍后再切模式」这种正常操作变得不可行。
+func (c *Config) normalizePrompt() error {
+	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
+	case "", "passthrough":
+		c.Prompt.Mode = "passthrough"
+	case "custom":
+		c.Prompt.Mode = "custom"
+	default:
+		return fmt.Errorf("prompt.mode: %q 不是合法值（custom / passthrough）", c.Prompt.Mode)
+	}
+	if c.Prompt.Mode != "custom" {
+		c.PromptText = ""
+		return nil
+	}
+	text, err := prompt.Load(strings.TrimSpace(c.Prompt.File))
+	if err != nil {
+		return err
+	}
+	c.PromptText = text
 	return nil
 }
 

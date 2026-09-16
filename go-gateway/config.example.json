@@ -29,6 +29,10 @@
   "features": {
     "sanitize_blacklist_fingerprints": true
   },
+  "prompt": {
+    "mode": "passthrough",
+    "file": ""
+  },
   "upstash": {
     "url": "",
     "token": ""
