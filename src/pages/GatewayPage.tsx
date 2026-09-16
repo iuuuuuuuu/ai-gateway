@@ -27,6 +27,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -469,9 +470,15 @@ export default function GatewayPage() {
   const [port, setPort] = useState(7863);
   const [apiKey, setApiKey] = useState("");
   const [autoStart, setAutoStart] = useState(false);
-  /** 网关工作模式：balance 负载均衡 / rotation 积分轮转 / pinned 指定账号 */
+  /** 网关工作模式：balance 自动 / manual 手动（勾选账号）/ rotation 积分轮转 */
   const [mode, setMode] = useState<GatewayMode>("balance");
-  const [pinnedUid, setPinnedUid] = useState<string>("");
+  /**
+   * 手动模式下勾选的账号 uid 列表（可多选）。
+   *
+   * 为什么是多选而不是单选：多个账号组成池子、内部仍按到期日分层自动均衡，
+   * 这是最常用的用法；只勾一个即等价于旧的「指定账号」。
+   */
+  const [manualUids, setManualUids] = useState<string[]>([]);
   /**
    * 「单一模型 + 积分轮转」锁定的模型名（空串 = 未锁定）。
    *
@@ -572,10 +579,26 @@ export default function GatewayPage() {
       setApiKey(cfg.api_key || "");
     }
     setAutoStart(Boolean(cfg.auto_start));
-    setMode(cfg.mode === "pinned" ? "pinned" : cfg.mode === "rotation" ? "rotation" : "balance");
-    setPinnedUid(cfg.pinned_uid ?? "");
+    setMode(cfg.mode === "manual" ? "manual" : cfg.mode === "rotation" ? "rotation" : "balance");
+    // 勾选列表：新字段优先；旧配置只有 pinned_uid 时读作「只勾了那一个」
+    setManualUids(
+      Array.isArray(cfg.manual_uids) && cfg.manual_uids.length > 0
+        ? cfg.manual_uids.filter((u): u is string => typeof u === "string" && u.trim() !== "")
+        : cfg.pinned_uid
+          ? [cfg.pinned_uid]
+          : [],
+    );
     setAllowedModel(cfg.allowed_model ?? "");
   }, []);
+
+  /** 手动模式的可选账号：排除已禁用与需重登的（它们不会进池，勾了也没用）。 */
+  const availableAccounts = useMemo(
+    () =>
+      (status?.accounts ?? []).filter(
+        (a) => !a.disabled && !a.needsRelogin && typeof a.uid === "string" && a.uid !== "",
+      ),
+    [status?.accounts],
+  );
 
   /**
    * 切换工作模式并立即生效。
@@ -588,25 +611,29 @@ export default function GatewayPage() {
    * `switchGatewayMode` 在 core 里把「保存 + 重导出 + 按需重启」合成一步。
    */
   async function changeMode(next: GatewayMode) {
-    const uid =
-      next === "pinned"
-        ? pinnedUid || status?.accounts?.[0]?.uid || ""
-        : null;
-    if (next === "pinned" && !uid) {
-      toast.error("「指定账号」模式需要先选择一个账号");
+    // 切到手动模式时若还没勾账号，默认勾上当前选中的（或第一个可用）账号 ——
+    // 否则用户点完立刻看到「未勾选任何账号」的报错，多一步无谓操作。
+    const uids =
+      next === "manual"
+        ? manualUids.length > 0
+          ? manualUids
+          : availableAccounts.slice(0, 1).map((a) => a.uid)
+        : [];
+    if (next === "manual" && uids.length === 0) {
+      toast.error("手动模式需要先勾选至少一个账号（当前账号库没有可用账号）");
       return;
     }
     setMode(next);
-    setPinnedUid(uid ?? "");
+    setManualUids(uids);
     try {
-      const res = await api.switchGatewayMode(next, uid);
+      const res = await api.switchGatewayMode(next, uids);
       if (res.reloaded) {
         toast.success(
-          next === "pinned"
-            ? "已切换为指定账号并重启网关"
+          next === "manual"
+            ? `已切换为手动模式（${uids.length} 个账号）并重启网关`
             : next === "rotation"
               ? "已切换为积分轮转并重启网关"
-              : "已切换为负载均衡并重启网关",
+              : "已切换为自动模式并重启网关",
           next === "rotation"
             ? { description: "将只用一个账号，烧到不可用才轮转到下一个" }
             : undefined,
@@ -620,13 +647,19 @@ export default function GatewayPage() {
   }
 
   /**
-   * 切换「随 App 启动」。同样是开关型设置，立即持久化，
-   * 否则 5 秒轮询会用后端旧值拨回开关。
+   * 手动模式下改勾选：立即重导出凭证并按需重启网关。
+   *
+   * 为什么每次勾选都立即生效而不是等「保存」：账号池是启动时建立的，
+   * 只改本地状态会让用户以为勾了就生效，实际池子没变。
    */
-  async function changeAutoStart(next: boolean) {
-    setAutoStart(next);
+  async function changeManualUids(next: string[]) {
+    setManualUids(next);
+    if (next.length === 0) {
+      // 交给「至少勾一个」的提示，不发请求（后端也会拒绝）
+      return;
+    }
     try {
-      await api.saveGatewayConfig({ auto_start: next });
+      await api.switchGatewayMode("manual", next);
       await refresh();
     } catch (e) {
       toast.error(api.asError(e));
@@ -634,11 +667,22 @@ export default function GatewayPage() {
     }
   }
 
-  /** 指定账号模式下切换目标账号，同样立即生效（重导出凭证 + 按需重启）。 */
-  async function changePinnedUid(uid: string) {
-    setPinnedUid(uid);
+  /** 勾/取消勾一个账号。 */
+  async function toggleManualUid(uid: string) {
+    const next = manualUids.includes(uid)
+      ? manualUids.filter((u) => u !== uid)
+      : [...manualUids, uid];
+    await changeManualUids(next);
+  }
+
+  /**
+   * 切换「随 App 启动」。同样是开关型设置，立即持久化，
+   * 否则 5 秒轮询会用后端旧值拨回开关。
+   */
+  async function changeAutoStart(next: boolean) {
+    setAutoStart(next);
     try {
-      await api.switchGatewayMode("pinned", uid);
+      await api.saveGatewayConfig({ auto_start: next });
       await refresh();
     } catch (e) {
       toast.error(api.asError(e));
@@ -1138,10 +1182,10 @@ export default function GatewayPage() {
             <div className="text-[13px]">工作模式</div>
             <div className="mt-0.5 text-[11px] text-muted-foreground">
               {mode === "balance"
-                ? "先打最近到期的积分，同一天到期的账号平均分摊（点击即时生效）"
+                ? "全部账号按到期日分层自动均衡（点击即时生效）"
                 : mode === "rotation"
                   ? "只用一个账号烧到不可用，再换按到期日排序的下一个（点击即时生效）"
-                  : "只使用下方指定的这一个账号（点击即时生效）"}
+                  : "只使用下方勾选的账号，池内仍自动均衡（点击即时生效）"}
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
@@ -1152,7 +1196,7 @@ export default function GatewayPage() {
               onClick={() => void changeMode("balance")}
             >
               <Shuffle className="size-3.5" />
-              负载均衡
+              自动
             </Button>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -1173,49 +1217,93 @@ export default function GatewayPage() {
               </TooltipContent>
             </Tooltip>
             <Button
-              variant={mode === "pinned" ? "default" : "outline"}
+              variant={mode === "manual" ? "default" : "outline"}
               size="sm"
               className="h-8 gap-1.5 px-2.5 text-xs"
-              onClick={() => void changeMode("pinned")}
+              onClick={() => void changeMode("manual")}
             >
               <UserRound className="size-3.5" />
-              指定账号
+              手动
             </Button>
           </div>
         </Row>
 
-        {/* 指定账号模式下选择账号 */}
-        {mode === "pinned" ? (
-          <Row className="flex-col items-stretch gap-2 sm:flex-row sm:items-center">
-            <div className="min-w-0">
-              <Label htmlFor="gw-account" className="text-[13px] font-normal">
-                使用账号
-              </Label>
-              <div className="mt-0.5 text-[11px] text-muted-foreground">
-                {status?.accounts?.length
-                  ? `共 ${status.accounts.length} 个账号可选`
-                  : "账号库为空"}
+        {/*
+          手动模式：勾选参与账号池的账号（可多选）。
+          用勾选列表而不是单选下拉：多个账号组成池子、内部仍自动均衡，
+          这是最常用的用法；勾一个即等价于旧的「指定账号」。
+        */}
+        {mode === "manual" ? (
+          <Row className="flex-col items-stretch gap-2">
+            <div className="flex min-w-0 items-center justify-between gap-3">
+              <div className="min-w-0">
+                <Label className="text-[13px] font-normal">参与账号池的账号</Label>
+                <div className="mt-0.5 text-[11px] text-muted-foreground">
+                  {availableAccounts.length
+                    ? `已勾选 ${manualUids.length} / 可选 ${availableAccounts.length} 个；池内仍按到期日分层自动均衡`
+                    : "账号库为空"}
+                </div>
               </div>
+              {availableAccounts.length > 0 && (
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2 text-xs"
+                    onClick={() => void changeManualUids(availableAccounts.map((a) => a.uid))}
+                  >
+                    全选
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2 text-xs"
+                    onClick={() => void changeManualUids([])}
+                  >
+                    清空
+                  </Button>
+                </div>
+              )}
             </div>
-            {/* Radix Select 不允许 value="" （会抛错），「未选择」用哨兵值表示，
-                再在 onValueChange 里映射回空串 —— 保证 state 里仍是空串语义。 */}
-            <Select
-              value={pinnedUid || NONE_VALUE}
-              onValueChange={(v) => void changePinnedUid(v === NONE_VALUE ? "" : v)}
-            >
-              <SelectTrigger id="gw-account" size="sm" className="w-44 shrink-0" aria-label="使用账号">
-                <SelectValue placeholder="（未选择）" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={NONE_VALUE}>（未选择）</SelectItem>
-                {(status?.accounts ?? []).map((a) => (
-                  <SelectItem key={a.uid} value={a.uid}>
-                    {a.nickname || a.uid.slice(0, 8)}
-                    {a.needsRelogin ? "（需重新登录）" : ""}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            {availableAccounts.length === 0 ? (
+              <div className="rounded-lg border border-dashed px-3 py-4 text-center text-xs text-muted-foreground">
+                账号库为空，请先在「账号管理」添加账号。
+              </div>
+            ) : (
+              <div className="max-h-56 min-w-0 overflow-y-auto rounded-lg border">
+                {availableAccounts.map((a) => {
+                  const checked = manualUids.includes(a.uid);
+                  return (
+                    <label
+                      key={a.uid}
+                      className={cn(
+                        "flex min-w-0 cursor-pointer items-center gap-2.5 border-b border-border/50 px-3 py-2 last:border-b-0 hover:bg-accent/50",
+                        checked && "bg-accent/30",
+                      )}
+                    >
+                      <Checkbox
+                        checked={checked}
+                        onCheckedChange={() => void toggleManualUid(a.uid)}
+                        aria-label={`选择账号 ${a.nickname || a.uid.slice(0, 8)}`}
+                      />
+                      <span className="min-w-0 flex-1 truncate text-xs">
+                        {a.nickname || a.uid.slice(0, 8)}
+                      </span>
+                      {a.needsRelogin ? (
+                        <Badge variant="outline" className="h-4 shrink-0 px-1 text-[10px] text-destructive">
+                          需重新登录
+                        </Badge>
+                      ) : null}
+                    </label>
+                  );
+                })}
+              </div>
+            )}
+            {manualUids.length === 0 ? (
+              <p className="text-[11px] text-amber-600 dark:text-amber-500">
+                至少勾选一个账号，否则网关启动时会因账号池为空而失败。
+              </p>
+            ) : null}
           </Row>
         ) : null}
 

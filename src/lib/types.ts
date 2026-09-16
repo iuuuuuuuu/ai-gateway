@@ -26,6 +26,14 @@ export interface AccountMeta {
    * 「这是谁的号、干什么用的」。备注只存本地，不参与登录。
    */
   note?: string | null;
+  /**
+   * 用户手动禁用：不进网关账号池。
+   *
+   * 注意：禁用的只是「接流量的资格」，签到 / 旅行 / 领奖等养号任务照跑 ——
+   * 号暂时不接流量不等于不要额度与连登天数。这与网关内部因冷却/熔断而
+   * 临时不可用完全不同：后者会自行恢复，前者只能由用户显式改回。
+   */
+  disabled?: boolean;
   /** 原始域名（如 www.workbuddy.ai / copilot.tencent.com）—— 排查时比区域标签更具体。 */
   domain?: string | null;
   /** 手机号（国服账号的真实身份线索；其 email 常为空）。 */
@@ -529,14 +537,25 @@ export interface CodeBuddyCnIdeSwitchResult {
  * pinned  —— 指定账号：只使用 pinned_uid 对应的那一个账号
  * rotation —— 单一模型 + 积分轮转：只用一个账号烧到不可用，再换按到期日
  *             排序的下一个（仍优先烧最快过期的额度）                      */
-export type GatewayMode = "balance" | "pinned" | "rotation";
+/**
+ * 网关工作模式。
+ *
+ * - `balance` 自动：全部（未禁用的）账号参与，池内加权随机 + 到期日分层
+ * - `manual`  手动：只使用勾选的账号，池内仍自动均衡
+ * - `rotation` 积分轮转：单一模型烧号，按到期日换下一个
+ *
+ * `pinned` 是历史值，读作 `manual`（后端 `GatewayMode::from_str` 已兼容）。
+ */
+export type GatewayMode = "balance" | "manual" | "rotation";
 
 export interface GatewayConfig {
   /** 是否已启用（启动过即为 true）。 */
   enabled: boolean;
   /** 网关工作模式。 */
   mode?: GatewayMode;
-  /** 指定账号模式下锁定的账号 uid。 */
+  /** 手动模式下勾选的账号 uid 列表（可多选）。 */
+  manual_uids?: string[];
+  /** 指定账号模式下锁定的账号 uid（旧字段，仅向后兼容）。 */
   pinned_uid?: string | null;
   /**
    * 「单一模型 + 积分轮转」锁定的模型名（仅 rotation 模式生效）。
@@ -635,12 +654,14 @@ export interface GatewayStatus {
   mode?: GatewayMode;
   /** 指定账号模式锁定的 uid。 */
   pinnedUid?: string | null;
-  /** 可选账号列表（供「指定账号」下拉使用）。 */
+  /** 可选账号列表（供手动模式的勾选列表使用）。 */
   accounts?: Array<{
     uid: string;
     nickname?: string;
     expiresAt?: number;
     needsRelogin?: boolean;
+    /** 用户手动禁用：勾选列表里不再展示（勾了也不会进池）。 */
+    disabled?: boolean;
   }>;
   /**
    * 因「需重新登录」而被排除出网关账号池的账号。

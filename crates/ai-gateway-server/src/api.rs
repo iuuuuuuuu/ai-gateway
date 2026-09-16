@@ -50,6 +50,7 @@ pub fn router() -> Router {
         .route("/api/status", get(api_status))
         .route("/api/accounts", get(api_accounts))
         .route("/api/accounts/note", post(api_set_account_note))
+        .route("/api/accounts/disabled", post(api_set_account_disabled))
         .route("/api/codebuddy-cli/status", get(api_codebuddy_cli_status))
         .route(
             "/api/codebuddy-cli/install-helper",
@@ -204,6 +205,36 @@ async fn api_set_account_note(Json(body): Json<Value>) -> Response {
         Ok(acc) => json_ok(json!({ "ok": true, "account": account::account_meta(&acc) })),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }
+}
+
+/// POST /api/accounts/disabled —— 设置账号禁用状态。
+///
+/// body: `{ "accountId": "...", "disabled": true }`
+///
+/// 语义：禁用 = 不进网关账号池；签到 / 旅行 / 上报等养号任务照跑。
+/// 改完立刻重导出凭证并按需重启网关，做到「点了就生效」。
+async fn api_set_account_disabled(Json(body): Json<Value>) -> Response {
+    let id = body
+        .get("accountId")
+        .or_else(|| body.get("account_id"))
+        .or_else(|| body.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if id.trim().is_empty() {
+        return json_err("缺少账号 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    // 缺省视为「禁用」：调用方通常是想禁用它，漏传字段时按更保守的语义处理
+    let disabled = body.get("disabled").and_then(Value::as_bool).unwrap_or(true);
+    let acc = match account::set_account_disabled(id, disabled) {
+        Ok(a) => a,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    let sync = ai_gateway_core::modules::gateway::sync_and_reload(true).await;
+    json_ok(json!({
+        "ok": true,
+        "account": account::account_meta(&acc),
+        "sync": sync,
+    }))
 }
 
 async fn api_codebuddy_cli_status() -> Response {
@@ -937,12 +968,45 @@ async fn api_gateway_config() -> Response {
     }))
 }
 
+/// 从请求体里取出「手动模式勾选的账号」。
+///
+/// 兼容三种写法（都指向同一语义，只是历史版本不同）：
+///   - `manualUids: ["uid-1", "uid-2"]`  ← 新格式
+///   - `manual_uids: [...]`              ← snake_case
+///   - `pinnedUid: "uid-1"`              ← 旧版单值，等价于「只勾了那一个」
+///
+/// 抽成函数是为了让两个入口（配置保存、模式切换）口径一致 ——
+/// 分别解析容易出现「一边认新格式、一边只认旧格式」的诡异差异。
+fn extract_manual_uids(body: &Value) -> Vec<String> {
+    for key in ["manualUids", "manual_uids"] {
+        if let Some(items) = body.get(key).and_then(Value::as_array) {
+            let list: Vec<String> = items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            return list;
+        }
+    }
+    body.get("pinnedUid")
+        .or_else(|| body.get("pinned_uid"))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .into_iter()
+        .collect()
+}
+
 /// POST /api/gateway/config —— 保存网关配置。
 async fn api_save_gateway_config(Json(body): Json<Value>) -> Response {
     // 前端 camelCase → 配置 snake_case
     let mut body = body;
     if let Some(u) = body.get("pinnedUid").cloned() {
         body["pinned_uid"] = u;
+    }
+    if let Some(u) = body.get("manualUids").cloned() {
+        body["manual_uids"] = u;
     }
     match ai_gateway_core::modules::gateway::save_gateway_config(&body) {
         Ok(v) => json_ok(json!({ "config": v })),
@@ -954,15 +1018,14 @@ async fn api_save_gateway_config(Json(body): Json<Value>) -> Response {
 ///
 /// 与 /api/gateway/config 的区别：后者只写配置文件，而网关账号池是启动时
 /// 建立的，改完必须手动重启才生效。此接口把三步合成一步。
+///
+/// body：`{ mode, manualUids: [...] }`。
+/// 兼容旧的 `pinnedUid` 单值形式（等价于「只勾那一个」）。
 async fn api_switch_gateway_mode(Json(body): Json<Value>) -> Response {
     let mode = body.get("mode").and_then(Value::as_str).unwrap_or("balance");
-    let pinned = body
-        .get("pinnedUid")
-        .or_else(|| body.get("pinned_uid"))
-        .and_then(Value::as_str)
-        .map(|s| s.to_string());
+    let uids = extract_manual_uids(&body);
     let mode = ai_gateway_core::modules::gateway::GatewayMode::from_str(mode);
-    let result = ai_gateway_core::modules::gateway::switch_mode(mode, pinned).await;
+    let result = ai_gateway_core::modules::gateway::switch_mode(mode, uids).await;
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
         let msg = result
             .get("error")

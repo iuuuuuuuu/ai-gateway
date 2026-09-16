@@ -1019,6 +1019,24 @@ export default function AccountsPage() {
                 // 备注改完后重新拉列表：备注存在账号库里，卡片本身不持有列表状态，
                 // 不刷新的话关闭弹窗后卡片上仍是旧备注。
                 onNoteSaved={() => void fetchAll()}
+                // 禁用状态存在账号库里，且后端会重导出凭证并按需重启网关，
+                // 因此这里刷新账号列表让界面立刻反映新状态。
+                onToggleDisabled={async (target) => {
+                  const next = !target.disabled;
+                  const label = target.nickname || target.uid || "该账号";
+                  try {
+                    await api.setAccountDisabled(target.id, next);
+                    toast.success(
+                      next
+                        ? `已禁用「${label}」：不再进入账号池，签到等养号任务继续运行`
+                        : `已启用「${label}」：已重新加入账号池`,
+                    );
+                  } catch (e) {
+                    toast.error(api.asError(e));
+                  }
+                  // 无论成功失败都刷新：失败时界面回到后端真实状态
+                  await fetchAll();
+                }}
                 onSwitch={setSwitchAccount}
                 onCheckin={onCheckin}
                 onRefresh={onRefresh}

@@ -194,6 +194,7 @@ pub fn run() {
             commands::detect_codebuddy_cn_ide_account,
             commands::delete_account,
             commands::set_account_note,
+            commands::set_account_disabled,
             commands::oauth_start,
             commands::oauth_status,
             commands::import_local,

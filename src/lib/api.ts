@@ -104,6 +104,7 @@ const ROUTES: Record<string, Route> = {
   detect_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/detect" },
   delete_account: { method: "POST", path: "/api/delete" },
   set_account_note: { method: "POST", path: "/api/accounts/note" },
+  set_account_disabled: { method: "POST", path: "/api/accounts/disabled" },
   oauth_start: { method: "POST", path: "/api/oauth/start" },
   oauth_status: { method: "POST", path: "/api/oauth/status" },
   import_local: { method: "POST", path: "/api/import-local" },
@@ -758,6 +759,7 @@ export function saveGatewayConfig(config: Partial<GatewayConfig>): Promise<{ con
   if (config.auto_start !== undefined) args.autoStart = config.auto_start;
   if (config.mode !== undefined) args.mode = config.mode;
   if (config.pinned_uid !== undefined) args.pinnedUid = config.pinned_uid;
+  if (config.manual_uids !== undefined) args.manualUids = config.manual_uids;
   return call<{ config: GatewayConfig }>("save_gateway_config", args);
 }
 
@@ -798,15 +800,30 @@ export function syncGatewayAccounts(autoReload = true): Promise<GatewaySyncResul
  *
  * 与 saveGatewayConfig 的区别：那个只写配置文件，而网关账号池是启动时建立的，
  * 因此改完必须手动重启才生效。此接口把「保存 + 重导出凭证 + 按需重启」合成一步。
+ *
+ * @param manualUids 手动模式下勾选的账号列表（可多选）。
  */
 export function switchGatewayMode(
   mode: GatewayMode,
-  pinnedUid?: string | null,
+  manualUids?: string[] | null,
 ): Promise<GatewayModeSwitchResult> {
   return call<GatewayModeSwitchResult>("switch_gateway_mode", {
     mode,
-    pinnedUid: pinnedUid ?? null,
+    manualUids: manualUids ?? [],
   });
+}
+
+/**
+ * 设置账号的禁用状态。
+ *
+ * 语义：禁用 = 不进网关账号池；签到 / 旅行 / 上报等养号任务照跑。
+ * 后端会顺带重导出凭证并按需重启网关，做到「点了就生效」。
+ */
+export function setAccountDisabled(
+  accountId: string,
+  disabled: boolean,
+): Promise<{ ok: boolean; account: AccountMeta; sync?: unknown }> {
+  return call("set_account_disabled", { accountId, disabled });
 }
 
 /**

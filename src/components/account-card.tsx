@@ -1,4 +1,4 @@
-import { ArrowRight, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Globe, History, Info, Loader2, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2 } from "lucide-react";
+import { ArrowRight, Ban, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Globe, History, Info, Loader2, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
@@ -273,6 +273,13 @@ interface Props {
   onDelete: (a: AccountMeta) => void;
   /** 备注保存成功后触发，供父级重新拉取账号列表（卡片自身不持有列表状态）。 */
   onNoteSaved?: () => void;
+  /**
+   * 切换账号的禁用状态。
+   *
+   * 禁用 = 不进网关账号池；签到 / 旅行 / 领奖等养号任务照跑。
+   * 由父级实现（需要提示、刷新列表），卡片只负责触发。
+   */
+  onToggleDisabled?: (a: AccountMeta) => void;
   onCheckin?: (a: AccountMeta) => void;
   onRefresh?: (a: AccountMeta) => void;
   /** 领养 Buddy（仅领养，不派猫；与「一键旅行」的重叠部分单独暴露出来） */
@@ -334,7 +341,7 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
   );
 }
 
-export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefresh, onAdopt, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, onCheckin, onRefresh, onAdopt, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
   /** 备注编辑弹窗；`noteDraft` 是受控输入（打开时用当前备注初始化）。 */
   const [noteOpen, setNoteOpen] = useState(false);
@@ -380,6 +387,18 @@ export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefre
 
   const statusChips = (
     <>
+      {/* 禁用标记放在最前：它是「这个号当前不接流量」的最强信号，
+          比备注/区域等描述性标签更需要一眼看到。 */}
+      {account.disabled ? (
+        <Badge
+          variant="outline"
+          className={cn(chipClass, "gap-1 border-destructive/40 text-destructive")}
+          title="已禁用：不进入网关账号池（签到等养号任务仍在运行）"
+        >
+          <Ban className="size-3 shrink-0" />
+          已禁用
+        </Badge>
+      ) : null}
       {/* 备注放在最前面：它是用户自己起的标签，正是用来「一眼认出这是谁的号」的，
           排在区域/签到等自动状态之前才符合使用意图。 */}
       {account.note ? (
@@ -487,6 +506,26 @@ export function AccountCard({ account, onDelete, onNoteSaved, onCheckin, onRefre
                 <DropdownMenuItem onSelect={() => setRecordsOpen(true)}>
                   <History />
                   查看记录
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                {/* 禁用/启用：禁用的只是「进网关账号池的资格」，
+                    签到等养号任务照跑，因此文案强调「不接流量」而非「停用账号」。 */}
+                <DropdownMenuItem
+                  onSelect={() => {
+                    onToggleDisabled?.(account);
+                  }}
+                >
+                  {account.disabled ? (
+                    <>
+                      <CircleCheck />
+                      启用（重新加入账号池）
+                    </>
+                  ) : (
+                    <>
+                      <Ban />
+                      禁用（不进入账号池）
+                    </>
+                  )}
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>

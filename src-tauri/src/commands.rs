@@ -160,6 +160,27 @@ pub fn set_account_note(account_id: String, note: String) -> Result<Value, Strin
     Ok(json!({ "ok": true, "account": account::account_meta(&acc) }))
 }
 
+/// POST /api/accounts/disabled —— 设置账号的禁用状态。
+///
+/// 语义（与所有者确认）：禁用 = **不进网关账号池**，但签到 / 旅行 / 上报等
+/// 养号任务照跑。「号暂时不接流量」不等于「不要额度与连登天数」，
+/// 把两者绑死会让用户失去「先养着，以后再启用」这个最常用的用法。
+///
+/// 禁用只改本地账号库字段；真正生效需要在导出凭证时过滤（见 gateway.rs 的
+/// should_export），因此这里顺带触发一次重导出 + 重启，做到「点了就生效」。
+#[tauri::command]
+pub async fn set_account_disabled(account_id: String, disabled: bool) -> Result<Value, String> {
+    let acc = account::set_account_disabled(&account_id, disabled)?;
+    // 禁用状态直接影响导出集合：立刻重导出，网关在跑则重启以加载新池。
+    // 失败不阻断（账号状态已存好），但要如实回报，否则用户以为没生效。
+    let sync = ai_gateway_core::modules::gateway::sync_and_reload(true).await;
+    Ok(json!({
+        "ok": true,
+        "account": account::account_meta(&acc),
+        "sync": sync,
+    }))
+}
+
 /// POST /api/oauth/start —— 发起 OAuth 扫码登录。
 ///
 /// `region` 为 `"cn"`（缺省）或 `"intl"`：决定取 state 的域名与平台标识
@@ -775,6 +796,7 @@ pub fn save_gateway_config(
     auto_start: Option<bool>,
     mode: Option<String>,
     pinned_uid: Option<String>,
+    manual_uids: Option<Vec<String>>,
 ) -> Result<Value, String> {
     let mut patch = serde_json::Map::new();
     if let Some(p) = port {
@@ -791,6 +813,15 @@ pub fn save_gateway_config(
     }
     if let Some(u) = pinned_uid {
         patch.insert("pinned_uid".to_string(), json!(u));
+    }
+    // 手动模式勾选的账号列表（多选）
+    if let Some(list) = manual_uids {
+        let cleaned: Vec<String> = list
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        patch.insert("manual_uids".to_string(), json!(cleaned));
     }
     let v = ai_gateway_core::modules::gateway::save_gateway_config(&Value::Object(patch))?;
     Ok(json!({ "config": v }))
@@ -819,11 +850,22 @@ pub fn kill_gateway_port_holder(port: u16) -> Result<Value, String> {
 ///
 /// 与 `save_gateway_config` 的区别：后者只写配置文件，而网关的账号池是
 /// 启动时建立的，因此改完必须手动重启才生效。本命令把「保存 + 重导出 + 重启」
-/// 合成一步，让「负载均衡 ↔ 指定账号」点击即生效。
+/// 合成一步，让「自动 ↔ 手动」点击即生效。
+///
+/// `manual_uids` 是手动模式下勾选的账号列表；`pinned_uid` 保留仅为兼容旧前端调用。
 #[tauri::command(rename_all = "camelCase")]
-pub async fn switch_gateway_mode(mode: String, pinned_uid: Option<String>) -> Result<Value, String> {
+pub async fn switch_gateway_mode(
+    mode: String,
+    manual_uids: Option<Vec<String>>,
+    pinned_uid: Option<String>,
+) -> Result<Value, String> {
     let mode = ai_gateway_core::modules::gateway::GatewayMode::from_str(&mode);
-    let result = ai_gateway_core::modules::gateway::switch_mode(mode, pinned_uid).await;
+    // 新字段优先；旧前端只传 pinned_uid 时按「只勾了那一个」处理
+    let uids: Vec<String> = match manual_uids {
+        Some(list) => list,
+        None => pinned_uid.into_iter().collect(),
+    };
+    let result = ai_gateway_core::modules::gateway::switch_mode(mode, uids).await;
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
         let msg = result
             .get("error")

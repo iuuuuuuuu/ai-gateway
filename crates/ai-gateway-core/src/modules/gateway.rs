@@ -405,15 +405,20 @@ fn select_export_uids(candidates: &[String], only: &Option<Vec<String>>) -> Vec<
 /// 网关工作模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayMode {
-    /// 负载均衡：账号池加权随机选号，自动避开冷却/熔断的账号。
+    /// 自动（负载均衡）：账号池加权随机选号，自动避开冷却/熔断的账号；
+    /// 全部（未禁用的）账号参与。
     Balance,
-    /// 指定账号：只使用 pinned_uid 对应的账号。
-    Pinned,
+    /// 手动：只使用用户勾选的账号，池子内部仍按到期日分层 + 加权随机选号。
+    ///
+    /// 与旧的「指定账号（Pinned）」的关系：手动模式是它的推广 ——
+    /// 勾一个账号时行为与旧「指定账号」等价，勾多个则在勾选集合内均衡。
+    /// 旧配置里的 `pinned_uid` 会被当作「只勾了那一个」读取，无需迁移。
+    Manual,
     /// 单一模型 + 积分轮转：只用一个账号烧到不可用，再换按到期日排序的下一个。
     ///
-    /// 与 Pinned 的关键区别：**仍然导出全部账号** —— 轮转需要「下一个」作为备选，
-    /// 只导出一个是转不起来的。区别在网关侧的选择策略（pool.rotation），
-    /// 而不在凭证范围。
+    /// 与手动模式的关键区别：**轮转不看勾选列表**（除非同时处于手动模式）——
+    /// 它的「换下一个」依赖备选账号都在池里，只导出一个是转不起来的。
+    /// 区别在网关侧的选择策略（pool.rotation），而不在凭证范围。
     Rotation,
 }
 
@@ -421,13 +426,15 @@ impl GatewayMode {
     pub fn as_str(&self) -> &'static str {
         match self {
             GatewayMode::Balance => "balance",
-            GatewayMode::Pinned => "pinned",
+            GatewayMode::Manual => "manual",
             GatewayMode::Rotation => "rotation",
         }
     }
+
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
-            "pinned" | "pin" | "single" => GatewayMode::Pinned,
+            // 兼容旧值："pinned" 是手动模式的单账号特例，读作手动即可
+            "manual" | "pinned" | "pin" | "single" => GatewayMode::Manual,
             // 兼容几种自然叫法：轮转 / 单一模型轮转
             "rotation" | "rotate" | "rolling" => GatewayMode::Rotation,
             _ => GatewayMode::Balance,
@@ -441,7 +448,10 @@ pub fn gateway_mode() -> GatewayMode {
         .get("mode").and_then(Value::as_str).unwrap_or("balance"))
 }
 
-/// 读取「指定账号」模式锁定的 uid。
+/// 读取「指定账号」模式锁定的单个 uid（**旧字段，仅为向后兼容保留**）。
+///
+/// 新代码请用 `manual_uids()`：手动模式支持勾选多个账号，
+/// 单个 uid 只是「只勾了一个」的特例。
 pub fn pinned_uid() -> Option<String> {
     let cfg = load_gateway_config();
     // 注意：必须先把配置绑定到变量，否则临时值在语句结束即被释放（E0716）
@@ -449,18 +459,42 @@ pub fn pinned_uid() -> Option<String> {
     if s.is_empty() { None } else { Some(s.to_string()) }
 }
 
+/// 手动模式下用户勾选的账号 uid 列表。
+///
+/// 读取顺序（保证旧配置无需迁移即可继续工作）：
+///   1. `manual_uids` 数组（新字段）
+///   2. `pinned_uid` 单值（旧字段）—— 旧版「指定账号」模式只锁一个账号，
+///      读作「只勾了那一个」语义完全一致
+///
+/// 返回空列表表示「没勾任何账号」，调用方应视为配置不完整并提示用户，
+/// 而不是悄悄放行全部账号（那会让「手动」模式静默退化成「自动」）。
+pub fn manual_uids() -> Vec<String> {
+    let cfg = load_gateway_config();
+    if let Some(items) = cfg.get("manual_uids").and_then(Value::as_array) {
+        return items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+    }
+    pinned_uid().into_iter().collect()
+}
+
 /// 当前实际参与网关的账号 uid 集合。
 ///
-/// 负载均衡 / 轮转：全部账号；指定账号：仅 pinned_uid。
+/// 自动（Balance）：全部账号；手动（Manual）：仅勾选的账号。
 /// 网关依据 `auths/` 目录里的凭证文件建立账号池，
-/// 因此「只导出目标账号」即可实现指定账号，同时保留熔断/冷却/粘性等能力。
+/// 因此「只导出勾选的账号」即可实现手动模式，同时保留熔断/冷却/粘性等能力。
 ///
-/// 轮转模式刻意**不过滤**：它的「换下一个」依赖备选账号都在池里。
+/// 轮转模式（Rotation）刻意**不过滤**：它的「换下一个」依赖备选账号都在池里，
+/// 只导出一个是转不起来的。
 fn active_uids() -> Option<Vec<String>> {
     match gateway_mode() {
         // None = 不过滤，全部导出
         GatewayMode::Balance | GatewayMode::Rotation => None,
-        GatewayMode::Pinned => Some(pinned_uid().into_iter().collect()),
+        GatewayMode::Manual => Some(manual_uids()),
     }
 }
 
@@ -503,6 +537,14 @@ pub fn export_accounts_to_dir(
         if needs_relogin(acc) {
             return false;
         }
+        // 用户手动禁用的账号不进池：这是显式意图，优先级高于任何模式选择
+        //（即使它出现在手动模式的勾选列表里也不导出 —— 否则「禁用」会被模式覆盖，
+        // 用户会看到「明明禁用了却还在接流量」）。
+        // 注意：只影响网关池；签到 / 旅行 / 上报等养号任务照跑
+        //（与所有者确认的语义：禁用 ≠ 停止养号）。
+        if crate::modules::account::account_disabled(acc) {
+            return false;
+        }
         let uid = account::get_str(acc, "uid").unwrap_or_default();
         !select_export_uids(&[uid], &only).is_empty()
     };
@@ -530,11 +572,19 @@ pub fn export_accounts_to_dir(
         written += 1;
     }
 
-    // 清理不再需要的凭证：账号库中已删除的、因模式切换而不再导出的，
-    // 以及已被标记需重新登录的（留着只会让网关持续调用失效凭证）。
+    // 清理不再需要的凭证：账号库中已删除的、因模式切换而不再导出的、
+    // 已被标记需重新登录的，以及被用户**手动禁用**的
+    //（留着只会让网关持续把它加载进池）。
+    //
+    // 这里的过滤条件必须与上面 `should_export` **逐条对应** ——
+    // 二者一旦分叉就会出现「导出时不写、清理时又保留」的残留凭证，
+    // 网关仍会把旧账号加载进池，表现为「禁用/切换模式不生效」。
+    // （本函数此前正是漏了 disabled 这一条：导出侧已加过滤，
+    //   清理侧只滤了 needs_relogin，导致禁用账号的凭证文件永远留着。）
     let all_uids: Vec<String> = accounts
         .iter()
         .filter(|a| !needs_relogin(a))
+        .filter(|a| !crate::modules::account::account_disabled(a))
         .filter_map(|a| account::get_str(a, "uid"))
         .collect();
     let live: Vec<String> = select_export_uids(&all_uids, &only)
@@ -1221,21 +1271,28 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
                  已暂停导出到网关。请先在「账号管理」页重新登录，恢复后会自动重新加入。"
             ));
         }
-        if gateway_mode() == GatewayMode::Pinned {
-            let pinned = pinned_uid().unwrap_or_default();
-            if accounts
+        if gateway_mode() == GatewayMode::Manual {
+            let picked = manual_uids();
+            // 勾了账号但全都不可用：明确指出问题，而不是笼统说「账号库为空」
+            let dead_picked = picked
                 .iter()
-                .any(|a| account::get_str(a, "uid").as_deref() == Some(pinned.as_str()) && needs_relogin(a))
-            {
+                .filter(|u| {
+                    accounts.iter().any(|a| {
+                        account::get_str(a, "uid").as_deref() == Some(u.as_str())
+                            && (needs_relogin(a) || account::account_disabled(a))
+                    })
+                })
+                .count();
+            if !picked.is_empty() && dead_picked == picked.len() {
                 return Err(
-                    "「指定账号」锁定的账号已标记「需重新登录」，请先在「账号管理」页重新登录，\
-                     或改选其他账号。"
+                    "手动模式勾选的账号都不可用（需重新登录或已被禁用），\
+                     请在网关页面重新勾选。"
                         .to_string(),
                 );
             }
         }
         return Err(match gateway_mode() {
-            GatewayMode::Pinned => "「指定账号」模式尚未选择账号，请在网关页面选择后启动".to_string(),
+            GatewayMode::Manual => "手动模式尚未勾选任何账号，请在网关页面勾选后启动".to_string(),
             GatewayMode::Balance => "账号库为空，请先添加账号再启动网关".to_string(),
             // 轮转模式同样需要至少一个账号；此时「没有下一个可轮转」是主要问题。
             GatewayMode::Rotation => {
@@ -1519,16 +1576,29 @@ pub fn sync_only() -> Value {
 /// 抽成纯函数便于测试：`switch_mode` 会真的写用户配置并可能重启网关，
 /// 不适合在单测里直接调用。
 ///
-/// 语义：切到负载均衡时 `pinned_uid` 置 null（避免残留旧锁定值导致
-/// 下次切回指定账号时用到意料之外的账号）；空串同样归一为 null。
-fn mode_patch(mode: GatewayMode, pinned_uid: Option<&str>) -> Value {
-    let pinned = match pinned_uid.map(str::trim) {
-        Some(uid) if !uid.is_empty() => json!(uid),
-        _ => Value::Null,
+/// 语义：
+///   - 切到自动（Balance）时清空 `manual_uids` 与 `pinned_uid`，
+///     避免残留勾选值导致下次切回手动时用到意料之外的账号。
+///   - `pinned_uid` 始终写 null：它是旧字段，新代码统一用 `manual_uids`。
+///     保留写 null 是为了让升级后的配置不残留旧锁定值（否则 `manual_uids()`
+///     读不到数组时会回退到 `pinned_uid`，行为变得难以预测）。
+fn mode_patch(mode: GatewayMode, uids: &[String]) -> Value {
+    let list: Vec<Value> = uids
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| json!(s))
+        .collect();
+    // 仅手动模式保留勾选列表；其它模式清空，避免模式切换后残留
+    let manual = if mode == GatewayMode::Manual {
+        json!(list)
+    } else {
+        json!([])
     };
     json!({
         "mode": mode.as_str(),
-        "pinned_uid": pinned,
+        "manual_uids": manual,
+        "pinned_uid": Value::Null,
     })
 }
 
@@ -1597,35 +1667,40 @@ pub async fn set_allowed_model(model: &str) -> Value {
     })
 }
 
-/// 切换工作模式（负载均衡 / 指定账号）并**立即生效**。
+/// 切换工作模式（自动 / 手动 / 轮转）并**立即生效**。
 ///
 /// 为什么需要这个专用入口：`save_gateway_config` 只写配置文件，
 /// 而网关的账号池是**启动时**扫描 `gateway_auths/` 建立的，两者都不会
-/// 因改配置而变化。于是用户点了「指定账号」后，池里仍是全部账号，
+/// 因改配置而变化。于是用户切到手动模式后，池里仍是全部账号，
 /// 必须手动点「重启」才真正生效（这正是「切换模式要重启」的根因）。
 ///
 /// 这里把三件事合成一步：
-///  1. 落盘新配置（mode / pinned_uid）
+///  1. 落盘新配置（mode / manual_uids）
 ///  2. 按新模式重导出凭证（清理不再需要的账号文件）
 ///  3. 若网关正在运行，重启它以加载新池
 ///
 /// 未运行时只做 1+2：下次启动自然是新池，无需空转重启。
-pub async fn switch_mode(mode: GatewayMode, pinned_uid: Option<String>) -> Value {
-    let patch = mode_patch(mode, pinned_uid.as_deref());
+pub async fn switch_mode(mode: GatewayMode, uids: Vec<String>) -> Value {
+    // 校验必须在**写配置之前**：否则被拒绝的请求仍会把配置改成非法状态
+    //（实测：空勾选被拒后，配置里的 manual_uids 已被清空，
+    //  用户原来的勾选被一次无效操作悄悄抹掉）。
+    let picked: Vec<String> = uids
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if mode == GatewayMode::Manual && picked.is_empty() {
+        return json!({
+            "ok": false,
+            "error": "手动模式需要先勾选至少一个账号",
+        });
+    }
+
+    let patch = mode_patch(mode, &picked);
     let cfg = match save_gateway_config(&patch) {
         Ok(v) => v,
         Err(e) => return json!({ "ok": false, "error": e }),
     };
-
-    // 指定账号模式必须先选好账号，否则池会是空的 —— 提前拦住并给出可操作提示，
-    // 而不是让用户看到一个「启动了但没有账号」的网关。
-    if mode == GatewayMode::Pinned && pinned_uid.as_deref().unwrap_or("").trim().is_empty() {
-        return json!({
-            "ok": false,
-            "error": "「指定账号」模式需要先选择一个账号",
-            "config": cfg,
-        });
-    }
 
     let (count, changed) = match export_accounts_to_gateway() {
         Ok(v) => v,
@@ -1659,7 +1734,8 @@ pub async fn switch_mode(mode: GatewayMode, pinned_uid: Option<String>) -> Value
     json!({
         "ok": true,
         "mode": mode.as_str(),
-        "pinnedUid": pinned_uid,
+        // 勾选的账号列表（前端据此回显勾选状态）
+        "manualUids": picked,
         "accounts": count,
         "changed": changed,
         "reloaded": reloaded,
@@ -2068,35 +2144,51 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // 模式切换补丁：切回负载均衡必须清掉 pinned_uid（否则残留旧锁定值）。
+    // 模式切换补丁：切到自动模式必须清空勾选列表（否则残留旧值，
+    // 下次切回手动时会用到意料之外的账号）。
     #[test]
-    fn mode_patch_sets_mode_and_pinned() {
-        let p = super::mode_patch(GatewayMode::Pinned, Some("uid-1"));
-        assert_eq!(p["mode"], "pinned");
-        assert_eq!(p["pinned_uid"], "uid-1");
+    fn mode_patch_sets_mode_and_manual_uids() {
+        let p = super::mode_patch(GatewayMode::Manual, &["uid-1".to_string()]);
+        assert_eq!(p["mode"], "manual");
+        assert_eq!(p["manual_uids"][0], "uid-1");
 
-        // 负载均衡：pinned_uid 归 null，不带任何遗留值。
-        let b = super::mode_patch(GatewayMode::Balance, None);
+        // 多选：顺序保留、空值被剔除
+        let m = super::mode_patch(
+            GatewayMode::Manual,
+            &["uid-1".to_string(), "  ".to_string(), " uid-2 ".to_string()],
+        );
+        assert_eq!(m["manual_uids"].as_array().map(Vec::len), Some(2));
+        assert_eq!(m["manual_uids"][0], "uid-1");
+        assert_eq!(m["manual_uids"][1], "uid-2", "首尾空白应被裁掉");
+
+        // 自动模式：勾选列表清空，不带任何遗留值
+        let b = super::mode_patch(GatewayMode::Balance, &[]);
         assert_eq!(b["mode"], "balance");
+        assert_eq!(b["manual_uids"].as_array().map(Vec::len), Some(0));
         assert!(b["pinned_uid"].is_null());
 
-        // 空串/纯空白同样归一为 null（前端「未选择」会传空串）。
-        for empty in ["", "   "] {
-            let e = super::mode_patch(GatewayMode::Pinned, Some(empty));
-            assert!(e["pinned_uid"].is_null(), "empty {empty:?} must become null");
-        }
+        // 即使误传了 uid，自动模式也不应保留（否则模式语义会被绕过）
+        let b2 = super::mode_patch(GatewayMode::Balance, &["uid-9".to_string()]);
+        assert_eq!(b2["manual_uids"].as_array().map(Vec::len), Some(0));
 
-        // uid 首尾空白被裁掉（避免与账号库里的 uid 不匹配导致导出为空）。
-        let t = super::mode_patch(GatewayMode::Pinned, Some("  uid-2  "));
-        assert_eq!(t["pinned_uid"], "uid-2");
+        // 旧字段 pinned_uid 一律写 null：新版统一用 manual_uids
+        for mode in [GatewayMode::Balance, GatewayMode::Manual, GatewayMode::Rotation] {
+            let v = super::mode_patch(mode, &["uid-1".to_string()]);
+            assert!(v["pinned_uid"].is_null(), "pinned_uid 应恒为 null");
+        }
     }
 
     // 模式字符串解析：未知值一律回落 balance（不报错、不误锁账号）。
     #[test]
     fn gateway_mode_from_str_defaults_to_balance() {
-        assert_eq!(GatewayMode::from_str("pinned"), GatewayMode::Pinned);
-        assert_eq!(GatewayMode::from_str("PINNED"), GatewayMode::Pinned);
-        assert_eq!(GatewayMode::from_str("single"), GatewayMode::Pinned);
+        // 旧值 "pinned" 必须读作手动模式，否则老用户升级后配置失效
+        for s in ["pinned", "PINNED", "pin", "single", "manual", "MANUAL"] {
+            assert_eq!(
+                GatewayMode::from_str(s),
+                GatewayMode::Manual,
+                "输入 {s:?} 应解析为手动模式"
+            );
+        }
         assert_eq!(GatewayMode::from_str("balance"), GatewayMode::Balance);
         assert_eq!(GatewayMode::from_str(""), GatewayMode::Balance);
         assert_eq!(GatewayMode::from_str("garbage"), GatewayMode::Balance);
@@ -2109,17 +2201,27 @@ mod tests {
             assert_eq!(GatewayMode::from_str(s), GatewayMode::Rotation, "输入 {s:?}");
         }
         assert_eq!(GatewayMode::Rotation.as_str(), "rotation");
-        // 不能被误当成 pinned（两者语义完全不同：pinned 只导出一个账号）
-        assert_ne!(GatewayMode::from_str("rotation"), GatewayMode::Pinned);
+        // 不能被误当成手动（两者语义不同：手动只导出勾选的账号）
+        assert_ne!(GatewayMode::from_str("rotation"), GatewayMode::Manual);
     }
 
-    // 轮转模式的 mode_patch 必须清掉 pinned_uid —— 否则从「指定账号」切过去时
-    // 会残留旧锁定值，而 active_uids() 对轮转是「不过滤」，残留值虽不生效，
-    // 但下次切回 pinned 会用到意料之外的账号。
+    // 手动模式与自动模式的字符串互不混淆。
     #[test]
-    fn mode_patch_for_rotation_clears_pinned() {
-        let r = super::mode_patch(GatewayMode::Rotation, None);
+    fn manual_mode_round_trips() {
+        assert_eq!(GatewayMode::Manual.as_str(), "manual");
+        assert_eq!(GatewayMode::from_str("manual"), GatewayMode::Manual);
+        assert_eq!(GatewayMode::Balance.as_str(), "balance");
+        assert_ne!(GatewayMode::Manual, GatewayMode::Balance);
+    }
+
+    // 轮转模式的 mode_patch 必须清空勾选列表 —— 否则从手动切过去时会残留值，
+    // 而 active_uids() 对轮转是「不过滤」，残留值虽不生效，
+    // 但下次切回手动会用到意料之外的账号。
+    #[test]
+    fn mode_patch_for_rotation_clears_manual_uids() {
+        let r = super::mode_patch(GatewayMode::Rotation, &["uid-1".to_string()]);
         assert_eq!(r["mode"], "rotation");
+        assert_eq!(r["manual_uids"].as_array().map(Vec::len), Some(0));
         assert!(r["pinned_uid"].is_null(), "轮转模式不应带 pinned_uid");
     }
 
@@ -2391,4 +2493,239 @@ mod tests {
         );
         drop(listener);
     }
+
+    // -----------------------------------------------------------------------
+    // 账号禁用：不进网关池（需求1）
+    //
+    // 语义（与所有者确认）：禁用 = 不进账号池；签到 / 旅行 / 上报等养号任务照跑。
+    // 因此这里只验证「导出集合」这一个可观测点。
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn disabled_account_is_excluded_from_gateway_export() {
+        let dir = std::env::temp_dir().join(format!("wb-gw-disabled-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let active = json!({
+            "uid": "uid-on", "nickname": "启用号", "access_token": "AT-ON",
+            "refresh_token": "RT-ON", "domain": "copilot.tencent.com", "expiresAt": 1_900_000_000_000i64,
+        });
+        let off = json!({
+            "uid": "uid-off", "nickname": "禁用号", "access_token": "AT-OFF",
+            "refresh_token": "RT-OFF", "domain": "copilot.tencent.com", "expiresAt": 1_900_000_000_000i64,
+            "disabled": true,
+        });
+
+        // 先让两个账号都在池里（模拟禁用前的状态）。
+        //
+        // 注意：seed 时**不能**带 disabled 字段 —— 禁用账号在任何情况下都不导出，
+        // 因此必须用「未禁用形态」写入，才能构造出「凭证已在池中」这个前置条件。
+        let off_before = json!({
+            "uid": "uid-off", "nickname": "禁用号", "access_token": "AT-OFF",
+            "refresh_token": "RT-OFF", "domain": "copilot.tencent.com", "expiresAt": 1_900_000_000_000i64,
+        });
+        export_accounts_to_dir(&dir, &[active.clone(), off_before], None).expect("seed both");
+        assert!(dir.join("workbuddy-uid-off.json").exists(), "前置条件：禁用号此刻在池中");
+
+        // 打上禁用标记后：它的凭证必须被清理掉
+        export_accounts_to_dir(&dir, &[active.clone(), off.clone()], None).expect("export with disabled");
+        assert!(
+            !dir.join("workbuddy-uid-off.json").exists(),
+            "禁用账号的凭证必须被删除，否则网关仍会把它加载进池"
+        );
+        assert!(dir.join("workbuddy-uid-on.json").exists(), "启用账号应保留");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn disabled_takes_priority_over_manual_selection() {
+        // 关键：即使禁用账号出现在手动勾选列表里，也不得导出 ——
+        // 否则「禁用」会被模式覆盖，用户会看到「明明禁用了却还在接流量」。
+        let dir = std::env::temp_dir().join(format!("wb-gw-prio-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let picked = json!({
+            "uid": "uid-picked", "access_token": "AT-P", "domain": "copilot.tencent.com",
+            "expiresAt": 1_900_000_000_000i64,
+        });
+        let picked_but_disabled = json!({
+            "uid": "uid-pd", "access_token": "AT-PD", "domain": "copilot.tencent.com",
+            "expiresAt": 1_900_000_000_000i64, "disabled": true,
+        });
+
+        let only = Some(vec!["uid-picked".to_string(), "uid-pd".to_string()]);
+        export_accounts_to_dir(&dir, &[picked, picked_but_disabled], only).expect("export");
+
+        assert!(dir.join("workbuddy-uid-picked.json").exists(), "勾选且启用的应导出");
+        assert!(
+            !dir.join("workbuddy-uid-pd.json").exists(),
+            "勾选但被禁用的不应导出（禁用优先于勾选）"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn re_enabling_restores_credential() {
+        let dir = std::env::temp_dir().join(format!("wb-gw-reenable-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let base = json!({
+            "uid": "uid-r", "access_token": "AT-R", "domain": "copilot.tencent.com",
+            "expiresAt": 1_900_000_000_000i64,
+        });
+        let mut disabled = base.clone();
+        disabled["disabled"] = json!(true);
+
+        export_accounts_to_dir(&dir, &[disabled], None).expect("export disabled");
+        assert!(!dir.join("workbuddy-uid-r.json").exists());
+
+        // 取消禁用后应恢复进池
+        export_accounts_to_dir(&dir, &[base], None).expect("export enabled");
+        assert!(
+            dir.join("workbuddy-uid-r.json").exists(),
+            "取消禁用后凭证应重新写入"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // 手动模式：勾选列表决定导出集合（需求2）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn manual_mode_exports_only_selected_accounts() {
+        let dir = std::env::temp_dir().join(format!("wb-gw-manual-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let mk = |uid: &str| {
+            json!({
+                "uid": uid, "access_token": format!("AT-{uid}"),
+                "domain": "copilot.tencent.com", "expiresAt": 1_900_000_000_000i64,
+            })
+        };
+        let all = vec![mk("uid-a"), mk("uid-b"), mk("uid-c")];
+
+        // 自动模式（None = 不过滤）：全部导出
+        export_accounts_to_dir(&dir, &all, None).expect("export all");
+        for u in ["uid-a", "uid-b", "uid-c"] {
+            assert!(dir.join(format!("workbuddy-{u}.json")).exists(), "{u} 应在池中");
+        }
+
+        // 手动模式只勾 a 和 c：b 必须被清理
+        let only = Some(vec!["uid-a".to_string(), "uid-c".to_string()]);
+        export_accounts_to_dir(&dir, &all, only).expect("export manual");
+        assert!(dir.join("workbuddy-uid-a.json").exists());
+        assert!(dir.join("workbuddy-uid-c.json").exists());
+        assert!(
+            !dir.join("workbuddy-uid-b.json").exists(),
+            "未勾选的账号必须被移出池，否则手动模式形同虚设"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // 旧字段兼容：pinned_uid 单值读作「只勾了那一个」。
+    #[test]
+    fn legacy_pinned_uid_reads_as_single_manual_pick() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-legacy-pinned");
+        // 旧配置：只有 mode=pinned + pinned_uid，没有 manual_uids
+        crate::modules::gateway::save_gateway_config(&json!({
+            "mode": "pinned",
+            "pinned_uid": "uid-legacy",
+        }))
+        .expect("save legacy config");
+
+        // 旧 mode 值应读作 Manual
+        assert_eq!(gateway_mode(), GatewayMode::Manual, "旧的 pinned 应读作手动模式");
+        // 勾选列表应回退为那个单值
+        assert_eq!(manual_uids(), vec!["uid-legacy".to_string()]);
+    }
+
+    // 新字段优先于旧字段：两者同时存在时以 manual_uids 为准。
+    #[test]
+    fn manual_uids_takes_priority_over_legacy_pinned() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-manual-priority");
+        crate::modules::gateway::save_gateway_config(&json!({
+            "mode": "manual",
+            "manual_uids": ["uid-new-1", "uid-new-2"],
+            "pinned_uid": "uid-old",
+        }))
+        .expect("save config");
+
+        assert_eq!(
+            manual_uids(),
+            vec!["uid-new-1".to_string(), "uid-new-2".to_string()],
+            "应优先读新字段，而不是回退到旧的 pinned_uid"
+        );
+    }
+
+    // 空 manual_uids 数组不应回退到 pinned_uid（显式清空是有意义的意图）。
+    #[test]
+    fn empty_manual_uids_does_not_fall_back_to_pinned() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-empty-manual");
+        crate::modules::gateway::save_gateway_config(&json!({
+            "mode": "manual",
+            "manual_uids": [],
+            "pinned_uid": "uid-stale",
+        }))
+        .expect("save config");
+
+        assert!(
+            manual_uids().is_empty(),
+            "空数组是「没勾任何账号」的显式表达，不应回退到旧值"
+        );
+    }
+
+    // 手动模式空勾选时 active_uids 返回空集合（而不是 None=全部）——
+    // 否则「手动但没勾」会静默退化成「自动」，用户意图被无声忽略。
+    #[test]
+    fn manual_mode_with_no_picks_yields_empty_not_all() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-manual-empty");
+        crate::modules::gateway::save_gateway_config(&json!({
+            "mode": "manual",
+            "manual_uids": [],
+        }))
+        .expect("save config");
+
+        let uids = active_uids();
+        assert!(
+            matches!(&uids, Some(list) if list.is_empty()),
+            "空勾选应得到空集合（Some(vec![])），而非 None（=不过滤全部）"
+        );
+    }
+
+
+    // 回归：校验必须在写配置**之前**。
+    //
+    // 曾出现的缺陷：空勾选被拒后，配置里的 manual_uids 已被清空 ——
+    // 用户一次无效操作就悄悄抹掉了原来的勾选。
+    #[test]
+    fn rejected_empty_manual_pick_does_not_clobber_config() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-reject-order");
+
+        // 先用合法勾选建立状态
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let ok = rt.block_on(switch_mode(
+            GatewayMode::Manual,
+            vec!["uid-keep-1".to_string(), "uid-keep-2".to_string()],
+        ));
+        assert_eq!(ok.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(manual_uids(), vec!["uid-keep-1", "uid-keep-2"]);
+
+        // 空勾选应被拒绝，且**不能**改动已保存的勾选
+        let rejected = rt.block_on(switch_mode(GatewayMode::Manual, vec![]));
+        assert_eq!(rejected.get("ok").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            manual_uids(),
+            vec!["uid-keep-1", "uid-keep-2"],
+            "被拒绝的请求不得清空原有勾选（校验必须在写配置之前）"
+        );
+    }
+
 }

@@ -103,6 +103,42 @@ pub fn set_account_note(account_id: &str, note: &str) -> Result<Value, String> {
     Ok(updated)
 }
 
+/// 账号是否被用户**手动禁用**。
+///
+/// 语义（与所有者确认）：禁用 = **不进网关账号池**，但其它自动任务照跑。
+/// 之所以不去掉签到/领养等任务：那些是「养号」动作，号暂时不接流量
+/// 不等于不要额度与连登天数；把两者绑死会让用户失去「先养着，以后再启用」
+/// 这个最常用的用法。
+///
+/// 与「自动禁用」的区别：网关内部还有因冷却/熔断/余额耗尽而临时不可用的账号
+///（见 pool 的 CoolKind），那是**运行时自动判定**、会自行恢复；
+/// 本字段是**用户意图**、只能由用户显式改回。
+pub fn account_disabled(acc: &Value) -> bool {
+    acc.get("disabled").and_then(Value::as_bool) == Some(true)
+}
+
+/// 设置账号的禁用状态并落盘；返回更新后的账号。
+///
+/// 传 `false` 时**删除字段**而不是写 `false`：与备注同一做法，
+/// 保持账号库干净，也让「字段存在与否」可被用作调试线索。
+pub fn set_account_disabled(account_id: &str, disabled: bool) -> Result<Value, String> {
+    let mut accounts = load_accounts();
+    let acc = accounts
+        .iter_mut()
+        .find(|a| get_str(a, "id").as_deref() == Some(account_id))
+        .ok_or_else(|| "账号不存在".to_string())?;
+    if let Some(obj) = acc.as_object_mut() {
+        if disabled {
+            obj.insert("disabled".to_string(), json!(true));
+        } else {
+            obj.remove("disabled");
+        }
+    }
+    let updated = acc.clone();
+    save_accounts(&accounts).map_err(|e| e.to_string())?;
+    Ok(updated)
+}
+
 /// 账号的展示元数据（不泄露 token）。对照 server.py `account_meta`。
 pub fn account_meta(acc: &Value) -> Value {
     // 区域由 domain 后缀推导（国服 .cn / 国际版 .ai），供界面区分展示。
@@ -126,6 +162,8 @@ pub fn account_meta(acc: &Value) -> Value {
         "needsReloginReason": acc.get("needs_relogin_reason"),
         // 备注：用户自定义标签，用于认出「这是谁的号」。
         "note": acc.get("note"),
+        // 用户手动禁用：不进网关账号池（其它自动任务照跑）。
+        "disabled": account_disabled(acc),
         // 原始域名（如 www.workbuddy.ai / copilot.tencent.com）：
         // 区域标签只给「国服/国际版」，排查问题时常需要看确切域名。
         "domain": acc.get("domain"),
