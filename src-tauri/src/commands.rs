@@ -456,6 +456,44 @@ pub fn get_checkin_logs() -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// 记录保留设置（设置页可调）
+//
+// 覆盖签到日志、积分快照、任务记录三类本地观察数据。
+// 默认 60 天；用户可改，改完立刻对后续清理生效（无需重启）。
+// ---------------------------------------------------------------------------
+
+/// GET /api/settings/retention —— 读取保留天数设置。
+///
+/// 同时返回预设档位，避免前端硬编码选项（两处各写一份容易不一致）。
+#[tauri::command]
+pub fn get_record_retention() -> Value {
+    use crate::modules::config::{
+        record_retention_days, RECORD_RETENTION_DEFAULT_DAYS, RECORD_RETENTION_MAX_DAYS,
+        RECORD_RETENTION_MIN_DAYS, RECORD_RETENTION_PRESETS,
+    };
+    json!({
+        "days": record_retention_days(),
+        "defaultDays": RECORD_RETENTION_DEFAULT_DAYS,
+        "minDays": RECORD_RETENTION_MIN_DAYS,
+        "maxDays": RECORD_RETENTION_MAX_DAYS,
+        "presets": RECORD_RETENTION_PRESETS
+            .iter()
+            .map(|(d, label)| json!({ "days": d, "label": label }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// POST /api/settings/retention —— 保存保留天数。
+///
+/// 返回归一化后的实际生效值：用户填了越界值时立刻看到真实数字，
+/// 而不是「界面显示 0、实际按 60 天清理」。
+#[tauri::command]
+pub fn save_record_retention(days: i64) -> Result<Value, String> {
+    let applied = crate::modules::config::set_record_retention_days(days).map_err(|e| e.to_string())?;
+    Ok(json!({ "days": applied }))
+}
+
+// ---------------------------------------------------------------------------
 // 派猫猫旅行
 // ---------------------------------------------------------------------------
 

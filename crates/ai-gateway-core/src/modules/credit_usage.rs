@@ -12,8 +12,8 @@ use std::sync::Mutex;
 
 use crate::modules::account::{account_display_name, load_accounts};
 use crate::modules::config::{
-    atomic_write, credit_usage_snapshots_file, load_checkin_logs, now_ms, store_dir,
-    CHECKIN_LOG_KEEP_DAYS,
+    atomic_write, credit_usage_snapshots_file, load_checkin_logs, now_ms, record_retention_days,
+    store_dir,
 };
 use crate::modules::official_usage;
 
@@ -132,7 +132,9 @@ fn should_suppress_duplicate(
 }
 
 fn normalize_snapshots(snapshots: &[Value], at_ms: i64) -> Vec<Value> {
-    let cutoff = at_ms.saturating_sub(CREDIT_SNAPSHOT_RETENTION_DAYS * 24 * 3600 * 1000);
+    // 保留天数来自设置项（默认 60 天，设置页可调）
+    let keep_days = record_retention_days();
+    let cutoff = at_ms.saturating_sub(keep_days * 24 * 3600 * 1000);
     let mut kept: Vec<Value> = snapshots
         .iter()
         .filter_map(|value| {
@@ -234,7 +236,9 @@ fn parse_checkin_event(value: &Value) -> Option<CheckinEvent> {
 }
 
 fn parse_snapshots(values: &[Value], at_ms: i64) -> Vec<Snapshot> {
-    let cutoff = at_ms.saturating_sub(CREDIT_SNAPSHOT_RETENTION_DAYS * 24 * 3600 * 1000);
+    // 保留天数来自设置项（与 normalize_snapshots 同一口径）
+    let keep_days = record_retention_days();
+    let cutoff = at_ms.saturating_sub(keep_days * 24 * 3600 * 1000);
     let mut snapshots: Vec<Snapshot> = values
         .iter()
         .filter_map(snapshot_from_value)
@@ -289,7 +293,8 @@ fn build_statistics(
 ) -> Value {
     let snapshots = parse_snapshots(snapshot_values, at_ms);
     let today = local_date(at_ms).unwrap_or_else(|| Local::now().date_naive());
-    let checkin_cutoff = at_ms.saturating_sub(CHECKIN_LOG_KEEP_DAYS * 24 * 3600 * 1000);
+    // 与签到日志的清理口径保持一致（同一设置项）
+    let checkin_cutoff = at_ms.saturating_sub(record_retention_days() * 24 * 3600 * 1000);
     let checkins: Vec<CheckinEvent> = checkin_values
         .iter()
         .filter_map(parse_checkin_event)
@@ -442,7 +447,7 @@ fn build_statistics(
 
     // 逐日序列起点：全局最早快照与保留窗口下界的较大者；无快照时为 None（返回空序列）
     let daily_start = coverage_start_at.and_then(local_date).map(|coverage_date| {
-        let earliest = today - ChronoDuration::days(CREDIT_SNAPSHOT_RETENTION_DAYS - 1);
+        let earliest = today - ChronoDuration::days(record_retention_days() - 1);
         coverage_date.max(earliest)
     });
     let empty_account_daily: HashMap<String, f64> = HashMap::new();
@@ -534,7 +539,7 @@ fn build_statistics(
 
     json!({
         "generatedAt": at_ms,
-        "retentionDays": CREDIT_SNAPSHOT_RETENTION_DAYS,
+        "retentionDays": record_retention_days(),
         "coverageStartAt": coverage_start_at,
         "summary": {
             "currentRemaining": current_remaining,

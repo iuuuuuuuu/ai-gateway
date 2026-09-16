@@ -700,7 +700,17 @@ export default function AccountsPage() {
     ? codebuddyCnIde.activeAccountName || "未检测到"
     : "未安装";
   return (
-    <div className="mx-auto w-full max-w-[1180px] px-6 py-8 sm:px-8 sm:py-9">
+    // 流式布局：内容随窗口铺满（减去侧栏），只保留内边距。
+    //
+    // 留白的演进（按 2340px 屏、侧栏 220px 计算，每侧留白）：
+    //   max-w-3xl (768px)  → 676px
+    //   max-w-[1180px]     → 470px
+    //   max-w-[1800px]     → 160px   ← 用户反馈"还是留白太多"
+    //   去除上限（本版）    → 0（仅 px-8 内边距）
+    // 结论：只要保留居中定宽，宽屏上就一定有留白；本页内容（账号卡片、
+    // 状态块、操作按钮）都是横向铺开的行式布局，能自然拉伸，故完全放开。
+    // 兼容网关页同步做了相同处理，两页留白表现保持一致。
+    <div className="w-full space-y-6 px-5 py-6 sm:px-8 sm:py-8">
       <header className="mb-6">
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0">

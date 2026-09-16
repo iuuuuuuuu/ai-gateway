@@ -125,6 +125,9 @@ const ROUTES: Record<string, Route> = {
   get_auto_checkin_config: { method: "GET", path: "/api/checkin/config" },
   save_auto_checkin_config: { method: "POST", path: "/api/checkin/config" },
   get_checkin_logs: { method: "GET", path: "/api/checkin/logs" },
+  // 记录保留设置：Tauri 命令与 HTTP 路由同名映射，webui 模式下同样可用
+  get_record_retention: { method: "GET", path: "/api/settings/retention" },
+  save_record_retention: { method: "POST", path: "/api/settings/retention" },
   get_travel_status: { method: "GET", path: "/api/travel/status" },
   travel_run: { method: "POST", path: "/api/travel/run" },
   travel_adopt: { method: "POST", path: "/api/travel/adopt" },
@@ -551,6 +554,24 @@ export function saveAutoCheckinConfig(config: CheckinConfig): Promise<CheckinCon
 
 export function getCheckinLogs(): Promise<{ logs: CheckinLog[] }> {
   return call("get_checkin_logs");
+}
+
+/** 记录保留天数设置（签到日志 / 积分快照 / 任务记录共用同一口径）。 */
+export interface RecordRetentionSetting {
+  days: number;
+  defaultDays: number;
+  minDays: number;
+  maxDays: number;
+  presets: { days: number; label: string }[];
+}
+
+export function getRecordRetention(): Promise<RecordRetentionSetting> {
+  return call("get_record_retention");
+}
+
+/** 保存保留天数；返回归一化后的实际生效值（越界值会被夹到合法区间）。 */
+export function saveRecordRetention(days: number): Promise<{ days: number }> {
+  return call("save_record_retention", { days });
 }
 
 export async function getTravelStatus(accountId: string): Promise<TravelStatus> {

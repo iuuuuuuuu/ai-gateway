@@ -915,14 +915,15 @@ export default function GatewayPage() {
     // 留白的演进（按 2340px 屏、侧栏 220px 计算，每侧留白）：
     //   max-w-3xl (768px)    → 676px
     //   max-w-[1180px]       → 470px   ← 用户反馈"还是很多留白"
+    //   max-w-[1800px]       → 160px   ← 用户反馈"还是留白太多"
     //   去除上限（本版）      → 0（仅 px-8 内边距）
-    // 结论：只要保留居中定宽，宽屏上必然有大片留白；网关页的内容
-    //（状态块、设置行、账号池卡片、用量表）本身都适合变宽，故直接放开。
-    // 仍保留 max-w-[1800px] 作为超宽屏（4K/带鱼屏）兜底，避免单行文字过长难扫读。
+    // 结论：只要保留居中定宽，宽屏上就一定有留白；本页内容（状态块、设置行、
+    // 账号池卡片、用量表）都是横向铺开的行式布局，能自然拉伸，故完全放开。
+    // 账号管理页同步做了相同处理，两页留白表现保持一致。
     // Radix Tooltip 必须有 TooltipProvider 祖先，否则抛错导致整页白屏
     //（本页此前没有 Tooltip，故一直没有该 Provider；本轮新增了页头 tooltip）。
     <TooltipProvider delayDuration={250}>
-    <div className="mx-auto w-full max-w-[1800px] space-y-6 px-5 py-6 sm:px-8 sm:py-8">
+    <div className="w-full space-y-6 px-5 py-6 sm:px-8 sm:py-8">
       <header className="flex min-w-0 items-start justify-between gap-3">
         <div className="min-w-0">
           <h1 className="flex items-center gap-2 text-lg font-medium leading-6">

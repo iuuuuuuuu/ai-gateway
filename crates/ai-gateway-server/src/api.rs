@@ -90,6 +90,10 @@ pub fn router() -> Router {
             get(api_checkin_config).post(api_save_checkin_config),
         )
         .route("/api/checkin/logs", get(api_checkin_logs))
+        .route(
+            "/api/settings/retention",
+            get(api_record_retention).post(api_save_record_retention),
+        )
         .route("/api/travel/status", get(api_travel_status))
         .route("/api/travel/run", post(api_travel_run))
         .route("/api/travel/adopt", post(api_travel_adopt))
@@ -621,6 +625,39 @@ async fn api_save_checkin_config(Json(body): Json<Value>) -> Response {
 
 async fn api_checkin_logs() -> Response {
     json_ok(json!({ "logs": config::load_checkin_logs() }))
+}
+
+/// GET /api/settings/retention —— 记录保留天数设置。
+///
+/// 同时返回预设档位，避免前端硬编码选项（两处各写一份容易不一致）。
+async fn api_record_retention() -> Response {
+    json_ok(json!({
+        "days": config::record_retention_days(),
+        "defaultDays": config::RECORD_RETENTION_DEFAULT_DAYS,
+        "minDays": config::RECORD_RETENTION_MIN_DAYS,
+        "maxDays": config::RECORD_RETENTION_MAX_DAYS,
+        "presets": config::RECORD_RETENTION_PRESETS
+            .iter()
+            .map(|(d, label)| json!({ "days": d, "label": label }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// POST /api/settings/retention —— 保存记录保留天数。
+///
+/// 返回归一化后的实际生效值：用户填越界值时立刻看到真实数字，
+/// 而不是「界面显示 0、实际按 60 天清理」。
+async fn api_save_record_retention(Json(body): Json<Value>) -> Response {
+    let Some(days) = body.get("days").and_then(Value::as_i64) else {
+        return json_err(
+            "缺少 days 字段或类型不是整数".to_string(),
+            StatusCode::BAD_REQUEST,
+        );
+    };
+    match config::set_record_retention_days(days) {
+        Ok(applied) => json_ok(json!({ "days": applied })),
+        Err(e) => json_err(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 async fn api_travel_status() -> Response {

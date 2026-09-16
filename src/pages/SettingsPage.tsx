@@ -126,6 +126,8 @@ function logLabel(result: string): { text: string; tone: "success" | "warning" |
 function AutoCheckinCard() {
   const [cfg, setCfg] = useState<CheckinConfig | null>(null);
   const [logs, setLogs] = useState<CheckinLog[]>([]);
+  // 日志标题里的天数取自「记录保留」设置，避免与真实清理口径不一致
+  const [retentionDays, setRetentionDays] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
@@ -136,9 +138,15 @@ function AutoCheckinCard() {
 
   async function load() {
     try {
-      const [c, l] = await Promise.all([api.getAutoCheckinConfig(), api.getCheckinLogs()]);
+      const [c, l, r] = await Promise.all([
+        api.getAutoCheckinConfig(),
+        api.getCheckinLogs(),
+        // 保留设置失败不应影响签到日志展示，故单独 catch
+        api.getRecordRetention().catch(() => null),
+      ]);
       setCfg(c);
       setLogs(l.logs);
+      if (r) setRetentionDays(r.days);
     } catch (e) {
       setMsg({ type: "err", text: api.asError(e) });
     }
@@ -264,7 +272,10 @@ function AutoCheckinCard() {
         )}
 
         <div className="px-4 py-3 sm:px-5">
-          <p className="mb-2 text-[13px] font-medium">签到日志（最近 30 天）</p>
+          {/* 天数必须与「记录保留」设置一致：写死 30 天会在用户改成 60 天后骗人 */}
+          <p className="mb-2 text-[13px] font-medium">
+            签到日志{retentionDays ? `（最近 ${retentionDays} 天）` : ""}
+          </p>
           {logs.length === 0 ? (
             <p className="py-3 text-center text-sm text-muted-foreground">暂无签到记录</p>
           ) : (
@@ -1445,6 +1456,7 @@ export default function SettingsPage() {
         <AppEnvCard />
         <ProxyCard />
         <ScheduledTaskCard />
+        <RecordRetentionCard />
         <PermissionCheckCard />
         <AutoCheckinCard />
         <AutoRotateCard />
@@ -1452,5 +1464,99 @@ export default function SettingsPage() {
         {api.isWebui() && !api.isDemoMode() ? null : <UpdateCard />}
       </div>
     </div>
+  );
+}
+
+/**
+ * 记录保留：签到日志 / 积分快照 / 任务记录保留多久。
+ *
+ * 为什么做成勾选而不是输入框：保留天数是粗粒度选择，
+ * 常用档位就那么几个；手填既容易填错（0、负数、极大值），
+ * 也要用户自己去想「填多少合适」。
+ * 后端仍会做区间归一化（1..3650），越界值会被夹到合法范围并回显真实值。
+ */
+function RecordRetentionCard() {
+  const [setting, setSetting] = useState<api.RecordRetentionSetting | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      try {
+        const res = await api.getRecordRetention();
+        if (alive) setSetting(res);
+      } catch (e) {
+        if (alive) setMsg({ type: "err", text: api.asError(e) });
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  async function choose(days: number) {
+    if (saving || setting?.days === days) return;
+    setSaving(true);
+    setMsg(null);
+    try {
+      const res = await api.saveRecordRetention(days);
+      // 用后端返回的实际生效值刷新，避免界面与真实行为不一致
+      setSetting((prev) => (prev ? { ...prev, days: res.days } : prev));
+      setMsg({ type: "ok", text: `已保存：保留 ${res.days} 天` });
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <SettingsGroup id="settings-retention" title="记录保留">
+      <SettingsFieldRow
+        label="本地记录保留天数"
+        description="签到日志、积分快照与任务记录都会按此天数清理；超出部分在下次写入时自动删除。"
+      >
+        {setting ? (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {setting.presets.map((p) => (
+              <Button
+                key={p.days}
+                type="button"
+                size="sm"
+                variant={setting.days === p.days ? "default" : "outline"}
+                className="h-7 px-2.5 text-xs"
+                disabled={saving}
+                onClick={() => void choose(p.days)}
+              >
+                {p.label}
+              </Button>
+            ))}
+          </div>
+        ) : (
+          <span className="text-xs text-muted-foreground">加载中…</span>
+        )}
+      </SettingsFieldRow>
+      {setting && !setting.presets.some((p) => p.days === setting.days) && (
+        <SettingsRow>
+          <div className="text-xs text-muted-foreground">
+            当前为自定义值：<span className="font-medium text-foreground">{setting.days}</span> 天
+            （可选范围 {setting.minDays}–{setting.maxDays}）
+          </div>
+        </SettingsRow>
+      )}
+      {msg && (
+        <SettingsRow>
+          <div
+            className={cn(
+              "text-xs",
+              msg.type === "ok" ? "text-emerald-600 dark:text-emerald-500" : "text-destructive",
+            )}
+          >
+            {msg.text}
+          </div>
+        </SettingsRow>
+      )}
+    </SettingsGroup>
   );
 }
