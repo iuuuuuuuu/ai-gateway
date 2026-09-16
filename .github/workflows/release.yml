@@ -440,13 +440,42 @@ jobs:
       - name: 合并 updater 清单
         run: python3 scripts/merge-update-manifests.py artifacts
 
-      # draft: true —— 首次跑通 macOS 之前先不直接对外发布，
-      # 你在 Release 页面核对无误后点 Publish 即可。信任这条流水线后改成 false。
+      # 发布说明优先用仓库里手写的 .github/RELEASE_NOTES_<版本>.md（能写清「为什么」
+      # 和升级注意事项），没有就回退到 GitHub 自动生成的提交列表。
       #
-      # 注意：draft 的 Release 不参与 releases/latest/ 解析，所以只要还是 draft，
-      # 自动更新端点就是 404 —— 必须点 Publish 之后客户端才能收到更新。
+      # 这两步过去都是手工的：流水线把 Release 建成 draft，再由人工
+      # `gh release edit --notes-file ...` 补说明并发布。只要有人忘了点，Release
+      # 就一直是 draft —— 而 draft 不参与 releases/latest/ 解析，自动更新直接 404
+      # （v1.0.0 与 v1.0.1 都出现过，两次都得手工补）。
+      #
+      # body_path 指向不存在的文件时该 action 只告警并回退到 body，不会失败；
+      # 这里仍显式判断，避免每次发布都刷一条无意义的告警。
+      - name: 解析发布说明
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # GITHUB_REF_NAME 在 tag 触发时形如 v1.0.1，去掉前缀 v 得到版本号。
+          p=".github/RELEASE_NOTES_${GITHUB_REF_NAME#v}.md"
+          if [ -f "$p" ]; then
+            echo "path=$p" >> "$GITHUB_OUTPUT"
+            echo "使用手写发布说明：$p"
+          else
+            echo "未找到 $p，改用自动生成的提交列表"
+          fi
+
+      # draft: false —— 直接发布。
+      #
+      # 历史上这里是 true（担心 macOS 没跑通，想先人工核对）。但 draft 的
+      # Release **不参与 releases/latest/ 解析**，于是自动更新端点会 404，
+      # 必须有人手动点 Publish 客户端才能收到更新。
+      #
+      # 产物本身已有足够防护，不需要靠 draft 兜底：build 任务对每个平台的
+      # 产物做了数量断言、对 .sig 存在性做了硬校验，release 任务又用
+      # needs + !cancelled() 保证「某平台失败不影响其余平台照常发布」。
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
-          draft: true
+          draft: false
+          body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: true
