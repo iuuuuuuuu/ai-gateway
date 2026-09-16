@@ -64,20 +64,22 @@ jobs:
             goos: darwin
             goarch: arm64
             arch_label: aarch64
-          # Intel Mac（x64）。
+          # Intel Mac（x86_64-apple-darwin）这一腿**已移除**。
           #
-          # runner 标签必须是 macos-15-intel：Intel 的旧标签已不可用 ——
-          # macos-13 早已下线，而 macos-14 现在是 **arm64**（用它只会产出 arm64 二进制）。
-          # 据 GitHub 官方 runner 文档，标准 Intel macOS runner 现为
-          # macos-15-intel / macos-26-intel（4 CPU / 14GB，公开仓库免费不限量）。
-          # 注意别写成 macos-15-large / -xlarge —— 那些是付费大机型。
-          - name: macos-x64
-            os: macos-15-intel
-            target: x86_64-apple-darwin
-            bundles: app
-            goos: darwin
-            goarch: amd64
-            arch_label: x64
+          # 原因：它是整个发布的关键路径。实测 macos-x64 跑 892s（14m52s），而
+          # windows-x64 707s、linux-x64 576s、macos-arm64 只剩 299s —— 四腿并行，
+          # 另外三个平台全程空等 Intel，发布墙钟被它单独拖到 15m21s。去掉后墙钟
+          # 由 windows-x64 决定，约 12m10s，一次省 185s。
+          #
+          # 它的编译门控**没有丢**：已搬进 ci.yml 的「Intel Mac 编译校验」一步
+          # （cargo check --workspace --all-targets --target x86_64-apple-darwin，
+          # 跑在 macos-14 上），每次 push/PR 都会跑，比原来只在 tag 时跑还早。
+          #
+          # 也不影响自动更新：gen-update-json.sh 与 merge-update-manifests.py 都
+          # 只处理 Windows 清单，macOS 两腿本来就不产出 latest-<os>-<arch>.json。
+          #
+          # 代价（明确记账）：不再分发 Intel Mac 的 .dmg。若日后需要，加回这一腿即可，
+          # label 必须是 macos-15-intel（macos-13 已下线，macos-14 现在是 arm64）。
           - name: linux-x64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
@@ -97,9 +99,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # 不要在此加 `key:` —— Swatinem/rust-cache 的 `key` 是**追加**在自动生成的
+      # key 之后，不是替代。自动 key 已含 OS + target triple，再加 matrix.target
+      # 只会把同一份依赖缓存按平台切碎、多存几份。
+      #
+      # 后果是实测过的：仓库缓存一度冲到 10.43 GB / 10 GB（97%），触发 LRU 驱逐，
+      # 反过来把 ci.yml 的 v0-rust-check-* 缓存挤掉，逼出冷编译（最差 438s，
+      # 是均值 148s 的 3 倍）。
       - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
 
       - name: 安装 Linux 系统依赖
         if: runner.os == 'Linux'
@@ -128,9 +135,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      # 同 ci.yml：不指 cache-dependency-path 的话 setup-go 会去找仓库根的
+      # go.sum（不存在），缓存形同虚设，每次都要重新编译整个 stdlib。
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
+          cache-dependency-path: go-gateway/go.sum
 
       - name: 解析版本号
         shell: bash
