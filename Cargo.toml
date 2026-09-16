@@ -6,3 +6,28 @@ members = [
     "src-tauri",
 ]
 resolver = "2"
+
+# ── 构建画像 ────────────────────────────────────────────────────────────────
+#
+# 这里**刻意不设 `lto = "fat"` / `codegen-units = 1`**。
+# 两者确实能让发布包更小更快，但会把每次 release 构建的单核链接时间显著拉长，
+# 而本仓库的开发循环里 release 构建非常频繁（build-single.ps1 / tauri build）。
+# 本项目的主要耗时来自「无谓的重编」（见 crates/ai-gateway-core/build.rs 的注释），
+# 那部分已经修掉；再叠加 fat LTO 只会让每次构建都更慢。
+# 真需要极致产物时用 `CARGO_PROFILE_RELEASE_LTO=fat` 临时覆盖即可。
+
+[profile.release]
+# 依赖树很重（reqwest+rustls+ring、rusqlite bundled、hyper、windows-rs…），
+# Thin LTO 能在几乎不增加链接耗时的前提下拿到大部分跨 crate 内联收益。
+lto = "thin"
+# 默认 16 太碎，链接期重复优化多；降到 4 提升 LTO 效果而编译时间基本不变。
+codegen-units = 4
+# 去除调试符号：本仓库依赖里 rusqlite(bundled SQLite)、ring、aws-lc 级别的小型 C
+# 依赖会带进大量符号，release 下用不到。
+strip = "debuginfo"
+
+# 单测/CI 用的 profile：与 CI 的 `cargo check --profile test` 保持一致，
+# 避免同一 crate 在 CI 里被编两遍。
+[profile.test]
+opt-level = 0
+
