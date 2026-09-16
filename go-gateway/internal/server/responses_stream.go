@@ -87,9 +87,16 @@ func (h *Handler) streamResponses(w http.ResponseWriter, result *chatResult, mod
 			}
 		}
 		if err != nil {
+			// 非 EOF 的读错误 = 上游中途断流（idle 超时 cancel、连接重置、
+			// 上游截断）。必须在这里**收尾并返回**：往下走会继续执行成功路径的
+			// 收尾，补出 response.completed，而客户端只认最后一个事件 —— 于是
+			// 半截回复被当成正常完成，用户看到「输出莫名其妙断了且无任何报错」。
+			// response.failed 与 response.completed 自相矛盾，两者只能发一个。
 			if err != io.EOF {
 				_ = out.write("response.failed", ctx.failedEvent("upstream stream error: "+err.Error()))
+				return
 			}
+			// io.EOF 是**正常**结束（上游发完 [DONE] 后关连接），落到成功收尾。
 			break
 		}
 	}
