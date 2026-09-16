@@ -48,6 +48,60 @@ func (a *Auth) NeedsRefresh(within time.Duration) bool {
 	return time.Now().Add(within).Unix() >= a.ExpiresAt
 }
 
+// Region 账号所属服务区域。
+//
+// 存在的意义：**同名模型在两个区域可能是不同的后端模型**，能力并不一致。
+// 实测（2026-09-16，/v3/config 元数据 + 逐账号发图验证）：
+//
+//	glm-5.3  国服「旗舰模型，擅长复杂软件工程与长程 Agent 任务」out=64000
+//	         国际版「能力均衡，适合日常使用」                out=48000
+//	         —— 国服后端能读图；国际版后端把图片换成固定占位符（token 增量
+//	         恒为 +29，与图片体积无关），模型只能回答「无法查看图片」。
+//
+// 因此「同一个 glm-5.3 时好时坏」的真实原因是**选号随机命中了两个不同后端**，
+// 而不是模型本身不稳定。见 pool.PickForModelRegion 与 server 的区域路由。
+type Region int
+
+const (
+	// RegionAny 不限区域（默认；等价于引入本概念之前的行为）。
+	RegionAny Region = iota
+	// RegionCN 国服（*.workbuddy.cn / *.codebuddy.cn）。
+	RegionCN
+	// RegionIntl 国际版（*.workbuddy.ai / *.codebuddy.ai）。
+	RegionIntl
+)
+
+func (r Region) String() string {
+	switch r {
+	case RegionCN:
+		return "cn"
+	case RegionIntl:
+		return "intl"
+	default:
+		return "any"
+	}
+}
+
+// Region 返回账号所属区域。
+//
+// 判据与 upstream.IsIntl 完全一致（依据凭证里的 domain 字段）：
+// 以 .ai 结尾为国际版，其余（含 domain 缺失）按国服处理 —— 历史上只存在
+// 国服账号，缺失时按国服保持向后兼容。
+func (a *Auth) Region() Region {
+	if a.IsIntl() {
+		return RegionIntl
+	}
+	return RegionCN
+}
+
+// IsIntl 报告账号是否属于国际版。
+func (a *Auth) IsIntl() bool {
+	if a == nil {
+		return false
+	}
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(a.Domain)), ".ai")
+}
+
 // Parse 兼容两种磁盘形态：
 //
 //	嵌套形 {"auth":{...},"account":{...}}  （插件 OAuth 输出）

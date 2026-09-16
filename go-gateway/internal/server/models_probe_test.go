@@ -35,17 +35,6 @@ func modelsFailUpstream(t *testing.T) *upstream.Client {
 	})
 }
 
-// resetModelsCache 清掉动态模型缓存，让下一次调用真的去打上游。
-//
-// 生产代码有 5 分钟失败负缓存，测试里必须绕开它才能复现「反复探测」。
-func resetModelsCache() {
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
-}
-
 // callModels 调一次 /v1/models，返回状态码。
 func callModels(h *Handler) int {
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
@@ -112,11 +101,11 @@ func TestModelsProbeRepeatedFailureStillNoBreaker(t *testing.T) {
 	}
 }
 
-// TestModelsProbePrefersNonIntlAccount 两者都在时，探测必须选国服账号。
+// TestModelsProbeRegionCNSelectsCNAccount 指定国服时，探测必须选国服账号。
 //
-// 国际版该端点恒 500；且国际版常占据最早到期档位（分层选号会优先选它），
-// 若不绕开就会一直选中它、动态列表永远拉不到。
-func TestModelsProbePrefersNonIntlAccount(t *testing.T) {
+// 不能按到期日选：国际版常占据最早到期档位，按分层选号会一直选中它，
+// 于是「国服真值」实际来自国际版 —— 这正是能力标注不可信的根因之一。
+func TestModelsProbeRegionCNSelectsCNAccount(t *testing.T) {
 	p := testPoolWith(
 		// 国际版到期更早 —— 按分层选号它会被优先选中
 		&auth.Auth{UID: "intl-1", AccessToken: "t", Domain: "www.workbuddy.ai", SoonestExpireAt: time.Now().Add(time.Hour).Unix()},
@@ -124,19 +113,27 @@ func TestModelsProbePrefersNonIntlAccount(t *testing.T) {
 	)
 	h := NewHandler(Config{Pool: p, Upstream: modelsFailUpstream(t), MaxRotate: 1})
 
-	got := h.pickModelsProbeAccount()
+	got := h.pickProbeAccountInRegion(auth.RegionCN)
 	if got == nil {
 		t.Fatal("应选出账号")
 	}
 	if got.UID != "cn-1" {
-		t.Fatalf("探测应优先非国际版账号，实际选了 %q（国际版 models 端点恒 500）", got.UID)
+		t.Fatalf("指定国服时应选国服账号，实际选了 %q", got.UID)
+	}
+
+	// 同一池子按国际版探测，必须选国际版的那个。
+	gotIntl := h.pickProbeAccountInRegion(auth.RegionIntl)
+	if gotIntl == nil || gotIntl.UID != "intl-1" {
+		t.Fatalf("指定国际版时应选国际版账号，实际 %v", gotIntl)
 	}
 }
 
-// TestModelsProbeFallsBackToIntlWhenOnlyIntl 全是国际版时仍要返回一个账号。
+// TestModelsProbeRegionCNReturnsNilWhenNoCNAccount 池里没有国服账号时返回 nil。
 //
-// 而不是返回 nil：万一上游修好了该端点，应当能自愈。
-func TestModelsProbeFallsBackToIntlWhenOnlyIntl(t *testing.T) {
+// 关键回归保护：**不得**退回国际版账号。用国际版账号拉到的清单如果被当成
+// 国服真值，就会把国服独有模型标成「不存在」、把国服能力（如 glm-5.3 能读图）
+// 标成国际版的答案 —— 本次修复要消除的就是这种「真值串区」。
+func TestModelsProbeRegionCNReturnsNilWhenNoCNAccount(t *testing.T) {
 	p := testPoolWith(&auth.Auth{
 		UID:             "intl-1",
 		AccessToken:     "t",
@@ -145,16 +142,20 @@ func TestModelsProbeFallsBackToIntlWhenOnlyIntl(t *testing.T) {
 	})
 	h := NewHandler(Config{Pool: p, Upstream: modelsFailUpstream(t), MaxRotate: 1})
 
-	got := h.pickModelsProbeAccount()
-	if got == nil {
-		t.Fatal("全是国际版时仍应返回一个账号（上游修好后可自愈），而非 nil")
+	if got := h.pickProbeAccountInRegion(auth.RegionCN); got != nil {
+		t.Fatalf("池里没有国服账号时不该用国际版账号冒充，实际返回 %q", got.UID)
 	}
-	if got.UID != "intl-1" {
-		t.Fatalf("应返回唯一的国际版账号，实际 %q", got.UID)
+	// 但 RegionAny（兼容路径）仍应退回国际版账号，让探测能自愈。
+	got := h.pickProbeAccountInRegion(auth.RegionAny)
+	if got == nil || got.UID != "intl-1" {
+		t.Fatalf("RegionAny 应回退到唯一的国际版账号，实际 %v", got)
 	}
 }
 
 // TestModelsProbeSkipsUnavailableAccounts 冷却/禁用的账号不应被选来探测。
+//
+// AvailableUIDs 已过滤 healthy，因此该断言实际验证的是「探测没有绕开它
+// 自行扫全表」——历史上探测曾有一个不看健康状态的独立实现。
 func TestModelsProbeSkipsUnavailableAccounts(t *testing.T) {
 	p := testPoolWith(
 		&auth.Auth{UID: "intl-cooling", AccessToken: "t", Domain: "www.workbuddy.ai", SoonestExpireAt: time.Now().Add(time.Hour).Unix()},
@@ -163,12 +164,13 @@ func TestModelsProbeSkipsUnavailableAccounts(t *testing.T) {
 	p.Disable("cn-ok", "测试禁用")
 	h := NewHandler(Config{Pool: p, Upstream: modelsFailUpstream(t), MaxRotate: 1})
 
-	got := h.pickModelsProbeAccount()
-	// 唯一可用的就是国际版那个 —— 应返回它，而不是被禁用的 cn-ok
-	if got == nil {
-		t.Fatal("应回退到可用的国际版账号")
-	}
-	if got.UID != "intl-cooling" {
+	// 被禁用的国服账号不可用 → 该区域探测返回 nil，而不是选它。
+	if got := h.pickProbeAccountInRegion(auth.RegionCN); got != nil {
 		t.Fatalf("不应选被禁用的账号，实际 %q", got.UID)
+	}
+	// 国际版那个仍可用。
+	got := h.pickProbeAccountInRegion(auth.RegionIntl)
+	if got == nil || got.UID != "intl-cooling" {
+		t.Fatalf("应选可用的国际版账号，实际 %v", got)
 	}
 }

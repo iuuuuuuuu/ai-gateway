@@ -9,10 +9,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
@@ -74,7 +72,13 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/messages", h.withAuth(h.messages))
 	h.mux.HandleFunc("POST /messages", h.withAuth(h.messages))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+	// /v1/models/regions 是给人看的「按区域的能力真值」对比视图。
+	// 必须注册在 /v1/models 之后（Go 1.22 ServeMux 按具体度优先，顺序无关，
+	// 但显式排在后面读起来更清楚它是 /v1/models 的补充而非替代）。
+	h.mux.HandleFunc("GET /v1/models/regions", h.withAuth(h.modelsRegions))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
+	// /debug/* 同样走鉴权：它透出账号 UID 与域名，属敏感信息。
+	h.mux.HandleFunc("GET /debug/", h.withAuth(h.debugHandler))
 	h.mux.HandleFunc("GET /usage", h.withAuth(h.usageReport))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
@@ -204,17 +208,33 @@ func withImageCapability(entries []map[string]any) []map[string]any {
 }
 
 // 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
+//
+// 已按 /v3/config 的 data.agents[name=="cli"].models 校正（实测 2026-09-16，
+// 共 16 个）。此前的表已明显过期：缺 glm-5.3 / glm-5.3-flash / auto /
+// hy4-preview / hy3-x / kimi-k3-1 / kimi-k2.8-preview / deepseek-v4.1-flash，
+// 却留着上游已下架的 hy3-preview / hy3-preview-agent / deepseek-v4-flash。
+//
+// 过期会**真的出错**，不只是展示问题：能力真值表用这张表兜底，
+// 若它缺了 glm-5.3，网关就会认为「国服没有 glm-5.3」，于是把带图片的
+// glm-5.3 请求判成「只能去国际版」—— 正好与事实相反（实测只有国服能读图）。
+// 也就是说，静态表错误会把图片请求推向读不到图的那一侧。
 var staticModels = withImageCapability([]map[string]any{
-	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "kimi-k2.7", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy3-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy3-preview-agent", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "deepseek-v4-pro", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "deepseek-v4-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "auto", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 256000},
+	{"id": "hy4-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
+	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 192000},
+	{"id": "hy3-x", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 192000},
+	{"id": "deepseek-v4.1-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
+	{"id": "deepseek-v4-pro", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
+	{"id": "glm-5.3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
+	{"id": "glm-5.3-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
+	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
+	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 200000},
+	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 200000},
+	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 512000},
+	{"id": "kimi-k3-1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
+	{"id": "kimi-k2.8-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
+	{"id": "kimi-k2.7", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 256000},
+	{"id": "kimi-k2.6", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 256000},
 })
 
 // staticModelsIntl 国际版静态模型表（动态接口失败时的回退）。
@@ -225,6 +245,7 @@ var staticModels = withImageCapability([]map[string]any{
 // 历史：此前该表抄自本地缓存 acc-product-config-v3.json，其中
 //   - gpt-5.3-codex 属于 CodeBuddy 产品清单，不在 WorkBuddy 的 cli 清单里；
 //   - 缺 kimi-k2.8-preview、hy4-preview-f。
+//
 // 现已按 /v3/config 校正。
 //
 // 关于 hy4-preview：它不在 cli 清单里，但**实测可用**（HTTP 200 正常出流），
@@ -278,192 +299,25 @@ var staticModelsAll = func() []map[string]any {
 	return out
 }()
 
-// dynamicModelsCache 动态模型缓存。
-var dynamicModelsCache struct {
-	sync.RWMutex
-	ids      []upstream.ModelInfo
-	fetched  time.Time // 最近一次成功拉取时间
-	lastFail time.Time // 最近一次拉取失败时间（负缓存）
-}
-
+// dynamicModelsTTL 动态模型清单的缓存时长；modelsFetchFailCooldown 是拉取失败后的负缓存时长。
+//
+// 缓存本身按区域分桶，在 capability.go 的 regionModelCache 里；
+// 这两个常量被那里复用，故留在包内共享。
 const (
 	dynamicModelsTTL        = time.Hour
 	modelsFetchFailCooldown = 5 * time.Minute
 )
 
-// models 返回模型列表：优先动态（缓存 1h），失败回退静态表。
+// models 返回模型列表：优先动态（按区域，缓存 1h），失败回退静态表。
+//
+// 列表是**两区并集**：/v1/models 没有账号上下文，无法知道用户会选哪个账号，
+// 因此必须让客户端看到全部可用的名称，同时用能力字段诚实地表达
+// 「这个名称只在某一个区域存在」。见 mergedModelList 与 capabilityFieldsFor。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   h.mergedModelList(),
 	})
-}
-
-// modelCapabilityFields 生成模型能力字段（图片输入等）。
-//
-// 为什么一次下发**多种拼写**：客户端读的字段名各不相同，且都只在各自的
-// provider 专用解析器里读，没有统一约定（实测 2026-09-16，见各客户端源码）：
-//
-//	OpenClaw   OpenAI Codex  → input_modalities / inputModalities
-//	OpenClaw   Copilot       → capabilities.supports.vision
-//	OpenClaw   HuggingFace   → architecture.input_modalities
-//	OpenClaw   OpenRouter    → architecture.modality（"text+image->text"）
-//	OpenClaw   Vercel AI GW  → tags 含 "vision"
-//	OpenClaw   LM Studio     → capabilities.vision
-//	ZCode      /v1/models    → 只读 id / supported_formats（不读能力字段）
-//	DSH        /v1/models    → 只读 id/name/context/maxTokens（不读能力字段）
-//
-// 多写几种是安全的：所有已知解析器都只取自己认识的键，遇到多余键不会报错
-// （OpenClaw 的 Copilot 解析器只额外要求 object=="model"，本函数已保证）。
-// 这样 OpenClaw 等能读该字段的客户端可直接受益，其余客户端行为不变。
-//
-// supportsImages 为 nil（上游未声明）时**不下发**任何能力字段：宁可不写，
-// 也不要谎报成纯文本 —— 后者会让本可用的图片能力被客户端主动关掉。
-func modelCapabilityFields(supportsImages *bool) map[string]any {
-	if supportsImages == nil {
-		return nil
-	}
-	if !*supportsImages {
-		// 显式不支持：明确告知，避免客户端按「默认支持」处理。
-		return map[string]any{
-			"supportsImages": false,
-			"capabilities":   map[string]any{"vision": false, "supports": map[string]any{"vision": false}},
-		}
-	}
-	return map[string]any{
-		"supportsImages": true,
-		// OpenClaw OpenAI Codex：接受 "image"/"vision" 两种写法。
-		"input_modalities": []string{"text", "image"},
-		"inputModalities":  []string{"text", "image"},
-		// OpenClaw Copilot / LM Studio。
-		"capabilities": map[string]any{
-			"vision":   true,
-			"supports": map[string]any{"vision": true},
-		},
-		// OpenClaw HuggingFace / OpenRouter。
-		"architecture": map[string]any{
-			"input_modalities": []string{"text", "image"},
-			"modality":         "text+image->text",
-		},
-		// OpenClaw Vercel AI Gateway。
-		"tags": []string{"vision"},
-		// ZCode 自身配置用的词汇（对 /v1/models 无消费方，但无副作用且便于人读）。
-		"modalities": map[string]any{
-			"input":  []string{"text", "image"},
-			"output": []string{"text"},
-		},
-	}
-}
-
-// modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
-func (h *Handler) modelList() []map[string]any {
-	if infos := h.fetchDynamicModels(); len(infos) > 0 {
-		out := make([]map[string]any, 0, len(infos)+len(staticModelsIntl))
-		seen := make(map[string]bool, len(infos)+len(staticModelsIntl))
-		for _, mi := range infos {
-			entry := map[string]any{
-				"id":                mi.ID,
-				"object":            "model",
-				"created":           1753600000,
-				"owned_by":          "workbuddy",
-				"context_length":    mi.ContextWindow,
-				"max_output_tokens": mi.MaxTokens,
-			}
-			if mi.ContextWindow == 0 {
-				entry["context_length"] = 131072 // 兜底
-			}
-			for k, v := range modelCapabilityFields(mi.SupportsImages) {
-				entry[k] = v
-			}
-			seen[mi.ID] = true
-			out = append(out, entry)
-		}
-		// 动态列表只来自「被抽中的那个账号」所在区域（通常是国服），
-		// 另一个区域的模型名不会出现在里面。不补的话，混合账号池下客户端
-		// 看不到国际版独有模型（如 hy4-preview），也就无法主动选用。
-		// 注意：国际版的拉取接口已改用 /v3/config（两区域都可用），
-		// 这里保留静态表补齐是为了覆盖「抽到国服账号」这一情况，属兜底。
-		for _, m := range staticModelsIntl {
-			if id, _ := m["id"].(string); id != "" && !seen[id] {
-				seen[id] = true
-				out = append(out, m)
-			}
-		}
-		return out
-	}
-	return staticModelsAll
-}
-
-// fetchDynamicModels 从池中任一健康账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
-// 拉取失败记录时间戳进入 5min 负缓存，冷却期内直接用静态表，避免反复打上游。
-func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
-	dynamicModelsCache.RLock()
-	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
-		out := dynamicModelsCache.ids
-		dynamicModelsCache.RUnlock()
-		return out
-	}
-	// 失败负缓存：冷却期内不再请求上游。
-	if !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
-		dynamicModelsCache.RUnlock()
-		return nil
-	}
-	dynamicModelsCache.RUnlock()
-
-	acct := h.pickModelsProbeAccount()
-	if acct == nil {
-		return nil
-	}
-	infos, err := h.cfg.Upstream.FetchModels(acct)
-	if err != nil || len(infos) == 0 {
-		// **不喂熔断器**：/models 是「能力探测」接口（拿 contextWindow / efforts），
-		// 它的失败不代表该账号不能聊天 —— 实测国际版账号的
-		// /console/enterprises/personal/models 恒返回 500，而同账号的 chat 完全正常。
-		//
-		// 曾经这里调 NoteError(acct.UID)，导致：国际版账号恰好占据最早到期档位
-		// （分层选号优先选它们）→ 每次客户端启动探测模型都记一次失败 → 累计 3 次
-		// 触发 30 分钟熔断 → 界面上表现为「这几个国际版账号莫名被熔断」。
-		//
-		// 防重复请求由下面的 lastFail 负缓存负责，无需惩罚账号。
-		dynamicModelsCache.Lock()
-		dynamicModelsCache.lastFail = time.Now()
-		dynamicModelsCache.Unlock()
-		return nil
-	}
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = infos
-	dynamicModelsCache.fetched = time.Now()
-	dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
-	dynamicModelsCache.Unlock()
-	return infos
-}
-
-// pickModelsProbeAccount 选一个用于探测 /models 的账号。
-//
-// 优先非国际版：国际版该端点恒 500（实测 5/5），选它只会浪费一次请求并让
-// 动态模型列表永远拉不到（只能退回静态表）。
-//
-// 为什么不用 Pool.Pick()：探测是**只读能力发现**，不需要遵循分层/轮转选号策略 ——
-// 那些策略的目的是「把流量导向最该用的账号」，而这里只需要一个能用的账号。
-// 用 Pick() 反而会固定选中「最早到期档位」（可能整档都是国际版）。
-//
-// 全是国际版时仍返回其中一个（而非 nil）：万一上游修好了该端点，可自愈。
-func (h *Handler) pickModelsProbeAccount() *auth.Auth {
-	var intlFallback *auth.Auth
-	for _, uid := range h.cfg.Pool.AvailableUIDs() {
-		a := h.cfg.Pool.AuthByUID(uid)
-		if a == nil {
-			continue
-		}
-		if upstream.IsIntl(a) {
-			if intlFallback == nil {
-				intlFallback = a
-			}
-			continue
-		}
-		return a
-	}
-	return intlFallback
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -738,6 +592,12 @@ func errorCodeFor(err error) string {
 	var locked *modelLockedError
 	if errors.As(err, &locked) {
 		return "model_not_allowed"
+	}
+	// 带图片请求缺区域账号：不是「账号池暂时不可用、稍后重试」，而是
+	// 「你的池子缺一类账号」。用独立的码让客户端/用户能区分，而不是
+	// 混进 no_healthy_account 里被当成一次普通的负载抖动。
+	if f := failureOf(err); f != nil && f.Kind == FailureImageRegionUnavailable {
+		return "image_region_unavailable"
 	}
 	return "no_healthy_account"
 }
