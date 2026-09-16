@@ -133,6 +133,7 @@ pub fn router() -> Router {
         .route("/api/gateway/models", get(api_gateway_models))
         .route("/api/gateway/usage", get(api_gateway_usage))
         .route("/api/gateway/task-run", post(api_gateway_task_run))
+        .route("/api/gateway/growth-task", post(api_gateway_growth_task))
         // ---- 一键导入：接入本机 AI 客户端 ----
         .route("/api/gateway/agents", get(api_agents_detect))
         .route("/api/gateway/agents/import", post(api_agents_import))
@@ -1230,6 +1231,42 @@ async fn api_gateway_task_run(Json(body): Json<Value>) -> Response {
         return json_err("缺少 task 参数".to_string(), StatusCode::BAD_REQUEST);
     }
     json_ok(ai_gateway_core::modules::gateway::run_task_now(&task).await)
+}
+
+/// POST /api/gateway/growth-task —— 成长任务「一键完成」。
+///
+/// body: { "action": "list" | "run" | "run-all", "accountId": "...", "taskCode": "..." }
+///
+/// 与 /api/gateway/task-run 的分工：那个触发的是「网关侧的养号任务」
+///（活跃上报 / 夜猫子 / 开学季 / trial，作用于账号池）；本接口操作的是
+/// **成长任务体系**（18 个任务，按账号逐个推进 + 领奖），二者是不同的东西。
+///
+/// 直接在返回值里带 `ok` 字段而不抛 HTTP 错误：成长任务的失败往往是
+/// 「部分账号成功、部分失败」，整条请求变红会让界面拿不到已完成的部分。
+async fn api_gateway_growth_task(Json(body): Json<Value>) -> Response {
+    let action = body
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if action.is_empty() {
+        return json_err(
+            "缺少 action 参数（list / run / run-all）".to_string(),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let account_id = body
+        .get("accountId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let task_code = body
+        .get("taskCode")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    json_ok(ai_gateway_core::modules::gateway::growth_task(&action, &account_id, &task_code).await)
 }
 
 /// GET /api/gateway/agents —— 探测全部客户端的安装与配置状态。

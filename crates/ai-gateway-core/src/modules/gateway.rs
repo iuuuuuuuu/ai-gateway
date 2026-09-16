@@ -2475,6 +2475,104 @@ pub async fn run_task_now(task: &str) -> Value {
     }
 }
 
+/// 成长任务「一键完成」：把请求转给网关的 `/tasks/growth`。
+///
+/// 与 `run_task_now` 的关键差别是**耗时**：跑一轮全部待办时每个账号都可能
+/// 包含真实对话（Go 侧默认 chatGap 6s / reportGap 1.05s），单个账号分钟级是常态，
+/// 全账号更久。因此：
+///   1. 超时给到 10 分钟（与 Go 侧 `growTaskTimeout` 对齐）——给短了会在任务
+///      执行到一半时切断，而那时**已经产生了真实消耗**，半途而废比慢更糟；
+///   2. 同样持有 `TaskBusyGuard`：它会推迟自动同步重启，否则「任务跑到一半
+///      网关被重启」会重现（那是另一个提交刚修掉的缺陷）。
+///
+/// `action` 取 `list` / `run` / `run-all`；`run` 需要 `account_id`，
+/// 可选 `task_code`（为空 = 跑该账号全部待办）。
+pub async fn growth_task(action: &str, account_id: &str, task_code: &str) -> Value {
+    let action = action.trim();
+    if !matches!(action, "list" | "run" | "run-all") {
+        return json!({
+            "ok": false,
+            "error": "action 需为 list / run / run-all",
+        });
+    }
+    if action != "run-all" && account_id.trim().is_empty() {
+        return json!({
+            "ok": false,
+            "error": "缺少账号 id",
+        });
+    }
+
+    // 与 run_task_now 同理：全程持有，Drop 即复位。
+    // 这同时也让自动同步在成长任务期间推迟重启（见 SYNC_RESTART_PENDING）。
+    let _busy = TaskBusyGuard::acquire("growth");
+
+    let cfg = load_gateway_config();
+    let port = cfg.get("port").and_then(Value::as_u64).unwrap_or(7863) as u16;
+    let api_key = cfg
+        .get("api_key")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let url = format!("http://127.0.0.1:{port}/tasks/growth");
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return json!({ "ok": false, "error": format!("无法创建 HTTP 客户端: {e}") }),
+    };
+
+    let mut body = json!({ "action": action });
+    if !account_id.trim().is_empty() {
+        body["accountId"] = json!(account_id.trim());
+    }
+    if !task_code.trim().is_empty() {
+        body["taskCode"] = json!(task_code.trim());
+    }
+
+    let mut req = client.post(&url).json(&body);
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {api_key}"));
+    }
+
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let payload: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+            if !(200..300).contains(&status) {
+                // 网关的错误体是 OpenAI 形状，取出 message 给用户看；
+                // 取不到时退回「HTTP N」而不是编一句像是成功的话。
+                let detail = payload
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("网关 /tasks/growth 返回 HTTP {status}"));
+                return json!({ "ok": false, "error": detail });
+            }
+            // 直接把网关的结果透出去：成长任务的返回结构（tasks/items/summary）
+            // 由 Go 侧定义，宿主不该重编一遍 —— 多一层转换就多一处可能丢字段。
+            let mut out = payload;
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("ok".to_string(), json!(true));
+            }
+            out
+        }
+        Err(e) => json!({
+            "ok": false,
+            "error": if e.is_connect() {
+                "无法连接网关，请先启动网关".to_string()
+            } else if e.is_timeout() {
+                "任务执行超时（超过 10 分钟）。任务可能仍在网关侧继续，请稍后查看记录。".to_string()
+            } else {
+                e.to_string()
+            },
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

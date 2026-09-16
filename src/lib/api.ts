@@ -33,6 +33,7 @@ import type {
   GatewayPortHolder,
   GatewaySyncResult,
   GatewayTaskName,
+  GrowthTaskResult,
   GatewayTaskRunResult,
   GatewayUsageResult,
   GithubConfig,
@@ -165,6 +166,7 @@ const ROUTES: Record<string, Route> = {
   get_gateway_models: { method: "GET", path: "/api/gateway/models" },
   get_gateway_usage: { method: "GET", path: "/api/gateway/usage" },
   run_gateway_task: { method: "POST", path: "/api/gateway/task-run" },
+  run_growth_task: { method: "POST", path: "/api/gateway/growth-task" },
   // ---- 一键导入：接入本机 AI 客户端 ----
   detect_agent_clients: { method: "GET", path: "/api/gateway/agents" },
   import_agent_client: { method: "POST", path: "/api/gateway/agents/import" },
@@ -781,6 +783,26 @@ export function getGatewayConfig(): Promise<GatewayConfigResult> {
  */
 export function runGatewayTask(task: GatewayTaskName): Promise<GatewayTaskRunResult> {
   return call<GatewayTaskRunResult>("run_gateway_task", { task });
+}
+
+/**
+ * 成长任务「一键完成」。
+ *
+ * `action`：
+ *   - `list`：列出该账号的成长任务（只读、秒级）
+ *   - `run`：执行该账号的任务；`taskCode` 省略 = 跑全部待办
+ *   - `run-all`：所有账号跑一轮
+ *
+ * **耗时差异极大**：`list` 秒级；`run` 单账号分钟级（可能含**真实对话**，
+ * 会消耗 token 与额度）；`run-all` 更久。调用方必须给出「正在执行」反馈并
+ * 禁用按钮，否则用户会以为没反应而反复点击 —— 而重复点击会重复消耗。
+ */
+export function runGrowthTask(
+  action: "list" | "run" | "run-all",
+  accountId?: string,
+  taskCode?: string,
+): Promise<GrowthTaskResult> {
+  return call<GrowthTaskResult>("run_growth_task", { action, accountId, taskCode });
 }
 
 /**

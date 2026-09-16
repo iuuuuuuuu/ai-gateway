@@ -634,6 +634,105 @@ export interface GatewayTaskRunResult {
 /** 养号任务标识（与 Go 网关 /tasks/run 的 task 参数一一对应）。 */
 export type GatewayTaskName = "activity" | "nightowl" | "school" | "trial";
 
+/**
+ * 成长任务的展示状态（Go 侧 growtask 的 View* 常量）。
+ *
+ * 与养号任务的 `ran/skip` 不同，成长任务是**逐任务**的结果，
+ * 因此每个任务自己带状态与进度。
+ */
+export type GrowthTaskStatus =
+  | "claimable"
+  | "in_progress"
+  | "not_accepted"
+  | "accepted"
+  | "claimed"
+  | "unsupported"
+  | "locked";
+
+/** 成长任务列表里的一项（action=list）。 */
+export interface GrowthTaskView {
+  task_code: string;
+  title?: string;
+  /** 客户端操作指引（多用于 `unsupported` 的任务）。 */
+  description?: string;
+  /** 达成条件简述。 */
+  task_desc?: string;
+  /** 奖励积分 / 能量。 */
+  credit?: number;
+  energy?: number;
+  status: GrowthTaskStatus;
+  /** 状态的中文说明，界面可直接显示。 */
+  status_text: string;
+  accept_status?: string;
+  /** 上游是否下发了进度。**未报名时为 false**（progress 为 null）。 */
+  has_progress?: boolean;
+  /** "当前/目标"，如 "3/5"；无进度时为空。 */
+  progress?: string;
+  claimable?: boolean;
+  /** 能否被本工具自动完成。false 时只展示指引，不提供「一键完成」。 */
+  automatable?: boolean;
+  /** 该项需要**真实对话**才能推进（会消耗 token 与额度），界面应提示。 */
+  needs_chat?: boolean;
+  /** 本工具会执行什么动作（中文说明）。 */
+  action_desc?: string;
+  /** 无法自动完成时的原因说明。 */
+  hint?: string;
+}
+
+/** 单项任务的执行结果（action=run）。 */
+export interface GrowthTaskItemResult {
+  task_code: string;
+  title?: string;
+  desc?: string;
+  status: "done" | "skipped" | "error" | "unsupported";
+  message: string;
+  /** 动作前后进度（"当前/目标"）——「上报 200 ≠ 计分」的证据。 */
+  progress_before?: string;
+  progress_after?: string;
+  claimed?: boolean;
+  credit?: number;
+  energy?: number;
+  claim_error?: string;
+}
+
+/**
+ * 成长任务「一键完成」的返回。
+ *
+ * 三种 action 的返回形状不同（list 带 tasks / run 带 items / run-all 带 results），
+ * 故这里是**联合形状**而非各自独立的类型 —— 界面按 action 取用对应字段。
+ * 失败时 `ok=false` + `error`，且**不抛 HTTP 错误**：部分成功也要能拿到已完成的部分。
+ */
+export interface GrowthTaskResult {
+  ok: boolean;
+  error?: string;
+  /** action=list 时返回。 */
+  accountId?: string;
+  tasks?: GrowthTaskView[];
+  total?: number;
+  /** action=run（未指定 taskCode）时返回。 */
+  items?: GrowthTaskItemResult[];
+  /** action=run（指定 taskCode）时返回。 */
+  item?: GrowthTaskItemResult;
+  /** action=run-all 时返回。 */
+  results?: Array<{
+    uid: string;
+    realm: string;
+    skipped?: boolean;
+    skip_reason?: string;
+    items?: GrowthTaskItemResult[];
+    claimed?: number;
+    credit?: number;
+    energy?: number;
+    error?: string;
+  }>;
+  summary?: {
+    accounts?: number;
+    claimed?: number;
+    credit?: number;
+    energy?: number;
+  };
+}
+
 /** 单个「账号+模型」的冷却记录（来自网关 /status 的 model_cooling）。 */
 export interface GatewayModelCooling {
   /** 被限流的模型名。 */

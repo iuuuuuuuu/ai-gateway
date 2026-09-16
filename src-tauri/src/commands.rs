@@ -886,6 +886,33 @@ pub async fn run_gateway_task(task: String) -> Result<Value, String> {
     Ok(ai_gateway_core::modules::gateway::run_task_now(&task).await)
 }
 
+/// POST /tasks/growth —— 成长任务「一键完成」（列表 / 单账号执行 / 全账号执行）。
+///
+/// `action` 取 `list` / `run` / `run-all`：
+///   - `list`：列出该账号的成长任务（只读，秒级返回）
+///   - `run`：执行该账号的任务；`task_code` 为空 = 跑全部待办
+///   - `run-all`：所有账号跑一轮
+///
+/// **耗时差异很大**：`list` 秒级；`run` 单账号分钟级（可能含真实对话，
+/// 会消耗 token 与额度）；`run-all` 更久。界面必须给出「正在执行」的反馈，
+/// 否则用户会以为没反应而反复点击 —— 而重复点击会重复消耗。
+///
+/// 错误一律走返回值的 `error` 字段而不是 Err（与 run_gateway_task 一致）：
+/// 让界面能同时拿到失败原因，而不是整条请求变红、拿不到任何上下文。
+#[tauri::command]
+pub async fn run_growth_task(
+    action: String,
+    account_id: Option<String>,
+    task_code: Option<String>,
+) -> Result<Value, String> {
+    Ok(ai_gateway_core::modules::gateway::growth_task(
+        &action,
+        account_id.as_deref().unwrap_or(""),
+        task_code.as_deref().unwrap_or(""),
+    )
+    .await)
+}
+
 /// 检测端口是否可用。
 #[tauri::command]
 pub fn check_gateway_port(port: u16) -> Result<Value, String> {
