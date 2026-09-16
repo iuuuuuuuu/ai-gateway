@@ -458,6 +458,14 @@ type Client struct {
 
 	ChatBaseCN    string
 	BillingBaseCN string
+	// WebBaseCN / WebBaseIntl 官网域（成长中心）基址。
+	//
+	// 为什么需要第三个基址：成长任务的**领奖**接口只在官网域提供
+	//（www.workbuddy.cn/activity/growth/tasks/<code>/claim），
+	// chat 域与 billing 域上都没有该路径（实测 CLI 域同形路径恒 400）。
+	// 任务列表与报名仍在 chat 域，因此三个基址并存、不可互相替代。
+	WebBaseCN   string
+	WebBaseIntl string
 	// BaseIntl 国际版基址。与国服不同，国际版所有端点（chat / billing /
 	// 签到 / 旅行 / token 刷新）都在同一域名下，因此只需一个 base。
 	BaseIntl string
@@ -494,8 +502,10 @@ func New() *Client {
 		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr},
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
-			BillingBaseCN:        "https://www.codebuddy.cn",
-			BaseIntl:             "https://www.workbuddy.ai",
+		BillingBaseCN:        "https://www.codebuddy.cn",
+		BaseIntl:             "https://www.workbuddy.ai",
+		WebBaseCN:            "https://www.workbuddy.cn",
+		WebBaseIntl:          "https://www.workbuddy.ai",
 	}
 }
 
@@ -616,6 +626,24 @@ func (c *Client) billingBase(a *auth.Auth) string {
 		return "https://www.workbuddy.ai"
 	}
 	return c.BillingBaseCN
+}
+
+// webBase 返回该账号的官网（成长中心）基址。
+//
+// 国服与国际版都是各自站点的主域：国服 www.workbuddy.cn、国际版 www.workbuddy.ai。
+// 与 billingBase 的区别在于 billing 在国服走 codebuddy.cn（计费后台），
+// 而成长中心是面向用户的 Web 站点 —— 两者不可互相替代。
+func (c *Client) webBase(a *auth.Auth) string {
+	if isIntl(a) {
+		if c.WebBaseIntl != "" {
+			return c.WebBaseIntl
+		}
+		return "https://www.workbuddy.ai"
+	}
+	if c.WebBaseCN != "" {
+		return c.WebBaseCN
+	}
+	return "https://www.workbuddy.cn"
 }
 
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
