@@ -16,6 +16,8 @@ import type {
   AutoRotateConfig,
   CheckinConfig,
   CheckinLog,
+  GatewayConfig,
+  GatewayTaskName,
   GithubConfig,
   RotateLog,
   RotateStatus,
@@ -311,6 +313,249 @@ function AutoCheckinCard() {
             </div>
           )}
         </div>
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/**
+ * 自动养号任务：活跃上报 / 夜猫子 / 开学季 / 国际版 trial。
+ *
+ * 为什么单独一张卡而不塞进「自动签到」：这 4 个任务跑在**网关**里（不是宿主里），
+ * 配置项落在 gateway_config.json 并转写进网关的 config.json；与宿主的自动签到
+ * 是两条独立的链路。混在一起会让「改了不生效」变得无从排查。
+ *
+ * 为什么每个任务都写明前置条件：它们都会在条件不满足时静默跳过
+ *（夜猫子限时段、开学季限活动期、活跃上报与开学季只跑国服、trial 只跑国际版）。
+ * 不写清楚，用户点「立即执行」看不到任何变化，只会以为功能坏了。
+ */
+function AutoCareTasksCard() {
+  const [cfg, setCfg] = useState<GatewayConfig | null>(null);
+  const [saving, setSaving] = useState(false);
+  /** 正在「立即执行」的任务名（用于按任务显示 loading）。 */
+  const [running, setRunning] = useState<string | null>(null);
+  const [msg, setMsg] = useState<{ type: "ok" | "err" | "warn"; text: string } | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await api.getGatewayConfig();
+      setCfg(res.config);
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function save() {
+    if (!cfg) return;
+    setSaving(true);
+    setMsg(null);
+    try {
+      const res = await api.saveGatewayConfig({
+        activity_hours: cfg.activity_hours,
+        nightowl_hours: cfg.nightowl_hours,
+        school_hours: cfg.school_hours,
+        trial_hours: cfg.trial_hours,
+        activity_enabled: cfg.activity_enabled,
+        nightowl_enabled: cfg.nightowl_enabled,
+        school_enabled: cfg.school_enabled,
+        trial_enabled: cfg.trial_enabled,
+        activity_report_count: cfg.activity_report_count,
+      });
+      setCfg(res.config);
+      // 说清楚「还要重启」：网关只在启动时读一次 config.json，
+      // 不提示的话用户会以为保存没生效，反复点保存。
+      setMsg({ type: "ok", text: "配置已保存。重启网关后生效（可在「兼容网关」页重启）" });
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function runNow(task: GatewayTaskName) {
+    setRunning(task);
+    setMsg(null);
+    try {
+      const res = await api.runGatewayTask(task);
+      if (!res.ok) {
+        setMsg({ type: "err", text: res.error || "执行失败" });
+      } else if (!res.ran) {
+        // 被前置条件挡下是正常结果，用 warning 而非 error —— 否则用户会以为坏了
+        setMsg({ type: "warn", text: res.message || "本次未执行（前置条件不满足）" });
+      } else {
+        setMsg({ type: "ok", text: `已触发一轮：${res.message || "执行完成"}` });
+      }
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  /** 更新某个任务的时点列表（输入框是逗号分隔的小时）。 */
+  function setHours(key: keyof GatewayConfig, value: string) {
+    if (!cfg) return;
+    const hours = value
+      .split(/[,，\s]+/)
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isInteger(n) && n >= 0 && n <= 23);
+    setCfg({ ...cfg, [key]: hours });
+  }
+
+  /** 时点列表 → 输入框文本。 */
+  function hoursText(hours?: number[]): string {
+    return (hours ?? []).join(", ");
+  }
+
+  const tasks: {
+    name: GatewayTaskName;
+    label: string;
+    enabledKey: keyof GatewayConfig;
+    hoursKey: keyof GatewayConfig;
+    description: ReactNode;
+    /** 前置条件说明（界面必须写清楚，否则「立即执行」没反应像是坏了）。 */
+    note: string;
+    /** 额外的数值配置（只有活跃上报有）。 */
+    extra?: ReactNode;
+  }[] = [
+    {
+      name: "activity",
+      label: "活跃上报",
+      enabledKey: "activity_enabled",
+      hoursKey: "activity_hours",
+      description: "每个账号发送对话活跃事件，点亮连登天数并解锁领养猫猫的前置条件",
+      note: "仅国服账号。签到只恢复余额，连登天数必须靠本任务点亮。",
+      extra: cfg ? (
+        <SettingsFieldRow
+          label="每号每日条数"
+          description="条；默认 3。单条偶发被服务端丢弃，多条提高点亮成功率"
+          htmlFor="care-activity-count"
+          operational
+        >
+          <Input
+            id="care-activity-count"
+            className="w-full sm:w-48"
+            type="number"
+            min={1}
+            max={20}
+            value={cfg.activity_report_count ?? 3}
+            onChange={(e) =>
+              setCfg({ ...cfg, activity_report_count: Number(e.target.value) })
+            }
+          />
+        </SettingsFieldRow>
+      ) : null,
+    },
+    {
+      name: "nightowl",
+      label: "夜猫子任务",
+      enabledKey: "nightowl_enabled",
+      hoursKey: "nightowl_hours",
+      description: "在夜猫时段内补一次任务，点亮仅在夜间计入的成长任务",
+      note: "只在 23:00–08:00（北京时间）内有效，时段外点击「立即执行」会被跳过并提示原因。仅国服账号。",
+    },
+    {
+      name: "school",
+      label: "开学季活动",
+      enabledKey: "school_enabled",
+      hoursKey: "school_hours",
+      description: "领取活动里已达标的奖励",
+      note: "限时活动。仅领取已达标的任务奖励，不伪造学生认证 / 邀请等动作；活动下线后自动跳过。仅国服账号。",
+    },
+    {
+      name: "trial",
+      label: "国际版 trial 加油包",
+      enabledKey: "trial_enabled",
+      hoursKey: "trial_hours",
+      description: "为国际版账号领取 trial 加油包",
+      note: "仅国际版账号（国服无此入口）。已领取过的账号会被幂等跳过，可每天重试。",
+    },
+  ];
+
+  return (
+    <SettingsGroup id="settings-care-tasks" title="自动养号任务">
+      <CardContent className="space-y-0 p-0">
+        <p className="border-b border-border/60 bg-muted/25 px-4 py-3 text-xs leading-5 text-muted-foreground sm:px-5">
+          这 4 个任务由<b className="text-foreground">兼容网关</b>执行。改完配置需要重启网关才会生效；
+          「立即执行」会立刻让网关跑一轮，便于验证配置是否正确。
+        </p>
+
+        {cfg ? (
+          <>
+            {tasks.map((task) => (
+              <div key={task.name} className="border-b border-border/60">
+                <SettingsFieldRow
+                  label={task.label}
+                  description={task.description}
+                  htmlFor={`care-${task.name}-enabled`}
+                  operational
+                >
+                  <Switch
+                    id={`care-${task.name}-enabled`}
+                    checked={cfg[task.enabledKey] !== false}
+                    onCheckedChange={(v) => setCfg({ ...cfg, [task.enabledKey]: v })}
+                  />
+                </SettingsFieldRow>
+
+                <SettingsFieldRow
+                  label="执行时刻"
+                  description="小时，可填多个用逗号分隔（0-23）；例如 9, 21"
+                  htmlFor={`care-${task.name}-hours`}
+                  operational
+                >
+                  <Input
+                    id={`care-${task.name}-hours`}
+                    className="w-full sm:w-48"
+                    value={hoursText(cfg[task.hoursKey] as number[] | undefined)}
+                    onChange={(e) => setHours(task.hoursKey, e.target.value)}
+                  />
+                </SettingsFieldRow>
+
+                {/* 额外数值配置排在按钮之前：按钮行是这一组的收尾，
+                    插在它后面会让「立即执行」看起来属于下一个配置项。 */}
+                {task.extra}
+
+                <div className="flex flex-wrap items-center gap-2 px-4 py-3 sm:px-5">
+                  <DemoAction>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={running !== null}
+                      onClick={() => void runNow(task.name)}
+                    >
+                      {running === task.name ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                      立即执行
+                    </Button>
+                  </DemoAction>
+                  <span className="text-xs leading-4 text-muted-foreground/75">{task.note}</span>
+                </div>
+              </div>
+            ))}
+
+            <div className="flex flex-wrap gap-2 px-4 py-3 sm:px-5">
+              <DemoAction>
+                <Button size="sm" onClick={save} disabled={saving}>
+                  {saving ? <Loader2 className="animate-spin" /> : <Save />}保存配置
+                </Button>
+              </DemoAction>
+            </div>
+          </>
+        ) : (
+          <p className="px-4 py-3 text-sm text-muted-foreground sm:px-5">加载配置中…</p>
+        )}
+
+        {msg && (
+          <Alert
+            variant={msg.type === "err" ? "destructive" : "default"}
+            className="!w-auto mx-4 my-4 sm:mx-5"
+          >
+            <AlertDescription>{msg.text}</AlertDescription>
+          </Alert>
+        )}
       </CardContent>
     </SettingsGroup>
   );
@@ -1459,6 +1704,7 @@ export default function SettingsPage() {
         <RecordRetentionCard />
         <PermissionCheckCard />
         <AutoCheckinCard />
+        <AutoCareTasksCard />
         <AutoRotateCard />
         {api.isDesktop() || api.isDemoMode() ? <StartupCard /> : null}
         {api.isWebui() && !api.isDemoMode() ? null : <UpdateCard />}
