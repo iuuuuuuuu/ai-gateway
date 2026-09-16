@@ -36,8 +36,69 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # 发版前的快速验证门。
+  #
+  # 背景：本工作流此前**没有任何测试** —— 没有 cargo test、没有 cargo check、
+  # 没有 go test，唯一的校验是产物断言（.sig 数量、安装包存在性）。也就是说，
+  # 一个 tag 完全可以为「从未通过编译校验与单测」的代码发布安装包，而且发布
+  # 一旦出去就撤不回来。这一点在 push 阶段由 ci.yml 覆盖，但打 tag 时并不强制
+  # 要求 ci 绿 —— tag 可以打在任意 commit 上。
+  #
+  # 为什么不直接塞进下面四个平台 job：那会把同样的检查重复跑 4 遍，而 windows
+  # 那条关键路径已经很贵（707s）。这里用**一个** ubuntu job 做门控，四平台
+  # 必须等它通过才开跑，代价只有 ~2 分钟，换来「发布出去的必定测过」。
+  #
+  # 用 needs 而非 continue-on-error：这里就是要它**能拦住**发布，与下面
+  # build 的"单平台失败不阻断其余平台"是相反的策略，两者互不冲突。
+  preflight:
+    name: preflight / 发版前验证
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: go-gateway/go.sum
+
+      - name: 安装 Linux 系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - run: npm ci
+
+      # build.rs 内嵌网关、ai-gateway-server 的 RustEmbed 内嵌 dist/，
+      # 两者都必须在 cargo 之前就位，否则编译会以「未内嵌」或找不到目录失败。
+      - name: 构建内嵌网关
+        run: sh scripts/build-gateway.sh
+
+      - name: 构建前端
+        run: npm run build
+
+      - name: 核心单测
+        run: cargo test -p ai-gateway-core
+
+      - name: 全 workspace 编译校验
+        run: cargo check --workspace --all-targets --profile test
+
+      - name: Go 网关单测
+        working-directory: go-gateway
+        run: go test ./...
+
   build:
     name: build / ${{ matrix.name }}
+    needs: preflight
     # 单平台失败不阻断其余平台，也不阻断 Release。
     #
     # 注意这里有两层，缺一不可：
@@ -425,13 +486,23 @@ jobs:
 
   release:
     name: 发布 Release
-    needs: build
+    needs: [preflight, build]
     # 手动触发没有 tag，不建 Release（只留在 Artifacts 里供下载验证）
     #
     # !cancelled() 不可省略：needs: build 默认要求依赖成功，只要有一个平台
     # 失败（continue-on-error 不会把结果改成 success），release 就会被 skip。
     # 加上它之后，只要不是被主动取消，Windows 等成功的平台产物照常发布。
-    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    #
+    # 前半段 needs.preflight.result == 'success' 是必须的：`build` 的 needs 是
+    # preflight，preflight 一挂 build 就会被 skip，而 !cancelled() 对「被 skip」
+    # 是 true —— 于是 release 会照常执行、却一个产物都没有，merge-update-manifests.py
+    # 拿空目录去跑，轻则报错重则发一个空 Release。
+    # 这正是「发版前验证」要防的情况：测试挂了就宁可什么都不发。
+    #
+    # 注意不能写成 needs: build 就够了 —— build 被 skip 时其 result 也是 skipped，
+    # 而这里要区分的是「build 跑过但某些平台失败」（照常发）与「build 压根没跑」
+    # （不能发），所以必须同时看 preflight。
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
