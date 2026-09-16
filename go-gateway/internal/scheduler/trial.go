@@ -15,6 +15,7 @@ import (
 	"log"
 	"time"
 
+	"workbuddy2api/internal/records"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -56,11 +57,19 @@ func (s *Scheduler) runTrial(ctx context.Context) {
 		switch {
 		case err != nil:
 			log.Printf("trial %s: %v", uid8(a.UID), err)
+			// 失败按天去重：trial 每天最多跑两次，同一失败不必重复出现。
+			s.cfg.Records.TaskDaily(a.UID, "trial 加油包", records.ResultFailed, err.Error())
 		case claimed:
 			newly++
 			log.Printf("trial %s: claimed new trial pack", uid8(a.UID))
+			// 只有**真的领到新包**才写：这是国际版唯一的积分增益动作，
+			// 属于用户最想知道的「有新变化」。
+			s.cfg.Records.Task(a.UID, "trial 加油包", records.ResultSuccess, "领取到新的 trial 加油包")
 		default:
 			already++
+			// 「已领过」是幂等成功而非失败，但它同样是**没有变化**，
+			// 每天写一条只会刷屏 —— 按天去重后保留一条可查即可。
+			s.cfg.Records.TaskDaily(a.UID, "trial 加油包", records.ResultAlready, "本周期已领取过")
 		}
 	}
 

@@ -5,6 +5,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/records"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -69,6 +71,14 @@ type Config struct {
 	// 国际版（workbuddy.ai）的 billing 与 growth 接口暂无真实数据，默认跳过；
 	// token 保活不受此限制（两个区域都需要刷新）。
 	CheckinScope string
+
+	// Records 账号记录写入器（nil = 不记录）。
+	//
+	// 为什么要它：这 4 个任务的日志此前只走 log.Printf 写 stdout，而宿主启动
+	// 网关子进程时把 stdout/stderr 丢进了 Stdio::null —— 任务照跑，但界面上
+	// 一条执行痕迹都没有（用户报的正是这个现象）。改为写宿主已经在读的
+	// account_records.json，记录就能与签到并列出现在「账号记录 → 任务」里。
+	Records *records.Recorder
 }
 
 // checkinScopeAllows 该账号是否参与签到与猫猫旅行。
@@ -79,6 +89,23 @@ func (s *Scheduler) checkinScopeAllows(a *auth.Auth) bool {
 	return !upstream.IsIntl(a)
 }
 
+// 手动触发用的任务名。用字符串而非 taskKind 暴露给宿主：
+// taskKind 是内部排程的实现细节（顺序会随排程重构变化），
+// 而宿主（GUI/webui）需要的是稳定的对外标识。
+const (
+	TaskNameActivity = "activity"
+	TaskNameNightOwl = "nightowl"
+	TaskNameSchool   = "school"
+	TaskNameTrial    = "trial"
+)
+
+// ErrTaskRunning 该任务已有一轮手动触发在执行中。
+//
+// 为什么需要去重：一轮活跃上报按账号数 × 条数 × 间隔串行跑，大账号池下可长达数分钟。
+// 用户连点「立即执行」若不拦，会叠加出成倍的重复上报 —— 那正是活跃上报刻意
+// 控制条数要规避的风控画像。
+var ErrTaskRunning = errors.New("task already running")
+
 // Scheduler 调度器。
 type Scheduler struct {
 	cfg Config
@@ -87,6 +114,111 @@ type Scheduler struct {
 	// 避免同日多趟对上游重试轰炸；进程重启即清零（无需持久化）。
 	mu         sync.Mutex
 	adoptTried map[string]string
+
+	// taskMu/taskBusy 手动触发的在跑标记。与 mu 分开：排程循环会自动跑同一批任务，
+	// 共用一把锁会让「手动触发」与「到点执行」互相阻塞，把定时任务拖慢。
+	taskMu   sync.Mutex
+	taskBusy map[string]bool
+}
+
+// TaskRunResult 手动触发一轮任务的结果。
+//
+// 为什么要回报「跑了没有」而不只是成功/失败：这些任务都有前置条件
+// （夜猫子限时段、开学季限活动期、活跃上报与开学季只跑国服），
+// 不满足时**跳过是正确行为**而非错误。宿主据此在界面上说明原因，
+// 否则用户点了「立即执行」看不到任何变化，会以为功能坏了。
+type TaskRunResult struct {
+	Task string `json:"task"`
+	// Ran 是否真的执行了一轮（false = 被前置条件挡下）。
+	Ran bool `json:"ran"`
+	// Skip 跳过原因码；Ran=true 时为空。
+	//
+	// 用稳定的英文码而非直接给中文：宿主可据此分支（如高亮提示），
+	// 文案留给 Message，改文案不会破坏调用方的判断。
+	Skip string `json:"skip,omitempty"`
+	// Message 面向用户的中文说明，可直接显示在界面上。
+	Message string `json:"message"`
+}
+
+// claimTask 尝试认领某个任务；已被认领时返回 false。
+//
+// 手动触发与到点排程共用一组标记：它们在跑同一批上游请求，若互不感知，
+// 用户恰好在 10:00 点「立即执行」就会与排程那轮叠成双倍上报 ——
+// 正是活跃上报刻意控制条数要规避的风控画像。
+func (s *Scheduler) claimTask(name string) bool {
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+	if s.taskBusy[name] {
+		return false
+	}
+	s.taskBusy[name] = true
+	return true
+}
+
+// releaseTask 归还认领。
+func (s *Scheduler) releaseTask(name string) {
+	s.taskMu.Lock()
+	delete(s.taskBusy, name)
+	s.taskMu.Unlock()
+}
+
+// RunTaskByName 手动触发一轮指定任务（供宿主「立即执行」按钮）。
+//
+// 只做「立刻跑一轮」，不检查 enabled 开关：开关管的是**后台是否自动排程**，
+// 用户主动点击就该执行 —— 与宿主侧 checkin_all / travel_run 的既有语义一致。
+//
+// 未知任务名返回错误而非静默成功：宿主拼错名字时必须能看见，否则按钮点了没反应。
+func (s *Scheduler) RunTaskByName(name string) (TaskRunResult, error) {
+	switch name {
+	case TaskNameActivity, TaskNameNightOwl, TaskNameSchool, TaskNameTrial:
+	default:
+		return TaskRunResult{}, fmt.Errorf("unknown task %q", name)
+	}
+
+	if !s.claimTask(name) {
+		return TaskRunResult{
+				Task: name, Skip: "already_running",
+				Message: "该任务正在执行中，请稍后再试",
+			},
+			ErrTaskRunning
+	}
+	defer s.releaseTask(name)
+
+	// 夜猫子只在夜猫窗口内计入：窗口外触发会被 runNightOwl 直接跳过，
+	// 与其让用户白等一轮然后什么都没发生，不如提前回报原因。
+	if name == TaskNameNightOwl && !withinNightWindow() {
+		return TaskRunResult{
+			Task:    name,
+			Skip:    "outside_window",
+			Message: "当前不在夜猫子时段（23:00–08:00 北京时间），上游不计入本次上报",
+		}, nil
+	}
+
+	switch name {
+	case TaskNameActivity:
+		s.RunActivityNow()
+	case TaskNameNightOwl:
+		s.RunNightOwlNow()
+	case TaskNameSchool:
+		s.RunSchoolNow()
+	case TaskNameTrial:
+		s.RunTrialNow()
+	}
+	return TaskRunResult{Task: name, Ran: true, Message: "已触发一轮"}, nil
+}
+
+// runCareTask 到点执行一个养号任务，并与手动触发互斥。
+//
+// 与手动触发的唯一区别：排程这轮被占用时**记一行日志就走**，不排队。
+// 排队会让「迟到唤醒 + 用户刚点过立即执行」叠成两轮；而下一个整点很快就会再来，
+// 漏掉一轮的代价远小于双倍上报。
+func (s *Scheduler) runCareTask(name string, run func()) {
+	if !s.claimTask(name) {
+		log.Printf("%s: skipped (a manual run is already in progress)", name)
+		return
+	}
+	defer s.releaseTask(name)
+	run()
 }
 
 // New 构建。
@@ -112,7 +244,11 @@ func New(cfg Config) *Scheduler {
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = defaultActivityReportCount
 	}
-	return &Scheduler{cfg: cfg, adoptTried: make(map[string]string)}
+	return &Scheduler{
+		cfg:        cfg,
+		adoptTried: make(map[string]string),
+		taskBusy:   make(map[string]bool),
+	}
 }
 
 // nextFire 返回 now 之后最近的一个整点触发时间；hours 为本地小时（0-23）。
@@ -213,13 +349,13 @@ func (s *Scheduler) Run(ctx context.Context) {
 				case taskKeepalive:
 					s.RunKeepaliveNow()
 				case taskActivity:
-					s.runActivity(ctx)
+					s.runCareTask(TaskNameActivity, func() { s.runActivity(ctx) })
 				case taskNightOwl:
-					s.runNightOwl(ctx)
+					s.runCareTask(TaskNameNightOwl, func() { s.runNightOwl(ctx) })
 				case taskSchool:
-					s.runSchool(ctx)
+					s.runCareTask(TaskNameSchool, func() { s.runSchool(ctx) })
 				case taskTrial:
-					s.runTrial(ctx)
+					s.runCareTask(TaskNameTrial, func() { s.runTrial(ctx) })
 				}
 			}
 		}

@@ -379,6 +379,11 @@ func TestScheduleInvalidHourRejected(t *testing.T) {
 		{`{"schedule":{"checkin_hours":[25]}}`, "checkin_enabled"},
 		{`{"schedule":{"checkin_hours":[-1]}}`, "checkin_enabled"},
 		{`{"schedule":{"keepalive_hours":[-1]}}`, "keepalive_enabled"},
+		// 界面现在可自由填这 4 个任务的时点，非法值同样必须快速失败
+		{`{"schedule":{"activity_hours":[24]}}`, "activity_enabled"},
+		{`{"schedule":{"nightowl_hours":[-1]}}`, "nightowl_enabled"},
+		{`{"schedule":{"school_hours":[99]}}`, "school_enabled"},
+		{`{"schedule":{"trial_hours":[-3]}}`, "trial_enabled"},
 	}
 	for _, tc := range cases {
 		dir := t.TempDir()
@@ -391,6 +396,115 @@ func TestScheduleInvalidHourRejected(t *testing.T) {
 		if !strings.Contains(err.Error(), tc.wantSwitch) {
 			t.Errorf("error for %s should point at schedule.%s: %v", tc.body, tc.wantSwitch, err)
 		}
+	}
+}
+
+// TestScheduleNewTaskDefaults 4 个养号任务的缺省值：时刻与开关都要有默认。
+//
+// 为什么默认值也要测：宿主（界面）读不到这些字段时会自己填一份默认，
+// 两边一旦不一致，用户「不改任何东西直接保存」就会把网关配置改成另一套排程。
+func TestScheduleNewTaskDefaults(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		hours []int
+		want  []int
+	}{
+		{"activity_hours", c.Schedule.ActivityHours, []int{10}},
+		{"nightowl_hours", c.Schedule.NightOwlHours, []int{1}},
+		{"school_hours", c.Schedule.SchoolHours, []int{12}},
+		{"trial_hours", c.Schedule.TrialHours, []int{9, 21}},
+	} {
+		if len(tc.hours) != len(tc.want) {
+			t.Errorf("%s=%v want %v", tc.name, tc.hours, tc.want)
+			continue
+		}
+		for i := range tc.want {
+			if tc.hours[i] != tc.want[i] {
+				t.Errorf("%s=%v want %v", tc.name, tc.hours, tc.want)
+				break
+			}
+		}
+	}
+	if !c.Schedule.ActivityEnabled || !c.Schedule.NightOwlEnabled ||
+		!c.Schedule.SchoolEnabled || !c.Schedule.TrialEnabled {
+		t.Errorf("4 个任务的开关缺省都应为 true: %+v", c.Schedule)
+	}
+	if c.Schedule.ActivityReportCount != 3 {
+		t.Errorf("activity_report_count=%d want 3", c.Schedule.ActivityReportCount)
+	}
+}
+
+// TestScheduleNewTaskEmptyHoursFallsBackToDefault 单独把某个新任务的 hours 配成
+// 空数组 / null 时，也应回落默认值。
+//
+// 回归保护：这几行此前被误写在 `if len(ActivityHours)==0` 的块里，
+// 于是只有活跃上报为空时才顺带赋值 —— 单独清空 nightowl_hours 会得到空排程，
+// 而 nextFire 对空数组返回零时间，任务被**静默关掉**（与「未配置→回落默认」相反）。
+func TestScheduleNewTaskEmptyHoursFallsBackToDefault(t *testing.T) {
+	cases := map[string]string{
+		"emptyarr": `{"schedule":{"nightowl_hours":[],"school_hours":[],"trial_hours":[]}}`,
+		"null":     `{"schedule":{"nightowl_hours":null,"school_hours":null,"trial_hours":null}}`,
+		"显式活动时点":   `{"schedule":{"activity_hours":[7],"nightowl_hours":[],"school_hours":null,"trial_hours":[]}}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			fp := filepath.Join(dir, "c.json")
+			os.WriteFile(fp, []byte(body), 0o600)
+			c, err := Load(fp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(c.Schedule.NightOwlHours) != 1 || c.Schedule.NightOwlHours[0] != 1 {
+				t.Errorf("nightowl_hours=%v want default [1]", c.Schedule.NightOwlHours)
+			}
+			if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12 {
+				t.Errorf("school_hours=%v want default [12]", c.Schedule.SchoolHours)
+			}
+			if len(c.Schedule.TrialHours) != 2 || c.Schedule.TrialHours[0] != 9 || c.Schedule.TrialHours[1] != 21 {
+				t.Errorf("trial_hours=%v want default [9 21]", c.Schedule.TrialHours)
+			}
+		})
+	}
+}
+
+// TestScheduleNewTaskExplicitHoursAndDisable 显式时点与显式禁用都要被尊重
+// （与签到同样的语义：禁用不擦除用户配的小时，便于原样恢复）。
+func TestScheduleNewTaskExplicitHoursAndDisable(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"nightowl_hours":[2,3],"school_hours":[15],`+
+		`"trial_hours":[8],"activity_hours":[11],"activity_report_count":5,`+
+		`"school_enabled":false,"trial_enabled":false}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Schedule.NightOwlHours) != 2 || c.Schedule.NightOwlHours[0] != 2 || c.Schedule.NightOwlHours[1] != 3 {
+		t.Errorf("nightowl_hours=%v want [2 3]", c.Schedule.NightOwlHours)
+	}
+	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 15 {
+		t.Errorf("school_hours=%v want [15]", c.Schedule.SchoolHours)
+	}
+	if len(c.Schedule.TrialHours) != 1 || c.Schedule.TrialHours[0] != 8 {
+		t.Errorf("trial_hours=%v want [8]", c.Schedule.TrialHours)
+	}
+	if c.Schedule.ActivityReportCount != 5 {
+		t.Errorf("activity_report_count=%d want 5", c.Schedule.ActivityReportCount)
+	}
+	if c.Schedule.SchoolEnabled || c.Schedule.TrialEnabled {
+		t.Errorf("显式 false 应生效: %+v", c.Schedule)
+	}
+	if !c.Schedule.ActivityEnabled || !c.Schedule.NightOwlEnabled {
+		t.Errorf("未显式关闭的开关应保持 true: %+v", c.Schedule)
 	}
 }
 

@@ -142,6 +142,23 @@ pub fn default_gateway_config() -> Value {
         "pinned_uid": null,
         "last_status": null,
         "last_error": null,
+        // ---- 4 个自动养号任务的排程（写进网关的 schedule 块，见 write_native_config）----
+        //
+        // 默认值必须与 Go 侧 cmd/server/config.go 的 Default() 逐字一致：
+        // 这里是界面上的初值，那边是「键缺席」时的兜底。两边不一致时，
+        // 用户「不改任何东西直接保存」就会把网关排程改成另一套时刻。
+        "activity_hours": [10],
+        "nightowl_hours": [1],
+        "school_hours": [12],
+        "trial_hours": [9, 21],
+        "activity_enabled": true,
+        "nightowl_enabled": true,
+        "school_enabled": true,
+        "trial_enabled": true,
+        "activity_report_count": 3,
+        "checkin_enabled": true,
+        "keepalive_enabled": true,
+        "checkin_scope": "cn",
     })
 }
 
@@ -1088,6 +1105,62 @@ fn upstream_proxy() -> String {
         .to_string()
 }
 
+/// 从宿主配置里取某个任务的执行时点（小时列表），非法/缺失一律回落默认。
+///
+/// 为什么要这层兜底而不是直接 `cfg.get(...).cloned()`：
+///   - 键缺失（老配置）→ 必须给出与 Go 侧 `Default()` 完全一致的默认值，
+///     否则「用户没配过」与「用户配了空」会得到两种不同排程；
+///   - 前端数值输入框可能传来 0 / 负数 / >23 的脏值。Go 侧对此是**启动即报错**
+///     （validateScheduleHours），一旦写进 native config，网关会直接起不来 ——
+///     在宿主这边先滤掉，坏值退化为「该时点不生效」而不是「整个网关挂掉」；
+///   - 空列表同样回落默认：Go 侧把空数组视同「未配置」（见其 normalize()）。
+///
+/// 去重后排序，避免用户重复填同一小时导致网关在同一时刻跑两轮。
+fn schedule_hours(cfg: &Value, key: &str, default: &[i64]) -> Value {
+    let raw = cfg.get(key).and_then(Value::as_array);
+    let mut hours: Vec<i64> = match raw {
+        Some(items) => items
+            .iter()
+            .filter_map(Value::as_i64)
+            .filter(|h| (0..=23).contains(h))
+            .collect(),
+        None => Vec::new(),
+    };
+    if hours.is_empty() {
+        hours = default.to_vec();
+    }
+    hours.sort_unstable();
+    hours.dedup();
+    json!(hours)
+}
+
+/// 网关记录任务结果所需的账号身份映射：网关 uid → {id, name}。
+///
+/// 为什么必须由宿主传下去，而不是让网关用它手上的 uid 顶替：
+///
+///   - 界面「账号卡片 → 查看记录」按账号库的 **id**（uuid）过滤记录，
+///     而网关凭证里只有 uid。网关拿 uid 当 accountId 写，用户点开某个账号
+///     永远查不到这些任务 —— 过滤条件对不上，且不会有任何报错。
+///   - 展示名同理：宿主用 `account::account_display_name`（email → nickname → uid），
+///     而网关的凭证里根本没有 email（授权信息只在账号库的 profile_raw）。
+///
+/// 只含 id / uid / 展示名，**不含任何 token**：这份配置会落到磁盘
+/// （gateway_native_config.json），凭证绝不该出现在那里。
+fn gateway_account_identities() -> Value {
+    let items: Vec<Value> = account::load_accounts()
+        .iter()
+        .filter_map(|acc| {
+            let uid = account::get_str(acc, "uid")?;
+            Some(json!({
+                "uid": uid,
+                "id": acc.get("id").and_then(Value::as_str).unwrap_or(""),
+                "name": account::account_display_name(acc),
+            }))
+        })
+        .collect();
+    json!(items)
+}
+
 /// 生成网关需要的 config.json（网关原生格式）。
 fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
     let dir = gateway_dir();
@@ -1097,6 +1170,11 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
     if let Some(parent) = state_file.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+
+    // 账号记录文件由宿主独占命名：路径只在这里算一次、随配置透传给网关。
+    // 两边各自推算数据目录（宿主看 AI_GATEWAY_HOME，网关看自己的 cwd）
+    // 迟早会算出不同的值，而那种错法表现为「静默不记录」，极难排查。
+    let records_file = crate::modules::account_records::account_records_file();
 
     let native = json!({
         "listen": cfg.get("listen").and_then(Value::as_str).unwrap_or(":7863"),
@@ -1114,6 +1192,33 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
             // 签到 + 猫猫旅行的区域范围：cn（缺省，仅国服）/ all。
             // 国际版（workbuddy.ai）的 billing 与 growth 接口暂无真实数据，默认跳过。
             "checkin_scope": cfg.get("checkin_scope").and_then(Value::as_str).unwrap_or("cn"),
+            // ---- 4 个自动养号任务 ----
+            //
+            // 为什么必须写在这里：网关只读它自己的 config.json，键缺席时用
+            // Go 侧的硬编码默认值（cmd/server/config.go 的 Default()）。宿主界面
+            // 改的却是 gateway_config.json —— 不落到此处，用户在界面上做的任何
+            // 调整都不会生效，且从界面上完全看不出来（表现为「改了没用」）。
+            //
+            // 时点是**数值列表**（支持多个整点，如 trial 默认 [9,21]），
+            // 因此走 as_array + as_i64 而不是单个数字。
+            "activity_hours": schedule_hours(cfg, "activity_hours", &[10]),
+            "nightowl_hours": schedule_hours(cfg, "nightowl_hours", &[1]),
+            "school_hours": schedule_hours(cfg, "school_hours", &[12]),
+            "trial_hours": schedule_hours(cfg, "trial_hours", &[9, 21]),
+            // 开关缺省 true：与 checkin_enabled / keepalive_enabled 同语义 ——
+            // 老配置里没有这些键时保持既有行为（任务照跑），只有显式 false 才关。
+            "activity_enabled": cfg.get("activity_enabled").and_then(Value::as_bool).unwrap_or(true),
+            "nightowl_enabled": cfg.get("nightowl_enabled").and_then(Value::as_bool).unwrap_or(true),
+            "school_enabled": cfg.get("school_enabled").and_then(Value::as_bool).unwrap_or(true),
+            "trial_enabled": cfg.get("trial_enabled").and_then(Value::as_bool).unwrap_or(true),
+            // 每号每日上报条数：取 3 而非 1（单条偶发被服务端静默丢弃，多条提高
+            // 点亮成功率），也不宜过多以免被风控当成异常流量。上限 20 兜住误填。
+            "activity_report_count": cfg
+                .get("activity_report_count")
+                .and_then(Value::as_i64)
+                .filter(|n| *n > 0)
+                .unwrap_or(3)
+                .min(20),
         },
         "upstream": {
             "timeout_seconds": 120,
@@ -1153,7 +1258,25 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
                 ""
             }
         },
-        "session_sticky": { "enabled": true, "ttl": "30m", "gc_interval": "5m" }
+        "session_sticky": { "enabled": true, "ttl": "30m", "gc_interval": "5m" },
+        // ---- 账号记录回写（养号任务的执行痕迹）----
+        //
+        // 为什么需要：活跃上报 / 夜猫子 / 开学季 / trial 都实现在 Go 网关里，
+        // 它们此前只 log.Printf 写 stdout，而宿主启动子进程时把
+        // stdout/stderr 丢进了 Stdio::null（见本文件 start_gateway）——
+        // 于是「任务跑了但界面上一条记录都没有」。
+        //
+        // 让 Go 侧直接写宿主已经在读的 account_records.json（同文件、同结构），
+        // 记录就能与签到并列出现在「账号记录 → 任务」里，不引入第二套格式。
+        "account_records": {
+            "file": records_file.to_string_lossy(),
+            // 保留天数取宿主设置，与签到日志/积分快照同一口径：
+            // 两边各算一次会出现「界面说保留 60 天，网关按 7 天清」这类不一致。
+            "retention_days": crate::modules::config::record_retention_days(),
+            // 账号身份映射（uid → id/name）：界面按账号库 id 过滤，
+            // 见 gateway_account_identities 的注释。
+            "identities": gateway_account_identities(),
+        }
     });
     let path = dir.join("gateway_native_config.json");
     let text = serde_json::to_string_pretty(&native).map_err(|e| e.to_string())?;
@@ -1907,6 +2030,92 @@ pub async fn fetch_usage(days: Option<i64>) -> Value {
     }
 }
 
+/// 手动触发网关侧的一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
+///
+/// 为什么走 HTTP 而不是在宿主里重做一遍：这些任务的实现（上报事件形状、
+/// 夜猫时间窗判定、只领已达标奖励的边界）全在 Go 网关里且已有测试覆盖，
+/// 宿主只借一个入口，不复制业务逻辑。
+///
+/// 返回结构固定为
+///   { "ok": bool, "ran": bool, "skip": string|null, "message": string, "error": string|null }
+/// —— 与 `fetch_usage` 同一约定：网关没起来不是异常，而是由 `ok=false` +
+/// 可读的 `error` 表达，调用方据此给出「请先启动网关」这类提示。
+///
+/// 注意 `ran=false` 且 `skip` 非空是**正常结果**（如夜猫子不在时段内），
+/// 界面要把它当说明展示，而不是错误。
+pub async fn run_task_now(task: &str) -> Value {
+    let task = task.trim();
+    if task.is_empty() {
+        return json!({
+            "ok": false, "ran": false, "skip": Value::Null,
+            "message": "", "error": "缺少任务名",
+        });
+    }
+
+    let cfg = load_gateway_config();
+    let port = cfg.get("port").and_then(Value::as_u64).unwrap_or(7863) as u16;
+    let api_key = cfg
+        .get("api_key")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let url = format!("http://127.0.0.1:{port}/tasks/run");
+    let fail = |error: String| {
+        json!({
+            "ok": false, "ran": false, "skip": Value::Null,
+            "message": "", "error": error,
+        })
+    };
+
+    let client = match reqwest::Client::builder()
+        // 超时给得比其它接口宽：活跃上报要按「账号数 × 条数 × 间隔」（条间 800ms）
+        // 串行跑完，2500ms 那种探活级超时会让大账号池必然超时。
+        // 这里只等入口返回，不等整轮跑完（Go 侧同步执行，故仍需留足余量）。
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return fail(format!("无法创建 HTTP 客户端: {e}")),
+    };
+
+    let mut req = client.post(&url).json(&json!({ "task": task }));
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {api_key}"));
+    }
+
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+            if !(200..300).contains(&status) {
+                // 网关的错误体是 OpenAI 形状，取出里面的 message 给用户看
+                let detail = body
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("网关 /tasks/run 返回 HTTP {status}"));
+                return fail(detail);
+            }
+            json!({
+                "ok": true,
+                "ran": body.get("ran").and_then(Value::as_bool).unwrap_or(false),
+                // 空串归一成 null：前端据「有无 skip」分支，空串会让它误以为有原因
+                "skip": body.get("skip").and_then(Value::as_str).filter(|s| !s.is_empty()),
+                "message": body.get("message").and_then(Value::as_str).unwrap_or(""),
+                "error": Value::Null,
+            })
+        }
+        Err(e) => fail(if e.is_connect() {
+            "无法连接网关，请先启动网关".to_string()
+        } else {
+            e.to_string()
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2274,6 +2483,229 @@ mod tests {
         assert!(!derive("balance"));
         assert!(!derive("pinned"));
         assert!(!derive("garbage"));
+    }
+
+    // write_native_config 必须把 4 个养号任务的排程写进 native config 的 schedule 块。
+    //
+    // 回归保护：此前这里只写 checkin/keepalive 两项，4 个任务的字段一个都没有 ——
+    // 网关于是用它自己的硬编码默认值，用户在设置页改的任何东西都不落盘、
+    // 界面与实际行为不一致，且从界面上完全看不出来。
+    #[test]
+    fn native_config_writes_care_tasks_schedule() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-care-schedule");
+        let cfg = json!({
+            "port": 7863,
+            "listen": ":7863",
+            "activity_hours": [7, 19],
+            "nightowl_hours": [2],
+            "school_hours": [14, 15],
+            "trial_hours": [8],
+            "activity_enabled": false,
+            "nightowl_enabled": true,
+            "school_enabled": false,
+            "trial_enabled": true,
+            "activity_report_count": 5,
+        });
+
+        let path = super::write_native_config(&cfg).expect("write native config");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let native: Value = serde_json::from_str(&text).unwrap();
+        let sched = &native["schedule"];
+
+        // 显式配置的时刻必须逐字落盘
+        assert_eq!(sched["activity_hours"], json!([7, 19]), "{text}");
+        assert_eq!(sched["nightowl_hours"], json!([2]), "{text}");
+        assert_eq!(sched["school_hours"], json!([14, 15]), "{text}");
+        assert_eq!(sched["trial_hours"], json!([8]), "{text}");
+        // 开关：显式 false 必须落成 false（true 是缺省，测 false 才有区分度）
+        assert_eq!(sched["activity_enabled"], json!(false), "{text}");
+        assert_eq!(sched["nightowl_enabled"], json!(true), "{text}");
+        assert_eq!(sched["school_enabled"], json!(false), "{text}");
+        assert_eq!(sched["trial_enabled"], json!(true), "{text}");
+        assert_eq!(sched["activity_report_count"], json!(5), "{text}");
+
+        // 既有字段不能被这次改动挤掉
+        assert_eq!(sched["checkin_hours"], json!([9, 21]), "{text}");
+        assert_eq!(sched["keepalive_hours"], json!([22]), "{text}");
+        assert_eq!(sched["checkin_enabled"], json!(true), "{text}");
+        assert_eq!(sched["keepalive_enabled"], json!(true), "{text}");
+        assert_eq!(sched["checkin_scope"], json!("cn"), "{text}");
+    }
+
+    // 键缺席（老配置）时必须落上默认值 —— 且与 Go 侧 Default() 一致。
+    //
+    // 为什么要断言具体数值而不是「非空即可」：界面读的是宿主配置的默认值，
+    // 网关读的是自己 Default() 的默认值；两边一旦漂移，用户「什么都没改直接保存」
+    // 就会把排程改成另一套时刻，而界面上显示的还是原来那套。
+    #[test]
+    fn native_config_fills_care_task_defaults() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-care-defaults");
+        // 只给启动必需的字段，养号任务相关键全部缺席（模拟老配置）
+        let cfg = json!({ "port": 7863, "listen": ":7863" });
+
+        let path = super::write_native_config(&cfg).expect("write native config");
+        let native: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let sched = &native["schedule"];
+
+        assert_eq!(sched["activity_hours"], json!([10]));
+        assert_eq!(sched["nightowl_hours"], json!([1]));
+        assert_eq!(sched["school_hours"], json!([12]));
+        assert_eq!(sched["trial_hours"], json!([9, 21]));
+        assert_eq!(sched["activity_enabled"], json!(true));
+        assert_eq!(sched["nightowl_enabled"], json!(true));
+        assert_eq!(sched["school_enabled"], json!(true));
+        assert_eq!(sched["trial_enabled"], json!(true));
+        assert_eq!(sched["activity_report_count"], json!(3));
+    }
+
+    // write_native_config 必须把账号记录文件路径与账号身份映射交给网关。
+    //
+    // 回归保护：这 4 个养号任务实现在 Go 网关里，日志此前只写 stdout，
+    // 而宿主启动子进程时把它丢进了 Stdio::null —— 用户界面上一条执行记录都没有。
+    // 修法是让网关写宿主已经在读的 account_records.json，因此**路径必须由宿主给出**：
+    // 两边各自推算数据目录迟早会算出不同的值，而那种错法表现为「静默不记录」。
+    #[test]
+    fn native_config_passes_account_records_target() {
+        let iso = crate::modules::config::test_isolation::Isolated::new("gw-records-target");
+        let cfg = json!({ "port": 7863, "listen": ":7863" });
+
+        let path = super::write_native_config(&cfg).expect("write native config");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let native: Value = serde_json::from_str(&text).unwrap();
+        let block = &native["account_records"];
+
+        // 路径必须是**绝对路径**且指向宿主算出的那个文件。
+        // 相对路径会让网关按自己的 cwd（gateway/ 目录）解析，写到别处去。
+        let file = block["file"].as_str().unwrap_or("");
+        assert!(!file.is_empty(), "必须透传记录文件路径: {text}");
+        assert!(
+            std::path::Path::new(file).is_absolute(),
+            "记录文件路径必须是绝对路径（网关 cwd 与宿主不同）: {file}"
+        );
+        assert_eq!(
+            file,
+            crate::modules::account_records::account_records_file().to_string_lossy(),
+            "路径应取自 account_records_file()，而不是另算一个"
+        );
+        // 与宿主同一口径的保留天数（避免「界面说 60 天、网关按 7 天清」）
+        assert_eq!(
+            block["retention_days"].as_i64(),
+            Some(crate::modules::config::record_retention_days()),
+            "{text}"
+        );
+        // 隔离目录下账号库为空：映射应存在且为空数组（结构齐全，前端/网关都不必判空）
+        assert!(
+            block["identities"].is_array(),
+            "identities 必须是数组: {text}"
+        );
+
+        drop(iso);
+    }
+
+    // 账号身份映射必须带 id 与展示名，且**绝不能带 token**。
+    //
+    // 两个理由：
+    //   1. 界面按账号库的 id（uuid）过滤记录，而网关凭证里只有 uid。
+    //      网关拿 uid 当 accountId 写，用户点开某个账号永远查不到这些任务。
+    //   2. 这份配置会落到磁盘（gateway_native_config.json），凭证不该出现在那里。
+    #[test]
+    fn gateway_account_identities_carry_id_and_name_without_tokens() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-identities");
+        crate::modules::account::save_accounts(&[json!({
+            "id": "acct-1",
+            "uid": "uid-1",
+            "email": "shown@example.com",
+            "nickname": "昵称甲",
+            "access_token": "SECRET_AT",
+            "refresh_token": "SECRET_RT",
+        })])
+        .expect("seed accounts");
+
+        let list = super::gateway_account_identities();
+        let arr = list.as_array().expect("should be array");
+        assert_eq!(arr.len(), 1, "{list}");
+        assert_eq!(arr[0]["uid"], json!("uid-1"));
+        assert_eq!(arr[0]["id"], json!("acct-1"));
+        // 展示名与 account_display_name 一致（email 优先）
+        assert_eq!(arr[0]["name"], json!("shown@example.com"));
+
+        // 凭证绝不能进配置
+        let text = list.to_string();
+        assert!(!text.contains("SECRET_AT"), "access_token 泄漏进配置: {text}");
+        assert!(!text.contains("SECRET_RT"), "refresh_token 泄漏进配置: {text}");
+    }
+
+    // schedule_hours：脏值过滤 + 兜底 + 去重排序。
+    //
+    // 为什么必须过滤非法小时：Go 侧 validateScheduleHours 对越界值**启动即报错**，
+    // 写进 native config 会让网关直接起不来。宿主这边先滤掉，坏值退化为
+    // 「该时点不生效」，而不是整个网关挂掉。
+    #[test]
+    fn schedule_hours_filters_and_falls_back() {
+        let calls = |v: Value| super::schedule_hours(&v, "activity_hours", &[10]);
+
+        // 缺键 / null / 空数组 → 回落默认
+        assert_eq!(calls(json!({})), json!([10]));
+        assert_eq!(calls(json!({"activity_hours": null})), json!([10]));
+        assert_eq!(calls(json!({"activity_hours": []})), json!([10]));
+        // 全是脏值 → 也回落默认（而不是变成「没有任何时点」= 静默关掉任务）
+        assert_eq!(calls(json!({"activity_hours": [24, -1, "x", null]})), json!([10]));
+
+        // 合法值保留；非法值单独剔除而不影响同批合法值
+        assert_eq!(calls(json!({"activity_hours": [7]})), json!([7]));
+        assert_eq!(calls(json!({"activity_hours": [23, 0]})), json!([0, 23]));
+        assert_eq!(
+            calls(json!({"activity_hours": [7, 99, 8]})),
+            json!([7, 8]),
+            "非法值应被剔除，合法值保留"
+        );
+
+        // 去重 + 升序：重复时点会让网关在同一时刻跑两轮
+        assert_eq!(calls(json!({"activity_hours": [9, 9, 3]})), json!([3, 9]));
+        // 浮点小时不接受（界面是整数输入框；2.5 点不是有效排程）
+        assert_eq!(calls(json!({"activity_hours": [2.5, 6]})), json!([6]));
+    }
+
+    // activity_report_count 的上下界：<=0 回落 3，超大值封顶 20。
+    //
+    // 为什么封顶：条数直接决定每号每日发往上游的请求数，误填 10000 会被风控
+    // 判定成异常流量。上限与「取 3」的理由同源（见 Go 侧常量注释）。
+    #[test]
+    fn native_config_clamps_activity_report_count() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-report-count");
+        let count_for = |v: Value| {
+            let path = super::write_native_config(&v).expect("write");
+            let native: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            native["schedule"]["activity_report_count"].clone()
+        };
+
+        assert_eq!(count_for(json!({"activity_report_count": 0})), json!(3), "0 应回落默认");
+        assert_eq!(count_for(json!({"activity_report_count": -5})), json!(3), "负数应回落默认");
+        assert_eq!(count_for(json!({"activity_report_count": 7})), json!(7));
+        assert_eq!(count_for(json!({"activity_report_count": 10000})), json!(20), "应封顶 20");
+    }
+
+    // default_gateway_config 里的养号任务默认值必须齐全。
+    //
+    // 它是界面上的初值来源（load_gateway_config 以它为 base 合并磁盘配置）；
+    // 缺了字段前端就会显示空白输入框，用户一保存就把网关排程改成空。
+    #[test]
+    fn default_gateway_config_has_care_task_fields() {
+        let cfg = super::default_gateway_config();
+        assert_eq!(cfg["activity_hours"], json!([10]));
+        assert_eq!(cfg["nightowl_hours"], json!([1]));
+        assert_eq!(cfg["school_hours"], json!([12]));
+        assert_eq!(cfg["trial_hours"], json!([9, 21]));
+        for key in [
+            "activity_enabled",
+            "nightowl_enabled",
+            "school_enabled",
+            "trial_enabled",
+        ] {
+            assert_eq!(cfg[key], json!(true), "{key} 缺省应为 true");
+        }
+        assert_eq!(cfg["activity_report_count"], json!(3));
     }
 
     // 凭证导出必须原样带着 credit 块：它是网关「按积分到期分层选号」的依据。

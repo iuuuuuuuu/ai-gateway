@@ -32,6 +32,8 @@ import type {
   GatewayPortCheck,
   GatewayPortHolder,
   GatewaySyncResult,
+  GatewayTaskName,
+  GatewayTaskRunResult,
   GatewayUsageResult,
   GithubConfig,
   ImportPreviewAccount,
@@ -162,6 +164,7 @@ const ROUTES: Record<string, Route> = {
   sync_gateway_accounts: { method: "POST", path: "/api/gateway/sync" },
   get_gateway_models: { method: "GET", path: "/api/gateway/models" },
   get_gateway_usage: { method: "GET", path: "/api/gateway/usage" },
+  run_gateway_task: { method: "POST", path: "/api/gateway/task-run" },
   // ---- 一键导入：接入本机 AI 客户端 ----
   detect_agent_clients: { method: "GET", path: "/api/gateway/agents" },
   import_agent_client: { method: "POST", path: "/api/gateway/agents/import" },
@@ -748,6 +751,17 @@ export function getGatewayConfig(): Promise<GatewayConfigResult> {
 }
 
 /**
+ * 手动触发一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
+ *
+ * 这 4 个任务的实现在 Go 网关里，本函数只是把请求转过去。
+ * 注意返回 `ran=false` + `skip` 是**正常结果**（如夜猫子不在 23:00–08:00 窗口内），
+ * 调用方应当作说明展示而非报错。
+ */
+export function runGatewayTask(task: GatewayTaskName): Promise<GatewayTaskRunResult> {
+  return call<GatewayTaskRunResult>("run_gateway_task", { task });
+}
+
+/**
  * 保存网关配置。
  *
  * 显式把 snake_case 字段转成 camelCase：Tauri 的 `invoke` 按
@@ -762,6 +776,19 @@ export function saveGatewayConfig(config: Partial<GatewayConfig>): Promise<{ con
   if (config.mode !== undefined) args.mode = config.mode;
   if (config.pinned_uid !== undefined) args.pinnedUid = config.pinned_uid;
   if (config.manual_uids !== undefined) args.manualUids = config.manual_uids;
+  // 养号任务排程：同样显式转 camelCase，否则 Tauri 会静默丢弃这些字段
+  //（webui 的 HTTP 版兼容两种写法，桌面版只认 camelCase）。
+  if (config.activity_hours !== undefined) args.activityHours = config.activity_hours;
+  if (config.nightowl_hours !== undefined) args.nightowlHours = config.nightowl_hours;
+  if (config.school_hours !== undefined) args.schoolHours = config.school_hours;
+  if (config.trial_hours !== undefined) args.trialHours = config.trial_hours;
+  if (config.activity_enabled !== undefined) args.activityEnabled = config.activity_enabled;
+  if (config.nightowl_enabled !== undefined) args.nightowlEnabled = config.nightowl_enabled;
+  if (config.school_enabled !== undefined) args.schoolEnabled = config.school_enabled;
+  if (config.trial_enabled !== undefined) args.trialEnabled = config.trial_enabled;
+  if (config.activity_report_count !== undefined) {
+    args.activityReportCount = config.activity_report_count;
+  }
   return call<{ config: GatewayConfig }>("save_gateway_config", args);
 }
 

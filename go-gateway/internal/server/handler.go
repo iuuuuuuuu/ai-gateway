@@ -14,6 +14,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 	"workbuddy2api/internal/usage"
@@ -35,6 +36,12 @@ type Config struct {
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
 	// Usage Token 用量统计器（可选；nil = 不统计，/usage 返回 enabled=false）。
 	Usage *usage.Stats
+	// RunTask 手动触发一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
+	//
+	// 用回调而非直接持有 *scheduler.Scheduler：server 包不该依赖调度器的
+	// 内部结构（Config 字段、排程循环），只借一个「按名字跑一轮」的入口，
+	// 依赖方向仍是 main 组装、server 消费。nil = 该能力不可用（如单测）。
+	RunTask func(name string) (scheduler.TaskRunResult, error)
 	// AllowedModel 「单一模型」锁定：非空时**只放行这一个模型**，其余一律拒绝。
 	//
 	// 用于「单一模型 + 积分轮转」模式：轮转的语义是「把这个账号的某个模型额度
@@ -76,6 +83,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /usage", h.withAuth(h.usageReport))
+	// 养号任务手动触发：与 /status 同用 withAuth —— 它会向上游发真实请求，
+	// 未鉴权暴露等于给人一个刷账号活跃度的开关。
+	h.mux.HandleFunc("POST /tasks/run", h.withAuth(h.tasksRun))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
 }
@@ -148,6 +158,47 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
 	})
+}
+
+// tasksRun 手动触发一轮养号任务（POST /tasks/run，body: {"task":"activity"}）。
+//
+// 为什么要有这个入口：这 4 个任务此前只有「按点自动跑」，用户既看不见执行结果、
+// 也没法在改完配置后立刻验证。手动触发是**可观测性**的一部分。
+//
+// 返回 200 + ran=false 表示「被前置条件挡下」（如夜猫子不在时段内）——
+// 这是正常状态而非错误，宿主界面据此给出人话说明；真正的问题（未知任务名）
+// 才返回 400。
+func (h *Handler) tasksRun(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.URL.Query().Get("task"))
+	if name == "" {
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+		var parsed struct {
+			Task string `json:"task"`
+		}
+		if err := jsonUnmarshal(string(body), &parsed); err == nil {
+			name = strings.TrimSpace(parsed.Task)
+		}
+	}
+	if name == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "missing task name")
+		return
+	}
+	if h.cfg.RunTask == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "tasks_unavailable",
+			"task runner not configured on this gateway instance")
+		return
+	}
+	res, err := h.cfg.RunTask(name)
+	if errors.Is(err, scheduler.ErrTaskRunning) {
+		// 与宿主 checkin_all 的 already_running 同一语义：不是故障，是防重入。
+		writeJSON(w, http.StatusOK, res)
+		return
+	}
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // usageReport 返回网关累计 Token 用量（GET /usage?days=N，days 省略或 0 = 全部）。

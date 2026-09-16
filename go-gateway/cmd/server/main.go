@@ -15,6 +15,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/records"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
@@ -129,6 +130,22 @@ func main() {
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
 
+	// 账号记录回写：这 4 个养号任务的日志只写 stdout，而宿主启动子进程时
+	// 把 stdout/stderr 丢进了 Stdio::null —— 界面上一条执行痕迹都没有。
+	// 改为写宿主已经在读的 account_records.json，记录就能与签到并列显示。
+	// 路径与账号身份均由宿主经配置透传（见 config.AccountRecords）。
+	recorder := records.New(
+		cfg.AccountRecords.File,
+		cfg.AccountRecords.RetentionDays,
+		cfg.RecordIdentities(),
+	)
+	if recorder.Enabled() {
+		log.Printf("账号记录回写已启用：%s（保留 %d 天）",
+			recorder.Path(), cfg.AccountRecords.RetentionDays)
+	} else {
+		log.Printf("账号记录回写未启用（配置缺少 account_records.file）：任务照跑，但界面不会有记录")
+	}
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:                p,
 		Upstream:            up,
@@ -146,6 +163,7 @@ func main() {
 		TrialDisabled:       !cfg.Schedule.TrialEnabled,
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		CheckinScope:        cfg.Schedule.CheckinScope,
+		Records:             recorder,
 	})
 	if normalizeCheckinScope(cfg.Schedule.CheckinScope) == "all" {
 		log.Printf("签到与猫猫旅行范围：国服 + 国际版（schedule.checkin_scope=all）")
@@ -195,6 +213,9 @@ func main() {
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
 		Usage:        usageStore,
+		// 养号任务手动触发：宿主（GUI/webui）的「立即执行」按钮经此转到调度器。
+		// 传方法值而非 *Scheduler —— server 包只需这一个能力，不必知道调度器结构。
+		RunTask: sch.RunTaskByName,
 		// 单一模型锁定：仅轮转模式下生效（负载均衡不限制模型，保持原有行为）。
 		AllowedModel: func() string {
 			if cfg.Pool.Rotation {

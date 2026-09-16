@@ -146,8 +146,17 @@ curl -s http://localhost:7863/v1/chat/completions \
   "schedule": {
     "checkin_hours": [9, 21],
     "keepalive_hours": [22],
+    "activity_hours": [10],
+    "nightowl_hours": [1],
+    "school_hours": [12],
+    "trial_hours": [9, 21],
     "checkin_enabled": true,
-    "keepalive_enabled": true
+    "keepalive_enabled": true,
+    "activity_enabled": true,
+    "nightowl_enabled": true,
+    "school_enabled": true,
+    "trial_enabled": true,
+    "activity_report_count": 3
   },
   "upstream": {
     "timeout_seconds": 120,
@@ -181,6 +190,15 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `schedule.keepalive_hours` | `[22]` | 每日本地时区整点刷新 token 保活。空数组/`null` 同上 |
 | `schedule.checkin_enabled` | `true` | 签到**总开关**；`false` 真正关掉签到（**猫猫旅行随之停摆**，见下） |
 | `schedule.keepalive_enabled` | `true` | token 保活总开关；`false` 关掉保活 |
+| `schedule.activity_hours` | `[10]` | 活跃上报时点：点亮**连登天数**并解锁领养前置。空数组/`null` = 回落默认 |
+| `schedule.nightowl_hours` | `[1]` | 夜猫子任务时点；**仅在 23:00–08:00（北京时间）内计入**，窗口外自动跳过 |
+| `schedule.school_hours` | `[12]` | 开学季活动时点；限时活动，只领取**已达标**的奖励，活动下线后自动跳过 |
+| `schedule.trial_hours` | `[9, 21]` | 国际版 trial 加油包领取时点；**只跑国际版账号**，已领过的幂等跳过 |
+| `schedule.activity_enabled` | `true` | 活跃上报开关 |
+| `schedule.nightowl_enabled` | `true` | 夜猫子任务开关 |
+| `schedule.school_enabled` | `true` | 开学季活动开关 |
+| `schedule.trial_enabled` | `true` | trial 领取开关 |
+| `schedule.activity_report_count` | `3` | 每号每日活跃上报条数（上限 20）。取 3 而非 1：单条偶发被服务端静默丢弃 |
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新/签到/余额/模型）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
@@ -299,12 +317,19 @@ curl -s http://localhost:7863/v1/chat/completions \
 |---|---|---|---|
 | 签到 | `schedule.checkin_enabled` 默认 `true` | `checkin_hours` 默认 `[9, 21]` 整点 | 签到 + 余额查询；余额恢复则解冻冷却账号；**收尾顺带跑一趟猫猫旅行** |
 | 保活 | `schedule.keepalive_enabled` 默认 `true` | `keepalive_hours` 默认 `[22]` 整点 | 全账号刷新 token；session 失效自动禁用 |
+| 活跃上报 | `schedule.activity_enabled` 默认 `true` | `activity_hours` 默认 `[10]` 整点 | 每号发 `activity_report_count`（默认 3）条对话活跃事件，点亮**连登天数**并解锁领养前置。仅国服（受 `checkin_scope` 约束） |
+| 夜猫子 | `schedule.nightowl_enabled` 默认 `true` | `nightowl_hours` 默认 `[1]` 整点 | 补一次上报以点亮仅在夜间计入的成长任务。**窗口外自动跳过**（23:00–08:00 北京时间） |
+| 开学季 | `schedule.school_enabled` 默认 `true` | `school_hours` 默认 `[12]` 整点 | 只**领取已达标**的活动奖励，不伪造学生认证/邀请等动作；活动下线后自动跳过。仅国服 |
+| trial 加油包 | `schedule.trial_enabled` 默认 `true` | `trial_hours` 默认 `[9, 21]` 整点 | 为**国际版**账号领取 trial 加油包；已领过的按幂等成功跳过 |
+
+后 4 个任务都可用 `POST /tasks/run` **手动触发一轮**（不检查开关），便于改完配置立刻验证。
 
 容器时区由 `TZ` 控制（compose 默认 `Asia/Shanghai`）。
 
 #### 关闭定时任务
 
-用 `schedule.checkin_enabled` / `schedule.keepalive_enabled` 显式关闭，两者互相独立：
+用 `schedule.checkin_enabled` / `schedule.keepalive_enabled`（以及 4 个养号任务的
+`*_enabled`）显式关闭，各自独立：
 
 ```json
 "schedule": {
@@ -371,7 +396,20 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /usage` | Bearer（`api_key` 非空时） | Token 用量统计（网关自统计）：`?days=7` 限范围，省略 = 全部历史；含汇总、按模型/账号/日期明细 |
+| `POST /tasks/run` | Bearer（`api_key` 非空时） | 手动触发一轮养号任务，body `{"task":"activity"｜"nightowl"｜"school"｜"trial"}`（也可用 `?task=`）。返回 `{ok, ran, skip, message}` |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
+
+`POST /tasks/run` 的返回语义（宿主界面的「立即执行」按钮靠它区分「跑了」与「没跑成」）：
+
+| 情形 | HTTP | 返回 |
+|---|---|---|
+| 正常执行一轮 | 200 | `{"ok":true,"ran":true,"message":"已触发一轮"}` |
+| 被前置条件挡下（如夜猫子不在 23:00–08:00） | 200 | `{"ok":true,"ran":false,"skip":"outside_window","message":"当前不在夜猫子时段…"}` |
+| 上一轮仍在执行（防重入） | 200 | `{"ok":true,"ran":false,"skip":"already_running",…}` |
+| 任务名不认识 | 400 | OpenAI 形状错误体，`error.message` 含具体任务名 |
+
+**`ran=false` 不是错误**：这些任务都有前置条件（夜猫子限时段、开学季限活动期、活跃上报与开学季只跑国服、trial 只跑国际版），
+不满足时跳过是正确行为。手动触发**不检查** `schedule.*_enabled` —— 那些开关只管后台是否自动排程。
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
 

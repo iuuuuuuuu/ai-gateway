@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/records"
 )
 
 const (
@@ -66,10 +67,12 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
 		count := s.cfg.ActivityReportCount
 		ok := 0
+		var lastErr error
 		for i := 1; i <= count; i++ {
 			rid := fmt.Sprintf("%s-r%d", cid, i)
 			if err := s.cfg.Upstream.ReportChatActivity(a, cid, rid); err != nil {
 				log.Printf("activity %s: report %d/%d failed: %v", uid8(a.UID), i, count, err)
+				lastErr = err
 				break // 本号上报失败：不再续发，streak 自检无意义
 			}
 			ok++
@@ -80,9 +83,18 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 			}
 		}
 		if ok < count {
+			// 失败必须留痕：这条记录是用户排查「连登为什么没涨」的唯一线索
+			//（宿主的网关子进程丢弃了 stdout，日志到不了界面）。
+			// 用 Daily 是因为排程按整点触发、机器休眠后还会补跑，
+			// 不去重会把同一天的记录刷成一片重复行。
+			s.cfg.Records.TaskDaily(a.UID, "活跃上报", records.ResultFailed,
+				fmt.Sprintf("第 %d/%d 条上报失败: %v", ok+1, count, lastErr))
 			continue // 未发满：streak 自检与领养重试均无意义
 		}
 		log.Printf("activity %s: reported %d/%d ok", uid8(a.UID), ok, count)
+		// 成功上报确实点亮了连登，属于「有新变化」，每次都要留痕。
+		s.cfg.Records.Task(a.UID, "活跃上报", records.ResultSuccess,
+			fmt.Sprintf("已上报 %d/%d 条（点亮连登天数）", ok, count))
 		s.checkActivityStreak(a) // 回读 streak 自检
 		s.travelAdoptForce(a)    // 对话量刚补满 → 立即重试领养（豁免当日防抖）
 	}

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/records"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -59,8 +60,8 @@ type Config struct {
 		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 关活跃上报
 		NightOwlEnabled  bool `json:"nightowl_enabled"`  // 缺省 true；false = 关夜猫子任务
-		SchoolEnabled   bool `json:"school_enabled"`   // 缺省 true；false = 关开学季活动
-		TrialEnabled    bool `json:"trial_enabled"`    // 缺省 true；false = 关 trial 领取
+		SchoolEnabled    bool `json:"school_enabled"`    // 缺省 true；false = 关开学季活动
+		TrialEnabled     bool `json:"trial_enabled"`     // 缺省 true；false = 关 trial 领取
 		// ActivityReportCount 每号每日上报条数，默认 3。
 		//
 		// 取 3 而非 1：单条上报偶发被服务端丢弃（缺 userId 时 200 但静默丢弃），
@@ -140,6 +141,29 @@ type Config struct {
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
 	} `json:"session_sticky"`
 
+	// AccountRecords 账号记录回写目标（由宿主透传）。
+	//
+	// 为什么要宿主给路径而不是网关自己算：网关的工作目录是宿主指定的
+	// gateway/ 子目录，而账号记录由宿主写在数据目录根下。两边各自推算
+	// （宿主看 AI_GATEWAY_HOME，网关看 cwd）迟早会算出不同的值，
+	// 而那种错法表现为「任务跑了但界面上没有记录」，几乎无法从现象定位。
+	//
+	// 整个块缺席（老宿主没写这个键）时 File 为空 → 不记录：
+	// 独立运行 gateway.exe 的场景下这是正确行为，不该报错也不该刷日志。
+	AccountRecords struct {
+		// File account_records.json 的**绝对路径**。
+		File string `json:"file"`
+		// RetentionDays 记录保留天数，与宿主设置同一口径
+		//（避免「界面说保留 60 天、网关按 7 天清」这类不一致）。
+		RetentionDays int `json:"retention_days"`
+		// Identities 账号身份映射：网关手上只有 uid，而界面按账号库的 id 过滤记录。
+		Identities []struct {
+			UID  string `json:"uid"`
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"identities"`
+	} `json:"account_records"`
+
 	// 解析后
 	SoftRateDur         time.Duration `json:"-"`
 	BreakerCooldownDur  time.Duration `json:"-"`
@@ -148,6 +172,22 @@ type Config struct {
 	SessionGCInterval   time.Duration `json:"-"`
 	// CreditRefreshIntervalD 解析后的积分到期巡检周期。
 	CreditRefreshIntervalD time.Duration `json:"-"`
+}
+
+// RecordIdentities 把配置里的账号身份映射转成 records 包需要的形状
+//（uid → 宿主的 id 与展示名）。
+//
+// 抽成方法而不是在 main 里内联转换：identities 是切片结构体，
+// 内联转换会在 main 里引入一个与 records 包重复的匿名类型。
+func (c *Config) RecordIdentities() map[string]records.Identity {
+	out := make(map[string]records.Identity, len(c.AccountRecords.Identities))
+	for _, item := range c.AccountRecords.Identities {
+		if item.UID == "" {
+			continue
+		}
+		out[item.UID] = records.Identity{ID: item.ID, Name: item.Name}
+	}
+	return out
 }
 
 // Default 默认配置。
@@ -307,9 +347,18 @@ func (c *Config) normalize() error {
 	}
 	if len(c.Schedule.ActivityHours) == 0 {
 		c.Schedule.ActivityHours = []int{10}
-	c.Schedule.NightOwlHours = []int{1}
-	c.Schedule.SchoolHours = []int{12}
-	c.Schedule.TrialHours = []int{9, 21}
+	}
+	// 这三个此前被误写在 ActivityHours 的 if 里：只有活跃上报为空时才顺带赋值，
+	// 于是单独把 nightowl_hours 配成 []/null 会得到空排程 —— nextFire 对空数组
+	// 返回零时间，任务被静默关掉（与「未配置 → 回落默认」的约定相反）。
+	if len(c.Schedule.NightOwlHours) == 0 {
+		c.Schedule.NightOwlHours = []int{1}
+	}
+	if len(c.Schedule.SchoolHours) == 0 {
+		c.Schedule.SchoolHours = []int{12}
+	}
+	if len(c.Schedule.TrialHours) == 0 {
+		c.Schedule.TrialHours = []int{9, 21}
 	}
 	if c.Schedule.ActivityReportCount <= 0 {
 		c.Schedule.ActivityReportCount = 3
@@ -350,7 +399,18 @@ func (c *Config) validateScheduleHours() error {
 	if err := checkHourRange("schedule.keepalive_hours", "keepalive_enabled", c.Schedule.KeepaliveHours); err != nil {
 		return err
 	}
-	return checkHourRange("schedule.activity_hours", "activity_enabled", c.Schedule.ActivityHours)
+	if err := checkHourRange("schedule.activity_hours", "activity_enabled", c.Schedule.ActivityHours); err != nil {
+		return err
+	}
+	// 下面三个此前漏校验：界面上现在可自由填时点，非法值必须在启动时就报错，
+	// 而不是留到 nextFire 静默算出无意义的排程。
+	if err := checkHourRange("schedule.nightowl_hours", "nightowl_enabled", c.Schedule.NightOwlHours); err != nil {
+		return err
+	}
+	if err := checkHourRange("schedule.school_hours", "school_enabled", c.Schedule.SchoolHours); err != nil {
+		return err
+	}
+	return checkHourRange("schedule.trial_hours", "trial_enabled", c.Schedule.TrialHours)
 }
 
 func checkHourRange(field, switchKey string, hours []int) error {

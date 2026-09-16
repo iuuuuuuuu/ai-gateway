@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"workbuddy2api/internal/records"
 )
 
 // nightWindowStartHour / nightWindowEndHour 夜猫时段（CST）：[23:00, 08:00)。
@@ -61,6 +63,11 @@ func (s *Scheduler) RunNightOwlNow() {
 func (s *Scheduler) runNightOwl(ctx context.Context) {
 	if !withinNightWindow() {
 		log.Printf("nightowl: skipped (outside 23:00-08:00 CST window)")
+		// 窗口外跳过是「明确且原因重要」的：用户点了「立即执行」却什么都没发生，
+		// 若不留痕就只能猜测（这正是本功能最初的问题 —— 日志进了 Stdio::null）。
+		// 用 TaskAllDaily：这是整轮条件、与具体账号无关，逐账号各写一条等于刷屏。
+		s.cfg.Records.TaskAllDaily("夜猫子任务", records.ResultInfo,
+			"当前不在夜猫时段（23:00–08:00 北京时间），上游不计入本次上报")
 		return
 	}
 
@@ -87,8 +94,14 @@ func (s *Scheduler) runNightOwl(ctx context.Context) {
 		cid := fmt.Sprintf("wb2api-night-%d", time.Now().UnixMilli())
 		if err := s.cfg.Upstream.ReportChatActivity(a, cid, cid+"-r1"); err != nil {
 			log.Printf("nightowl %s: report failed: %v", uid8(a.UID), err)
+			// 失败按天去重：排程只有 01 点一次，但机器休眠后补跑、
+			// 用户手工触发都会让同一失败重复出现。
+			s.cfg.Records.TaskDaily(a.UID, "夜猫子任务", records.ResultFailed, err.Error())
 			continue
 		}
 		log.Printf("nightowl %s: black_cat reported ok", uid8(a.UID))
+		// 成功即「有新变化」：black_cat 是时段敏感任务，本轮上报就是它的点亮动作。
+		s.cfg.Records.Task(a.UID, "夜猫子任务", records.ResultSuccess,
+			"已在夜猫时段补报一次（点亮 black_cat 任务）")
 	}
 }

@@ -574,7 +574,48 @@ export interface GatewayConfig {
   auto_start: boolean;
   last_status?: string | null;
   last_error?: string | null;
+
+  // ---- 自动养号任务排程（写进网关 config.json 的 schedule 块）----
+  //
+  // 这些字段由宿主读取后转写到网关的 native config；网关只认它自己的 config.json，
+  // 因此改这里必须重启网关才会生效。
+
+  /** 活跃上报时点（小时列表，默认 [10]）：点亮连登天数并解锁领养前置。 */
+  activity_hours?: number[];
+  /** 夜猫子任务时点（默认 [1]）：仅在 23:00–08:00 北京时间内计入。 */
+  nightowl_hours?: number[];
+  /** 开学季活动任务时点（默认 [12]）：限时活动，只领取已达标的奖励。 */
+  school_hours?: number[];
+  /** 国际版 trial 加油包领取时点（默认 [9, 21]，仅国际版账号）。 */
+  trial_hours?: number[];
+  activity_enabled?: boolean;
+  nightowl_enabled?: boolean;
+  school_enabled?: boolean;
+  trial_enabled?: boolean;
+  /** 每号每日活跃上报条数（默认 3，上限 20）。 */
+  activity_report_count?: number;
 }
+
+/** 手动触发养号任务的结果（POST /api/gateway/task-run）。 */
+export interface GatewayTaskRunResult {
+  ok: boolean;
+  /** 是否真的执行了一轮；false = 被前置条件挡下（见 skip / message）。 */
+  ran: boolean;
+  /**
+   * 跳过原因码；`ran=true` 时为空。
+   *
+   * - `outside_window`：不在夜猫子时段（23:00–08:00 北京时间）
+   * - `already_running`：该任务上一轮还在执行
+   */
+  skip?: string | null;
+  /** 面向用户的中文说明，可直接显示。 */
+  message: string;
+  /** 调用失败的原因（网关未启动、任务名不认识等）；成功时为 null。 */
+  error?: string | null;
+}
+
+/** 养号任务标识（与 Go 网关 /tasks/run 的 task 参数一一对应）。 */
+export type GatewayTaskName = "activity" | "nightowl" | "school" | "trial";
 
 /** 单个「账号+模型」的冷却记录（来自网关 /status 的 model_cooling）。 */
 export interface GatewayModelCooling {
@@ -637,6 +678,16 @@ export interface GatewayPool {
   redis_mode?: string;
 }
 
+/** 网关状态里「可选账号」一项（手动模式勾选列表的数据源）。 */
+export interface GatewayStatusAccount {
+  uid: string;
+  nickname?: string;
+  expiresAt?: number;
+  needsRelogin?: boolean;
+  /** 用户手动禁用：勾选列表里不再展示（勾了也不会进池）。 */
+  disabled?: boolean;
+}
+
 /** 网关综合状态。 */
 export interface GatewayStatus {
   running: boolean;
@@ -655,14 +706,7 @@ export interface GatewayStatus {
   /** 指定账号模式锁定的 uid。 */
   pinnedUid?: string | null;
   /** 可选账号列表（供手动模式的勾选列表使用）。 */
-  accounts?: Array<{
-    uid: string;
-    nickname?: string;
-    expiresAt?: number;
-    needsRelogin?: boolean;
-    /** 用户手动禁用：勾选列表里不再展示（勾了也不会进池）。 */
-    disabled?: boolean;
-  }>;
+  accounts?: GatewayStatusAccount[];
   /**
    * 因「需重新登录」而被排除出网关账号池的账号。
    *

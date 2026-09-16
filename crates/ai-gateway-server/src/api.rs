@@ -132,6 +132,7 @@ pub fn router() -> Router {
         .route("/api/gateway/restart", post(api_gateway_restart))
         .route("/api/gateway/models", get(api_gateway_models))
         .route("/api/gateway/usage", get(api_gateway_usage))
+        .route("/api/gateway/task-run", post(api_gateway_task_run))
         // ---- 一键导入：接入本机 AI 客户端 ----
         .route("/api/gateway/agents", get(api_agents_detect))
         .route("/api/gateway/agents/import", post(api_agents_import))
@@ -1001,13 +1002,34 @@ fn extract_manual_uids(body: &Value) -> Vec<String> {
 
 /// POST /api/gateway/config —— 保存网关配置。
 async fn api_save_gateway_config(Json(body): Json<Value>) -> Response {
-    // 前端 camelCase → 配置 snake_case
+    // 前端 camelCase → 配置 snake_case。
+    //
+    // 必须逐个显式映射而不是「原样透传」：原样写下去会在配置文件里留下
+    // camelCase 键，而读取方（write_native_config / 前端 applyConfig）找的是
+    // snake_case —— 表现为「保存成功但值丢了」。
     let mut body = body;
-    if let Some(u) = body.get("pinnedUid").cloned() {
-        body["pinned_uid"] = u;
-    }
-    if let Some(u) = body.get("manualUids").cloned() {
-        body["manual_uids"] = u;
+    const ALIASES: &[(&str, &str)] = &[
+        ("pinnedUid", "pinned_uid"),
+        ("manualUids", "manual_uids"),
+        ("activityHours", "activity_hours"),
+        ("nightowlHours", "nightowl_hours"),
+        ("schoolHours", "school_hours"),
+        ("trialHours", "trial_hours"),
+        ("activityEnabled", "activity_enabled"),
+        ("nightowlEnabled", "nightowl_enabled"),
+        ("schoolEnabled", "school_enabled"),
+        ("trialEnabled", "trial_enabled"),
+        ("activityReportCount", "activity_report_count"),
+    ];
+    for (camel, snake) in ALIASES {
+        if let Some(v) = body.get(*camel).cloned() {
+            body[*snake] = v;
+            // 删掉 camelCase 键：否则它会被浅合并原样写进配置文件，
+            // 下次读取时既无用又会让人误以为配置生效了。
+            if let Some(map) = body.as_object_mut() {
+                map.remove(*camel);
+            }
+        }
     }
     match ai_gateway_core::modules::gateway::save_gateway_config(&body) {
         Ok(v) => json_ok(json!({ "config": v })),
@@ -1188,6 +1210,26 @@ async fn api_gateway_usage(Query(params): Query<HashMap<String, String>>) -> Res
         .and_then(|v| v.parse::<i64>().ok())
         .filter(|d| *d > 0);
     json_ok(ai_gateway_core::modules::gateway::fetch_usage(days).await)
+}
+
+/// POST /api/gateway/task-run —— 手动触发网关侧一轮养号任务。
+///
+/// body: { "task": "activity" | "nightowl" | "school" | "trial" }
+///
+/// 与 /api/checkin/all 的分工：那个是宿主自己实现的签到，本接口只是把请求
+/// 转给网关的 /tasks/run —— 这 4 个任务的实现（上报事件形状、夜猫时间窗、
+/// 只领已达标奖励的边界）都在网关里且已有测试覆盖，宿主不复制业务逻辑。
+async fn api_gateway_task_run(Json(body): Json<Value>) -> Response {
+    let task = body
+        .get("task")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if task.is_empty() {
+        return json_err("缺少 task 参数".to_string(), StatusCode::BAD_REQUEST);
+    }
+    json_ok(ai_gateway_core::modules::gateway::run_task_now(&task).await)
 }
 
 /// GET /api/gateway/agents —— 探测全部客户端的安装与配置状态。

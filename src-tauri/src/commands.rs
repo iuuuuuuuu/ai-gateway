@@ -789,7 +789,11 @@ pub fn get_gateway_config() -> Result<Value, String> {
 /// 前端以 camelCase 传参（`{ port, apiKey, autoStart }`），故此处声明
 /// `rename_all = "camelCase"`；只把出现的字段透传给 core 做浅合并，
 /// 未传字段沿用磁盘上的现有值。
+///
+/// 养号任务排程（activity_hours 等）也走这里：它们最终由 write_native_config
+/// 转写进网关的 config.json，与 checkin_enabled 等既有字段同一来源。
 #[tauri::command(rename_all = "camelCase")]
+#[allow(clippy::too_many_arguments)]
 pub fn save_gateway_config(
     port: Option<u16>,
     api_key: Option<String>,
@@ -797,6 +801,15 @@ pub fn save_gateway_config(
     mode: Option<String>,
     pinned_uid: Option<String>,
     manual_uids: Option<Vec<String>>,
+    activity_hours: Option<Vec<i64>>,
+    nightowl_hours: Option<Vec<i64>>,
+    school_hours: Option<Vec<i64>>,
+    trial_hours: Option<Vec<i64>>,
+    activity_enabled: Option<bool>,
+    nightowl_enabled: Option<bool>,
+    school_enabled: Option<bool>,
+    trial_enabled: Option<bool>,
+    activity_report_count: Option<i64>,
 ) -> Result<Value, String> {
     let mut patch = serde_json::Map::new();
     if let Some(p) = port {
@@ -823,8 +836,44 @@ pub fn save_gateway_config(
             .collect();
         patch.insert("manual_uids".to_string(), json!(cleaned));
     }
+    // 养号任务排程：与上面同样「传了才覆盖」，未传则保留磁盘上的现有值。
+    for (key, value) in [
+        ("activity_hours", activity_hours),
+        ("nightowl_hours", nightowl_hours),
+        ("school_hours", school_hours),
+        ("trial_hours", trial_hours),
+    ] {
+        if let Some(hours) = value {
+            patch.insert(key.to_string(), json!(hours));
+        }
+    }
+    for (key, value) in [
+        ("activity_enabled", activity_enabled),
+        ("nightowl_enabled", nightowl_enabled),
+        ("school_enabled", school_enabled),
+        ("trial_enabled", trial_enabled),
+    ] {
+        if let Some(flag) = value {
+            patch.insert(key.to_string(), json!(flag));
+        }
+    }
+    if let Some(n) = activity_report_count {
+        patch.insert("activity_report_count".to_string(), json!(n));
+    }
     let v = ai_gateway_core::modules::gateway::save_gateway_config(&Value::Object(patch))?;
     Ok(json!({ "config": v }))
+}
+
+/// POST /tasks/run —— 手动触发网关侧一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
+///
+/// 手动触发**不**检查「启用」开关：该开关只管后台是否自动排程，用户主动点击就该执行
+///（与 `checkin_all` / `travel_run` 的既有语义一致）。
+///
+/// 返回值里的 `ran=false` + `skip` 是**正常结果**（如夜猫子不在 23:00–08:00 窗口内），
+/// 界面应当作说明展示而非报错 —— 否则用户点了「立即执行」看到红色错误会以为坏了。
+#[tauri::command]
+pub async fn run_gateway_task(task: String) -> Result<Value, String> {
+    Ok(ai_gateway_core::modules::gateway::run_task_now(&task).await)
 }
 
 /// 检测端口是否可用。

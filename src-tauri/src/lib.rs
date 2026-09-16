@@ -244,6 +244,7 @@ pub fn run() {
             commands::get_gateway_status,
             commands::get_gateway_config,
             commands::save_gateway_config,
+            commands::run_gateway_task,
             commands::check_gateway_port,
             commands::kill_gateway_port_holder,
             commands::get_gateway_port_holder,
