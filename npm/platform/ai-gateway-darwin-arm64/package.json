@@ -1,6 +1,6 @@
 {
   "name": "ai-gateway-darwin-arm64",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "ai-gateway platform binary (darwin-arm64)",
   "os": [
     "darwin"

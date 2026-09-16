@@ -75,3 +75,8 @@ __pycache__/
 
 # 本地隔离测试实例的 Tauri 配置（独立 identifier + 数据目录，仅供开发调试）
 src-tauri/tauri.dev-sandbox.conf.json
+
+# 本地构建出的待发布产物（安装包 + .sig + updater 清单）。
+# 这些只应上传到 GitHub Release，不入库：安装包 11 MB 量级，进 git 历史后
+# 永远删不掉，且公开仓库没必要存二进制。发布走 release.yml 或 gh release upload。
+/dist-bin/
