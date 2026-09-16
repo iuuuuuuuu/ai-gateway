@@ -15,6 +15,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/records"
+	"workbuddy2api/internal/upstream"
 )
 
 const (
@@ -95,8 +96,15 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		// 成功上报确实点亮了连登，属于「有新变化」，每次都要留痕。
 		s.cfg.Records.Task(a.UID, "活跃上报", records.ResultSuccess,
 			fmt.Sprintf("已上报 %d/%d 条（点亮连登天数）", ok, count))
-		s.checkActivityStreak(a) // 回读 streak 自检
-		s.travelAdoptForce(a)    // 对话量刚补满 → 立即重试领养（豁免当日防抖）
+		// 回读 streak 自检，并**把这份快照交给活跃地图闭环复用**：
+		// 连登天数、补签卡余额、各档兑换状态本来就在同一个响应体里
+		//（data.streak / data.makeup_cards / data.redemption_status），
+		// 闭环再单独请求一次等于对同一端点打两次上游。
+		streak, _ := s.readStreakState(a)
+		s.travelAdoptForce(a) // 对话量刚补满 → 立即重试领养（豁免当日防抖）
+		// 活跃地图闭环（礼包/补偿/补签/兑换/抽奖）紧跟在上报之后：
+		// 它的每一步都以「刚被点亮的连登天数」为前提，分开排程会顺序倒挂。
+		s.growthMapRound(a, streak, false)
 	}
 }
 
@@ -117,17 +125,30 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 //
 // 返回 true 表示「上报 OK 但 streak 可疑」，供测试断言。
 func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
-	days, err := s.cfg.Upstream.GrowthStreak(a)
+	_, suspect := s.readStreakState(a)
+	return suspect
+}
+
+// readStreakState 读一次连登快照，同时完成「自检」与「供活跃地图复用」。
+//
+// 为什么合并成一个调用：streak 响应体里同时装着连登天数（自检要看）、
+// 补签卡余额与各档兑换状态（活跃地图要看）。分成两次读就是对同一端点打两次上游 ——
+// 既有被风控多算一次请求的代价，也让同一份数据出现两个可能不一致的快照。
+//
+// 返回值 suspect 的语义与 checkActivityStreak 一致（true = 上报成功但天数可疑）。
+// 读取失败时 state 为 nil、suspect 为 true：调用方据此跳过依赖天数的步骤。
+func (s *Scheduler) readStreakState(a *auth.Auth) (*upstream.GrowthStreakState, bool) {
+	st, err := s.cfg.Upstream.GrowthStreakState(a)
 	if err != nil {
 		log.Printf("WARN: activity %s: streak check failed (report ok): %v", uid8(a.UID), err)
-		return true
+		return nil, true
 	}
-	if days == 0 {
+	if st.Days() == 0 {
 		log.Printf("WARN: activity %s: report ok but streak.days=0 (silent drop?)", uid8(a.UID))
-		return true
+		return st, true
 	}
-	log.Printf("activity %s: streak days=%d", uid8(a.UID), days)
-	return false
+	log.Printf("activity %s: streak days=%d", uid8(a.UID), st.Days())
+	return st, false
 }
 
 // sleepCtx 睡满 d；ctx 取消时立即返回 false（优雅停机不等满间隔）。

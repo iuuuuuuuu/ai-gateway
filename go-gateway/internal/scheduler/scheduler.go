@@ -97,6 +97,12 @@ const (
 	TaskNameNightOwl = "nightowl"
 	TaskNameSchool   = "school"
 	TaskNameTrial    = "trial"
+	// TaskNameGrowthMap 活跃地图闭环（补签/兑换/抽奖/礼包）。
+	//
+	// 它没有独立排程时点（并入活跃上报，见 growthmap.go 顶部说明），
+	// 但仍注册为可手动触发的任务名：日排程每个账号一天只跑一轮，
+	// 用户想立刻确认「我的补签卡/抽奖次数有没有被处理」时需要一个入口。
+	TaskNameGrowthMap = "growthmap"
 )
 
 // ErrTaskRunning 该任务已有一轮手动触发在执行中。
@@ -112,8 +118,13 @@ type Scheduler struct {
 
 	// mu/adoptTried 领养当日失败记录：uid → 自然日（CST）。门槛未达的账号当日不再重试，
 	// 避免同日多趟对上游重试轰炸；进程重启即清零（无需持久化）。
-	mu         sync.Mutex
-	adoptTried map[string]string
+	//
+	// growthClaimed 同一把锁下的「活跃地图当日已跑」标记（uid → 自然日 CST）。
+	// 两类任务都是「每日一轮」的养号动作，用同一把锁即可：它们只在写各自 map 时短暂持有，
+	// 不跨网络请求，不会把排程拖慢。
+	mu             sync.Mutex
+	adoptTried     map[string]string
+	growthClaimed  map[string]string
 
 	// taskMu/taskBusy 手动触发的在跑标记。与 mu 分开：排程循环会自动跑同一批任务，
 	// 共用一把锁会让「手动触发」与「到点执行」互相阻塞，把定时任务拖慢。
@@ -170,7 +181,7 @@ func (s *Scheduler) releaseTask(name string) {
 // 未知任务名返回错误而非静默成功：宿主拼错名字时必须能看见，否则按钮点了没反应。
 func (s *Scheduler) RunTaskByName(name string) (TaskRunResult, error) {
 	switch name {
-	case TaskNameActivity, TaskNameNightOwl, TaskNameSchool, TaskNameTrial:
+	case TaskNameActivity, TaskNameNightOwl, TaskNameSchool, TaskNameTrial, TaskNameGrowthMap:
 	default:
 		return TaskRunResult{}, fmt.Errorf("unknown task %q", name)
 	}
@@ -203,6 +214,8 @@ func (s *Scheduler) RunTaskByName(name string) (TaskRunResult, error) {
 		s.RunSchoolNow()
 	case TaskNameTrial:
 		s.RunTrialNow()
+	case TaskNameGrowthMap:
+		s.RunGrowthMapNow()
 	}
 	return TaskRunResult{Task: name, Ran: true, Message: "已触发一轮"}, nil
 }
@@ -245,9 +258,10 @@ func New(cfg Config) *Scheduler {
 		cfg.ActivityReportCount = defaultActivityReportCount
 	}
 	return &Scheduler{
-		cfg:        cfg,
-		adoptTried: make(map[string]string),
-		taskBusy:   make(map[string]bool),
+		cfg:           cfg,
+		adoptTried:    make(map[string]string),
+		growthClaimed: make(map[string]string),
+		taskBusy:      make(map[string]bool),
 	}
 }
 
