@@ -441,7 +441,7 @@ fn parse_ts(v: Option<&Value>) -> Option<i64> {
 // 背景：`read_auth_file_for` 只读两个固定文件名，因此「从本机导入」每区域
 // 最多只能拿到**当前**登录的 1 个账号。但客户端每次登录/切换都会把当时的
 // 登录态另存一份快照（`workbuddy-desktop.<UTC 时间>.<pid>.<uuid>.info`），
-// 本工具每次切换前也会备份（`~/.ai-gateway/backups/<stem>.<UTC 时间>.info`）。
+// 本工具每次切换前也会备份（`~/.wb-switch/backups/<stem>.<UTC 时间>.info`）。
 // 这些文件里躺着本机历史上登录过的账号，过去完全没有入口能读到它们。
 //
 // 本节提供扫描与去重：同一 (区域, uid) 可能有多份文件，只保留**凭证最新**
@@ -455,7 +455,7 @@ pub enum AuthFileSource {
     Current,
     /// 历史登录快照（客户端留存的带时间戳 `.info`）。
     Snapshot,
-    /// 本工具切换前的备份（`~/.ai-gateway/backups/`）。
+    /// 本工具切换前的备份（`~/.wb-switch/backups/`）。
     Backup,
 }
 

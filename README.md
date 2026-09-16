@@ -361,7 +361,7 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 |---|---|---|
 | 当前登录态 | `auth/workbuddy-desktop.info`、`workbuddy-desktop-ai.info` | 每区域各 1 个（固定文件名） |
 | 历史登录快照 | `auth/workbuddy-desktop[-ai].<时间>.<pid>.<uuid>.info` | 客户端每次登录/切换时留存 |
-| 切换备份 | `~/.ai-gateway/backups/*.info` | 本工具每次切换账号前的备份 |
+| 切换备份 | `~/.wb-switch/backups/*.info` | 本工具每次切换账号前的备份 |
 
 弹框里可勾选任意多个账号批量导入，并标注每个候选的来源、区域与凭证可用性
 （可保活 / 仅 access 有效 / 凭证已过期），已在账号库中的会标出「已在账号库」或「将更新」。
@@ -403,7 +403,7 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 > 数据，留着开关只会让用户切到 `all` 后得到一堆无意义的失败日志，故已移除。
 > 历史配置里残留的 `region_scope` 会被忽略。
 >
-> 若上游日后补齐了国际版接口，可手动把 `~/.ai-gateway/gateway/gateway_native_config.json`
+> 若上游日后补齐了国际版接口，可手动把 `~/.wb-switch/gateway/gateway_native_config.json`
 > 的 `schedule.checkin_scope` 改成 `"all"`，让**网关侧**的签到与旅行覆盖国际版
 > （默认 `"cn"`，不在界面上暴露）。App 侧无此开关。
 
@@ -429,11 +429,11 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 │  └─ gateway_embed.rs                           内嵌网关的释放与缓存      │
 │                                                                        │
 │  内嵌网关二进制（Go，gzip 压缩，构建期写入）                              │
-│  └─ 运行时释放为 ~/.ai-gateway/gateway/bin/gateway-<指纹>.exe            │
+│  └─ 运行时释放为 ~/.wb-switch/gateway/bin/gateway-<指纹>.exe            │
 └────────────────────────────────────────────────────────────────────────┘
             │                                        │
             ▼                                        ▼
-  ~/.ai-gateway/accounts.json              ~/.ai-gateway/gateway/
+  ~/.wb-switch/accounts.json              ~/.wb-switch/gateway/
      （账号库 · 唯一真源）                    └─ gateway_auths/
                                                  （网关凭证 · 派生素材）
 ```
@@ -464,7 +464,7 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 
 ### 安装方式一：安装包（推荐）
 
-从 [Releases](https://github.com/momo0410/workbuddy-switch-gateway/releases/latest) 下载：
+从 [Releases](https://github.com/momo0410/ai-gateway/releases/latest) 下载：
 
 | 文件 | 说明 |
 |---|---|
@@ -583,7 +583,7 @@ scripts/             # 构建与发布脚本
    Claude 系客户端按 Sonnet / Opus / Haiku / Fable 四个槽位顺序映射
 3. 单卡片「一键接入」只写入该客户端；顶部「一键更新所有已安装智能体」逐客户端执行，
    单个失败不会影响其他客户端
-4. 每次写入前自动备份到 `~/.ai-gateway/agent-backups/<客户端>/<时间戳>/`，
+4. 每次写入前自动备份到 `~/.wb-switch/agent-backups/<客户端>/<时间戳>/`，
    卡片「备份历史」中可查看并一键回滚
 
 > 接入会覆盖各客户端现有网关配置（每次均自动备份）。以 Claude Desktop 为例，
@@ -635,7 +635,7 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 
 ### 网关配置项
 
-配置文件位于 `~/.ai-gateway/gateway/gateway_config.json`，也可在界面中修改：
+配置文件位于 `~/.wb-switch/gateway/gateway_config.json`，也可在界面中修改：
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
@@ -684,7 +684,7 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
      然后用豆包客户端访问一次，凭证会自动抓取并回写（页面每 20 秒轮询一次）
    - **手动录入**：点「编辑」填写 `sessionid` / `sid_guard` / `ttwid`
 3. 账号列表里可执行：**探活**、**查询额度**、**备份/恢复对话状态**、
-   **导出对话**（markdown + json，输出到 `~/.ai-gateway/exports/`）
+   **导出对话**（markdown + json，输出到 `~/.wb-switch/exports/`）
 4. 顶部按钮：「保活」（启动客户端触发会话续期）、「探活续期」（HTTP 探测）、
    「额度巡检」（批量查询）、「诊断」（排查为什么读不到凭证）
 
@@ -717,37 +717,44 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 
 | 内容 | 路径 | 说明 |
 |---|---|---|
-| 账号库 | `~/.ai-gateway/accounts.json` | **唯一真源**，含所有账号凭证，建议单独备份 |
-| Trae 账号库 | `~/.ai-gateway/trae_accounts.json` | Trae Work 与 Trae 共用（两者登录态独立） |
-| 豆包账号库 | `~/.ai-gateway/doubao_accounts.json` | 含会话凭证（等价于密码，勿分享） |
-| 网关凭证 | `~/.ai-gateway/gateway/gateway_auths/` | 由账号库派生，删除后可自动重建 |
-| 网关配置 | `~/.ai-gateway/gateway/gateway_config.json` | 端口、API Key、模式等 |
-| 网关原生配置 | `~/.ai-gateway/gateway/gateway_native_config.json` | 转换后交给网关进程的配置 |
-| 内嵌网关副本 | `~/.ai-gateway/gateway/bin/` | 按内容指纹命名，版本升级后自动更新 |
-| 登录态快照 | `~/.ai-gateway/profiles*/` | Trae 系与豆包各一套，含一代 `.bak` 回退 |
-| 豆包对话备份 | `~/.ai-gateway/doubao_chats/` | 客户端状态（对话正文在云端） |
-| 对话导出 | `~/.ai-gateway/exports/` | markdown + json |
-| 代理抓包日志 | `~/.ai-gateway/logs/` | 凭证已脱敏，但可能含其他请求信息 |
-| CA 证书 | `~/.ai-gateway/certs/` | 自签 CA，安装后请妥善保管私钥 |
-| 智能体配置备份 | `~/.ai-gateway/agent-backups/` | 一键接入前自动备份，可随时回滚 |
-| 签到 / 轮换日志 | `~/.ai-gateway/*_logs.json` | 最多保留 30 天 |
+| 账号库 | `~/.wb-switch/accounts.json` | **唯一真源**，含所有账号凭证，建议单独备份 |
+| Trae 账号库 | `~/.wb-switch/trae_accounts.json` | Trae Work 与 Trae 共用（两者登录态独立） |
+| 豆包账号库 | `~/.wb-switch/doubao_accounts.json` | 含会话凭证（等价于密码，勿分享） |
+| 网关凭证 | `~/.wb-switch/gateway/gateway_auths/` | 由账号库派生，删除后可自动重建 |
+| 网关配置 | `~/.wb-switch/gateway/gateway_config.json` | 端口、API Key、模式等 |
+| 网关原生配置 | `~/.wb-switch/gateway/gateway_native_config.json` | 转换后交给网关进程的配置 |
+| 内嵌网关副本 | `~/.wb-switch/gateway/bin/` | 按内容指纹命名，版本升级后自动更新 |
+| 登录态快照 | `~/.wb-switch/profiles*/` | Trae 系与豆包各一套，含一代 `.bak` 回退 |
+| 豆包对话备份 | `~/.wb-switch/doubao_chats/` | 客户端状态（对话正文在云端） |
+| 对话导出 | `~/.wb-switch/exports/` | markdown + json |
+| 代理抓包日志 | `~/.wb-switch/logs/` | 凭证已脱敏，但可能含其他请求信息 |
+| CA 证书 | `~/.wb-switch/certs/` | 自签 CA，安装后请妥善保管私钥 |
+| 智能体配置备份 | `~/.wb-switch/agent-backups/` | 一键接入前自动备份，可随时回滚 |
+| 签到 / 轮换日志 | `~/.wb-switch/*_logs.json` | 最多保留 30 天 |
 
 > `accounts.json` 与 `doubao_accounts.json` 包含可直接登录的凭证，请勿分享或提交到版本库。
 
-### 从更名前的版本升级
+### 数据目录与版本拆分（2026-09-16）
 
-旧版本（`WorkBuddy Switch Gateway`）的数据在 `~/.wb-switch`。新版本首次启动会**自动迁移**：
+应用数据统一放在 **`~/.wb-switch/`**，老版本（`WorkBuddy Switch Gateway`，0.8.x
+线）与本版本共用这一份账号库与网关状态 —— 在任一版本里新增的账号，另一个版本
+会直接看到，无需手工同步。
 
-- **复制式**迁移：旧目录**原样保留**，新旧两版可并存，也可随时回退旧版
-- **并集合并**：账号库按 `(区域, uid)` 去重合并，新库里的条目优先（不会用旧值覆盖你后来的修改）
-- **只迁移一次**：完成标记写在 `~/.ai-gateway/.migrated-from-wb-switch`，
-  之后你在新版里删除的账号不会被旧目录「复活」
+1.0.0 更名时曾把数据目录换成 `~/.ai-gateway` 并做一次性迁移。由于本仓库此后与
+老仓库**并行维护**、两版常同时装在一台机器上，那个迁移会让两边各自变成一份
+快照、互相看不见对方新增的账号，因此目录已统一回 `.wb-switch`。
+
+**从 1.0.0 / 1.0.1 升级**时，首次启动会自动把 `~/.ai-gateway` 里的数据迁移进来：
+
+- **复制式**迁移：旧目录**原样保留**，可随时回退
+- **并集合并**：账号库按 `(区域, uid)` 去重合并，已有条目不被覆盖
+- **只迁移一次**：完成标记写在 `~/.wb-switch/.migrated-from-ai-gateway`，
+  之后你在某一版里删除的账号不会被另一版「复活」
 - 设了 `AI_GATEWAY_HOME` 时不迁移（隔离环境不该被真实数据污染）
 
-> 签名私钥仍在旧路径 `~/.wb-switch/wb-switch-updater.key`。
-> `scripts/build-signed.ps1` 会**自动回退**到旧路径并提示；
-> 如需迁移请手动复制到 `%USERPROFILE%\.ai-gateway\` 并改名为 `ai-gateway-updater.*`
-> —— 脚本刻意不自动搬运私钥。
+> 签名私钥位于 `~/.wb-switch/wb-switch-updater.key`（与数据目录同处）。
+> `scripts/build-signed.ps1` 会自动回退到更名那一代的 `~/.ai-gateway/ai-gateway-updater.*`；
+> 需要迁移时请手动复制过去并改名为 `wb-switch-updater.*` —— 脚本刻意不自动搬运私钥。
 
 ---
 
@@ -807,7 +814,7 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 **Q：「从本机导入」能找回历史登录过的账号吗？**
 > 能。它会扫描当前登录态（每区域 1 个固定文件）、客户端留存的历史登录快照
 > （`workbuddy-desktop[-ai].<时间>.<pid>.<uuid>.info`）以及本工具的切换备份
-> （`~/.ai-gateway/backups/`），可在弹框里一次勾选多个账号导入。
+> （`~/.wb-switch/backups/`），可在弹框里一次勾选多个账号导入。
 >
 > 同一 `(区域, uid)` 的多份文件只保留**凭证最新**的一份（按可用性 → 到期时间 →
 > 文件修改时间取优），避免旧快照里已被轮换的 refresh token 顶掉有效凭证。

@@ -17,17 +17,17 @@
     不匹配就秒级失败，绝不浪费一次完整构建。
 
     私钥与口令的固定位置（均在仓库外，公开仓库零提交风险）：
-      %USERPROFILE%\.ai-gateway\ai-gateway-updater.key       minisign 私钥
-      %USERPROFILE%\.ai-gateway\ai-gateway-updater.password  私钥口令
+      %USERPROFILE%\.wb-switch\wb-switch-updater.key       minisign 私钥
+      %USERPROFILE%\.wb-switch\wb-switch-updater.password  私钥口令
 
 .PARAMETER Bundles
     要构建的 bundle 类型，默认 "nsis"（Windows 安装包）。多平台用逗号分隔，如 "nsis,msi"。
 
 .PARAMETER KeyFile
-    私钥文件路径，默认 %USERPROFILE%\.ai-gateway\ai-gateway-updater.key。
+    私钥文件路径，默认 %USERPROFILE%\.wb-switch\wb-switch-updater.key。
 
 .PARAMETER PasswordFile
-    口令文件路径，默认 %USERPROFILE%\.ai-gateway\ai-gateway-updater.password。
+    口令文件路径，默认 %USERPROFILE%\.wb-switch\wb-switch-updater.password。
 
 .PARAMETER CheckOnly
     只做密钥预检（路径、口令、keyid 与 tauri.conf.json 公钥是否配对），不执行构建。
@@ -58,12 +58,14 @@ $root = Split-Path -Parent $PSScriptRoot   # 仓库根
 
 # ── 密钥路径解析（含旧路径回退）─────────────────────────────────────────
 #
-# 更名后默认路径变成 ~/.ai-gateway/ai-gateway-updater.*，但**已发布的密钥仍在旧路径**
-# ~/.wb-switch/wb-switch-updater.* 下。
+# 2026-09-16 拆分后，数据目录统一回 ~/.wb-switch（见 config::store_dir 的注释：
+# 两版并行维护、共用同一份账号库），因此密钥的**首选路径也回到 ~/.wb-switch**。
+# ~/.ai-gateway 是更名那一代（1.0.0~1.0.1）用过的路径，作为回退保留 ——
+# 只在其中一处放过密钥的机器仍能签出包。
 #
 # 刻意不自动移动密钥文件：私钥丢失即无法再为已发布客户端签名新版本，
-# 而脚本自动搬运私钥是个不必要的风险面。改为「新路径优先、旧路径回退」，
-# 并在用到旧路径时明确提示用户，由用户自行决定是否迁移。
+# 而脚本自动搬运私钥是个不必要的风险面。改为「首选路径优先、另一路径回退」，
+# 并在用到非首选路径时明确提示用户，由用户自行决定是否迁移。
 function Resolve-KeyPath {
     param(
         [string]$Explicit,
@@ -71,11 +73,11 @@ function Resolve-KeyPath {
         [string]$LegacyName
     )
     if ($Explicit) { return $Explicit }
-    $new = Join-Path $env:USERPROFILE ".ai-gateway\$NewName"
+    $new = Join-Path $env:USERPROFILE ".wb-switch\$LegacyName"
     if (Test-Path -LiteralPath $new) { return $new }
-    $legacy = Join-Path $env:USERPROFILE ".wb-switch\$LegacyName"
+    $legacy = Join-Path $env:USERPROFILE ".ai-gateway\$NewName"
     if (Test-Path -LiteralPath $legacy) { return $legacy }
-    # 两者都不存在：返回新路径，让后续的存在性检查给出面向新路径的报错
+    # 两者都不存在：返回首选路径，让后续的存在性检查给出面向首选路径的报错
     return $new
 }
 
@@ -86,9 +88,9 @@ if (-not $PasswordFile) {
     $PasswordFile = Resolve-KeyPath -Explicit "" -NewName "ai-gateway-updater.password" -LegacyName "wb-switch-updater.password"
 }
 
-if ($KeyFile -match '\.wb-switch\\') {
-    Write-Host "提示：正在使用更名前的旧密钥路径 $KeyFile" -ForegroundColor Yellow
-    Write-Host "      如需迁移到新路径，请手动把 .key 与 .password 复制到 %USERPROFILE%\.ai-gateway\ 并改名为 ai-gateway-updater.*" -ForegroundColor Yellow
+if ($KeyFile -match '\.ai-gateway\\') {
+    Write-Host "提示：正在使用更名那一代的密钥路径 $KeyFile" -ForegroundColor Yellow
+    Write-Host "      如需迁移到当前路径，请手动把 .key 与 .password 复制到 %USERPROFILE%\.wb-switch\ 并改名为 wb-switch-updater.*" -ForegroundColor Yellow
     Write-Host "      （脚本刻意不自动搬运私钥：私钥丢失即无法再为已发布客户端签名）" -ForegroundColor Yellow
 }
 

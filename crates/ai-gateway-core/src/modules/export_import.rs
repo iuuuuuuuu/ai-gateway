@@ -2,7 +2,7 @@
 //!
 //! 纯逻辑（`parse_accounts_json` / `merge_import_records` / `select_export_records`）
 //! 不依赖文件系统，便于无 UI 环境单测；`export_accounts` / `import_accounts`
-//! 负责读写账号库（`~/.ai-gateway/accounts.json`）。
+//! 负责读写账号库（`~/.wb-switch/accounts.json`）。
 
 use std::path::{Path, PathBuf};
 

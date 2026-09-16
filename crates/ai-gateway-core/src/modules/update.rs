@@ -21,10 +21,14 @@ use crate::modules::config::{
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 本整合版仓库所有者（与上游 changexbc/workbuddy-switch 区分开）。
 pub const GITHUB_OWNER: &str = "momo0410";
-/// 仓库名必须与 git 远端一致。应用显示名已改为 AI Gateway，但 GitHub 仓库
-/// **没有**改名，仍叫 workbuddy-switch-gateway —— 这里写 "ai-gateway" 会让
-/// 检查更新与自动更新全部 404（v1.0.0 就踩过这个坑，见下方单测）。
-pub const GITHUB_REPO: &str = "workbuddy-switch-gateway";
+/// 仓库名必须与 git 远端一致。应用显示名已改为 AI Gateway，GitHub 仓库
+/// 也已在 2026-09-16 拆分为独立的 momo0410/ai-gateway（老仓库
+/// workbuddy-switch-gateway 回退到 v0.8.5，只维护 0.8.x 线）。
+///
+/// 两仓库的 `releases/latest` 是**两个不同的指针**：写错会让检查更新与
+/// 自动更新全部 404（v1.0.0 就踩过这个坑，见下方单测），或者把 1.x 用户
+/// 降级回老仓库的 0.8.x。
+pub const GITHUB_REPO: &str = "ai-gateway";
 
 /// 成功结果缓存有效期（6 小时）。自动轮询（30 分钟）命中缓存，不发网络请求；
 /// 设置页手动检查传 force=true 绕过缓存强制刷新。
@@ -69,14 +73,17 @@ pub fn load_github_config() -> Value {
             }
         }
     }
-    // 历史配置可能指向上游仓库（changexbc/workbuddy-switch 或本仓库旧名
-    // workbuddy-switch-gateway）；迁到当前仓库，避免把用户更新成上游版本
-    // 而丢失网关功能。
+    // 历史配置可能指向上游仓库（changexbc/workbuddy-switch）—— 那与本项目
+    // 无关，必须迁走，否则会把用户更新成上游版本而丢失网关功能。
+    //
+    // **只迁移上游**，不再迁移 momo0410/workbuddy-switch-gateway：该项目现已
+    // 拆为两个仓库，老仓库（workbuddy-switch-gateway）是**合法的另一个更新源**
+    // （0.8.x 线）。曾经把本仓库旧名也一并迁移，是因为当年改名没改仓库；如今
+    // 仓库真的拆开了，再迁移会把「刻意留在 0.8.x 的用户」静默拉回 1.x。
     //
     // 注意：更名脚本曾把这里两个不同的仓库名都替换成了 "ai-gateway"，
-    // 使条件退化成 `repo == "ai-gateway" || repo == "ai-gateway"`（恒等重复），
-    // 于是上游配置根本不会被迁移。这里恢复成各自真实的名字。
-    if owner == "changexbc" && (repo == "workbuddy-switch" || repo == "workbuddy-switch-gateway") {
+    // 使条件退化成恒等重复，于是上游配置根本不会被迁移。这里保持各自真实名字。
+    if owner == "changexbc" && repo == "workbuddy-switch" {
         repo = GITHUB_REPO.to_string();
         should_normalize = true;
     }
@@ -328,20 +335,23 @@ mod tests {
 
     #[test]
     fn updater_manifest_urls_lists_merged_then_platform_specific() {
-        let urls = updater_manifest_urls("momo0410", "workbuddy-switch-gateway", "windows", "x86_64");
+        let urls = updater_manifest_urls("momo0410", "ai-gateway", "windows", "x86_64");
         assert_eq!(
             urls,
             vec![
-                "https://github.com/momo0410/workbuddy-switch-gateway/releases/latest/download/latest.json",
-                "https://github.com/momo0410/workbuddy-switch-gateway/releases/latest/download/latest-windows-x86_64.json",
+                "https://github.com/momo0410/ai-gateway/releases/latest/download/latest.json",
+                "https://github.com/momo0410/ai-gateway/releases/latest/download/latest-windows-x86_64.json",
             ]
         );
     }
 
     /// 仓库名写错会让「检查更新」与自动更新同时 404，而这类错误**不会**在
     /// 构建或运行时报错，只会在用户点更新时静默失败（v1.0.0 发布后才发现
-    /// 端点指向并不存在的 momo0410/ai-gateway）。所以把三处仓库名钉在一起：
+    /// 端点指向并不存在的仓库）。所以把仓库名钉在一起：
     /// 本模块常量、tauri.conf.json 的 updater endpoints、前端的 update.ts。
+    ///
+    /// 2026-09-16 拆分后本条同时防住**反向**错误：把新仓库的端点点回老仓库，
+    /// 会让 1.x 用户看到老仓库 0.8.x 的 `releases/latest` 并被降级。
     #[test]
     fn repo_name_stays_in_sync_across_config_and_frontend() {
         const TAURI_CONF: &str = include_str!("../../../../src-tauri/tauri.conf.json");
@@ -356,10 +366,16 @@ mod tests {
             FRONTEND_UPDATE_TS.contains(&format!("GITHUB_REPO = \"{GITHUB_REPO}\"")),
             "src/lib/update.ts 的 GITHUB_REPO 必须与 update.rs 的 GITHUB_REPO 一致（{GITHUB_REPO}）"
         );
+        // 老仓库名不得再出现在这三个更新端点里：它现在属于 0.8.x 线，
+        // 一旦混入就会把 1.x 用户降级（两个仓库的 releases/latest 是不同指针）。
+        assert!(
+            !expected.contains("workbuddy-switch-gateway"),
+            "AI Gateway 的更新源不能指向老的 workbuddy-switch-gateway（那是 0.8.x 线）"
+        );
     }
 
-    /// 仓库**已改名**时这个断言会失败，提醒同步 scripts/gen-update-json.sh 与
-    /// scripts/publish-release.sh 里同为 "ai-gateway" 的默认 REPO 值。
+    /// 脚本里的默认仓库名必须与常量一致，否则本地发版会把清单写成另一个
+    /// 仓库的 URL（构建期看不出来，只在客户端更新时静默失败）。
     #[test]
     fn gen_update_json_default_repo_matches_constant() {
         const GEN_UPDATE_JSON: &str = include_str!("../../../../scripts/gen-update-json.sh");

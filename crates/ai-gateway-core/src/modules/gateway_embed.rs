@@ -5,7 +5,7 @@
 //! 做法：
 //!   1. 构建期由 `build.rs` 把网关二进制 gzip 压缩后放到 OUT_DIR；
 //!   2. 本模块用 `include_bytes!` 把它编进主程序；
-//!   3. 运行时首次启动解压到 `~/.ai-gateway/gateway/bin/gateway-<指纹>.exe`；
+//!   3. 运行时首次启动解压到 `~/.wb-switch/gateway/bin/gateway-<指纹>.exe`；
 //!   4. 指纹取「内嵌数据长度 + 内容哈希」，因此升级后会自动落地新文件，
 //!      不会复用旧版本。
 //!

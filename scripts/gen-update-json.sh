@@ -9,11 +9,12 @@ cd "$(dirname "$0")/.." || exit 1
 # 默认值必须与 src-tauri/tauri.conf.json 的 updater endpoints 一致，
 # 否则生成的 URL 会指向别的仓库，客户端永远拉不到更新。
 #
-# 注意：应用显示名已改成 AI Gateway，但 GitHub 仓库**没有**改名，仍是
-# workbuddy-switch-gateway。这里写 ai-gateway 会让清单 URL 指向不存在的仓库
-# （v1.0.0 就是这样，导致 v0.8.5 用户收不到更新）。改仓库名时才改这里。
+# 注意：应用显示名是 AI Gateway，GitHub 仓库自 2026-09-16 起也已拆分独立的
+# momo0410/ai-gateway（老仓库 workbuddy-switch-gateway 回退到 v0.8.5，只维护
+# 0.8.x 线）。这里写错会让清单 URL 指向另一个仓库的 releases/latest ——
+# 要么 404，要么把 1.x 用户降级回 0.8.x。
 OWNER="${1:-momo0410}"
-REPO="${2:-workbuddy-switch-gateway}"
+REPO="${2:-ai-gateway}"
 VERSION="${UPDATE_VERSION:-$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')}"
 UPDATE_OS="${UPDATE_OS:-windows}"
 UPDATE_ARCH="${UPDATE_ARCH:-x86_64}"

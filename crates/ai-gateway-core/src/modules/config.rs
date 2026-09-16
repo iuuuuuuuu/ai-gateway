@@ -174,7 +174,7 @@ pub fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// 本软件自身的数据目录（`~/.ai-gateway`）。
+/// 本软件自身的数据目录（`~/.wb-switch`）。
 ///
 /// 可用环境变量 `AI_GATEWAY_HOME` 覆盖到任意目录，用于**开发/测试隔离**：
 /// 起一个独立实例、指向空目录，就不会动到正在使用的那份账号库与网关状态。
@@ -183,7 +183,24 @@ pub fn home_dir() -> PathBuf {
 /// **不读 `USERPROFILE`**（实测：把 USERPROFILE 指到临时目录后，宿主服务仍然读到
 /// 真实的 ~/.ai-gateway），因此光靠环境变量没法隔离数据目录。
 ///
-/// 不设该变量时行为与之前完全一致（仍为 `~/.ai-gateway`），对正常使用零影响。
+/// ## 为什么目录名是 `.wb-switch` 而不是 `.ai-gateway`（2026-09-16）
+///
+/// 应用在 1.0.0 更名时把数据目录一并换成了 `~/.ai-gateway`，并为老用户做了
+/// 一次性「复制式迁移」。但 2026-09-16 起本仓库与老仓库
+/// （workbuddy-switch-gateway，0.8.x 线）**并行维护**，两版会同时装在同一台
+/// 机器上使用，于是那个迁移暴露出一个真实的数据缺陷：
+///
+///   迁移的幂等标记 `.migrated-from-wb-switch` 让迁移**只跑一次**，
+///   此后 `.ai-gateway` 就成了迁移那一刻的快照。用户在任一版本里新增的账号
+///   都不会出现在另一个版本里 —— 而从用户视角这是**同一个应用的两代**，
+///   理当共用同一份账号库。
+///
+/// 因此数据目录回到 `.wb-switch`（0.8.x 一直在用的那个），两版真正共享同一
+/// 份账号库与网关状态。`.ai-gateway` 不再被写入，仅在老用户机器上存在时作为
+/// 一次性迁移来源（见 migrate_store.rs）。
+///
+/// 保留 `AI_GATEWAY_HOME` 变量名不变：它是新版本才引入的，且改名只涉及源码，
+/// 改了反而会让既有的隔离脚本失效。
 pub fn store_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("AI_GATEWAY_HOME") {
         let p = PathBuf::from(dir);
@@ -191,7 +208,7 @@ pub fn store_dir() -> PathBuf {
             return p;
         }
     }
-    home_dir().join(".ai-gateway")
+    home_dir().join(".wb-switch")
 }
 
 pub fn accounts_file() -> PathBuf {

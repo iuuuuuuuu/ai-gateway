@@ -1,7 +1,7 @@
 //! 网关（workbuddy2api）托管与账号桥接。
 //!
 //! 设计：把编译好的 gateway 可执行文件作为**子进程**托管，并复用本机已有的
-//! 账号库（`~/.ai-gateway/accounts.json`）为其生成凭证目录，使账号管理页与
+//! 账号库（`~/.wb-switch/accounts.json`）为其生成凭证目录，使账号管理页与
 //! OpenAI 兼容网关共享同一批账号。
 //!
 //! 为什么用子进程而不是把网关逻辑用 Rust 重写：
@@ -27,7 +27,7 @@ use crate::modules::config::{atomic_write, now_ms, store_dir};
 // 路径与配置
 // ---------------------------------------------------------------------------
 
-/// 网关配置文件名（放在 ~/.ai-gateway/ 下，与账号库同目录）。
+/// 网关配置文件名（放在 ~/.wb-switch/ 下，与账号库同目录）。
 const GATEWAY_CONFIG: &str = "gateway_config.json";
 
 /// 上游网关在 /healthz 透出的身份标识（响应头 X-Service + 响应体 service 字段）。
@@ -40,7 +40,7 @@ const GATEWAY_AUTH_DIR: &str = "gateway_auths";
 /// 网关状态文件名（账号池冷却/熔断状态持久化）。
 const GATEWAY_STATE_DIR: &str = "gateway_data";
 
-/// 网关运行目录（~/.ai-gateway/gateway）。
+/// 网关运行目录（~/.wb-switch/gateway）。
 pub fn gateway_dir() -> PathBuf {
     store_dir().join("gateway")
 }
@@ -73,9 +73,9 @@ fn gateway_exe_name() -> &'static str {
 ///
 /// 优先顺序：
 ///   1. 环境变量 AI_GATEWAY_ROUTER_BIN（显式指定，便于开发/替换）
-///   2. 内嵌版本（单文件分发：解压到 ~/.ai-gateway/gateway/bin/）
+///   2. 内嵌版本（单文件分发：解压到 ~/.wb-switch/gateway/bin/）
 ///   3. 与本程序同目录的 gateway.exe（自定义/调试用）
-///   4. ~/.ai-gateway/gateway/ 下的 gateway.exe
+///   4. ~/.wb-switch/gateway/ 下的 gateway.exe
 ///
 /// 内嵌版本优先于「同目录文件」，保证单文件分发场景下运行的是
 /// 与主程序同版本、同源码构建的网关，不会误用同目录里遗留的旧文件。
