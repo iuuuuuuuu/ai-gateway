@@ -1,6 +1,7 @@
 {
-  "listen": ":7863",
+  "listen": "127.0.0.1:7863",
   "api_key": "your-api-key-here",
+  "max_rotate": 3,
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "cooldown": {

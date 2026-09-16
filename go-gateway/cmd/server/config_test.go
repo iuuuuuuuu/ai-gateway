@@ -11,11 +11,24 @@ import (
 
 func TestDefault(t *testing.T) {
 	c := Default()
-	if c.Listen != ":7863" {
-		t.Errorf("listen=%s", c.Listen)
+	// 默认必须只绑回环：默认 api_key 为空（= 不鉴权），绑全网卡等于
+	// 把本机账号的付费额度开放给同局域网的任何设备。
+	if c.Listen != "127.0.0.1:7863" {
+		t.Errorf("listen=%s，默认必须绑回环", c.Listen)
+	}
+	if c.APIKey != "" {
+		t.Errorf("api_key 默认为空是本测试的前提（为此才必须绑回环），实际 %q", c.APIKey)
+	}
+	if c.MaxRotate != 3 {
+		t.Errorf("max_rotate=%d want 3", c.MaxRotate)
 	}
 	if err := c.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
+	}
+	// normalize 不得把回环地址改写成通配（历史 bug：只在缺冒号时补 ":" 前缀，
+	// 这条断言锁住「显式回环地址原样保留」）。
+	if c.Listen != "127.0.0.1:7863" {
+		t.Errorf("normalize 后 listen=%s，回环地址不应被改写", c.Listen)
 	}
 	if c.SoftRateDur.Seconds() != 60 {
 		t.Errorf("soft=%v", c.SoftRateDur)

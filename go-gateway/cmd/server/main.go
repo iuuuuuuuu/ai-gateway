@@ -163,6 +163,7 @@ func main() {
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
+		MaxRotate:    cfg.MaxRotate,
 		Usage:        usageStore,
 		// 单一模型锁定：仅轮转模式下生效（负载均衡不限制模型，保持原有行为）。
 		AllowedModel: func() string {

@@ -91,25 +91,35 @@ function isWorkbuddyCurrent(account: AccountMeta, current: AppStatus["current"] 
   );
 }
 
-/** 并行查询今日签到；失败的账号不写入，由调用方保留原值。 */
+/**
+ * 并行查询今日签到；失败的账号标成 undefined（「未知」）。
+ *
+ * 为什么返回 undefined 而不是直接丢弃该账号：调用方是**整体替换**语义的
+ * setCheckinMap(next)。若失败账号被丢弃，它就保留上一次的值 —— 批量签到后
+ * 重查时表现为「签到明明跑了，卡片还显示未签到」，而 `todayCheckedIn === false`
+ * 恰好又是账号卡渲染「手动签到」入口的条件（account-card.tsx:456），
+ * 于是入口消失、用户既看不到真实状态也无从手动补救。
+ * 返回 undefined 让徽章回到「不渲染」（account-card.tsx:389 的 !== undefined 守卫），
+ * 界面诚实表达「未知」，下次成功查询自然纠正。
+ */
 async function fetchTodayCheckinMap(
   accountIds: string[],
   isStale?: () => boolean,
-): Promise<Record<string, boolean>> {
+): Promise<Record<string, boolean | undefined>> {
   const entries = await Promise.all(
     accountIds.map(async (id) => {
       try {
         const res = await api.getCheckinStatus(id);
-        if (isStale?.() || !res.ok) return null;
+        if (isStale?.() || !res.ok) return [id, undefined] as const;
         return [id, res.todayCheckedIn] as const;
       } catch {
-        return null;
+        return [id, undefined] as const;
       }
     }),
   );
-  const next: Record<string, boolean> = {};
+  const next: Record<string, boolean | undefined> = {};
   for (const entry of entries) {
-    if (entry) next[entry[0]] = entry[1];
+    next[entry[0]] = entry[1];
   }
   return next;
 }
@@ -162,7 +172,7 @@ export default function AccountsPage() {
   const [autoCheckinConfig, setAutoCheckinConfig] = useState<CheckinConfig | null>(null);
   const [autoCheckinSaving, setAutoCheckinSaving] = useState(false);
   /** 账号 id -> 今日是否已签到（undefined=查询中/未知） */
-  const [checkinMap, setCheckinMap] = useState<Record<string, boolean>>({});
+  const [checkinMap, setCheckinMap] = useState<Record<string, boolean | undefined>>({});
   const [autoTravelConfig, setAutoTravelConfig] = useState<TravelConfig | null>(null);
   const [autoTravelSaving, setAutoTravelSaving] = useState(false);
   /** 账号 id -> 今日旅行状态（undefined=查询中/未知） */
@@ -534,11 +544,12 @@ export default function AccountsPage() {
         } else {
           toast.success("签到完成", { description: summary });
         }
-        // 批量签到后重查国服账号的今日签到状态，无需切换页面即反映最新结果
+        // 批量签到后重查国服账号的今日签到状态，无需切换页面即反映最新结果。
+        // 整体替换（不是增量合并）：fetchTodayCheckinMap 对查询失败的账号返回
+        // undefined，合并会把这些账号的旧值留下来，导致签到失败/重查失败的账号
+        // 一直显示旧的「未签到」，且「手动签到」入口随之消失。
         const next = await fetchTodayCheckinMap(scopedAccounts.map((account) => account.id));
-        if (Object.keys(next).length > 0) {
-          setCheckinMap((prev) => ({ ...prev, ...next }));
-        }
+        setCheckinMap(next);
       } catch (e) {
         toast.error("批量签到失败", { description: api.asError(e) });
       }

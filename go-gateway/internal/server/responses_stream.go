@@ -75,12 +75,14 @@ func (h *Handler) streamResponses(w http.ResponseWriter, result *chatResult, mod
 	for {
 		line, err := br.ReadString('\n')
 		line = strings.TrimRight(line, "\r\n")
+		// 注意不要用 := 遮蔽外层 err：那样「读到的最后一行之后 err != nil」
+		// （含 ctx 被 IdleTimeout 取消）会被吃掉，循环直接进入正常收尾。
 		if payload, ok := strings.CutPrefix(line, "data: "); ok {
 			if payload == "[DONE]" {
 				break
 			}
 			var chunk map[string]any
-			if json.Unmarshal([]byte(payload), &chunk) == nil {
+			if jerr := json.Unmarshal([]byte(payload), &chunk); jerr == nil {
 				if werr := ctx.consume(out, chunk); werr != nil {
 					return
 				}
@@ -88,10 +90,18 @@ func (h *Handler) streamResponses(w http.ResponseWriter, result *chatResult, mod
 		}
 		if err != nil {
 			if err != io.EOF {
-				_ = out.write("response.failed", ctx.failedEvent("upstream stream error: "+err.Error()))
+				ctx.transportErr = "upstream stream error: " + err.Error()
 			}
 			break
 		}
+	}
+
+	// 上游以 HTTP 200 + 流内 {"error":{...}} 表示终止性失败（渠道未批准、账号被封，
+	// 见 upstream/sse.go 的 normalizeFrame 注释）。此时若继续补 response.completed
+	// 等于宣告「正常完成」，客户端会把截断/空回答当成一次成功回合。
+	if msg := ctx.failureMessage(); msg != "" {
+		_ = out.write("response.failed", ctx.failedEvent(msg))
+		return
 	}
 
 	if !ctx.textStarted {
@@ -124,6 +134,25 @@ type responsesStreamState struct {
 	toolOrder   []int
 	usage       map[string]any
 	finished    bool
+
+	// upstreamErr 上游流内终止性 error 帧的文案；transportErr 传输层/空闲超时
+	// 导致的异常断流。任一非空都表示本次请求必须按失败收尾（见 failureMessage）。
+	upstreamErr  string
+	transportErr string
+}
+
+// failureMessage 返回应当按失败收尾的原因；空串表示可以正常收尾。
+//
+// 传输层断流（transportErr）不参与「是否需要 finish_reason」的判定：这里没有
+// 可比的字段，且上游异常断开本身就足以说明本次不能宣告成功。
+func (s *responsesStreamState) failureMessage() string {
+	if s.transportErr != "" {
+		return s.transportErr
+	}
+	if s.upstreamErr != "" {
+		return "upstream error: " + s.upstreamErr
+	}
+	return ""
 }
 
 type responsesToolCall struct {
@@ -201,6 +230,14 @@ func (s *responsesStreamState) startTextItem(out *sseWriter) error {
 
 // consume 处理单个 chat SSE chunk。
 func (s *responsesStreamState) consume(out *sseWriter, chunk map[string]any) error {
+	// 终止性 error 帧没有 choices，若直接落到下面的解析会被整个忽略，
+	// 表现为「客户端收到一个成功但空洞的回合」（与 messages_stream.go 同因）。
+	if e, ok := chunk["error"]; ok && e != nil {
+		if s.upstreamErr == "" {
+			s.upstreamErr = errorFrameText(e)
+		}
+		return nil
+	}
 	if id := str(chunk["id"]); id != "" && s.responseID == "resp_wb2api" {
 		s.responseID = id
 	}

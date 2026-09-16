@@ -11,7 +11,11 @@ const alertVariants = cva(
         default: "bg-card text-card-foreground",
         destructive:
           "text-destructive bg-card [&>svg]:text-current *:data-[slot=alert-description]:text-destructive/90",
-        warning: "border-amber-500/30 bg-amber-500/10 text-amber-900",
+        // 必须带 dark 覆盖：琥珀-900 压在深色底上对比度约 1.8:1，肉眼几乎看不见，
+        // 而这条变体承载的正是「导出文件含 token 等同密码」这类关键安全提示。
+        // 仓库内其它琥珀色文字（switch-account-dialog、GatewayPage 等）都成对写了
+        // dark:，只有这里漏了。
+        warning: "border-amber-500/30 bg-amber-500/10 text-amber-900 dark:text-amber-200",
       },
     },
     defaultVariants: {

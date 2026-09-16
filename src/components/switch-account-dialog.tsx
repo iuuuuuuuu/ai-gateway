@@ -121,13 +121,34 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       });
       const nickname = account.nickname || account.email || account.uid || "该账号";
       const parts: string[] = [];
-      if (res.sessionCopy?.copied.length) {
-        parts.push(`已复制 ${res.sessionCopy.copied.length} 个会话`);
+      const copy = res.sessionCopy;
+      const failed = copy?.errors ?? [];
+      // 复制会话是不可逆的数据搬运：失败或一个都没复制时不能只弹绿色成功，
+      // 否则用户以为会话已跟着账号走了，等新账号里找不到才发现
+      //（此时认证文件已改写、WorkBuddy 已重启，只能再切一次回去补救）。
+      if (copy?.copied.length) {
+        parts.push(`已复制 ${copy.copied.length} 个会话`);
+      }
+      if (failed.length) {
+        parts.push(`失败 ${failed.length} 个`);
       }
       if (res.backup) parts.push(`备份: ${res.backup}`);
-      toast.success(`已切换至「${nickname}」`, {
-        description: parts.length ? parts.join("；") : "WorkBuddy 已重启为目标账号。",
-      });
+      // 勾选了复制但后端压根没做（目标 uid 缺失或与当前账号相同 → 后端返回 None）
+      const copySkipped = copySessions && !copy;
+      if (copySkipped) {
+        parts.push("会话未复制：目标账号缺少 UID 或与当前账号相同");
+      }
+      const badCopy = failed.length > 0 || copySkipped;
+      const description = parts.length ? parts.join("；") : "WorkBuddy 已重启为目标账号。";
+      if (badCopy) {
+        toast.warning(`已切换至「${nickname}」`, {
+          description: failed.length
+            ? `${description}（${failed[0].error}）`
+            : description,
+        });
+      } else {
+        toast.success(`已切换至「${nickname}」`, { description });
+      }
       onOpenChange(false);
       onDone?.();
     } catch (e) {

@@ -16,7 +16,9 @@ const badgeVariants = cva(
           "border-transparent bg-destructive text-white [a&]:hover:bg-destructive/90 focus-visible:ring-destructive/20",
         outline: "text-foreground [a&]:hover:bg-accent [a&]:hover:text-accent-foreground",
         success: "border-transparent bg-primary/15 text-primary",
-        warning: "border-transparent bg-amber-500/15 text-amber-700",
+        // 与 alert 的 warning 同理：amber-700 在深色底上不可读，必须补 dark 覆盖
+        //（账号卡片的「需重新登录 / Token 已过期」徽标用的就是这个变体）。
+        warning: "border-transparent bg-amber-500/15 text-amber-700 dark:text-amber-400",
       },
     },
     defaultVariants: {

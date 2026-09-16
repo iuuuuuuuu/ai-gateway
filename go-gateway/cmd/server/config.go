@@ -15,10 +15,17 @@ import (
 
 // Config 顶层配置。
 type Config struct {
-	Listen    string `json:"listen"`     // ":7863"
+	// Listen 监听地址。默认只绑回环：网关默认 api_key 为空（= 不鉴权），
+	// 绑全网卡会让同局域网内任何人都能直接消耗本机账号的付费额度
+	// （见 handler.go 的 authorized）。确需对外暴露时显式写
+	// "0.0.0.0:7863" 并务必同时设置 api_key。
+	Listen    string `json:"listen"`     // "127.0.0.1:7863"
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+
+	// MaxRotate 单请求最多换号次数，<=0 时由 NewHandler 回落为 3。
+	MaxRotate int `json:"max_rotate"`
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -127,10 +134,11 @@ type Config struct {
 // Default 默认配置。
 func Default() *Config {
 	c := &Config{
-		Listen:    ":7863",
+		Listen:    "127.0.0.1:7863",
 		APIKey:    "",
 		AuthDir:   "./auths",
 		StateFile: "./data/state.json",
+		MaxRotate: 3,
 	}
 	c.Cooldown.SoftRate = "60s"
 	c.Schedule.CheckinHours = []int{9, 21}
