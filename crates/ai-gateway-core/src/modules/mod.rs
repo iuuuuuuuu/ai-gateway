@@ -24,7 +24,7 @@ pub mod doubao_session;
 pub mod export_import;
 pub mod gateway;
 pub mod gateway_embed;
-// 数据目录迁移（~/.wb-switch → ~/.ai-gateway，复制式、幂等）
+// 数据目录迁移（~/.ai-gateway → ~/.wb-switch，复制式、幂等）
 pub mod migrate_store;
 pub mod oauth;
 pub mod official_usage;

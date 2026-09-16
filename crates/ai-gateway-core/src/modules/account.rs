@@ -1,4 +1,4 @@
-//! 账号存储：读取/写入 `~/.ai-gateway/accounts.json`，与 Python 版共享数据目录。
+//! 账号存储：读取/写入 `~/.wb-switch/accounts.json`，与 Python 版共享数据目录。
 //!
 //! 对照 server.py `load_accounts` / `save_accounts` / `find_account` /
 //! `account_display_name` / `account_meta`。

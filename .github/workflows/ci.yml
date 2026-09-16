@@ -39,6 +39,8 @@ jobs:
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'x86_64-apple-darwin' || '' }}
 
       - name: 安装 Linux 系统依赖
         if: runner.os == 'Linux'
@@ -57,10 +59,26 @@ jobs:
       - name: 核心单测
         run: cargo test -p ai-gateway-core
 
-      # 全 workspace 编译（含 src-tauri 桌面壳）。--all-targets 会把测试代码
-      # 也编一遍，所以平台门控写错（少一个 cfg）在这里就会红。
+      # --profile test 不可省：cargo test 默认在 `test` profile 下构建（继承 dev，
+      # 但 debug-assertions / overflow-checks 与 dev 不同，产物因此不通用），而
+      # cargo check 默认用 `dev`。不加这一条，ai-gateway-core 会在同一个 job 里被
+      # 完整编译两遍 —— Windows 上实测第二遍要付 19–21s，而 windows-latest 正是
+      # ci 的关键路径，这 20s 直接进墙钟。
+      #
+      # --all-targets 会把测试代码也编一遍，所以平台门控写错（少一个 cfg）在这里就会红。
       - name: 全 workspace 编译校验
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --profile test
+
+      # Intel Mac（x86_64-apple-darwin）的编译门控。
+      #
+      # 以前这层覆盖由 release.yml 的 macos-15-intel 那一腿提供，但它是整个发布
+      # 的关键路径（892s，比第二慢的 windows-x64 707s 还多 3 分钟），已从发布矩阵
+      # 摘掉。摘掉后 Intel 目标就没有任何地方做编译校验了 —— 上面那条
+      # cargo check --workspace 只编 arm64。这里把它补回来：交叉检查比跑一整个
+      # Intel runner + 完整 release 构建便宜得多，门控强度却一样。
+      - name: Intel Mac 编译校验（x86_64-apple-darwin）
+        if: runner.os == 'macOS'
+        run: cargo check --workspace --all-targets --target x86_64-apple-darwin
 
   gateway:
     name: gateway / Go 单测与构建
@@ -68,9 +86,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # cache-dependency-path 不可省：setup-go 默认找**仓库根**的 go.sum，
+      # 而本仓库的 go.mod/go.sum 在 go-gateway/ 下 —— 不指路的话缓存永远不生效
+      # （默认的 hashFiles('**/go.sum') 也会因为找不到而落到空缓存分支）。
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
+          cache-dependency-path: go-gateway/go.sum
 
       # 网关源码随仓库分发（Go 版本），这里验证单测与三平台交叉构建链路。
       - name: Go 单测
@@ -82,3 +104,43 @@ jobs:
           GOOS: linux
           GOARCH: amd64
         run: sh scripts/build-gateway.sh
+
+  # 这一路补上 build.yml 被摘掉 tag 触发后失去的覆盖：
+  # `cargo build -p ai-gateway-server --release`（**release 二进制**，不是 cargo
+  # check）全仓库只有它跑过。
+  #
+  # 为什么值得单独一个 job：release profile 与 check/test profile 的产物不通用，
+  # 而且只有 release 构建才会暴露 LTO / 优化期才炸的错误（例如死代码消除触发的
+  # 借用检查、#[cfg] 组合在优化后失效）。release.yml 里虽然也会构建，但那是在
+  # tag 之后 —— 那时候发现问题已经晚了。
+  #
+  # 只跑 linux 一个平台：这里要的是「release 模式能不能编出来」，跨平台门控由
+  # 上面的 check 矩阵负责，在 Windows/macOS 上再跑一遍 release 纯属重复烧时间。
+  release-bin:
+    name: release 二进制编译校验
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: go-gateway/go.sum
+
+      # build.rs 会把网关二进制 gzip 后编进主程序，缺了它这一步会报
+      # 「本构建未内嵌网关二进制」—— 所以必须先产出网关。
+      # 也必须先有 dist/：ai-gateway-server 用 RustEmbed 嵌入 ../../dist。
+      - name: 构建内嵌网关
+        run: sh scripts/build-gateway.sh
+
+      - run: npm ci
+
+      - name: 构建前端
+        run: npm run build
+
+      - name: release 二进制编译
+        run: cargo build -p ai-gateway-server --release

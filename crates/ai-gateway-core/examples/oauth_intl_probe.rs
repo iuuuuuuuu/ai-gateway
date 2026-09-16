@@ -21,7 +21,7 @@
 //!   3. 拿到 token 后调一次 `GET /v2/plugin/login/account` 验证 uid 可取
 //!
 //! 与 `oauth::oauth_poll` 的区别：本探针**不调用 `save_collected_account`**，
-//! 因此不会改动 `~/.ai-gateway/accounts.json`。
+//! 因此不会改动 `~/.wb-switch/accounts.json`。
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

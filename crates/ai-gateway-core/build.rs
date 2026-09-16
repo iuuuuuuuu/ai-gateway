@@ -69,13 +69,27 @@ fn main() {
     enc.write_all(&raw).expect("压缩网关失败");
     let gz = enc.finish().expect("压缩网关失败");
 
+    // 关键：把压缩数据写成**独立的二进制文件**，再用 include_bytes! 引进来，
+    // 而不是 format!("Some(&{:?})") 展开成一个 15.5 MB 的 Rust 数组字面量。
+    //
+    // 原因：`{:?}` 会把每个字节渲染成 "31, 139, 8, " 这样的十进制文本，产出
+    // 一个 ~15.5 MB 的 .rs 文件，rustc 每次都得**逐字节解析这个字面量**。
+    // 实测这一项占了 ai-gateway-core 重编时间的绝大部分：
+    //   改 build.rs 触发重编 54.1s  vs  只改 src 重编 20.5s
+    // 改成 include_bytes! 后同一路径实测降到 5.09s。
+    // 而 CI 的 windows 关键路径上，核心单测恰好就是 68s，可见其占比。
+    //
+    // 生成文件仍是表达式形式（include! 需要表达式，不能是 const 项）。
+    let bin_file = out_dir.join("gateway_embed.gz");
+    std::fs::write(&bin_file, &gz).expect("写入 gateway_embed.gz 失败");
+
     std::fs::write(
         &gen_file,
         format!(
-            "// 由 build.rs 生成：内嵌网关（原始 {} 字节 → 压缩 {} 字节）\nSome(&{:?})",
+            "// 由 build.rs 生成：内嵌网关（原始 {} 字节 → 压缩 {} 字节）\nSome(include_bytes!({:?}))",
             raw.len(),
             gz.len(),
-            gz
+            bin_file
         ),
     )
     .expect("写入 gateway_embed.rs 失败");

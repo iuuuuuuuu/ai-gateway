@@ -18,7 +18,7 @@
 //! | 12 | MiniMax Code | `~/.minimax/config.yaml` | Anthropic Messages（`@ai-sdk/anthropic`） |
 //!
 //! 安全约定：
-//!   - 写入前一律备份原文件到 `~/.ai-gateway/agent-backups/<target>/<时间戳>/`；
+//!   - 写入前一律备份原文件到 `~/.wb-switch/agent-backups/<target>/<时间戳>/`；
 //!   - 只覆盖托管字段，保留用户其余配置（尤其是 MCP / 主题 / 项目信任列表 / 插件）；
 //!   - 生成 `manifest.json`，可随时一键安全回滚至修改前状态；
 //!   - 支持模型多选：配置时将用户选中的所有模型同步注入客户端配置。

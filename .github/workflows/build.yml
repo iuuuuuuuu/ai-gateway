@@ -1,8 +1,17 @@
 name: build
 
+# 手动触发专用的"Windows 试装包"工作流。
+#
+# 历史上这里挂了 `push: tags: ["v*"]`，导致每个 v* tag 会**同时**触发本工作流与
+# release.yml —— 两边都构建 Windows Tauri 应用、都往 npm 发布，纯重复。实测每次
+# tag 白烧 6m03s–6m12s 墙钟外加 303 MiB 缓存配额，而且 v1.0.0 / v1.0.1 两次都在
+# 「Publish platform package」那一步失败（烧掉 ~248s 编译才挂）。
+#
+# 现在 tag 发布统一由 release.yml 负责，这里只保留手动触发。
+# 注意 `cargo build -p ai-gateway-server --release` 的覆盖**没有丢**，
+# 已搬到 ci.yml 的 release-bin job；下面那两个 if: startsWith(github.ref, 'refs/tags/v')
+# 的分支在只剩 workflow_dispatch 后永远不会触发，因此手动跑只会产出试装包、不发布。
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       platform:

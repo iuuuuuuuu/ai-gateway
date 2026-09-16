@@ -22,9 +22,11 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
 OWNER="${RELEASE_OWNER:-momo0410}"
-# 仓库名与应用显示名不同：显示名是 AI Gateway，GitHub 仓库仍是
-# workbuddy-switch-gateway（未改名）。这里写错会让自动更新 404。
-REPO="${RELEASE_REPO:-workbuddy-switch-gateway}"
+# 仓库名必须与应用显示名所在的仓库一致：显示名是 AI Gateway，GitHub 仓库
+# 自 2026-09-16 起是独立的 momo0410/ai-gateway（老仓库
+# workbuddy-switch-gateway 回退到 v0.8.5，只维护 0.8.x 线）。写错会让自动
+# 更新 404，或把 1.x 用户降级回 0.8.x。
+REPO="${RELEASE_REPO:-ai-gateway}"
 SETUP_NAME="ai-gateway-windows-x86_64-setup.exe"
 WORK_DIR="$REPO_ROOT/.release-staging"
 

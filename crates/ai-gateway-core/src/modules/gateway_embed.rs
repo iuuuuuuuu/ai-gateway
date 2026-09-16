@@ -5,7 +5,7 @@
 //! 做法：
 //!   1. 构建期由 `build.rs` 把网关二进制 gzip 压缩后放到 OUT_DIR；
 //!   2. 本模块用 `include_bytes!` 把它编进主程序；
-//!   3. 运行时首次启动解压到 `~/.ai-gateway/gateway/bin/gateway-<指纹>.exe`；
+//!   3. 运行时首次启动解压到 `~/.wb-switch/gateway/bin/gateway-<指纹>.exe`；
 //!   4. 指纹取「内嵌数据长度 + 内容哈希」，因此升级后会自动落地新文件，
 //!      不会复用旧版本。
 //!
@@ -17,8 +17,12 @@ use std::path::PathBuf;
 
 use crate::modules::config::store_dir;
 
-/// 构建期写入的压缩数据；未提供网关时为 None。
 /// 内嵌的压缩数据；由 build.rs 生成。
+///
+/// build.rs 写出的表达式内部用 `include_bytes!` 直接引用一个**二进制** .gz
+/// 文件。早先这里在生成文件里展开 `Some(&[31, 139, 8, ...])` 这样的十进制数组
+/// 字面量，导致 rustc 每次重编都要解析一个 ~15.5 MB 的源文件 —— 那是本 crate
+/// 编译耗时的大头（实测 54.1s vs 20.5s，改用二进制 include 后降到 5.09s）。
 static EMBEDDED_GZ: Option<&'static [u8]> = include!(concat!(env!("OUT_DIR"), "/gateway_embed.rs"));
 
 /// 是否内嵌了网关二进制。

@@ -1,15 +1,37 @@
-//! 数据目录迁移：`~/.wb-switch` → `~/.ai-gateway`。
+//! 数据目录迁移：`~/.ai-gateway` → `~/.wb-switch`。
 //!
-//! ## 为什么是「复制」而不是「移动」
+//! ## 为什么方向是反的（2026-09-16 拆分之后）
 //!
-//! 更名后旧版本可能仍在用户的另一台机器/另一个目录里使用，甚至用户会回退到旧版。
-//! 移动会把旧版的数据直接掏空，回退即数据丢失。复制迁移下新旧两版可并存，
-//! 用户确认新版无误后再自行删除旧目录。
+//! 1.0.0 更名时迁移方向是 `~/.wb-switch` → `~/.ai-gateway`。2026-09-16 起
+//! 本仓库（AI Gateway，1.x）与老仓库（workbuddy-switch-gateway，0.8.x）
+//! **并行维护**，两版会同时装在同一台机器上，于是**共用同一份账号库**成了
+//! 硬需求 —— 见 `config::store_dir` 的注释。
+//!
+//! 目录统一回 `.wb-switch`（0.8.x 一直在用、且此刻仍在被写入的那个），因此
+//! 迁移方向反过来：把 `.ai-gateway` 里**已升级过的那批数据**并回 `.wb-switch`。
+//!
+//! ## 为什么标记文件名换了（这是关键，别合并成同一个）
+//!
+//! 老标记 `.migrated-from-wb-switch` 写在**目标目录**（当年的 `.ai-gateway`）里。
+//! 已经跑过那次迁移的用户，其 `.ai-gateway` 里就有这个标记。若这次复用同名标记
+//! 且仍写在目标目录（现在的 `.wb-switch`），逻辑会完全错乱：`.wb-switch` 里通常
+//! 没有该标记（它不是当年那次迁移的目标），于是一次启动后标记被写进 `.wb-switch`
+//! ——但用户的真实数据其实在 `.ai-gateway`，判定却已是「迁移完成」。
+//!
+//! 因此用**新的标记名** `.migrated-from-ai-gateway` 写在新的目标目录
+//! （`.wb-switch`）里。它与老标记互相独立，两代迁移各自幂等，且对「已经跑过老
+//! 迁移的机器」仍会正确地再执行一次反向合并。
+//!
+//! ## 为什么是「复制 + 并集合并」而不是「移动」
+//!
+//! 与初版同样的理由，且在拆分场景下更重要：用户可能仍在用 0.8.x，也可能回退。
+//! 移动会掏空一侧，回退即数据丢失。并集合并（按 `(区域, uid)` 去重）保证两侧
+//! 的账号汇到一处，且**不删除**来源目录里的任何东西。
 //!
 //! ## 幂等性
 //!
-//! 以「目标目录里已存在账号库或网关配置」作为「已迁移」的判据：这样
-//! ① 重复启动不会反复拷贝；② 用户已经在新版里新建过数据时不会被旧数据覆盖。
+//! 以目标目录里的标记文件为「已迁移」判据：① 重复启动不会反复拷贝；
+//! ② 用户之后在某版里删掉的账号，不会被另一版的旧数据「复活」。
 //!
 //! ## 环境变量覆盖时不迁移
 //!
@@ -20,8 +42,8 @@ use std::path::{Path, PathBuf};
 
 use super::config;
 
-/// 旧数据目录名（更名前）。
-const LEGACY_DIR_NAME: &str = ".wb-switch";
+/// 旧数据目录名（更名后、拆分前那一代）。
+const LEGACY_DIR_NAME: &str = ".ai-gateway";
 
 /// 迁移结果摘要。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,11 +97,14 @@ impl MigrationOutcome {
 /// 的账号库（2 个账号），而「目标已有数据」正是跳过条件，于是旧目录里真正的
 /// 8 个账号从此再也搬不过来。
 ///
-/// 标记的另一个作用：迁移只在**第一次**启动时发生。之后用户在新版本里删除的账号
-/// 不会被下次启动从旧目录「复活」。
-const MARKER_FILE: &str = ".migrated-from-wb-switch";
+/// 标记的另一个作用：迁移只在**第一次**启动时发生。之后用户在某一版里删除的
+/// 账号，不会被另一版的数据「复活」。
+///
+/// **注意**：这个文件名与更名前那一代的 `.migrated-from-wb-switch` 刻意不同，
+/// 原因见文件头注释 —— 两者若同名会让「已跑过老迁移的机器」被误判为已完成。
+const MARKER_FILE: &str = ".migrated-from-ai-gateway";
 
-/// 旧数据目录路径。
+/// 旧数据目录路径（更名后、拆分前那一代：`~/.ai-gateway`）。
 pub fn legacy_store_dir() -> PathBuf {
     config::home_dir().join(LEGACY_DIR_NAME)
 }
@@ -103,6 +128,9 @@ fn write_marker(target: &Path, from: &Path) -> std::io::Result<()> {
 }
 
 /// 执行一次迁移（幂等，可重复调用）。
+///
+/// 方向：`~/.ai-gateway`（更名后那一代）→ `~/.wb-switch`（0.8.x 线一直在用、
+/// 且拆分后两版共用）。见文件头注释。
 pub fn migrate_store_dir() -> MigrationOutcome {
     // 环境变量覆盖 = 用户刻意隔离，不迁移
     if std::env::var_os("AI_GATEWAY_HOME").is_some_and(|v| !v.is_empty()) {
@@ -274,8 +302,9 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        let legacy = base.join(".wb-switch");
-        let target = base.join(".ai-gateway");
+        // 方向：legacy = 更名后那一代（.ai-gateway），target = 共用的 .wb-switch。
+        let legacy = base.join(".ai-gateway");
+        let target = base.join(".wb-switch");
         (base, legacy, target)
     }
 
@@ -515,9 +544,19 @@ mod tests {
     }
 
     #[test]
-    fn 旧目录名常量与更名前一致() {
-        assert_eq!(LEGACY_DIR_NAME, ".wb-switch");
-        assert!(legacy_store_dir().ends_with(".wb-switch"));
+    fn 旧目录名常量为更名后那一代() {
+        assert_eq!(LEGACY_DIR_NAME, ".ai-gateway");
+        assert!(legacy_store_dir().ends_with(".ai-gateway"));
+    }
+
+    /// 迁移标记文件名必须与更名前那一代**不同**。
+    ///
+    /// 同名会让「已跑过老迁移的机器」被误判为已完成：老标记当年写在
+    /// `.ai-gateway`，而现在的目标目录是 `.wb-switch`，两者不可混用。
+    #[test]
+    fn 迁移标记名与更名前那一代不冲突() {
+        assert_ne!(MARKER_FILE, ".migrated-from-wb-switch");
+        assert_eq!(MARKER_FILE, ".migrated-from-ai-gateway");
     }
 
     #[test]
