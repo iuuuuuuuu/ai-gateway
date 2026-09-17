@@ -1221,6 +1221,9 @@ mod tests {
             100,
         );
         let recs = v.get("records").and_then(Value::as_array).unwrap();
+        // 先钉住条数：首条快照只建立基线不产生记录，故这里恰好 1 条。
+        // 有条数断言时按下标取值才是确定的（同 ts 的顺序问题只影响多条时）。
+        assert_eq!(recs.len(), 1, "首个快照不该产生记录，应恰好 1 条");
         assert_eq!(
             recs[0].get("source").and_then(Value::as_str),
             Some(crate::modules::account_records::CREDIT_SOURCE_CONSUME)
@@ -1443,25 +1446,40 @@ mod tests {
                 .map(|r| (r.get("amount"), r.get("title")))
                 .collect::<Vec<_>>()
         );
-        // query_records 按 ts **降序**（最新在前）返回 —— 故 recs[0] 是后发生的发放。
-        assert_eq!(
-            recs[0].get("amount").and_then(Value::as_i64),
-            Some(380),
-            "最新一条应是发放 +380"
-        );
+
+        // **不要按下标断言顺序**：三条快照在同一毫秒内写完时 `ts` 相同，
+        // 而 query_records 用稳定排序按 ts 降序 —— 同 ts 会保留插入顺序，
+        // 于是 recs[0] 是 -350 而不是 +380。
+        //
+        // 这一点在 Linux CI 上暴露（本地 Windows 通过）：
+        // `real_grant_after_real_consumption_is_still_recorded` 报
+        // 「最新一条应是发放 +380，left: Some(-350)」。
+        // 顺序在同 ts 下不是被测语义（两条记录都写对了才是），
+        // 所以按**内容**定位，让断言与平台时钟精度无关。
+        let find = |amount: i64| {
+            recs.iter()
+                .find(|r| r.get("amount").and_then(Value::as_i64) == Some(amount))
+                .unwrap_or_else(|| panic!("找不到 amount={amount} 的记录，实际 {recs:?}"))
+        };
+        let consumed = find(-350);
         assert!(
-            recs[0]
+            consumed
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .contains("调用扣减"),
+            "消耗那条应是「调用扣减」，实际 {:?}",
+            consumed.get("title")
+        );
+        let granted = find(380);
+        assert!(
+            granted
                 .get("title")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .contains("额度发放"),
-            "最新一条应是额度发放，实际 {:?}",
-            recs[0].get("title")
-        );
-        assert_eq!(
-            recs[1].get("amount").and_then(Value::as_i64),
-            Some(-350),
-            "较早一条应是消耗 -350"
+            "发放那条应是「额度发放」，实际 {:?}",
+            granted.get("title")
         );
     }
 
