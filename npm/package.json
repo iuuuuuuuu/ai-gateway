@@ -1,6 +1,6 @@
 {
   "name": "ai-gateway",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "WorkBuddy 账号切换工具：本地 webui（浏览器操作）+ 桌面 App（安装后运行 ai-gateway）",
   "bin": {
     "ai-gateway": "bin/ai-gateway.js"
@@ -10,11 +10,11 @@
     "scripts"
   ],
   "optionalDependencies": {
-    "ai-gateway-darwin-arm64": "1.0.5",
-    "ai-gateway-darwin-x64": "1.0.5",
-    "ai-gateway-linux-arm64": "1.0.5",
-    "ai-gateway-linux-x64": "1.0.5",
-    "ai-gateway-win32-x64": "1.0.5"
+    "ai-gateway-darwin-arm64": "1.0.6",
+    "ai-gateway-darwin-x64": "1.0.6",
+    "ai-gateway-linux-arm64": "1.0.6",
+    "ai-gateway-linux-x64": "1.0.6",
+    "ai-gateway-win32-x64": "1.0.6"
   },
   "scripts": {
     "postinstall": "node scripts/install.js"
