@@ -1228,6 +1228,24 @@ function poolAccountName(acc: GatewayPoolAccount): string {
 }
 
 /**
+ * 界面上标识一个账号的名字：**备注 → 上游昵称 → uid 前缀**。
+ *
+ * 为什么不直接用昵称：上游昵称对国服账号常为空，回退到 uid 只剩一串随机串，
+ * 用户根本对不上「这是谁的号」；备注是用户自己在「账号管理」里填的标签
+ * （如「公司号」「备用」），正是为这个场景准备的，所以排在最前。
+ * 两者都缺时才退到 uid 前缀，保证任何账号都有一个稳定、可点选的显示名。
+ *
+ * `trim()` 顺带挡掉纯空白的备注，避免下拉出现一项看不见字的条目。
+ *
+ * 与 `poolAccountName` 的分工：那个用于**账号池**（名字来自网关进程的 /status，
+ * 昵称随凭证一起导出），而备注只存宿主侧 —— 要让那里的卡片也显示备注，
+ * 得先把备注导出给网关，属另一处改动。本函数用于**宿主侧**的下拉与用量列表。
+ */
+function accountLabel(account: { uid: string; nickname?: string; note?: string }): string {
+  return account.note?.trim() || account.nickname?.trim() || account.uid.slice(0, 8);
+}
+
+/**
  * 账号池「概览行 + 二级展开行」。
  *
  * 形态在本轮由所有者定为**表格**（草案 `dist/账号池表格-终稿v4.html` 已逐条确认）：
@@ -1627,7 +1645,10 @@ function ManualAccountOption({
   credit?: CreditExpiry;
   creditLoading?: boolean;
 }) {
-  const name = account.nickname || account.uid.slice(0, 8);
+  // 取名口径统一走 accountLabel（备注 → 昵称 → uid 前缀）：
+  // 此前这里是 `account.nickname || account.uid.slice(0, 8)`，于是**设了备注
+  // 的账号在勾选列表里依旧只显示一串 uid** —— 用户填的备注等于白填。
+  const name = accountLabel(account);
   const isIntl = meta?.regionKey === "intl";
   const resources = usableResources(credit);
   // 积分只认账号卡片那一份 `totalRemaining`（`POST /api/credits`）——
@@ -2793,7 +2814,9 @@ export default function GatewayPage() {
   const usageNickname = useMemo(() => {
     const map = new Map<string, string>();
     for (const account of status?.accounts ?? []) {
-      map.set(account.uid, account.nickname || account.uid.slice(0, 8));
+      // 与「指定账号」勾选列表共用同一取名口径（accountLabel）——
+      // 两处本是同一条回退链的两份手写副本，再各写一份迟早走偏。
+      map.set(account.uid, accountLabel(account));
     }
     return map;
   }, [status?.accounts]);

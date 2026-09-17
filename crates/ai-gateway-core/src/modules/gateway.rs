@@ -1956,6 +1956,32 @@ pub fn stop_gateway() -> Value {
     json!({ "stopped": stopped })
 }
 
+/// 「指定账号」下拉里的单个账号条目。
+///
+/// `note` 必须一并下发：界面上的账号名按 **备注 → 昵称 → uid 前缀** 取，
+/// 而备注是用户自己在「账号管理」里填的标签（如「公司号」），恰恰是分辨
+/// 「这是谁的号」的唯一可靠线索 —— 上游昵称对国服账号常为空，uid 又是一串随机串。
+/// 此前只下发 nickname，于是**设了备注的账号在下拉里依旧显示 uid 前缀**，
+/// 等于备注白设。
+///
+/// 缺 uid 的脏记录直接跳过：SelectItem 的 value 不能为空串，
+/// 否则 Radix 会抛错并让整页白屏。
+///
+/// 与 `account_meta` 的 needsRelogin 同口径：复用 `refresh::needs_relogin`，
+/// 不直接读原始标记（旧版本把网络抖动也写成了 needs_relogin）。
+/// 前端手动模式的「可选账号」过滤依赖这个字段，误报会让用户看到
+/// 「明明能用的号却选不了」。
+fn pinned_account_option(acc: &Value) -> Option<Value> {
+    let uid = account::get_str(acc, "uid")?;
+    Some(json!({
+        "uid": uid,
+        "nickname": account::get_str(acc, "nickname").unwrap_or_default(),
+        "note": account::get_str(acc, "note").unwrap_or_default(),
+        "expiresAt": acc.get("expiresAt").and_then(Value::as_i64).unwrap_or(0),
+        "needsRelogin": crate::modules::refresh::needs_relogin(acc),
+    }))
+}
+
 /// 网关综合状态：配置 + 运行态 + 健康 + 账号池详情。
 pub async fn gateway_status() -> Value {
     let cfg = load_gateway_config();
@@ -2025,19 +2051,7 @@ pub async fn gateway_status() -> Value {
         // 供前端下拉选择「指定账号」
         "accounts": account::load_accounts()
             .iter()
-            .filter_map(|a| {
-                let uid = account::get_str(a, "uid")?;
-                Some(json!({
-                    "uid": uid,
-                    "nickname": account::get_str(a, "nickname").unwrap_or_default(),
-                    "expiresAt": a.get("expiresAt").and_then(Value::as_i64).unwrap_or(0),
-                    // 与 account_meta 同口径：复用 refresh::needs_relogin，
-                    // 不直接读原始标记（旧版本把网络抖动也写成 needs_relogin）。
-                    // 前端手动模式的「可选账号」过滤依赖这个字段，
-                    // 误报会让用户看到「明明能用的号却选不了」。
-                    "needsRelogin": crate::modules::refresh::needs_relogin(a),
-                }))
-            })
+            .filter_map(pinned_account_option)
             .collect::<Vec<Value>>(),
         "exeSource": gateway_source(),
         "portAvailable": port_free(port),
@@ -2700,6 +2714,37 @@ pub async fn growth_task(action: &str, account_id: &str, task_code: &str) -> Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 「指定账号」下拉的条目必须把备注一并下发给界面。
+    //
+    // 界面的账号名按 备注 → 昵称 → uid 前缀 的顺序取。备注只存本地，网关状态里
+    // 不带上它，用户填的备注在选号时就完全不可见 —— 表现为「设了备注还是只显示
+    // 一串 uid」。这里锁住 note 字段与回退语义（缺备注时为空串，由界面回退）。
+    #[test]
+    fn pinned_account_option_carries_note_for_ui_label() {
+        let acc = json!({
+            "uid": "uid-abc",
+            "nickname": "",
+            "note": "公司号",
+            "expiresAt": 1_760_000_000,
+            "needs_relogin": false,
+        });
+        let opt = super::pinned_account_option(&acc).expect("有 uid 就应产出条目");
+        assert_eq!(opt["uid"], "uid-abc");
+        assert_eq!(opt["note"], "公司号");
+        assert_eq!(opt["nickname"], "");
+        assert_eq!(opt["expiresAt"], 1_760_000_000_i64);
+        assert_eq!(opt["needsRelogin"], false);
+
+        // 没填备注的老账号：条目照常产出，note 为空串（界面据此回退到昵称 / uid）。
+        let opt = super::pinned_account_option(&json!({"uid": "uid-1"})).expect("有 uid 就应产出条目");
+        assert_eq!(opt["note"], "");
+        assert_eq!(opt["nickname"], "");
+
+        // 无 uid 的脏记录不得进下拉：SelectItem 的 value 为空串会让 Radix 抛错，
+        // 进而整页白屏（实测过）。
+        assert!(super::pinned_account_option(&json!({"nickname": "无 uid"})).is_none());
+    }
 
     // 回归保护：局部更新（如启动后回写 last_status）不得覆盖用户设置。
     // 曾经的缺陷是 merge 以「默认值」为基准，导致 api_key / listen 被重置，

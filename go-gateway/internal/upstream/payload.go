@@ -86,6 +86,17 @@ func ensureSystemFirst(obj map[string]any) {
 // effortRank 档位从低到高。
 var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
 
+// KnownEffort 该档位名是否是网关认识的思考档（大小写与空白不敏感）。
+//
+// 导出它而不是让调用方各存一份档位表：档位表一旦分叉，就会出现
+// 「校验用一个、改写用另一个」——同一请求在两道关里被判成不同结果。
+// 服务端用它在选号前拒绝无法识别的档位名（那些名字此前被原样透传给上游，
+// 上游多半静默忽略，用户同样看不到原因）。
+func KnownEffort(name string) bool {
+	_, ok := effortRank[strings.TrimSpace(strings.ToLower(name))]
+	return ok
+}
+
 // normalizeReasoningEffort 按模型 supportedEfforts 降级 reasoning_effort（snake/camel 双字段兼容）。
 //   - 请求档位模型支持 → 原样透传
 //   - 请求档位不支持 → 改为 ≤请求档位的最高支持档（降级）

@@ -18,12 +18,88 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
+
+// unsupportedEffortError 请求的思考档位不被该模型支持。
+//
+// 为什么**直接拒绝**而不是像以前那样静默降级：
+// 静默降级（把 `max` 改写成 `high`）在客户端看来是「我明明调了 max，回答却很短」，
+// 而网关日志里只有一行 `reasoning_effort downgraded`——用户既不知道发生了什么，
+// 也不知道该改成哪个档，只能反复试。既然档位是客户端**显式**指定的，
+// 不支持时就该如实报错并**列出支持哪些档**，让它一次就能改对。
+//
+// 单独成型（而不是拼字符串）是为了让调用方识别它并回以 400 + 专用错误码。
+type unsupportedEffortError struct {
+	model     string   // 请求的模型（裸名）
+	requested string   // 客户端请求的档位
+	supported []string // 该模型支持的档位（非空；空则根本不会走到这里）
+	unknown   bool     // true = 请求的档位名本身无法识别（拼写错误之类）
+}
+
+func (e *unsupportedEffortError) Error() string {
+	got := e.requested
+	if got == "" {
+		got = "(未指定)"
+	}
+	// 必须**列出全部**支持档：只说「不支持 max」用户没法改对，只能挨个试。
+	// 这与 modelLockedError 的文案口径一致（列出全部允许项）。
+	list := strings.Join(e.supported, " / ")
+	if e.unknown {
+		return "模型 " + e.model + " 不认识思考档位 " + got + "；它支持的是 " + list +
+			"。请改为其中之一，或去掉 reasoning_effort 使用默认档。"
+	}
+	return "模型 " + e.model + " 不支持思考档位 " + got + "；它支持的是 " + list +
+		"。请改为其中之一，或去掉 reasoning_effort 使用默认档。"
+}
+
+// checkRequestedEffort 校验客户端显式指定的思考档位是否被该模型支持。
+//
+// 返回 nil 表示放行。放行情形（**都不算错**，不能拦）：
+//
+//	请求体没带 reasoning_effort      → 用上游默认档，无需校验
+//	档位值为空串 / 非字符串           → 交给上游处理（网关不替它判错）
+//	模型不在能力表里                  → 未知即不拦（宁可不拦也不错拦）
+//	该模型未声明 supportedEfforts     → 上游没说支持什么，网关无从校验
+//
+// 只有「模型**明确**声明了支持档、而请求的档不在其中」才拒绝 —— 这正是
+// 以前会被静默改写的那些请求。档位名无法识别（不在 effortRank 里）也算拒绝：
+// 那种拼写错误此前被原样透传给上游，上游多半静默忽略，用户同样看不到原因。
+//
+// 比较一律小写 + trim：客户端写法并不统一（`High` / ` high ` 都出现过）。
+func checkRequestedEffort(model string, requested any, supported []string) error {
+	if len(supported) == 0 {
+		// 上游未声明该模型的档位 → 无从校验，放行（与 /v1/models 不下发档位一致）。
+		return nil
+	}
+	raw, ok := requested.(string)
+	if !ok {
+		// 缺字段或类型不对：前者是「用默认档」，后者让上游去报类型错。
+		return nil
+	}
+	req := strings.TrimSpace(strings.ToLower(raw))
+	if req == "" {
+		return nil
+	}
+	for _, s := range supported {
+		if strings.TrimSpace(strings.ToLower(s)) == req {
+			return nil
+		}
+	}
+	return &unsupportedEffortError{
+		model:     model,
+		requested: strings.TrimSpace(raw),
+		supported: supported,
+		// 档位名本身不认识（拼写错误之类）与「认识但不被该模型支持」分开表达：
+		// 前者用户多半是打错了，后者是模型能力问题，文案要给不同的提示。
+		unknown: !upstream.KnownEffort(req),
+	}
+}
 
 // modelLockedError 请求的模型不在「限制使用的模型」白名单内。
 //
@@ -175,6 +251,19 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 		// 返回 nil 会 panic。UID 留空即可（本次没有选中任何账号）。
 		return &chatResult{Model: model}, http.StatusBadRequest,
 			&modelLockedError{requested: model, allowed: h.allowed}
+	}
+
+	// 思考档位校验：客户端**显式**指定了该模型不支持的档时直接拒绝。
+	//
+	// 为什么放在选号之前（与上面的白名单同一位置）：这是**请求侧**错误，
+	// 换账号、重试都无济于事。若等到出站才由 normalizeReasoningEffort 静默降级，
+	// 用户看到的是「调了 max 却答得很短」，而网关侧只有一行降级日志 ——
+	// 既不知道发生了什么，也不知道该改成哪个档。
+	//
+	// 放在这里还有一个实际好处：**不消耗账号**。此前每个被静默改写的请求
+	// 都照常占用一个账号名额并真的发出去了。
+	if err := checkRequestedEffort(model, effortOf(body), h.effortsForModel(model)); err != nil {
+		return &chatResult{Model: model}, http.StatusBadRequest, err
 	}
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
@@ -435,6 +524,80 @@ func modelOf(body []byte) string {
 	}
 	_ = json.Unmarshal(body, &probe)
 	return probe.Model
+}
+
+// effortOf 从请求体里取出客户端显式指定的思考档位（两个拼写都认）。
+//
+// 返回 `any` 而不是 `string`：要区分「没带这个字段」与「带了但值不是字符串」。
+// 前者是「用默认档」（放行），后者该由上游去报类型错，网关不替它判。
+// 用两个指针字段实现，避免 `map[string]any` 解一遍整个请求体
+//（请求体可能很大，含图片 base64）。
+func effortOf(body []byte) any {
+	var probe struct {
+		Snake *string `json:"reasoning_effort"`
+		Camel *string `json:"reasoningEffort"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return nil
+	}
+	// snake 优先：与 normalizeReasoningEffort 的取值顺序一致，
+	// 否则校验用一个、改写用另一个，会出现「校验过了却被改成别的档」。
+	if probe.Snake != nil {
+		return *probe.Snake
+	}
+	if probe.Camel != nil {
+		return *probe.Camel
+	}
+	return nil
+}
+
+// effortsForModel 返回该模型在**任一区域**声明的支持档位（空=未声明）。
+//
+// 为什么跨区域取并集：请求进到 forwardChat 时还没选号，不知道会用哪个区域的
+// 账号（选号在下面才发生）。若只按某一区域校验，会给另一区域的合法档位误报 400。
+// 取并集是**保守**方向：宁可漏拦，也不要把合法请求挡在门外 ——
+// 漏拦的后果是回到上游处理（与原行为一致），误拦的后果是用户完全无法使用。
+//
+// 只有「所有区域都没声明」时才返回空（= 无从校验，放行）。
+//
+// **只读缓存，绝不触发拉取**：本函数在每次 chat 请求的关键路径上，
+// 若在这里调 buildCapabilityIndex()，缓存未命中时它会真的去打上游
+//（fetchModelsForRegion → FetchModels），后果有两个且都严重：
+//   - 每次冷启动后的第一个请求都要先等一次模型拉取；
+//   - 测试里那次拉取会被计成一次「上游调用」，让「上下文超长只打上游 1 次」
+//     这类计数断言无故失败（实测踩到：TestContextTooLongDoesNotRotateAccounts
+//     从 1 次变成 2 次）。
+//
+// 缓存空 = 尚未探测过模型 → 无从校验 → 放行。这不是妥协：没有能力数据时
+// 本来就无法判断，放行等同于本特性引入之前的行为（那时一律透传给上游）。
+func (h *Handler) effortsForModel(model string) []string {
+	if model == "" {
+		return nil
+	}
+	regionModelCache.Lock()
+	defer regionModelCache.Unlock()
+	var out []string
+	seen := map[string]bool{}
+	for _, region := range []auth.Region{auth.RegionCN, auth.RegionIntl} {
+		rm := regionModelCache.byRegion[region]
+		if rm == nil {
+			continue
+		}
+		for _, mi := range rm.infos {
+			if mi.ID != model {
+				continue
+			}
+			for _, e := range mi.Efforts {
+				key := strings.TrimSpace(strings.ToLower(e))
+				if key == "" || seen[key] {
+					continue
+				}
+				seen[key] = true
+				out = append(out, e)
+			}
+		}
+	}
+	return out
 }
 
 // rewriteModel 把请求体里的 model 字段改成 bare。

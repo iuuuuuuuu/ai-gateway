@@ -785,6 +785,12 @@ func errorCodeFor(err error) string {
 	if errors.As(err, &locked) {
 		return "model_not_allowed"
 	}
+	// 思考档位不被该模型支持：同样是**请求侧**错误（改请求即可，重试无用），
+	// 因此给独立错误码，而不是让它落进 no_healthy_account 被当成账号故障。
+	var effort *unsupportedEffortError
+	if errors.As(err, &effort) {
+		return "unsupported_reasoning_effort"
+	}
 	// 带图片请求缺区域账号：不是「账号池暂时不可用、稍后重试」，而是
 	// 「你的池子缺一类账号」。用独立的码让客户端/用户能区分，而不是
 	// 混进 no_healthy_account 里被当成一次普通的负载抖动。

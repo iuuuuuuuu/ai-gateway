@@ -27,6 +27,7 @@ package server
 // 会把「能读图」谎报成事实，客户端据此发出必然被静默降级的请求。
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -198,6 +199,17 @@ type regionCapability struct {
 	// 请求判成「只能去国际版」，正好推向读不到图的那一侧）。
 	// 静态表只该用来「提供信息」，不该用来「否定存在」。
 	FromStatic bool
+	// Efforts 该区域上游声明的**允许思考档**（reasoning.supportedEfforts）。
+	//
+	// 空 = 未声明（含固定档模型、静态兜底表）→ /v1/models 不下发任何档位字段。
+	// 与 SupportsImages 同一套「宁可不写也不编造」的语义：编造的档位会被客户端
+	// 拿去发请求，而它要么被上游降级、要么被忽略，用户看到的是「调了没生效」。
+	Efforts []string
+	// DefaultEffort 该区域上游声明的默认思考档（reasoning.effort，空=未声明）。
+	//
+	// 与 Efforts 正交：Efforts 答「允许哪些」，本字段答「不指定时用哪档」。
+	// 上游未保证默认档一定在 Efforts 里，故两者分别保存、分别下发。
+	DefaultEffort string
 }
 
 // capabilityIndex 按区域索引的模型能力表。
@@ -251,6 +263,10 @@ func (h *Handler) buildCapabilityIndex() *capabilityIndex {
 				// 判断「另一个区域没有该模型」时只看真值，静态表不算数
 				//（表会过期，曾因它漏了 glm-5.3 而把图片请求推向读不到图的一侧）。
 				FromStatic: !dynamic,
+				// 思考档：动态路径透传上游声明；静态兜底表**不编造**档位
+				//（手抄表里没有 reasoning 信息，编一个会让客户端调了没生效）。
+				Efforts:       mi.Efforts,
+				DefaultEffort: mi.DefaultEffort,
 			}
 		}
 	}
@@ -445,8 +461,18 @@ func (idx *capabilityIndex) capabilityFieldsFor(id string) map[string]any {
 	}
 
 	fields := modelCapabilityFields(cap.SupportsImages)
-	if fields == nil {
+	// 思考档与图片能力**正交**：图片能力未声明（nil）时仍可能有思考档，
+	// 因此不能因为 `fields == nil` 就跳过它，否则「未声明图片能力的模型
+	// 一律看不到档位」—— 而这两件事在上游是各自独立的字段。
+	reasoning := modelReasoningFields(cap.Efforts, cap.DefaultEffort)
+	if fields == nil && reasoning == nil {
 		return nil
+	}
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	for k, v := range reasoning {
+		fields[k] = v
 	}
 	if len(supported) == 1 {
 		// 只在**真值确认**单区可用时附带说明。字段名用 snake_case 与本响应里
@@ -529,4 +555,53 @@ func modelCapabilityFields(supportsImages *bool) map[string]any {
 			"output": []string{"text"},
 		},
 	}
+}
+
+// modelReasoningFields 生成思考等级（reasoning effort）字段。
+//
+// 与 modelCapabilityFields 是**正交**的两个维度（一个答「能不能收图」，
+// 一个答「思考用哪档」），因此独立成函数、独立调用，不合并成一个 map。
+//
+// efforts 为空 = 上游未声明（含固定档模型、静态兜底表）→ 返回 nil，不下发任何键。
+// 这与图片能力的三态语义一致：**宁可不写，也不要凭空编造档位** —— 客户端会拿着
+// 编造的档位去发请求，而该档位要么被上游降级、要么被忽略，用户看到的是
+// 「我明明调了 max 却没生效」这类无从排查的现象。
+//
+// 一次下发**多种拼写**的理由与图片能力相同：各客户端读的字段名不统一，且没有
+// 统一约定。所有已知解析器都只取自己认识的键，多余键不会报错。
+//
+//	OpenAI 风格     → supported_efforts / reasoning_efforts
+//	OpenRouter 风格 → reasoning.supported_efforts / reasoning.default_effort
+//	通用容错        → supportedEfforts / reasoningEfforts / defaultEffort
+//
+// 默认档只在 defaultEffort 非空时下发。**不要**用 efforts[0] 之类的猜测填充：
+// 上游没声明默认档时，网关也不知道，编一个反而误导。
+func modelReasoningFields(efforts []string, defaultEffort string) map[string]any {
+	if len(efforts) == 0 {
+		return nil
+	}
+	// 复制一份：efforts 来自按区域的模型缓存（regionCapability.Efforts），
+	// 是共享切片。直接塞进响应 map 会让调用方对返回值的任何 in-place 修改
+	// 污染缓存 —— 下次请求就会带着被改过的档位列表。
+	list := make([]string, len(efforts))
+	copy(list, efforts)
+
+	nested := map[string]any{"supported_efforts": list}
+	out := map[string]any{
+		// 主拼写：OpenAI / 多数客户端。
+		"supported_efforts": list,
+		// 容错拼写。
+		"supportedEfforts":  list,
+		"reasoning_efforts": list,
+		"reasoningEfforts":  list,
+		// OpenRouter 风格：嵌套在 reasoning 对象下。
+		"reasoning": nested,
+	}
+	if d := strings.TrimSpace(defaultEffort); d != "" {
+		nested["default_effort"] = d
+		out["default_effort"] = d
+		out["defaultEffort"] = d
+		out["default_reasoning_effort"] = d
+	}
+	return out
 }

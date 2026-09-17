@@ -851,6 +851,14 @@ export interface GatewayPool {
 export interface GatewayStatusAccount {
   uid: string;
   nickname?: string;
+  /**
+   * 用户自己在「账号管理」里填的备注。
+   *
+   * 界面取名口径是 **备注 → 昵称 → uid 前缀**（见 `accountLabel`）：
+   * 上游昵称对国服账号常为空，uid 又是一串随机串，备注才是分辨
+   * 「这是谁的号」的唯一可靠线索。缺省 = 没填（回退到昵称）。
+   */
+  note?: string;
   expiresAt?: number;
   needsRelogin?: boolean;
   /** 用户手动禁用：勾选列表里不再展示（勾了也不会进池）。 */
