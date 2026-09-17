@@ -21,11 +21,10 @@ set -e
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
-OWNER="${RELEASE_OWNER:-momo0410}"
-# 仓库名必须与应用显示名所在的仓库一致：显示名是 AI Gateway，GitHub 仓库
-# 自 2026-09-16 起是独立的 momo0410/ai-gateway（老仓库
-# workbuddy-switch-gateway 回退到 v0.8.5，只维护 0.8.x 线）。写错会让自动
-# 更新 404，或把 1.x 用户降级回 0.8.x。
+OWNER="${RELEASE_OWNER:-iuuuuuuuu}"
+# **本仓库是 fork**，发布目标必须是本 fork（`RELEASE_OWNER` 可覆盖）。
+# 指向上游会把用户更新成上游版本、本 fork 的功能全部消失；releases/latest
+# 在每个 fork 上是不同的指针，写错不是 404 就是切错版本。
 REPO="${RELEASE_REPO:-ai-gateway}"
 SETUP_NAME="ai-gateway-windows-x86_64-setup.exe"
 WORK_DIR="$REPO_ROOT/.release-staging"

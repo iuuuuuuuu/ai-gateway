@@ -19,15 +19,20 @@ use crate::modules::config::{
 
 /// 应用当前版本（来自 Cargo.toml package.version）。
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-/// 本整合版仓库所有者（与上游 changexbc/workbuddy-switch 区分开）。
-pub const GITHUB_OWNER: &str = "momo0410";
-/// 仓库名必须与 git 远端一致。应用显示名已改为 AI Gateway，GitHub 仓库
-/// 也已在 2026-09-16 拆分为独立的 momo0410/ai-gateway（老仓库
-/// workbuddy-switch-gateway 回退到 v0.8.5，只维护 0.8.x 线）。
+/// **本 fork 的**仓库所有者 —— 更新源指向这里，而不是上游。
 ///
-/// 两仓库的 `releases/latest` 是**两个不同的指针**：写错会让检查更新与
-/// 自动更新全部 404（v1.0.0 就踩过这个坑，见下方单测），或者把 1.x 用户
-/// 降级回老仓库的 0.8.x。
+/// 为什么必须改成自己：本 fork 带了大量上游没有的功能与修复。若更新源仍指向上游，
+/// 用户点「检查更新」会被更新成上游版本，**这些功能全部消失**（且是不可逆的降级）。
+/// 已装的用户因此只会收到本 fork 的更新。
+///
+/// 上游是 `momo0410/ai-gateway`（其前身 `momo0410/workbuddy-switch-gateway` 是
+/// 0.8.x 线）。归属说明保留在 LICENSE / NOTICE / README，不在此处。
+pub const GITHUB_OWNER: &str = "iuuuuuuuu";
+/// 仓库名必须与 git 远端一致。应用显示名已改为 AI Gateway。
+///
+/// `releases/latest` 在**每个 fork 上都是不同的指针**：写错会让检查更新与
+/// 自动更新全部 404（上游 v1.0.0 就踩过这个坑，见下方单测），
+/// 或者把用户切到别人的版本上去。
 pub const GITHUB_REPO: &str = "ai-gateway";
 
 /// 成功结果缓存有效期（6 小时）。自动轮询（30 分钟）命中缓存，不发网络请求；

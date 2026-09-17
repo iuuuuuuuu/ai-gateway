@@ -1,4 +1,6 @@
-export const GITHUB_OWNER = "momo0410";
+// 更新源必须是**本 fork**：写错会让自动更新静默 404，或把用户切到别人的版本上去。
+// 后端 `update.rs` 的 GITHUB_OWNER/GITHUB_REPO 必须与此一致 —— 有单测钉住这一点。
+export const GITHUB_OWNER = "iuuuuuuuu";
 export const GITHUB_REPO = "ai-gateway";
 export const GITHUB_REPOSITORY_URL = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}`;
 export const GITHUB_RELEASE_URL = `${GITHUB_REPOSITORY_URL}/releases/latest`;
