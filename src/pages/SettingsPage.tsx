@@ -6,11 +6,18 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
+import {
+  DEFAULT_PROXY_SCOPE,
+  PROXY_SCOPE_FIELDS,
+  proxyScopeOf,
+  proxyScopeSummary,
+} from "@/lib/proxy-scope";
 import { getThemePreference, setThemePreference, type ThemePreference } from "@/lib/theme";
 import type {
   AutoRotateConfig,
@@ -20,6 +27,7 @@ import type {
   GatewayTaskName,
   GatewayTaskRuntime,
   GithubConfig,
+  ProxyScope,
   RotateLog,
   RotateStatus,
   UpdateInfo,
@@ -1397,15 +1405,31 @@ function useAuthFile(): string | undefined {
   return useAccountsStore((s) => s.status?.authFile);
 }
 
-/** 自动更新：检查公开 GitHub Releases 源 + 安装签名更新。 */
-function UpdateCard() {
-  const version = useAccountsStore((s) => s.status?.version);
-  const [info, setInfo] = useState<UpdateInfo | null>(null);
-  const [checking, setChecking] = useState(false);
-  const [installOpen, setInstallOpen] = useState(false);
+/**
+ * 网络代理：**独立成一个配置区**（所有者诉求原话「代理单独开一个配置，
+ * 三个选项 Github 国内版 国际版 加上描述」）。
+ *
+ * 为什么从「自动更新」卡片里搬出来，而不是原地加三个勾选框：
+ *
+ *  1. 代理的作用范围本轮已经**超出更新**（国际版/国服账号的上游请求都归它管），
+ *     继续挂在「自动更新」下会让人以为它只影响更新 —— 那正是上一轮文案反复
+ *     改措辞想解决的误解。
+ *  2. 「自动更新」卡片在 **webui（浏览器打开宿主页面）下整块不渲染**
+ *     （见页面底部的 `api.isWebui() ? null : <UpdateCard/>`），因为浏览器里
+ *     不能安装桌面更新包。而代理配置是**纯宿主配置**，与能不能装更新无关 ——
+ *     留在那张卡里等于「用浏览器打开时根本配不了代理」。
+ *
+ * 三格开关的语义差别很大，因此每格都必须带**描述**（所有者本次明确要求
+ * 「加上描述」）：只说「国内版」用户无从判断该不该开。
+ */
+function NetworkProxyCard() {
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   const [githubConfig, setGithubConfig] = useState<GithubConfig>({});
   const [proxyUrl, setProxyUrl] = useState("");
+  // 三个开关的初值是**默认值**而不是全 false：老配置里没有 proxy_scope 字段，
+  // 用全 false 初始化会让界面在加载完成前把「国际版」显示成关闭（而后端实际
+  // 是开着的）—— 一帧的假象也足以让人误判成「我的开关被重置了」。
+  const [proxyScope, setProxyScope] = useState<ProxyScope>(DEFAULT_PROXY_SCOPE);
   const [proxySaving, setProxySaving] = useState(false);
 
   useEffect(() => {
@@ -1416,6 +1440,8 @@ function UpdateCard() {
         if (cancelled) return;
         setGithubConfig(config);
         setProxyUrl(config.proxy ?? "");
+        // 逐键兜底：老配置没有 proxy_scope，必须回落默认值（见 proxyScopeOf）。
+        setProxyScope(proxyScopeOf(config));
       })
       .catch((e) => {
         if (!cancelled) setMsg({ type: "err", text: api.asError(e) });
@@ -1424,22 +1450,6 @@ function UpdateCard() {
       cancelled = true;
     };
   }, []);
-
-  async function check() {
-    setChecking(true);
-    setMsg(null);
-    try {
-      const r = await api.checkUpdate(proxyUrl, true);
-      setInfo(r);
-      if (!r.ok) {
-        setMsg({ type: "err", text: r.message || r.error || "检查失败" });
-      }
-    } catch (e) {
-      setMsg({ type: "err", text: api.asError(e) });
-    } finally {
-      setChecking(false);
-    }
-  }
 
   async function saveProxy() {
     const value = proxyUrl.trim();
@@ -1458,19 +1468,159 @@ function UpdateCard() {
     setProxySaving(true);
     setMsg(null);
     try {
-      const saved = await api.saveGithubConfig({ ...githubConfig, proxy: value });
+      // proxy_scope **必须一起提交**：后端保存接口写的是整份 github_config.json，
+      // 漏传这个字段会让它按默认值补齐 —— 表现成「用户关掉国际版开关、一保存
+      // 地址又自己开了」，而界面上看不出是谁改的。
+      const saved = await api.saveGithubConfig({
+        ...githubConfig,
+        proxy: value,
+        proxy_scope: proxyScope,
+      });
       setGithubConfig(saved);
       setProxyUrl(saved.proxy ?? "");
+      // 以**回读值**为准而不是提交值：后端可能有归一化（例如 trim），
+      // 界面必须显示真正落盘的那一份，否则用户看到的是自己以为的结果。
+      setProxyScope(proxyScopeOf(saved));
       setMsg({
         type: "ok",
+        // 提示按**实际生效的开关**生成，而不是写死一句：用户关掉某一格之后
+        // 仍看到「国际版会使用它」会以为开关没生效 —— 那是界面在撒谎。
         text: value
-          ? "代理已保存（更新检查、安装包下载，以及「仅国际版账号」的上游请求会使用它）"
-          : "已关闭代理（更新检查与网关请求将直连）",
+          ? proxyScopeSummary(proxyScopeOf(saved))
+          : "未填写代理地址，全部直连（开关状态已保留）",
       });
     } catch (e) {
       setMsg({ type: "err", text: api.asError(e) });
     } finally {
       setProxySaving(false);
+    }
+  }
+
+  return (
+    <SettingsGroup id="settings-network-proxy" title="网络代理">
+      <CardContent className="space-y-0 p-0">
+        <SettingsFieldRow
+          label="网络代理地址"
+          // 该代理的适用范围在此前几轮里反复收窄过（先只服务 GitHub 更新、
+          // 后来扩到国际版上游、再收窄成「仅国际版」）。本轮起范围不再写死在
+          // 文案里，而是由下方**三个独立开关**控制 —— 因此这段描述只说
+          // 「填一次、范围见下面开关」。复述出来的范围一旦与开关状态不符，
+          // 就是界面在撒谎（而这正是前几轮反复改措辞的原因）。
+          description="地址只填一次，下面的开关决定哪些范围使用它。留空表示全部直连。"
+          htmlFor="update-proxy"
+          className="bg-muted/25"
+          operational
+        >
+          <Input
+            id="update-proxy"
+            className="w-full sm:w-80"
+            value={proxyUrl}
+            onChange={(event) => setProxyUrl(event.target.value)}
+            placeholder="例如 http://127.0.0.1:7897"
+            spellCheck={false}
+            autoComplete="off"
+          />
+        </SettingsFieldRow>
+
+        {/*
+          三个独立开关（Github / 国内版 / 国际版）。
+
+          为什么用 Checkbox 而不是 Switch：所有者在本仓库明确要求过「都改为勾选
+          而不是手写」（见 AGENTS.md 的 UI Component Policy），且三行并列时勾选框
+          比拨动开关更容易一眼看出「哪些被选中」。
+        */}
+        <div className="border-b border-border/60 bg-muted/25">
+          {PROXY_SCOPE_FIELDS.map((field) => (
+            <label
+              key={field.key}
+              htmlFor={field.id}
+              data-slot="proxy-scope-row"
+              data-scope-key={field.key}
+              className="flex cursor-pointer items-start gap-2.5 border-b border-border/40 px-4 py-2.5 last:border-b-0 sm:px-5"
+            >
+              <Checkbox
+                id={field.id}
+                className="mt-0.5"
+                checked={proxyScope[field.key]}
+                onCheckedChange={(checked) =>
+                  // checked 可能是 "indeterminate"（Radix 的三态）：一律按
+                  // 「非 true 即 false」处理，避免把中间态写进配置。
+                  setProxyScope((prev) => ({ ...prev, [field.key]: checked === true }))
+                }
+                aria-label={`代理范围：${field.label}`}
+              />
+              <span className="min-w-0 flex-1">
+                <span className="block text-[13px] font-medium leading-4">{field.label}</span>
+                <span className="mt-0.5 block text-xs leading-4 text-muted-foreground/75">
+                  {field.description}
+                </span>
+              </span>
+            </label>
+          ))}
+        </div>
+
+        <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3 sm:px-5">
+          <DemoAction><Button size="sm" variant="outline" onClick={() => void saveProxy()} disabled={proxySaving}>
+            {proxySaving ? <Loader2 className="animate-spin" /> : <Save />}
+            保存代理
+          </Button></DemoAction>
+        </div>
+
+        {msg && (
+          <Alert
+            variant={msg.type === "err" ? "destructive" : "default"}
+            className="!w-auto mx-4 mb-4 sm:mx-5"
+          >
+            <AlertDescription>{msg.text}</AlertDescription>
+          </Alert>
+        )}
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/** 自动更新：检查公开 GitHub Releases 源 + 安装签名更新。 */
+function UpdateCard() {
+  const version = useAccountsStore((s) => s.status?.version);
+  const [info, setInfo] = useState<UpdateInfo | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [installOpen, setInstallOpen] = useState(false);
+  const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  // 「检查更新」按钮用的代理地址。**只读**：编辑入口在「网络代理」卡片里
+  //（那块配置在 webui 下也要能改，而本卡片在 webui 下整块不渲染）。
+  const [proxyUrl, setProxyUrl] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .getGithubConfig()
+      .then((config) => {
+        if (cancelled) return;
+        setProxyUrl(config.proxy ?? "");
+      })
+      .catch((e) => {
+        if (!cancelled) setMsg({ type: "err", text: api.asError(e) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function check() {
+    setChecking(true);
+    setMsg(null);
+    try {
+      // 传 null 而不是空串，让后端按「用户没填」处理；是否真的走代理由
+      // Github 那个开关在后端决定（关掉时手动检查也必须直连）。
+      const r = await api.checkUpdate(proxyUrl.trim() || undefined, true);
+      setInfo(r);
+      if (!r.ok) {
+        setMsg({ type: "err", text: r.message || r.error || "检查失败" });
+      }
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setChecking(false);
     }
   }
 
@@ -1499,40 +1649,12 @@ function UpdateCard() {
           </Button></DemoAction>
         </div>
 
-        <SettingsFieldRow
-          label="网络代理地址"
-          // 该代理的适用范围在「网关支持出站代理」之后扩大了：
-          // 以前只服务 GitHub 更新，现在网关与账号相关的上游请求也复用它
-          // （国际版 workbuddy.ai 在国内直连不通，必须走代理）。
-          // 文案必须说实话，否则用户不会想到「国际版账号报错要来这里配」。
-          //
-          // 再收窄（2026-09-17，所有者诉求「代理只对国际版生效，别让国内也走
-          // 代理流量」）：现在**只有国际版账号**的上游请求经此代理，国服
-          // （copilot.tencent.com / codebuddy.cn）一律直连。文案必须写明这一点 ——
-          // 说成「网关与账号请求均会使用」会让用户以为国服流量也在绕道，
-          // 从而不敢填、或者填了之后怀疑国服变慢是它造成的。
-          description="GitHub 更新检查与安装包下载；以及网关里「仅国际版账号」的上游请求（workbuddy.ai 在国内直连不通时尤其需要）。国服账号不受影响，始终直连。留空表示全部直连。"
-          htmlFor="update-proxy"
-          className="bg-muted/25"
-          operational
-        >
-          <Input
-            id="update-proxy"
-            className="w-full sm:w-80"
-            value={proxyUrl}
-            onChange={(event) => setProxyUrl(event.target.value)}
-            placeholder="例如 http://127.0.0.1:7897"
-            spellCheck={false}
-            autoComplete="off"
-          />
-        </SettingsFieldRow>
-
-        <div className="flex flex-wrap gap-2 border-b border-border/60 bg-muted/25 px-4 py-3 sm:px-5">
-          <DemoAction><Button size="sm" variant="outline" onClick={() => void saveProxy()} disabled={proxySaving}>
-            {proxySaving ? <Loader2 className="animate-spin" /> : <Save />}
-            保存代理
-          </Button></DemoAction>
-        </div>
+        {/*
+          代理地址与三个开关**已搬到「网络代理」卡片**（见 NetworkProxyCard）。
+          留在这里的重复控件会让两处状态各存一份 —— 在其中一处改完保存，
+          另一处仍显示旧值，用户无法判断哪个是真的。
+          本卡片只保留「用当前配置的代理检查一次更新」这个动作。
+        */}
 
         <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3 sm:px-5">
           <DemoAction><Button size="sm" variant="outline" onClick={check} disabled={checking}>
@@ -2200,6 +2322,7 @@ export default function SettingsPage() {
       <div className="min-w-0 space-y-12">
         <AppearanceCard />
         <AppEnvCard />
+        <NetworkProxyCard />
         <ProxyCard />
         <ScheduledTaskCard />
         <RecordRetentionCard />

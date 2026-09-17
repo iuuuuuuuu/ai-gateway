@@ -484,10 +484,43 @@ export interface CodeBuddyCliInstallResult {
   error?: string;
 }
 
+/**
+ * 代理的**适用范围**（三个独立开关）。
+ *
+ * 为什么把「一个代理地址」拆成三个开关：同一个地址对不同用途的收益完全不同 ——
+ * GitHub（检查更新 / 下载安装包）在国内基本必须走代理；国际版上游
+ *（workbuddy.ai）国内直连实测 wsarecv 超时，也需要；而国服上游
+ *（codebuddy.cn / copilot.tencent.com）直连即通，绕进代理只会多一跳延迟、
+ * 多一个故障面（代理一挂，本来好好的国服账号跟着不可用）。
+ *
+ * 地址仍然只填一次（用户不该填三遍），三个开关只决定「哪些用途使用它」。
+ */
+export interface ProxyScope {
+  /** 检查更新与下载安装包时是否使用代理。默认开。 */
+  github: boolean;
+  /**
+   * 国服账号（*.workbuddy.cn / *.codebuddy.cn / copilot.tencent.com）的上游请求是否使用代理。
+   *
+   * 默认关：国内直连通常更快；且关了之后是**真直连**（连 HTTPS_PROXY 也不用）。
+   */
+  cn: boolean;
+  /**
+   * 国际版账号（*.workbuddy.ai / *.codebuddy.ai）的上游请求是否使用代理。
+   *
+   * 默认开：国内直连实测不稳定（wsarecv 超时），不走代理基本用不了。
+   */
+  intl: boolean;
+}
+
 export interface GithubConfig {
   owner?: string;
   repo?: string;
   proxy?: string;
+  /**
+   * 三个开关。**允许缺失**：老配置 / 老后端里没有这个字段，
+   * 读取方必须用 `proxyScopeOf()` 兜底成默认值，不能自己当 false 处理。
+   */
+  proxy_scope?: Partial<ProxyScope> | null;
 }
 
 export interface UpdateInfo {
@@ -766,6 +799,20 @@ export interface GatewayPoolAccount {
   success_count?: number;
   err_total?: number;
   in_flight?: number;
+  /**
+   * 最近一次成功调用的时刻（ISO 8601；Go 侧 `pool.Status.LastSuccessTime`）。
+   *
+   * 与 `success_count` 的分工：计数回答「一共成了多少次」，本字段回答「上一次成
+   * 是什么时候」—— 后者才能区分「一直在稳定成功」与「早就不再被选中了」
+   * （计数是个只增不减的累计值，看不出停滞）。
+   */
+  last_success?: string;
+  /** 最近一次失败的时刻（ISO 8601）；供「最近成功」旁证用。 */
+  last_err?: string;
+  /** 连续失败计数（熔断器输入；达到阈值即熔断）。 */
+  breaker_fails?: number;
+  /** 熔断截止时刻（ISO 8601）；非空且未过期 = 正在熔断期。 */
+  breaker_until?: string;
   /** 「最近到期积分」的到期时刻（Unix 秒）；缺省 = 未知。 */
   soonest_expire_at?: number;
   /** 到期日（YYYY-MM-DD），即选号分层档位键；同一天的账号同级。 */

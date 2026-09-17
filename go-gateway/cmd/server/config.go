@@ -166,7 +166,31 @@ type Config struct {
 	//
 	// 注意 Go 的 http.ProxyFromEnvironment **只读环境变量**、不读 Windows 注册表，
 	// 所以「浏览器能走系统代理」不代表网关也能 —— 必须显式配置。
+	//
+	// 地址本身与区域无关：**是否真的使用它**由下面的 ProxyScope 按区域决定。
 	Proxy string `json:"proxy"`
+
+	// ProxyScope 代理的适用范围（三个独立开关中的**网关侧两个**）。
+	//
+	// 为什么把「一个地址」拆成按区域的两个开关：同一个代理对两个区域的收益完全
+	// 相反 —— 国际版（workbuddy.ai）国内直连实测 wsarecv 超时，必须走代理；
+	// 国服（copilot.tencent.com / codebuddy.cn）直连即通，绕进代理只会多一跳延迟、
+	// 多一个故障面（代理一挂，本来好好的国服账号跟着不可用）。
+	//
+	// 为什么没有 github：检查更新 / 下载安装包是**宿主**的活，网关根本不发往
+	// github.com 的请求。多一个永远不会被读的键只会误导排查。
+	//
+	// 缺省值见 Default()：cn=false / intl=true，**不是**「全开」。
+	// 理由：本次改动之前国服走的是 ProxyFromEnvironment（**不吃**显式代理），
+	// 只有国际版吃。若把缺省当成「全开」，所有既有用户升级后国服会被**新绕进**
+	// 显式代理 —— 那正是上一轮明确要消除的行为。缺省取「国际版开、国服关」
+	// 才能保证升级前后逐字一致（详见 upstream.SetProxyScope 的注释）。
+	ProxyScope struct {
+		// CN 国服账号的出站请求是否使用该代理（缺省 false = 直连）。
+		CN bool `json:"cn"`
+		// Intl 国际版账号的出站请求是否使用该代理（缺省 true）。
+		Intl bool `json:"intl"`
+	} `json:"proxy_scope"`
 
 	SessionSticky struct {
 		Enabled    bool   `json:"enabled"`     // 默认 true
@@ -319,6 +343,15 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	// 代理适用范围缺省值：**国际版开、国服关**（逐字保持改动前的行为）。
+	//
+	// 这里**刻意不是**「全 true」。Load 先取 Default() 再 json.Unmarshal 覆盖，
+	// 所以老配置（没有 proxy_scope 键）保留的就是这两个值 —— 而改动前国服走的
+	// 是 ProxyFromEnvironment、并不吃显式代理。若缺省成 true，升级后所有既有
+	// 用户的国服流量会被新绕进代理（与「别让国内也走代理流量」的要求相反）。
+	// 同理不能缺省成 false：那会让国际版代理静默失效，国内直连直接超时。
+	c.ProxyScope.CN = false
+	c.ProxyScope.Intl = true
 	return c
 }
 

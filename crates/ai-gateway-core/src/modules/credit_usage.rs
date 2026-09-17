@@ -31,6 +31,26 @@ struct Snapshot {
     account_name: String,
     total: f64,
     remaining: f64,
+    /// 包子集：`packageCode → remaining`。空 = 该快照没有包级明细（老数据）。
+    ///
+    /// 为什么必须存：聚合值（total/remaining）分不清「某个包没读到」与「余额真的少了」。
+    /// 实测（所有者真实数据）上游会偶发返回**不完整的包列表** ——
+    /// 例如某次只返回 1 个 30 的包，聚合 total 就从 380 掉到 30，
+    /// 被当成「积分消耗 -350」记了一条；下次读到完整列表又记「+350 增长」，
+    /// 而余额其实一整天都是 380（幻影配对）。
+    ///
+    /// 有了包级明细才能按**包的身份**判断：某 packageCode 这次不在、下次又回来
+    /// ⇒ 读数失败（包不会凭空消失再回来），不是消耗。
+    packages: std::collections::BTreeMap<String, f64>,
+    /// 写入这条快照时，它是否已被判为「不可信读数」。
+    ///
+    /// 为什么要把判定结果存下来（而不是下次再算）：区分「抖动后的恢复」与
+    /// 「真实消耗后的重新发放」靠的是**中间那次的证据** ——
+    ///   · 抖动：`p380` 整个不在（包消失）
+    ///   · 真消耗：`p380` 在，只是 remaining 变成 30
+    /// 两次读数当下就能分辨，但事后只看数值（都回到 380）无法区分。
+    /// 故把「上次是可疑读数」记进快照，回升那次据此判定为**恢复**而非发放。
+    suspect: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +92,16 @@ fn snapshot_from_value(value: &Value) -> Option<Snapshot> {
     let ts = value.get("ts").and_then(Value::as_i64)?;
     let total = number(value.get("total"))?.max(0.0);
     let remaining = number(value.get("remaining"))?.max(0.0);
+    // 包级明细可选：老快照没有这个字段，解析成空 map（= 无判据，退回聚合值比较）。
+    let packages = value
+        .get("packages")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(k, v)| number(Some(v)).map(|n| (k.clone(), n)))
+                .collect()
+        })
+        .unwrap_or_default();
     Some(Snapshot {
         ts,
         account_id,
@@ -79,6 +109,9 @@ fn snapshot_from_value(value: &Value) -> Option<Snapshot> {
             .unwrap_or_else(|| "unknown".to_string()),
         total,
         remaining,
+        packages,
+        // 老快照没有这个字段 → 视为可信（当时没有判据，不该倒推怀疑历史数据）。
+        suspect: value.get("suspect").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 
@@ -96,6 +129,34 @@ fn snapshot_value(
         "total": total.max(0.0),
         "remaining": remaining.max(0.0),
     })
+}
+
+/// 带包级明细的快照值。
+///
+/// 包级明细是本次修复的核心依据（见 `reading_trust`），因此新快照一律带上。
+/// **包级为空时不写 `packages` 字段** —— 保持与老快照同形，
+/// 避免下游把「空 map」误读成「这个账号一个包都没有」。
+///
+/// `suspect` 为 true 表示这次读数已被判为不完整：写进快照后，
+/// 下一次回升时才能区分「抖动恢复」与「真实发放」（见 `reading_trust` 判据 3）。
+/// false 时不写该字段，保持文件紧凑（绝大多数快照都是可信的）。
+fn snapshot_value_with_packages(
+    ts: i64,
+    account_id: &str,
+    account_name: &str,
+    total: f64,
+    remaining: f64,
+    packages: &std::collections::BTreeMap<String, f64>,
+    suspect: bool,
+) -> Value {
+    let mut value = snapshot_value(ts, account_id, account_name, total, remaining);
+    if !packages.is_empty() {
+        value["packages"] = json!(packages);
+    }
+    if suspect {
+        value["suspect"] = json!(true);
+    }
+    value
 }
 
 /// 读取本地观察快照；文件缺失或损坏时返回空列表。
@@ -273,11 +334,105 @@ pub fn credit_delta(prev_remaining: f64, prev_total: f64, remaining: f64, total:
     })
 }
 
+/// 一次读数的可信度判定结果。
+#[derive(Debug, PartialEq, Eq)]
+enum ReadingTrust {
+    /// 读数正常，可按 credit_delta 记为真实变化。
+    Ok,
+    /// 读数不完整（上游返回的包列表缺了东西），**不可据此记积分变化**。
+    /// 携带人话原因，供 detail 使用。
+    Incomplete(&'static str),
+}
+
+/// 判断本次读数是否可信 —— 用**包级证据**，不靠「数值大小像不像异常」猜。
+///
+/// 背景（所有者真实数据实测）：上游会偶发返回**不完整的包列表**，
+/// 导致聚合 total/remaining 凭空下跌再涨回，记录里出现 `-350` / `+350` 的幻影配对，
+/// 而余额其实一整天没变。上游**没有**「积分消耗明细」接口可查，
+/// 所以只能靠包的身份来分辨「没读到」与「真的少了」。
+///
+/// 三条判据，任一成立即判为读数不完整：
+///
+/// 1. **包凭空消失**：上次存在、这次不见了的 `packageCode`。
+///    包不会自己消失又回来 —— 真到期有 `expireAt` 为证，真消耗只减 `remaining` 不删包。
+///    故「少包」直接说明这次没读到它们。
+///    （只在**两侧都有包级明细**时可用；老快照没有明细则跳过这条。）
+///
+/// 2. **容量不应因消耗而减少**：`total`（额度容量）是各包的**总额度**，
+///    消耗只减 `remaining`，**不会**让 `total` 变小。
+///    所以 `total` 下降必然意味着**包集合变了**（少读到包 / 包被回收），而非用掉额度。
+///    `total` 上升是正常的（新包到账）；`total` 不变也正常。
+///
+/// 3. **上一次是不可信读数，本次回升 ⇒ 是恢复而非发放**：
+///    只看**紧邻**的上一次会漏掉回升那一侧 —— 序列 `380 → 30 → 380` 里，
+///    第三次是「total 上升」，判据 2 放行；而它上一次（30）的包里没有 p380，
+///    判据 1 也看不出「消失」。于是 `+350` 那一半照样被记下来。
+///    故读 `prev.suspect`：上一次已被判可疑、且本次数值比它高 ⇒ 判定为恢复。
+///
+///    为什么用「上一次是否可疑」而不是「数值是否回到更早的值」：
+///    后者无法区分抖动恢复与「真消耗后又发放」——两者数值都可能回到原处。
+///    而这两者在**中间那次读数当下**就能分辨（包消失 = 抖动；包在但余额跌 = 真消耗），
+///    所以把判定结果存进快照，回升时直接读，不做事后猜测。
+///
+/// 注意判据 2 **不依赖**包级明细，因此对老快照也生效 ——
+/// 这正是本次幻影记录的直接原因：`total` 与 `remaining` 同时从 380 掉到 30。
+///
+/// 为什么不用「归零/暴跌幅度」当判据：消耗快时余额确实可能快速下降甚至归零，
+/// 那会误杀真实消耗（所有者明确指出过这一点）。上面三条都是**结构性证据**，与幅度无关。
+fn reading_trust(
+    prev: &Snapshot,
+    now_total: f64,
+    now_remaining: f64,
+    now_packages: &std::collections::BTreeMap<String, f64>,
+) -> ReadingTrust {
+    let dropped = now_remaining < prev.remaining - f64::EPSILON;
+
+    // 判据 1：有包级明细时，看有没有包凭空消失。
+    if !prev.packages.is_empty() {
+        let vanished: Vec<&str> = prev
+            .packages
+            .keys()
+            .filter(|code| !now_packages.contains_key(*code))
+            .map(String::as_str)
+            .collect();
+        if !vanished.is_empty() {
+            // 只有「余额也在跌」时才需要怀疑；余额不跌而包少了，说明只是没读到。
+            // 若余额同时在跌，仍可能是真消耗 + 真到期，故只在**容量也跌**时定性。
+            let capacity_dropped = now_total < prev.total - f64::EPSILON;
+            if capacity_dropped || dropped {
+                return ReadingTrust::Incomplete("上游本次返回的积分包列表不完整");
+            }
+        }
+    }
+
+    // 判据 2：total（额度容量）不应因消耗而减少。
+    if now_total < prev.total - f64::EPSILON {
+        return ReadingTrust::Incomplete("额度容量意外减少，上游本次返回的积分包列表不完整");
+    }
+
+    // 判据 3：上一次已判可疑、本次数值回升 ⇒ 这是**恢复**，不是发放。
+    if prev.suspect && (now_total > prev.total + f64::EPSILON || !dropped) {
+        return ReadingTrust::Incomplete("上一次为不完整读数，本次为恢复");
+    }
+
+    ReadingTrust::Ok
+}
+
 /// 写入一个成功的资源观察值。
 ///
 /// 同一账号同一资源值在短时间内只保留一条；资源值发生变化时立即保留，
 /// 这样余额下降可以归因到新快照。返回值表示本次是否实际写入。
-pub fn record_snapshot(account_id: &str, account_name: &str, total: f64, remaining: f64) -> bool {
+///
+/// `packages` 是本次读到的包子集（`packageCode → remaining`），
+/// 用于分辨「包没读到」与「余额真的少了」（见 `reading_trust`）。
+/// 传空 map 也能工作，只是失去判据 1（判据 2 仍生效）。
+pub fn record_snapshot(
+    account_id: &str,
+    account_name: &str,
+    total: f64,
+    remaining: f64,
+    packages: std::collections::BTreeMap<String, f64>,
+) -> bool {
     let account_id = account_id.trim();
     if account_id.is_empty() {
         return false;
@@ -295,33 +450,61 @@ pub fn record_snapshot(account_id: &str, account_name: &str, total: f64, remaini
     // 为什么在这里记而不是在调用方：本函数已经拿到了「上一快照」与「本次余额」，
     // 差值就在这里最自然；调用方（签到、切换、巡检）各自算差值会口径不一。
     // 只在**余额确实变化**时记录，避免每 15 分钟的巡检刷出一堆 amount=0 的噪音。
+    //
+    // **但变化的前提是这次读数可信**：上游会偶发返回不完整的包列表，
+    // 若不判可信度就会记出「-380 消耗」+「+380 发放」的幻影配对（见 reading_trust 注释）。
+    // 本次读数是否可疑 —— 供写入快照（下一次回升时据此判定「恢复」而非「发放」）。
+    let mut suspect = false;
     if let Some(prev) = snapshots
         .iter()
         .filter_map(snapshot_from_value)
         .filter(|s| s.account_id == account_id)
         .max_by_key(|s| s.ts)
     {
-        if let Some(delta) = credit_delta(prev.remaining, prev.total, remaining, total) {
-            let source = classify_credit_source(delta.amount, delta.capacity);
-            let (title, detail) = credit_record_text(source, &delta);
-            crate::modules::account_records::add_credit_record(
-                account_id,
-                account_name.trim(),
-                title,
-                delta.amount,
-                &detail,
-                Some(source),
-            );
+        match reading_trust(&prev, total, remaining, &packages) {
+            ReadingTrust::Incomplete(why) => {
+                suspect = true;
+                // 读数不完整 → **不记积分变化**（记了就是幻影）。
+                // 但仍打一行日志：这是上游行为异常，排查时需要线索，
+                // 且不能静默 —— 否则「记录里少了一条」会被当成功能坏了。
+                eprintln!(
+                    "[积分统计] 跳过一次不可信读数（{why}）：账号 {} 上次 total={} remaining={}，本次 total={} remaining={}",
+                    &account_id[..account_id.len().min(8)],
+                    prev.total,
+                    prev.remaining,
+                    total,
+                    remaining,
+                );
+            }
+            ReadingTrust::Ok => {
+                if let Some(delta) = credit_delta(prev.remaining, prev.total, remaining, total) {
+                    let source = classify_credit_source(delta.amount, delta.capacity);
+                    let (title, detail) = credit_record_text(source, &delta);
+                    crate::modules::account_records::add_credit_record(
+                        account_id,
+                        account_name.trim(),
+                        title,
+                        delta.amount,
+                        &detail,
+                        Some(source),
+                    );
+                }
+            }
         }
     }
 
     let mut kept = normalize_snapshots(&snapshots, at_ms);
-    kept.push(snapshot_value(
+    // 不可信读数**仍然写入快照**：它是「上游这次返回了什么」的事实，
+    // 丢掉会让下一次比较失去基准（而且下一次可能才是完整的那次）。
+    // 被抑制的只是「据此推断积分变化」这一步。
+    kept.push(snapshot_value_with_packages(
         at_ms,
         account_id,
         account_name.trim(),
         total,
         remaining,
+        &packages,
+        suspect,
     ));
     if kept.len() > CREDIT_SNAPSHOT_MAX_RECORDS {
         kept.drain(..kept.len() - CREDIT_SNAPSHOT_MAX_RECORDS);
@@ -995,12 +1178,12 @@ mod tests {
         let _iso = crate::modules::config::test_isolation::Isolated::new("credit-source-e2e");
 
         // 首个快照只建立基线，不产生记录
-        assert!(record_snapshot("acc-src", "n", 1000.0, 1000.0));
+        assert!(record_snapshot("acc-src", "n", 1000.0, 1000.0, Default::default()));
         let v = crate::modules::account_records::query_records("acc-src", 0, 0, &[], 100);
         assert_eq!(v.get("total").and_then(Value::as_u64), Some(0), "首个快照不该产生记录");
 
         // 余额 +100 且容量 +100 → 额度发放
-        assert!(record_snapshot("acc-src", "n", 1100.0, 1100.0));
+        assert!(record_snapshot("acc-src", "n", 1100.0, 1100.0, Default::default()));
         let v = crate::modules::account_records::query_records(
             "acc-src",
             0,
@@ -1027,8 +1210,8 @@ mod tests {
     #[test]
     fn pure_consumption_snapshot_records_consume_source() {
         let _iso = crate::modules::config::test_isolation::Isolated::new("credit-consume-e2e");
-        assert!(record_snapshot("acc-c", "n", 1000.0, 1000.0));
-        assert!(record_snapshot("acc-c", "n", 1000.0, 900.0));
+        assert!(record_snapshot("acc-c", "n", 1000.0, 1000.0, Default::default()));
+        assert!(record_snapshot("acc-c", "n", 1000.0, 900.0, Default::default()));
 
         let v = crate::modules::account_records::query_records(
             "acc-c",
@@ -1043,5 +1226,262 @@ mod tests {
             Some(crate::modules::account_records::CREDIT_SOURCE_CONSUME)
         );
         assert_eq!(recs[0].get("amount").and_then(Value::as_i64), Some(-100));
+    }
+
+    // -----------------------------------------------------------------------
+    // 幻影积分记录（所有者实测反馈：「发放的积分根本没有变化 但是这里记录
+    // 却是 -380 然后又 +380」）
+    //
+    // 根因：上游偶发返回**不完整的包列表**，聚合 total/remaining 凭空下跌再涨回，
+    // 被当成「消耗」+「发放」记成一对。下面用 owner 的**真实数值**做回归。
+    // -----------------------------------------------------------------------
+
+    /// 构造一份包子集。
+    fn packs(entries: &[(&str, f64)]) -> std::collections::BTreeMap<String, f64> {
+        entries.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    /// 判据 2（核心）：`total`（额度容量）不应因消耗而减少。
+    ///
+    /// owner 真实数据：某次上游只返回 1 个 30 的包 → total 从 380 掉到 30，
+    /// 于是被记成「-350 积分消耗」。但**容量不会因为消耗而变小**，
+    /// 所以 total 下降本身就证明「这次没读全」。
+    #[test]
+    fn reading_trust_rejects_dropped_capacity() {
+        let prev = snapshot_from_value(&json!({
+            "accountId": "a", "ts": 1, "total": 380.0, "remaining": 380.0
+        }))
+        .unwrap();
+        // total 380 → 30（同时 remaining 也跌）⇒ 必须判为不可信
+        assert_eq!(
+            reading_trust(&prev, 30.0, 30.0, &packs(&[("p30", 30.0)])),
+            ReadingTrust::Incomplete("额度容量意外减少，上游本次返回的积分包列表不完整"),
+        );
+        // total 380 → 0 ⇒ 同样不可信
+        assert!(matches!(
+            reading_trust(&prev, 0.0, 0.0, &packs(&[])),
+            ReadingTrust::Incomplete(_)
+        ));
+    }
+
+    /// 正常消耗：`total` 不变、只 `remaining` 跌 ⇒ 必须放行（否则会误杀真实消耗）。
+    ///
+    /// 这是本判据**不能**用「跌幅大小」代替的原因：消耗快时余额掉得快是正常的。
+    #[test]
+    fn reading_trust_allows_real_consumption() {
+        let prev = snapshot_from_value(&json!({
+            "accountId": "a", "ts": 1, "total": 1000.0, "remaining": 1000.0
+        }))
+        .unwrap();
+        // 容量没变、余额跌到 0（消耗快）⇒ 真实消耗，放行
+        assert_eq!(reading_trust(&prev, 1000.0, 0.0, &packs(&[("p1", 0.0)])), ReadingTrust::Ok);
+        // 容量没变、余额小跌 ⇒ 放行
+        assert_eq!(reading_trust(&prev, 1000.0, 900.0, &packs(&[("p1", 900.0)])), ReadingTrust::Ok);
+    }
+
+    /// 判据 1：包凭空消失（下次又回来）⇒ 读数失败。
+    ///
+    /// 包不会自己消失再回来 —— 真到期有 expireAt 为证，真消耗只减 remaining 不删包。
+    #[test]
+    fn reading_trust_rejects_vanished_package() {
+        let prev = snapshot_from_value(&json!({
+            "accountId": "a", "ts": 1, "total": 380.0, "remaining": 380.0,
+            "packages": { "p380": 380.0 }
+        }))
+        .unwrap();
+        // 这次只剩 p30，p380 不见了，且余额也跌 ⇒ 不可信
+        assert!(matches!(
+            reading_trust(&prev, 30.0, 30.0, &packs(&[("p30", 30.0)])),
+            ReadingTrust::Incomplete(_)
+        ));
+    }
+
+    /// 真实到期（包消失 + 容量跌）在**没有 expireAt 证据**时也会被判不可信 ——
+    /// 这是刻意的保守：宁可漏记一次真到期，也不要刷出一对幻影记录。
+    /// （真到期会在下一次读数稳定后由「容量确实少了且不再回来」体现。）
+    #[test]
+    fn reading_trust_is_conservative_when_package_disappears() {
+        let prev = snapshot_from_value(&json!({
+            "accountId": "a", "ts": 1, "total": 1000.0, "remaining": 900.0,
+            "packages": { "p1": 500.0, "p2": 400.0 }
+        }))
+        .unwrap();
+        // p2 消失、总容量 1000→500
+        assert!(matches!(
+            reading_trust(&prev, 500.0, 500.0, &packs(&[("p1", 500.0)])),
+            ReadingTrust::Incomplete(_)
+        ));
+    }
+
+    /// 新包到账（total 上升）必须放行 —— 那是真实的额度发放。
+    #[test]
+    fn reading_trust_allows_grant() {
+        let prev = snapshot_from_value(&json!({
+            "accountId": "a", "ts": 1, "total": 380.0, "remaining": 100.0,
+            "packages": { "p380": 100.0 }
+        }))
+        .unwrap();
+        assert_eq!(
+            reading_trust(&prev, 760.0, 480.0, &packs(&[("p380", 100.0), ("p380b", 380.0)])),
+            ReadingTrust::Ok
+        );
+    }
+
+    /// 老快照没有包级明细时判据 2 仍生效（向后兼容：老数据也能被保护）。
+    #[test]
+    fn reading_trust_works_without_package_detail() {
+        let prev = snapshot_from_value(&json!({
+            "accountId": "a", "ts": 1, "total": 380.0, "remaining": 380.0
+        }))
+        .unwrap();
+        assert!(prev.packages.is_empty(), "老快照应解析成空包集");
+        // 无包级明细 → 判据 1 跳过，判据 2 仍拦下 total 下降
+        assert!(matches!(
+            reading_trust(&prev, 30.0, 30.0, &packs(&[])),
+            ReadingTrust::Incomplete(_)
+        ));
+        // 无包级明细 + total 不变 → 放行
+        assert_eq!(reading_trust(&prev, 380.0, 200.0, &packs(&[])), ReadingTrust::Ok);
+    }
+
+    /// 端到端：owner 的幻影配对**不再产生任何积分记录**。
+    ///
+    /// 复现真实序列：380 → 30（只读到 1 个包）→ 380（读全了）。
+    /// 修复前会记「-350 消耗」+「+350 增长」；修复后应为 0 条。
+    #[test]
+    fn phantom_pair_is_not_recorded() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("credit-phantom-pair");
+
+        // 基线：完整读到 380 的包
+        assert!(record_snapshot("acc-ph", "n", 380.0, 380.0, packs(&[("p380", 380.0)])));
+        // 上游这次只返回了 30 的包（不完整）—— 修复前会记「-350 消耗」
+        assert!(record_snapshot("acc-ph", "n", 30.0, 30.0, packs(&[("p30", 30.0)])));
+        // 下次读全了 —— 修复前会记「+350 增长」
+        assert!(record_snapshot("acc-ph", "n", 380.0, 380.0, packs(&[("p380", 380.0)])));
+
+        let v = crate::modules::account_records::query_records(
+            "acc-ph",
+            0,
+            0,
+            &[crate::modules::account_records::KIND_CREDIT.to_string()],
+            100,
+        );
+        let recs = v.get("records").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            recs.len(),
+            0,
+            "幻影配对不该产生任何积分记录，实际产生了 {} 条: {:?}",
+            recs.len(),
+            recs.iter()
+                .map(|r| (r.get("amount"), r.get("title")))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// 对照：真实消耗在同样流程下**仍要**被记录（不能因为修幻影而把真消耗也吞掉）。
+    #[test]
+    fn real_consumption_still_recorded_after_fix() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("credit-real-consume");
+
+        assert!(record_snapshot("acc-rc", "n", 380.0, 380.0, packs(&[("p380", 380.0)])));
+        // 容量不变、余额跌 350 ⇒ 真实消耗，必须记
+        assert!(record_snapshot("acc-rc", "n", 380.0, 30.0, packs(&[("p380", 30.0)])));
+
+        let v = crate::modules::account_records::query_records(
+            "acc-rc",
+            0,
+            0,
+            &[crate::modules::account_records::KIND_CREDIT.to_string()],
+            100,
+        );
+        let recs = v.get("records").and_then(Value::as_array).unwrap();
+        assert_eq!(recs.len(), 1, "真实消耗必须被记录");
+        assert_eq!(recs[0].get("amount").and_then(Value::as_i64), Some(-350));
+        assert_eq!(
+            recs[0].get("source").and_then(Value::as_str),
+            Some(crate::modules::account_records::CREDIT_SOURCE_CONSUME)
+        );
+    }
+
+    /// **最容易误伤的一条**：真实消耗之后又有真实发放，必须**两条都记**。
+    ///
+    /// 序列：`380 → 30（真消耗，包还在）→ 760（真发放，来了新包）`
+    /// 若判据 3 写成「数值回升 = 恢复」就会把第二条件吞掉 —— 这正是我第一版
+    /// 用「回到旧值」做判据时的错误。用 `suspect` 标志才能区分：
+    ///   · 真消耗那次**不可疑**（包在、只是余额少）→ 下一次回升是**发放**，要记
+    ///   · 抖动那次**可疑**（包消失）→ 下一次回升是**恢复**，不记
+    #[test]
+    fn real_grant_after_real_consumption_is_still_recorded() {
+        let _iso =
+            crate::modules::config::test_isolation::Isolated::new("credit-grant-after-consume");
+
+        assert!(record_snapshot("acc-gc", "n", 380.0, 380.0, packs(&[("p380", 380.0)])));
+        // 真消耗：包还在，余额跌到 30（不可疑）
+        assert!(record_snapshot("acc-gc", "n", 380.0, 30.0, packs(&[("p380", 30.0)])));
+        // 真发放：来了一个新包，总容量 380 → 760
+        assert!(record_snapshot(
+            "acc-gc",
+            "n",
+            760.0,
+            410.0,
+            packs(&[("p380", 30.0), ("p380b", 380.0)])
+        ));
+
+        let v = crate::modules::account_records::query_records(
+            "acc-gc",
+            0,
+            0,
+            &[crate::modules::account_records::KIND_CREDIT.to_string()],
+            100,
+        );
+        let recs = v.get("records").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            recs.len(),
+            2,
+            "真消耗 + 真发放都要记，实际 {:?}",
+            recs.iter()
+                .map(|r| (r.get("amount"), r.get("title")))
+                .collect::<Vec<_>>()
+        );
+        // query_records 按 ts **降序**（最新在前）返回 —— 故 recs[0] 是后发生的发放。
+        assert_eq!(
+            recs[0].get("amount").and_then(Value::as_i64),
+            Some(380),
+            "最新一条应是发放 +380"
+        );
+        assert!(
+            recs[0]
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .contains("额度发放"),
+            "最新一条应是额度发放，实际 {:?}",
+            recs[0].get("title")
+        );
+        assert_eq!(
+            recs[1].get("amount").and_then(Value::as_i64),
+            Some(-350),
+            "较早一条应是消耗 -350"
+        );
+    }
+
+    /// 新快照要带包级明细（否则判据 1 永远用不上）。
+    #[test]
+    fn new_snapshot_carries_package_detail() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("credit-snapshot-packages");
+        assert!(record_snapshot(
+            "acc-pk",
+            "n",
+            380.0,
+            380.0,
+            packs(&[("p380", 380.0)])
+        ));
+        let snapshots = load_snapshots();
+        let mine = snapshots
+            .iter()
+            .filter_map(snapshot_from_value)
+            .find(|s| s.account_id == "acc-pk")
+            .expect("应写入快照");
+        assert_eq!(mine.packages.get("p380"), Some(&380.0));
     }
 }

@@ -3,9 +3,14 @@ import { Link } from "react-router-dom";
 import {
   Activity,
   AlertTriangle,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   Bot,
   Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Copy,
   Filter,
   Globe,
@@ -24,6 +29,7 @@ import {
   Square,
   UserRound,
   Wand2,
+  X,
   Zap,
 } from "lucide-react";
 
@@ -157,6 +163,34 @@ const USAGE_RANGE_OPTIONS: { key: UsageRangeKey; label: string; days?: number }[
 ];
 
 const exactTokenFormatter = new Intl.NumberFormat("en-US");
+
+/**
+ * 「Token 用量」区块里承载口径信息的**次级文字**（「共 N 个」、行内数值、行内 meta）
+ * 统一用的前景色。
+ *
+ * 为什么不能用既有的 `text-muted-foreground`：诊断对真实渲染取色实测，「共 N 个」
+ * 的对比度只有 **2.97:1**，而 WCAG AA 正文要求 **4.5:1**。更要命的是它是整个用量
+ * 区块里**唯一**携带「筛掉了几行 / 这是谁的口径」的元素 —— 最该被看见的字最淡，
+ * 正是所有者「看不出变化」的放大因素之一。meta 行原先是 0.8 不透明度，同理。
+ *
+ * `--muted-strong` 是本轮为它新增的 token（`src/index.css`，oklch 0.42），
+ * 比 `--muted-foreground`（0.52）深一档；在 `--background`（1 0 0）与 `--card`
+ * 上分别约 7.5:1 / 7.9:1，留足余量。
+ *
+ * 为什么不直接用 `text-foreground`：那样次级文字与主文字（模型名 / 账号名）
+ * 同色，层级会塌掉 —— 修对比度不该以牺牲信息层级为代价。
+ */
+const USAGE_STRONG_TEXT = "text-muted-strong";
+
+/**
+ * 「按模型 / 按账号」两个列表在 420px 高度内大概能完整显示的行数。
+ *
+ * 用途只有一个：决定要不要显示底部那行「共 N 个，列表可滚动」。行高约 56px
+ * （名称行 + 条 + meta，再加 py-2），420 / 56 = 7.5 —— 取 7 是**保守**值：
+ * 刚好 7 行时不给提示（此时列表末尾与容器底边几乎重合，用户能看出到底了），
+ * 超过 7 行才提示，避免把"还有内容"这件事变成常驻噪音。
+ */
+const USAGE_LIST_VISIBLE_ROWS = 7;
 
 /**
  * 网关页布局，持久化到 localStorage。
@@ -361,11 +395,9 @@ function maxOf(values: number[]): number {
  *
  * 为什么 `onToggle` 是**可选**的（不是让所有调用点都能点）：
  *   - 「按模型 / 按账号」两个列表要能互相筛选；
- *   - 而新版账号明细面板（`AccountModelDetail`）里的同名行是**只读明细**，它的
- *     占比基准也不同（以该账号自己为准）。若它也变成可点的，点一下就会去改
- *     用量区块的筛选 —— 在明细面板里点模型本意是「看清这个模型」，却让页面
- *     另一处悄悄收窄，这是最容易让人迷失的一类隐式联动。
- *   因此交互能力由调用点显式开启，明细面板保持纯展示（返回 null 时不接线）。
+ *   - 而单账号的模型明细（`AccountModelDetail`）已随「账号池选中」一起移除，
+ *     本页现在只有这一处调用点会接线。
+ *   因此交互能力仍由调用点显式开启，保持「可点 / 不可点」的语义显式化。
  *
  * 视觉上可点/不可点**完全一致**（只叠加选中态与 hover）：所有者明确要求
  * 「现有信息一条都不能删」，所以 label / 占比条 / 数值 / meta 的排版与字号
@@ -379,6 +411,7 @@ function UsageBarRow({
   selected = false,
   onToggle,
   dataSlot,
+  valueSlot,
 }: {
   label: string;
   value: number;
@@ -393,6 +426,15 @@ function UsageBarRow({
   onToggle?: () => void;
   /** 标记本行属于哪个列表，供测试与调试定位（不影响样式）。 */
   dataSlot?: string;
+  /**
+   * 数值 span 的 `data-slot`。
+   *
+   * 为什么数值要单独可定位：「点账号 → 左侧数值换成该账号在该模型上的量」是本轮
+   * 语义修正的**核心断言**，而行的 `innerText` 把数值与 meta 混在一起，从整行文本里
+   * 抠数字会在「数值恰好也是 meta 里某个数字的子串」时误判。给数值一个稳定定位点，
+   * 测试才能断言「这个 span 的文字本身变了」，而不是「整行里出现过这个数」。
+   */
+  valueSlot?: string;
 }) {
   const percent = max > 0 ? Math.max(3, Math.round((value / max) * 100)) : 0;
   // 可点时必须用真实的 <button>（而不是给 div 挂 onClick）：键盘 Tab / Enter 与
@@ -418,13 +460,55 @@ function UsageBarRow({
   return (
     <Root {...(rootProps as Record<string, unknown>)} data-slot={dataSlot}>
       <div className="flex items-baseline justify-between gap-3 text-xs">
-        <span className="min-w-0 truncate">{label}</span>
-        <span className="shrink-0 tabular-nums text-muted-foreground">{formatUsageCompact(value)}</span>
+        <span className="flex min-w-0 items-center gap-1.5">
+          {/*
+            行首勾选框（**装饰性**，不是可交互控件）。
+
+            为什么不用 Radix `Checkbox`（本项目 UI 规范首选 shadcn 组件）：整行本身
+            已经是 `<button>`，在按钮里再放一个 `role="checkbox"` 的真实控件是嵌套
+            交互元素（HTML 不允许，React 会报 validateDOMNesting），并且会出现
+            「点勾选框」与「点行」两种说不清的语义。所有者原话是「我勾选右边账号」
+            —— 他要的是**看得出自己勾了哪个**，而不是要一个独立的复选框。因此状态
+            语义仍由行上的 `aria-pressed` 承担（读屏已可读），这个方框只补他眼睛要找
+            的那个标记，故标 `aria-hidden` 明确叫读屏别重复念。
+
+            未选时的空框也**必须画出来**：只画选中态的话，用户仍然看不出「这里能
+            勾」，就又回到「行里什么都没有、以为要点别处」的老困惑。
+          */}
+          <span
+            aria-hidden="true"
+            data-slot="usage-row-checkbox"
+            data-checked={selected ? "true" : "false"}
+            className={cn(
+              "flex size-3.5 shrink-0 items-center justify-center rounded-[4px] border text-[9px] leading-none",
+              selected
+                ? "border-primary bg-primary text-primary-foreground"
+                : "border-border bg-card text-transparent",
+            )}
+          >
+            <Check className="size-2.5" strokeWidth={3} />
+          </span>
+          <span className="min-w-0 truncate">{label}</span>
+        </span>
+        {/*
+          数值与 meta 的前景色从 `text-muted-foreground`（oklch 0.52）换成
+          `USAGE_STRONG_TEXT`（oklch 0.42）：诊断实测「共 N 个」只有 2.97:1，
+          远低于 WCAG AA 的 4.5:1，而它恰恰是**唯一携带口径信息的元素**。
+          数值与 meta 同理 —— 换口径后它们就是「这个账号用了多少」的唯一载体，
+          最该被看清的字不该是最淡的。
+        */}
+        <span data-slot={valueSlot} className={cn("shrink-0 tabular-nums", USAGE_STRONG_TEXT)}>
+          {formatUsageCompact(value)}
+        </span>
       </div>
       <div className="h-1.5 overflow-hidden rounded-full bg-muted">
         <div className="h-full rounded-full bg-primary/70" style={{ width: `${percent}%` }} />
       </div>
-      {meta ? <div className="truncate text-[11px] text-muted-foreground">{meta}</div> : null}
+      {meta ? (
+        <div data-slot="usage-row-meta" className={cn("truncate text-[11px]", USAGE_STRONG_TEXT)}>
+          {meta}
+        </div>
+      ) : null}
     </Root>
   );
 }
@@ -560,136 +644,6 @@ function ModelFilter({
 }
 
 /**
- * 「点账号 → 看该账号的模型 / Token 明细」面板（新版布局的**唯一**新增交互）。
- *
- * 所有者原话：「默认跟旧版的一样，只不过左侧可以通过点击账号的方式来显示…
- * 的模型 token 信息」。因此这里只做一件事：把**这一个账号**在所选范围内的
- * 模型构成讲清楚，不复述账号池已有的运行态（健康/冷却/在途都在卡片上）。
- *
- * 为什么与「Token 用量」区块并存而不是取代它：
- *   - 区块回答「整体谁在烧」（按模型 / 按账号 / 每日趋势），是**全局**视图；
- *   - 本面板回答「这一个号烧在哪些模型上」，是**单账号**视图，且紧贴被点的卡片。
- *   两者粒度不同，且默认（未选账号）时本面板不出现 —— 观感与旧版一致。
- */
-function AccountModelDetail({
-  uid,
-  nickname,
-  models,
-  total,
-  records,
-  rangeLabel,
-  creditUsed,
-  credits,
-  modelFilter,
-  onClose,
-}: {
-  uid: string;
-  nickname: string;
-  /** undefined = 网关未提供「账号 × 模型」明细（旧版网关），与「空数组」含义不同。 */
-  models: GatewayUsageGroup[] | undefined;
-  /** 该账号在当前范围内的 Token 合计。 */
-  total: number;
-  records: number;
-  rangeLabel: string;
-  /** 该账号在当前范围内的积分消耗（0 = 无数据）。 */
-  creditUsed: number;
-  /** 网关侧记录的剩余积分（可能为 undefined）。 */
-  credits?: number;
-  /** 生效中的模型筛选（空数组 = 未筛选），用于说明「这里为什么只有这几个模型」。 */
-  modelFilter: string[];
-  onClose: () => void;
-}) {
-  const max = maxOf((models ?? []).map((m) => m.total));
-  return (
-    <Card
-      // data-slot 是本项目标记「这个部件是什么」的既有约定（shadcn 用它，
-      // 既有用例也按 [data-slot="checkbox"] 取元素），不另造 data-testid。
-      data-slot="account-model-detail"
-      className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none xl:sticky xl:top-6"
-    >
-      <div className="flex min-w-0 items-start justify-between gap-2 border-b border-border/60 px-4 py-3 sm:px-5">
-        <div className="min-w-0">
-          <div className="flex items-center gap-1.5 text-[13px] font-medium">
-            <ListFilter className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-            <span className="truncate" title={nickname}>{nickname}</span>
-          </div>
-          <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground/80" title={uid}>
-            {uid}
-          </div>
-        </div>
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-7 shrink-0 px-2 text-xs"
-          onClick={onClose}
-          aria-label="取消选择该账号"
-        >
-          取消选择
-        </Button>
-      </div>
-
-      <div className="mx-4 grid grid-cols-3 gap-2 py-3 sm:mx-5">
-        <Stat
-          label="总 Token"
-          value={formatUsageCompact(total)}
-          hint={exactTokenFormatter.format(total)}
-        />
-        <Stat label="调用次数" value={exactTokenFormatter.format(records)} hint="成功请求" />
-        <Stat
-          label="消耗积分"
-          value={creditUsed > 0 ? exactTokenFormatter.format(Math.round(creditUsed)) : "—"}
-          hint={creditUsed > 0 ? rangeLabel : "无快照数据"}
-        />
-      </div>
-
-      <div className="border-t border-border/50 pb-3 pt-3">
-        <div className="px-4 text-[12px] font-medium text-muted-foreground sm:px-5">
-          该账号的模型明细
-          {modelFilter.length > 0 ? (
-            <span className="ml-1.5 font-normal text-muted-foreground/70">
-              （已按模型筛选，仅显示选中的 {modelFilter.length} 个）
-            </span>
-          ) : null}
-        </div>
-        <div className="mt-1 max-h-[22rem] overflow-y-auto">
-          {models === undefined ? (
-            // 与「该账号确实没用过」区分开：旧版网关给不出交叉聚合，
-            // 说清楚是「拿不到」而不是让用户对着空列表猜。
-            <div className="px-4 py-2 text-xs text-muted-foreground sm:px-5">
-              当前网关未提供「账号 × 模型」明细，请更新网关后重试
-            </div>
-          ) : models.length > 0 ? (
-            models.map((model) => (
-              <UsageBarRow
-                key={model.key}
-                label={model.key}
-                value={model.total}
-                max={max}
-                meta={`${exactTokenFormatter.format(model.records)} 次调用 · 输入 ${formatUsageCompact(model.input)} / 输出 ${formatUsageCompact(model.output)}`}
-              />
-            ))
-          ) : (
-            <div className="px-4 py-2 text-xs text-muted-foreground sm:px-5">
-              {modelFilter.length > 0
-                ? "该账号在所选模型上没有 Token 消耗"
-                : "该账号在此范围内没有 Token 消耗（调用可能都失败了，或还没被网关统计到）"}
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* 余额只作参考并标明口径：它是网关巡检写入的快照，与账号管理页的
-          实时查询不是同一时刻，两者混用会让同一个号在两页显示不同余额。 */}
-      <div className="border-t border-border/50 px-4 py-2.5 text-[11px] text-muted-foreground sm:px-5">
-        剩余积分 {typeof credits === "number" ? exactTokenFormatter.format(credits) : "—"}
-        <span className="text-muted-foreground/70">（网关侧快照）</span>
-        <span className="ml-2">统计范围：{rangeLabel}</span>
-      </div>
-    </Card>
-  );
-}
-
-/**
  * 「取不到用量」时该显示哪一句。
  *
  * 把这几档判定（读取中 / 未运行 / 不可达 / 网关不支持统计 / 真错误）抽出来，
@@ -767,15 +721,34 @@ function formatRelativeTime(deltaMs: number): string {
   return `${Math.floor(hour / 24)} 天前`;
 }
 
-/** 把剩余秒数格式化成「1 小时 5 分钟」这类中文时长。 */
+/**
+ * 把剩余秒数格式化成中文时长；**一分钟以内给到秒，一小时以内给到分+秒**。
+ *
+ * 为什么必须补这两档（这是本轮实测暴露的真实缺陷）：
+ * 模型冷却是 429 限流的**短冷却**，真实值就是 42 秒 / 65 秒 / 192 秒这个量级。
+ * 旧实现只有「分钟」一档且向上取整，于是 42 秒显示成「1 分钟」、192 秒显示成
+ * 「4 分钟」—— 那既不是剩余时间也不是它的上界，用户据此判断「还要等多久」
+ * 会系统性偏大（192 秒被读成 4 分钟）。草稿 `账号池表格-终稿v4.html` 给的
+ * 也正是「剩 42 秒」「剩 3 分 12 秒」这种精度。
+ *
+ * 账号级冷却（余额欠费 / 熔断）是分钟到小时级，仍走小时/分钟档，
+ * 既有界面的显示口径不受影响。
+ */
 function formatRemaining(sec: number): string {
   if (sec <= 0) return "即将恢复";
-  const totalMinutes = Math.max(1, Math.ceil(sec / 60));
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-  if (hours > 0 && minutes > 0) return `${hours} 小时 ${minutes} 分钟`;
-  if (hours > 0) return `${hours} 小时`;
-  return `${minutes} 分钟`;
+  // 向上取整到秒：42.3 秒显示「43 秒」而不是「42 秒」—— 少报会让用户早一瞬重试，
+  // 正好撞上还没到期的冷却。
+  const total = Math.ceil(sec);
+  if (total < 60) return `${total} 秒`;
+  if (total < 3600) {
+    const m = Math.floor(total / 60);
+    const s = total % 60;
+    return s === 0 ? `${m} 分钟` : `${m} 分 ${s} 秒`;
+  }
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (minutes > 0) return `${hours} 小时 ${minutes} 分钟`;
+  return `${hours} 小时`;
 }
 
 /** 把冷却截止时刻格式化成「09-15 13:25」（本地时区）。 */
@@ -881,27 +854,377 @@ function queuedReasonText(acc: GatewayPoolAccount): string {
 }
 
 /**
- * 网关账号池账号卡片：展示冷却/熔断/在途等运行态。
+ * 账号级冷却的短标签。
  *
- * 新旧两版**渲染同一张卡片**（所有者本轮的原话：「新版默认跟旧版的一样」）。
- * 新版唯一的差别是卡片可以点：点一下就把该账号的模型 / Token 明细显示在下方。
- * 此前新版往卡片里塞了进度条、在途徽标与「消耗积分 / 消耗 Token / 调用次数」
- * 三列，等于换了一套布局 —— 那不是所有者要的，已全部移除。
+ * 用短标签而不是把 `coolReasonText()` 整句塞进「状态」列：状态列要能一眼扫完，
+ * 长句会把列宽撑到挤掉「消耗」列。整句作为悬浮说明保留（信息一条不少）。
+ */
+function poolCoolKindLabel(kind: string | undefined): string {
+  if (kind === "hard_credit") return "余额欠费";
+  if (kind === "breaker") return "熔断";
+  if (kind === "soft_rate") return "账号限速";
+  return "冷却中";
+}
+
+/**
+ * 账号池可排序的列。`#`（消耗排名）**不在**其中 —— 它跟着消耗列走，不是独立排序。
+ */
+type PoolSortKey = "account" | "state" | "tokens" | "records" | "credits" | "balance" | "expiry";
+
+/**
+ * 这一行在该列上是不是「拿不到值」（界面上显示为「—」/「未知」）。真值 → 恒排最后。
+ *
+ * 判定刻意与**显示口径逐条对齐**（`total > 0 ? … : "—"` 之类）：排序与显示若
+ * 用两套「有没有值」的判据，就会出现「显示 — 的行却排在 0 的前面」这种
+ * 无法解释的顺序。
+ *
+ * 为什么必须在**方向翻转之外**单独判定（本实现第一版就在这里错了）：
+ * 「消耗积分」在「全部」范围里就是 null（积分快照只留 30 天，给不出可信值），
+ * 若让 null 参与数值比较（当成 0），降序时它们沉底看起来正常，**升序时却会全部
+ * 冒到最前面** —— 用户点一下升序，看到一屏「—」，会以为整张表坏了。
+ * 实测现象：点「消耗 Token」升序后，完全没有用量的 uid-4 冲到了第一位。
+ * 「未知」既不是最大也不是最小，它就不该参与大小比较。
+ */
+function poolCellBlank(key: PoolSortKey, row: PoolRowMetrics): boolean {
+  if (key === "tokens") return row.total <= 0;
+  if (key === "records") return row.records <= 0;
+  if (key === "credits") return row.creditUsed === null || row.creditUsed <= 0;
+  if (key === "balance") return row.balance === null;
+  // 「到期档位」无档位 = 永远轮不到它，与「未知」同性质：不参与大小比较。
+  if (key === "expiry") return !Number.isFinite(row.expiryKey);
+  return false;
+}
+
+const POOL_SORT_OPTIONS = {
+  /** 比较函数；`< 0` = left 排在前面。拿不到值的情形已由 poolCellBlank 提前排除。 */
+  account: (l: PoolRowMetrics, r: PoolRowMetrics) => poolAccountName(l.acc).localeCompare(poolAccountName(r.acc), "zh-CN"),
+  /**
+   * 「状态」排序按**可用性分层**而不是按标签字面：健康 → 排队 → 账号冷却 → 已禁用。
+   *
+   * 为什么不用标签 `localeCompare`：那样「已禁用 / 排队中 / 健康 / 冷却中」会按拼音排，
+   * 得到「健康、冷却中、排队中、已禁用」这种与运维直觉无关的顺序 ——
+   * 而点这一列的人想问的是「哪些号还能接流量」。
+   *
+   * 同一档内再按「有没有模型冷却」排（无冷却的在前）：同显示「健康」的两个号里，
+   * 一个模型全通、另一个有两个模型被限流，后者显然更该排在后面。
+   */
+  state: (l: PoolRowMetrics, r: PoolRowMetrics) =>
+    l.stateRank - r.stateRank || l.modelCoolCount - r.modelCoolCount,
+  tokens: (l: PoolRowMetrics, r: PoolRowMetrics) => l.total - r.total,
+  records: (l: PoolRowMetrics, r: PoolRowMetrics) => l.records - r.records,
+  credits: (l: PoolRowMetrics, r: PoolRowMetrics) => (l.creditUsed ?? 0) - (r.creditUsed ?? 0),
+  balance: (l: PoolRowMetrics, r: PoolRowMetrics) => (l.balance ?? 0) - (r.balance ?? 0),
+  expiry: (l: PoolRowMetrics, r: PoolRowMetrics) => l.expiryKey - r.expiryKey,
+} satisfies Record<PoolSortKey, (l: PoolRowMetrics, r: PoolRowMetrics) => number>;
+
+const POOL_SORT_DEFAULT_DIR: Record<PoolSortKey, "asc" | "desc"> = {
+  account: "asc",
+  state: "asc",
+  tokens: "desc",
+  records: "desc",
+  credits: "desc",
+  balance: "desc",
+  // 升序 = 最快到期的排前面（选号就是按这个分层）
+  expiry: "asc",
+};
+
+/** 可点排序的表头单元格（自带 `aria-sort`，读屏能播报当前排序方向）。 */
+function PoolSortHeader({
+  label,
+  sortKey,
+  align = "left",
+  className,
+  title,
+  activeKey,
+  dir,
+  onToggle,
+}: {
+  label: React.ReactNode;
+  sortKey: PoolSortKey;
+  align?: "left" | "right";
+  className?: string;
+  title?: string;
+  activeKey: PoolSortKey;
+  dir: "asc" | "desc";
+  onToggle: (key: PoolSortKey) => void;
+}) {
+  const active = activeKey === sortKey;
+  const Icon = !active ? ArrowUpDown : dir === "asc" ? ArrowUp : ArrowDown;
+  return (
+    <th
+      scope="col"
+      // aria-sort 只在**当前排序列**上出现：给每一列都写 "none" 是合法但啰嗦的，
+      // 读屏会逐列播报「未排序」，反而盖住了真正生效的那一列。
+      aria-sort={active ? (dir === "asc" ? "ascending" : "descending") : undefined}
+      className={cn(
+        "whitespace-nowrap px-2.5 py-1.5 text-[11px] font-medium text-muted-foreground",
+        align === "right" ? "text-right" : "text-left",
+        className,
+      )}
+    >
+      {/* 排序必须用真实的 <button>（不是给 th 挂 onClick）：键盘 Tab 与读屏
+          都依赖原生语义，且焦点框能让人看出「这一列可以点」。 */}
+      <button
+        type="button"
+        onClick={() => onToggle(sortKey)}
+        title={title}
+        className={cn(
+          "inline-flex items-center gap-1 rounded transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40",
+          active ? "text-primary" : "text-muted-foreground",
+        )}
+      >
+        {label}
+        <Icon className={cn("size-3 shrink-0", active ? "opacity-100" : "opacity-45")} aria-hidden="true" />
+      </button>
+    </th>
+  );
+}
+
+/** 概览行里点开二级详情的开关（真正的 `<button>`，带 `aria-expanded` + `aria-controls`）。 */
+function PoolExpandToggle({
+  open,
+  controls,
+  onClick,
+}: {
+  open: boolean;
+  controls: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-expanded={open}
+      aria-controls={controls}
+      aria-label={open ? "收起该账号详情" : "展开该账号详情"}
+      className={cn(
+        // 展开态用 **--primary** 系。此前踩过「用 secondary 当选中/进行态，
+        // 与 outline 只差 4% 亮度，看起来永远停在默认态」的坑，故不重复。
+        "inline-flex size-4 items-center justify-center rounded transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40",
+        open ? "bg-primary/15 text-primary" : "text-muted-foreground hover:bg-muted hover:text-foreground",
+      )}
+    >
+      {open ? (
+        <ChevronDown className="size-3.5" aria-hidden="true" />
+      ) : (
+        <ChevronRight className="size-3.5" aria-hidden="true" />
+      )}
+    </button>
+  );
+}
+
+/**
+ * 「消耗 Token」列里的迷你占比条。
+ *
+ * 为什么这里可以有、而卡片不行：那是**每行一个进度条图**（所有者明确否掉的
+ * 重元素）；这里是一个 3px 高、40px 宽的细条，只表达「这一行相对最高消耗占多少」，
+ * 不抢行高也不抢注意力。
+ *
+ * 刻意**不设最小宽度**（旧版用量行有 3% 下限）：给 1 token 也画成 3% 会让
+ * 「几乎没用」看起来像「用了不少」。真为 0 就是空条 —— 那正是要传达的信息。
+ */
+function PoolUsageBar({ percent }: { percent: number }) {
+  return (
+    // data-slot 是本项目标记「这个部件是什么」的既有约定，测试按它取元素。
+    <span
+      data-slot="pool-usage-bar"
+      className="inline-block h-[3px] w-10 shrink-0 overflow-hidden rounded-full bg-muted align-middle"
+      title={`占本池最高消耗的 ${percent}%`}
+    >
+      <i className="block h-full rounded-full bg-primary" style={{ width: `${percent}%` }} />
+    </span>
+  );
+}
+
+/** 每个池账号在当前日期范围内的派生指标（表格的列值都从这里取，保证排序与显示同源）。 */
+interface PoolRowMetrics {
+  acc: GatewayPoolAccount;
+  /** 该账号在当前范围内的 Token 消耗（无数据 = 0）。 */
+  total: number;
+  /** 该账号在当前范围内的调用次数（无数据 = 0）。 */
+  records: number;
+  /** 消耗占比（0-100，相对本池最高消耗）。 */
+  percent: number;
+  /** 消耗排名（1 = 最高；跟着消耗走，与当前排序无关）。 */
+  rank: number;
+  /** 当前范围内的积分消耗；null = 该范围给不出可信值（「全部」）。 */
+  creditUsed: number | null;
+  /** 今日消耗积分；null = 宿主没给积分统计（旧版后端，或还没拉到）。 */
+  creditToday: number | null;
+  /** 积分余额（网关侧快照）；null = 未取到。 */
+  balance: number | null;
+  /** 到期档位的可比较键（毫秒；无档位 = +∞ ⇒ 恒排最后）。 */
+  expiryKey: number;
+  /**
+   * 状态分层（越小越能用）：健康 1 → 排队 2 → 账号冷却 3 → 已禁用 4。
+   *
+   * 分层口径**与「状态」列的标签逐条对齐**；模型冷却不进这一层，它另有一列
+   * `modelCoolCount`。理由：点「状态」列排序的人想问的是「哪些号还能接流量」，
+   * 而那个答案就写在状态列里。若把「只有模型冷却」的号单独划一档，界面上会出现
+   * 「显示健康的行排在排队中之后」这种按列头解释不通的顺序。
+   */
+  stateRank: number;
+  /** 模型级冷却的模型数（0 = 无）。同一状态档内的次序键：无冷却的排前面。 */
+  modelCoolCount: number;
+}
+
+/**
+ * 状态分层与「状态」列的标签**同源**，避免排序与显示各算一遍。
+ *
+ * 优先级：禁用 > 账号级冷却 > 排队 > 健康 —— 与状态标签的判定顺序逐字相同。
+ */
+function poolStateRank(acc: GatewayPoolAccount): number {
+  if (acc.disabled) return 4;
+  if (acc.cooling) return 3;
+  if (acc.queued) return 2;
+  return 1;
+}
+
+/** 到期档位的可比较键：`YYYY-MM-DD` → 本地零点毫秒；无档位 = +∞（恒排最后）。 */
+function poolExpiryKey(expireDay: string | undefined): number {
+  if (!expireDay) return Number.POSITIVE_INFINITY;
+  const t = new Date(`${expireDay}T00:00:00`).getTime();
+  return Number.isNaN(t) ? Number.POSITIVE_INFINITY : t;
+}
+
+/**
+ * 「最近成功」的显示文案。
+ *
+ * 用**绝对时刻**（`09-15 13:25`）而不是「12 秒前」：本页每秒都有一次 tick 驱动相对
+ * 时间，但那是页面级状态；把 tick 传进每一行会让整张表每秒重渲染一遍 ——
+ * 十几行 × 每秒一次是没必要的开销，而「最近一次成功是什么时候」看绝对时刻更准。
+ *
+ * **必须显式挡掉 Go 的零值时间**：`pool.Status.LastSuccessTime` 带
+ * `json:",omitempty"`，但 `time.Time` 是结构体、**永远不为空**，因此从未成功过的
+ * 账号会把它序列化成 `"0001-01-01T00:00:00Z"` 发过来。旧实现直接 `new Date()` 格式化，
+ * 于是界面上出现「最近成功 01-01 08:05」这种**编造的日期** —— 真实数据实测截图里
+ * 就有一行是这样（账号从未成功过，却看起来像在元旦早上成功过）。
+ * 判据取「年份 ≤ 1」而不是「等于 1」：Go 零值就是 0001 年，任何真实时间都远大于它。
+ */
+function poolLastSuccessText(acc: GatewayPoolAccount): string {
+  const raw = acc.last_success;
+  if (!raw) return "—";
+  const t = new Date(raw);
+  if (Number.isNaN(t.getTime()) || t.getUTCFullYear() <= 1) return "—";
+  return formatUntil(raw) ?? "—";
+}
+
+/**
+ * 模型冷却角标的**悬浮提示**正文（也与角标的原生 `title` 共用，保证两处文案一致）。
+ *
+ * 文案口径是本轮的硬要求，逐句都有原因：
+ *   1. 先列出**是哪几个模型**、各自还剩多久 —— 不展开就能看到，这是角标存在的理由；
+ *   2. 必须点明「**仅这些模型不可用，其它模型照常可用**」—— 否则用户会误以为这号废了；
+ *   3. 若该账号**同时**有账号级冷却，补一句「账号冷却是整号不可用（换模型也不行）」——
+ *      这两种冷却长得像但后果完全相反，是整块界面最容易误读的地方。
+ */
+function PoolModelCoolingTip({ acc }: { acc: GatewayPoolAccount }) {
+  const modelCools = acc.model_cooling ?? [];
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="font-medium">
+        <AlertTriangle className="mr-1 inline size-3 align-[-2px]" aria-hidden="true" />
+        {modelCools.length} 个模型正在限流
+      </div>
+      {modelCools.map((mc) => (
+        <div key={mc.model} className="flex items-center justify-between gap-3">
+          <span className="font-mono">{mc.model}</span>
+          <span className="shrink-0 tabular-nums opacity-85">
+            {typeof mc.remaining_sec === "number" && mc.remaining_sec > 0
+              ? `剩 ${formatRemaining(mc.remaining_sec)}`
+              : "即将恢复"}
+          </span>
+        </div>
+      ))}
+      {/* 分隔线用 bg-current/15 而不是 border-current：Tailwind v4 里 `border-*` 默认
+          只设宽度，颜色要靠 border-color 工具类；而 border-current 是否被识别成颜色
+          取决于版本，写错就退化成「看不见的线」。一条 1px 的 div 没有这个歧义。 */}
+      <div className="my-0.5 h-px bg-current opacity-15" aria-hidden="true" />
+      <div className="opacity-75">
+        仅这些模型不可用，其它模型照常可用；到期自动恢复。点本行可看完整详情。
+      </div>
+      {acc.cooling ? (
+        <>
+          <div className="my-0.5 h-px bg-current opacity-15" aria-hidden="true" />
+          <div className="opacity-75">
+            注意：本账号还有<strong className="font-medium">账号级冷却</strong>
+            （{poolCoolKindLabel(acc.cool_kind)}），那是<strong className="font-medium">整号不可用</strong>
+            （换模型也不行），与模型限流是两回事。
+          </div>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * 角标的原生 `title` 兜底文案（纯文本版，供 `title` 与读屏使用）。
+ *
+ * 为什么与上面的 JSX 提示并存：Radix 的 Tooltip 需要一个已挂载的 Provider 与
+ * 悬浮/聚焦事件才会出现，而 `title` 在任何情况下都在（键盘 focus、鼠标悬停、
+ * 无 JS 环境）。两处文案口径一致，不构成「信息两套」。
+ */
+function modelCoolingTitle(acc: GatewayPoolAccount): string {
+  const modelCools = acc.model_cooling ?? [];
+  const lines = modelCools.map(
+    (mc) =>
+      `${mc.model}（${
+        typeof mc.remaining_sec === "number" && mc.remaining_sec > 0
+          ? `剩 ${formatRemaining(mc.remaining_sec)}`
+          : "即将恢复"
+      }）`,
+  );
+  const head = `${modelCools.length} 个模型正在限流：${lines.join("、")}`;
+  const tail = "仅这些模型不可用，其它模型照常可用；到期自动恢复。";
+  const accountLevel = acc.cooling
+    ? `注意：本账号还有账号级冷却（${poolCoolKindLabel(acc.cool_kind)}），那是整号不可用（换模型也不行）。`
+    : "";
+  return [head, tail, accountLevel].filter(Boolean).join(" ");
+}
+
+function poolAccountName(acc: GatewayPoolAccount): string {
+  return acc.nickname || acc.uid;
+}
+
+/**
+ * 账号池「概览行 + 二级展开行」。
+ *
+ * 形态在本轮由所有者定为**表格**（草案 `dist/账号池表格-终稿v4.html` 已逐条确认）：
+ * 一账号一行的概览行（箭头 / # / 账号 / 状态 / 消耗 Token / 调用 / 消耗积分 /
+ * 积分余额 / 到期档位），点箭头展开二级行（模型冷却完整列表 + 运行态 + 积分 + UID）。
+ *
+ * **两类冷却必须分开显示**（这是本轮最容易做错的地方）：
+ *   - 账号级（`cooling` / `cool_kind`）→ 「状态」列直接显示（它决定整号能不能接流量，
+ *     最该一眼看到），文案是「余额欠费 / 熔断 / 账号限速 / 冷却中 + 剩余秒」；
+ *   - 模型级（`model_cooling[]`）→ 「状态」列只给**角标计数**（`⚠ N 模型`），
+ *     悬浮提示列出是哪几个、还剩多久，二级行里有完整列表。
+ *   两者可同时存在，且后果完全不同：账号级是「换模型也不行」，模型级是
+ *   「换模型照常可用」。角标的悬浮提示会按这个口径点明（见下）。
  */
 function PoolAccountRow({
-  acc,
-  selectable = false,
-  selected = false,
-  onSelect,
+  metrics,
+  expanded,
+  onToggle,
+  detailId,
+  usageRangeLabel,
+  creditStatsLoaded,
+  stickySessions,
 }: {
-  acc: GatewayPoolAccount;
-  /** 新版布局：卡片可点，点击后把该账号的明细显示在下方。 */
-  selectable?: boolean;
-  /** 是否为当前选中的账号（仅有视觉反馈，不影响数据）。 */
-  selected?: boolean;
-  onSelect?: () => void;
+  metrics: PoolRowMetrics;
+  expanded: boolean;
+  onToggle: () => void;
+  /** 二级行的 DOM id —— 供 `aria-controls` 指向，读屏才知道展开的是哪一块。 */
+  detailId: string;
+  /** 当前日期筛选的中文名（列头 tooltip 与「今日消耗积分」的口径说明都要用）。 */
+  usageRangeLabel: string;
+  /** 宿主是否提供了积分统计；false 时积分消耗列显示「—」而不是假装 0。 */
+  creditStatsLoaded: boolean;
+  /** 网关侧的**池级**粘性会话绑定数（后端没有逐账号口径）。 */
+  stickySessions: number;
 }) {
+  const { acc, total, records, percent, rank, creditUsed, creditToday, balance, expiryKey } = metrics;
   const modelCools = acc.model_cooling ?? [];
+  const coolingModelCount = modelCools.length;
   // 状态标签的优先级：禁用 > 账号级冷却 > 排队 > 健康。
   //
   // 「排队」单独作为一档，因为它最容易让人误判：账号本身完全健康、积分充足，
@@ -916,132 +1239,251 @@ function PoolAccountRow({
         : { label: "健康", cls: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" };
   // 到期日就是选号分层档位：同一 expire_day 的账号在均衡时同级（平均分摊）。
   const expiry = acc.expire_day
-    ? { label: `到期 ${acc.expire_day.slice(5)}`, title: `最近到期积分：${acc.expire_day}（同一天的账号同级平均分摊）` }
-    : { label: "到期未知", title: "尚未取到积分到期信息：会排在其他账号之后，仅在它们不可用时才使用" };
-
-  // 可点时必须用真实的 <button>（而不是给 div 挂 onClick）：键盘 Tab / Enter
-  // 与读屏都依赖原生语义。卡片视觉不变，只去掉 button 的默认样式。
-  const Root = selectable ? "button" : "div";
-  const rootProps = selectable
-    ? {
-        type: "button" as const,
-        onClick: onSelect,
-        "aria-pressed": selected,
-        title: selected ? "再次点击可取消查看该账号的明细" : "点击查看该账号的模型与 Token 明细",
-      }
-    : {};
+    ? { label: acc.expire_day.slice(5), title: `最近到期积分：${acc.expire_day}（同一天的账号同级平均分摊）` }
+    : { label: "未知", title: "尚未取到积分到期信息：会排在其他账号之后，仅在它们不可用时才使用" };
+  // 「#」是**消耗排名**（第 1 名 = 消耗最高），不是行号 —— 这样即使按别的列排序，
+  // 也能立刻看出「这个号在消耗上排第几」。无消耗数据时不给排名（否则会显示一批并列第 1）。
+  const rankLabel = rank > 0 ? String(rank) : "—";
 
   return (
-    // 每个账号是**独立卡片**而非长列表的一行。
-    //
-    // 原因：此前是无边框的行，靠 border-b 分隔；分两列后在列与列之间没有视觉边界，
-    // 且行高随冷却内容参差（有模型冷却的行高一倍），整体看起来像未对齐的拼贴。
-    // 独立卡片 + 栅格 auto-rows-fr 后，同排卡片等高、边界清晰。
-    //
-    // 选中态用 ring 标注（与账号卡片「当前账号」同款做法）：用户点了哪个号，
-    // 下方的明细属于谁必须一眼可见，否则滚动后明细与卡片对不上号。
-    <Root
-      {...rootProps}
-      className={cn(
-        "flex min-w-0 flex-col rounded-xl border p-3 text-left transition-colors",
-        acc.queued && !acc.cooling && !acc.disabled ? "border-dashed border-border/60 bg-muted/20" : "border-border/60 bg-card/40",
-        selectable && "cursor-pointer hover:border-border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40",
-        selected && "border-sky-500/50 bg-sky-500/[0.04] ring-1 ring-sky-500/25",
-      )}
-    >
-      <div className="flex min-w-0 items-start gap-3">
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-medium">{acc.nickname || acc.uid}</div>
-          <div className="truncate font-mono text-[11px] text-muted-foreground/80">{acc.uid}</div>
-        </div>
-        <span
-          className={cn("shrink-0 rounded-md px-1.5 py-0.5 text-[11px] font-medium", state.cls)}
-          title={acc.queued && !acc.cooling && !acc.disabled ? queuedReasonText(acc) : coolReasonText(acc)}
-        >
-          {state.label}
-        </span>
-      </div>
-
-      {/* 运行数据：3 列网格（「剩余积分 / 到期档位 / 成功·在途」）。
-          新旧两版列数完全一致 —— 新版不再额外并入用量列。 */}
-      <div className="mt-2.5 grid grid-cols-3 gap-x-2 gap-y-2 border-t border-border/50 pt-2.5 text-[11px]">
-        <div className="min-w-0">
-          <div className="text-[10px] text-muted-foreground/70">剩余积分</div>
-          <div className="truncate text-[13px] font-medium tabular-nums" title="网关侧记录的最新积分余额">
-            {typeof acc.credits === "number" ? exactTokenFormatter.format(acc.credits) : "—"}
+    <>
+      <tr
+        data-slot="pool-row"
+        data-uid={acc.uid}
+        className={cn(
+          "border-b border-border/40 transition-colors",
+          // 展开态用 --primary 系（与展开箭头、排序激活态同一套，不用 secondary）。
+          expanded ? "bg-primary/[0.04]" : "hover:bg-muted/40",
+        )}
+      >
+        <td className="px-1.5 py-1">
+          <PoolExpandToggle open={expanded} controls={detailId} onClick={onToggle} />
+        </td>
+        <td className="w-8 px-1.5 py-1">
+          <span
+            className={cn(
+              "inline-flex size-[17px] items-center justify-center rounded-[5px] text-[10px] font-medium tabular-nums",
+              rank > 0 && rank <= 3 ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground",
+            )}
+            title="消耗排名（第 1 名 = 本范围内消耗最高）"
+          >
+            {rankLabel}
+          </span>
+        </td>
+        <td className="max-w-[168px] px-2.5 py-0.5">
+          {/* 行高刻意钉在「一行名字 + 一行 uid 前缀」≈ 28px（leading-4 + leading-3）：
+              草稿要求概览行约 30px/行、一屏十几个账号。不给显式 leading 的话
+              Tailwind 的默认行高（1.5×）会把两行撑到 34px，行高直接多出 20%。 */}
+          <div className="truncate text-[12.5px] font-medium leading-4" title={acc.nickname || acc.uid}>
+            {acc.nickname || acc.uid}
           </div>
-        </div>
-        <div className="min-w-0">
-          <div className="text-[10px] text-muted-foreground/70">到期档位</div>
-          <div className="truncate text-[13px] font-medium tabular-nums" title={expiry.title}>
-            {acc.expire_day ? acc.expire_day.slice(5) : "未知"}
+          {/* uid 在概览行给短前缀（完整值在二级行「积分」块里，信息不丢），
+              因为 36 字符的 uuid 会把「账号」列撑到吃掉「消耗」列的宽度。 */}
+          <div className="truncate font-mono text-[10px] leading-3 text-muted-foreground/80" title={acc.uid}>
+            {acc.uid.slice(0, 8)}
           </div>
-        </div>
-        <div className="min-w-0">
-          <div className="text-[10px] text-muted-foreground/70">成功 / 在途</div>
-          <div className="truncate text-[12px] tabular-nums text-muted-foreground">
-            <span className={cn(typeof acc.success_count === "number" && acc.success_count > 0 && "text-foreground/80")}>
-              {typeof acc.success_count === "number" && acc.success_count > 0 ? exactTokenFormatter.format(acc.success_count) : "—"}
+        </td>
+        <td className="px-2.5 py-1">
+          <span className="inline-flex flex-wrap items-center gap-1">
+            {/* 账号级冷却 —— 决定整号能不能接流量，直接显示。 */}
+            <span
+              className={cn("shrink-0 whitespace-nowrap rounded-md px-1.5 py-0.5 text-[11px] font-medium", state.cls)}
+              title={acc.queued && !acc.cooling && !acc.disabled ? queuedReasonText(acc) : coolReasonText(acc)}
+            >
+              {state.label}
+              {acc.cooling ? ` · ${poolCoolKindLabel(acc.cool_kind)}` : ""}
+              {acc.cooling && typeof acc.cool_remaining_sec === "number" && acc.cool_remaining_sec > 0
+                ? ` ${formatRemaining(acc.cool_remaining_sec)}`
+                : ""}
             </span>
-            {" / "}
-            <span className={cn(acc.in_flight ? "text-foreground/80" : "")}>{acc.in_flight ?? 0}</span>
-          </div>
-        </div>
-      </div>
+            {/* 模型级冷却 —— 只有角标计数 + 悬浮明细（避免在概览行铺开一长串模型名）。 */}
+            {coolingModelCount > 0 ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  {/*
+                    角标用**真实的 `<button>`**（外层 Badge 只提供既有 shadcn 样式）：
+                    Radix 的 Tooltip 在 focus 时也会打开，键盘用户因此同样能看到明细；
+                    用 span 的话这一处提示对键盘与读屏完全不可达。
 
-      {/* 冷却明细：区分「余额欠费」（账号级）与「模型冷却」（仅单个模型）。
-          「模型冷却只影响该模型」这句已上提到区块顶部统一说明，
-          不再逐账号重复 —— 14 个账号会重复 14 遍，纯噪音。 */}
-      {acc.cooling || modelCools.length > 0 ? (
-        <div className="mt-2 flex flex-col gap-1 border-t border-border/50 pt-2 text-[11px]">
-          {acc.cooling ? (
-            <div className="flex min-w-0 items-center gap-2">
-              <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 font-medium text-amber-700 dark:text-amber-400">
-                {acc.cool_kind === "hard_credit" ? "余额欠费" : acc.cool_kind === "breaker" ? "熔断" : "账号限速"}
-              </span>
-              <span className="min-w-0 flex-1 truncate text-muted-foreground" title={coolReasonText(acc)}>
-                {coolReasonText(acc)}
-              </span>
-              {typeof acc.cool_remaining_sec === "number" && acc.cool_remaining_sec > 0 ? (
-                <span className="shrink-0 tabular-nums text-muted-foreground">
-                  剩余 {formatRemaining(acc.cool_remaining_sec)}
-                </span>
-              ) : null}
-            </div>
-          ) : null}
-          {modelCools.map((mc) => {
-            const until = formatUntil(mc.until);
-            return (
-              <div key={mc.model} className="flex min-w-0 items-center gap-2">
-                <span className="shrink-0 rounded bg-sky-500/15 px-1.5 py-0.5 font-medium text-sky-700 dark:text-sky-400">
+                    刻意**不用** `title`：Radix 的提示会先出现，原生 `title` 约一秒后再
+                    叠一个几乎一样的黑框，看起来像两个提示打架。兜底文案改用 `aria-label`
+                    （读屏必然读到，视觉上不出第二个框）。
+
+                    用 `data-pool-badge` 而不是 `data-slot`：Badge 与 TooltipTrigger 这对
+                    asChild 组合会合并 props，`data-slot` 会被 Radix 的值占掉，测试按它
+                    取元素会取到别的部件（既有的区域标签就踩过这个坑）。
+                  */}
+                  <Badge
+                    asChild
+                    variant="outline"
+                    className="pool-mbadge gap-1 py-0 text-[11px] font-medium"
+                  >
+                    <button
+                      type="button"
+                      data-pool-badge="model-cooling"
+                      aria-label={modelCoolingTitle(acc)}
+                    >
+                      <AlertTriangle className="size-3 shrink-0" aria-hidden="true" />
+                      {coolingModelCount} 模型
+                    </button>
+                  </Badge>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" align="start" className="max-w-sm">
+                  <PoolModelCoolingTip acc={acc} />
+                </TooltipContent>
+              </Tooltip>
+            ) : null}
+          </span>
+        </td>
+        <td className="px-2.5 py-1 text-right">
+          <div className="flex items-center justify-end gap-1.5">
+            <span
+              className={cn("tabular-nums", total > 0 ? "text-foreground/90" : "text-muted-foreground")}
+              title={`${exactTokenFormatter.format(total)} tokens（${usageRangeLabel}）`}
+            >
+              {total > 0 ? formatUsageCompact(total) : "—"}
+            </span>
+            <PoolUsageBar percent={percent} />
+          </div>
+        </td>
+        <td
+          className={cn("px-2.5 py-1 text-right tabular-nums", records > 0 ? "text-foreground/90" : "text-muted-foreground")}
+          title={records > 0 ? `${exactTokenFormatter.format(records)} 次成功请求（${usageRangeLabel}）` : undefined}
+        >
+          {records > 0 ? exactTokenFormatter.format(records) : "—"}
+        </td>
+        <td
+          className={cn(
+            "px-2.5 py-1 text-right tabular-nums",
+            creditUsed && creditUsed > 0 ? "text-foreground/90" : "text-muted-foreground",
+          )}
+          title={
+            creditUsed === null
+              ? "「全部」范围给不出可信的积分消耗：积分快照只保留 30 天"
+              : `账号库积分记录里累计的消耗（${usageRangeLabel}）`
+          }
+        >
+          {creditUsed !== null && creditUsed > 0 ? exactTokenFormatter.format(Math.round(creditUsed)) : "—"}
+        </td>
+        <td className="px-2.5 py-1 text-right">
+          <span
+            className={cn("tabular-nums", balance !== null ? "text-foreground/90" : "text-muted-foreground")}
+            title="网关侧记录的最新积分余额（与账号管理页的实时查询口径不同，可能差一个刷新周期）"
+          >
+            {balance !== null ? exactTokenFormatter.format(balance) : "—"}
+          </span>
+        </td>
+        <td className="px-2.5 py-1">
+          <span
+            className={cn("tabular-nums", Number.isFinite(expiryKey) ? "text-foreground/90" : "text-muted-foreground")}
+            title={expiry.title}
+          >
+            {expiry.label}
+          </span>
+        </td>
+      </tr>
+
+      {expanded ? (
+        <tr data-slot="pool-detail-row" data-uid={acc.uid} className="border-b border-border/40 bg-muted/25">
+          <td colSpan={9} className="px-0">
+            <div id={detailId} className="flex flex-col gap-3 py-2.5 pl-12 pr-3">
+              {/* ---------- 1. 模型冷却：完整列表 ---------- */}
+              <div className="flex flex-col gap-1.5">
+                <div className="flex flex-wrap items-center gap-1.5 text-[10.5px] font-medium uppercase tracking-wide text-muted-foreground">
                   模型冷却
-                </span>
-                <span className="min-w-0 flex-1 truncate font-mono text-muted-foreground" title={mc.reason || mc.model}>
-                  {mc.model}
-                </span>
-                <span
-                  className="shrink-0 tabular-nums text-muted-foreground"
-                  title={
-                    mc.reset_at_parsed === false
-                      ? "上游报错里未给出可解析的重置时间，按固定软冷却时长处理"
-                      : until
-                        ? `预计 ${until} 恢复`
-                        : undefined
-                  }
-                >
-                  {until ? `${until} 恢复` : ""}
-                  {typeof mc.remaining_sec === "number" && mc.remaining_sec > 0
-                    ? `（剩 ${formatRemaining(mc.remaining_sec)}）`
-                    : ""}
-                </span>
+                  {coolingModelCount > 0 ? (
+                    <span className="font-normal normal-case tracking-normal text-muted-foreground">
+                      {coolingModelCount} 个 · 仅这些模型不可用，换模型仍可用
+                    </span>
+                  ) : null}
+                </div>
+                {coolingModelCount > 0 ? (
+                  <div className="flex flex-col gap-1">
+                    {modelCools.map((mc) => (
+                      <div
+                        key={mc.model}
+                        data-slot="pool-model-cooling-item"
+                        className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2.5 rounded-lg border border-amber-500/25 bg-amber-500/[0.07] px-2.5 py-1 text-[11.5px]"
+                      >
+                        <span className="truncate font-mono font-medium" title={mc.model}>
+                          {mc.model}
+                        </span>
+                        <span className="shrink-0 tabular-nums text-amber-700 dark:text-amber-400">
+                          {typeof mc.remaining_sec === "number" && mc.remaining_sec > 0
+                            ? `剩 ${formatRemaining(mc.remaining_sec)}`
+                            : "即将恢复"}
+                        </span>
+                        <span className="max-w-[300px] truncate text-[10.5px] text-muted-foreground" title={mc.reason || mc.model}>
+                          {mc.reason || `${formatUntil(mc.until) ?? "到期"}后自动恢复`}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-[11px] text-muted-foreground">该账号当前没有模型级限流</div>
+                )}
               </div>
-            );
-          })}
-          {/* 「只影响上述模型」这句全局提示已上提到账号池区块顶部，
-              此处不再逐账号重复（14 个账号会重复 14 遍，纯噪音）。 */}
-        </div>
+
+              {/* ---------- 2. 运行态 ---------- */}
+              <div className="flex flex-col gap-1.5">
+                <div className="text-[10.5px] font-medium uppercase tracking-wide text-muted-foreground">运行态</div>
+                <div className="grid grid-cols-[repeat(auto-fill,minmax(172px,1fr))] gap-x-4 gap-y-0.5 text-[11.5px]">
+                  <PoolKV k="在途请求" v={String(acc.in_flight ?? 0)} />
+                  <PoolKV
+                    k="成功 / 失败"
+                    v={`${typeof acc.success_count === "number" ? exactTokenFormatter.format(acc.success_count) : "—"} / ${
+                      typeof acc.err_total === "number" ? exactTokenFormatter.format(acc.err_total) : "—"
+                    }`}
+                  />
+                  <PoolKV k="最近成功" v={poolLastSuccessText(acc)} />
+                  {/* 冷却原因在「状态」列已有短标签，这里给完整一句（同样是账号级冷却）。 */}
+                  <PoolKV k="账号冷却" v={acc.cooling ? coolReasonText(acc) : "—"} />
+                  {/* 粘性会话是**池级**计数（网关 /status 的 sticky_sessions），不是逐账号的。
+                      标成「池级」而不是编一个逐账号数字：后端拿不到按账号的绑定数。 */}
+                  <PoolKV k="粘性会话" v={`${stickySessions}（池级）`} />
+                </div>
+              </div>
+
+              {/* ---------- 3. 积分 ---------- */}
+              <div className="flex flex-col gap-1.5">
+                <div className="text-[10.5px] font-medium uppercase tracking-wide text-muted-foreground">积分</div>
+                <div className="grid grid-cols-[repeat(auto-fill,minmax(172px,1fr))] gap-x-4 gap-y-0.5 text-[11.5px]">
+                  <PoolKV
+                    k="今日消耗积分"
+                    v={
+                      // 刻意给**今日**这一档，而不是复述上面的筛选范围：`CreditStatisticsResource`
+                      // 里只有今日 / 近 7 天 / 本月三个窗口，「近 30 天」与「全部」都落回本月，
+                      // 复述筛选范围会把「本月」说成「近 30 天」。列名如实写「今日」。
+                      creditStatsLoaded
+                        ? exactTokenFormatter.format(Math.round(creditToday ?? 0))
+                        : "—"
+                    }
+                  />
+                  <PoolKV
+                    k="剩余积分"
+                    v={balance !== null ? exactTokenFormatter.format(balance) : "—"}
+                  />
+                  <PoolKV k="最近到期" v={acc.expire_day ?? "未知"} />
+                  <PoolKV k="UID" v={acc.uid} mono />
+                </div>
+              </div>
+            </div>
+          </td>
+        </tr>
       ) : null}
-    </Root>
+    </>
+  );
+}
+
+/** 二级行里的一对「标签 / 值」。 */
+function PoolKV({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
+  return (
+    <span className="flex min-w-0 items-baseline gap-2">
+      <span className="shrink-0 text-muted-foreground">{k}</span>
+      <span className={cn("min-w-0 truncate tabular-nums", mono && "font-mono")} title={v}>
+        {v}
+      </span>
+    </span>
   );
 }
 
@@ -1282,19 +1724,6 @@ export default function GatewayPage() {
   const [modelFilter, setModelFilter] = useState<string[]>([]);
 
   /**
-   * 新版布局下被点选的账号（池 uid；空串 = 未选）。
-   *
-   * 这是新版**唯一**的交互差异（所有者原话：「默认跟旧版的一样，只不过左侧
-   * 可以通过点击账号的方式来显示左边的模型 token 信息」）：点卡片即把该账号
-   * 的模型 / Token 明细显示在下方。
-   *
-   * 不复用 `usageAccountFilter`（那是下拉筛选）：两者语义不同 —— 下拉是
-   * 「我要持续盯这个号」，卡片点选是「我随手点开看一眼」。共用一个状态会让
-   * 点卡片把下拉也改掉，用户在另一个区块的选择被悄悄覆盖。
-   */
-  const [selectedPoolUid, setSelectedPoolUid] = useState<string>("");
-
-  /**
    * 「Token 用量」区块里的**双向联动交叉筛选**。
    *
    * 所有者原话：「他不是左右两侧面板么?左边是模型,右边是账号,我希望可以**点击右边
@@ -1308,10 +1737,9 @@ export default function GatewayPage() {
    *
    * 均以「再点一次 = 取消选择」的 toggle 语义工作。
    *
-   * 为什么**不复用** `selectedPoolUid`（新版点账号卡片那个）：那个选的是**账号池卡片**
-   * 的 uid，作用是把明细面板显示出来，筛选条件刻意不出现在用量区块里；而这里是
-   * 「用量区块内部两个列表互相收窄」。共用一个状态会让「在账号池点了张卡片」顺手
-   * 把用量列表也筛掉，而用户根本没往那边看。反过来亦然。
+   * 注意：账号池那一侧本轮已**没有**任何「选中」状态（所有者决定：去掉选中功能，
+   * 展开是就地看详情、不是挑一个对象当筛选条件）。因此这里不存在与账号池
+   * 抢状态的问题 —— 账号池的行展开状态是 `poolExpandedUids`，只影响它自己。
    */
   const [usageCrossFilter, setUsageCrossFilter] = useState<
     { kind: "model"; key: string } | { kind: "account"; key: string } | null
@@ -2057,26 +2485,198 @@ export default function GatewayPage() {
     return usageAccounts.filter((a) => users.has(a.key));
   }, [usageAccounts, usageCrossFilter, usageAccountModels, accountKeysByModel]);
 
+  const usageScopeAccount = usageCrossFilter?.kind === "account" ? usageCrossFilter.key : "";
+  const usageScopeModel = usageCrossFilter?.kind === "model" ? usageCrossFilter.key : "";
+
   /**
-   * 占比条的百分**基准**：一律用**未经任何筛选的全量**峰值，而不是筛选后集合的峰值。
+   * `accountModels` 的二级索引：uid → (模型名 → 该账号在该模型上的计量)。
    *
-   * 理由（本条的取舍是刻意的，不是随手取的）：
-   *   - 用筛选后集合当基准时，每个筛选状态下条最高的那条**永远顶满 100%**。于是
-   *     「点账号前后、点模型前后」条的长度几乎不变 —— 用户看不到筛选到底改变了
-   *     多少，也就失去了「这个账号/模型占整体多大」这个本区块最该回答的问题。
-   *   - 用全量基准时，筛选生效会直接表现为**所有条一起变短**，这本身就是「当前
-   *     正在按某个条件筛选」的视觉反馈，与下面的提示条互为印证。
+   * 为什么单独建这一层：换口径后**每一行**都要按「另一侧的那一项」反查一次
+   * （点账号 → 左侧每个模型查一次；点模型 → 右侧每个账号查一次）。直接在原始数组里
+   * `find` 是 O(行数 × 该账号模型数)，真实数据下模型 30 个、账号 18 个，每次交互就
+   * 多出几百次线性扫描；建索引一次 O(总数)，之后每行 O(1)。
    *
-   * 代价与补偿：小账号被筛出来时条会短到接近不可见。但条只是**相对**度量，右侧
-   * 的精确数值与下方 meta（调用次数 · 输入/输出）在任何筛选下都照实显示，因此
-   * 「信息一条都没少」—— 这也是所有者明确要求过的。
-   *
-   * 注意基准用 `usageModelsAll` / `usageAccountsAll`（网关在该统计范围内的全量），
-   * **不随** ModelFilter 或交叉筛选变化；但**随**「今日/近 7 天/近 30 天/全部」
-   * 变化 —— 那是统计口径，不是筛选，换了口径本就应该重新归一。
+   * 索引值就是网关给的 `GatewayUsageGroup`（含 total/records/input/output…），
+   * 因此换口径时可以把这些字段**整体**铺到行上，不需要任何前端二次累加 ——
+   * 少一次自己算，就少一处口径漂移的机会（本项目的老教训）。
    */
-  const usageMaxModel = maxOf(usageModelsAll.map((m) => m.total));
-  const usageMaxAccount = maxOf(usageAccountsAll.map((a) => a.total));
+  const crossByUidModel = useMemo(() => {
+    const map = new Map<string, Map<string, GatewayUsageGroup>>();
+    if (!usageAccountModels) return map;
+    for (const [uid, models] of Object.entries(usageAccountModels)) {
+      const inner = new Map<string, GatewayUsageGroup>();
+      for (const model of models) inner.set(model.key, model);
+      map.set(uid, inner);
+    }
+    return map;
+  }, [usageAccountModels]);
+
+  /**
+   * 「点账号 → 左侧每行的数值换成该账号在该模型上的量」—— 本次语义修正的**核心**。
+   *
+   * 之前这里只做了「筛掉不相关的行」，没做「换值」：留下的行仍显示全局聚合
+   * `model.total`。单模型范围下筛完还是那一行、数字逐字相同，于是所有者点了账号
+   * 看不到任何变化，说出「点击右侧账号,但是左侧模型的消耗量并没有变,所以我才说不对」。
+   *
+   * 现在的语义（所有者已确认）：
+   *   - 列表内容：仍筛掉无关行（不变）；
+   *   - **每行数值**：换成该账号 × 该模型的量。数据取自网关的 `accountModels`，
+   *     即「由网关侧记录时直接累计」的权威交叉值，前端不做任何二次推导；
+   *   - **meta（调用/输入/输出）**：同样换成该账号的 —— 只换总数而留着全局调用次数
+   *     会造出「一亿 tokens 却 0 次调用」这种自相矛盾的行；
+   *   - **占比条基准**：换成该账号内的峰值（见 usageMaxModelScoped）。
+   *
+   * 关于「明细缺失」这条兜底路径（真实数据里必然遇到，不能丢）：
+   * `accountModels` 可能只覆盖部分日期 —— 所有者真实 `usage.json` 里
+   * `models`/`accounts` 覆盖 09-13~09-17 共 5 天，而 `accountModels` 只有 09-16/09-17。
+   * 因此这里**只对「明细里确实有这一格」的行换值**：查不到就原样保留该行的全局数值，
+   * 绝不清零。清零等于把「网关没记明细」渲染成「该账号在这个模型上没用量」—— 那正是
+   * 本次需求里最不能犯的假结论（用户右边明明看到该账号有 2287 次调用）。
+   * 真正「查不到」另有两条出口：该账号在明细里完全缺席时列表本就为空（走
+   * usageCrossItemBlank 的「拿不到明细」文案），部分缺席时走 usageCrossItemPartial
+   * 的「列表可能不全」提示。
+   */
+  const usageModelsDisplay = useMemo(() => {
+    if (!usageScopeAccount || !usageAccountModels) return usageModelsScoped;
+    const byModel = crossByUidModel.get(usageScopeAccount);
+    if (!byModel) return usageModelsScoped;
+    return usageModelsScoped.map((model) => {
+      const hit = byModel.get(model.key);
+      // 查不到 → 原样返回（保留全局值），而不是清零。理由见上面的长注释。
+      if (!hit) return model;
+      return {
+        ...model,
+        total: hit.total ?? 0,
+        records: hit.records ?? 0,
+        input: hit.input ?? 0,
+        output: hit.output ?? 0,
+        cacheWrite: hit.cacheWrite ?? 0,
+        cacheRead: hit.cacheRead ?? 0,
+      };
+    });
+  }, [usageModelsScoped, usageScopeAccount, usageAccountModels, crossByUidModel]);
+
+  /**
+   * 「点模型 → 右侧每行的数值换成该模型在该账号上的量」—— 反方向同理。
+   *
+   * 所有者的要求是**双向**的（「点账号换模型的数字，点模型换账号的数字」）。
+   * 反查的格子在正常情况下必然存在（右侧列表就是从 accountKeysByModel 筛出来的），
+   * 但这里仍按「查不到就不动」处理 —— 与正向保持同一条兜底规则，避免两个方向在
+   * 边界上给出不同答案。
+   */
+  const usageAccountsDisplay = useMemo(() => {
+    if (!usageScopeModel || !usageAccountModels) return usageAccountsScoped;
+    return usageAccountsScoped.map((account) => {
+      const hit = crossByUidModel.get(account.key)?.get(usageScopeModel);
+      if (!hit) return account;
+      return {
+        ...account,
+        total: hit.total ?? 0,
+        records: hit.records ?? 0,
+        input: hit.input ?? 0,
+        output: hit.output ?? 0,
+        cacheWrite: hit.cacheWrite ?? 0,
+        cacheRead: hit.cacheRead ?? 0,
+      };
+    });
+  }, [usageAccountsScoped, usageScopeModel, usageAccountModels, crossByUidModel]);
+
+  /**
+   * 占比条的百分**基准**：随**口径**走，而不是永远用全局峰值。
+   *
+   *   - 未点任何一项 → 全局峰值，回答「谁占整体大头」；
+   *   - 点账号 → **该账号内**的峰值。回答「在这个号里谁占大头」。
+   *     这同时解决了旧基准的一个视觉死角：被点的那个号里所有模型的条长之和本就只是
+   *     全局的一小块，条**普遍很短**，看起来像「这个号几乎没用」；换成账号内归一后
+   *     条长重新铺满，内部结构一眼可辨；
+   *   - 点模型 → **该模型在各账号上**的峰值（右侧列表）。回答「这个模型主要被谁用了」。
+   *
+   * 与「筛选」的分界（刻意划定的，有测试锁着）：基准只随**口径**（今日/近 7 天/…、
+   * 点了哪一项）变，**不随**顶部 ModelFilter 变 —— ModelFilter 是「我要看哪几个模型」
+   * 的展示收窄，若基准也跟着收窄，勾一个模型就会让所有条重新顶满，用户反而看不出
+   * 「它在总量里占多少」。
+   *
+   * 取峰值时一律用**未经行筛选**的完整集合（该账号的全部模型 / 用过该模型的所有
+   * 账号）：若只用筛出来的那几行，被筛掉的那个恰好是峰值时，剩下的条会莫名其妙顶满。
+   *
+   * 明细缺失时退回全局基准：拿不到交叉明细就得不到「该账号内的峰值」，而用 0 当基准
+   * 会让所有条宽归零 —— 等于把「拿不到明细」画成「没有用量」。
+   */
+  const usageMaxModelScoped = useMemo(() => {
+    if (usageScopeAccount && usageAccountModels) {
+      const owned = usageAccountModels[usageScopeAccount];
+      if (owned && owned.length > 0) return maxOf(owned.map((m) => m.total));
+    }
+    return maxOf(usageModelsAll.map((m) => m.total));
+  }, [usageScopeAccount, usageAccountModels, usageModelsAll]);
+
+  const usageMaxAccountScoped = useMemo(() => {
+    if (usageScopeModel && usageAccountModels) {
+      const values: number[] = [];
+      for (const inner of crossByUidModel.values()) {
+        const hit = inner.get(usageScopeModel);
+        if (hit) values.push(hit.total ?? 0);
+      }
+      if (values.length > 0) return maxOf(values);
+    }
+    return maxOf(usageAccountsAll.map((a) => a.total));
+  }, [usageScopeModel, usageAccountModels, crossByUidModel, usageAccountsAll]);
+
+  /**
+   * 顶部四张汇总卡的口径。
+   *
+   * 所有者明确选了「跟着变」：点了账号后界面进入「这个账号的视角」，上面四张卡与
+   * 下面两个列表处处一致。反面（不变）会造出「上面 1238.3M、下面 199.7M」两个数字
+   * 并存的局面 —— 那正是所有者本轮抱怨的同一类问题的镜像。
+   *
+   * 为什么「跟着变」之外还必须再加一条常驻口径条（见 JSX 里的
+   * `data-slot="usage-scope-bar"`）：只把数字换掉而不说明换成了什么口径，用户会以为
+   * **总量掉了 / 数据丢了**。口径条把「当前只统计这一个账号」写在数字紧上方，
+   * 两处互为解释。这是所有者确认过的设计（草稿「当前口径：账号 <uid 前 8 位>」）。
+   *
+   * 取值优先级：明细里有该格 → 用交叉值；明细缺失 → 退回该账号在该范围内的聚合值
+   * （`usageAccountsAll` 里的 total/records/…）。退而求其次而不是显示 0，与上面两条
+   * 兜底规则一致：**绝不把「明细缺失」渲染成「没有用量」**。
+   */
+  const usageSummaryDisplay = useMemo(() => {
+    if (!usageCrossFilter || !usageSummary) return usageSummary;
+    if (usageScopeAccount) {
+      const hit = crossByUidModel.get(usageScopeAccount);
+      if (hit) {
+        const sum = (pick: (m: GatewayUsageGroup) => number) =>
+          [...hit.values()].reduce((acc, m) => acc + (pick(m) ?? 0), 0);
+        const input = sum((m) => m.input);
+        const cacheRead = sum((m) => m.cacheRead);
+        return {
+          ...usageSummary,
+          total: sum((m) => m.total),
+          records: sum((m) => m.records),
+          input,
+          output: sum((m) => m.output),
+          cacheWrite: sum((m) => m.cacheWrite),
+          cacheRead,
+          uncachedInput: sum((m) => m.uncachedInput),
+          // 命中率要跟着重算：直接沿用全局值会让「这个号」的输入与命中率对不上。
+          cacheHitRate: input > 0 ? cacheRead / input : null,
+        };
+      }
+      const account = usageAccountsAll.find((a) => a.key === usageScopeAccount);
+      return account ? { ...usageSummary, ...account, key: undefined } : usageSummary;
+    }
+    if (usageScopeModel) {
+      const model = usageModelsAll.find((m) => m.key === usageScopeModel);
+      return model ? { ...usageSummary, ...model, key: undefined } : usageSummary;
+    }
+    return usageSummary;
+  }, [
+    usageCrossFilter,
+    usageSummary,
+    usageScopeAccount,
+    usageScopeModel,
+    crossByUidModel,
+    usageAccountsAll,
+    usageModelsAll,
+  ]);
 
   const usageNickname = useMemo(() => {
     const map = new Map<string, string>();
@@ -2212,98 +2812,134 @@ export default function GatewayPage() {
     return map;
   }, [creditStats, usageRange, uidByAccountId]);
 
-  /** 当前日期筛选的中文名，用于卡片列头的 tooltip。 */
+  /** 当前日期筛选的中文名，用于表格列头的 tooltip。 */
   const usageRangeLabel = USAGE_RANGE_OPTIONS.find((o) => o.key === usageRange)?.label ?? "统计范围";
 
   /**
-   * 新版布局的进度条与排序：**一律以「消耗 Token」为唯一指标**。
+   * 网关池 uid → **今日**消耗积分（二级行「积分」块用）。
    *
-   * 为什么不用「消耗积分」（两列都在，必须选一个明确的）：
-   *   - 积分消耗来自 `/api/credits/stats`，它只有今日 / 近 7 天 / 本月三个窗口，
-   *     而本页的筛选有四项。选「全部」时该接口给不出可信值（积分快照只保留
-   *     30 天），于是整批账号的积分消耗都是 0 —— 按它排序会得到**一个看似
-   *     正常、实则毫无意义的顺序**，这比不排序更误导。
-   *   - Token 用量来自网关 `/usage`，四个窗口都由网关按日聚合后过滤，
-   *     任何筛选下都有完整数据。
-   * 因此进度条与排序都用 Token；积分仍以「消耗积分」列呈现，只是不参与排序
-   * （排序依据只有一个时，用户才能解释「为什么这个号排在前面」）。
+   * 为什么不复用 `creditUsedByUid`：那一份跟着上面的日期筛选走，而二级行的
+   * 「今日消耗积分」是**固定档**（列名已经写明「今日」）。`CreditStatisticsResource`
+   * 只有今日 / 近 7 天 / 本月三个窗口——「近 30 天」与「全部」都落回本月，
+   * 所以二级行不能复述筛选范围，否则「本月」会被说成「近 30 天」。
    *
-   * 下面几步刻意**不用 useMemo**：数据量是账号数（十几条），而本页每秒都有
-   * 一次重渲染（驱动「上次更新 x 秒前」），缓存省下的遍历远小于维护依赖数组
-   * 的成本 —— 更别说依赖写错时会拿到上一轮的旧排序，那才是真麻烦。
+   * 与上面同样的键换算：统计接口按账号库 `id` 分组，而池里是 `uid`。
    */
+  const creditTodayByUid = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const a of creditStats?.accounts ?? []) {
+      const uid = uidByAccountId.get(a.accountId);
+      if (!uid) continue;
+      map.set(uid, a.usageToday ?? 0);
+    }
+    return map;
+  }, [creditStats, uidByAccountId]);
 
-  /** uid → 该账号在当前范围内的 Token 消耗（无数据按 0）。 */
-  const usageTotalByUid = new Map<string, number>();
-  for (const account of poolAccounts) {
-    usageTotalByUid.set(account.uid, usageByUid.get(account.uid)?.total ?? 0);
+  /**
+   * 账号池表格的行指标：**当前排序与列显示的唯一数据源**。
+   *
+   * 为什么排序与显示必须同源：`#`（消耗排名）与「消耗 Token」列若各算一遍，
+   * 一旦有一处口径不同（比如排名把无数据的算 0、列却显示「—」），
+   * 就会出现「第 3 名显示 0」这种自相矛盾的行，而这正是最难解释的一类 bug。
+   *
+   * 这几步刻意**不用 useMemo**：数据量是账号数（十几条），而本页每秒都有
+   * 一次重渲染（驱动「上次更新 x 秒前」），缓存省下的遍历远小于维护依赖数组的
+   * 成本 —— 更别说依赖写错时会拿到上一轮的旧排序，那才是真麻烦。
+   */
+  const poolRows: PoolRowMetrics[] = (() => {
+    // 「消耗占比条」的 100% 参照物 = **本批账号里的最高消耗**。
+    //
+    // 不用固定上限（如「按额度算百分比」）：所有者的要求是「谁的最长就以谁为
+    // 参照物」。固定上限在用量普遍很低时会让所有条都缩成一条线，反而看不出
+    // 相对高低 —— 而「谁烧得多」正是这列要回答的问题。
+    // maxOf 的下限是 1，因此下面算比例时不会除零。
+    const totals = poolAccounts.map((acc) => usageByUid.get(acc.uid)?.total ?? 0);
+    const max = maxOf(totals);
+    const rows = poolAccounts.map((acc) => {
+      const usageRow = usageByUid.get(acc.uid);
+      const total = usageRow?.total ?? 0;
+      // 「全部」范围给不出可信的积分消耗（积分快照只保留 30 天），显示「—」而不是 0——
+      // 0 会被读成「这个号今天没消耗」，而事实是「这个范围查不到」。
+      const creditUsed =
+        usageRange === "all" ? null : (creditUsedByUid.get(acc.uid) ?? (creditStats ? 0 : null));
+      return {
+        acc,
+        total,
+        records: usageRow?.records ?? 0,
+        percent: Math.round((total / max) * 100),
+        // 排名先占位，下面按消耗排序后统一回填。
+        rank: 0,
+        creditUsed,
+        creditToday: creditStats ? (creditTodayByUid.get(acc.uid) ?? 0) : null,
+        balance: typeof acc.credits === "number" ? acc.credits : null,
+        expiryKey: poolExpiryKey(acc.expire_day),
+        stateRank: poolStateRank(acc),
+        modelCoolCount: (acc.model_cooling ?? []).length,
+      } satisfies PoolRowMetrics;
+    });
+    // 「#」列是**消耗排名**（第 1 名 = 消耗最高），不是行号 —— 这样即使按别的列
+    // 排序，也能立刻看出「这个号在消耗上排第几」。并列时同名次之后跳号。
+    [...rows]
+      .filter((row) => row.total > 0)
+      .sort((left, right) => right.total - left.total)
+      .forEach((row, index) => {
+        row.rank = index + 1;
+      });
+    return rows;
+  })();
+
+  /**
+   * 表格的排序状态。默认「消耗 Token 降序」（所有者确认过的默认）。
+   *
+   * 旧版（classic）走另一条路（见 `poolRowMetricsForClassic`），不读这个状态：
+   * 旧版的契约是「默认观感与升级前逐字一致」，不能被排序悄悄改掉顺序。
+   */
+  const [poolSort, setPoolSort] = useState<{ key: PoolSortKey; dir: "asc" | "desc" }>({
+    key: "tokens",
+    dir: "desc",
+  });
+
+  /** 点表头：同一列再点一次切升降序，换列则用该列的默认方向。 */
+  function togglePoolSort(key: PoolSortKey) {
+    setPoolSort((current) =>
+      current.key === key
+        ? { key, dir: current.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: POOL_SORT_DEFAULT_DIR[key] },
+    );
+  }
+
+  /** 展开的行（uid 集合）—— 可同时展开多行，便于对比两三个账号。 */
+  const [poolExpandedUids, setPoolExpandedUids] = useState<string[]>([]);
+  const poolExpandedSet = new Set(poolExpandedUids);
+  const poolAllExpanded = poolAccounts.length > 0 && poolExpandedUids.length === poolAccounts.length;
+
+  function togglePoolExpanded(uid: string) {
+    setPoolExpandedUids((current) =>
+      current.includes(uid) ? current.filter((item) => item !== uid) : [...current, uid],
+    );
   }
 
   /**
-   * 本批账号里的最高消耗 —— 进度条的 100% 参照物。
+   * 表格展示顺序：按当前排序列 + 方向排序。
    *
-   * 不用固定上限（如「按额度算百分比」）：所有者的要求是「谁的最长就以谁为
-   * 参照物」。固定上限在用量普遍很低时会让所有条都缩成一条线，反而看不出
-   * 相对高低 —— 而「谁烧得多」正是这块要回答的问题。
-   * maxOf 的下限是 1，因此下面算比例时不会除零。
+   * **「拿不到值」的行永远垫底，且不随升降序翻转**（判定见 `poolCellBlank`）。
+   * 这是本实现第一版真实踩到的坑：把「无数据」当成 0 参与比较，升序时它们会全部
+   * 冲到最前面 —— 一屏「—」看起来像表坏了（实测 uid-4 冲到了第一位）。
+   *
+   * 比较结果相同时不交换（`sort` 在 V8 上是稳定的）——「还没拿到数据」与
+   * 「真的都没消耗」都不会把网关原序打乱成随机顺序。
    */
-  const poolMaxUsage = maxOf([...usageTotalByUid.values()]);
-
-  /**
-   * 卡片展示顺序：新版按 Token 消耗降序，旧版保持网关返回的原序。
-   *
-   * 旧版必须原序：默认布局的观感不能变（所有者明确要求），而排序本身是
-   * 新版进度条的配套 —— 没有进度条时，一个悄悄变化的顺序只会让人找不到账号。
-   *
-   * 全部为 0（无数据 / 该范围无消耗）时比较恒为 0，`sort` 在 V8 上是稳定的，
-   * 于是保留原序 —— 「还没拿到数据」与「真的都没消耗」都不会打乱列表。
-   */
-  const poolDisplayAccounts =
-    layout === "merged"
-      ? [...poolAccounts].sort(
-          (left, right) =>
-            (usageTotalByUid.get(right.uid) ?? 0) - (usageTotalByUid.get(left.uid) ?? 0),
-        )
-      : poolAccounts;
-
-  /** uid → 排名（1 = 消耗最高），与展示顺序一致。 */
-  const poolUsageRank = new Map<string, number>();
-  poolDisplayAccounts.forEach((account, index) => poolUsageRank.set(account.uid, index + 1));
-
-  /**
-   * uid → 进度条占比（0-100）。
-   *
-   * 刻意**不设最小宽度**（旧版用量行有 3% 下限）：这里的条是「与最大值比」
-   * 的度量，给 1 token 也画成 3% 会让「几乎没用」看起来像「用了不少」。
-   * 真为 0 就是空条 —— 那正是要传达的信息。
-   */
-  const usagePercentByUid = new Map<string, number>();
-  for (const [uid, total] of usageTotalByUid) {
-    usagePercentByUid.set(uid, Math.round((total / poolMaxUsage) * 100));
-  }
-
-  /**
-   * 选中账号的模型明细。
-   *
-   * 未选账号、或网关未提供 accountModels（旧版网关）时返回 undefined 而不是空数组：
-   * 「拿不到明细」与「这个号确实没调用过」是两件事，界面要给出不同的说法。
-   *
-   * 模型筛选在这里同样生效（与「按模型」列表口径一致）：筛选是「我想看哪些
-   * 模型」的全局意图，单账号明细没有理由例外。`modelFilterSet` 为空时不过滤。
-   */
-  const selectedPoolModels = selectedPoolUid
-    ? usageAccountModels
-      ? (usageAccountModels[selectedPoolUid] ?? []).filter(
-          (m) => !modelFilterActive || modelFilterSet.has(m.key),
-        )
-      : undefined
-    : undefined;
-
-  /** 选中账号在当前范围内的合计（用于明细区的标题行）。 */
-  const selectedPoolUsage = usageAccounts.find((a) => a.key === selectedPoolUid) ?? null;
-
-  /** 选中的池账号对象（供明细区展示昵称 / 余额）。 */
-  const selectedPoolAccount = poolAccounts.find((a) => a.uid === selectedPoolUid) ?? null;
+  const poolSortedRows = [...poolRows].sort((left, right) => {
+    const leftBlank = poolCellBlank(poolSort.key, left);
+    const rightBlank = poolCellBlank(poolSort.key, right);
+    // 两个都空 → 视为相等（保持网关原序）；只有一个空 → 它垫底。
+    if (leftBlank || rightBlank) {
+      if (leftBlank && rightBlank) return 0;
+      return leftBlank ? 1 : -1;
+    }
+    const diff = POOL_SORT_OPTIONS[poolSort.key](left, right);
+    return poolSort.dir === "asc" ? diff : -diff;
+  });
 
   const endpoint = status?.openaiBase ?? "";
   const endpointHint = useMemo(() => {
@@ -2347,26 +2983,6 @@ export default function GatewayPage() {
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          {/* 布局切换：旧版（账号池与用量分块）↔ 新版（用量并进账号卡片）。
-              图标按钮 + tooltip，与账号页「紧凑/宽松」同一范式，避免页头变宽。 */}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="shrink-0"
-                onClick={toggleLayout}
-                aria-label={layout === "classic" ? "切换到新版布局（用量并进账号卡片）" : "切换到旧版布局"}
-              >
-                {layout === "classic" ? <LayoutGrid className="size-4" /> : <Rows3 className="size-4" />}
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="left">
-              {layout === "classic"
-                ? "新版布局：用量直接并进账号卡片，看「谁在跑、烧了多少」不用上下对照（会记住选择）"
-                : "旧版布局：账号池与 Token 用量各自独立成块（会记住选择）"}
-            </TooltipContent>
-          </Tooltip>
           <Button
             variant="ghost"
             size="icon"
@@ -2809,28 +3425,161 @@ export default function GatewayPage() {
                 分层选号会优先消耗最快过期的额度，前面档位用尽或冷却后它们会自动承接流量。
               </div>
             ) : null}
-            {/* 新版布局的一句引导：卡片可以点。
-                不说明的话没人会去点一张看起来纯展示的卡片 —— 这个交互就白做了。
-                只在新版出现：旧版布局必须与既有观感逐字一致（有测试锁着）。 */}
-            {layout === "merged" ? (
-              <div className="mx-4 mt-2 text-[11px] text-muted-foreground/80 sm:mx-5">
-                点击任意账号卡片，可在下方查看<strong className="font-normal text-foreground/80">该账号的模型与 Token 明细</strong>；再次点击取消选择。
-              </div>
-            ) : null}
-            {/* 卡片网格：auto-rows-fr 让同一排的卡片等高，避免因冷却明细行数不同而参差。 */}
-            <div className="grid auto-rows-fr grid-cols-1 gap-3 p-3 sm:grid-cols-2 sm:p-4 xl:grid-cols-3 2xl:grid-cols-4">
-              {poolAccounts.map((acc) => (
-                <PoolAccountRow
-                  key={acc.uid}
-                  acc={acc}
-                  // 新版可点：点同一个账号第二次 = 取消选择（回到「全部账号」）。
-                  selectable={layout === "merged"}
-                  selected={layout === "merged" && selectedPoolUid === acc.uid}
-                  onSelect={() =>
-                    setSelectedPoolUid((current) => (current === acc.uid ? "" : acc.uid))
-                  }
-                />
-              ))}
+            {/* 表格的一句引导：行可以展开。
+                不说明的话没人会去点一行看起来纯展示的表 —— 这个交互就白做了。 */}
+            <div className="mx-4 mt-2 text-[11px] text-muted-foreground/80 sm:mx-5">
+              点击行首的箭头可展开<strong className="font-normal text-foreground/80">该账号的模型冷却 / 运行态 / 积分详情</strong>（可同时展开多行）；
+              点表头可切换排序，默认按消耗降序。
+            </div>
+
+            {/* 账号池**恒为表格**（所有者本轮的形态决定：卡片 → 表格 + 二级展开）。
+                页头那个「布局切换」已按所有者要求归位到 **Token 用量**区块，
+                且**只切那一块** —— 因此这里不再有「旧版卡片 / 新版表格」的分叉：
+                账号池的形态是唯一的，切换按钮不再影响它。 */}
+            <div className="p-3 sm:p-4">
+                {/* 工具栏：日期筛选（统一控制三个消耗列）+ 全部展开 / 全部收起。 */}
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    <span className="text-[13px] font-medium">账号池</span>
+                    <span className="text-[11.5px] tabular-nums text-muted-foreground">
+                      {poolAccounts.length} 个 ·{" "}
+                      <span className="text-primary">{pool?.healthy ?? poolAccounts.length} 可用</span>
+                      {poolModelCooledCount > 0 ? ` / ${poolModelCooledCount} 模型限流` : ""}
+                      {pool?.cooling ? ` / ${pool.cooling} 冷却` : ""}
+                      {poolQueuedCount > 0 ? ` / ${poolQueuedCount} 排队` : ""}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {/* 日期筛选：与旧版口径完全一致（USAGE_RANGE_OPTIONS 同一份定义），
+                        统一控制「消耗 Token / 调用 / 消耗积分」三列。 */}
+                    {USAGE_RANGE_OPTIONS.map((option) => (
+                      <Button
+                        key={option.key}
+                        variant={usageRange === option.key ? "default" : "outline"}
+                        size="sm"
+                        className="h-7 px-2 text-xs"
+                        onClick={() => setUsageRange(option.key)}
+                        title={`三个消耗列（消耗 Token / 调用 / 消耗积分）都按「${option.label}」统计`}
+                      >
+                        {option.label}
+                      </Button>
+                    ))}
+                    <span className="mx-0.5 h-4 w-px bg-border" aria-hidden="true" />
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 gap-1 px-2 text-xs"
+                      data-slot="pool-expand-all"
+                      // 已经全展开 ⇒ 收起全部；否则展开全部。
+                      // 常驻一个按钮（而不是展开时换成另一个按钮）是为了位置稳定：
+                      // 它在两次点击之间不移动，用户不必重新找它。
+                      onClick={() =>
+                        setPoolExpandedUids(poolAllExpanded ? [] : poolAccounts.map((acc) => acc.uid))
+                      }
+                      aria-label={poolAllExpanded ? "全部收起账号详情" : "全部展开账号详情"}
+                    >
+                      {poolAllExpanded ? (
+                        <>
+                          <ChevronDown className="size-3.5" aria-hidden="true" />
+                          全部收起
+                        </>
+                      ) : (
+                        <>
+                          <ChevronRight className="size-3.5" aria-hidden="true" />
+                          全部展开
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                </div>
+
+                {/* 横向滚动容器：列多（9 列）而窄屏一定会溢出 —— 不给容器加
+                    overflow-x-auto 的话，溢出的列会被 Card 的 overflow-hidden **裁掉**，
+                    表现为「余额和到期档位莫名其妙不见了」。
+                    关键列（账号 / 状态 / 消耗）都排在前面，窄屏下先看到的正是它们。 */}
+                <div className="overflow-x-auto rounded-xl border border-border/60">
+                  <table data-slot="pool-table" className="w-full min-w-[860px] border-collapse text-[12px]">
+                    <thead>
+                      <tr className="border-b border-border/60 bg-muted/55">
+                        <th scope="col" className="w-7 px-1.5 py-1.5" aria-label="展开" />
+                        <th
+                          scope="col"
+                          className="w-8 px-1.5 py-1.5 text-left text-[11px] font-medium text-muted-foreground"
+                          title="消耗排名（第 1 名 = 本范围内消耗最高；它跟着消耗列走，不是行号，也不可排序）"
+                        >
+                          #
+                        </th>
+                        <PoolSortHeader label="账号" sortKey="account" activeKey={poolSort.key} dir={poolSort.dir} onToggle={togglePoolSort} />
+                        <PoolSortHeader
+                          label="状态"
+                          sortKey="state"
+                          activeKey={poolSort.key}
+                          dir={poolSort.dir}
+                          onToggle={togglePoolSort}
+                          title="按可用性排序：健康 → 排队 → 仅模型限流 → 账号冷却 → 已禁用"
+                        />
+                        <PoolSortHeader
+                          label="消耗 Token"
+                          sortKey="tokens"
+                          align="right"
+                          activeKey={poolSort.key}
+                          dir={poolSort.dir}
+                          onToggle={togglePoolSort}
+                          title={`按「${usageRangeLabel}」的 Token 消耗排序（默认降序）`}
+                        />
+                        <PoolSortHeader
+                          label="调用"
+                          sortKey="records"
+                          align="right"
+                          activeKey={poolSort.key}
+                          dir={poolSort.dir}
+                          onToggle={togglePoolSort}
+                          title={`按「${usageRangeLabel}」的成功调用次数排序`}
+                        />
+                        <PoolSortHeader
+                          label="消耗积分"
+                          sortKey="credits"
+                          align="right"
+                          activeKey={poolSort.key}
+                          dir={poolSort.dir}
+                          onToggle={togglePoolSort}
+                          title="按账号库积分记录的消耗排序（「全部」范围给不出可信值，恒排最后）"
+                        />
+                        <PoolSortHeader
+                          label="积分余额"
+                          sortKey="balance"
+                          align="right"
+                          activeKey={poolSort.key}
+                          dir={poolSort.dir}
+                          onToggle={togglePoolSort}
+                          title="按网关侧记录的最新积分余额排序（看谁快用完）"
+                        />
+                        <PoolSortHeader
+                          label="到期档位"
+                          sortKey="expiry"
+                          activeKey={poolSort.key}
+                          dir={poolSort.dir}
+                          onToggle={togglePoolSort}
+                          title="按最近到期积分档位排序；无档位（到期未知）恒排最后"
+                        />
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {poolSortedRows.map((row) => (
+                        <PoolAccountRow
+                          key={row.acc.uid}
+                          metrics={row}
+                          expanded={poolExpandedSet.has(row.acc.uid)}
+                          onToggle={() => togglePoolExpanded(row.acc.uid)}
+                          detailId={`pool-detail-${row.acc.uid}`}
+                          usageRangeLabel={usageRangeLabel}
+                          creditStatsLoaded={Boolean(creditStats)}
+                          stickySessions={pool?.sticky_sessions ?? 0}
+                        />
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
             </div>
           </>
         ) : (
@@ -2855,8 +3604,8 @@ export default function GatewayPage() {
       {/* Token 用量区块：**新旧两版完全共用**。
           所有者本轮明确否掉了「新版另做一套布局」的做法（原话：「默认跟旧版的
           一样，只不过左侧可以通过点击账号的方式来显示…模型 token 信息」），
-          因此这里不再按 layout 分叉 —— 新版唯一的差异是下面那个**点账号看明细**
-          的面板，它默认不出现，观感因此与旧版逐字一致。 */}
+          因此这里不再按 layout 分叉 —— 新版唯一的差异是账号池那边多出的
+          「表格 + 二级展开」，它就在账号池区块内就地展开，不影响本区块。 */}
       <Section
         title="Token 用量"
         description="经网关成功请求的上游用量，按模型 / 账号 / 日期聚合（网关重启后保留）"
@@ -2864,7 +3613,24 @@ export default function GatewayPage() {
         <Row>
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-              <span className="text-[13px]">统计范围</span>
+              {/*
+                「统计范围」后面接上**当前口径**（今日 · 账号X）。
+                草稿里所有者确认过这一条：只写「今日」时，用户看到汇总卡变小会以为是
+                「今天量少」，而不会想到「其实还叠加了账号口径」。把两项条件并排写出
+                （「统计范围 · 今日 · 账号 <uid 前 8 位>」），「为什么数字是这个」就不必再猜。
+              */}
+              <span className="text-[13px]">
+                统计范围
+                <span className="text-muted-foreground">
+                  {" · "}
+                  {usageRangeLabel}
+                  {usageScopeAccount
+                    ? ` · 账号 ${usageNickname.get(usageScopeAccount) ?? usageScopeAccount.slice(0, 8)}`
+                    : usageScopeModel
+                      ? ` · 模型 ${usageScopeModel}`
+                      : ""}
+                </span>
+              </span>
               {/* 上次更新时间：让用户知道看到的数据有多新，不必反复手点刷新。
                   相对时间由每秒 tick 驱动；悬停可见精确时刻。 */}
               {usageUpdatedAt ? (
@@ -2877,9 +3643,16 @@ export default function GatewayPage() {
                 </span>
               ) : null}
             </div>
+            {/*
+              这一行也不再是「网关总量」，而是**当前口径下**的合计 —— 否则它会与紧下方
+              的汇总卡自相矛盾（一个按全局算、一个按账号算）。口径换了这句话却不变，
+              是本区块最容易骗到人的地方。
+            */}
             <div className="mt-0.5 text-[11px] tabular-nums text-muted-foreground">
-              {usageSummary
-                ? `共 ${exactTokenFormatter.format(usageSummary.records)} 次调用 · 合计 ${exactTokenFormatter.format(usageSummary.total)} tokens`
+              {usageSummaryDisplay
+                ? `共 ${exactTokenFormatter.format(usageSummaryDisplay.records)} 次调用 · 合计 ${exactTokenFormatter.format(usageSummaryDisplay.total)} tokens${
+                    usageCrossFilter ? "（当前口径）" : ""
+                  }`
                 : "等待网关数据"}
             </div>
           </div>
@@ -2915,16 +3688,76 @@ export default function GatewayPage() {
             >
               <RefreshCw className={cn("size-3.5", usageLoading && "animate-spin")} />
             </Button>
+            {/* 布局切换：**旧版 ↔ 新版 Token 用量**（所有者本轮明确纠正：上轮说的
+                「新版」指的是 Token 用量新旧版，不是账号池）。
+
+                为什么从页头搬到这里：它只切本区块，挂在页头会让用户以为整页都跟着
+                换，进而以为账号池也有两套 —— 那正是本轮要纠正的误解。放在本区块头部
+                与日期范围按钮同排，作用域不言自明。
+                图标按钮 + tooltip 的范式不变（与账号页「紧凑/宽松」一致），页头因此
+                不会变宽。状态仍持久化到同一个 localStorage 键，老用户的记忆不丢。 */}
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-7"
+                  onClick={toggleLayout}
+                  data-slot="usage-layout-toggle"
+                  aria-label={layout === "classic" ? "切换到新版 Token 用量" : "切换到旧版 Token 用量"}
+                >
+                  {layout === "classic" ? <LayoutGrid className="size-3.5" /> : <Rows3 className="size-3.5" />}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="left">
+                {layout === "classic"
+                  ? "新版 Token 用量：加「当前口径」条与列头筛选徽标，并就地解释「筛了但没变少」是正确结果（会记住选择）"
+                  : "旧版 Token 用量：只有左右两栏 + 每日用量柱图（会记住选择）"}
+              </TooltipContent>
+            </Tooltip>
           </div>
         </Row>
 
-        {/* 筛选生效的说明：数字收窄了却不说清楚，用户会以为数据丢了。
-            同时点明「顶部汇总不随筛选变化」，避免与那句「合计 N tokens」冲突。 */}
+        {/* 当前口径条：**常驻**（只要点了某一项就显示）。
+            为什么必须常驻、而不是像旧实现那样"长度变了才显示"：旧的条件
+            （`scoped.length !== all.length`）在「今日 + 单模型」下恰好不成立 ——
+            而所有者正是在这个范围下点的账号。于是他点了之后**页面上一个字都没变**，
+            得出「功能没生效」的结论。反馈不能依赖"数据恰好变少了"这种偶然条件。
+            口径条紧贴汇总卡上方：汇总卡已换成该账号的数字（所有者选的「跟着变」），
+            这里明说口径，避免用户以为**总量掉了**。 */}
+        {usageCrossFilter && !usageCrossDegraded ? (
+          <div
+            data-slot="usage-scope-bar"
+            className="mx-4 mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-primary/30 bg-primary/5 px-3 py-1.5 text-[11px] leading-5 sm:mx-5"
+          >
+            <span className="font-medium text-primary" data-slot="usage-scope-label">
+              当前口径：
+              {usageScopeAccount
+                ? `账号 ${usageNickname.get(usageScopeAccount) ?? usageScopeAccount.slice(0, 8)}`
+                : `模型 ${usageScopeModel}`}
+            </span>
+            <span className="text-muted-foreground">
+              顶部汇总与左右列表<strong className="font-medium">都只统计这一项</strong>
+              {usageScopeAccount ? "在该范围内的用量" : "在各账号上的用量"}，
+              不是网关总量
+            </span>
+            <button
+              type="button"
+              className="ml-auto shrink-0 cursor-pointer font-medium text-primary underline-offset-2 hover:underline"
+              onClick={() => setUsageCrossFilter(null)}
+              data-slot="usage-scope-reset"
+            >
+              ✕ 恢复全部口径
+            </button>
+          </div>
+        ) : null}
+
+        {/* 筛选生效的说明：数字收窄了却不说清楚，用户会以为数据丢了。 */}
         {modelFilterActive ? (
           <div className="mx-4 mt-2 rounded-lg bg-muted/50 px-3 py-2 text-[11px] leading-5 text-muted-foreground sm:mx-5">
             已筛选 <strong className="font-medium text-foreground/80">{modelFilter.length}</strong> 个模型
-            （{modelFilter.join("、")}）：下方「按模型 / 按账号」与新版账号明细只统计这些模型；
-            上方的汇总数字与「每日用量」仍是网关全量，不随筛选变化。
+            （{modelFilter.join("、")}）：下方「按模型 / 按账号」与账号明细只统计这些模型；
+            上方的汇总数字与「每日用量」仍是当前口径下的全量，不随模型筛选变化。
           </div>
         ) : null}
 
@@ -2933,8 +3766,27 @@ export default function GatewayPage() {
             想到是自己点出来的。这里必须同时给出「点了什么」「另一侧剩几个」，
             并在两边都为 0 时点明是哪一级掐掉的（两级叠加最常见的困惑）。
             用 primary 系而不是 muted：它要和上面那条 ModelFilter 说明**区分开** ——
-            两条同时出现时，用户得能一眼看出「哪条是我刚点出来的」。 */}
-        {usageCrossNote ? (
+            两条同时出现时，用户得能一眼看出「哪条是我刚点出来的」。
+
+            **新旧版的差异就在这一条**（所有者已确认：布局切换指的是 Token 用量新旧版）：
+              - 新版：正常收窄时**不再重复**这条远处的提示条 —— 它的信息已被列头徽标
+                （「已按账号筛选 ✕」，就在列表标题上）与顶部口径条就地承担，
+                留着只是同一句话在页面上出现两遍；
+              - 旧版：保持既有观感（这条提示条就是旧版的反馈形态），一条不动。
+
+            但**下面这几种状态一律两版都显示**，因为这条提示条是那些信息**唯一**的
+            载体，新版把它去掉就会真的丢信息：
+              - 网关没给 accountModels（`usageCrossDegraded`）：无法筛选，必须说明；
+              - 明细完全缺失（`usageCrossItemBlank`）：要说「拿不到明细」而不是
+                「没用过」，这是本次最不能犯的假结论；
+              - 明细部分缺失（`usageCrossItemPartial`）：要提示列表可能不全；
+              - 结果为空的解释（`emptyReason`）：两级叠加筛空时必须点明是哪一级掐的。 */}
+        {usageCrossNote &&
+        (layout === "classic" ||
+          usageCrossDegraded ||
+          usageCrossItemBlank ||
+          usageCrossItemPartial ||
+          Boolean(usageCrossNote.emptyReason)) ? (
           <div
             data-slot="usage-cross-filter-note"
             className="mx-4 mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-[11px] leading-5 text-muted-foreground sm:mx-5"
@@ -2944,7 +3796,7 @@ export default function GatewayPage() {
               {usageCrossNote.emptyReason ? (
                 <span className="ml-1 text-foreground/80">{usageCrossNote.emptyReason}</span>
               ) : null}
-              <span className="ml-1 text-muted-foreground/70">{usageCrossNote.hint}</span>
+              <span className={cn("ml-1", USAGE_STRONG_TEXT)}>{usageCrossNote.hint}</span>
             </div>
             <Button
               variant="outline"
@@ -2966,31 +3818,47 @@ export default function GatewayPage() {
           if (!usageSnapshot || !usageSummary) {
             return <UsagePlaceholder text={`无法读取网关用量${usage?.error ? `：${usage.error}` : ""}`} />;
           }
+          // 换口径后的汇总。绑成局部常量而不是就地读 `usageSummaryDisplay`：后者
+          // 类型上带 null（数据未加载时就是 null），而这里刚判过 `usageSummary` 存在
+          // —— 用局部常量能让 TS 一并收窄（否则要写八处 `?.`），也把「这一段渲染的
+          // 就是当前口径下的数字」这件事写在最显眼处。
+          const scoped = usageSummaryDisplay ?? usageSummary;
           return (
           <>
             <div className="mx-4 grid grid-cols-2 gap-2 py-3 sm:mx-5 sm:grid-cols-4">
+              {/*
+                汇总卡用换口径后的 `scoped`：点了账号/模型后**跟着换口径**
+                （所有者明确选的「跟着变」）。不换的话会出现「上面写着网关总量
+                1238.3M、下面写着该账号 199.7M」两个数字并存，用户无法判断哪个是
+                哪个 —— 那正是本轮抱怨问题的镜像。换口径的安全性由紧上方的常驻
+                口径条兜底：它明说「只统计这一项，不是网关总量」，故不会误以为
+                总量掉了。
+
+                标签也随口径变（「总 Token」→「该账号 Token」）：只换数字不换标签，
+                用户仍会把它读成网关总量。
+              */}
               <Stat
-                label="总 Token"
-                value={formatUsageCompact(usageSummary.total)}
-                hint={exactTokenFormatter.format(usageSummary.total)}
+                label={usageScopeAccount ? "该账号 Token" : usageScopeModel ? "该模型 Token" : "总 Token"}
+                value={formatUsageCompact(scoped.total)}
+                hint={exactTokenFormatter.format(scoped.total)}
               />
               <Stat
                 label="输入"
-                value={formatUsageCompact(usageSummary.input)}
+                value={formatUsageCompact(scoped.input)}
                 hint={
-                  usageSummary.cacheHitRate != null
-                    ? `缓存命中率 ${(usageSummary.cacheHitRate * 100).toFixed(1)}%`
+                  scoped.cacheHitRate != null
+                    ? `缓存命中率 ${(scoped.cacheHitRate * 100).toFixed(1)}%`
                     : "无缓存读取数据"
                 }
               />
               <Stat
                 label="输出"
-                value={formatUsageCompact(usageSummary.output)}
-                hint={`缓存写入 ${formatUsageCompact(usageSummary.cacheWrite)}`}
+                value={formatUsageCompact(scoped.output)}
+                hint={`缓存写入 ${formatUsageCompact(scoped.cacheWrite)}`}
               />
               <Stat
                 label="调用次数"
-                value={exactTokenFormatter.format(usageSummary.records)}
+                value={exactTokenFormatter.format(scoped.records)}
                 hint="成功请求"
               />
             </div>
@@ -3003,29 +3871,78 @@ export default function GatewayPage() {
 
                 计数用 `usageModelsScoped` / `usageAccountsScoped`（第二级筛选后），
                 因为此时用户看到的就是这几条 —— 用未筛选的数会与列表长度对不上，
-                那正是「数字与内容矛盾」的经典困惑源。 */}
+                那正是「数字与内容矛盾」的经典困惑源。
+
+                数值/条宽/meta 一律取 `usageModelsDisplay` / `usageAccountsDisplay`
+                两条**换口径后**的派生数组（它们只在「另一侧被点选」时才与 Scoped 不同）：
+                Scoped 决定「显示哪几行」，Display 决定「这几行写什么数」。两者分开是
+                刻意的 —— 换口径不该影响"筛掉谁"，筛行也不该顺手改数值。 */}
             <div className="grid gap-4 border-t border-border/50 pb-2 pt-3 sm:grid-cols-2">
               <div className="min-w-0">
                 <div className="px-4 text-[12px] font-medium text-muted-foreground sm:px-5">
-                  按模型
-                  {usageModelsScoped.length > 0 ? (
-                    <span className="ml-1.5 font-normal text-muted-foreground/70">
-                      共 {usageModelsScoped.length} 个
-                      {usageCrossActive && usageModelsScoped.length !== usageModelsAll.length
-                        ? `（全部 ${usageModelsAll.length}）`
-                        : ""}
-                    </span>
-                  ) : null}
+                  <span className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
+                    <span>按模型</span>
+                    {usageModelsDisplay.length > 0 ? (
+                      <span className={cn("font-normal tabular-nums", USAGE_STRONG_TEXT)} data-slot="usage-model-count">
+                        共 {usageModelsDisplay.length} 个
+                        {usageCrossActive && usageModelsAll.length !== usageModelsDisplay.length
+                          ? `（全部 ${usageModelsAll.length}）`
+                          : ""}
+                      </span>
+                    ) : null}
+                    {/*
+                      「已按账号筛选 ✕」徽标：**始终**显示，只要**账号**被点选。
+
+                      为什么去掉旧版那个 `scoped.length !== all.length` 条件：
+                      在「今日 + 单模型」下该条件恒为假（筛完还是那 1 个模型），
+                      于是**唯一**能提示「筛选已生效」的锚点恰好缺席 —— 这正是所有者
+                      「看不出变化」的主因之一。反馈必须由「用户点了什么」决定，
+                      而不能由「数据恰好变少了」这种偶然结果决定。
+
+                      为什么条件必须是 `usageCrossAccount`（账号）而不是 `usageCrossModel`：
+                      左栏是「按模型」，**能收窄它的只有"点了账号"**；点模型收窄的是
+                      右栏。这里最初误写成 `usageCrossModel`，结果是「点账号后左侧
+                      徽标不出现」—— 与旧版那个 bug 症状完全相同（都是"用户点了、
+                      但该出现的反馈没出现"），只是换了个条件形式。
+                      这是被 verify-usage-crossfilter.cjs 的「列头徽标始终显示」当场测出来的。
+
+                      徽标本身就是清除按钮（点它即恢复全部口径），与顶部口径条上的
+                      「恢复全部口径」是同一状态的两条退路 —— 用户视线在列表里时
+                      不必再往上找。
+                    */}
+                    {usageCrossAccount ? (
+                      <Button
+                        variant="default"
+                        size="sm"
+                        className="h-5 cursor-pointer gap-0.5 px-1.5 text-[10px] font-medium"
+                        onClick={() => setUsageCrossFilter(null)}
+                        data-slot="usage-model-filter-badge"
+                        title="清除「按账号筛选」，恢复全部账号的口径"
+                      >
+                        已按账号筛选
+                        <X className="size-2.5" strokeWidth={3} />
+                      </Button>
+                    ) : null}
+                  </span>
                 </div>
-                <div className="mt-1 max-h-72 overflow-y-auto">
-                  {usageModelsScoped.length > 0 ? (
-                    usageModelsScoped.map((model) => (
+                {/*
+                  高度 288px（max-h-72）→ 420px（max-h-[420px]）。
+                  为什么必须改：288px 只装得下 4 行，所有者真实数据「全部」范围下
+                  账号有 18 个 —— 第 5 行往后在**未滚动时用真实鼠标点不到**
+                  （`elementFromPoint` 命中的是别的元素）。这不是"看不出变化"，
+                  是**根本点不到**，比前者更严重。
+                  底部另给一行滚动提示，让"还有更多"这件事本身可见。
+                */}
+                <div className="mt-1 max-h-[420px] overflow-y-auto" data-slot="usage-model-list">
+                  {usageModelsDisplay.length > 0 ? (
+                    usageModelsDisplay.map((model) => (
                       <UsageBarRow
                         key={model.key}
                         dataSlot="usage-model-row"
+                        valueSlot="usage-model-value"
                         label={model.key}
                         value={model.total}
-                        max={usageMaxModel}
+                        max={usageMaxModelScoped}
                         meta={`${exactTokenFormatter.format(model.records)} 次调用 · 输入 ${formatUsageCompact(model.input)} / 输出 ${formatUsageCompact(model.output)}`}
                         selected={usageCrossModel === model.key}
                         onToggle={() => toggleUsageModelFilter(model.key)}
@@ -3046,18 +3963,67 @@ export default function GatewayPage() {
                     </div>
                   )}
                 </div>
+                {/* 滚动提示：只在真的装不下时才说「可滚动」，否则是噪音。 */}
+                {usageModelsDisplay.length > USAGE_LIST_VISIBLE_ROWS ? (
+                  <div
+                    className={cn("mt-1 text-center text-[10px]", USAGE_STRONG_TEXT)}
+                    data-slot="usage-model-scroll-hint"
+                  >
+                    共 {usageModelsDisplay.length} 个，列表可滚动 · 已按用量降序
+                  </div>
+                ) : null}
+                {/*
+                  「换口径已生效」的就地说明。
+                  为什么必须有：即便数字已经真的换了（这是本轮的核心修复），当该账号
+                  在范围内**只用一个模型**时，列表**行数**仍不变（1 行 → 1 行）。
+                  所有者上一轮正是看着"行数没变"判定"没生效"的 —— 数字变了但行数没变
+                  时，用户仍可能怀疑。这里把"变了什么"直接写出来（原全局 X → 现 Y），
+                  把最后一点"是不是没反应"的疑虑当场解释掉。
+                  只在**两版都出现**（不限 layout）：这是正确性说明，不是观感增强。
+                */}
+                {usageCrossAccount && usageModelsDisplay.length > 0 ? (() => {
+                  const shown = usageModelsDisplay[0];
+                  const global = usageModelsAll.find((m) => m.key === shown.key);
+                  if (!global || global.total === shown.total) return null;
+                  return (
+                    <div
+                      className="mx-4 mt-1.5 rounded-lg bg-info/5 px-2.5 py-1.5 text-[10.5px] leading-5 sm:mx-5"
+                      data-slot="usage-rebased-hint"
+                    >
+                      ✓ 数字已换成<strong className="font-medium">该账号在此模型上的</strong>用量
+                      （原全局 {formatUsageCompact(global.total)} → 现 {formatUsageCompact(shown.total)}），
+                      小字与条宽也按该账号重算。
+                    </div>
+                  );
+                })() : null}
               </div>
               <div className="min-w-0">
                 <div className="px-4 text-[12px] font-medium text-muted-foreground sm:px-5">
-                  按账号
-                  {usageAccountsScoped.length > 0 ? (
-                    <span className="ml-1.5 font-normal text-muted-foreground/70">
-                      共 {usageAccountsScoped.length} 个
-                      {usageCrossActive && usageAccountsScoped.length !== usageAccountsAll.length
-                        ? `（全部 ${usageAccountsAll.length}）`
-                        : ""}
-                    </span>
-                  ) : null}
+                  <span className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
+                    <span>按账号</span>
+                    {usageAccountsDisplay.length > 0 ? (
+                      <span className={cn("font-normal tabular-nums", USAGE_STRONG_TEXT)} data-slot="usage-account-count">
+                        共 {usageAccountsDisplay.length} 个
+                        {usageCrossActive && usageAccountsAll.length !== usageAccountsDisplay.length
+                          ? `（全部 ${usageAccountsAll.length}）`
+                          : ""}
+                      </span>
+                    ) : null}
+                    {/* 反方向的同一枚徽标：点了模型后右侧「按账号」也要明说口径。 */}
+                    {usageCrossModel ? (
+                      <Button
+                        variant="default"
+                        size="sm"
+                        className="h-5 cursor-pointer gap-0.5 px-1.5 text-[10px] font-medium"
+                        onClick={() => setUsageCrossFilter(null)}
+                        data-slot="usage-account-filter-badge"
+                        title="清除「按模型筛选」，恢复全部模型的口径"
+                      >
+                        已按模型筛选
+                        <X className="size-2.5" strokeWidth={3} />
+                      </Button>
+                    ) : null}
+                  </span>
                 </div>
                 {/*
                   这里**不能**截断成前 5 个：账号池的均衡效果正是靠这个列表观察的。
@@ -3065,15 +4031,16 @@ export default function GatewayPage() {
                   用户据此误判「负载均衡只用到 5 个账号」。
                   改为全量展示并加滚动上限（高度受限，避免账号多时把页面撑得过长）。
                 */}
-                <div className="mt-1 max-h-72 overflow-y-auto">
-                  {usageAccountsScoped.length > 0 ? (
-                    usageAccountsScoped.map((account) => (
+                <div className="mt-1 max-h-[420px] overflow-y-auto" data-slot="usage-account-list">
+                  {usageAccountsDisplay.length > 0 ? (
+                    usageAccountsDisplay.map((account) => (
                       <UsageBarRow
                         key={account.key}
                         dataSlot="usage-account-row"
+                        valueSlot="usage-account-value"
                         label={usageNickname.get(account.key) ?? `${account.key.slice(0, 8)}…`}
                         value={account.total}
-                        max={usageMaxAccount}
+                        max={usageMaxAccountScoped}
                         meta={`${exactTokenFormatter.format(account.records)} 次调用 · ${account.key.slice(0, 8)}`}
                         selected={usageCrossAccount === account.key}
                         onToggle={() => toggleUsageAccountFilter(account.key)}
@@ -3091,6 +4058,14 @@ export default function GatewayPage() {
                     </div>
                   )}
                 </div>
+                {usageAccountsDisplay.length > USAGE_LIST_VISIBLE_ROWS ? (
+                  <div
+                    className={cn("mt-1 text-center text-[10px]", USAGE_STRONG_TEXT)}
+                    data-slot="usage-account-scroll-hint"
+                  >
+                    共 {usageAccountsDisplay.length} 个，列表可滚动 · 已按用量降序
+                  </div>
+                ) : null}
               </div>
             </div>
 
@@ -3121,33 +4096,6 @@ export default function GatewayPage() {
           );
         })()}
       </Section>
-
-      {/*
-        新版布局的**唯一**新增交互：点了账号池里的某张卡片后，这里显示该账号的
-        模型 / Token 明细。
-
-        为什么做成「点了才出现」而不是常驻一块：所有者要求新版默认与旧版一样
-        （原话「默认跟旧版的一样」）。常驻一块就等于改变了默认观感；点了才出现，
-        未点选时页面与旧版逐字一致。
-
-        为什么放在「Token 用量」**下方**而不是账号池旁边：点卡片时视线在账号池，
-        但明细内容比卡片宽（模型名 + 长度量），塞进卡片会把卡片撑爆；紧跟在
-        整块用量区块之后，用户顺着往下看就能找到，且不会打断默认布局。
-      */}
-      {layout === "merged" && selectedPoolAccount ? (
-        <AccountModelDetail
-          uid={selectedPoolAccount.uid}
-          nickname={selectedPoolAccount.nickname || selectedPoolAccount.uid}
-          models={selectedPoolModels}
-          total={selectedPoolUsage?.total ?? 0}
-          records={selectedPoolUsage?.records ?? 0}
-          rangeLabel={usageRangeLabel}
-          creditUsed={creditUsedByUid.get(selectedPoolAccount.uid) ?? 0}
-          credits={selectedPoolAccount.credits}
-          modelFilter={modelFilter}
-          onClose={() => setSelectedPoolUid("")}
-        />
-      ) : null}
 
       <Section title="客户端接入" description="把网关接入本机已安装的 AI 客户端，或按标准环境变量接入">
         <div className="space-y-4 p-4 sm:p-5">

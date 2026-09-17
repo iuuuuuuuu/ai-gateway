@@ -11,7 +11,7 @@
 // 运行方式（PowerShell）：
 //
 //	$env:WB_LIVE_ACCOUNTS = "D:\...\test-bin\growth-iso\accounts.json"
-//	$env:WB_LIVE_ACCOUNT  = "3b5d6048"      # uid 前 8 位；缺省用第一个国服账号
+//	$env:WB_LIVE_ACCOUNT  = "<uid前8位>"     # 缺省用第一个国服账号
 //	go test -tags live ./internal/growtask/ -run TestLive -v
 //
 // 写操作分级（默认最保守）：

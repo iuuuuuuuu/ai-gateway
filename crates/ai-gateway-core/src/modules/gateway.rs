@@ -1415,6 +1415,11 @@ fn terminate_process(pid: u32) -> Result<(), String> {
 /// 既啰嗦又容易只配一处导致「浏览器能用、网关不能用」的困惑。
 ///
 /// 返回空串表示未配置（网关将直连，并在日志里提示国际版可能超时）。
+///
+/// 注意：地址本身**与三个开关无关**，照旧原样透传。是否真的使用它由
+/// `proxy_scope.cn` / `proxy_scope.intl` 在 Go 侧按区域决定（见 native_config_proxy_scope）——
+/// 让网关自己按区域判断，而不是宿主在这里把地址清空，是因为清空之后就再也
+/// 分不出「用户没配代理」和「用户配了但关掉了某一路」，日志会误导排查方向。
 fn upstream_proxy() -> String {
     crate::modules::update::load_github_config()
         .get("proxy")
@@ -1422,6 +1427,21 @@ fn upstream_proxy() -> String {
         .unwrap_or("")
         .trim()
         .to_string()
+}
+
+/// 写出网关配置里的 `proxy_scope` 块（**只有 cn / intl 两个键**）。
+///
+/// 为什么不含 github：GitHub 的更新检查与安装包下载是**宿主的活**，与网关无关 ——
+/// 网关根本不发往 github.com 的请求。把 github 也塞进来会让网关配置里出现一个
+/// 它永远不会读的键，下一个人排查「为什么关了开关还在走代理」时会先怀疑这里。
+/// 宿主自己消费 github 那一格（见 update::configured_proxy 的调用点）。
+///
+/// 两个值都取 `update::proxy_scope()`（缺键 → 默认值，即国际版开、国服关），
+/// 与 github_config.json 是同一口径：老配置没有这个键时，网关收到的仍是
+/// 「国际版走代理、国服直连」= 本次改动前的行为。
+fn native_config_proxy_scope() -> Value {
+    let scope = crate::modules::update::proxy_scope();
+    json!({ "cn": scope.cn, "intl": scope.intl })
 }
 
 /// 从宿主配置里取某个任务的执行时点（小时列表），非法/缺失一律回落默认。
@@ -1590,7 +1610,16 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
         // 为什么网关需要它：国际版（workbuddy.ai）在国内直连不稳定（实测 wsarecv 超时），
         // 走代理才稳。而 Go 的 http.ProxyFromEnvironment **只读环境变量**、不读 Windows
         // 注册表，所以「浏览器能走系统代理」不代表网关也能。
+        //
+        // 地址只填一次，**适用范围由 proxy_scope 决定**（三个独立开关，见
+        // settings 页「网络代理」）。这里写出的是网关侧要用的两格（cn / intl），
+        // github 那一格由宿主自己消费，不进网关配置。
+        //
+        // 每次启动全量重写本文件，所以这个块必须写 —— 否则用户在界面上关掉
+        // 国际版代理后，下次启动网关又会按「缺键 → 默认值（intl=true）」把代理打开，
+        // 表现为「关了开关，重启后又自己开了」。
         "proxy": upstream_proxy(),
+        "proxy_scope": native_config_proxy_scope(),
         "pool": {
             "max_in_flight": 3,
             "breaker_threshold": 3,
@@ -4312,6 +4341,131 @@ mod tests {
             Some(&json!(["deepseek-v4.1-flash"])),
             "老的单值字符串应被写成单元素数组，行为不变"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 代理的三个独立开关：native config 的 proxy_scope 块
+    //
+    // 缺陷背景与 prompt / allowed_model 那两个块同源：write_native_config 每次
+    // 启动网关都**全量重写** gateway_native_config.json。不写这个块的话，
+    // 用户在界面上关掉国际版代理后，下次启动网关又会按「缺键 → 默认值
+    //（intl=true）」把代理打开 —— 表现为「关了开关，重启后又自己开了」。
+    // -----------------------------------------------------------------------
+
+    // 三个开关必须真的写进 native config，且**只有 cn / intl 两格**。
+    //
+    // 为什么刻意断言「没有 github」：更新检查与安装包下载是宿主的活，网关根本
+    // 不发往 github.com 的请求。把 github 也写进去会让网关配置里出现一个它永远
+    // 不会读的键，下一个人排查「为什么关了开关还在走代理」时会先怀疑这里。
+    #[test]
+    fn native_config_writes_proxy_scope_without_github() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-proxy-scope");
+        // 先把 github_config.json 写成一组**非默认**的开关，确保读的是它而不是
+        // 恰好等于默认值的兜底结果（否则测试会因为「默认值碰巧一样」而假绿）。
+        crate::modules::update::save_github_config(&json!({
+            "proxy": "http://127.0.0.1:7897",
+            "proxy_scope": {"github": true, "cn": true, "intl": false},
+        }))
+        .expect("save github config");
+
+        let path = write_native_config(&json!({})).expect("write native config");
+        let native: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+
+        assert_eq!(
+            native.pointer("/proxy_scope/cn"),
+            Some(&json!(true)),
+            "用户在界面上打开的国服代理必须写进 native config"
+        );
+        assert_eq!(
+            native.pointer("/proxy_scope/intl"),
+            Some(&json!(false)),
+            "用户在界面上关掉的国际版代理必须写进 native config（否则重启网关又自己开了）"
+        );
+        // 地址照旧原样透传：开关只决定「用不用」，不改地址本身。
+        assert_eq!(
+            native.pointer("/proxy").and_then(Value::as_str),
+            Some("http://127.0.0.1:7897"),
+            "代理地址必须原样写出"
+        );
+        // github 那一格**不进**网关配置（详见本用例开头）。
+        let scope = native.get("proxy_scope").expect("proxy_scope 块必须存在");
+        assert!(
+            scope.get("github").is_none(),
+            "proxy_scope 不该含 github：那是宿主的活，网关不发往 github.com 的请求"
+        );
+        assert_eq!(
+            scope.as_object().map(|o| o.len()),
+            Some(2),
+            "proxy_scope 应恰好只有 cn / intl 两个键，实际 {scope}"
+        );
+    }
+
+    // 老配置（github_config.json 里没有 proxy_scope）→ native config 写出默认值。
+    //
+    // 这是升级路径的落点：写出的必须是「国际版开、国服关」= 本次改动前的行为。
+    // 若这里写成全 false，所有既有用户一升级，国际版的代理就静默失效了。
+    #[test]
+    fn native_config_proxy_scope_defaults_for_legacy_config() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-proxy-legacy");
+        // 老配置：只有 owner / repo / proxy 三个键，**没有** proxy_scope。
+        crate::modules::update::save_github_config(&json!({
+            "proxy": "http://127.0.0.1:7890",
+        }))
+        .expect("save github config");
+        // 复核前提：磁盘上确实没有这个键（save 若顺手补了它，本用例就测不到
+        // 「读取侧对缺失的兜底」了）。
+        let raw = std::fs::read_to_string(crate::modules::update::github_config_file())
+            .expect("read github config");
+        let raw_json: Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(
+            raw_json.pointer("/proxy_scope/intl"),
+            Some(&json!(true)),
+            "save 时缺键应已按默认值补齐（否则下面的断言测的是别的路径）"
+        );
+
+        let path = write_native_config(&json!({})).expect("write native config");
+        let native: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+
+        assert_eq!(
+            native.pointer("/proxy_scope/intl"),
+            Some(&json!(true)),
+            "老配置升级后国际版必须仍走代理（否则国际版账号会莫名开始超时）"
+        );
+        assert_eq!(
+            native.pointer("/proxy_scope/cn"),
+            Some(&json!(false)),
+            "老配置升级后国服必须仍直连（升级不得把国服新绕进代理）"
+        );
+    }
+
+    // 未配代理时 native config 也要有这个块（默认值），且 proxy 是空串。
+    //
+    // 为什么仍要写：与 prompt 块同理，本函数全量重写该文件。块缺席时 Go 侧的
+    // 兜底是 Default()（同样是国际版开、国服关），所以**行为**等价；但显式写出
+    // 能让落到磁盘的配置自解释 —— 用户直接打开 gateway_native_config.json 时
+    // 能看到「网关侧认为这两个开关是什么」，不必去猜默认值。
+    #[test]
+    fn native_config_writes_proxy_scope_even_without_proxy() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-proxy-none");
+        crate::modules::update::save_github_config(&json!({ "proxy": "" })).expect("save");
+
+        let path = write_native_config(&json!({})).expect("write native config");
+        let native: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+
+        assert_eq!(
+            native.pointer("/proxy").and_then(Value::as_str),
+            Some(""),
+            "未配代理时 proxy 应为空串"
+        );
+        assert_eq!(
+            native.pointer("/proxy_scope/intl"),
+            Some(&json!(true)),
+            "即使没填地址也要写出开关（自解释，且与 Go 侧默认值一致）"
+        );
+        assert_eq!(native.pointer("/proxy_scope/cn"), Some(&json!(false)));
     }
 
     // 默认配置里不能有限制（「默认是全部」这条需求在配置层的落点）。

@@ -733,10 +733,25 @@ export function getGithubConfig(): Promise<GithubConfig> {
   return call("get_github_config");
 }
 
-export function saveGithubConfig(config: GithubConfig): Promise<GithubConfig> {
-  return call("save_github_config", {
+/**
+ * 保存更新源配置（含代理地址与 proxy_scope 三个开关）。
+ *
+ * **两个通道的返回形状不同，必须在这里抹平**：
+ *   - Tauri command 直接返回配置对象（commands.rs::save_github_config）；
+ *   - webui 的 HTTP 路由返回 `{ ok: true, config: {...} }`（api.rs::api_save_update_config）。
+ *
+ * 不抹平的后果不是「报错」而是「静默清空」：调用方写的是 `saved.proxy`，
+ * 在 webui 下读出 undefined → 输入框被清空、三个开关被拨回默认值，而用户
+ * 明明刚点了保存。本函数此前没做这层适配，webui（浏览器打开宿主页面）下
+ * 保存代理一直是坏的，只是没有用例覆盖到。
+ */
+export async function saveGithubConfig(config: GithubConfig): Promise<GithubConfig> {
+  const res = await call<GithubConfig & { config?: GithubConfig }>("save_github_config", {
     config: config as unknown as Record<string, unknown>,
   });
+  // 只认「带 config 包装层」这一种形态：Tauri 返回的配置对象里没有 config 键
+  //（它只有 owner/repo/proxy/proxy_scope），所以这个判断不会误伤。
+  return res && typeof res === "object" && res.config ? res.config : res;
 }
 
 export function checkUpdate(proxy?: string, force?: boolean): Promise<UpdateInfo> {

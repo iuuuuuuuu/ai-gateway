@@ -17,6 +17,11 @@
   --secondary-foreground: oklch(0.32 0.01 264);
   --muted: oklch(0.96 0.004 264);
   --muted-foreground: oklch(0.52 0.012 264);
+  /* muted-strong 次级但**必须看得清**的文字（Token 用量区块的「共 N 个」/ 行内数值
+     / 行内 meta）。比 muted-foreground 深一档：诊断对真实渲染取色实测，原色只有
+     2.97:1，低于 WCAG AA 的 4.5:1，而它恰恰是唯一携带筛选口径信息的元素。
+     本 token 在 --background 上约 7.5:1、在 --card 上约 7.9:1，留足余量。 */
+  --muted-strong: oklch(0.42 0.014 264);
   --accent: oklch(0.955 0.004 264);
   --accent-foreground: oklch(0.24 0.01 264);
   --destructive: oklch(0.577 0.245 27.325);
@@ -31,6 +36,12 @@
      而不是和「国服」这种自动状态同色（所有者反馈过备注不够明显）。 */
   --info: oklch(0.62 0.13 250);
   --info-foreground: oklch(0.99 0.002 250);
+  /* warning 琥珀：用于「系统层面的限流告警」（账号池的模型冷却角标、冷却态标签）。
+     与 --info（蓝＝用户自己写的内容）语义分开：蓝＝你写的，琥珀＝系统报的。
+     此前这些地方散着写 amber-500/600 的 Tailwind 调色板值，主题切换时无法统一
+     调整，也与 Rhea token 体系脱节。 */
+  --warning: oklch(0.705 0.15 70);
+  --warning-foreground: oklch(0.99 0.002 70);
   --chart-1: oklch(0.646 0.222 41.116);
   --chart-2: oklch(0.6 0.118 184.704);
   --chart-3: oklch(0.398 0.07 227.392);
@@ -69,6 +80,9 @@
   --secondary-foreground: oklch(0.929 0.013 255.508);
   --muted: oklch(0.279 0.041 260.031);
   --muted-foreground: oklch(0.704 0.04 256.788);
+  /* muted-strong（暗色）：深底上不能继续压暗，改为向白提亮一档，与亮色下「比
+     muted-foreground 更醒目」的语义保持一致。 */
+  --muted-strong: oklch(0.86 0.02 258);
   --accent: oklch(0.279 0.041 260.031);
   --accent-foreground: oklch(0.929 0.013 255.508);
   --destructive: oklch(0.704 0.191 22.216);
@@ -81,6 +95,9 @@
   /* info 信息蓝（暗色）：提亮并略降饱和，否则深底上会发闷、与主色绿难分辨。 */
   --info: oklch(0.68 0.12 250);
   --info-foreground: oklch(0.208 0.042 265.755);
+  /* warning 琥珀（暗色）：深底上必须提亮，否则与背景对比不足、看起来像禁用态。 */
+  --warning: oklch(0.78 0.14 72);
+  --warning-foreground: oklch(0.208 0.042 265.755);
   --chart-1: oklch(0.488 0.243 264.376);
   --chart-2: oklch(0.696 0.17 162.48);
   --chart-3: oklch(0.769 0.188 70.08);
@@ -117,6 +134,7 @@
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
   --color-muted-foreground: var(--muted-foreground);
+  --color-muted-strong: var(--muted-strong);
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
@@ -196,4 +214,24 @@
 .dark .chip-note {
   /* 暗色下不能再用「混黑」压暗（深底会糊掉），改为向白提亮。 */
   color: color-mix(in oklab, var(--info) 82%, white);
+}
+
+/* ---------------------------------------------------------------------------
+   账号池「模型冷却」角标（.pool-mbadge）
+   
+   为什么单独一个 class：这里的三组颜色同样基于 `color-mix(in oklab, …)`，
+   与 chip-note 同一套写法；而它还必须带 `cursor: help` —— 这个角标**唯一**的
+   交互就是悬浮，光标不给提示的话没人会去悬停，那提示就等于没做。
+   
+   与 .chip-note 的语义区分：蓝 = 用户写的备注，琥珀 = 系统层面的限流告警。
+   --------------------------------------------------------------------------- */
+.pool-mbadge {
+  cursor: help;
+  background: color-mix(in oklab, var(--warning) 16%, transparent);
+  border-color: color-mix(in oklab, var(--warning) 36%, transparent);
+  color: color-mix(in oklab, var(--warning) 62%, black);
+}
+.dark .pool-mbadge {
+  /* 暗色下同样是「混黑会糊」，改为提亮。 */
+  color: color-mix(in oklab, var(--warning) 82%, white);
 }

@@ -639,9 +639,24 @@ pub fn get_github_config() -> Value {
 }
 
 /// POST /api/update/config —— 保存更新源配置。
+///
+/// 前端（src/lib/api.ts::saveGithubConfig）把配置包在 `config` 键里传进来
+///（与 webui 的 POST body 同一约定），这里必须剥掉那层壳再交给
+/// `update::save_github_config` —— 后者读的是配置本身。不剥的话它会读到一份
+/// 没有 owner/repo/proxy/proxy_scope 的壳，把地址写成空串、三个开关回落默认值：
+/// 用户点「保存代理」反而把配置清空了，而且返回 Ok 毫无报错。
+///
+/// 同时容忍**裸配置**（直接传配置对象）：无脑只看 `config` 键会让裸形状被读成
+/// 空配置，那是同一个坑的另一面。
 #[tauri::command]
 pub fn save_github_config(config: Value) -> Result<Value, String> {
-    update::save_github_config(&config).map_err(|e| e.to_string())?;
+    let submitted = match config.get("config") {
+        // config 键存在且是个对象 → 用它（真实调用形状）
+        Some(inner) if inner.is_object() => inner.clone(),
+        // 其余（不存在 / null / 非对象）→ 整个参数就是配置
+        _ => config,
+    };
+    update::save_github_config(&submitted).map_err(|e| e.to_string())?;
     Ok(update::load_github_config())
 }
 

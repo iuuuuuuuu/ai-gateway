@@ -867,8 +867,32 @@ async fn api_update_config() -> Response {
     json_ok(update::load_github_config())
 }
 
+/// 从 POST body 里取出真正的配置对象（剥掉 `{config: {...}}` 包装层）。
+///
+/// **必须剥掉包装层**：前端（src/lib/api.ts::saveGithubConfig）与 Tauri command
+/// 的约定是把配置放在 `config` 键里，而 webui 的 POST body 就是这个调用参数本身。
+/// 不剥的话 `save_github_config` 读到的是一份**没有 owner/repo/proxy/proxy_scope
+/// 的壳**，于是：地址被写成空串、proxy_scope 回落默认值 —— 用户点「保存代理」后
+/// 配置反而被清空，且返回 200 毫无报错（本轮加三个开关时实测发现）。
+///
+/// 三种形状都要能吃：
+///   - `{"config": {...}}` → 内层（前端 / Tauri 的真实调用形状）
+///   - 裸配置 `{...}`       → 整个 body（其它调用方 / 手工 curl）
+///   - `{"config": null}`   → 回落整个 body
+///
+/// 第三种用 `is_object()` 而不是「键存在就用」：`get()` 对 null 返回
+/// `Some(Null)`，若直接 unwrap_or 会得到一个 Value::Null 当配置 —— 同样是把用户
+/// 的设置清掉，只是换成另一种错法。
+fn submitted_update_config(body: &Value) -> &Value {
+    match body.get("config") {
+        Some(inner) if inner.is_object() => inner,
+        _ => body,
+    }
+}
+
 async fn api_save_update_config(Json(body): Json<Value>) -> Response {
-    match update::save_github_config(&body) {
+    let submitted = submitted_update_config(&body);
+    match update::save_github_config(submitted) {
         Ok(()) => json_ok(json!({ "ok": true, "config": update::load_github_config() })),
         Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
     }
@@ -1488,7 +1512,6 @@ async fn api_agents_backups(Query(params): Query<HashMap<String, String>>) -> Re
 mod allowed_models_body_tests {
     use super::allowed_models_from_body;
     use serde_json::json;
-
     // 新界面（多选）的两种键名都要认。
     #[test]
     fn reads_array_from_both_key_names() {
@@ -1557,5 +1580,73 @@ mod allowed_models_body_tests {
         assert!(allowed_models_from_body(&json!({"models": 123})).is_empty());
         assert!(allowed_models_from_body(&json!({"model": 42})).is_empty());
         assert!(allowed_models_from_body(&json!({"models": [1, 2, 3]})).is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/update/config 的 {config: {...}} 包装层
+//
+// 缺陷背景（本轮加三个开关时实测发现）：前端把配置放在 `config` 键里提交
+//（与 Tauri command 的调用约定一致），而 webui 的 POST body 就是调用参数本身。
+// 本路由此前直接把整个 body 交给 save_github_config —— 它读到一份**没有
+// owner/repo/proxy/proxy_scope 的壳**，于是把地址写成空串、proxy_scope 回落
+// 默认值。表现是「用户点保存代理，配置反而被清空」，而接口返回 200 毫无报错。
+//
+// 与 api_save_checkin_config / api_save_gateway_config 是同一个坑（那两处早已
+// 用 `body.get("config").unwrap_or(&body)` 处理），这里补上并把契约钉住。
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod update_config_body_tests {
+    use super::submitted_update_config;
+    use serde_json::json;
+
+    // 带包装（前端 / Tauri 调用约定的真实形状）：必须取出内层配置。
+    #[test]
+    fn unwraps_config_envelope() {
+        let body = json!({"config": {
+            "owner": "momo0410",
+            "repo": "ai-gateway",
+            "proxy": "http://127.0.0.1:7897",
+            "proxy_scope": {"github": true, "cn": true, "intl": false},
+        }});
+        let inner = submitted_update_config(&body);
+        assert_eq!(
+            inner.get("proxy").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:7897"),
+            "必须取到内层 proxy，否则地址会被写成空串（保存 = 清空）"
+        );
+        assert_eq!(
+            inner.pointer("/proxy_scope/cn"),
+            Some(&json!(true)),
+            "必须取到内层 proxy_scope，否则三个开关会被静默重置成默认值"
+        );
+    }
+
+    // 不带包装（裸配置 / 其它调用方）：原样使用整个 body。
+    //
+    // 不能无脑只看 `config` 键：那会让裸形状被读成空配置 —— 同样是把用户
+    // 的设置清掉。两种形状都必须工作。
+    #[test]
+    fn accepts_bare_config_too() {
+        let body = json!({"proxy": "http://127.0.0.1:7897", "proxy_scope": {"intl": true}});
+        let inner = submitted_update_config(&body);
+        assert_eq!(
+            inner.get("proxy").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:7897")
+        );
+        assert_eq!(inner.pointer("/proxy_scope/intl"), Some(&json!(true)));
+    }
+
+    // `config` 键存在但为 null：回落整个 body（而不是把 null 当配置）。
+    #[test]
+    fn null_config_falls_back_to_body() {
+        let body = json!({"config": null, "proxy": "http://127.0.0.1:1"});
+        let inner = submitted_update_config(&body);
+        assert_eq!(
+            inner.get("proxy").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:1"),
+            "config=null 时应回落整个 body（此时 body 自己就是配置）"
+        );
     }
 }

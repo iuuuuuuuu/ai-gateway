@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -119,20 +120,30 @@ func main() {
 	// 走代理才稳。宿主把「设置 → 更新代理」里已填的地址复用到此处，用户无需配两遍。
 	// 地址无效不致命：记日志并继续直连，避免一个配置项导致网关起不来。
 	//
-	// 作用范围**仅国际版账号**：国服（copilot.tencent.com / codebuddy.cn）直连
-	// 即通，把它的流量绕进代理只会多一跳延迟、多一个故障面（代理挂了国服跟着挂）。
-	// 因此这里的日志必须写明范围 —— 用户看到「出站请求经 X」会以为全走代理。
+	// 适用范围**由 proxy_scope 的两个开关决定**（设置页里「国内版 / 国际版」两格）：
+	//   开 → 该区域走上面的显式代理；关 → 该区域**真直连**（连环境变量代理也不用）。
+	// 缺省（老配置没有 proxy_scope 键）= 国际版开、国服关，即本次改动前的行为。
+	// 因此在 config.go 的 Default() 里把这两个值写死，键缺席时不会翻转既有行为。
+	//
+	// 顺序**必须**是 SetProxy → SetProxyScope：后者不解析地址（避免
+	// 「host:port 自动补 http://」这类容错在两处各写一份而分叉），只按开关布置。
 	if proxy := strings.TrimSpace(cfg.Proxy); proxy != "" {
 		if err := up.SetProxy(proxy); err != nil {
 			log.Printf("proxy: 配置无效，忽略并直连：%v", err)
+		} else if err := up.SetProxyScope(cfg.ProxyScope.CN, cfg.ProxyScope.Intl); err != nil {
+			// 走到这里说明地址在 SetProxy 通过、在这里却失败（不应发生）；
+			// 记日志并保留 SetProxy 的结果，不让一个开关把网关拦停。
+			log.Printf("proxy: 适用范围设置失败，按默认分流（国际版走代理、国服直连）：%v", err)
 		} else {
-			log.Printf("proxy: 国际版账号（*.ai）的出站请求经 %s；国服账号一律直连（不经过该代理）", proxy)
+			// 日志必须**如实**写明两个区域各自的走向：只说「出站请求经 X」会让
+			// 用户以为国服也在绕道，从而误判国服变慢的原因（反之亦然）。
+			log.Printf("proxy: %s", describeProxyScope(proxy, cfg.ProxyScope.CN, cfg.ProxyScope.Intl))
 		}
 	} else {
 		log.Printf("proxy: 未配置（国际版账号在部分网络下可能超时，可在软件的「设置 → 更新代理」中填写）")
 	}
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
-	// 两套 client（国服直连 / 国际版代理）都要设：只设 c.HTTP 会让国际版的
+	// 两套 client（国服 / 国际版）都要设：只设 c.HTTP 会让国际版的
 	// 短 RPC 悄悄退回 120s 硬编码上限，与配置不符且无法从界面上看出来。
 	rpcTimeout := time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	up.HTTP.Timeout = rpcTimeout
@@ -282,4 +293,25 @@ func main() {
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")
+}
+
+// describeProxyScope 拼一行**如实**的代理适用范围日志。
+//
+// 为什么值得单独一个函数并配单测：这行日志是用户排查「某一路为什么走了/没走
+// 代理」的第一现场（网关子进程的 stdout 在 GUI 里可能被丢弃，用户能看到的
+// 往往只有这里）。写错方向的代价是把他引到完全错误的排查路径上 ——
+// 例如国服其实直连、日志却说「经代理」，他会去查代理为什么慢。
+//
+// 三种状态都要能读出来：走显式代理 / 真直连（连环境变量也不用）/ 只跟环境变量。
+func describeProxyScope(addr string, cn, intl bool) string {
+	// 措辞刻意区分「显式代理」与「环境变量代理」：两者都可能让流量绕道，
+	// 但只有前者是用户在设置页里填的，混为一谈就没法解释现象。
+	state := func(enabled bool) string {
+		if enabled {
+			return "经 " + addr
+		}
+		return "真直连（连 HTTPS_PROXY 等环境变量代理也不用）"
+	}
+	return fmt.Sprintf("国服账号（*.cn / copilot.tencent.com）%s；国际版账号（*.ai）%s",
+		state(cn), state(intl))
 }
