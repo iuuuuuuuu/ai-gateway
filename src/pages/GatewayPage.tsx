@@ -858,12 +858,23 @@ function queuedReasonText(acc: GatewayPoolAccount): string {
  *
  * 用短标签而不是把 `coolReasonText()` 整句塞进「状态」列：状态列要能一眼扫完，
  * 长句会把列宽撑到挤掉「消耗」列。整句作为悬浮说明保留（信息一条不少）。
+ *
+ * **未知 kind 返回空串**（而不是「冷却中」）：本函数有三处调用，
+ * 其中两处是**拼接**——`状态标签 · <label>` 与 `账号级冷却（<label>）`。
+ * 状态标签在冷却时本身就是「冷却中」，兜底再返回「冷却中」会拼出
+ * 「冷却中 · 冷却中 42 秒」（实测造数据时确实这么显示过）；
+ * 括号那处则会变成「账号级冷却（）」。
+ * 空串 + 调用处判空，两处都能退化成正常文案。
+ *
+ * 真实取值只有两个（Go 侧 `CoolKind.String()`）：`hard_credit`（余额不足，
+ * 冷却到次日 04:00 等签到）与 `soft_rate`（429 短冷却）。
+ * `breaker` 是宿主侧熔断的表述，一并保留以免回归。
  */
 function poolCoolKindLabel(kind: string | undefined): string {
   if (kind === "hard_credit") return "余额欠费";
   if (kind === "breaker") return "熔断";
   if (kind === "soft_rate") return "账号限速";
-  return "冷却中";
+  return "";
 }
 
 /**
@@ -1110,6 +1121,34 @@ function poolLastSuccessText(acc: GatewayPoolAccount): string {
 }
 
 /**
+ * 「多久以前用过」的**相对**文案，供状态列的「N 分钟前用过」使用。
+ *
+ * 与 `poolLastSuccessText` 的分工：那个给二级行的**绝对时刻**（`09-15 13:25`），
+ * 用于精确核对；这个给概览行的**相对说法**，用于一眼判断「刚才是不是它」。
+ * 两者都要：绝对时刻回答「具体几点」，相对说法回答「离现在近不近」。
+ *
+ * 为什么不用页面级 tick 驱动它：本页每秒都有一次 tick（驱动冷却倒计时），
+ * 但把 tick 传进每一行会让整张表每秒重渲染一遍。这里刻意**只按已有渲染机会更新**
+ * —— 「几分钟前」这种粒度不需要秒级刷新，网关状态本身就是 5 秒轮询来的。
+ *
+ * 档位取「秒 / 分钟 / 小时 / 天」，与冷却倒计时的 `formatRemaining` 口径一致，
+ * 避免同一页出现两套时间说法。
+ */
+function poolLastUsedAgo(acc: GatewayPoolAccount): string | null {
+  const raw = acc.last_success;
+  if (!raw) return null;
+  const t = new Date(raw);
+  if (Number.isNaN(t.getTime()) || t.getUTCFullYear() <= 1) return null;
+  const sec = Math.floor((Date.now() - t.getTime()) / 1000);
+  // 时钟偏差可能让「刚成功」算出负数，按 0 处理（显示「刚刚」而不是「-3 秒前」）
+  if (sec < 0) return "刚刚";
+  if (sec < 60) return "刚刚";
+  if (sec < 3600) return `${Math.floor(sec / 60)} 分钟前`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)} 小时前`;
+  return `${Math.floor(sec / 86400)} 天前`;
+}
+
+/**
  * 模型冷却角标的**悬浮提示**正文（也与角标的原生 `title` 共用，保证两处文案一致）。
  *
  * 文案口径是本轮的硬要求，逐句都有原因：
@@ -1176,8 +1215,10 @@ function modelCoolingTitle(acc: GatewayPoolAccount): string {
   );
   const head = `${modelCools.length} 个模型正在限流：${lines.join("、")}`;
   const tail = "仅这些模型不可用，其它模型照常可用；到期自动恢复。";
+  // 括号里只有在**拿得到具体原因**时才写 —— 否则会出现「账号级冷却（）」这种空括号。
+  const coolKind = poolCoolKindLabel(acc.cool_kind);
   const accountLevel = acc.cooling
-    ? `注意：本账号还有账号级冷却（${poolCoolKindLabel(acc.cool_kind)}），那是整号不可用（换模型也不行）。`
+    ? `注意：本账号还有账号级冷却${coolKind ? `（${coolKind}）` : ""}，那是整号不可用（换模型也不行）。`
     : "";
   return [head, tail, accountLevel].filter(Boolean).join(" ");
 }
@@ -1225,6 +1266,21 @@ function PoolAccountRow({
   const { acc, total, records, percent, rank, creditUsed, creditToday, balance, expiryKey } = metrics;
   const modelCools = acc.model_cooling ?? [];
   const coolingModelCount = modelCools.length;
+  /**
+   * 「正在使用」—— 该账号此刻有在途请求（`in_flight > 0`）。
+   *
+   * 为什么用这个而不是找「当前账号」字段：`/status` **没有**那样的字段。
+   * 网关是**按请求选号**的，同一时刻可能多个账号都在服务，所以「当前账号」是单数
+   * 这个前提本身不成立；`in_flight` 才是真实的「此刻在干活」信号
+   *（在此之前它只出现在展开后的二级行里）。
+   *
+   * `> 0` 而不是 `!= null`：后端给的是计数（缺省 0），0 表示没有在途请求 —— 那才是
+   * 「没在用」，不能因为字段存在就点亮。
+   */
+  const inFlight = acc.in_flight ?? 0;
+  const inUse = inFlight > 0;
+  /** 空闲时的「N 分钟前用过」；从未成功过则为 null（不编造日期）。 */
+  const lastUsedAgo = inUse ? null : poolLastUsedAgo(acc);
   // 状态标签的优先级：禁用 > 账号级冷却 > 排队 > 健康。
   //
   // 「排队」单独作为一档，因为它最容易让人误判：账号本身完全健康、积分充足，
@@ -1250,10 +1306,23 @@ function PoolAccountRow({
       <tr
         data-slot="pool-row"
         data-uid={acc.uid}
+        // `data-in-use` 供 UI 测试直接锁定「哪几行正在被使用」，
+        // 不必去解析徽标文案（文案会随「带数字」等需求变动）。
+        data-in-use={inUse ? "true" : undefined}
         className={cn(
           "border-b border-border/40 transition-colors",
           // 展开态用 --primary 系（与展开箭头、排序激活态同一套，不用 secondary）。
-          expanded ? "bg-primary/[0.04]" : "hover:bg-muted/40",
+          expanded ? "pool-row-expanded bg-primary/[0.04]" : "hover:bg-muted/40",
+          /*
+            正在使用的行：**整行左侧一条蓝竖线 + 极淡蓝底**（见 index.css 的
+            `.pool-row-inuse` —— 为什么用 inset 阴影而不是 border-left、
+            为什么色条不能只靠状态列的徽标，都写在那里）。
+
+            注意顺序：本类放在展开态之后，两者同时成立时由
+            `.pool-row-inuse.pool-row-expanded` 那条规则接管底色，
+            不会出现「展开的号恰好在使用中就把展开色吃掉」。
+          */
+          inUse && "pool-row-inuse",
         )}
       >
         <td className="px-1.5 py-1">
@@ -1285,13 +1354,39 @@ function PoolAccountRow({
         </td>
         <td className="px-2.5 py-1">
           <span className="inline-flex flex-wrap items-center gap-1">
-            {/* 账号级冷却 —— 决定整号能不能接流量，直接显示。 */}
+            {/*
+              「使用中 N」放在**状态列最前**：它是「此刻在不在干活」，与后面的
+              「健康 / 排队中 / 冷却中」是**两个不同维度**（可用性 vs 活跃度），
+              后者回答「能不能用」，前者回答「正在不被在用」。放最前是因为它变化最快、
+              最需要一眼看到（本行的左色条也是同一个信号，两者一起用）。
+            */}
+            {inUse ? (
+              <span
+                data-slot="pool-inuse-badge"
+                className="pool-inuse shrink-0 gap-1 rounded-full border px-2 py-[1px] text-[11px] font-semibold"
+                title={`正在使用：此刻有 ${inFlight} 个请求在途（说明流量正落在这个账号上）`}
+              >
+                <span className="pool-inuse-dot" aria-hidden="true" />
+                使用中 {inFlight}
+              </span>
+            ) : null}
+            {/* 账号级冷却 —— 决定整号能不能接流量，直接显示。
+                带 `data-slot="pool-state"`：状态列里现在有**三块**（使用中徽标 /
+                这一块 / 模型冷却角标），按 DOM 顺序取「第一个 span」已经不稳
+                —— 本行加上使用中徽标后，既有用例的 `span > span` 取到的是徽标。
+                给稳定的钩子，让断言认语义而不是认位置。 */}
             <span
+              data-slot="pool-state"
               className={cn("shrink-0 whitespace-nowrap rounded-md px-1.5 py-0.5 text-[11px] font-medium", state.cls)}
               title={acc.queued && !acc.cooling && !acc.disabled ? queuedReasonText(acc) : coolReasonText(acc)}
             >
               {state.label}
-              {acc.cooling ? ` · ${poolCoolKindLabel(acc.cool_kind)}` : ""}
+              {/* 只有拿得到具体原因时才追加「 · 原因」——未知 kind 时
+                  `poolCoolKindLabel` 返回空串，这里若不判空就会拼出
+                  「冷却中 · 42 秒」这种多一个点的文案。 */}
+              {acc.cooling && poolCoolKindLabel(acc.cool_kind)
+                ? ` · ${poolCoolKindLabel(acc.cool_kind)}`
+                : ""}
               {acc.cooling && typeof acc.cool_remaining_sec === "number" && acc.cool_remaining_sec > 0
                 ? ` ${formatRemaining(acc.cool_remaining_sec)}`
                 : ""}
@@ -1332,6 +1427,23 @@ function PoolAccountRow({
                   <PoolModelCoolingTip acc={acc} />
                 </TooltipContent>
               </Tooltip>
+            ) : null}
+            {/*
+              空闲账号的「N 分钟前用过」—— 回答「刚才是不是它」。
+              这在**没有在途请求时**是唯一能给的线索：此刻确实没在用它，
+              但用户往往想知道「上一个成功是不是这个号」，否则流量一停就完全看不出动向。
+              有在途请求时不显示（「使用中 N」已经更强，两个一起出是冗余）。
+              `last_success` 从未有过（Go 零值时间）时 `poolLastUsedAgo` 返回 null，
+              这里就不渲染 —— **不给编造的日期**（该坑的说明见 poolLastSuccessText 注释）。
+            */}
+            {!inUse && lastUsedAgo ? (
+              <span
+                data-slot="pool-last-used"
+                className="shrink-0 whitespace-nowrap text-[10.5px] text-muted-foreground"
+                title={`最近一次成功：${poolLastSuccessText(acc)}`}
+              >
+                {lastUsedAgo}用过
+              </span>
             ) : null}
           </span>
         </td>
