@@ -23,6 +23,21 @@ on:
           - win-x64
         # 仅支持 Windows x64；macOS / Linux 支持已移除。
 
+  # 仅为让 GitHub **注册**本工作流而存在的自引用触发。
+  #
+  # 背景：GitHub 的 workflow 是**惰性注册**的 —— 只有某个触发条件真正命中过一次，
+  # 它才会出现在 `actions/workflows` 列表里，此后才能用 workflow_dispatch 手动触发。
+  # 本工作流原先只有 workflow_dispatch（鸡生蛋问题），于是在 fork 里从未注册，
+  # `PUT /actions/workflows/build.yml/enable` 一直返回 404、也无法 dispatch
+  #（上游注册过是因为文件是被上游自己推上去的）。
+  #
+  # paths 限定为「本文件自身」，因此它只在改动本工作流时多跑一次，
+  # 不会在每次 push 时重复构建（那正是文件顶部注释里记录过的浪费）。
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build.yml"
+
 permissions:
   contents: write
 
