@@ -48,8 +48,117 @@ fn delete_account_from_path(path: &Path, account_id: &str) -> Result<(), String>
 }
 
 /// 读取账号库；文件缺失或损坏返回空列表。
+///
+/// **会顺带按 `id` 收敛重复条目**（见 `dedupe_and_heal`）：历史 bug 让
+/// uid/email 都缺失的账号每采集一次就多一条，只修写入路径清不掉已有数据。
 pub fn load_accounts() -> Vec<Value> {
-    load_accounts_from_path(&accounts_file())
+    let mut accounts = load_accounts_from_path(&accounts_file());
+    if dedupe_by_id(&mut accounts) {
+        // 只有真的合并过才落盘 —— 避免每次读取都写文件（那是无谓 IO，
+        // 也会让「文件 mtime」失去参考价值）。
+        if let Err(error) = save_accounts_to_path(&accounts_file(), &accounts) {
+            // 收敛失败不影响本次读取：内存里已经是去重后的结果，
+            // 下次读取会再试一次。所以只记日志，不向上抛。
+            eprintln!("[账号库] 合并重复条目后写回失败（下次读取会重试）: {error}");
+        }
+    }
+    accounts
+}
+
+/// 按 `id` 合并重复条目，返回「是否发生过合并」。
+///
+/// 合并规则（三条都要，缺一会留下新的坑）：
+///
+/// 1. **`disabled` 取「任一条为 true 则 true」**：禁用是用户的**显式意图**，
+///    不该被一条没有该字段的旧条目无声解除。这正是所有者遇到的
+///    「禁用了但显示未禁用、还无法启用」。
+/// 2. **其余字段取 `refreshedAt` 较新者**：token 相关字段必须用新的，
+///    否则会把刷新结果退回去（本事故里两条恰好差在 token 上）。
+/// 3. **`id` / `createdAt` 保留先出现那条**：`id` 相同才有合并；
+///    `createdAt` 是「同一次采集」的证据，保留任意一条都一样。
+///
+/// 只对**有非空 id** 的条目去重：无 id 的条目身份未知（可能是手工导入的
+/// 不同账号），按 id 合并对它们无从下手，也不该乱合并。
+fn dedupe_by_id(accounts: &mut Vec<Value>) -> bool {
+    // 收集：id → 该 id 的全部条目下标
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, account) in accounts.iter().enumerate() {
+        let Some(id) = get_str(account, "id").filter(|id| !id.trim().is_empty()) else {
+            continue;
+        };
+        groups.entry(id).or_default().push(index);
+    }
+
+    let mut drop_indexes: Vec<usize> = Vec::new();
+    let mut replacements: Vec<(usize, Value)> = Vec::new();
+
+    for indexes in groups.values() {
+        if indexes.len() < 2 {
+            continue;
+        }
+        let keep_index = indexes[0];
+
+        // 2) 其余字段取 refreshedAt 较新者：以最新那条为基底
+        let newest_index = indexes
+            .iter()
+            .copied()
+            .max_by_key(|&i| {
+                accounts[i]
+                    .get("refreshedAt")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(keep_index);
+        let mut merged = accounts[newest_index].clone();
+
+        // 3) id / createdAt 保留先出现那条
+        if let Some(id_value) = accounts[keep_index].get("id").cloned() {
+            merged["id"] = id_value;
+        }
+        if let Some(created_at) = accounts[keep_index].get("createdAt").cloned() {
+            merged["createdAt"] = created_at;
+        }
+
+        // 1) disabled：任一条为 true 就 true
+        let any_disabled = indexes.iter().any(|&i| {
+            accounts[i]
+                .get("disabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        });
+        if any_disabled {
+            merged["disabled"] = json!(true);
+        }
+        // 备注同样不该丢：取第一条非空的（用户手写的标签，比 token 更该保）
+        if get_str(&merged, "note").is_none() {
+            if let Some(note) = indexes
+                .iter()
+                .filter_map(|&i| get_str(&accounts[i], "note"))
+                .next()
+            {
+                merged["note"] = json!(note);
+            }
+        }
+
+        replacements.push((keep_index, merged));
+        for &i in indexes.iter().skip(1) {
+            drop_indexes.push(i);
+        }
+    }
+
+    if drop_indexes.is_empty() {
+        return false;
+    }
+
+    for (index, value) in replacements {
+        accounts[index] = value;
+    }
+    // 从后往前删，避免下标位移
+    drop_indexes.sort_unstable_by(|a, b| b.cmp(a));
+    for index in drop_indexes {
+        accounts.remove(index);
+    }
+    true
 }
 
 /// 写回账号库（原子写），保持原 JSON 数组结构。
@@ -227,10 +336,30 @@ fn same_region(a: &Value, b: &Value) -> bool {
 /// 非空 UID 始终优先；仅当新账号没有 UID 时，才使用真实邮箱兜底。
 /// 命中已有身份时保留本地 id，避免调用方持有的账号引用失效。
 /// 两个区域各自独立匹配，跨区域永不合并。
+///
+/// **`id` 也参与匹配（必须放在最前）**：`id` 是账号库主键，界面、备注、
+/// 禁用、`processedIds` 比对全部按它走。此前这里只看 `uid` / `email`，
+/// 于是 **uid 与 email 都缺失**的账号（国际版 OAuth、企业账号常无邮箱）
+/// 永远匹配不上 → 每次采集/登录都 `push` 一条 → 账号库里长出重复条目。
+///
+/// 实测事故（所有者反馈「禁用了但状态不显示，且无法启用」）：同一个号存了两条，
+/// 一条 `disabled: true`、另一条没有该字段。`set_account_disabled` 内部用
+/// `.find()` 只改**第一条**，而界面渲染**两条**、用户点的恰好是第二条 ⇒
+/// 显示「未禁用」、菜单永远只给「禁用」、而网关导出时第一条被过滤 ⇒ 池里也没有它。
+/// 根因就是这里的身份口径与 `upsert_account` 不一致（后者有 id 匹配）。
 pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value) -> Value {
+    let collected_id = get_str(&collected, "id");
     let collected_uid = get_str(&collected, "uid");
     let collected_email = identity_email(&collected);
     let matches_identity = |existing: &Value| {
+        // 0) id 精确匹配 —— 最准，且不受 uid/email 缺失影响。
+        //    放在区域判断**之前**：id 是全库唯一的，同 id 必然同账号，
+        //    不该因区域字段缺失（老数据）而漏配。
+        if let Some(id) = collected_id.as_deref() {
+            if get_str(existing, "id").as_deref() == Some(id) {
+                return true;
+            }
+        }
         if !same_region(existing, &collected) {
             return false;
         }
@@ -850,6 +979,149 @@ mod tests {
 
         std::fs::remove_dir_all(&auth).ok();
         std::fs::remove_dir_all(&backups).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // 重复条目：所有者实测「禁用了但状态不显示，且无法启用」的根因。
+    //
+    // 现场：同一个号在库里两条（uid/email 都是 null 的国际版 OAuth 账号），
+    // 一条 disabled=true、另一条没有该字段。禁用只改到第一条，界面渲染两条，
+    // 用户点的那张是第二条 ⇒ 显示未禁用、菜单只给「禁用」、网关导出时第一条被过滤。
+    // -----------------------------------------------------------------------
+
+    /// 补上 id 匹配后，uid 与 email **都缺失**的采集结果也能合并，不再每次 push。
+    ///
+    /// 这是重复条目的**产生**路径：此前 matches_identity 只看 uid/email，
+    /// 两者皆 null 时恒为 false。
+    #[test]
+    fn collected_account_without_uid_or_email_merges_by_id() {
+        // 现场形状：国际版 OAuth 账号，uid/email/nickname 全 null，只有 id 与 domain
+        let collected = json!({
+            "id": "acc-noid",
+            "uid": null,
+            "email": null,
+            "nickname": null,
+            "domain": "www.workbuddy.ai",
+            "access_token": "AT-1",
+            "createdAt": 100,
+            "refreshedAt": 200,
+        });
+
+        let mut store: Vec<Value> = vec![collected.clone()];
+        // 再采集一次（同 id）—— 修复前会变成 2 条
+        let _ = upsert_collected_account(&mut store, collected.clone());
+        assert_eq!(
+            store.len(),
+            1,
+            "uid/email 都缺失时也必须按 id 合并，否则每采集一次多一条"
+        );
+
+        // 第三次（模拟刷新后再采集）仍应只有一条
+        let mut again_input = collected.clone();
+        again_input["access_token"] = json!("AT-2");
+        again_input["refreshedAt"] = json!(300);
+        let saved = upsert_collected_account(&mut store, again_input);
+        assert_eq!(store.len(), 1, "反复采集必须幂等");
+        assert_eq!(saved["access_token"], "AT-2", "token 应更新为最新");
+    }
+
+    /// `load_accounts` 会把已有重复条目**收敛成一条**并写回。
+    ///
+    /// 只修写入路径清不掉历史数据 —— 所有者库里已经有那一对。
+    #[test]
+    fn load_accounts_heals_duplicate_entries() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("account-dedupe");
+
+        // 现场形状：老的在前（无 disabled、token 旧），新的在后（disabled=true、token 新）
+        let old_entry = json!({
+            "id": "dup-1", "uid": null, "email": null, "nickname": null,
+            "domain": "www.workbuddy.ai",
+            "access_token": "AT-OLD", "refresh_token": "RT-OLD",
+            "createdAt": 100, "refreshedAt": 200,
+        });
+        let new_entry = json!({
+            "id": "dup-1", "uid": null, "email": null, "nickname": null,
+            "domain": "www.workbuddy.ai", "disabled": true,
+            "access_token": "AT-NEW", "refresh_token": "RT-NEW",
+            "createdAt": 100, "refreshedAt": 300,
+        });
+        let other = json!({
+            "id": "keep-1", "uid": "u-keep", "nickname": "别的号",
+            "access_token": "AT-K", "createdAt": 1, "refreshedAt": 1,
+        });
+
+        save_accounts(&[old_entry, other, new_entry]).unwrap();
+        assert_eq!(
+            load_accounts_from_path(&accounts_file()).len(),
+            3,
+            "写盘后应有 3 条"
+        );
+
+        let healed = load_accounts();
+        assert_eq!(
+            healed.len(),
+            2,
+            "重复 id 应被收敛成一条，实际 {} 条",
+            healed.len()
+        );
+
+        let dup = healed
+            .iter()
+            .find(|a| a["id"] == "dup-1")
+            .expect("合并后应保留该账号");
+        // 1) disabled 取 true（禁用是显式意图，不该被旧条目无声解除）
+        assert_eq!(dup["disabled"], json!(true), "disabled 应保留 true");
+        // 2) token 取较新的
+        assert_eq!(dup["access_token"], "AT-NEW", "token 应取 refreshedAt 较新者");
+        // 3) createdAt 保留（同一次采集的证据）
+        assert_eq!(dup["createdAt"], json!(100));
+
+        // 写回要真的落盘（下次读取不再需要合并）
+        let on_disk = load_accounts_from_path(&accounts_file());
+        assert_eq!(
+            on_disk.len(),
+            2,
+            "收敛结果必须写回文件，否则每次读取都要重算"
+        );
+    }
+
+    /// 不同 id 的账号**不能**被误合并（哪怕它们 uid/email 都缺失）。
+    #[test]
+    fn dedupe_does_not_merge_distinct_ids() {
+        let mut accounts = vec![
+            json!({"id": "a", "uid": null, "email": null, "refreshedAt": 1}),
+            json!({"id": "b", "uid": null, "email": null, "refreshedAt": 2}),
+            json!({"id": "a", "uid": null, "email": null, "refreshedAt": 3}),
+        ];
+        let merged = dedupe_by_id(&mut accounts);
+        assert!(merged);
+        assert_eq!(accounts.len(), 2, "只合并同 id 的，不同 id 必须都留着");
+        assert!(accounts.iter().any(|a| a["id"] == "b"));
+    }
+
+    /// 无 id 的条目**不参与**按 id 去重（身份未知，可能是不同账号）。
+    #[test]
+    fn dedupe_ignores_entries_without_id() {
+        let mut accounts = vec![
+            json!({"uid": "u1", "nickname": "无 id 甲"}),
+            json!({"uid": "u1", "nickname": "无 id 乙"}),
+        ];
+        let merged = dedupe_by_id(&mut accounts);
+        assert!(!merged, "无 id 的条目不该被按 id 合并");
+        assert_eq!(accounts.len(), 2);
+    }
+
+    /// 备注也要保住：用户手写的标签比 token 更该留。
+    #[test]
+    fn dedupe_keeps_note_from_any_entry() {
+        let mut accounts = vec![
+            json!({"id": "n1", "uid": null, "refreshedAt": 100, "note": "主力号"}),
+            json!({"id": "n1", "uid": null, "refreshedAt": 200}),
+        ];
+        assert!(dedupe_by_id(&mut accounts));
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0]["note"], "主力号", "旧条目的备注不该被丢掉");
+        assert_eq!(accounts[0]["refreshedAt"], json!(200), "其余字段取较新者");
     }
 
     /// 造一个独立的临时扫描目录。
