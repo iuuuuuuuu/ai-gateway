@@ -22,7 +22,7 @@ import { accountReloginAlarm } from "@/lib/account-expiry";
 import { cn } from "@/lib/utils";
 import { AccountRecordsView } from "@/components/account-records-view";
 import { demoModeEnabled } from "@/lib/demo-mode";
-import type { AccountMeta, CreditExpiry, CreditResource, GatewayTaskName, TravelStatus } from "@/lib/types";
+import type { AccountMeta, AccountRunningTask, CreditExpiry, CreditResource, GatewayTaskName, TravelStatus } from "@/lib/types";
 
 const AVATAR_TONES = [
   "bg-emerald-100 text-emerald-800",
@@ -128,6 +128,23 @@ function accountDetailRows(account: AccountMeta): [string, string, string?][] {
 }
 
 const chipClass = "rounded-md px-1.5 py-0 text-[11px] font-medium";
+
+/**
+ * 「本轮已跑」标记的悬停说明。
+ *
+ * 为什么必须解释进度口径：`processed` 是**下界** —— Go 侧记录只在「成功且有新
+ * 变化 / 失败 / 重要跳过」时写，且按天去重（`records.TaskDaily`），所以一轮里
+ * 没有新变化的账号不会留下记录。不说明的话，用户看到「3/14」长时间不动会
+ * 以为卡死了，而那其实是正常现象（Rust 侧 `task_processed_ids` 与设置页
+ * `TaskRunningPanel` 都对此有明确警告，这里保持同一口径）。
+ */
+function runningTaskTitle(task: AccountRunningTask): string {
+  const progress =
+    task.total && task.total > 0
+      ? `本轮进度：已记录 ${task.processed ?? 0} / ${task.total} 个账号（近似值，无新变化的账号不写记录，数字可能停住不动）。`
+      : "本轮进度暂不可用。";
+  return `本账号已参与「${task.label}」本轮任务。${progress}点开右上角菜单可单独运行本账号的养护任务。`;
+}
 
 function travelIconChip({
   label,
@@ -570,6 +587,15 @@ interface Props {
   onRunTask?: (task: GatewayTaskName) => void;
   /** 正在执行的任务名；用于临时置灰并避免重复触发。 */
   taskRunning?: GatewayTaskName;
+  /**
+   * 本账号参与了**正在跑的那一轮**养号任务时下发的标记；否则为 null/undefined。
+   *
+   * 由父级按 `taskRuntime.processedIds.includes(account.id)` 判定 —— 注意是
+   * **账号库 id**，不是网关 uid（两者在真实数据里不同，用 uid 会一个都对不上
+   * 且不会报错）。不在本轮范围内的账号（区域不符 / 已禁用 / 需重登）由后端
+   * 的 `total` 口径排除，父级因此也不会给它标记 —— 否则用户会以为所有号都在跑。
+   */
+  runningTask?: AccountRunningTask | null;
   onSwitch?: (a: AccountMeta) => void;
   todayCheckedIn?: boolean;
   /** 今日旅行状态（undefined=查询中/未知，不渲染标签） */
@@ -627,7 +653,7 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
   );
 }
 
-export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, onCheckin, onRefresh, onAdopt, onRunTask, taskRunning, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, onCheckin, onRefresh, onAdopt, onRunTask, taskRunning, runningTask, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
   /** 备注编辑弹窗；`noteDraft` 是受控输入（打开时用当前备注初始化）。 */
   const [noteOpen, setNoteOpen] = useState(false);
@@ -687,10 +713,42 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
           已禁用
         </Badge>
       ) : null}
+      {/* 「本账号已参与本轮任务」标记。紧跟在「已禁用」之后、描述性标签（备注/区域/
+          签到）**之前**：它是秒级出现又消失的实时状态，而其余标签都是账号的稳定属性。
+          刻意**不**排到「已禁用」前面 —— 那条标签的注释已写明「放最前」的既有约定，
+          这里不去推翻它（两者可以并存：禁用的号照跑养号任务）。
+          措辞用「本轮已跑」而不是「正在跑」：后端只给 `processedIds`（**已留下
+          记录**的账号），Go 侧记录是在处理完一个账号之后才写，因此本轮正在处理的
+          那个号还没进集合，后端也没有「当前是哪个号」这个字段。照实说「已跑」，
+          不编造一个后端并不提供的状态（详见 types.ts 的 AccountRunningTask）。 */}
+      {runningTask && (
+        <Badge
+          variant="success"
+          className={cn(chipClass, "max-w-[12rem] gap-1")}
+          aria-label={`本账号本轮已跑：${runningTask.label}`}
+          title={runningTaskTitle(runningTask)}
+        >
+          {/* 转圈图标暗示「任务仍在进行」，让静态文字带上时间感 */}
+          <Loader2 className="size-3 shrink-0 animate-spin" />
+          <span className="truncate">本轮已跑 · {runningTask.label}</span>
+        </Badge>
+      )}
       {/* 备注放在最前面：它是用户自己起的标签，正是用来「一眼认出这是谁的号」的，
-          排在区域/签到等自动状态之前才符合使用意图。 */}
+          排在区域/签到等自动状态之前才符合使用意图。
+          
+          用 chip-note（信息蓝）而不是默认的灰：灰色与「国服」这类自动状态同色，
+          备注反而看不出是「我自己写的东西」（所有者反馈过不够明显）。
+          蓝＝用户写的 / 绿＝系统状态，一眼可分。
+          
+          宽度上限：宽松 12rem，紧凑收到 7.5rem（120px）——紧凑列宽只有约 300px，
+          而头部一行的「不可压缩」需求算下来已超 452px（详见下方 compact 头部注释），
+          备注若不收窄会把三个产品按钮挤出可视区。超出部分省略号 + 悬停看全文。 */}
       {account.note ? (
-        <Badge variant="outline" className={cn(chipClass, "max-w-[12rem] gap-1")} title={`备注：${account.note}`}>
+        <Badge
+          variant="outline"
+          className={cn(chipClass, "chip-note gap-1", compact ? "max-w-[7.5rem]" : "max-w-[12rem]")}
+          title={`备注：${account.note}`}
+        >
           <PencilLine className="size-3 shrink-0" />
           <span className="truncate">{account.note}</span>
         </Badge>
@@ -754,7 +812,10 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
           )}
         </div>
 
-        <div className={cn("absolute z-20", compact ? "right-2.5 top-1/2 -translate-y-1/2" : "right-3.5 top-3.5")}>
+        {/* ⋯ 按钮的位置：紧凑头部改成两行后不能再垂直居中（会落在两行之间、
+            与产品图标不在同一水平线）。改为贴第一行中心：header py-1.5(6px) +
+            产品图标 28px 的一半(14px) ⇒ 约 20px。宽松模式仍贴右上角。 */}
+        <div className={cn("absolute z-20", compact ? "right-2.5 top-5" : "right-3.5 top-3.5")}>
           {demoModeEnabled ? (
             <DemoAction>
               <Button variant="ghost" size="icon" className={cn("rounded-lg text-muted-foreground hover:text-foreground", compact ? "size-7" : "size-8")} aria-label={`管理账号 ${name}`} title="更多账号操作">
@@ -890,10 +951,23 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
         </div>
 
         {compact ? (
-          <div className="relative z-10 flex w-full min-w-0 items-center gap-2 pr-10">
-            <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-5" title={name}>{name}</h3>
-            <div className="hidden shrink-0 items-center gap-1 min-[420px]:flex">{statusChips}</div>
-            <div className="ml-auto flex shrink-0 items-center gap-1">
+          /* 紧凑头部改为**两行**（所有者确认的方案 B / 2-B）：
+             第一行 = 名字 + 三个产品切换图标 + ⋯；第二行 = 状态标签。
+             
+             为什么必须分行：紧凑列宽 ≈ 300px（栅格 minmax(min(100%,300px),1fr)），
+             而原来一行要放的全部是 shrink-0（不可压缩）：
+               备注 chip(max-w-12rem=192) + 已签到(62) + 需重登(66) + 三图标(92) + ⋯预留(40)
+               ≈ 452px > 300px
+             结果就是**三个产品按钮被挤出可视区**（所有者实测反馈「按钮都挤下去了」）。
+             原实现用 `min-[420px]:flex` 把状态区整个藏掉来回避，代价是窄列下状态全丢；
+             分行则两边都保住：图标不再被挤，状态也还能换行显示。
+             
+             状态行不再限 hidden/min-[420px]：分行后它有自己的整行宽度，
+             窄列下换行即可，没有必要再藏（藏了就等于「紧凑模式看不到状态」）。 */
+          <div className="relative z-10 flex w-full min-w-0 flex-col">
+            <div className="flex w-full min-w-0 items-center gap-2 pr-10">
+              <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-5" title={name}>{name}</h3>
+              <div className="ml-auto flex shrink-0 items-center gap-1">
               {workbuddyActive ? (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -966,7 +1040,11 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   <TooltipContent side="top">{codebuddyCliConfigured ? "设为 CodeBuddy CLI 当前账号" : "请先接入 CodeBuddy CLI"}</TooltipContent>
                 </Tooltip>
               )}
+              </div>
             </div>
+            {/* 第二行：状态标签。紧凑列宽约 300px，这一行独占整宽后可换行，
+                所以不再需要原来那个 `hidden min-[420px]:flex` 的回避手段。 */}
+            <div className="mt-1.5 flex w-full min-w-0 flex-wrap items-center gap-1">{statusChips}</div>
           </div>
         ) : (
           <div className={cn("relative z-10 flex w-full min-w-0 items-center gap-3", workbuddyActive || codebuddyCliActive ? "pr-[112px]" : "pr-10")}>
@@ -1211,7 +1289,6 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
             <AccountRecordsView
               accounts={[]}
               fixedAccountId={account.id}
-              defaultRange="30d"
               compact
             />
           </div>

@@ -155,6 +155,9 @@ const ROUTES: Record<string, Route> = {
   get_gateway_config: { method: "GET", path: "/api/gateway/config" },
   save_gateway_config: { method: "POST", path: "/api/gateway/config" },
   switch_gateway_mode: { method: "POST", path: "/api/gateway/mode" },
+  // 「限制使用的模型」：多值（新界面）与单值（旧界面）共用同一个路由，
+  // 后端按 body 里的键名区分（models/allowedModels vs model/allowedModel）。
+  set_allowed_models: { method: "POST", path: "/api/gateway/allowed-model" },
   set_allowed_model: { method: "POST", path: "/api/gateway/allowed-model" },
   start_gateway: { method: "POST", path: "/api/gateway/start" },
   check_gateway_port: { method: "POST", path: "/api/gateway/port-check" },
@@ -602,6 +605,15 @@ export interface AccountRecordItem {
   /** 积分增减或 Token 数量；无则为 0 */
   amount: number;
   detail: string;
+  /**
+   * 积分变化的来源：grant（额度发放）| consume（调用扣减）| expire（额度到期）| adjust。
+   *
+   * **可选**是刻意的，不是疏漏：这个字段是后加的，历史记录里根本没有它。
+   * 后端对老记录不会补写（记录是只追加的事件流，不改写历史），
+   * 所以运行时完全可能是 undefined —— 声明成必填只会把 undefined 藏进类型里，
+   * 让渲染处忘记兜底。消费方必须自己判空。
+   */
+  source?: string;
 }
 
 export interface AccountRecordsResult {
@@ -917,9 +929,23 @@ export function setAccountDisabled(
 }
 
 /**
- * 设置「单一模型 + 积分轮转」的目标模型；传空串清除锁定。
+ * 设置「限制使用的模型」白名单（多选）；传空数组 = 清除限制（全部放行）。
  *
- * 网关运行时后端会自动重启它以生效（模型锁定由网关启动时读取）。
+ * **三个工作模式都生效**：网关会拒绝名单外的模型（400 model_not_allowed）。
+ * 网关运行时后端会自动重启它以生效（模型限制由网关启动时读取）。
+ *
+ * 为什么走 `set_allowed_models` 而不是旧的单值命令：旧命令只表达一个模型，
+ * 传数组时后端会解析失败。旧命令仍保留（向后兼容已发布的调用方）。
+ */
+export function setAllowedModels(models: string[]): Promise<GatewayModeSwitchResult> {
+  return call<GatewayModeSwitchResult>("set_allowed_models", { models });
+}
+
+/**
+ * 设置单个模型限制；传空串清除限制。
+ *
+ * @deprecated 多选请用 {@link setAllowedModels}。保留这个入口只为向后兼容
+ *（脚本、旧版界面自调用）。它现在等价于传一个单元素数组。
  */
 export function setAllowedModel(model: string): Promise<GatewayModeSwitchResult> {
   return call<GatewayModeSwitchResult>("set_allowed_model", { model });

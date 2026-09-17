@@ -52,13 +52,25 @@ type Config struct {
 	// 因此被链接器的死代码消除剔出了二进制 —— 表现为「代码写了但根本调不到」。
 	GrowthTasks *GrowthTaskAPI
 
-	// AllowedModel 「单一模型」锁定：非空时**只放行这一个模型**，其余一律拒绝。
+	// AllowedModels 「限制使用的模型」白名单：**非空时只放行列表内的模型**，
+	// 其余一律拒绝；空（或 nil）= 不限制（默认，向后兼容）。
 	//
-	// 用于「单一模型 + 积分轮转」模式：轮转的语义是「把这个账号的某个模型额度
-	// 烧干净再换下一个账号」，因此必须锁定模型 —— 否则客户端换个模型就能绕过
-	// 轮转策略，账号选择与额度消耗都会变得不可预期。
+	// 三个工作模式（自动 / 积分轮转 / 手动）共用同一份白名单 —— 它限制的是
+	// 「网关放行哪些模型」，与「用哪些账号」是正交的两件事，所以不该只在
+	// 轮转模式下生效。轮转模式尤其依赖它：轮转的语义是「把这个账号的某个
+	// 模型额度烧干净再换下一个账号」，模型是策略的一部分，不锁定的话客户端
+	// 换个模型就能绕过轮转策略，账号选择与额度消耗都会变得不可预期。
 	//
-	// 空串 = 不限制（默认，向后兼容）。大小写不敏感比较。
+	// 大小写不敏感比较；元素两侧空白被忽略；元素自带 `cn:` / `global:` 前缀
+	// 时先剥掉再比较（用户既可能在界面上选到裸名，也可能手写带前缀的名字）。
+	// 由 NewHandler 归一化后缓存到 Handler.allowed，请求路径上零分配。
+	AllowedModels []string
+
+	// AllowedModel 已废弃的**单值**写法（历史字段，仅为向后兼容保留）。
+	//
+	// 老配置里可能是 `pool.allowed_model: "deepseek-v4.1-flash"` 这样的字符串，
+	// 调用方（main.go）读出来塞在这里。NewHandler 会把它并进 AllowedModels，
+	// 因此老配置的行为逐字不变。**新代码一律用 AllowedModels。**
 	AllowedModel string
 
 	// PromptMode 系统提示词替换模式："passthrough"（缺省）/ "custom"。
@@ -82,6 +94,14 @@ const ServiceName = "workbuddy2api"
 type Handler struct {
 	cfg Config
 	mux *http.ServeMux
+	// allowed 「限制使用的模型」白名单（已归一化：剥前缀、去空白）。
+	//
+	// 在 NewHandler 里算一次并缓存，而不是每个请求现算：归一化会分配，
+	// 而请求路径上（forwardChat 每次调用）做这件事纯属浪费 —— 白名单
+	// 只在进程启动时定一次，运行期不会变（改了配置要重启网关）。
+	//
+	// 空（nil 或零长度）= 不限制，这是默认值也是老配置的行为。
+	allowed []string
 }
 
 // NewHandler 构建 handler。
@@ -101,7 +121,17 @@ func NewHandler(cfg Config) *Handler {
 	if strings.TrimSpace(cfg.PromptMode) == "" {
 		cfg.PromptMode = prompt.ModePassthrough
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	// 白名单归一化：多值字段 + 老配置的单值字段**合并**（不是二选一）。
+	//
+	// 为什么合并而不是「多值非空就忽略单值」：宿主升级过程中可能出现两者
+	// 同时被写进配置的中间态（新的写多值、旧的单值还留在文件里）。若此时
+	// 忽略单值，用户原来锁定的那个模型会**静默失效** —— 表现为「升级后
+	// 限制突然不管用了」，是安全方向的错误，宁可多放行一个也不能漏。
+	h := &Handler{
+		cfg:     cfg,
+		mux:     http.NewServeMux(),
+		allowed: normalizeAllowedModels(append(append([]string{}, cfg.AllowedModels...), cfg.AllowedModel)),
+	}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("POST /responses", h.withAuth(h.responses))
@@ -658,7 +688,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // 必须让客户端看到真实原因，而不是被误导去等账号恢复。
 //
 // 两类请求侧错误（两者都是「重试无用、要改请求」）：
-//   - 单一模型模式拒绝 → model_not_allowed（见 modelLockedError）
+//   - 模型不在白名单 → model_not_allowed（见 modelLockedError）
 //   - 上下文超长       → context_length_exceeded
 func openAIFailure(err error) (code, msg string) {
 	if f := failureOf(err); f != nil && f.Kind == FailureContextTooLong {
@@ -685,7 +715,7 @@ func anthropicFailure(err error) (code, msg string) {
 
 // responsesFailure 同上，Responses API 的上游失败码是 upstream_error。
 //
-// 单一模型拒绝沿用 #14 为该协议定的 invalid_request_error，**不**把
+// 模型白名单拒绝沿用 #14 为该协议定的 invalid_request_error，**不**把
 // errorCodeFor 的 model_not_allowed 直接透出：model_not_allowed 是本网关给
 // chat/completions 形状定的码，不属于 Responses 词汇表（见 responsesBodyCodes
 // ——该协议用 invalid_request / payload_too_large）。同理 anthropicFailure 保持
@@ -747,8 +777,8 @@ var responsesBodyCodes = bodyErrorCodes{tooLarge: "payload_too_large", badReques
 
 // errorCodeFor 把 forwardChat 的错误映射成面向客户端的错误码。
 //
-// 区分「模型被单一模型模式拒绝」与「账号都不可用」很重要：前者是**调用方
-// 需要改的东西**（换模型或换模式），后者是**服务端状态**。都报
+// 区分「模型不在白名单」与「账号都不可用」很重要：前者是**调用方
+// 需要改的东西**（换模型或调整「放行模型」），后者是**服务端状态**。都报
 // no_healthy_account 会把用户引向排查账号，而真正的原因在请求里。
 func errorCodeFor(err error) string {
 	var locked *modelLockedError

@@ -26,6 +26,11 @@
   --ring: oklch(0.725 0.133 163.03);
   --brand: oklch(0.725 0.133 163.03);
   --brand-foreground: oklch(0.985 0.002 247.839);
+  /* info 信息蓝：用于「用户自己写的内容」这类需要与系统状态（绿）区分的标记。
+     具体用途见 .chip-note —— 备注标签用它，好让「这是我起的名字」一眼可辨，
+     而不是和「国服」这种自动状态同色（所有者反馈过备注不够明显）。 */
+  --info: oklch(0.62 0.13 250);
+  --info-foreground: oklch(0.99 0.002 250);
   --chart-1: oklch(0.646 0.222 41.116);
   --chart-2: oklch(0.6 0.118 184.704);
   --chart-3: oklch(0.398 0.07 227.392);
@@ -73,6 +78,9 @@
   --ring: oklch(0.696 0.17 162.48);
   --brand: oklch(0.696 0.17 162.48);
   --brand-foreground: oklch(0.208 0.042 265.755);
+  /* info 信息蓝（暗色）：提亮并略降饱和，否则深底上会发闷、与主色绿难分辨。 */
+  --info: oklch(0.68 0.12 250);
+  --info-foreground: oklch(0.208 0.042 265.755);
   --chart-1: oklch(0.488 0.243 264.376);
   --chart-2: oklch(0.696 0.17 162.48);
   --chart-3: oklch(0.769 0.188 70.08);
@@ -166,4 +174,26 @@
   [aria-label="Token 总览"] {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
+}
+
+/* ---------------------------------------------------------------------------
+   备注标签（chip-note）
+   
+   为什么单独一个 class 而不是写 Tailwind 任意值：这里要的三组颜色都基于
+   `color-mix(in oklab, var(--info) N%, ...)`，写在 class 里比塞进 `[]` 任意值
+   更可靠、可读，也能一次性覆盖暗色（token 已按主题定义，无需再写 dark: 变体）。
+   
+   语义：**备注是用户自己写的内容**，此前用的是与「国服」等自动状态相同的灰色，
+   导致「一眼认出这是谁的号」这个用途失效（所有者反馈「备注是不是不太明显」）。
+   改用信息蓝后，蓝＝你写的 / 绿＝系统状态，一眼可分。
+   --------------------------------------------------------------------------- */
+.chip-note {
+  background: color-mix(in oklab, var(--info) 13%, transparent);
+  border-color: color-mix(in oklab, var(--info) 30%, transparent);
+  color: color-mix(in oklab, var(--info) 72%, black);
+  font-weight: 500;
+}
+.dark .chip-note {
+  /* 暗色下不能再用「混黑」压暗（深底会糊掉），改为向白提亮。 */
+  color: color-mix(in oklab, var(--info) 82%, white);
 }

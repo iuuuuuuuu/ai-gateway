@@ -67,6 +67,15 @@ type Identity struct {
 
 // record 一条账号记录。字段顺序与宿主侧 AccountRecord::to_json 保持一致，
 // 便于两边直接 diff 文件。
+//
+// 为什么**没有** Source 字段：网关只写 task 记录，而 source 只对积分变化有意义
+//（宿主侧 account_records.rs 的 CREDIT_SOURCE_*）。网关不写积分记录，
+// 因此这里刻意不声明它 —— 声明一个永不赋值的字段，只会让人误以为网关也会写来源。
+//
+// 那宿主的 source 会不会被网关弄丢？不会：append 走的是 load()，它用
+// []json.RawMessage **按原始字节**透传每条既有记录，未知字段一个比特都不动。
+// 这条契约有 TestPreservesHostCreditSourceField 专门锁住 —— 它是两边共用
+// 同一个文件时最容易出错的地方（丢了字段只会表现为「界面上来源徽标不见了」）。
 type record struct {
 	Ts          int64  `json:"ts"`
 	AccountID   string `json:"accountId"`

@@ -129,5 +129,5 @@ func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.
 		return nil, err
 	}
 	BillingHeaders(req, a)
-	return c.doJSON(req)
+	return c.doJSON(a, req)
 }

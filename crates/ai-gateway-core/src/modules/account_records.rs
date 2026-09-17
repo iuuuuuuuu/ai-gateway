@@ -34,6 +34,22 @@ pub const KIND_TASK: &str = "task";
 pub const KIND_CREDIT: &str = "credit";
 pub const KIND_TOKEN: &str = "token";
 
+/// 积分变化的「来源」取值。
+///
+/// 为什么需要一个独立字段而不是继续写在 title 里：title 是给人读的短标题
+/// （「积分增长」「积分消耗」），来源是**另一条正交信息** —— 同一个「积分增长」
+/// 既可能来自新积分包到账，也可能是返还。两者都塞进 title 会让标题在
+/// 「积分增长 · 额度发放」这类拼接里越写越长，且前端无法据此稳定地筛选/配色。
+///
+/// 这些取值描述的是**观测到的事实**，而不是猜测的任务名：
+/// 上游资源接口只返回容量与余额，不返回「这笔积分由哪个任务产生」，
+/// 因此这里如实记录「余额是怎么动的」，而不是编造一个任务名。
+/// 具体判据见 [`crate::modules::credit_usage::classify_credit_source`]。
+pub const CREDIT_SOURCE_GRANT: &str = "grant";
+pub const CREDIT_SOURCE_CONSUME: &str = "consume";
+pub const CREDIT_SOURCE_EXPIRE: &str = "expire";
+pub const CREDIT_SOURCE_ADJUST: &str = "adjust";
+
 static RECORD_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// 账号记录文件路径。
@@ -60,11 +76,18 @@ pub struct AccountRecord {
     pub amount: i64,
     /// 补充说明（错误信息、模型名等）。
     pub detail: String,
+    /// 积分变化的来源（grant | consume | expire | adjust）。
+    ///
+    /// 用 `Option` 而不是空字符串：**历史记录里根本没有这个字段**，
+    /// 若用空串表示「无来源」，读回来的老记录与「来源未知」就无法区分，
+    /// 前端也就没法决定该不该渲染这一栏。`None` 一律表示「这条记录没有来源信息」
+    /// （历史记录，以及 task / token 两类记录 —— 来源只对积分变化有意义）。
+    pub source: Option<String>,
 }
 
 impl AccountRecord {
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "ts": self.ts,
             "accountId": self.account_id,
             "accountName": self.account_name,
@@ -73,11 +96,23 @@ impl AccountRecord {
             "result": self.result,
             "amount": self.amount,
             "detail": self.detail,
-        })
+        });
+        // 只有确实有来源时才写这个键。
+        //
+        // 为什么不是写 `"source": null`：task / token 记录不该凭空多出一个恒为
+        // null 的字段 —— Go 侧是**按原始字节**透传宿主记录的（records.go 的 load），
+        // 给它不需要的键只会让两边 diff 变噪声，也看不出「谁有来源」。
+        if let Some(source) = &self.source {
+            value["source"] = json!(source);
+        }
+        value
     }
 }
 
 /// 追加一条任务执行记录。
+///
+/// 任务记录不带来源：它的 `title` 本身就是任务名（如「自动签到」「夜猫子任务」），
+/// 再记一个 source 只是把同一件事写两遍。
 pub fn add_task_record(account_id: &str, account_name: &str, title: &str, result: &str, detail: &str) {
     push(AccountRecord {
         ts: now_ms(),
@@ -88,16 +123,24 @@ pub fn add_task_record(account_id: &str, account_name: &str, title: &str, result
         result: result.to_string(),
         amount: 0,
         detail: detail.to_string(),
+        source: None,
     });
 }
 
 /// 追加一条积分变化记录（amount 正为增长、负为消耗）。
+///
+/// `source` 是这个账号**为什么**变分（见 [`CREDIT_SOURCE_GRANT`] 等）。
+/// 为什么必须由调用方传进来、而不是在这里按 amount 正负猜：
+/// 「余额涨了」本身分不出「签到/任务发的奖励」与「买的积分包到账」，
+/// 只有掌握前后快照的调用方（`credit_usage::record_snapshot`）才能判断容量有没有一起变。
+/// 在这里按符号猜，等于把「任务奖励」这个**未经证实的结论**写进记录。
 pub fn add_credit_record(
     account_id: &str,
     account_name: &str,
     title: &str,
     amount: i64,
     detail: &str,
+    source: Option<&str>,
 ) {
     push(AccountRecord {
         ts: now_ms(),
@@ -108,10 +151,16 @@ pub fn add_credit_record(
         result: if amount >= 0 { "success" } else { "info" }.to_string(),
         amount,
         detail: detail.to_string(),
+        source: source
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(String::from),
     });
 }
 
 /// 追加一条 Token 消耗记录。
+///
+/// 同样不带 source：`title` 里已经带了模型名（真正的来源维度）。
 pub fn add_token_record(
     account_id: &str,
     account_name: &str,
@@ -132,6 +181,7 @@ pub fn add_token_record(
         result: "info".to_string(),
         amount: tokens,
         detail: detail.to_string(),
+        source: None,
     });
 }
 
@@ -520,7 +570,7 @@ mod tests {
     fn add_helpers_write_expected_kinds() {
         let _iso = Isolated::new("records-add-helpers");
         add_task_record("a", "na", "自动签到", "success", "");
-        add_credit_record("a", "na", "积分消耗", -12, "");
+        add_credit_record("a", "na", "积分消耗", -12, "", Some(CREDIT_SOURCE_CONSUME));
         add_token_record("a", "na", "glm-5.2", 1234, "");
 
         let v = query_records("a", 0, 0, &[], 100);
@@ -547,6 +597,122 @@ mod tests {
                 .contains("glm-5.2"),
             "Token 记录标题应含模型名"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 来源（source）：积分记录必须能看出「为什么变分」
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn credit_record_persists_source() {
+        let _iso = Isolated::new("records-credit-source");
+        add_credit_record("a", "na", "积分增长 · 额度发放", 100, "余额 +100", Some(CREDIT_SOURCE_GRANT));
+
+        let v = query_records("a", 0, 0, &[KIND_CREDIT.to_string()], 100);
+        let recs = v.get("records").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            recs[0].get("source").and_then(Value::as_str),
+            Some(CREDIT_SOURCE_GRANT),
+            "来源必须被写入并可从查询结果读回"
+        );
+    }
+
+    #[test]
+    fn credit_record_without_source_omits_the_key() {
+        // 调用方没给来源时不该凭空写一个 null：Go 侧按原始字节透传，
+        // 多余的键只会让两边 diff 变噪声。
+        let _iso = Isolated::new("records-credit-no-source");
+        add_credit_record("a", "na", "积分调整", 5, "", None);
+
+        let v = query_records("a", 0, 0, &[], 100);
+        let recs = v.get("records").and_then(Value::as_array).unwrap();
+        assert!(
+            recs[0].get("source").is_none(),
+            "无来源时不应出现 source 键，实际: {:?}",
+            recs[0].get("source")
+        );
+    }
+
+    #[test]
+    fn blank_source_is_treated_as_absent() {
+        // 空串/空白与 None 同义：否则前端会拿到 "" 并渲染成空徽标。
+        let _iso = Isolated::new("records-credit-blank-source");
+        add_credit_record("a", "na", "t", 5, "", Some("   "));
+        let v = query_records("a", 0, 0, &[], 100);
+        let recs = v.get("records").and_then(Value::as_array).unwrap();
+        assert!(recs[0].get("source").is_none(), "空白来源应被规整为「无」");
+    }
+
+    #[test]
+    fn task_and_token_records_never_carry_source() {
+        // 来源只对积分变化有意义：任务标题本身就是任务名，Token 的标题带模型名。
+        let _iso = Isolated::new("records-no-source-other-kinds");
+        add_task_record("a", "na", "自动签到", "success", "");
+        add_token_record("a", "na", "glm-5.2", 10, "");
+        let v = query_records("a", 0, 0, &[], 100);
+        for r in v.get("records").and_then(Value::as_array).unwrap() {
+            assert!(r.get("source").is_none(), "非积分记录不该有 source: {r:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_records_without_source_still_query_and_normalize() {
+        // **老记录兼容**：升级前写入的积分记录没有 source 字段。
+        // 它们必须照常被查询返回（不能被过滤掉、也不能让解析失败退化成空集），
+        // 且缺失字段不能被补成 null 之类的值 —— 前端靠「有没有这个键」决定渲不渲染。
+        let _iso = Isolated::new("records-legacy-no-source");
+        let now = now_ms();
+        let legacy = json!([
+            {
+                "ts": now, "accountId": "old", "accountName": "老账号",
+                "kind": KIND_CREDIT, "title": "积分增长", "result": "success",
+                "amount": 100, "detail": ""
+            }
+        ]);
+        atomic_write(
+            &account_records_file(),
+            &serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .expect("写入老记录应成功");
+
+        let v = query_records("old", 0, 0, &[], 100);
+        assert_eq!(v.get("total").and_then(Value::as_u64), Some(1), "老记录必须仍可查到");
+        let recs = v.get("records").and_then(Value::as_array).unwrap();
+        assert_eq!(recs[0].get("title").and_then(Value::as_str), Some("积分增长"));
+        assert!(
+            recs[0].get("source").is_none(),
+            "老记录不该被凭空补出来源字段"
+        );
+    }
+
+    #[test]
+    fn mixed_legacy_and_new_records_coexist() {
+        // 真实场景：文件里既有升级前的老记录，也有带来源的新记录。
+        // 查询必须同时返回两者，且新记录的 source 不受老记录影响。
+        let _iso = Isolated::new("records-mixed-source");
+        let now = now_ms();
+        let legacy = json!([
+            {
+                "ts": now - 1000, "accountId": "a", "accountName": "n",
+                "kind": KIND_CREDIT, "title": "积分增长", "result": "success",
+                "amount": 50, "detail": ""
+            }
+        ]);
+        atomic_write(
+            &account_records_file(),
+            &serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        add_credit_record("a", "n", "积分增长 · 额度发放", 100, "", Some(CREDIT_SOURCE_GRANT));
+
+        let v = query_records("a", 0, 0, &[KIND_CREDIT.to_string()], 100);
+        assert_eq!(v.get("total").and_then(Value::as_u64), Some(2));
+        let recs = v.get("records").and_then(Value::as_array).unwrap();
+        // 倒序：新记录在前
+        assert_eq!(recs[0].get("source").and_then(Value::as_str), Some(CREDIT_SOURCE_GRANT));
+        assert!(recs[1].get("source").is_none(), "老记录仍应无 source");
+        // 净变化把两者都算进去
+        assert_eq!(v.pointer("/summary/creditNet").and_then(Value::as_i64), Some(150));
     }
 
     // -----------------------------------------------------------------------

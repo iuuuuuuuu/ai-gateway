@@ -30,6 +30,9 @@ import { cn } from "@/lib/utils";
  *
  * 日期筛选的默认范围取「今天」而不是「全部」：绝大多数时候用户关心的是
  * 最近发生了什么，而全部记录在小屏上会刷出几百条。
+ *
+ * 「今天」是**写死的**，不接受调用方覆盖（此前有个 `defaultRange` 参数，
+ * 唯一的调用点传了 "30d" 把它覆盖掉，用户打开就看到近 30 天）。详见组件内注释。
  */
 export type RecordKind = "task" | "credit" | "token";
 
@@ -99,21 +102,61 @@ const KIND_META: Record<string, { label: string; icon: typeof Zap; tone: string 
   token: { label: "Token", icon: Zap, tone: "text-violet-600 dark:text-violet-400" },
 };
 
+/**
+ * 积分来源的展示标签。
+ *
+ * 为什么在前端再维护一份标签、而不是直接显示后端给的英文 source：
+ * source 是**数据契约**（供筛选/统计用），它的取值必须稳定；展示文案则会变
+ *（今天叫「额度发放」，明天可能改成「积分包到账」）。混用会让改文案变成改协议。
+ *
+ * 同样重要的是：表里**没有**的取值（以及 undefined）一律不渲染徽标 ——
+ * 历史记录根本没有 source 字段，后端也不会回头补写（记录是只追加的事件流）。
+ * 若不判空就渲染，老记录会显示成「来源：undefined」。
+ */
+const SOURCE_META: Record<string, { label: string; tone: string; title: string }> = {
+  grant: {
+    label: "额度发放",
+    tone: "border-emerald-600/30 text-emerald-700 dark:text-emerald-400",
+    title: "余额与额度容量同时增加：新的积分包到账",
+  },
+  consume: {
+    label: "调用扣减",
+    tone: "border-muted-foreground/30 text-muted-foreground",
+    title: "余额减少而额度容量不变：被调用消耗",
+  },
+  expire: {
+    label: "额度到期",
+    tone: "border-destructive/30 text-destructive",
+    title: "余额减少且额度容量同降：积分包被回收，包内剩余一并失效",
+  },
+  adjust: {
+    label: "其他调整",
+    tone: "border-amber-600/30 text-amber-700 dark:text-amber-400",
+    title: "无法归入发放 / 消耗 / 到期的余额变化",
+  },
+};
+
 export function AccountRecordsView({
   accounts,
   fixedAccountId,
-  defaultRange = "today",
   compact = false,
 }: {
   /** 可筛选的账号列表；为空时只按「全部账号」查询。 */
   accounts: { id: string; name: string }[];
   /** 固定账号（用于账号详情内嵌）；提供时隐藏账号选择器。 */
   fixedAccountId?: string;
-  defaultRange?: string;
   /** 紧凑模式：减少内边距与标题，用于嵌在其它卡片里。 */
   compact?: boolean;
 }) {
-  const [rangeKey, setRangeKey] = useState(defaultRange);
+  // 日期范围**不可由调用方指定**，恒为「今天」。
+  //
+  // 为什么不保留一个 defaultRange 参数（此前是 `defaultRange = "today"`）：
+  // 它唯一的调用点（account-card.tsx 的「查看记录」弹窗）传了 "30d"，
+  // 于是用户打开记录看到的是近 30 天，而组件自己的注释写着「默认取今天」——
+  // 参数的存在让「默认值」变成两处口径，且覆盖发生在离用户最远的地方。
+  // 用户关心的是「今天发生了什么」，而近 30 天只是他偶尔才需要的一步操作
+  // （点一下「近 30 天」按钮即可）。删掉这个入口，这类不一致就无法再被引入。
+  const [rangeKey, setRangeKey] = useState("today");
   const [fromDate, setFromDate] = useState(() => dateKey(new Date()));
   const [toDate, setToDate] = useState(() => dateKey(new Date()));
   const [accountId, setAccountId] = useState(fixedAccountId ?? "");
@@ -374,6 +417,9 @@ function RecordRow({ record }: { record: api.AccountRecordItem }) {
   const meta = KIND_META[record.kind] ?? KIND_META.task;
   const Icon = meta.icon;
   const isFailed = record.result === "failed" || record.result === "error";
+  // 来源徽标：只有积分记录、且后端确实给了已知来源时才渲染。
+  // 老记录（无 source 字段）与 task/token 记录都落进 undefined → 不渲染。
+  const source = record.kind === "credit" ? SOURCE_META[record.source ?? ""] : undefined;
 
   // 金额展示：积分带正负号，Token 只显示数值
   const amountText = useMemo(() => {
@@ -394,11 +440,23 @@ function RecordRow({ record }: { record: api.AccountRecordItem }) {
       </span>
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 text-xs">
-          <span className="flex min-w-0 items-center gap-1.5">
+          <span className="flex min-w-0 flex-wrap items-center gap-1.5">
             <span className="font-medium">{record.title}</span>
             <Badge variant="outline" className="h-4 px-1 text-[10px] font-normal">
               {meta.label}
             </Badge>
+            {/* 来源徽标：这就是「积分增加看不出是通过什么任务」的答案所在。
+                它是数据里真实记录下来的来源类别，不是按时间邻近猜出来的任务名
+                （上游不返回这种账单流水，详见后端 credit_usage::classify_credit_source）。 */}
+            {source && (
+              <Badge
+                variant="outline"
+                className={cn("h-4 px-1 text-[10px] font-normal", source.tone)}
+                title={source.title}
+              >
+                {source.label}
+              </Badge>
+            )}
             {record.result === "success" && <CircleCheck className="size-3 text-emerald-600" />}
             {record.result === "already" && <CircleCheck className="size-3 text-amber-600" />}
           </span>

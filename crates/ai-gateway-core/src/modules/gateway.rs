@@ -140,6 +140,12 @@ pub fn default_gateway_config() -> Value {
         //   "pinned"  —— 指定账号：只使用 pinned_uid 对应的那一个账号
         "mode": "balance",
         "pinned_uid": null,
+        // 「限制使用的模型」白名单：空数组 = 不限制（**默认是全部**）。
+        //
+        // 为什么默认必须是空：这是**新增能力**，老配置里没有这个键。
+        // 默认成任何非空名单都会让既有用户升级后被静默限制住。
+        // 三个工作模式共用同一份名单（见 write_native_config）。
+        "allowed_model": [],
         "last_status": null,
         "last_error": null,
         // ---- 4 个自动养号任务的排程（写进网关的 schedule 块，见 write_native_config）----
@@ -207,6 +213,19 @@ fn finalize_gateway_config(mut cfg: Value) -> Value {
         });
     cfg["port"] = json!(port);
     cfg["listen"] = json!(normalize_listen(port));
+    // 「限制使用的模型」统一成**数组**形状。
+    //
+    // 老配置里这个键是单值字符串（实测所有者本机的 gateway_config.json 就是
+    // `"allowed_model": "deepseek-v4.1-flash"`）。在这里归一化的收益：
+    //   - `/api/gateway/config` 与 `/api/gateway/status.config` 的出口形状恒定，
+    //     界面不必为「这次拿到的是字符串还是数组」分两条渲染路径；
+    //   - 任何一次保存（哪怕只是切个 auto_start 开关）都会把磁盘上的老形状
+    //     顺手升级成数组，配置随时间自然收敛，不需要单独的迁移步骤。
+    //
+    // 读取侧仍必须吃字符串（Go 侧 `AllowedModels.UnmarshalJSON`、前端
+    // `normalizeAllowedModels`）：配置文件也可能被直接编辑，或由老版本宿主写入，
+    // 归一化只保证「经过本函数之后」的形状。
+    cfg["allowed_model"] = allowed_models_of(&cfg);
     cfg
 }
 
@@ -1586,16 +1605,17 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
                 GatewayMode::from_str(cfg.get("mode").and_then(Value::as_str).unwrap_or("balance")),
                 GatewayMode::Rotation
             ),
-            // 「单一模型」锁定：非空时网关只放行该模型。
-            // 只在轮转模式下有意义 —— 负载均衡不限制模型（保持原有行为）。
-            "allowed_model": if matches!(
-                GatewayMode::from_str(cfg.get("mode").and_then(Value::as_str).unwrap_or("balance")),
-                GatewayMode::Rotation
-            ) {
-                cfg.get("allowed_model").and_then(Value::as_str).unwrap_or("").trim()
-            } else {
-                ""
-            }
+            // 「限制使用的模型」白名单：非空时网关只放行名单内的模型。
+            //
+            // **三个工作模式都写**（不再只在轮转模式下写）：限制模型与「用哪些
+            // 账号」是正交的两件事。此前只在轮转下写，导致用户在自动/手动模式
+            // 下配的限制被静默丢弃 —— 官方 native config 里那一项恒为空串，
+            // 表现为「界面上勾了、网关照样放行一切」。
+            //
+            // 形状是**字符串数组**（空数组 = 不限制）。Go 侧
+            // `AllowedModels.UnmarshalJSON` 同时吃字符串与数组，因此把老的
+            // 单值字符串读成单元素数组、写成数组，两边都自洽。
+            "allowed_model": allowed_models_of(cfg),
         },
         "session_sticky": { "enabled": true, "ttl": "30m", "gc_interval": "5m" },
         // ---- 账号记录回写（养号任务的执行痕迹）----
@@ -2109,39 +2129,97 @@ fn mode_patch(mode: GatewayMode, uids: &[String]) -> Value {
     })
 }
 
-/// 读取「单一模型」锁定的模型名（配合轮转模式）；未设置返回空串。
-pub fn allowed_model() -> String {
-    load_gateway_config()
-        .get("allowed_model")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string()
+/// 从任意配置值里读出「限制使用的模型」名单。
+///
+/// **同时接受两种形状**（这是向后兼容的关键）：
+///   - 字符串 `"glm-5.3"`        → 老配置/老宿主的单值写法 → `["glm-5.3"]`
+///   - 数组   `["glm-5.3","x"]`  → 新宿主的写法            → 逐项读出
+///
+/// 为什么必须两者都吃：用户从旧版本升级上来时，gateway_config.json 里这个键
+/// 是字符串。只认数组会让名单**静默变成空**（= 不限制），表现为「升级后限制
+/// 突然不管用了」——安全方向的静默失败，比启动报错更危险。
+///
+/// 归一化：逐项 trim、丢弃空项；**去重**（界面可能因重复点击传入重复项，
+/// 去重后错误信息里不会出现「a、a、b」这种读起来像 bug 的文案）。
+/// 元素**不剥区域前缀**：那是网关（Go 侧）的职责，两边各写一套必然分叉。
+fn allowed_models_of(cfg: &Value) -> Value {
+    let raw = cfg.get("allowed_model");
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |item: &str| {
+        let trimmed = item.trim();
+        if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    };
+    match raw {
+        Some(Value::Array(items)) => {
+            for item in items {
+                if let Some(s) = item.as_str() {
+                    push(s);
+                }
+            }
+        }
+        Some(Value::String(s)) => push(s),
+        // null / 键缺席 / 其它形状一律当作「未配置」= 不限制。
+        // 其它形状不报错：配置读路径上的宽容比严格更重要 —— 这里报错会让
+        // 网关**启动不起来**，而一个畸形的名单最多是限制没生效。
+        _ => {}
+    }
+    json!(out)
 }
 
-/// 归一化「单一模型」配置值：空串/纯空白 → Null（清除锁定），其余取 trim 后的值。
+/// 读取「限制使用的模型」名单；未设置返回空数组（= 不限制）。
+pub fn allowed_models() -> Vec<String> {
+    allowed_models_of(&load_gateway_config())
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 读取老的**单值**写法（仅向后兼容，供旧调用方/旧界面读）。
+///
+/// 多值名单存在时返回**第一项**：旧界面的下拉是单选，给它一个能对上号的值，
+/// 比返回空串（界面显示「不限制」而实际有限制）少一次误导。
+pub fn allowed_model() -> String {
+    allowed_models().into_iter().next().unwrap_or_default()
+}
+
+/// 归一化「限制使用的模型」配置值：空数组/全空项 → `[]`（清除限制），
+/// 其余逐项 trim + 去重。
 ///
 /// 抽成纯函数便于测试（真正的保存路径会写用户配置并可能重启网关）。
-fn allowed_model_patch(model: &str) -> Value {
-    let trimmed = model.trim();
-    if trimmed.is_empty() {
-        json!({ "allowed_model": Value::Null })
-    } else {
-        json!({ "allowed_model": trimmed })
-    }
+fn allowed_models_patch(models: &[String]) -> Value {
+    json!({ "allowed_model": allowed_models_of(&json!({ "allowed_model": models })) })
 }
 
-/// 保存「单一模型 + 积分轮转」的目标模型并**立即生效**。
+/// 保存「限制使用的模型」白名单并**立即生效**。
 ///
-/// 空串 = 清除锁定（仍可轮转，但不限制模型 —— 不建议，客户端能换模型绕过
-/// 额度控制）。
+/// 空数组 = 清除限制（= 全部放行，默认）；名单非空时网关只放行名单内的模型。
+/// **三个工作模式共用**：限制模型与「用哪些账号」是正交的两件事，因此不再
+/// 只在轮转模式下生效。
 ///
 /// 为什么需要立即生效：`allowed_model` 由网关**启动时**读取，光落盘不会改变
 /// 正在运行的进程（与切换模式同理，用户会看到「选了没反应」），因此在网关
 /// 运行时重启它。
-pub async fn set_allowed_model(model: &str) -> Value {
-    let patch = allowed_model_patch(model);
-    let cfg = match save_gateway_config(&patch) {
+pub async fn set_allowed_models(models: &[String]) -> Value {
+    let normalized = allowed_models_patch(models);
+    let list: Vec<String> = normalized
+        .get("allowed_model")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let cfg = match save_gateway_config(&normalized) {
         Ok(v) => v,
         Err(e) => return json!({ "ok": false, "error": e }),
     };
@@ -2161,7 +2239,7 @@ pub async fn set_allowed_model(model: &str) -> Value {
                 update_runtime_state("failed", Some(e.clone()));
                 return json!({
                     "ok": false,
-                    "error": format!("模型已保存，但重启网关失败：{e}"),
+                    "error": format!("模型限制已保存，但重启网关失败：{e}"),
                     "config": cfg,
                 });
             }
@@ -2170,8 +2248,25 @@ pub async fn set_allowed_model(model: &str) -> Value {
     json!({
         "ok": true,
         "reloaded": reloaded,
-        "allowedModel": model.trim(),
+        // 回显归一化后的完整名单（前端据此更新勾选态，而不是自己猜）。
+        "allowedModels": list,
+        // 老的**单值**回显字段：旧界面/旧调用方读它。
+        // 多值时取第一项（旧界面是单选，给一个能对上号的值比给空串少一次误导）。
+        "allowedModel": list.first().cloned().unwrap_or_default(),
     })
+}
+
+/// 保存**单个**模型限制（向后兼容入口，等价于 `set_allowed_models` 传单元素）。
+///
+/// 空串 = 清除限制。
+pub async fn set_allowed_model(model: &str) -> Value {
+    let trimmed = model.trim();
+    let list: Vec<String> = if trimmed.is_empty() {
+        Vec::new()
+    } else {
+        vec![trimmed.to_string()]
+    };
+    set_allowed_models(&list).await
 }
 
 /// 切换工作模式（自动 / 手动 / 轮转）并**立即生效**。
@@ -4089,4 +4184,204 @@ mod tests {
         assert_eq!(cfg.get("prompt_file").and_then(Value::as_str), Some(""));
     }
 
+    // -----------------------------------------------------------------------
+    // 「限制使用的模型」白名单（多值 / 三模式 / 默认全部）
+    //
+    // 本轮把单值 `allowed_model`（仅轮转模式）升级为多值白名单（三个模式都有）。
+    // 三条必须守住的线：老的单值字符串继续能读、空 = 不限制、native config
+    // 每次启动都写出当前的完整名单。
+    // -----------------------------------------------------------------------
+
+    // 老配置的单值字符串必须读成单元素名单。
+    //
+    // 这是向后兼容的核心：所有既有 gateway_config.json 里这个键都是字符串
+    //（实测所有者本机的配置就是 `"allowed_model": "deepseek-v4.1-flash"`）。
+    // 只认数组会让名单**静默变成空** = 不限制 —— 表现为「升级后限制突然不管
+    // 用了」，比启动报错更危险。
+    #[test]
+    fn allowed_models_reads_legacy_single_string() {
+        let out = super::allowed_models_of(&json!({ "allowed_model": "deepseek-v4.1-flash" }));
+        assert_eq!(
+            out,
+            json!(["deepseek-v4.1-flash"]),
+            "老的字符串形状必须读成单元素名单"
+        );
+    }
+
+    // 新形状：字符串数组。
+    #[test]
+    fn allowed_models_reads_array() {
+        let out = super::allowed_models_of(&json!({ "allowed_model": ["a", "b", "c"] }));
+        assert_eq!(out, json!(["a", "b", "c"]));
+    }
+
+    // 空值一律 = 不限制（空数组 / null / 空串 / 键缺席）。
+    #[test]
+    fn allowed_models_empty_means_unrestricted() {
+        for cfg in [
+            json!({ "allowed_model": [] }),
+            json!({ "allowed_model": null }),
+            json!({ "allowed_model": "" }),
+            json!({ "allowed_model": "   " }),
+            json!({}), // 老配置根本没有这个键
+        ] {
+            assert_eq!(
+                super::allowed_models_of(&cfg),
+                json!([]),
+                "空值必须是不限制（空名单），实际输入 {cfg}"
+            );
+        }
+    }
+
+    // 归一化：逐项 trim、丢弃空项、去重。
+    //
+    // 去重不是为了省空间 —— 错误信息里出现「a、a、b」会让人以为程序有 bug。
+    #[test]
+    fn allowed_models_normalizes_items() {
+        let out = super::allowed_models_of(&json!({
+            "allowed_model": ["  a  ", "", "   ", "a", "b"]
+        }));
+        assert_eq!(out, json!(["a", "b"]), "应 trim、丢空项、去重");
+    }
+
+    // 元素**不**剥区域前缀：那是网关（Go 侧）的职责，两边各写一套必然分叉。
+    #[test]
+    fn allowed_models_keeps_realm_prefix() {
+        let out = super::allowed_models_of(&json!({ "allowed_model": ["cn:a", "global:b"] }));
+        assert_eq!(
+            out,
+            json!(["cn:a", "global:b"]),
+            "宿主侧不剥前缀，交给 Go 侧 normalizeAllowedModels 统一处理"
+        );
+    }
+
+    // write_native_config 必须把多值名单写进 native config 的 pool 块。
+    //
+    // 缺陷背景：write_native_config 每次启动网关都**全量重写**
+    // gateway_native_config.json。它此前只在轮转模式下写这一项，于是自动/手动
+    // 模式下用户配的限制被静默丢弃 —— 表现为「界面上勾了、网关照样放行一切」。
+    #[test]
+    fn native_config_writes_allowed_models_in_all_modes() {
+        for mode in ["balance", "manual", "rotation"] {
+            let _iso = crate::modules::config::test_isolation::Isolated::new("gw-allowed-models");
+            let cfg = json!({
+                "mode": mode,
+                "allowed_model": ["deepseek-v4.1-flash", "glm-5.3"],
+            });
+            let path = write_native_config(&cfg).expect("write native config");
+            let native: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+
+            assert_eq!(
+                native.pointer("/pool/allowed_model"),
+                Some(&json!(["deepseek-v4.1-flash", "glm-5.3"])),
+                "mode={mode} 时限制名单必须写进 native config（三个模式都要写）"
+            );
+        }
+    }
+
+    // 未配置时 native config 里必须是**空数组**，不能是空串。
+    //
+    // 为什么形状要对：Go 侧两种都吃，但数组是「多值」语义的规范形状。
+    // 写成空串在老代码里会被当成「有值但为空」的边界去处理，多一层风险。
+    #[test]
+    fn native_config_writes_empty_array_when_unrestricted() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-allowed-empty");
+        let path = write_native_config(&json!({ "mode": "balance" })).expect("write");
+        let native: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+
+        assert_eq!(
+            native.pointer("/pool/allowed_model"),
+            Some(&json!([])),
+            "未配置时必须是空数组（= 不限制）"
+        );
+    }
+
+    // 老配置的单值字符串也要能写进 native config（读→写的完整往返）。
+    #[test]
+    fn native_config_writes_legacy_string_as_array() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-allowed-legacy");
+        let path =
+            write_native_config(&json!({ "allowed_model": "deepseek-v4.1-flash" })).expect("write");
+        let native: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+
+        assert_eq!(
+            native.pointer("/pool/allowed_model"),
+            Some(&json!(["deepseek-v4.1-flash"])),
+            "老的单值字符串应被写成单元素数组，行为不变"
+        );
+    }
+
+    // 默认配置里不能有限制（「默认是全部」这条需求在配置层的落点）。
+    #[test]
+    fn default_config_has_no_allowed_models() {
+        let cfg = default_gateway_config();
+        assert_eq!(
+            cfg.get("allowed_model"),
+            Some(&json!([])),
+            "默认必须是空名单（= 全部放行），否则全新安装的用户一启动就被限制"
+        );
+    }
+
+    // default_config_has_no_allowed_models 与 finalize 的归一化：见下方
+    // finalize_normalizes_legacy_string_to_array。这里先补后者。
+    //
+    // finalize_gateway_config 把老的单值字符串归一化成数组。
+    //
+    // 为什么要在配置出口归一化：`/api/gateway/config` 与 `/status.config` 的形状
+    // 恒定，界面才不必为「这次拿到的是字符串还是数组」分两条渲染路径；
+    // 且任何一次保存都会把磁盘上的老形状顺手升级，配置随时间自然收敛。
+    // 注意**读取侧仍必须吃字符串**（配置文件也可能被直接编辑、或由老宿主写入）
+    // —— 归一化只保证「经过本函数之后」的形状。
+    #[test]
+    fn finalize_normalizes_legacy_string_to_array() {
+        let out = super::finalize_gateway_config(json!({
+            "port": 7863,
+            "allowed_model": "deepseek-v4.1-flash",
+        }));
+        assert_eq!(
+            out.get("allowed_model"),
+            Some(&json!(["deepseek-v4.1-flash"])),
+            "老的单值字符串应在配置出口归一化成单元素数组"
+        );
+
+        // 已经是数组的原样保留（含顺序），不重排 —— 用户看到的顺序应与勾选顺序一致。
+        let arr = super::finalize_gateway_config(json!({
+            "port": 7863,
+            "allowed_model": ["b", "a"],
+        }));
+        assert_eq!(arr.get("allowed_model"), Some(&json!(["b", "a"])));
+
+        // 键缺席（老配置的常见情形）→ 空数组，而不是保持缺席。
+        // 保持缺席会让界面读到 undefined，多一处判空分支。
+        let absent = super::finalize_gateway_config(json!({ "port": 7863 }));
+        assert_eq!(absent.get("allowed_model"), Some(&json!([])));
+    }
+
+    // set_allowed_models 的落盘补丁：归一化后写入，空 → 空数组。
+    //
+    // 只测纯函数 `allowed_models_patch`，不测 `set_allowed_models` 本身：
+    // 后者会写用户配置并**重启网关**，在单测里跑会动到真实进程。
+    #[test]
+    fn allowed_models_patch_normalizes_and_clears() {
+        let patch = super::allowed_models_patch(&[
+            "  glm-5.3  ".to_string(),
+            "".to_string(),
+            "glm-5.3".to_string(),
+        ]);
+        assert_eq!(
+            patch,
+            json!({ "allowed_model": ["glm-5.3"] }),
+            "补丁必须归一化（trim + 丢空项 + 去重）"
+        );
+
+        let cleared = super::allowed_models_patch(&[]);
+        assert_eq!(
+            cleared,
+            json!({ "allowed_model": [] }),
+            "空输入 = 清除限制，写成空数组而不是 null（形状统一，便于前端回显）"
+        );
+    }
 }

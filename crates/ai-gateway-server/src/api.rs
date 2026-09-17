@@ -1061,26 +1061,58 @@ async fn api_switch_gateway_mode(Json(body): Json<Value>) -> Response {
     json_ok(result)
 }
 
-/// POST /api/gateway/allowed-model —— 设置「单一模型 + 积分轮转」的目标模型。
+/// POST /api/gateway/allowed-model —— 设置「限制使用的模型」白名单。
 ///
-/// body: `{ "model": "deepseek-v4.1-flash" }`；空串 = 清除锁定。
-/// 网关运行时自动重启以生效（模型锁定由网关启动时读取）。
+/// body 同时接受**两种形状**（向后兼容）：
+///   - `{ "models": ["a","b"] }` / `{ "allowedModels": ["a","b"] }` —— 新界面（多选）
+///   - `{ "model": "a" }` / `{ "allowedModel": "a" }`                —— 旧界面（单选）
+///
+/// 空数组 / 空串 = 清除限制（= 全部放行）。网关运行时自动重启以生效
+///（模型限制由网关启动时读取）。
 async fn api_set_allowed_model(Json(body): Json<Value>) -> Response {
-    let model = body
-        .get("model")
-        .or_else(|| body.get("allowedModel"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let result = ai_gateway_core::modules::gateway::set_allowed_model(model).await;
+    let models = allowed_models_from_body(&body);
+    let result = ai_gateway_core::modules::gateway::set_allowed_models(&models).await;
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
         let msg = result
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("设置模型失败")
+            .unwrap_or("设置模型限制失败")
             .to_string();
         return json_err(msg, StatusCode::BAD_REQUEST);
     }
     json_ok(result)
+}
+
+/// 从请求体里读出模型名单，兼容「多值数组」与「单值字符串」两种写法。
+///
+/// 抽成独立函数（而不是内联在 handler 里）是为了能单测这段兼容逻辑：
+/// 它是本路由向后兼容的全部依据，内联后只能靠起 HTTP 服务才能验证。
+///
+/// 顺序上**数组优先于单值**：两者同时出现在请求体里时，数组是新界面的意图，
+/// 单值多半是旧字段残留；取数组更符合用户当下的操作。
+fn allowed_models_from_body(body: &Value) -> Vec<String> {
+    let pick_array = |key: &str| -> Option<Vec<String>> {
+        body.get(key).and_then(Value::as_array).map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+    };
+    if let Some(list) = pick_array("models").or_else(|| pick_array("allowedModels")) {
+        return list;
+    }
+    // 单值形状：老界面的 `set_allowed_model(model: String)` 走的是这条。
+    body.get("model")
+        .or_else(|| body.get("allowedModel"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| vec![s.to_string()])
+        .unwrap_or_default()
 }
 
 /// POST /api/gateway/start —— 启动网关（可选 body.port 指定端口）。
@@ -1443,4 +1475,87 @@ async fn api_agents_backups(Query(params): Query<HashMap<String, String>>) -> Re
     json_ok(json!({
         "backups": ai_gateway_core::modules::agent_import::list_backups(&target),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// 「限制使用的模型」请求体兼容
+//
+// 这段逻辑是本路由向后兼容的**全部依据**（新界面发数组、旧界面发单个字符串），
+// 因此单独抽出来做成可单测的纯函数，而不是内联在 handler 里只能靠起 HTTP 服务验证。
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod allowed_models_body_tests {
+    use super::allowed_models_from_body;
+    use serde_json::json;
+
+    // 新界面（多选）的两种键名都要认。
+    #[test]
+    fn reads_array_from_both_key_names() {
+        assert_eq!(
+            allowed_models_from_body(&json!({"models": ["a", "b"]})),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            allowed_models_from_body(&json!({"allowedModels": ["a", "b"]})),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    // 旧界面（单选）的两种键名都要继续工作 —— 这是向后兼容的硬要求。
+    #[test]
+    fn reads_legacy_single_string() {
+        assert_eq!(
+            allowed_models_from_body(&json!({"model": "a"})),
+            vec!["a".to_string()]
+        );
+        assert_eq!(
+            allowed_models_from_body(&json!({"allowedModel": "a"})),
+            vec!["a".to_string()]
+        );
+    }
+
+    // 空值 = 清除限制（不是「限制一个叫空串的模型」）。
+    #[test]
+    fn empty_means_clear_restriction() {
+        for body in [
+            json!({}),
+            json!({"models": []}),
+            json!({"model": ""}),
+            json!({"model": "   "}),
+            json!({"models": ["", "  "]}),
+        ] {
+            assert!(
+                allowed_models_from_body(&body).is_empty(),
+                "空值应清除限制，实际输入 {body}"
+            );
+        }
+    }
+
+    // 数组优先于单值：两者同时出现时取数组（新界面的意图），单值多半是旧字段残留。
+    #[test]
+    fn array_wins_over_single_value() {
+        assert_eq!(
+            allowed_models_from_body(&json!({"models": ["a", "b"], "model": "z"})),
+            vec!["a".to_string(), "b".to_string()],
+            "同时出现时应以数组为准"
+        );
+    }
+
+    // 元素逐个 trim 并丢弃空项：前端多选传来的值理论上干净，但接口是公开的。
+    #[test]
+    fn trims_items_and_drops_blanks() {
+        assert_eq!(
+            allowed_models_from_body(&json!({"models": ["  a  ", "", "b"]})),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    // 类型不对不应 panic，退化成「不限制」。
+    #[test]
+    fn wrong_types_degrade_without_panic() {
+        assert!(allowed_models_from_body(&json!({"models": 123})).is_empty());
+        assert!(allowed_models_from_body(&json!({"model": 42})).is_empty());
+        assert!(allowed_models_from_body(&json!({"models": [1, 2, 3]})).is_empty());
+    }
 }

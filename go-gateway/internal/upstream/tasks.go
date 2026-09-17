@@ -316,7 +316,7 @@ func (c *Client) ClaimGrowthTask(a *auth.Auth, taskCode string) (credit, energy 
 		h.Set("X-Domain", a.Domain)
 	}
 
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(a, req)
 	if err != nil {
 		return 0, 0, false, err
 	}

@@ -129,7 +129,7 @@ func (c *Client) ReportDesktopEvents(a *auth.Auth, events ...DesktopEvent) error
 	if a.UID != "" {
 		h.Set("X-User-Id", a.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(a, req)
 	return err
 }
 
@@ -156,7 +156,7 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	if a.UID != "" {
 		h.Set("X-User-Id", a.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(a, req)
 	return err
 }
 
@@ -193,7 +193,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if a.UID != "" {
 		h.Set("X-User-Id", a.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(a, req)
 	return err
 }
 
@@ -472,7 +472,7 @@ func (c *Client) ChatWithModel(a *auth.Auth, modelID, prompt string, expertID st
 	if expertID != "" {
 		h.Set("X-Expert-Id", expertID)
 	}
-	resp, err := c.chatHTTP().Do(req)
+	resp, err := c.chatClientFor(a).Do(req)
 	if err != nil {
 		return "", "", err
 	}
@@ -642,7 +642,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	if a.UID != "" {
 		h.Set("X-User-Id", a.UID)
 	}
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(a, req)
 	if err != nil {
 		return nil, err
 	}

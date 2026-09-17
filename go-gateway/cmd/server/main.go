@@ -71,12 +71,20 @@ func main() {
 	// 「单一模型 + 积分轮转」模式（缺省关闭 = 负载均衡，老配置行为不变）。
 	if cfg.Pool.Rotation {
 		p.SetRotation(true)
-		if m := strings.TrimSpace(cfg.Pool.AllowedModel); m != "" {
-			log.Printf("pool: 已启用「单一模型 + 积分轮转」模式，锁定模型 %s（其他模型一律拒绝）", m)
-		} else {
-			// 未锁模型时轮转仍可用，但语义不完整：客户端可换模型绕过额度控制。
-			log.Printf("pool: 已启用「单一模型 + 积分轮转」模式，但未指定模型（pool.allowed_model 为空）—— 建议在界面选择模型")
-		}
+	}
+
+	// 「限制使用的模型」白名单：**三个工作模式都生效**（不再只在轮转下）。
+	//
+	// 这条日志是用户排查「为什么客户端被拒」的第一现场：网关子进程的 stdout
+	// 在 GUI 里可能被丢弃，因此把**生效的完整名单**打出来，用户从日志就能看出
+	// 自己配的是哪几个，而不是只能看到「被拒了」。
+	if list := cfg.Pool.AllowedModels; len(list) > 0 {
+		log.Printf("pool: 已限制可使用的模型，只放行 %s（其他模型一律拒绝；改配置后需重启网关）",
+			strings.Join(list, "、"))
+	} else if cfg.Pool.Rotation {
+		// 轮转但未限制模型：语义不完整（客户端可换模型绕过额度控制），
+		// 但这是合法配置，只提示不拦。
+		log.Printf("pool: 已启用「积分轮转」模式，但未限制模型（pool.allowed_model 为空）—— 建议在界面「放行模型」里选择")
 	}
 
 	// 会话粘性路由（可配关闭）。
@@ -110,22 +118,30 @@ func main() {
 	// 为什么需要：国际版（workbuddy.ai）在国内直连不稳定（实测 wsarecv 超时），
 	// 走代理才稳。宿主把「设置 → 更新代理」里已填的地址复用到此处，用户无需配两遍。
 	// 地址无效不致命：记日志并继续直连，避免一个配置项导致网关起不来。
+	//
+	// 作用范围**仅国际版账号**：国服（copilot.tencent.com / codebuddy.cn）直连
+	// 即通，把它的流量绕进代理只会多一跳延迟、多一个故障面（代理挂了国服跟着挂）。
+	// 因此这里的日志必须写明范围 —— 用户看到「出站请求经 X」会以为全走代理。
 	if proxy := strings.TrimSpace(cfg.Proxy); proxy != "" {
 		if err := up.SetProxy(proxy); err != nil {
 			log.Printf("proxy: 配置无效，忽略并直连：%v", err)
 		} else {
-			log.Printf("proxy: 出站请求经 %s", proxy)
+			log.Printf("proxy: 国际版账号（*.ai）的出站请求经 %s；国服账号一律直连（不经过该代理）", proxy)
 		}
 	} else {
 		log.Printf("proxy: 未配置（国际版账号在部分网络下可能超时，可在软件的「设置 → 更新代理」中填写）")
 	}
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
-	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
+	// 两套 client（国服直连 / 国际版代理）都要设：只设 c.HTTP 会让国际版的
+	// 短 RPC 悄悄退回 120s 硬编码上限，与配置不符且无法从界面上看出来。
+	rpcTimeout := time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
+	up.HTTP.Timeout = rpcTimeout
+	up.SetRPCTimeout(rpcTimeout)
 	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
 	up.HeaderTimeout = time.Duration(cfg.Upstream.HeaderTimeoutSeconds) * time.Second
-	if tr, ok := up.ChatHTTP.Transport.(*http.Transport); ok {
-		tr.ResponseHeaderTimeout = up.HeaderTimeout
-	}
+	// 遍历**所有** transport（含国际版代理那一个）——只改 ChatHTTP.Transport
+	// 会漏掉国际版，表现为「国服按新上限超时、国际版仍干等 120s」。
+	up.ApplyResponseHeaderTimeout(up.HeaderTimeout)
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
@@ -222,13 +238,13 @@ func main() {
 		// —— 表现为「代码写了、测试也过了，但运行时根本调不到」。
 		// 实测验证方式：`strings gateway.exe | findstr growth/tasks` 应有命中。
 		GrowthTasks: newGrowthTaskAPI(p, up, recorder),
-		// 单一模型锁定：仅轮转模式下生效（负载均衡不限制模型，保持原有行为）。
-		AllowedModel: func() string {
-			if cfg.Pool.Rotation {
-				return strings.TrimSpace(cfg.Pool.AllowedModel)
-			}
-			return ""
-		}(),
+		// 「限制使用的模型」白名单：三个工作模式都生效，空 = 不限制（默认）。
+		//
+		// 直接把已解析的切片传下去（不再按 rotation 过滤）：限制模型与「用哪些
+		// 账号」是正交的两件事，只在轮转下生效会让自动/手动模式完全无法限制模型。
+		// 老配置的 `allowed_model` 字符串由 AllowedModels.UnmarshalJSON 读成
+		// 单元素切片，因此老配置升级后行为逐字不变。
+		AllowedModels: cfg.Pool.AllowedModels,
 		// 系统提示词替换：mode 缺省 passthrough（透传客户端原始 system），
 		// custom 时用 PromptText（normalizePrompt 已读完盘并缓存）替换
 		// 客户端的 system/developer 消息。

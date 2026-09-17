@@ -142,12 +142,20 @@ type Config struct {
 		//
 		// 缺省 false 保证老配置行为不变；该字段由宿主写入网关配置。
 		Rotation bool `json:"rotation"`
-		// AllowedModel 「单一模型」锁定（配合 rotation）：非空时只放行该模型。
+		// AllowedModels 「限制使用的模型」白名单（多选）。
 		//
-		// 轮转的语义是「把这个账号的指定模型额度烧干净再换号」，模型是策略的
-		// 一部分，因此必须锁定 —— 否则客户端换个模型就绕过了轮转与额度控制，
-		// 也让「当前烧的是哪个模型」变得不可预期。空串 = 不限制（默认）。
-		AllowedModel string `json:"allowed_model"`
+		// 非空时网关**只放行名单内的模型**，其余一律 400 model_not_allowed；
+		// 空（默认）= 不限制。三个工作模式（自动 / 手动 / 积分轮转）共用同一份
+		// 名单 —— 它限制的是「放行哪些模型」，与「用哪些账号」是正交的两件事。
+		//
+		// 轮转模式尤其需要它：轮转的语义是「把这个账号的某个模型额度烧干净再
+		// 换号」，模型是策略的一部分，不限制的话客户端换个模型就能绕过轮转与
+		// 额度控制，也让「当前烧的是哪个模型」变得不可预期。
+		//
+		// 类型是 AllowedModels —— 它的 UnmarshalJSON 让同一个 JSON 键
+		// `allowed_model` **既接受字符串也接受数组**：老配置写的是
+		// `"deepseek-v4.1-flash"`，新宿主写的是 `["a","b"]`，两者都必须能读。
+		AllowedModels AllowedModels `json:"allowed_model"`
 	} `json:"pool"`
 
 	// Proxy 出站 HTTP 代理，形如 "http://127.0.0.1:7890"（缺省空 = 不用显式代理）。
@@ -203,6 +211,51 @@ type Config struct {
 	// 请求路径上做文件 IO 会引入可避免的延迟与失败面，且运行期改文件
 	// 本该由「改配置 + 重启」承载，语义更清晰（也避免读到写了一半的文件）。
 	PromptText string `json:"-"`
+}
+
+// AllowedModels 「限制使用的模型」白名单。
+//
+// 为什么需要自定义类型而不是直接用 []string：这个键在配置文件里的历史形状是
+// **字符串**（`"allowed_model": "deepseek-v4.1-flash"`），新宿主写的是**数组**。
+// 直接把字段声明成 []string 会让所有老配置在解析阶段就失败 ——
+// `json: cannot unmarshal string into Go struct field ... of type []string` ——
+// 表现为「升级后网关直接起不来」，是最严重的一类向后兼容事故。
+//
+// 自定义 UnmarshalJSON 是唯一能同时吃下两种形状的写法。
+type AllowedModels []string
+
+// UnmarshalJSON 同时接受字符串与字符串数组；null / 空串 → 空（= 不限制）。
+//
+// 其余形状（数字、对象）按类型错误上报，不静默吞掉：用户把
+// `"allowed_model": 123` 写进配置时，明确报错比「静默当成不限制」安全得多
+// —— 后者会让用户以为限制生效了，实际网关放行一切。
+func (a *AllowedModels) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		*a = nil
+		return nil
+	}
+	// 数组形状：正常解码，元素里的空白与空串交给 server 侧归一化统一处理
+	//（那里已经有一份 normalizeAllowedModels，两边各写一套必然分叉）。
+	if strings.HasPrefix(trimmed, "[") {
+		var list []string
+		if err := json.Unmarshal(data, &list); err != nil {
+			return fmt.Errorf("pool.allowed_model: %w", err)
+		}
+		*a = list
+		return nil
+	}
+	// 字符串形状（老配置）：空串视为「不限制」而不是「一个叫空串的模型」。
+	var single string
+	if err := json.Unmarshal(data, &single); err != nil {
+		return fmt.Errorf("pool.allowed_model: 需要字符串或字符串数组: %w", err)
+	}
+	if strings.TrimSpace(single) == "" {
+		*a = nil
+		return nil
+	}
+	*a = []string{single}
+	return nil
 }
 
 // RecordIdentities 把配置里的账号身份映射转成 records 包需要的形状

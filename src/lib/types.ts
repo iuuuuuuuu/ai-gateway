@@ -558,12 +558,18 @@ export interface GatewayConfig {
   /** 指定账号模式下锁定的账号 uid（旧字段，仅向后兼容）。 */
   pinned_uid?: string | null;
   /**
-   * 「单一模型 + 积分轮转」锁定的模型名（仅 rotation 模式生效）。
+   * 「限制使用的模型」白名单（多选）。**空数组 = 不限制（默认，全部放行）**。
    *
-   * 非空时网关**只放行该模型**，其余模型返回 400 model_not_allowed ——
-   * 轮转的语义是「把这个账号的指定模型额度烧干净再换号」，模型是策略的一部分。
+   * 非空时网关**只放行名单内的模型**，其余一律 400 model_not_allowed。
+   * **三个工作模式（自动 / 手动 / 积分轮转）都生效** —— 它限制的是「放行哪些
+   * 模型」，与「用哪些账号」是正交的两件事。
+   *
+   * 联合类型里的 `string` 是**向后兼容**，不是冗余：老配置里这个键是单值字符串
+   *（实测所有者本机的 gateway_config.json 就是 `"allowed_model":
+   * "deepseek-v4.1-flash"`）。声明成 `string[]` 会让读取方以为可以直接
+   * `.length` / `.map`，在老配置上运行时炸掉。
    */
-  allowed_model?: string | null;
+  allowed_model?: string[] | string | null;
   /** 服务端口（权威字段，前端口选择器直接编辑它）。 */
   port: number;
   /** 监听地址，由 port 派生，如 ":7863"。 */
@@ -877,6 +883,24 @@ export interface GatewayTaskRuntime {
    * 供账号卡片标记「这个号正在跑」。
    */
   processedIds?: string[];
+}
+
+/**
+ * 账号卡片上的「本轮已跑」标记（由 `AccountsPage` 从 `taskRuntime` 推导后下发）。
+ *
+ * 为什么措辞是「已跑」而不是「正在跑」：后端只透出 `processedIds` —— 它是
+ * **已经留下记录**的账号集合（见 Rust 侧 `task_runtime`），而 Go 侧记录是在
+ * **处理完一个账号之后**才写（`scheduler/activity.go` 等）。也就是说，
+ * 本轮**当前正在处理**的那个号还没进集合，后端也没有「当前是哪个号」这个字段。
+ * 因此界面照实说「本轮已跑」，不编造一个后端并不提供的「正在跑这个号」。
+ */
+export interface AccountRunningTask {
+  /** 任务中文名（取自 `taskRuntime.label`，如「活跃上报」）。 */
+  label: string;
+  /** 本轮已留下记录的账号数（分子）。近似值，口径见卡片悬停提示。 */
+  processed?: number;
+  /** 本轮预计遍历的账号数（分母）。 */
+  total?: number;
 }
 
 /** GET /api/gateway/config 响应。 */

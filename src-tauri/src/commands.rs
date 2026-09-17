@@ -988,9 +988,27 @@ pub async fn switch_gateway_mode(
     Ok(result)
 }
 
-/// 设置「单一模型 + 积分轮转」的目标模型；空串 = 清除锁定。
+/// 设置「限制使用的模型」白名单（多选）；空数组 = 清除限制（全部放行）。
 ///
-/// 网关运行时自动重启以生效（模型锁定由网关启动时读取，与切换模式同理）。
+/// 网关运行时自动重启以生效（模型限制由网关启动时读取，与切换模式同理）。
+#[tauri::command]
+pub async fn set_allowed_models(models: Vec<String>) -> Result<Value, String> {
+    let result = ai_gateway_core::modules::gateway::set_allowed_models(&models).await;
+    if result.get("ok").and_then(Value::as_bool) == Some(false) {
+        let msg = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("设置模型限制失败")
+            .to_string();
+        return Err(msg);
+    }
+    Ok(result)
+}
+
+/// 设置单个模型限制；空串 = 清除限制。
+///
+/// 保留这个**单值**入口是为了向后兼容（旧前端、脚本、已发布版本的自调用）：
+/// 它现在等价于 `set_allowed_models` 传一个单元素数组。
 #[tauri::command]
 pub async fn set_allowed_model(model: String) -> Result<Value, String> {
     let result = ai_gateway_core::modules::gateway::set_allowed_model(&model).await;

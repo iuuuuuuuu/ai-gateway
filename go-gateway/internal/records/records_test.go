@@ -153,6 +153,86 @@ func TestWriteFailureDoesNotPanicOrCorrupt(t *testing.T) {
 	r.TaskAllDaily("汇总", ResultInfo, "")
 }
 
+// TestPreservesHostCreditSourceField 宿主新增的 source 字段必须原样透传。
+//
+// 背景：宿主（Rust 侧 account_records.rs）给积分记录加了 `source`
+//（grant/consume/expire/adjust），用于回答「这笔积分是怎么变的」。
+// 网关**只写 task 记录**，但它每次追加都会把整份文件读出来重写 ——
+// 若把不认识的字段丢掉，用户看到的积分记录会集体失去来源，
+// 而界面上只会表现为「来源徽标不见了」，极难定位到这里。
+//
+// 这条断言同时锁住两件事：
+//  1. source 的值原样保留（不被改写、不被清空）；
+//  2. detail 里的中文判据无损（编码路径不能把中文写坏）。
+func TestPreservesHostCreditSourceField(t *testing.T) {
+	r, path := newRecorder(t, 60, nil)
+
+	// 模拟宿主新格式：带 source 与中文 detail
+	host := `[
+  {"ts": 1790000000000, "accountId": "a1", "accountName": "甲", "kind": "credit",
+   "title": "积分消耗 · 调用扣减", "result": "info", "amount": -12,
+   "detail": "余额 -12，额度容量不变（纯消耗）", "source": "consume"},
+  {"ts": 1790000000001, "accountId": "a1", "accountName": "甲", "kind": "credit",
+   "title": "积分增长 · 额度发放", "result": "success", "amount": 100,
+   "detail": "余额 +100，额度容量 +100（新增积分包到账）", "source": "grant"}
+]`
+	if err := os.WriteFile(path, []byte(host), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r.now = func() time.Time { return time.UnixMilli(1790000002000) }
+	r.Task("u1", "活跃上报", ResultSuccess, "")
+
+	all := readAll(t, path)
+	if len(all) != 3 {
+		t.Fatalf("应有 3 条（宿主 2 + 网关 1），实际 %d 条", len(all))
+	}
+	if all[0]["source"] != "consume" {
+		t.Errorf("source 被丢弃或改写: %v", all[0]["source"])
+	}
+	if all[1]["source"] != "grant" {
+		t.Errorf("source 被丢弃或改写: %v", all[1]["source"])
+	}
+	if all[0]["title"] != "积分消耗 · 调用扣减" {
+		t.Errorf("标题被改写: %v", all[0]["title"])
+	}
+	// 中文判据必须无损（编码路径若出错会变成乱码或替换字符）
+	if all[0]["detail"] != "余额 -12，额度容量不变（纯消耗）" {
+		t.Errorf("中文 detail 被写坏: %v", all[0]["detail"])
+	}
+	if all[1]["detail"] != "余额 +100，额度容量 +100（新增积分包到账）" {
+		t.Errorf("中文 detail 被写坏: %v", all[1]["detail"])
+	}
+}
+
+// TestPreservesLegacyCreditWithoutSource 老格式（无 source）的记录不该被补字段。
+//
+// 宿主对历史记录**不会回头补写** source（记录是只追加的事件流）。
+// 网关若「顺手」补一个 source: "" 或 source: null，前端就会把老记录
+// 渲染成一个空徽标 —— 所以要断言这个键**依然不存在**。
+func TestPreservesLegacyCreditWithoutSource(t *testing.T) {
+	r, path := newRecorder(t, 60, nil)
+
+	host := `[
+  {"ts": 1790000000000, "accountId": "a1", "accountName": "甲", "kind": "credit",
+   "title": "积分增长", "result": "success", "amount": 100, "detail": ""}
+]`
+	if err := os.WriteFile(path, []byte(host), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r.now = func() time.Time { return time.UnixMilli(1790000001000) }
+	r.Task("u1", "活跃上报", ResultSuccess, "")
+
+	all := readAll(t, path)
+	if len(all) != 2 {
+		t.Fatalf("应有 2 条记录，实际 %d 条", len(all))
+	}
+	if _, ok := all[0]["source"]; ok {
+		t.Errorf("老记录不该被补出 source 字段: %v", all[0]["source"])
+	}
+}
+
 // TestPreservesExistingRecordsFromHost 追加时不得破坏宿主已写的记录。
 //
 // 宿主与网关是两个写入方，交替改写同一个文件。网关若把不认识的字段丢掉，

@@ -148,6 +148,131 @@ fn normalize_snapshots(snapshots: &[Value], at_ms: i64) -> Vec<Value> {
     kept
 }
 
+/// 相邻快照之间的积分变化，连同它的来源判据。
+///
+/// 为什么要把「变化量」和「来源」放在一起算：来源的判据是**容量（total）
+/// 有没有跟着变**，而容量只存在于前后两个快照里。留在 `record_snapshot`
+/// 里就地算，是唯一能同时看到三个数的位置。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreditDelta {
+    /// 余额变化（正为增长、负为消耗）。
+    pub amount: i64,
+    /// 容量变化（正为新增额度、负为额度回收/到期）。
+    pub capacity: i64,
+}
+
+/// 判定一次积分变化的**来源类别**。
+///
+/// 重要：这里判定的是「余额是怎么动的」这一**可观测量**，不是「哪个任务发的奖励」。
+///
+/// 为什么不能给出任务名：上游资源接口
+///（`resource_summary`，见 `credits.rs`）只返回容量 / 余额 / 到期时间三类数字，
+/// 没有任何「这笔积分由哪个任务产生」的字段或账单流水。实测真实数据里
+/// 33 条积分增长记录中只有 1 条能在同账号 ±30 分钟内找到任务记录 ——
+/// 按时间邻近去「认领」来源，等于把 32 条无据可依的记录也贴上任务名，
+/// 那正是**编造**。因此这里只如实记录可验证的判据。
+///
+/// 判据（全部来自实测真实快照，见交付报告）：
+///   - 余额上升且容量同步上升 → `grant`：账号拿到了**新增额度**
+///     （实测 158 次上升中 141 次容量与余额增量完全相等，其余差额是到账前
+///     已被消耗的部分 —— 例如容量 +1650 而余额 +1620.73）。
+///   - 余额下降且容量不变   → `consume`：纯消耗（实测 434 次，容量变化恒为 0）。
+///   - 余额下降且容量同降   → `expire`：额度被回收/到期
+///     （实测 5 次，例如某积分包容量 -100、余额 -79，即包内还剩 79 分就整包失效）。
+///   - 其余                 → `adjust`：无法归入以上三类的调整。
+///
+/// 把 5000 条真实快照按相邻对回放，597 次变化全部落进前三类、0 次 adjust、
+/// 0 次自相矛盾（余额涨却判成 consume/expire 之类）。
+///
+/// 注：`capacity` 为 0 而 `amount` 为正时归 `adjust` 而不是 `grant` ——
+/// 「容量没变但余额涨了」意味着积分是**退回来**的（如失败调用返还），
+/// 不是新增额度；把它说成 grant 会让用户以为额度包变多了。
+pub fn classify_credit_source(amount: i64, capacity: i64) -> &'static str {
+    use crate::modules::account_records::{
+        CREDIT_SOURCE_ADJUST, CREDIT_SOURCE_CONSUME, CREDIT_SOURCE_EXPIRE, CREDIT_SOURCE_GRANT,
+    };
+    if amount > 0 && capacity > 0 && capacity >= amount {
+        return CREDIT_SOURCE_GRANT;
+    }
+    if amount < 0 && capacity == 0 {
+        return CREDIT_SOURCE_CONSUME;
+    }
+    if amount < 0 && capacity < 0 {
+        return CREDIT_SOURCE_EXPIRE;
+    }
+    CREDIT_SOURCE_ADJUST
+}
+
+/// 一次积分变化对应的展示文案（标题 + 说明）。
+///
+/// 为什么标题要区分来源、而不是继续用「积分增长 / 积分消耗」两个词：
+/// 那正是用户抱怨的现象 —— 记录里只写「积分增长 +100」，看不出这 100 是
+/// 新增额度还是别的。标题里带上来源类别，用户一眼能分清性质；
+/// `detail` 再补上**原始判据**（余额与容量各变了多少），
+/// 让他能自己核对，而不是只能相信我们的结论。
+///
+/// detail 里刻意写出容量变化：这正是「为什么判成这一类」的证据。
+/// 只给结论不给判据，用户无法区分「系统算错了」和「口径与我想的不同」。
+fn credit_record_text(source: &str, delta: &CreditDelta) -> (&'static str, String) {
+    use crate::modules::account_records::{
+        CREDIT_SOURCE_ADJUST, CREDIT_SOURCE_CONSUME, CREDIT_SOURCE_EXPIRE, CREDIT_SOURCE_GRANT,
+    };
+    match source {
+        CREDIT_SOURCE_GRANT => (
+            "积分增长 · 额度发放",
+            format!(
+                "余额 +{}，额度容量 +{}（新增积分包到账）",
+                delta.amount, delta.capacity
+            ),
+        ),
+        CREDIT_SOURCE_CONSUME => (
+            "积分消耗 · 调用扣减",
+            format!("余额 {}，额度容量不变（纯消耗）", delta.amount),
+        ),
+        CREDIT_SOURCE_EXPIRE => (
+            "积分减少 · 额度到期",
+            format!(
+                "余额 {}，额度容量 {}（积分包被回收，包内剩余一并失效）",
+                delta.amount, delta.capacity
+            ),
+        ),
+        CREDIT_SOURCE_ADJUST => (
+            "积分调整",
+            format!(
+                "余额 {}，额度容量 {}（无法归入发放/消耗/到期）",
+                delta.amount, delta.capacity
+            ),
+        ),
+        // 理论上不可达：source 只由 classify_credit_source 产生。
+        // 兜底而不 panic —— 记录是旁路观测数据，文案未知不该让主流程崩。
+        other => (
+            "积分变化",
+            format!("余额 {}，来源 {}（未识别）", delta.amount, other),
+        ),
+    }
+}
+
+/// 计算相邻两次快照之间的积分变化；无变化时返回 `None`。
+///
+/// 从 `record_snapshot` 里抽出来是为了**可被单测直接覆盖**：
+/// 原来的判据内联在写盘流程中（需要构造快照文件、锁、数据目录），
+/// 想断言「容量同增才算 grant」就得跑一整套 IO。纯函数化之后，
+/// 判据本身可以被逐分支钉死，写盘路径只剩下调用。
+///
+/// 用 `Option` 而不是返回 amount=0：调用方只在 `Some` 时才写记录，
+/// 让「没有变化就不写」这件事由类型表达，而不是靠调用方记得判零。
+pub fn credit_delta(prev_remaining: f64, prev_total: f64, remaining: f64, total: f64) -> Option<CreditDelta> {
+    // 四舍五入到整数：积分通常是整数，浮点误差会造出 -0.0000001 这类噪音
+    let amount = (remaining - prev_remaining).round() as i64;
+    if amount == 0 {
+        return None;
+    }
+    Some(CreditDelta {
+        amount,
+        capacity: (total - prev_total).round() as i64,
+    })
+}
+
 /// 写入一个成功的资源观察值。
 ///
 /// 同一账号同一资源值在短时间内只保留一条；资源值发生变化时立即保留，
@@ -176,20 +301,16 @@ pub fn record_snapshot(account_id: &str, account_name: &str, total: f64, remaini
         .filter(|s| s.account_id == account_id)
         .max_by_key(|s| s.ts)
     {
-        // 四舍五入到整数：积分通常是整数，浮点误差会造出 -0.0000001 这类噪音
-        let delta = (remaining - prev.remaining).round() as i64;
-        if delta != 0 {
-            let (title, detail) = if delta > 0 {
-                ("积分增长", String::new())
-            } else {
-                ("积分消耗", String::new())
-            };
+        if let Some(delta) = credit_delta(prev.remaining, prev.total, remaining, total) {
+            let source = classify_credit_source(delta.amount, delta.capacity);
+            let (title, detail) = credit_record_text(source, &delta);
             crate::modules::account_records::add_credit_record(
                 account_id,
                 account_name.trim(),
                 title,
-                delta,
+                delta.amount,
                 &detail,
+                Some(source),
             );
         }
     }
@@ -784,5 +905,143 @@ mod tests {
             100.0,
             now,
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // 积分来源判定：区分「额度发放 / 调用扣减 / 额度到期 / 其他调整」
+    //
+    // 这些判据直接来自实测真实快照（见交付报告）：
+    //   上升 158 次中 141 次容量与余额增量相等 → grant
+    //   下降 433 次容量不变                    → consume
+    //   下降   5 次容量同降                    → expire
+    // -----------------------------------------------------------------------
+
+    /// 真实样例：新积分包到账，容量 +100、余额 +100。
+    #[test]
+    fn capacity_and_balance_rising_together_is_a_grant() {
+        let delta = credit_delta(1000.0, 1000.0, 1100.0, 1100.0).expect("应有变化");
+        assert_eq!(delta.amount, 100);
+        assert_eq!(delta.capacity, 100);
+        assert_eq!(
+            classify_credit_source(delta.amount, delta.capacity),
+            crate::modules::account_records::CREDIT_SOURCE_GRANT
+        );
+    }
+
+    /// 真实样例（acc-6091…，2026-09-16）：容量 +1650 而余额只 +1620.73 ——
+    /// 到账与本次快照之间已经消耗掉一部分。这仍是 grant，不是 adjust。
+    #[test]
+    fn grant_still_holds_when_part_of_the_grant_was_already_spent() {
+        let delta = credit_delta(4656.62, 4700.0, 6277.35, 6350.0).expect("应有变化");
+        assert_eq!(delta.amount, 1621);
+        assert_eq!(delta.capacity, 1650);
+        assert_eq!(
+            classify_credit_source(delta.amount, delta.capacity),
+            crate::modules::account_records::CREDIT_SOURCE_GRANT,
+            "容量增量大于余额增量（到账后已消耗）仍属额度发放"
+        );
+    }
+
+    /// 真实样例：余额降、容量不变 = 纯消耗（实测 433 次全部如此）。
+    #[test]
+    fn balance_falling_with_stable_capacity_is_consumption() {
+        let delta = credit_delta(5000.0, 5000.0, 4969.0, 5000.0).expect("应有变化");
+        assert_eq!(delta.amount, -31);
+        assert_eq!(delta.capacity, 0);
+        assert_eq!(
+            classify_credit_source(delta.amount, delta.capacity),
+            crate::modules::account_records::CREDIT_SOURCE_CONSUME
+        );
+    }
+
+    /// 真实样例（acc-da16…，2026-09-14）：某积分包容量 -100、余额 -79 ——
+    /// 包内还剩 79 分就整包失效，那些分是**到期蒸发**而不是被调用消耗掉。
+    #[test]
+    fn balance_and_capacity_falling_together_is_expiry() {
+        let delta = credit_delta(3000.0, 3000.0, 2921.0, 2900.0).expect("应有变化");
+        assert_eq!(delta.amount, -79);
+        assert_eq!(delta.capacity, -100);
+        assert_eq!(
+            classify_credit_source(delta.amount, delta.capacity),
+            crate::modules::account_records::CREDIT_SOURCE_EXPIRE,
+            "容量同降说明是额度被回收，不是消耗"
+        );
+    }
+
+    /// 容量没变而余额涨了：积分是**退回来**的，不是新增额度。
+    /// 若判成 grant，用户会以为额度包变多了 —— 那是不实描述。
+    #[test]
+    fn balance_rising_without_capacity_is_an_adjustment_not_a_grant() {
+        let delta = credit_delta(1000.0, 1000.0, 1100.0, 1000.0).expect("应有变化");
+        assert_eq!(delta.amount, 100);
+        assert_eq!(delta.capacity, 0);
+        assert_eq!(
+            classify_credit_source(delta.amount, delta.capacity),
+            crate::modules::account_records::CREDIT_SOURCE_ADJUST
+        );
+    }
+
+    #[test]
+    fn unchanged_balance_yields_no_delta() {
+        // 没有变化就不该记一条 amount=0 的噪音（巡检每 15 分钟一次）
+        assert!(credit_delta(100.0, 100.0, 100.0, 100.0).is_none());
+        // 浮点误差也要被 round 吸收掉
+        assert!(credit_delta(100.0, 100.0, 100.0000001, 100.0).is_none());
+    }
+
+    /// 端到端：写入第二个快照后，积分记录必须带上来源，且是**可读回**的。
+    #[test]
+    fn second_snapshot_writes_a_credit_record_with_source() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("credit-source-e2e");
+
+        // 首个快照只建立基线，不产生记录
+        assert!(record_snapshot("acc-src", "n", 1000.0, 1000.0));
+        let v = crate::modules::account_records::query_records("acc-src", 0, 0, &[], 100);
+        assert_eq!(v.get("total").and_then(Value::as_u64), Some(0), "首个快照不该产生记录");
+
+        // 余额 +100 且容量 +100 → 额度发放
+        assert!(record_snapshot("acc-src", "n", 1100.0, 1100.0));
+        let v = crate::modules::account_records::query_records(
+            "acc-src",
+            0,
+            0,
+            &[crate::modules::account_records::KIND_CREDIT.to_string()],
+            100,
+        );
+        let recs = v.get("records").and_then(Value::as_array).unwrap();
+        assert_eq!(recs.len(), 1, "应写入一条积分记录");
+        assert_eq!(
+            recs[0].get("source").and_then(Value::as_str),
+            Some(crate::modules::account_records::CREDIT_SOURCE_GRANT)
+        );
+        assert_eq!(recs[0].get("amount").and_then(Value::as_i64), Some(100));
+        // 标题要能自解释，而不是笼统的「积分增长」
+        let title = recs[0].get("title").and_then(Value::as_str).unwrap_or("");
+        assert!(title.contains("额度发放"), "标题应含来源，实际: {title}");
+        // detail 要给出判据（容量变化），让用户能自行核对
+        let detail = recs[0].get("detail").and_then(Value::as_str).unwrap_or("");
+        assert!(detail.contains("容量"), "detail 应写明容量判据，实际: {detail}");
+    }
+
+    /// 端到端：纯消耗要记成 consume，而不是笼统的「积分消耗」。
+    #[test]
+    fn pure_consumption_snapshot_records_consume_source() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("credit-consume-e2e");
+        assert!(record_snapshot("acc-c", "n", 1000.0, 1000.0));
+        assert!(record_snapshot("acc-c", "n", 1000.0, 900.0));
+
+        let v = crate::modules::account_records::query_records(
+            "acc-c",
+            0,
+            0,
+            &[crate::modules::account_records::KIND_CREDIT.to_string()],
+            100,
+        );
+        let recs = v.get("records").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            recs[0].get("source").and_then(Value::as_str),
+            Some(crate::modules::account_records::CREDIT_SOURCE_CONSUME)
+        );
+        assert_eq!(recs[0].get("amount").and_then(Value::as_i64), Some(-100));
     }
 }

@@ -7,6 +7,7 @@ import {
   Check,
   CheckCircle2,
   Copy,
+  Filter,
   Globe,
   LayoutGrid,
   ListFilter,
@@ -42,8 +43,15 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
@@ -168,13 +176,168 @@ type GatewayLayout = "classic" | "merged";
 const LAYOUT_STORAGE_KEY = "ai-gateway.gateway-layout";
 
 /**
- * Radix Select 的「空值」哨兵。
+ * 把网关配置里的 `allowed_model` 归一化成字符串数组。
  *
- * Radix 明确不允许 `SelectItem value=""`（会抛错导致整页白屏），但业务上
- * 「未选择 / 不限制」是合法状态，因此用这个哨兵占位，在 onValueChange 里
- * 映射回空串 —— 组件外的 state 语义保持为「空串 = 未设置」。
+ * **必须同时吃两种形状**：老配置里这个键是单值字符串
+ *（实测所有者本机的 gateway_config.json 就是
+ * `"allowed_model": "deepseek-v4.1-flash"`），新配置是数组。
+ * 只认数组会让老配置在界面上显示成「全部」（= 不限制），而网关实际仍在限制 ——
+ * 用户看到的是「我明明限制了，界面却说没限制」，比报错更难排查。
+ *
+ * 归一化：逐项 trim、丢弃空项、去重（与 Rust 侧 `allowed_models_of` 同一口径）。
  */
-const NONE_VALUE = "__none__";
+function normalizeAllowedModels(raw: string[] | string | null | undefined): string[] {
+  const list = Array.isArray(raw) ? raw : typeof raw === "string" && raw.trim() !== "" ? [raw] : [];
+  const out: string[] = [];
+  for (const item of list) {
+    if (typeof item !== "string") continue;
+    const trimmed = item.trim();
+    if (trimmed !== "" && !out.includes(trimmed)) out.push(trimmed);
+  }
+  return out;
+}
+
+/**
+ * 「放行模型」控件：**多选**，默认「全部」。
+ *
+ * 与 Token 用量区块的「模型筛选」（`ModelFilter`，`data-slot="usage-model-filter"`）
+ * 是**两个完全不同的东西**，刻意做成两个互不影响的控件：
+ *
+ * | | 放行模型（本控件，写配置） | 模型筛选（Token 用量区块） |
+ * |---|---|---|
+ * | 作用面 | **服务端**：网关只放行勾选的模型，其他被 400 拒绝 | **前端**：只改变本页展示哪些模型的用量 |
+ * | 影响范围 | 真实影响客户端能否调用 | 只影响本页的**阅读**，不改任何配置、不写盘 |
+ * | 生效方式 | 保存进 config，网关重启后生效 | 立即生效，仅本页 |
+ * | 默认 | 全部放行（空集） | 全部显示（空集） |
+ * | 模式 | **三个模式都有** | **三个模式都有** |
+ *
+ * 两者默认都是「全部」，但语义与后果完全不同 —— 所以标签必须说清是哪一种：
+ * 本控件的标题是「放行模型」且说明里写明「网关会拒绝其它模型」，
+ * 而 `ModelFilter` 的标题是「全部模型」（描述的是展示范围）。
+ *
+ * 为什么用 `DropdownMenuCheckboxItem` 而不是一排 toggle：所有者本机
+ * `/v1/models` 实测返回 **30 个模型**，全部铺开会把区块挤成一面墙；
+ * 而多选又必须能一眼看出「当前选了哪些」，纯下拉单选做不到。
+ *
+ * 为什么选中后菜单**不关闭**：勾选列表要连着点好几项，每点一次都关掉会让人
+ * 反复重开（所有者原话就是嫌麻烦：「都改为勾选而不是手写，太麻烦了」）。
+ */
+function AllowedModelPicker({
+  options,
+  selected,
+  onChange,
+  onRefresh,
+  refreshing,
+}: {
+  /** 可选模型（来自网关 /v1/models；取不到时为当前已选值）。 */
+  options: string[];
+  /** 已选模型；空数组 = 全部（不限制），这是默认值。 */
+  selected: string[];
+  onChange: (next: string[]) => void;
+  onRefresh: () => void;
+  refreshing: boolean;
+}) {
+  const all = selected.length === 0;
+  const label = all
+    ? "全部模型"
+    : selected.length === 1
+      ? selected[0]
+      : `已限制 ${selected.length} 个`;
+
+  function toggle(model: string) {
+    // 从「全部」开始勾一个 = **只放行这一个**（把「全部」收窄成一项）。
+    //
+    // 与 ModelFilter 同一考虑：最常用的意图是「我只想放行某一个 / 某几个」。
+    // 若从「全部」点一项等于把它排除，用户得连点 29 次才能达到「只放行一个」。
+    if (all) {
+      onChange([model]);
+      return;
+    }
+    const next = selected.includes(model)
+      ? selected.filter((m) => m !== model)
+      : [...selected, model];
+    // 取消到空 = 回到「全部放行」。**不能**理解成「一个都不放行」——
+    // 那等于网关拒绝所有请求，绝不会是用户的本意。
+    onChange(next);
+  }
+
+  // 已选但不在可选列表里的模型也要能看见（否则网关列表变更后用户无从取消）。
+  const missing = selected.filter((m) => !options.includes(m));
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 w-56 shrink-0 justify-start gap-1.5 px-2.5 text-xs"
+          aria-label={`放行模型：${label}`}
+          data-slot="allowed-model-picker"
+        >
+          <Filter className="size-3.5" />
+          <span className="min-w-0 flex-1 truncate text-left">{label}</span>
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="max-h-80 w-64 overflow-y-auto">
+        <DropdownMenuLabel>放行模型（网关会拒绝其它模型）</DropdownMenuLabel>
+        <DropdownMenuItem
+          onSelect={(e) => {
+            // 勾选列表要连着点多项，选中后不关闭菜单。
+            e.preventDefault();
+            onChange([]);
+          }}
+          aria-label="放行模型：全部模型"
+        >
+          <span className="flex size-4 shrink-0 items-center justify-center">
+            {all ? <Check className="size-3.5" /> : null}
+          </span>
+          <span className="min-w-0 flex-1 truncate">全部模型（不限制）</span>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        {options.length === 0 && missing.length === 0 ? (
+          <div className="px-2.5 py-2 text-xs text-muted-foreground">
+            暂无模型列表，可点右侧刷新按钮重试
+          </div>
+        ) : null}
+        {/* 已选但已不在列表里的排在最前：它们仍然生效，用户需要能看到并取消。 */}
+        {missing.map((model) => (
+          <DropdownMenuCheckboxItem
+            key={`missing-${model}`}
+            checked
+            onSelect={(e) => e.preventDefault()}
+            onCheckedChange={() => toggle(model)}
+            aria-label={`放行模型：${model}`}
+          >
+            <span className="min-w-0 flex-1 truncate">{model}</span>
+            <span className="shrink-0 text-[11px] text-muted-foreground">不在当前列表</span>
+          </DropdownMenuCheckboxItem>
+        ))}
+        {options.map((model) => (
+          <DropdownMenuCheckboxItem
+            key={model}
+            checked={selected.includes(model)}
+            onSelect={(e) => e.preventDefault()}
+            onCheckedChange={() => toggle(model)}
+            aria-label={`放行模型：${model}`}
+          >
+            <span className="min-w-0 flex-1 truncate">{model}</span>
+          </DropdownMenuCheckboxItem>
+        ))}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          onSelect={(e) => {
+            e.preventDefault();
+            onRefresh();
+          }}
+          aria-label="刷新模型列表"
+        >
+          <RefreshCw className={cn("size-3.5", refreshing && "animate-spin")} />
+          刷新模型列表
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
 
 /** 大数紧凑展示（与 Token 统计页的 K/M/B 风格一致）。 */
 function formatUsageCompact(value: number): string {
@@ -190,21 +353,70 @@ function maxOf(values: number[]): number {
   return values.reduce((max, value) => Math.max(max, value), 1);
 }
 
-/** 用量分布行：名称 + 占比条 + 数值（可带底部说明）。 */
+/**
+ * 用量分布行：名称 + 占比条 + 数值（可带底部说明）。
+ *
+ * 「Token 用量」区块的双向联动交叉筛选就挂在这里：给了 `onToggle` 的行变成真正的
+ * `<button>` 且带 `aria-pressed`，可点、可 Tab、可读屏。
+ *
+ * 为什么 `onToggle` 是**可选**的（不是让所有调用点都能点）：
+ *   - 「按模型 / 按账号」两个列表要能互相筛选；
+ *   - 而新版账号明细面板（`AccountModelDetail`）里的同名行是**只读明细**，它的
+ *     占比基准也不同（以该账号自己为准）。若它也变成可点的，点一下就会去改
+ *     用量区块的筛选 —— 在明细面板里点模型本意是「看清这个模型」，却让页面
+ *     另一处悄悄收窄，这是最容易让人迷失的一类隐式联动。
+ *   因此交互能力由调用点显式开启，明细面板保持纯展示（返回 null 时不接线）。
+ *
+ * 视觉上可点/不可点**完全一致**（只叠加选中态与 hover）：所有者明确要求
+ * 「现有信息一条都不能删」，所以 label / 占比条 / 数值 / meta 的排版与字号
+ * 一个都不动，只在最外层换标签。
+ */
 function UsageBarRow({
   label,
   value,
   max,
   meta,
+  selected = false,
+  onToggle,
+  dataSlot,
 }: {
   label: string;
   value: number;
   max: number;
   meta?: string;
+  /** 是否处于选中态（仅 `onToggle` 存在时有意义）。 */
+  selected?: boolean;
+  /**
+   * 点击回调（再点一次 = 取消选择）。为 undefined 时本行退化为纯展示 `<div>` ——
+   * 与本次改动之前逐字一致。
+   */
+  onToggle?: () => void;
+  /** 标记本行属于哪个列表，供测试与调试定位（不影响样式）。 */
+  dataSlot?: string;
 }) {
   const percent = max > 0 ? Math.max(3, Math.round((value / max) * 100)) : 0;
+  // 可点时必须用真实的 <button>（而不是给 div 挂 onClick）：键盘 Tab / Enter 与
+  // 读屏都依赖原生语义。与账号池卡片 (`PoolAccountRow`) 同一套约定。
+  const Root = onToggle ? "button" : "div";
+  const rootProps = onToggle
+    ? {
+        type: "button" as const,
+        onClick: onToggle,
+        // aria-pressed 表达「这一项正被用作筛选条件」，与项目既有做法一致。
+        "aria-pressed": selected,
+        // 选中态用 --primary 系：本项目踩过「拿 secondary 当选中态、与 outline 只差
+        // 4% 亮度，看起来永远停在全部上」的坑，故选中一律走 primary（浅底 + 中描边
+        // + 加粗）。非选中态**不加任何底色**，保证未选时观感与改动前一致。
+        className: cn(
+          "block w-full cursor-pointer space-y-1.5 px-4 py-2 text-left transition-colors sm:px-5",
+          "hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+          selected && "bg-primary/10 font-medium ring-1 ring-inset ring-primary/40",
+        ),
+        title: selected ? "再次点击取消按此项筛选" : `点击按此项筛选（只显示与它相关的${label}）`,
+      }
+    : { className: "space-y-1.5 px-4 py-2 sm:px-5" };
   return (
-    <div className="space-y-1.5 px-4 py-2 sm:px-5">
+    <Root {...(rootProps as Record<string, unknown>)} data-slot={dataSlot}>
       <div className="flex items-baseline justify-between gap-3 text-xs">
         <span className="min-w-0 truncate">{label}</span>
         <span className="shrink-0 tabular-nums text-muted-foreground">{formatUsageCompact(value)}</span>
@@ -213,25 +425,26 @@ function UsageBarRow({
         <div className="h-full rounded-full bg-primary/70" style={{ width: `${percent}%` }} />
       </div>
       {meta ? <div className="truncate text-[11px] text-muted-foreground">{meta}</div> : null}
-    </div>
+    </Root>
   );
 }
 
 /**
  * 模型筛选控件：**多选**，默认「全部」。
  *
- * 与「单一模型」（`allowed_model`，仅积分轮转模式下出现）的分工 —— 这是两个
- * 完全不同层面的东西，刻意做成两个互不影响的控件：
+ * 与「放行模型」（`allowed_model`，`AllowedModelPicker`，三个模式都有）的分工 ——
+ * 这是两个完全不同层面的东西，刻意做成两个互不影响的控件：
  *
- * | | 单一模型（allowed_model） | 模型筛选（本控件） |
+ * | | 放行模型（allowed_model） | 模型筛选（本控件） |
  * |---|---|---|
- * | 作用面 | **服务端**：网关只放行这一个模型，其他被 400 拒绝 | **前端**：只改变这里展示哪些模型的用量 |
+ * | 作用面 | **服务端**：网关只放行勾选的那几个模型，其他被 400 拒绝 | **前端**：只改变这里展示哪些模型的用量 |
  * | 影响范围 | 真实影响客户端能否调用 | 只影响本页的**阅读**，不改任何配置、不写盘 |
  * | 生效方式 | 保存进 config，需重启网关 | 立即生效，仅本页 |
- * | 模式 | 只有积分轮转有（轮转的语义就是烧单一模型） | **三个模式都有**（看用量与工作模式无关） |
+ * | 模式 | **三个模式都有**（限制模型与用哪些账号正交） | **三个模式都有**（看用量与工作模式无关） |
  *
  * 因此这里的勾选**不会**、也不该被写进 `allowed_model`：把「我只想看 glm 的用量」
  * 变成「网关拒绝其它模型」会静默掐断客户端请求，是最危险的一类耦合。
+ * `verify-pool-progress-usage.cjs` 用回读 `/api/gateway/config` 锁死这一点。
  *
  * 为什么用下拉 + 勾选列表而不是一排 toggle 按钮：所有者本机的 `/v1/models`
  * 实测返回 **30 个模型**，全部铺开会把区块顶部挤成一面墙；而多选又必须能
@@ -987,13 +1200,19 @@ export default function GatewayPage() {
    */
   const [manualUids, setManualUids] = useState<string[]>([]);
   /**
-   * 「单一模型 + 积分轮转」锁定的模型名（空串 = 未锁定）。
+   * 「限制使用的模型」白名单（多选；**空数组 = 不限制 = 全部**，默认）。
    *
-   * 轮转的语义是「把这个账号的指定模型额度烧干净再换号」，模型是策略的一部分，
-   * 因此必须锁定：否则客户端换个模型就绕过了轮转与额度控制。网关侧会拒绝
-   * 非该模型的请求（400 model_not_allowed）。
+   * 为什么是多选：所有者原话「三个模式,都改为新增一个 筛选模型的功能,默认是全部,
+   * 可以多选模型(限制使用的模型)」。单选表达不了「这几个模型我都放行」。
+   *
+   * 与 `modelFilter`（Token 用量区块的展示筛选）的分工 —— 见上方 `ModelFilter`
+   * 的说明：那个只改变**本页展示哪些模型的用量**，不写配置；这个是**服务端放行**
+   * 限制，网关会真的拒绝名单外的模型（400 model_not_allowed）。
+   *
+   * 为什么三个工作模式都显示（此前只在积分轮转下）：限制的是「放行哪些模型」，
+   * 与「用哪些账号」是正交的两件事 —— 自动模式下同样可能只想放行几个模型。
    */
-  const [allowedModel, setAllowedModel] = useState<string>("");
+  const [allowedModels, setAllowedModels] = useState<string[]>([]);
   /** 网关支持的模型列表（用于模型下拉；取不到时退化为自由输入）。 */
   const [modelOptions, setModelOptions] = useState<string[]>([]);
   /** 模型列表是否正在加载（驱动刷新按钮的转圈）。 */
@@ -1052,7 +1271,7 @@ export default function GatewayPage() {
   /**
    * 用量展示的模型筛选（空数组 = 全部，默认）。
    *
-   * 与 `allowedModel` 的分工见上方 `ModelFilter` 的说明：那个是**服务端放行**
+   * 与 `allowedModels` 的分工见上方 `ModelFilter` 的说明：那个是**服务端放行**
    * 限制（写进配置、影响客户端能否调用），这个是**本页只读展示**的收窄。
    * 两者刻意不共用状态 —— 合并会让「我只想看一眼 glm 的用量」变成
    * 「网关拒绝其它模型」，静默掐断客户端请求。
@@ -1074,6 +1293,43 @@ export default function GatewayPage() {
    * 点卡片把下拉也改掉，用户在另一个区块的选择被悄悄覆盖。
    */
   const [selectedPoolUid, setSelectedPoolUid] = useState<string>("");
+
+  /**
+   * 「Token 用量」区块里的**双向联动交叉筛选**。
+   *
+   * 所有者原话：「他不是左右两侧面板么?左边是模型,右边是账号,我希望可以**点击右边
+   * 账号筛选左侧模型,点击左侧模型筛选右侧账号**」，并要求旧版（classic）也支持
+   *（「旧版的那个 token 用量也要支持这个功能」）。
+   *
+   * 两者是**同一个筛选器的两个入口**，不是两个独立状态 —— 所以放在一个 state 里：
+   * 若拆成 `selectedModel` + `selectedAccount` 两个 state，就得在每一处收尾手工保证
+   * 「设置其一时另一个被清掉」，漏一处就会出现「按 A 账号 + B 模型」这种既不是
+   * 点账号、也不是点模型意图的组合（详见下面 usageCrossFilter 的注释）。
+   *
+   * 均以「再点一次 = 取消选择」的 toggle 语义工作。
+   *
+   * 为什么**不复用** `selectedPoolUid`（新版点账号卡片那个）：那个选的是**账号池卡片**
+   * 的 uid，作用是把明细面板显示出来，筛选条件刻意不出现在用量区块里；而这里是
+   * 「用量区块内部两个列表互相收窄」。共用一个状态会让「在账号池点了张卡片」顺手
+   * 把用量列表也筛掉，而用户根本没往那边看。反过来亦然。
+   */
+  const [usageCrossFilter, setUsageCrossFilter] = useState<
+    { kind: "model"; key: string } | { kind: "account"; key: string } | null
+  >(null);
+
+  /** 把交叉筛选切到「这个模型」；已经是它则取消（toggle）。 */
+  function toggleUsageModelFilter(key: string) {
+    setUsageCrossFilter((current) =>
+      current?.kind === "model" && current.key === key ? null : { kind: "model", key },
+    );
+  }
+
+  /** 把交叉筛选切到「这个账号」；已经是它则取消（toggle）。 */
+  function toggleUsageAccountFilter(key: string) {
+    setUsageCrossFilter((current) =>
+      current?.kind === "account" && current.key === key ? null : { kind: "account", key },
+    );
+  }
 
   /**
    * 积分消耗统计（按账号给 今日 / 近 7 天 / 本月 三个时间窗）。
@@ -1206,7 +1462,7 @@ export default function GatewayPage() {
           ? [cfg.pinned_uid]
           : [],
     );
-    setAllowedModel(cfg.allowed_model ?? "");
+    setAllowedModels(normalizeAllowedModels(cfg.allowed_model));
   }, []);
 
   /** 手动模式的可选账号：排除已禁用与需重登的（它们不会进池，勾了也没用）。 */
@@ -1309,18 +1565,31 @@ export default function GatewayPage() {
   }
 
   /**
-   * 设置/清除「单一模型」锁定并立即生效。
+   * 设置/清除「限制使用的模型」白名单并立即生效。
    *
-   * 后端在网关运行时会自动重启它（模型锁定由网关启动时读取），因此这里
-   * 只需一次调用；失败时 refresh() 回滚为后端真实值，避免界面显示与实际不符。
+   * 后端在网关运行时会自动重启它（限制由网关启动时读取），因此这里只需一次调用；
+   * 失败时 refresh() 回滚为后端真实值，避免界面显示与实际不符。
+   *
+   * 空数组 = 解除限制（全部放行）。文案刻意点明「网关会拒绝其它模型」——
+   * 这是**服务端**限制，与 Token 用量区块那个只改展示的「模型筛选」不是一回事，
+   * 用户分不清就会以为只是换个看法，结果客户端被 400。
    */
-  async function changeAllowedModel(model: string) {
-    setAllowedModel(model);
+  async function changeAllowedModels(next: string[]) {
+    setAllowedModels(next);
     try {
-      const res = await api.setAllowedModel(model);
+      const res = await api.setAllowedModels(next);
+      const count = next.length;
       toast.success(
-        model ? `已锁定模型 ${model}，网关只放行该模型` : "已解除模型锁定（客户端可调任意模型）",
-        res.reloaded ? { description: "网关已重启以生效" } : undefined,
+        count === 0
+          ? "已解除模型限制（客户端可调用任意模型）"
+          : count === 1
+            ? `已限制只放行 ${next[0]}，网关会拒绝其它模型`
+            : `已限制只放行 ${count} 个模型，网关会拒绝其它模型`,
+        res.reloaded
+          ? { description: "网关已重启以生效" }
+          : count > 0
+            ? { description: next.join("、") }
+            : undefined,
       );
       await refresh();
     } catch (e) {
@@ -1329,14 +1598,14 @@ export default function GatewayPage() {
     }
   }
 
-  /** 拉取网关支持的模型列表（供「单一模型」下拉使用）。 */
+  /** 拉取网关支持的模型列表（供「放行模型」勾选列表使用）。 */
   const loadModels = useCallback(async () => {
     setModelsLoading(true);
     try {
       const list = await api.getGatewayModels();
       setModelOptions(list.map((m) => m.id).filter(Boolean).sort());
     } catch {
-      // 取不到就保留原列表：模型锁定仍可手填（下拉里已有「当前」兜底项）
+      // 取不到就保留原列表：勾选列表里仍有当前已选值兜底（标「不在当前列表」）
     } finally {
       setModelsLoading(false);
     }
@@ -1363,9 +1632,9 @@ export default function GatewayPage() {
 
   // Token 用量按所选范围拉取。
   //
-  // 首次挂载拉一次模型列表，供「单一模型」下拉使用。
+  // 首次挂载拉一次模型列表，供「放行模型」勾选列表使用。
   // 只在挂载时拉：模型列表来自网关动态接口，5 秒轮询里重复请求没有意义；
-  // 用户需要最新列表时可点旁边的刷新按钮。
+  // 用户需要最新列表时可点菜单里的刷新项。
   useEffect(() => {
     void loadModels();
   }, [loadModels]);
@@ -1624,12 +1893,191 @@ export default function GatewayPage() {
     });
   }, [usageAccountsAll, usageAccountModels, modelFilterActive, modelFilterSet]);
 
+  /** 第一级（ModelFilter）之后的模型列表 —— 交叉筛选的**输入**。 */
   const usageModels = useMemo(
     () => (modelFilterActive ? usageModelsAll.filter((m) => modelFilterSet.has(m.key)) : usageModelsAll),
     [usageModelsAll, modelFilterActive, modelFilterSet],
   );
-  const usageMaxModel = maxOf(usageModels.map((m) => m.total));
-  const usageMaxAccount = maxOf(usageAccounts.map((a) => a.total));
+
+  /**
+   * 模型 → 用过它的账号 uid 集合（由 `accountModels` 反转而来）。
+   *
+   * 这是「点模型 → 右侧只剩用过它的账号」**唯一**的数据来源。网关只给了
+   * `accountModels`（账号 → 模型），**没有**反向的「模型 → 账号」；而且反向关系
+   * 无法从 `models` 与 `accounts` 这两份各自聚合的结果还原 —— 各自求和之后交叉
+   * 关系就已经丢了（只知道「甲账号共 3 万」「glm 共 4 万」，推不出「甲账号用过
+   * glm 吗」）。这一点 `types.ts` 里 `accountModels` 的注释已经写明。
+   *
+   * 因此这里在前端把 `accountModels` **反转一次**得到反向索引，而不是新增后端字段：
+   *   - 反转的输入就是网关已有的权威交叉累计（Go 侧 `usage.go` 记录时直接累计），
+   *     结果与「网关再给一份反向索引」完全等价；
+   *   - 规模 = 账号数 × 每号模型数（所有者真实数据：11 个账号 × 1 个模型），
+   *     每次用量快照变化后重算一次，代价可忽略；
+   *   - 让网关再加一个 `modelAccounts` 字段等于把同一份事实存两遍，两处口径
+   *     必然漂移（本项目已有太多「两处各算一遍然后对不上」的教训）。
+   *
+   * 只在 `usageAccountModels` 存在时构造；缺字段（旧版网关）时得到空 Map，
+   * 界面据此走「拿不到明细」的降级分支，而不是假装筛出了空结果。
+   */
+  const accountKeysByModel = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    if (!usageAccountModels) return map;
+    for (const [uid, models] of Object.entries(usageAccountModels)) {
+      for (const model of models) {
+        const users = map.get(model.key);
+        if (users) users.add(uid);
+        else map.set(model.key, new Set([uid]));
+      }
+    }
+    return map;
+  }, [usageAccountModels]);
+
+  /**
+   * 交叉明细的**覆盖度**：`accountModels` 的求和 与 各聚合 total 的差额。
+   *
+   * 为什么必须有这一步（真实数据实测发现，不是假想问题）：
+   * 「账号 × 模型」交叉累计是网关**较新**才有的能力。所有者本机真实
+   * `usage.json`（只读副本）里，`models`/`accounts` 覆盖 09-13 ~ 09-17 共 5 天，
+   * 而 `accountModels` 只有 09-16 / 09-17 两天 —— 升级前的历史用量只有
+   * 「按模型」「按账号」两个各自聚合的结果，交叉维度是**空的**。
+   *
+   * 后果（若不判覆盖度）：真实数据下点那 7 个「只在 09-13~09-15 有量」的账号，
+   * 左侧会得到空列表，界面就会说「该账号没有用过任何模型」—— 这是**假结论**，
+   * 用户明明看着右边写着它有 2287 次调用。把「明细缺失」说成「确实没用过」，
+   * 正是本次需求里最不能犯的错。
+   *
+   * 判定方式：在同一统计范围内比较「交叉求和」与「该维度聚合 total」。
+   *   - 相等 → 交叉明细完整，空列表可以放心解释成「确实没用过」；
+   *   - 交叉求和更小 → 明细**部分缺失**，界面必须说明列表可能不全，
+   *     并在列表为空时明确讲「拿不到明细」而不是「没有用过」。
+   *
+   * 只在两个方向各算一次（账号数 + 模型数），代价可忽略。
+   */
+  const usageCrossCoverage = useMemo(() => {
+    const accountCross = new Map<string, number>();
+    const modelCross = new Map<string, number>();
+    if (!usageAccountModels) return { accountCross, modelCross };
+    for (const [uid, models] of Object.entries(usageAccountModels)) {
+      let accountSum = 0;
+      for (const model of models) {
+        const total = model.total ?? 0;
+        accountSum += total;
+        modelCross.set(model.key, (modelCross.get(model.key) ?? 0) + total);
+      }
+      accountCross.set(uid, accountSum);
+    }
+    return { accountCross, modelCross };
+  }, [usageAccountModels]);
+
+  /**
+   * 当前被点的那一项，交叉明细是否**不完整**（缺失量 > 0）。
+   *
+   * 返回 `{ known, expected }`：known = 交叉明细求和，expected = 该维度的聚合 total。
+   *   - `known === 0 && expected > 0` → **完全没有明细**（历史用量），
+   *     此时绝不能断言「它没用过任何模型」；
+   *   - `0 < known < expected` → 明细**部分缺失**，列表可用但可能不全。
+   */
+  const usageCrossMissing = useMemo(() => {
+    if (!usageCrossFilter || !usageAccountModels) return null;
+    const { accountCross, modelCross } = usageCrossCoverage;
+    if (usageCrossFilter.kind === "account") {
+      const expected = usageAccountsAll.find((a) => a.key === usageCrossFilter.key)?.total ?? 0;
+      return { known: accountCross.get(usageCrossFilter.key) ?? 0, expected };
+    }
+    const expected = usageModelsAll.find((m) => m.key === usageCrossFilter.key)?.total ?? 0;
+    return { known: modelCross.get(usageCrossFilter.key) ?? 0, expected };
+  }, [usageCrossFilter, usageAccountModels, usageCrossCoverage, usageAccountsAll, usageModelsAll]);
+
+  /** 交叉明细对该项**完全缺失**（用来区分「确实没用过」与「拿不到明细」）。 */
+  const usageCrossItemBlank = Boolean(
+    usageCrossMissing && usageCrossMissing.expected > 0 && usageCrossMissing.known === 0,
+  );
+  /** 交叉明细对该项**部分缺失**（列表能用，但要提示可能不全）。 */
+  const usageCrossItemPartial = Boolean(
+    usageCrossMissing && usageCrossMissing.known > 0 && usageCrossMissing.known < usageCrossMissing.expected,
+  );
+
+  const usageCrossModel = usageCrossFilter?.kind === "model" ? usageCrossFilter.key : "";
+  const usageCrossAccount = usageCrossFilter?.kind === "account" ? usageCrossFilter.key : "";
+  const usageCrossActive = usageCrossFilter !== null;
+  /**
+   * 交叉筛选已选中，但网关没给 `accountModels` —— 此时**不施加**第二级筛选。
+   *
+   * 为什么不退回「用别的数据凑一个近似结果」：`models` / `accounts` 里根本没有
+   * 交叉信息，任何凑法都是在编造。界面改用明确文案说明「拿不到明细」，这比给出
+   * 一个看似有理、实则错误的结果安全得多。
+   */
+  const usageCrossDegraded = usageCrossActive && !usageAccountModels;
+
+  /**
+   * 两级筛选的**叠加语义**（这里是最容易出「筛不出东西却不知道为什么」的地方，
+   * 所以先把语义定死再实现）。
+   *
+   *   第一级 = 顶部 `ModelFilter` 多选下拉 → 「我要看哪几个模型」
+   *   第二级 = 本区块内的点选（点账号 / 点模型）→ 「我要看与这一项相关的数据」
+   *
+   * 两者**既不是二选一，也不是并集**，而是「第一级先定出可见集合，第二级在这个
+   * 集合内再收窄」：
+   *   - 点账号 → 左侧 = 该账号用过的模型 ∩ ModelFilter 选中的模型
+   *   - 点模型 → 右侧 = 用过该模型的账号；而这些账号的数值仍只算 ModelFilter
+   *     选中模型的那部分（因为 `usageAccounts` 已经是第一级的结果）
+   *
+   * 为什么第二级不「覆盖」第一级：ModelFilter 是用户在顶部**明确声明**的全局意图，
+   * 若点个账号就把它顶掉，用户回到顶部会看到勾选还在、数据却已不是那个意思 ——
+   * 那才是真正的「不知道为什么」。叠加虽可能筛出空集，但空集是**可解释**的：
+   * 提示条会同时列出两级条件与各自的命中情况（见下方 usageCrossNote），
+   * 用户一眼能看出是哪一级把数据掐没了。
+   *
+   * 为什么第二级是「单一选择」而不是多选：所有者的原话是「点击右边账号筛选左侧
+   * 模型，点击左侧模型筛选右侧账号」—— 每一次点击都是**一个**条件。做成多选后
+   * 「点第二个账号」就有了「替换 / 追加」两义，而追加会让两侧列表迅速收敛到
+   * 空集（多账号 × 多模型的交集通常为空），那不是他描述的行为。
+   */
+  const usageModelsScoped = useMemo(() => {
+    if (!usageCrossFilter || !usageAccountModels) return usageModels;
+    if (usageCrossFilter.kind === "model") {
+      // 点模型：左侧收窄到被点的这一个（它必然在 usageModels 里，否则点不到）。
+      return usageModels.filter((m) => m.key === usageCrossFilter.key);
+    }
+    // 点账号：左侧只剩该账号用过的模型；没给明细时上面已提前返回。
+    const owned = new Set((usageAccountModels[usageCrossFilter.key] ?? []).map((m) => m.key));
+    return usageModels.filter((m) => owned.has(m.key));
+  }, [usageModels, usageCrossFilter, usageAccountModels]);
+
+  const usageAccountsScoped = useMemo(() => {
+    if (!usageCrossFilter || !usageAccountModels) return usageAccounts;
+    if (usageCrossFilter.kind === "account") {
+      // 点账号：右侧收窄到被点的这一个（它必然在 usageAccounts 里，否则点不到）。
+      return usageAccounts.filter((a) => a.key === usageCrossFilter.key);
+    }
+    // 点模型：右侧只剩用过该模型的账号 —— 靠上面反转出的反向索引，不靠数值大小
+    // 猜（用 `total > 0` 猜会在「该账号在此范围外/被第一级筛掉」时给出错误结论）。
+    const users = accountKeysByModel.get(usageCrossFilter.key);
+    if (!users) return [];
+    return usageAccounts.filter((a) => users.has(a.key));
+  }, [usageAccounts, usageCrossFilter, usageAccountModels, accountKeysByModel]);
+
+  /**
+   * 占比条的百分**基准**：一律用**未经任何筛选的全量**峰值，而不是筛选后集合的峰值。
+   *
+   * 理由（本条的取舍是刻意的，不是随手取的）：
+   *   - 用筛选后集合当基准时，每个筛选状态下条最高的那条**永远顶满 100%**。于是
+   *     「点账号前后、点模型前后」条的长度几乎不变 —— 用户看不到筛选到底改变了
+   *     多少，也就失去了「这个账号/模型占整体多大」这个本区块最该回答的问题。
+   *   - 用全量基准时，筛选生效会直接表现为**所有条一起变短**，这本身就是「当前
+   *     正在按某个条件筛选」的视觉反馈，与下面的提示条互为印证。
+   *
+   * 代价与补偿：小账号被筛出来时条会短到接近不可见。但条只是**相对**度量，右侧
+   * 的精确数值与下方 meta（调用次数 · 输入/输出）在任何筛选下都照实显示，因此
+   * 「信息一条都没少」—— 这也是所有者明确要求过的。
+   *
+   * 注意基准用 `usageModelsAll` / `usageAccountsAll`（网关在该统计范围内的全量），
+   * **不随** ModelFilter 或交叉筛选变化；但**随**「今日/近 7 天/近 30 天/全部」
+   * 变化 —— 那是统计口径，不是筛选，换了口径本就应该重新归一。
+   */
+  const usageMaxModel = maxOf(usageModelsAll.map((m) => m.total));
+  const usageMaxAccount = maxOf(usageAccountsAll.map((a) => a.total));
+
   const usageNickname = useMemo(() => {
     const map = new Map<string, string>();
     for (const account of status?.accounts ?? []) {
@@ -1637,6 +2085,93 @@ export default function GatewayPage() {
     }
     return map;
   }, [status?.accounts]);
+
+  /**
+   * 「当前正在按什么筛选」的可视提示（提示条正文 + 一键清除按钮）。
+   *
+   * 为什么这条**必须**存在：点了账号后左边少了一半模型，若页面上没有任何说明，
+   * 用户只会认为「数据丢了 / 页面出错了」—— 他不会想到是自己点出来的。
+   * 尤其本区块有两个可点的列表，误触的概率并不低。
+   *
+   * 文案刻意包含三件事，缺一不可：
+   *   1. 点的是**哪个**账号 / 模型（否则选了两个名字相近的模型时分不清）；
+   *   2. 另一侧因此**收窄到了几个**（「左侧只剩它用过的 2 个模型」）—— 这是本次
+   *      点击的直接后果，也是用户确认「点对了」的依据；
+   *   3. 结果是空集时**明确指出是哪一级掐掉的** —— 两级筛选叠加后最常见的困惑
+   *      就是「筛不出东西但不知道为什么」，这里把两个集合的规模都报出来。
+   */
+  const usageCrossNote = useMemo(() => {
+    if (!usageCrossFilter) return null;
+    // 分子分母都必须落在**被收窄的那一侧**，即「另一侧」：
+    //   点模型 → 收窄的是右侧账号列表 → 分母 = 全量账号数
+    //   点账号 → 收窄的是左侧模型列表 → 分母 = 全量模型数
+    // 这里曾经写反（点模型时分母取全量**模型**数），真实数据下渲染成
+    // 「右侧只显示用过它的账号（8 / 1）」—— 8 个账号配 1 个模型的分母，
+    // 读起来像是「8 个里只有 1 个」，与事实相反。分子分母必须同维度。
+    const total = usageCrossFilter.kind === "model" ? usageAccountsAll.length : usageModelsAll.length;
+    const visible = usageCrossFilter.kind === "model" ? usageAccountsScoped.length : usageModelsScoped.length;
+    const visibleLabel = usageCrossFilter.kind === "model" ? "账号" : "模型";
+
+    if (usageCrossDegraded) {
+      return {
+        text: `已点击${usageCrossFilter.kind === "model" ? "模型" : "账号"}「${usageCrossFilter.key}」，但当前网关未提供「账号 × 模型」明细，无法据此筛选。`,
+        hint: "请更新网关后重试；下面的列表仍是未筛选的全量数据。",
+        emptyReason: "",
+      };
+    }
+
+    // 该项**有用量但交叉明细完全缺失**（真实数据里升级前的历史用量就是这样）：
+    // 此时空列表的含义是「拿不到明细」，**不是**「它没用过」。
+    // 把它说成「没有用过任何模型」是本次最容易犯、也最伤人的假结论 ——
+    // 用户右边明明看到它有 2287 次调用。
+    if (usageCrossItemBlank && visible === 0) {
+      return {
+        text:
+          usageCrossFilter.kind === "account"
+            ? `已点击账号「${usageNickname.get(usageCrossFilter.key) ?? usageCrossFilter.key.slice(0, 8)}」，但网关没有记录它在「账号 × 模型」里的明细，无法列出它用过哪些模型。`
+            : `已点击模型「${usageCrossFilter.key}」，但网关没有记录它在「账号 × 模型」里的明细，无法列出哪些账号用过它。`,
+        hint: "该账号/模型的用量发生在网关开始记录交叉明细之前；换更近的统计范围（如「今日」）可看到明细。",
+        emptyReason: `此范围内它有 ${exactTokenFormatter.format(usageCrossMissing?.expected ?? 0)} tokens 的用量，只是明细缺失。`,
+      };
+    }
+
+    // 部分缺失：列表可用但可能不全，必须提示，否则用户会以为「它就只用了这一个模型」。
+    const partialHint = usageCrossItemPartial
+      ? `注意：网关只记录了部分「账号 × 模型」明细（${formatUsageCompact(usageCrossMissing?.known ?? 0)} / ${formatUsageCompact(usageCrossMissing?.expected ?? 0)}），以下列表可能不全。`
+      : "再次点击同一项可取消选择。";
+
+    // 两个维度都为 0 说明第一级（ModelFilter）就把数据掐没了：
+    // 被点的这项在 ModelFilter 选中的模型里一个都没用上。
+    const emptyReason =
+      visible === 0 && total === 0
+        ? "该范围内没有任何用量数据。"
+        : visible === 0
+          ? modelFilterActive
+            ? `它用过的${visibleLabel}都不在顶部「模型筛选」选中的 ${modelFilter.length} 个模型里 —— 请放宽或清除模型筛选。`
+            : `它没有用过任何${visibleLabel}。`
+          : "";
+    return {
+      text:
+        usageCrossFilter.kind === "account"
+          ? `已点击账号「${usageNickname.get(usageCrossFilter.key) ?? usageCrossFilter.key.slice(0, 8)}」，左侧只显示它用过的模型（${visible} / ${total}）。`
+          : `已点击模型「${usageCrossFilter.key}」，右侧只显示用过它的账号（${visible} / ${total}）。`,
+      hint: partialHint,
+      emptyReason,
+    };
+  }, [
+    usageCrossFilter,
+    usageCrossDegraded,
+    usageCrossItemBlank,
+    usageCrossItemPartial,
+    usageCrossMissing,
+    usageModelsAll,
+    usageAccountsAll,
+    usageModelsScoped,
+    usageAccountsScoped,
+    usageNickname,
+    modelFilterActive,
+    modelFilter,
+  ]);
 
   /** uid → 该账号在所选范围内的 Token 用量（卡片直接取用）。 */
   const usageByUid = useMemo(
@@ -2085,51 +2620,37 @@ export default function GatewayPage() {
           </Row>
         ) : null}
 
-        {/* 积分轮转模式下选择「单一模型」 —— 选定后网关只放行这一个模型 */}
-        {mode === "rotation" ? (
-          <Row className="flex-col items-stretch gap-2 sm:flex-row sm:items-center">
-            <div className="min-w-0">
-              <Label htmlFor="gw-model" className="text-[13px] font-normal">
-                单一模型
-              </Label>
-              <div className="mt-0.5 text-[11px] text-muted-foreground">
-                {allowedModel
-                  ? `只放行 ${allowedModel}，其他模型会被网关拒绝`
-                  : "未指定 —— 客户端可调任意模型，轮转将无法约束额度消耗"}
-              </div>
+        {/*
+          放行模型（限制使用的模型）：**三个工作模式都有**，多选，默认全部。
+
+          为什么不跟工作模式绑定（此前只在积分轮转下）：它限制的是「网关放行
+          哪些模型」，与「用哪些账号」是正交的两件事 —— 自动/手动模式下同样
+          可能只想放行某几个模型（例如只想让客户端用国内模型）。
+
+          措辞刻意用「放行模型」而不是「模型筛选」：后者已经被 Token 用量区块
+          那个**只改展示、不写配置**的控件占用，两者语义完全不同（那个不写盘，
+          这个会让网关真的 400 拒绝）。标题 + 说明里都点明「网关会拒绝其它模型」，
+          用户才不会以为这只是换个看法。
+        */}
+        <Row className="flex-col items-stretch gap-2 sm:flex-row sm:items-center">
+          <div className="min-w-0">
+            <Label htmlFor="gw-allowed-models" className="text-[13px] font-normal">
+              放行模型
+            </Label>
+            <div className="mt-0.5 text-[11px] text-muted-foreground">
+              {allowedModels.length === 0
+                ? "全部放行 —— 客户端可调用任意模型"
+                : `只放行 ${allowedModels.join("、")}，其它模型会被网关拒绝（400）`}
             </div>
-            <Select
-              value={allowedModel || NONE_VALUE}
-              onValueChange={(v) => void changeAllowedModel(v === NONE_VALUE ? "" : v)}
-            >
-              <SelectTrigger id="gw-model" size="sm" className="w-56 shrink-0" aria-label="单一模型">
-                <SelectValue placeholder="（不限制模型）" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={NONE_VALUE}>（不限制模型）</SelectItem>
-                {/* 已锁定但不在当前列表里时补一项，否则触发器会显示空白 */}
-                {allowedModel && !modelOptions.includes(allowedModel) ? (
-                  <SelectItem value={allowedModel}>{allowedModel}（当前）</SelectItem>
-                ) : null}
-                {modelOptions.map((m) => (
-                  <SelectItem key={m} value={m}>
-                    {m}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="size-8 shrink-0"
-              onClick={() => void loadModels()}
-              disabled={modelsLoading}
-              aria-label="刷新模型列表"
-            >
-              <RefreshCw className={cn("size-3.5", modelsLoading && "animate-spin")} />
-            </Button>
-          </Row>
-        ) : null}
+          </div>
+          <AllowedModelPicker
+            options={modelOptions}
+            selected={allowedModels}
+            onChange={(next) => void changeAllowedModels(next)}
+            onRefresh={() => void loadModels()}
+            refreshing={modelsLoading}
+          />
+        </Row>
 
         <Row className="flex-col items-stretch gap-2 sm:flex-row sm:items-center">
           <div className="min-w-0">
@@ -2364,7 +2885,7 @@ export default function GatewayPage() {
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
             {/* 模型筛选：默认「全部」、可多选，**三个工作模式下都在**。
-                与「单一模型」（allowed_model）的分工见 ModelFilter 的说明 ——
+                与「放行模型」（allowed_model）的分工见 ModelFilter 的说明 ——
                 那个是服务端放行限制（写进配置、影响客户端能否调用），
                 这个是本页只读展示的收窄，不碰任何配置。 */}
             <ModelFilter
@@ -2407,6 +2928,36 @@ export default function GatewayPage() {
           </div>
         ) : null}
 
+        {/* 交叉筛选的提示条 + 一键清除。
+            没有它，用户点完账号看到左侧少了一半模型，只会以为数据丢了 —— 他不会
+            想到是自己点出来的。这里必须同时给出「点了什么」「另一侧剩几个」，
+            并在两边都为 0 时点明是哪一级掐掉的（两级叠加最常见的困惑）。
+            用 primary 系而不是 muted：它要和上面那条 ModelFilter 说明**区分开** ——
+            两条同时出现时，用户得能一眼看出「哪条是我刚点出来的」。 */}
+        {usageCrossNote ? (
+          <div
+            data-slot="usage-cross-filter-note"
+            className="mx-4 mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-[11px] leading-5 text-muted-foreground sm:mx-5"
+          >
+            <div className="min-w-0">
+              <span>{usageCrossNote.text}</span>
+              {usageCrossNote.emptyReason ? (
+                <span className="ml-1 text-foreground/80">{usageCrossNote.emptyReason}</span>
+              ) : null}
+              <span className="ml-1 text-muted-foreground/70">{usageCrossNote.hint}</span>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-6 shrink-0 px-2 text-[11px]"
+              onClick={() => setUsageCrossFilter(null)}
+              data-slot="usage-cross-filter-clear"
+            >
+              清除筛选
+            </Button>
+          </div>
+        ) : null}
+
         {(() => {
           // 判定顺序与占位文案统一走 usageUnavailableText，避免「新版一套、
           // 旧版另一套」的措辞漂移（例如把「网关没开」说成「开了但坏了」）。
@@ -2444,38 +2995,67 @@ export default function GatewayPage() {
               />
             </div>
 
+            {/* 左右两栏就是双向联动的两个入口：点右侧账号 → 左侧只剩该账号用过的
+                模型；点左侧模型 → 右侧只剩用过该模型的账号。再点一次取消。
+
+                左「按模型」在**前**、右「按账号」在**后**，与所有者描述的顺序
+                （「左边是模型,右边是账号」）一致，栅格顺序不动。
+
+                计数用 `usageModelsScoped` / `usageAccountsScoped`（第二级筛选后），
+                因为此时用户看到的就是这几条 —— 用未筛选的数会与列表长度对不上，
+                那正是「数字与内容矛盾」的经典困惑源。 */}
             <div className="grid gap-4 border-t border-border/50 pb-2 pt-3 sm:grid-cols-2">
               <div className="min-w-0">
                 <div className="px-4 text-[12px] font-medium text-muted-foreground sm:px-5">
                   按模型
-                  {usageModels.length > 0 ? (
+                  {usageModelsScoped.length > 0 ? (
                     <span className="ml-1.5 font-normal text-muted-foreground/70">
-                      共 {usageModels.length} 个
+                      共 {usageModelsScoped.length} 个
+                      {usageCrossActive && usageModelsScoped.length !== usageModelsAll.length
+                        ? `（全部 ${usageModelsAll.length}）`
+                        : ""}
                     </span>
                   ) : null}
                 </div>
                 <div className="mt-1 max-h-72 overflow-y-auto">
-                  {usageModels.length > 0 ? (
-                    usageModels.map((model) => (
+                  {usageModelsScoped.length > 0 ? (
+                    usageModelsScoped.map((model) => (
                       <UsageBarRow
                         key={model.key}
+                        dataSlot="usage-model-row"
                         label={model.key}
                         value={model.total}
                         max={usageMaxModel}
                         meta={`${exactTokenFormatter.format(model.records)} 次调用 · 输入 ${formatUsageCompact(model.input)} / 输出 ${formatUsageCompact(model.output)}`}
+                        selected={usageCrossModel === model.key}
+                        onToggle={() => toggleUsageModelFilter(model.key)}
                       />
                     ))
                   ) : (
-                    <div className="px-4 py-2 text-xs text-muted-foreground sm:px-5">该范围内暂无数据</div>
+                    // 空结果必须给可读说明，且要说清**为什么**空 —— 两级筛选叠加后
+                    // 「什么都没有」与「筛没了」是两件事，后者要告诉用户放宽哪一级。
+                    // 另外「确实没用过」与「网关没记明细」也必须分开（见 usageCrossItemBlank）。
+                    <div className="px-4 py-2 text-xs text-muted-foreground sm:px-5">
+                      {usageCrossItemBlank
+                        ? "网关没有记录该账号的「账号 × 模型」明细（用量发生在开始记录之前）"
+                        : usageCrossActive && !usageCrossDegraded
+                          ? usageCrossAccount
+                            ? `该账号没有用过任何模型${modelFilterActive ? "（在当前模型筛选范围内）" : ""}`
+                            : "该范围内暂无数据"
+                          : "该范围内暂无数据"}
+                    </div>
                   )}
                 </div>
               </div>
               <div className="min-w-0">
                 <div className="px-4 text-[12px] font-medium text-muted-foreground sm:px-5">
                   按账号
-                  {usageAccounts.length > 0 ? (
+                  {usageAccountsScoped.length > 0 ? (
                     <span className="ml-1.5 font-normal text-muted-foreground/70">
-                      共 {usageAccounts.length} 个
+                      共 {usageAccountsScoped.length} 个
+                      {usageCrossActive && usageAccountsScoped.length !== usageAccountsAll.length
+                        ? `（全部 ${usageAccountsAll.length}）`
+                        : ""}
                     </span>
                   ) : null}
                 </div>
@@ -2486,18 +3066,29 @@ export default function GatewayPage() {
                   改为全量展示并加滚动上限（高度受限，避免账号多时把页面撑得过长）。
                 */}
                 <div className="mt-1 max-h-72 overflow-y-auto">
-                  {usageAccounts.length > 0 ? (
-                    usageAccounts.map((account) => (
+                  {usageAccountsScoped.length > 0 ? (
+                    usageAccountsScoped.map((account) => (
                       <UsageBarRow
                         key={account.key}
+                        dataSlot="usage-account-row"
                         label={usageNickname.get(account.key) ?? `${account.key.slice(0, 8)}…`}
                         value={account.total}
                         max={usageMaxAccount}
                         meta={`${exactTokenFormatter.format(account.records)} 次调用 · ${account.key.slice(0, 8)}`}
+                        selected={usageCrossAccount === account.key}
+                        onToggle={() => toggleUsageAccountFilter(account.key)}
                       />
                     ))
                   ) : (
-                    <div className="px-4 py-2 text-xs text-muted-foreground sm:px-5">该范围内暂无数据</div>
+                    <div className="px-4 py-2 text-xs text-muted-foreground sm:px-5">
+                      {usageCrossItemBlank
+                        ? "网关没有记录该模型的「账号 × 模型」明细（用量发生在开始记录之前）"
+                        : usageCrossActive && !usageCrossDegraded
+                          ? usageCrossModel
+                            ? `没有账号用过「${usageCrossModel}」${modelFilterActive ? "（在当前模型筛选范围内）" : ""}`
+                            : "该范围内暂无数据"
+                          : "该范围内暂无数据"}
+                    </div>
                   )}
                 </div>
               </div>

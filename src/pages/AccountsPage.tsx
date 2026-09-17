@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   ChevronDown,
@@ -44,7 +44,7 @@ import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
 import { useVisibilityInterval } from "@/lib/use-visibility-interval";
-import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, GatewayTaskName, TravelConfig, TravelStatus } from "@/lib/types";
+import type { AccountMeta, AccountRunningTask, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, GatewayTaskName, GatewayTaskRuntime, TravelConfig, TravelStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -183,6 +183,14 @@ export default function AccountsPage() {
    * 同一时刻只应有一个在跑；按卡片分组反而会让人以为每个号各跑各的。
    */
   const [taskRunning, setTaskRunning] = useState<GatewayTaskName>();
+  /**
+   * 网关侧正在执行的养号任务（含「哪些账号已跑过」）。
+   *
+   * 为什么不能复用上面的 `taskRunning`：那个只覆盖**本页这一次请求**，
+   * 一旦任务由别处（设置页的「立即执行」）触发、或本页刷新后，它就是空的，
+   * 而任务其实还在跑。网关侧状态是唯一权威来源，卡片标记必须读它。
+   */
+  const [taskRuntime, setTaskRuntime] = useState<GatewayTaskRuntime | null>(null);
   /** 接入/升级 CLI helper 确认框 */
   const [installConfirmOpen, setInstallConfirmOpen] = useState(false);
   /** 删除账号确认目标（null=关闭） */
@@ -355,6 +363,39 @@ export default function AccountsPage() {
       cancelled = true;
     };
   }, [accounts]);
+
+  // 网关任务运行态轮询（5 秒一轮）。
+  //
+  // 为什么本页要自己拉一次 `gateway_status()`：任务运行态（在跑什么、哪些账号
+  // 已跑过）只在这个接口里（`taskRuntime`）。本页此前**没有任何** status 轮询
+  // —— 已有的两条轮询分别是 `getTravelStatus`（60 秒）与积分，都不含该字段；
+  // 而设置页那个 2 秒轮询只在设置页挂载，切回本页就没了。所以这里必须新增一条，
+  // 而不是「复用既有的」（确实没有可复用的）。
+  //
+  // 周期取 5 秒（与网关页的 status 轮询同档，而不是设置页的 2 秒）：设置页 2 秒
+  // 是为了盯着进度条看，而本页只需「一眼看到在跑什么」。5 秒对一轮 40 秒以上的
+  // 任务来说最迟 12% 处就能看到标记，同时把这条**较重**的接口（宿主每次都要
+  // 探活网关 + 解析账号记录文件）的开销压到可接受范围 —— 本页是默认落地页，
+  // 常驻打开，2 秒一轮会长期空转。
+  //
+  // 用 useVisibilityInterval：窗口隐藏/收进托盘时**销毁**定时器，不在后台空转
+  //（与旅行轮询、设置页、网关页同一做法）。
+  //
+  // 失败静默清空（与设置页 loadRuntime 一致）：这是旁路观测数据，网关没起来时
+  // 本来就查不到，为此弹提示只会制造噪音。清空而不是保留旧值 —— 保留会让任务
+  // 结束后仍挂着一个不复存在的标记。
+  const loadTaskRuntime = useCallback(async () => {
+    try {
+      const status = await api.getGatewayStatus();
+      setTaskRuntime(status.taskRuntime ?? null);
+    } catch {
+      setTaskRuntime(null);
+    }
+  }, []);
+
+  useVisibilityInterval(() => void loadTaskRuntime(), 5000, {
+    onResume: () => void loadTaskRuntime(),
+  });
 
   // 只给尚未缓存的账号拉积分；切回首页不重复请求。点「刷新积分」才强制更新。
   useEffect(() => {
@@ -725,6 +766,31 @@ export default function AccountsPage() {
     creditOrderingReady
       ? orderedAccounts.find((account) => hasExpiringSoonCredits(creditMap[account.id]))?.id
       : undefined;
+  /**
+   * 「本轮已跑」标记：账号库 id → 标记内容。
+   *
+   * 判定口径必须用 `account.id`（账号库主键），**不能用 uid**：后端
+   * `taskRuntime.processedIds` 就是账号库 id（Rust 侧 `task_runtime` 的注释
+   * 明确写过「用 uid 会一个都对不上，且不会有任何报错」）。而本页的
+   * `AccountMeta` 恰好两者都有，写错在这里不会报错、只会静默不显示。
+   *
+   * `label` 缺省时**不**给标记：标签文案就是「在跑什么」，没有任务名的标记
+   * 是一句无信息量的「本轮已跑」，不值得占卡片位置。
+   *
+   * 不在本轮范围内的账号（区域不符 / 已禁用 / 需重登）不会出现在 `processedIds`
+   * 里 —— 后端 `total` 与 Go 侧各任务的过滤条件一致地排除了它们，因此这些卡片
+   * 自然不显示标记，不会被误认为「所有号都在跑」。
+   */
+  const runningTaskByAccountId = new Map<string, AccountRunningTask>();
+  if (taskRuntime?.running && taskRuntime.label) {
+    for (const id of taskRuntime.processedIds ?? []) {
+      runningTaskByAccountId.set(id, {
+        label: taskRuntime.label,
+        processed: taskRuntime.processed,
+        total: taskRuntime.total,
+      });
+    }
+  }
   const cliCurrentAccountId = codebuddyCli?.activeAccountId;
   const workbuddyCurrentName = current
     ? current.nickname || current.email || current.uid || "未知账号"
@@ -1085,6 +1151,7 @@ export default function AccountsPage() {
                 onAdopt={onAdopt}
                 onRunTask={onRunTask}
                 taskRunning={taskRunning}
+                runningTask={runningTaskByAccountId.get(a.id) ?? null}
                 todayCheckedIn={checkinMap[a.id]}
                 travelStatus={travelMap[a.id]}
                 credit={creditMap[a.id]}
