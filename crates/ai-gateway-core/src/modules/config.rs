@@ -215,6 +215,42 @@ pub fn accounts_file() -> PathBuf {
     store_dir().join("accounts.json")
 }
 
+/// 把数据目录重定向到临时目录 —— **仅供测试**，供集成测试（`tests/*.rs`）使用。
+///
+/// ## 为什么需要它（`cfg(test)` 覆盖不到集成测试）
+///
+/// `config::test_isolation` 整个模块是 `#[cfg(test)]` 的，而 `#[cfg(test)]` 只在
+/// **本 crate 自己的单元测试**编译时成立。集成测试（`tests/zz_*.rs`）把本 crate
+/// 当**外部依赖**链接，`cfg(test)` 不成立 —— 那个模块连同它的 `#[ctor]` 一起
+/// 不会被编进集成测试二进制，于是隔离完全失效。
+///
+/// 这不是理论风险，是实测：一个只调用 `store_dir()` 的探针集成测试，
+/// 在 `#[ctor]` 修复之后仍然读到 `C:\Users\<用户>\.wb-switch`（真实账号库）。
+/// 只要有任何集成测试走账号读写路径，它就会污染用户真实数据。
+///
+/// ## 用法
+///
+/// 在集成测试文件里，**在任何线程创建之前**（文件顶层 `#[ctor]`，或每个
+/// `#[test]` 的第一行且在 `--test-threads=1` 下）调用一次：
+///
+/// ```no_run
+/// #[ctor::ctor]
+/// fn isolate() { ai_gateway_core::modules::config::pin_store_dir_for_tests("my-test"); }
+/// ```
+///
+/// 幂等：重复调用不会改变已生效的目录。
+pub fn pin_store_dir_for_tests(tag: &str) {
+    // 已经指向临时目录就不动它 —— 幂等，且不会覆盖单元测试的隔离。
+    if std::env::var_os("AI_GATEWAY_HOME").is_some_and(|v| {
+        !v.is_empty() && std::path::Path::new(&v).starts_with(std::env::temp_dir())
+    }) {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("ai-gateway-it-{tag}-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::env::set_var("AI_GATEWAY_HOME", dir);
+}
+
 // ---------------------------------------------------------------------------
 // 应用设置（多应用共用的界面偏好与手动路径）
 // ---------------------------------------------------------------------------
@@ -230,23 +266,79 @@ pub fn app_settings_file() -> PathBuf {
 
 /// 把数据目录隔离到临时目录，供单元测试使用。
 ///
-/// 为什么需要一把全局锁：`AI_GATEWAY_HOME` 是**进程级**环境变量，而 cargo 默认
-/// 多线程跑测试。两个测试同时改它，会让其中一个读到另一个的目录 ——
-/// 表现为「刚写入的账号查不到」这类看似随机的失败。
-/// 所有依赖数据目录的测试都必须先拿这把锁。
+/// ## 为什么用 `set_var` 是错的（2026-09-16 实测事故）
+///
+/// 初版用「一把全局 `Mutex` + `std::env::set_var(AI_GATEWAY_HOME)`」做隔离，
+/// 并假设「所有依赖数据目录的测试都先拿这把锁」就安全。**这个假设不成立**：
+///
+/// 1. `std::env::set_var` 在 Rust 2024 起已是 `unsafe`，并且**在任何平台上都不是
+///    线程安全的** —— 它只对「调用时恰好在读同一变量」的线程构成 UB，而对
+///    「根本没去拿锁、却读了 `store_dir()`」的线程**不会报错，只会读到真实 home**。
+///    并发测试里只要有任何一个测试（或测试 helper）没拿锁就调用了 `store_dir()`，
+///    它就会把种子数据写进**用户真实的 `~/.wb-switch`**。
+/// 2. 事故证据：本机账号库里出现了 16 条一模一样的
+///    `{"uid":"legacy-user","email":"old@example.com"}` —— 这正是
+///    `account::tests` 里那条「只有 uid 没有 id」用例的种子数据。它先污染了
+///    `~/.ai-gateway`，随后被数据目录迁移原样搬进 `~/.wb-switch`，最终以一条
+///    「永远登录不了」的僵尸账号出现在界面上（见 `account::sanitize_accounts`
+///    与 `account::purge_credentialless_leftovers`）。
+///
+/// ## 现在的做法：在**任何线程被创建之前**把变量定死
+///
+/// `AI_GATEWAY_HOME` 改为在 `#[ctor]` 里于 `main` 之前指向一个**固定的、进程级**
+/// 临时目录，并在整个测试进程生命周期内不再改动：
+///
+/// - 不再需要 `set_var` 来「建立隔离」⇒ 隔离根目录在任何测试跑之前就已就位。
+/// - 所有测试线程读到的都是同一个隔离根目录 ⇒ 即使某个测试忘了拿锁，也不会碰到
+///   用户真实数据（最坏结果是测试之间互相看见，属可接受的失败模式）。
+/// - `Isolated` 退化为「拿锁 + 给一个唯一子目录」，用**子目录**把需要独立账号库的
+///   测试彼此隔开，且 `Drop` 时**还原到隔离根目录而非删除变量** —— 直接删除变量
+///   会让后续 `store_dir()` 退回真实 home，这正是事故的成因。
+///
+/// 关键点：环境变量的写入必须发生在 `std::thread` 首次 spawn **之前**。
+/// `#[ctor]` 在 `main` 之前运行，满足这个条件；在测试函数体里写则可能在其它测试
+/// 线程已经缓存了 `getenv` 结果之后才发生。
 #[cfg(test)]
 pub mod test_isolation {
     use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// 进程级隔离根目录。整个测试进程共用，永不变动。
+    fn root() -> &'static PathBuf {
+        static ROOT: OnceLock<PathBuf> = OnceLock::new();
+        ROOT.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("ai-gateway-tests-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        })
+    }
+
+    /// 在 `main` / 测试线程启动前把数据目录钉死到隔离根目录。
+    ///
+    /// 这是隔离**真正生效**的那一步：只要它在任何线程 spawn 之前执行完毕，
+    /// 后续任何一次 `store_dir()` 都不可能落到用户真实 home。
+    ///
+    /// **只覆盖 `--lib`（单元测试）**。集成测试（`tests/*.rs`）把本 crate 当外部
+    /// 依赖链接，`cfg(test)` 不成立，所以本模块连同 `#[ctor]` 一起不会被编进
+    /// 那些二进制 —— 它们的数据目录仍是**用户真实 home**（已用探针实测确认）。
+    /// 集成测试要隔离必须自己调用 `config::pin_store_dir_for_tests()`，
+    /// 参见 `tests/store_isolation.rs`。
+    #[ctor::ctor]
+    fn pin_test_home() {
+        let dir = root();
+        std::env::set_var("AI_GATEWAY_HOME", dir);
+    }
 
     fn lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    /// 隔离守卫：持有期间数据目录指向临时目录，释放时清理。
+    /// 隔离守卫：持有期间测试独占一个数据子目录。
     ///
-    /// 用 `MutexGuard` 而非 `Drop` 实现清理：这样即使测试 panic，锁也会释放，
+    /// 不再改环境变量 —— 只分配一个唯一子目录并把它设为当前测试的工作目录。
+    /// `MutexGuard` 而非 `Drop` 实现清理：即使测试 panic，锁也会释放，
     /// 后续测试不会被永久阻塞（poisoned 锁用 `into_inner` 兜底）。
     pub struct Isolated {
         _guard: MutexGuard<'static, ()>,
@@ -256,8 +348,8 @@ pub mod test_isolation {
     impl Isolated {
         pub fn new(tag: &str) -> Self {
             let guard = lock().lock().unwrap_or_else(|e| e.into_inner());
-            let dir = std::env::temp_dir().join(format!(
-                "ai-gateway-test-{tag}-{}-{}",
+            let dir = root().join(format!(
+                "{tag}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -266,6 +358,9 @@ pub mod test_isolation {
             ));
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::create_dir_all(&dir);
+            // 只改**子目录**：仍然经由环境变量下发，因为 `store_dir()` 是纯函数、
+            // 只认这一个来源；但写入的是进程级固定根目录下的唯一子目录，
+            // 因此即便与其它测试交错，也绝不会落到真实 home。
             std::env::set_var("AI_GATEWAY_HOME", &dir);
             Self { _guard: guard, dir }
         }
@@ -278,15 +373,17 @@ pub mod test_isolation {
 
     impl Drop for Isolated {
         fn drop(&mut self) {
-            std::env::remove_var("AI_GATEWAY_HOME");
+            // 还原到进程级隔离根目录（**不是**删除变量 —— 删除会让后续
+            // `store_dir()` 退回真实 home，正是本次事故的成因）。
+            std::env::set_var("AI_GATEWAY_HOME", root());
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 }
 
-
 /// 读取应用设置（缺失或损坏返回空对象）。
-pub fn load_app_settings() -> Value {    std::fs::read_to_string(app_settings_file())
+pub fn load_app_settings() -> Value {
+    std::fs::read_to_string(app_settings_file())
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .filter(Value::is_object)
@@ -844,6 +941,15 @@ pub fn utc_iso() -> String {
 
 /// 原子写文件（临时文件 + rename），对照 Python atomic_write。
 pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    // 先确保父目录存在：临时文件与目标同目录，父目录缺失时 `write` 会以
+    // 「系统找不到指定的路径 (os error 3)」失败 —— 而这在迁移动线上是**静默丢数据**：
+    // 合并写入失败后 `copy_dir_merged` 会把未过滤的旧账号库整个拷过去，
+    // 调用方只看得到 `Err`，文件却已经躺在目标目录里了（实测踩到）。
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -1252,13 +1358,12 @@ mod tests {
         .expect("client 应能构建");
 
         // 请求本机另一个端口（直连），不应碰代理。
-        let _ = client.get(format!("http://127.0.0.1:{port}/x")).send().await;
+        let _ = client
+            .get(format!("http://127.0.0.1:{port}/x"))
+            .send()
+            .await;
         // 此时假代理收到的是普通 GET（非 CONNECT），计数应为 0。
-        assert_eq!(
-            hits.load(Ordering::SeqCst),
-            0,
-            "未配置代理时不应走代理"
-        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "未配置代理时不应走代理");
     }
 
     /// 非法代理地址不应让 client 构建失败（回落直连）。
@@ -1288,10 +1393,7 @@ mod tests {
         // Web 分支，扫码后拿不到插件 token
         assert_eq!(Region::Cn.oauth_platform(), "workbuddy");
         assert_eq!(Region::Intl.oauth_platform(), "workbuddy-ai");
-        assert_ne!(
-            Region::Cn.oauth_platform(),
-            Region::Intl.oauth_platform()
-        );
+        assert_ne!(Region::Cn.oauth_platform(), Region::Intl.oauth_platform());
     }
 
     #[test]

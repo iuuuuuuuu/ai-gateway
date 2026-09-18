@@ -181,10 +181,22 @@ pub fn migrate_from_to(legacy: &Path, target: &Path) -> MigrationOutcome {
     }
 }
 
-/// 把旧账号库里的账号并入新账号库（按 `uid` 去重，已有条目保持不变）。
+/// 把旧账号库里的账号并入新账号库（按 `(区域, uid)` 去重，已有条目保持不变）。
 ///
 /// 返回新增的账号数。任一侧读取/解析失败时**不改动目标文件**（返回 0）——
 /// 账号库是唯一真源，宁可少合并也不能写坏。
+///
+/// ## 为什么这里**不**做任何形态过滤（曾经两次踩坑）
+///
+/// 为了删掉 `legacy-user` 那类残留记录，先后两版实现在这里按记录形态过滤，
+/// 合计打断了 13 条既有测试。根因是同一个：**「有 uid、暂时没有 token」在
+/// 账号库里是合法且常见的形态** —— 测试夹具（`[{"uid":"u1"}]`）、外部导入
+/// 中间态、待重新登录账号都长这样。任何通用形态判据都会先误伤它们，而真实数据里
+/// 那正是**用户待重新登录的账号**。
+///
+/// 因此迁移恢复为**忠实搬运**：只按身份去重，不做主观删减。残留记录的清理由
+/// 启动期的 `account::purge_credentialless_leftovers` 承担（窄判据 + 日志，
+/// 与 `refresh::repair_false_relogin_flags` 同一套路）。
 fn merge_accounts_file(legacy: &Path, target: &Path) -> usize {
     let Ok(legacy_text) = std::fs::read_to_string(legacy) else {
         return 0;
@@ -196,11 +208,13 @@ fn merge_accounts_file(legacy: &Path, target: &Path) -> usize {
         return 0;
     }
 
-    // 目标不存在或为空：直接由 copy_dir_merged 拷贝，这里不重复处理
+    // 目标不存在：视为空库，仍由本函数负责落盘（而不是留给 `copy_dir_merged`），
+    // 这样身份去重的结果一定会写出去。
     let mut target_accounts: Vec<serde_json::Value> = match std::fs::read_to_string(target) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(_) => return 0,
+        Err(_) => Vec::new(),
     };
+    let target_missing = !target.is_file();
 
     // 身份键必须与账号库自身的判重口径一致：`(区域, uid)`。
     //
@@ -209,21 +223,26 @@ fn merge_accounts_file(legacy: &Path, target: &Path) -> usize {
     // 同一个账号会被算成两个不同的键，合并后出现重复条目 —— 实测踩到过。
     let existing: std::collections::HashSet<(String, String)> = target_accounts
         .iter()
-        .filter_map(|a| account_identity(a))
+        .filter_map(migration_identity)
         .collect();
 
     let mut added = 0usize;
     for acc in legacy_accounts {
-        match account_identity(&acc) {
-            Some(key) if !existing.contains(&key) => {
+        if let Some(key) = migration_identity(&acc) {
+            if !existing.contains(&key) {
                 target_accounts.push(acc);
                 added += 1;
             }
-            // 无 uid 的条目无法判重：跳过，避免把同一个账号重复塞进去
-            _ => {}
         }
     }
-    if added == 0 {
+
+    if added == 0 && !target_missing {
+        return 0;
+    }
+    if target_missing && target_accounts.is_empty() {
+        // 旧库没有可并入的账号（全无身份）：写一个空数组，避免 `copy_dir_merged`
+        // 把整份旧账号库原样拷过去。
+        let _ = config::atomic_write(target, "[]");
         return 0;
     }
 
@@ -243,23 +262,27 @@ fn merge_accounts_file(legacy: &Path, target: &Path) -> usize {
 ///
 /// 区域来自 `domain` 后缀（`.cn` → 国服，其余 → 国际版）：两个区域的身份命名空间
 /// **相互独立**，同一串 uid 可以同时存在于国服与国际版，跨区域永不合并。
+///
+/// 直接转发 `account::account_identity`：这个键过去在本文件里有一份独立实现，
+/// 两份实现漂移过一次就会让「同一条账号在迁移路径与 upsert 路径下判成两个」，
+/// 合并结果出现重复条目。判重口径只允许有一个来源。
 fn account_identity(acc: &serde_json::Value) -> Option<(String, String)> {
-    let uid = acc.get("uid").and_then(|v| v.as_str())?.trim();
-    if uid.is_empty() {
-        return None;
-    }
-    let region = acc
-        .get("domain")
-        .and_then(|v| v.as_str())
-        .map(|d| {
-            if d.trim_end().ends_with(".cn") {
-                "cn"
-            } else {
-                "intl"
-            }
-        })
-        .unwrap_or("cn");
-    Some((region.to_string(), uid.to_string()))
+    crate::modules::account::account_identity(acc)
+}
+
+/// 该条目在合并判重时使用的键（`(区域, uid)`，无 uid 时回退到 id）。
+///
+/// 无 uid 的条目退回 id：id 是库内唯一标识，不带区域也不会误判。两者皆无时
+/// 返回 `None`（无从判重）—— 调用方跳过它，但仍**不丢弃**。
+/// 形态过滤的取舍见 `merge_accounts_file` 注释。
+fn migration_identity(acc: &serde_json::Value) -> Option<(String, String)> {
+    account_identity(acc).or_else(|| {
+        acc.get("id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|id| (String::new(), id.to_string()))
+    })
 }
 
 /// 递归拷贝目录内容（已存在的文件不覆盖，返回拷贝的顶层条目数）。
@@ -322,7 +345,10 @@ mod tests {
 
         let count = copy_dir_merged(&src, &dest).unwrap();
         assert_eq!(count, 2, "只应拷贝 b.txt 与 nested");
-        assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "new-a");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("a.txt")).unwrap(),
+            "new-a"
+        );
         assert_eq!(std::fs::read_to_string(dest.join("b.txt")).unwrap(), "b");
         assert_eq!(
             std::fs::read_to_string(dest.join("nested").join("c.txt")).unwrap(),
@@ -385,13 +411,20 @@ mod tests {
         .unwrap();
 
         let outcome = migrate_from_to(&legacy, &target);
-        assert!(outcome.migrated(), "目标已有数据也必须完成迁移：{outcome:?}");
+        assert!(
+            outcome.migrated(),
+            "目标已有数据也必须完成迁移：{outcome:?}"
+        );
 
-        let merged: Vec<serde_json::Value> = serde_json::from_str(
-            &std::fs::read_to_string(target.join("accounts.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(merged.len(), 8, "8 个旧账号必须全部可见，实际 {}", merged.len());
+        let merged: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(target.join("accounts.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            merged.len(),
+            8,
+            "8 个旧账号必须全部可见，实际 {}",
+            merged.len()
+        );
         for i in 1..=8 {
             assert!(
                 merged.iter().any(|a| a["uid"] == format!("u{i}")),
@@ -443,16 +476,13 @@ mod tests {
         )
         .unwrap();
 
-        let added = merge_accounts_file(
-            &legacy.join("accounts.json"),
-            &target.join("accounts.json"),
-        );
+        let added =
+            merge_accounts_file(&legacy.join("accounts.json"), &target.join("accounts.json"));
         assert_eq!(added, 1, "只有 u2 是新增的");
 
-        let merged: Vec<serde_json::Value> = serde_json::from_str(
-            &std::fs::read_to_string(target.join("accounts.json")).unwrap(),
-        )
-        .unwrap();
+        let merged: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(target.join("accounts.json")).unwrap())
+                .unwrap();
         assert_eq!(merged.len(), 2);
         let u1 = merged.iter().find(|a| a["uid"] == "u1").unwrap();
         assert_eq!(u1["nickname"], "新名", "新库里的条目不得被旧值覆盖");
@@ -467,10 +497,8 @@ mod tests {
         std::fs::write(legacy.join("accounts.json"), "not json at all").unwrap();
         std::fs::write(target.join("accounts.json"), r#"[{"uid":"keep"}]"#).unwrap();
 
-        let added = merge_accounts_file(
-            &legacy.join("accounts.json"),
-            &target.join("accounts.json"),
-        );
+        let added =
+            merge_accounts_file(&legacy.join("accounts.json"), &target.join("accounts.json"));
         assert_eq!(added, 0);
         let text = std::fs::read_to_string(target.join("accounts.json")).unwrap();
         assert!(text.contains("keep"), "目标文件必须保持原样");
@@ -485,11 +513,57 @@ mod tests {
         std::fs::write(legacy.join("accounts.json"), r#"[{"nickname":"无标识"}]"#).unwrap();
         std::fs::write(target.join("accounts.json"), r#"[{"uid":"u1"}]"#).unwrap();
 
-        let added = merge_accounts_file(
-            &legacy.join("accounts.json"),
-            &target.join("accounts.json"),
-        );
+        let added =
+            merge_accounts_file(&legacy.join("accounts.json"), &target.join("accounts.json"));
         assert_eq!(added, 0, "无 uid 无法判重，宁可不并入");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **契约测试**：迁移**忠实搬运**，不做形态过滤。
+    ///
+    /// 这条测试守的是一个曾经踩了两次的坑：为了在迁移时删掉 `legacy-user`
+    /// 那类残留记录，先后两版「按形态过滤」的实现合计打断了 13 条既有测试 ——
+    /// 根因都是同一个：「有 uid、暂时没有 token」在账号库里是**合法形态**
+    /// （测试夹具、导入中间态、待重新登录账号都长这样），通用过滤必然先误伤它们，
+    /// 而真实数据里那正是用户待重新登录的账号。
+    ///
+    /// 残留记录的清理改由启动期的 `account::purge_credentialless_leftovers`
+    /// 承担（窄判据 + 有日志）。迁移只负责搬运，不负责删。
+    #[test]
+    fn 迁移忠实搬运不过滤记录形态() {
+        let (base, legacy, target) = pair("faithful");
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        std::fs::write(
+            legacy.join("accounts.json"),
+            r#"[
+                {"uid":"legacy-user","email":"old@example.com","needs_relogin":true},
+                {"uid":"real-uid","nickname":"真账号","domain":"www.workbuddy.ai","access_token":"t"},
+                {"uid":"pending-relogin","needs_relogin":true,"domain":"www.workbuddy.ai"},
+                {"id":"id-only","nickname":"只有 id"}
+            ]"#,
+        )
+        .unwrap();
+
+        let outcome = migrate_from_to(&legacy, &target);
+        assert!(outcome.migrated(), "迁移应完成：{outcome:?}");
+
+        let merged: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(target.join("accounts.json")).unwrap())
+                .unwrap();
+
+        assert_eq!(
+            merged.len(),
+            4,
+            "迁移必须原样搬运全部条目（含 uid-only 的待重登账号），实际 {merged:?}"
+        );
+        for uid in ["legacy-user", "real-uid", "pending-relogin"] {
+            assert!(
+                merged.iter().any(|a| a["uid"] == uid),
+                "uid={uid} 必须被搬运"
+            );
+        }
+        assert!(merged.iter().any(|a| a["id"] == "id-only"));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -602,17 +676,19 @@ mod tests {
         )
         .unwrap();
 
-        let added = merge_accounts_file(
-            &legacy.join("accounts.json"),
-            &target.join("accounts.json"),
-        );
+        let added =
+            merge_accounts_file(&legacy.join("accounts.json"), &target.join("accounts.json"));
         assert_eq!(added, 0, "同一 (区域, uid) 不应被重复并入");
 
-        let merged: Vec<serde_json::Value> = serde_json::from_str(
-            &std::fs::read_to_string(target.join("accounts.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(merged.len(), 1, "不得出现重复账号，实际 {} 条", merged.len());
+        let merged: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(target.join("accounts.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            merged.len(),
+            1,
+            "不得出现重复账号，实际 {} 条",
+            merged.len()
+        );
         // 富化后的字段必须保留（新库条目优先）
         assert_eq!(merged[0]["needs_relogin"], true);
         assert_eq!(merged[0]["id"], "new-id");
@@ -635,10 +711,8 @@ mod tests {
         )
         .unwrap();
 
-        let added = merge_accounts_file(
-            &legacy.join("accounts.json"),
-            &target.join("accounts.json"),
-        );
+        let added =
+            merge_accounts_file(&legacy.join("accounts.json"), &target.join("accounts.json"));
         assert_eq!(added, 1, "两区域的身份命名空间相互独立，不得互相覆盖");
         let _ = std::fs::remove_dir_all(&base);
     }

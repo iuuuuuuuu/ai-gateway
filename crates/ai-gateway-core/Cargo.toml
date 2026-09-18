@@ -79,3 +79,9 @@ windows-registry = "0.6"
 [build-dependencies]
 # 构建期压缩内嵌网关
 flate2 = "1"
+
+[dev-dependencies]
+# 测试数据目录隔离：`#[ctor]` 让环境变量在 main / 任何测试线程启动**之前**就位。
+# 这是隔离能否生效的关键 —— 见 config::test_isolation 的事故注释。
+# 仅在 cfg(test) 下使用，不进发布产物。
+ctor = "0.2"
