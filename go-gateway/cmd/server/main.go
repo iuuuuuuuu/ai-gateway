@@ -26,6 +26,40 @@ import (
 	"workbuddy2api/internal/usage"
 )
 
+// qoderAuthOf 把 Qoder 凭证转成账号池用的 auth.Auth。
+//
+// 为什么两个结构不合并：Qoder 需要机器指纹（COSY 签名的必需输入）与
+// dt/drt 的明确语义，而 WorkBuddy 不需要。合并会让 WorkBuddy 侧也长出
+// 用不到的字段，且两者的令牌刷新逻辑完全不同（一个 OAuth refresh，
+// 一个 deviceToken/refresh + drt 轮换）。
+//
+// 桥接点收在这里：池只认 auth.Auth（选号逻辑要跨产品共用）。
+func qoderAuthOf(cr *qoder.Cred) *auth.Auth {
+	return &auth.Auth{
+		UID:          cr.UID,
+		Nickname:     cr.Nickname,
+		AccessToken:  cr.DT,
+		RefreshToken: cr.DRT,
+		ExpiresAt:    cr.DTExpiresAt,
+		// 域名用于区域判定（qoder.sh = 国际版，qoder.com.cn = 国服），
+		// 与 Qoder 自己的 RegionFromDomain 口径一致。
+		Domain:   cr.Region.Domain(),
+		FilePath: cr.FilePath,
+		Product:  auth.ProductQoder,
+	}
+}
+
+// maskUID 脱敏 uid（日志里不出现完整账号标识）。
+//
+// 本仓库是公开仓库，日志可能被用户贴到 issue 里 —— 只留前 8 位足够定位，
+// 又不足以反查账号。
+func maskUID(uid string) string {
+	if len(uid) <= 8 {
+		return uid
+	}
+	return uid[:8] + "…"
+}
+
 func main() {
 	// 子命令：宿主（Tauri）通过 `gateway qoder-login ...` 完成 Qoder 的设备流登录。
 	//
@@ -244,6 +278,51 @@ func main() {
 		log.Printf("trial 加油包领取已禁用（schedule.trial_enabled=false）")
 	}
 
+	// ---- 多产品路由（默认关闭）----
+	//
+	// 开启后：加载 Qoder 账号进同一个池，并注入 Qoder 的请求派发实现。
+	// 关闭时两者都不做 —— 行为与单产品时代逐字相同（回滚点）。
+	var qoderDispatch server.QoderUpstream
+	if cfg.Pool.MultiProduct {
+		qoderDir := cfg.Pool.QoderAuthDir
+		if qoderDir == "" {
+			qoderDir = qoder.DefaultAuthDir()
+		}
+		creds, failed, err := qoder.LoadDir(qoderDir)
+		if err != nil {
+			log.Printf("多产品路由已开启，但读取 Qoder 凭证目录失败（%s）：%v", qoderDir, err)
+		}
+		// 解析失败的文件必须**报出来**：用户会以为"账号导入了但没生效"，
+		// 而真正原因是格式不对（Qoder 凭证可能是手写的）。
+		for _, f := range failed {
+			log.Printf("Qoder 凭证解析失败，已跳过：%s", f)
+		}
+		added := 0
+		for _, cr := range creds {
+			if cr.UID == "" {
+				continue
+			}
+			if cr.EnsureFingerprint() {
+				// 指纹是 COSY 签名的必需输入，且必须跨重启稳定 —— 生成后落盘。
+				if err := cr.SaveAtomic(); err != nil {
+					log.Printf("Qoder 账号 %s 保存机器指纹失败：%v", maskUID(cr.UID), err)
+				}
+			}
+			p.Add(qoderAuthOf(cr))
+			added++
+		}
+		log.Printf("多产品路由已开启：Qoder 凭证目录 %s，载入 %d 个账号（解析失败 %d 个）",
+			qoderDir, added, len(failed))
+
+		qc := qoder.New()
+		// Qoder 的网关对 HTTP/2 不友好，New() 里已禁用 h2（见 qoder.New 的注释）。
+		qoderDispatch = qoder.NewDispatch(qc)
+		// 成本维度：让两产品按"单位额度消耗率"参与加权（见 design.md §2.3）。
+		p.SetMultiProduct(true, 0.3)
+	} else {
+		log.Printf("多产品路由已关闭（pool.multi_product=false）：只使用 WorkBuddy 账号")
+	}
+
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
@@ -276,6 +355,13 @@ func main() {
 		// 客户端的 system/developer 消息。
 		PromptMode: cfg.Prompt.Mode,
 		PromptText: cfg.PromptText,
+		// Qoder 产品派发：仅在多产品路由开启时注入。
+		//
+		// 关闭时（默认）此字段为 nil → dispatchUpstream 对所有账号返回
+		// "非 Qoder" → 全部走既有 WorkBuddy 路径，行为与单产品时代逐字相同。
+		// 这是 design.md §5 要求的回滚点：产品维度出问题就关掉开关，
+		// 立刻回到已验证的行为，不需要回滚代码。
+		Qoder: qoderDispatch,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

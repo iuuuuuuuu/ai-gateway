@@ -13,6 +13,7 @@ package server
 // 协议适配层只负责「形状转换」，不碰任何调度状态。
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -72,11 +73,19 @@ func (e *modelLockedError) Error() string {
 //   - Stream != nil  → 流式：调用方负责 Close，并按目标协议解析/转换 SSE。
 //   - Response != nil → 非流式：上游 SSE 已被 Aggregate 成 OpenAI chat.completion。
 type chatResult struct {
-	UID      string
-	Model    string
+	UID   string
+	Model string
+	// Product 供本次结果来自哪个产品（"" = WorkBuddy）。
+	//
+	// 调用方据此决定**怎么读这个流**：WorkBuddy 已是 OpenAI 形状，直接透传；
+	// Qoder 是嵌套形状，必须先翻译。搞混会得到空回答（HTTP 仍 200）。
+	Product  string
 	Stream   io.ReadCloser
 	Response map[string]any
 }
+
+// IsQoder 报告本次结果是否来自 Qoder（调用方据此选择流的读法）。
+func (r *chatResult) IsQoder() bool { return r != nil && r.Product == auth.ProductQoder }
 
 // forwardChat 执行「选号 → token 刷新 → 转发 → 失败换号」的完整轮转。
 //
@@ -279,7 +288,26 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 			}
 		}
 
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body)
+		// 按账号所属产品派发上游实现。
+		//
+		// 这一处是整个多产品路由的**唯一**分叉点：pool 可能选中任一产品的
+		// 账号，而两个产品的鉴权/端点/请求体编码/响应形状完全不同。
+		// 不加这个分支就会拿 Qoder 的凭证去请求 WorkBuddy 的端点 ——
+		// 失败信息会显示成"账号不可用"，排查方向被引向凭证，
+		// 完全看不出是派发错了产品。
+		qoderUp, isQoder := h.dispatchUpstream(acct)
+
+		var rc io.ReadCloser
+		var status int
+		var respBody []byte
+		var terr error
+		if isQoder {
+			// Qoder 路径：实现内部负责取模型 key、构造请求体、编码、COSY 签名。
+			// 传的是**客户端原始 OpenAI 请求体**（翻译在 qoder 包内完成）。
+			rc, status, respBody, terr = qoderUp.ChatStream(context.Background(), acct, body)
+		} else {
+			rc, status, respBody, terr = h.cfg.Upstream.ChatStream(acct, body)
+		}
 		if terr != nil {
 			lastStatus = http.StatusServiceUnavailable
 			lastErr = terr
@@ -363,19 +391,31 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 		uid := acct.UID
 		handedOff = true // 租约移交调用方，由其读完/关闭后释放
 
-		if stream {
-			return &chatResult{UID: uid, Model: modelOf(body), Stream: rc}, status, nil
+		product := ""
+		if isQoder {
+			product = auth.ProductQoder
 		}
 
-		resp, err := upstream.Aggregate(rc)
+		if stream {
+			return &chatResult{UID: uid, Model: modelOf(body), Product: product, Stream: rc}, status, nil
+		}
+
+		// 非流式：两个产品的聚合方式不同（Qoder 是嵌套 SSE，需要先拍平）。
+		var resp map[string]any
+		var aggErr error
+		if isQoder {
+			resp, aggErr = qoderUp.Aggregate(rc, modelOf(body))
+		} else {
+			resp, aggErr = upstream.Aggregate(rc)
+		}
 		rc.Close()
 		h.cfg.Pool.Release(uid)
 		handedOff = false
 		heldUID = ""
-		if err != nil {
-			return nil, http.StatusBadGateway, err
+		if aggErr != nil {
+			return nil, http.StatusBadGateway, aggErr
 		}
-		return &chatResult{UID: uid, Model: modelOf(body), Response: resp}, http.StatusOK, nil
+		return &chatResult{UID: uid, Model: modelOf(body), Product: product, Response: resp}, http.StatusOK, nil
 	}
 
 	msg := "all accounts unavailable (cooling/disabled)"

@@ -156,6 +156,25 @@ type Config struct {
 		// `allowed_model` **既接受字符串也接受数组**：老配置写的是
 		// `"deepseek-v4.1-flash"`，新宿主写的是 `["a","b"]`，两者都必须能读。
 		AllowedModels AllowedModels `json:"allowed_model"`
+
+		// MultiProduct 是否启用**多产品路由**（默认 false = 只跑 WorkBuddy）。
+		//
+		// 开启后：
+		//   · 加载 Qoder 凭证进同一个账号池（见 QoderAuthDir）
+		//   · 注入 Qoder 的请求派发实现（按账号所属产品分发到不同上游）
+		//   · 成本维度参与加权（见 pool.SetMultiProduct）
+		//
+		// 为什么做成开关而不是直接启用：跨产品路由是最容易"悄悄改变现有行为"
+		// 的地方，而现有单产品行为已在生产环境跑了很久。关闭时所有既有路径
+		// **逐字不变** —— 这也是出问题时的回滚点（关掉即回到已验证行为，
+		// 不需要回滚代码）。
+		MultiProduct bool `json:"multi_product"`
+
+		// QoderAuthDir Qoder 凭证目录；空 = ~/.wb-switch/qoder/auths。
+		//
+		// 与宿主侧的 qoder_account::auth_dir() 必须一致，否则会出现
+		// "界面里登录成功了但网关看不到账号"。
+		QoderAuthDir string `json:"qoder_auth_dir"`
 	} `json:"pool"`
 
 	// Proxy 出站 HTTP 代理，形如 "http://127.0.0.1:7890"（缺省空 = 不用显式代理）。

@@ -111,10 +111,23 @@ export default function QoderPage() {
     setLoading(true);
     try {
       const res = await api.qoderListAccounts();
-      setRows(res.accounts);
-      setOrphans(res.orphanCredentials ?? []);
-      setSummary(res.summary);
-      setLoadError(null);
+      // 防御性取值：**后端可能比前端旧**（用户升级了界面但没重启网关服务），
+      // 此时接口会返回空对象而不是报错 —— 直接读 res.accounts.map 会抛
+      // "Cannot read properties of undefined"，整个 React 树崩掉 → 整页白屏。
+      //
+      // 白屏是最糟的失败形态：用户看不到任何原因，也无从判断是没账号还是坏了。
+      // 实测踩到：mock 对未知路由返回 {} 时，本页正是这样白屏的。
+      setRows(Array.isArray(res?.accounts) ? res.accounts : []);
+      setOrphans(Array.isArray(res?.orphanCredentials) ? res.orphanCredentials : []);
+      setSummary(res?.summary ?? null);
+      // 结构不对时给出可读提示（而不是静默显示"还没有账号"）
+      if (!res || !Array.isArray(res.accounts)) {
+        setLoadError(
+          "后端返回的数据结构不正确（缺少 accounts 字段）。可能是网关服务版本过旧，请重启或更新后重试。",
+        );
+      } else {
+        setLoadError(null);
+      }
     } catch (e) {
       // 明确报错而不是显示空列表：空列表会被误读成"还没有账号"
       setLoadError(e instanceof Error ? e.message : String(e));
@@ -389,10 +402,23 @@ export default function QoderPage() {
             ) : rows.length === 0 ? (
               <div className="rounded-lg border border-dashed px-6 py-10 text-center">
                 <QoderMark size={28} className="mx-auto mb-3 opacity-60" />
-                <p className="text-sm font-medium">还没有 Qoder 账号</p>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  点「登录新账号」用浏览器授权，或「导入凭证」使用已有文件。
-                </p>
+                {/* 读取失败时**不显示**"还没有账号" —— 那会把"后端坏了/版本旧"
+                    误导成"我自己没加过账号"，用户会去反复点登录而不是查后端。 */}
+                {loadError ? (
+                  <>
+                    <p className="text-sm font-medium">无法读取账号列表</p>
+                    <p className="mt-1 text-sm text-muted-foreground">
+                      请按上方提示处理后重试；若问题持续，请检查网关服务是否在运行。
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-sm font-medium">还没有 Qoder 账号</p>
+                    <p className="mt-1 text-sm text-muted-foreground">
+                      点「登录新账号」用浏览器授权，或「导入凭证」使用已有文件。
+                    </p>
+                  </>
+                )}
               </div>
             ) : (
               <div className="overflow-x-auto">
