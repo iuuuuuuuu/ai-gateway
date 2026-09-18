@@ -88,6 +88,47 @@ func CredKey(credential string) string {
 	return "zcode-" + shortHash(strings.TrimSpace(credential))
 }
 
+// FileBaseName 该凭证对应的文件名（**不含目录**）。
+//
+// ## 为什么要这个方法而不是到处拼 `"zcode-" + uid`
+//
+// uid 本身已经带 `zcode-` 前缀（见 CredKey），再拼一次会得到
+// `zcode-zcode-xxx.json` —— 实测踩到过，文件名难看且容易让人以为
+// 有两个前缀层级。
+//
+// 统一在这里生成，保证"落盘"与"扫描"用同一个口径。
+func (c *Cred) FileBaseName() string {
+	uid := strings.TrimSpace(c.UID)
+	if uid == "" {
+		uid = CredKey(c.Credential)
+	}
+	// 已有前缀就不再重复加
+	if strings.HasPrefix(uid, "zcode-") {
+		return sanitizeFileName(uid) + ".json"
+	}
+	return "zcode-" + sanitizeFileName(uid) + ".json"
+}
+
+// sanitizeFileName 把任意字符串变成安全的文件名片段（防路径穿越）。
+//
+// 安全项：uid 可能是从凭证派生的，也可能来自用户手写的文件 ——
+// 直接拼进路径的话，异常的 uid（如 "../../etc/passwd"）会写到目录外。
+func sanitizeFileName(s string) string {
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			out = append(out, r)
+		default:
+			out = append(out, '_')
+		}
+	}
+	if len(out) == 0 {
+		return "unknown"
+	}
+	return string(out)
+}
+
 // shortHash 对字符串做稳定短哈希（FNV-1a 64 位，取 12 位十六进制）。
 //
 // 为什么不用 crypto/sha256：这里**不需要密码学强度**（不是防碰撞攻击，

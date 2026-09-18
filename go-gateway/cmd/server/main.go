@@ -24,6 +24,7 @@ import (
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 	"workbuddy2api/internal/usage"
+	"workbuddy2api/internal/zcode"
 )
 
 // qoderAuthOf 把 Qoder 凭证转成账号池用的 auth.Auth。
@@ -71,6 +72,14 @@ func main() {
 		// 这样宿主不传 --auth-dir 时也能落到正确位置。
 		defaultAuthDir := qoder.DefaultAuthDir()
 		os.Exit(qoder.RunLoginCLI(os.Args[2:], defaultAuthDir))
+	}
+	// ZCode 的登录子命令（同上的理由）。
+	//
+	// 与 Qoder 的差异：ZCode 的凭证是**用户可复制的字符串**，
+	// 故 `zcode-login import` 是主路径，OAuth 是备选。
+	if len(os.Args) > 1 && os.Args[1] == "zcode-login" {
+		defaultAuthDir := zcode.DefaultAuthDir()
+		os.Exit(zcode.RunLoginCLI(os.Args[2:], defaultAuthDir))
 	}
 
 	cfgPath := flag.String("config", "config.json", "path to config json")
