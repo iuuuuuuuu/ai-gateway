@@ -170,6 +170,21 @@ pub fn upsert_account(uid: &str, patch: &Value) -> Result<ZcodeAccount, String> 
         list.push(acc.clone());
     }
     save_accounts(&list)?;
+
+    // 「停止接流量」必须**同时写进凭证文件** —— 网关只扫 auths/，
+    // 不读本文件。漏了这一步，界面上的开关就是个摆设（实测确认过）。
+    if patch.get("disabled").and_then(Value::as_bool).is_some() {
+        // 同步失败**不阻断**元信息保存：账号库已经存好了，
+        // 而凭证文件可能因为用户手工删过而不存在（那不是错误）。
+        // 但要**如实告知** —— 静默失败会让开关看起来生效了而实际没有。
+        if let Err(e) = sync_no_route_to_credential(uid, acc.disabled) {
+            return Err(format!(
+                "账号信息已保存，但「停止接流量」标记未能写入凭证文件（{e}）。\
+                 网关可能仍会把请求路由到这个账号。"
+            ));
+        }
+    }
+
     Ok(acc)
 }
 
@@ -325,6 +340,74 @@ pub fn list_with_credentials() -> Result<Value, String> {
     }))
 }
 
+/// 更新账号时，把「用户手动禁用」**写进凭证文件**（`account.no_route`）。
+///
+/// ## 为什么必须下发到凭证文件
+///
+/// 网关的账号池是**扫描凭证目录**（`auths/`）建立的，而宿主的
+/// `accounts.json` 网关**根本不读**。于是界面上的「停止接流量」开关
+/// 只改了宿主自己的库 —— 网关完全不知道，那个账号照常接流量。
+///
+/// 这与 WorkBuddy 用的是同一个机制（见 `gateway.rs` 的
+/// `account.no_route` 注释），复用它可以避免第二套语义。
+///
+/// 标记名用 `no_route` 而不是 `disabled`：网关自己也有一组 disabled
+///（session 死 / 额度冻结），两者语义不同，混用会出问题。
+///
+/// ## 幂等
+///
+/// 启用时**删掉**这个键（而不是写 `false`）—— 与 WorkBuddy 侧一致，
+/// 也让"启用账号的凭证文件里没有这个键"成为可断言的事实。
+pub fn sync_no_route_to_credential(uid: &str, disabled: bool) -> Result<bool, String> {
+    let path = auth_dir().join(cred_file_name(uid));
+    if !path.exists() {
+        // 凭证不存在（用户只加了元信息）—— 不是错误，没什么可同步的
+        return Ok(false);
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取凭证失败: {e}"))?;
+    let mut doc: Value = serde_json::from_str(&raw).map_err(|e| format!("凭证格式错误: {e}"))?;
+
+    let account = doc
+        .as_object_mut()
+        .ok_or_else(|| "凭证顶层不是对象".to_string())?
+        .entry("account")
+        .or_insert_with(|| json!({}));
+    let account = account
+        .as_object_mut()
+        .ok_or_else(|| "凭证的 account 不是对象".to_string())?;
+
+    if disabled {
+        account.insert("no_route".to_string(), json!(true));
+    } else {
+        account.remove("no_route");
+    }
+    // uid 一并写入：Go 侧优先读 uid 字段，缺了会回退到文件名派生
+    account
+        .entry("uid".to_string())
+        .or_insert_with(|| json!(uid.trim()));
+
+    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("写入凭证失败: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("提交凭证失败: {e}"))?;
+    Ok(true)
+}
+
+/// 从凭证文件里读 `no_route` 标记（供界面显示上与网关对齐）。
+pub fn credential_no_route(uid: &str) -> bool {
+    let path = auth_dir().join(cred_file_name(uid));
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    doc.get("account")
+        .and_then(|a| a.get("no_route"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // 小工具
 // ---------------------------------------------------------------------------
@@ -423,5 +506,63 @@ mod tests {
         for k in ["uid", "nickname", "note", "provider", "disabled", "credits", "creditsTotal"] {
             assert!(v.get(k).is_some(), "视图缺少字段 {k}");
         }
+    }
+
+    // 「停止接流量」开关必须**写进凭证文件**（`account.no_route`）。
+    //
+    // ## 为什么必须锁住这一条
+    //
+    // 网关的账号池是**扫描凭证目录**（auths/）建立的，宿主的 accounts.json
+    // 网关**根本不读**。故只改账号库的话，界面上的开关是个**摆设** ——
+    // 用户以为停掉了，网关照常把请求路由过去。
+    //
+    // 这与 WorkBuddy 用同一个机制（`account.no_route`），复用可避免第二套语义。
+    #[test]
+    fn disabled_flag_is_written_to_credential_file() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("zcode-noroute");
+        ensure_dirs().unwrap();
+
+        let uid = "zcode-noroute-test01";
+        let cred_path = auth_dir().join(cred_file_name(uid));
+        std::fs::write(
+            &cred_path,
+            serde_json::to_string_pretty(&json!({
+                "uid": uid, "provider": "zai", "credential": "k.s"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // ① 禁用 → 凭证文件里出现 no_route
+        sync_no_route_to_credential(uid, true).unwrap();
+        assert!(
+            credential_no_route(uid),
+            "禁用后凭证文件里必须有 account.no_route —— \
+             否则网关看不到这个标记，账号照常接流量"
+        );
+
+        // ② 启用 → 标记被**删除**（而不是写成 false）
+        sync_no_route_to_credential(uid, false).unwrap();
+        assert!(
+            !credential_no_route(uid),
+            "取消禁用后标记必须清除，否则该账号永远不会被选号"
+        );
+        let raw = std::fs::read_to_string(&cred_path).unwrap();
+        let doc: Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            doc.get("account")
+                .and_then(|a| a.get("no_route"))
+                .is_none(),
+            "启用时应**删除**该键，而不是写 false（保持与 WorkBuddy 一致，\
+             也让「启用账号没有这个键」成为可断言的事实）"
+        );
+
+        // ③ 凭证不存在时**不报错**（用户只加了元信息是正常情况）
+        assert!(
+            sync_no_route_to_credential("zcode-nonexistent", true).is_ok(),
+            "凭证文件不存在时不该报错 —— 那是「只加了元信息」的正常状态"
+        );
+
+        let _ = std::fs::remove_file(&cred_path);
     }
 }

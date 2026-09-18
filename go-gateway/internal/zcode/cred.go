@@ -57,6 +57,19 @@ type Cred struct {
 	// Provider 服务商（"zai" / "bigmodel"）。
 	Provider Provider
 
+	// NoRoute 用户手动禁用：**只不接流量**。
+	//
+	// 由宿主的账号页「停止接流量」开关写入凭证文件的 `account.no_route`。
+	//
+	// 为什么用凭证文件传递而不是宿主的账号库：网关的池是**扫描
+	// auths/ 目录**建立的，它根本不读宿主的 accounts.json。若只改账号库，
+	// 界面上的开关就是个摆设 —— 网关照常把请求路由到这个账号。
+	//
+	// 命名与 WorkBuddy 侧一致（`no_route`），刻意不用 `disabled`：
+	// 池自己也有一组 disabled（session 死 / 额度冻结），两者语义不同，
+	// 混用会让「禁用即停养号」那个 bug 复现。
+	NoRoute bool
+
 	// JWT start-plan 令牌（OAuth 登录时上游一并返回）。
 	//
 	// 用途：**额度查询**用它（不是 Credential）。参考实现明确写了这一点。
@@ -284,6 +297,13 @@ func parseBytes(raw []byte, path string) (*Cred, error) {
 	c.JWT = firstNonEmpty(rawStr(doc, "jwt"), rawStr(doc, "token"))
 	c.JWTIssuedAt = rawInt(doc, "jwt_issued_at")
 	c.Provider = ParseProvider(firstNonEmpty(rawStr(doc, "provider"), rawStr(doc, "vendor")))
+
+	// 用户手动禁用（宿主写入的 `account.no_route`）。
+	//
+	// 两个位置都读：宿主的 `account` 段（与 WorkBuddy 一致）与顶层
+	//（手写凭证文件时用户可能直接写在顶层，不接受它会让禁用静默失效）。
+	c.NoRoute = rawBool(doc, "no_route") || rawBoolAt(doc, "account", "no_route")
+
 	return c, nil
 }
 
@@ -308,22 +328,50 @@ func LoadDir(dir string) (creds []*Cred, failed []string, err error) {
 }
 
 // SaveAtomic 原子写回凭证（导入或用户改昵称后调用）。
+//
+// ## ⚠ 必须保留宿主写入的 `account.no_route`
+//
+// 这个标记是**宿主**写的（账号页的「停止接流量」开关），而 SaveAtomic 是
+// **网关**写的。若这里整体覆盖，网关的任何一次写回都会把用户的禁用标记
+// **悄悄抹掉** —— 那个账号会重新开始接流量，而用户以为它还停着。
+//
+// 保留策略：**从磁盘读回再合并**，而不是只用内存里的字段重建。
+// 这样宿主后来加的字段（我们还不认识的）也不会被丢掉。
 func (c *Cred) SaveAtomic() error {
 	if c.FilePath == "" {
 		return fmt.Errorf("凭证没有来源路径，无法写回")
 	}
-	doc := map[string]any{
-		"uid":      c.UID,
-		"nickname": c.Nickname,
-		"provider": string(c.Provider),
-		"credential": c.Credential,
+
+	// 先读回现有内容（可能不存在 —— 那是新建，正常）
+	doc := map[string]any{}
+	if raw, err := os.ReadFile(c.FilePath); err == nil {
+		_ = json.Unmarshal(raw, &doc)
 	}
+
+	doc["uid"] = c.UID
+	doc["nickname"] = c.Nickname
+	doc["provider"] = string(c.Provider)
+	doc["credential"] = c.Credential
 	if c.JWT != "" {
 		doc["jwt"] = c.JWT
 	}
 	if c.JWTIssuedAt > 0 {
 		doc["jwt_issued_at"] = c.JWTIssuedAt
 	}
+
+	// 保留禁用标记（见上面的说明）。
+	//
+	// 用**读回的值**而不是 c.NoRoute：c.NoRoute 是上次加载时读到的，
+	// 期间用户在界面上可能改过 —— 磁盘上的才是最新的。
+	if existing := readNoRoute(doc); existing {
+		acc, _ := doc["account"].(map[string]any)
+		if acc == nil {
+			acc = map[string]any{}
+		}
+		acc["no_route"] = true
+		doc["account"] = acc
+	}
+
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
@@ -370,6 +418,44 @@ func rawStr(m map[string]json.RawMessage, key string) string {
 		return ""
 	}
 	return strings.TrimSpace(s)
+}
+
+// readNoRoute 从已解析的文档里读禁用标记（`account.no_route` 或顶层）。
+func readNoRoute(doc map[string]any) bool {
+	if b, ok := doc["no_route"].(bool); ok && b {
+		return true
+	}
+	if acc, ok := doc["account"].(map[string]any); ok {
+		if b, ok := acc["no_route"].(bool); ok && b {
+			return true
+		}
+	}
+	return false
+}
+
+// rawBool 读一个布尔字段（缺失或类型不符都返回 false）。
+// 缺失返回 false 而不是报错：三态语义里「未声明」等价于「不禁用」——
+// 若报错，历史凭证文件（没有这个键）会全部解析失败。
+func rawBool(m map[string]json.RawMessage, key string) bool {
+	raw, ok := m[key]
+	if !ok {
+		return false
+	}
+	var b bool
+	return json.Unmarshal(raw, &b) == nil && b
+}
+
+// rawBoolAt 读嵌套对象里的布尔字段（如 `account.no_route`）。
+func rawBoolAt(m map[string]json.RawMessage, outer, key string) bool {
+	raw, ok := m[outer]
+	if !ok {
+		return false
+	}
+	var nested map[string]json.RawMessage
+	if json.Unmarshal(raw, &nested) != nil {
+		return false
+	}
+	return rawBool(nested, key)
 }
 
 func rawInt(m map[string]json.RawMessage, key string) int64 {
