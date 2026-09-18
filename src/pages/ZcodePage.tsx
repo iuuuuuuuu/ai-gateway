@@ -536,6 +536,9 @@ export default function ZcodePage() {
                                   <Button
                                     variant="ghost"
                                     size="icon"
+                                    // 图标按钮**必须**有可访问名：Tooltip 的内容要悬停
+                                    // 才进 DOM，屏幕阅读器（与自动化测试）都拿不到。
+                                    aria-label={`编辑备注：${row.nickname || row.uid}`}
                                     onClick={() => {
                                       setEditTarget(row);
                                       setEditNote(row.note);
@@ -552,6 +555,7 @@ export default function ZcodePage() {
                                     variant="ghost"
                                     size="icon"
                                     disabled={busy === row.uid}
+                                    aria-label={`${row.disabled ? "恢复参与路由" : "停止接流量"}：${row.nickname || row.uid}`}
                                     onClick={() => void toggleDisabled(row)}
                                   >
                                     {row.disabled ? (
@@ -569,6 +573,7 @@ export default function ZcodePage() {
                                     variant="ghost"
                                     size="icon"
                                     disabled={busy === row.uid}
+                                    aria-label={`删除账号：${row.nickname || row.uid}`}
                                     onClick={() => void remove(row)}
                                   >
                                     <Trash2 className="h-4 w-4 text-destructive" />
