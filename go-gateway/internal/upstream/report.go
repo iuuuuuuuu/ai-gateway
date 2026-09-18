@@ -117,6 +117,11 @@ func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID stri
 // 事件带上它才会被归到该活动；不带则**不计分**（上游实测）。
 const SchoolSeasonActivityID = "school_open_day_2026"
 
+// 校园日任务的集成本源于 Sliverkiss/workbuddy2api 的 e45f39f（MIT）：
+// 该 commit 首次指出「school_season 是小程序专属下发的任务、判据为
+// mini chat_request_send + activityId」，本仓库据此在 Go 侧重新实现并实测校准。
+// 本文件的事件形状、activityId、以及下面的 UA 结论均由本项目独立实测确认。
+
 // miniChatRequestEvent 小程序（微信容器）指纹的 chat_request_send 事件。
 //
 // 与桌面版 chatRequestEvent 的差异（都来自实测的上游小程序客户端形状）：

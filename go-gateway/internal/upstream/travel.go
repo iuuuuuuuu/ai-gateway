@@ -75,6 +75,10 @@ func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.R
 // `Go-http-client/1.1` —— 上游把这个 UA 当作未知平台，于是把「小程序限定」的
 // 两个任务（school_season、Sequential_Tasks_1）过滤掉：只返回 18 项。
 //
+// 「上游按 UA 裁剪任务清单」这条线索最初来自 Sliverkiss/workbuddy2api 的
+// e45f39f（MIT）；但下面的逐 UA 对照、以及「不发 UA 才拿到完整 20 项」这一
+// 结论，是本项目用真实账号独立实测得出的（该 commit 并未涉及此现象）。
+//
 // 实测对照（同一账号、同一端点，唯一变量是 UA）：
 //
 //	Go-http-client/1.1（默认）→ 18 项，无小程序任务
