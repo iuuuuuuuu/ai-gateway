@@ -47,6 +47,12 @@ func qoderAuthOf(cr *qoder.Cred) *auth.Auth {
 		Domain:   cr.Region.Domain(),
 		FilePath: cr.FilePath,
 		Product:  auth.ProductQoder,
+		// 用户手动禁用（宿主账号页的「停止接流量」开关，写在凭证文件里）。
+		//
+		// ⚠ 必须传下去：池的 `healthy()` 会因它排除该账号。漏掉的话，
+		// 界面上的开关**完全不生效** —— 网关照常把请求路由到它
+		//（ZCode 侧实测确认过同样的缺陷）。
+		NoRoute: cr.NoRoute,
 	}
 }
 

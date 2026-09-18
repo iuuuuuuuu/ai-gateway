@@ -181,7 +181,94 @@ pub fn upsert_account(uid: &str, patch: &Value) -> Result<QoderAccount, String> 
         list.push(acc.clone());
     }
     save_accounts(&list)?;
+
+    // 「停止接流量」必须**同时写进凭证文件** —— 网关只扫 auths/，
+    // 不读本文件。漏了这一步，界面上的开关就是个摆设（ZCode 侧实测确认过，
+    // 详见 zcode_account::sync_no_route_to_credential 的注释）。
+    if patch.get("disabled").and_then(Value::as_bool).is_some() {
+        // 同步失败**不阻断**元信息保存（账号库已存好），但**如实告知** ——
+        // 静默失败会让开关看起来生效了而实际没有。
+        if let Err(e) = sync_no_route_to_credential(uid, acc.disabled) {
+            return Err(format!(
+                "账号信息已保存，但「停止接流量」标记未能写入凭证文件（{e}）。\
+                 网关可能仍会把请求路由到这个账号。"
+            ));
+        }
+    }
+
     Ok(acc)
+}
+
+/// 把「用户手动禁用」写进 Qoder 凭证文件（`account.no_route`）。
+///
+/// ## 为什么必须下发到凭证文件
+///
+/// 网关的账号池是**扫描凭证目录**（`auths/`）建立的，而宿主的
+/// `accounts.json` 网关**根本不读**。只改账号库的话，界面上的
+/// 「停止接流量」开关完全无效 —— 网关照常把请求路由到那个账号。
+///
+/// 与 WorkBuddy / ZCode 同一个机制（`account.no_route`），复用可避免第二套语义。
+///
+/// ## 幂等
+///
+/// 启用时**删除**该键（而不是写 `false`）—— 与另两个产品一致。
+pub fn sync_no_route_to_credential(uid: &str, disabled: bool) -> Result<bool, String> {
+    let path = auth_dir().join(cred_file_name(uid));
+    if !path.exists() {
+        // 凭证不存在（用户只加了元信息）—— 不是错误，没什么可同步的
+        return Ok(false);
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取凭证失败: {e}"))?;
+    let mut doc: Value = serde_json::from_str(&raw).map_err(|e| format!("凭证格式错误: {e}"))?;
+
+    let account = doc
+        .as_object_mut()
+        .ok_or_else(|| "凭证顶层不是对象".to_string())?
+        .entry("account")
+        .or_insert_with(|| json!({}));
+    let account = account
+        .as_object_mut()
+        .ok_or_else(|| "凭证的 account 不是对象".to_string())?;
+
+    if disabled {
+        account.insert("no_route".to_string(), json!(true));
+    } else {
+        account.remove("no_route");
+    }
+    account
+        .entry("uid".to_string())
+        .or_insert_with(|| json!(uid.trim()));
+
+    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("写入凭证失败: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("提交凭证失败: {e}"))?;
+    Ok(true)
+}
+
+/// 从凭证文件里读 `no_route` 标记。
+pub fn credential_no_route(uid: &str) -> bool {
+    let path = auth_dir().join(cred_file_name(uid));
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    doc.get("account")
+        .and_then(|a| a.get("no_route"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Qoder 凭证文件名（与 Go 侧口径一致）。
+pub fn cred_file_name(uid: &str) -> String {
+    let uid = uid.trim();
+    if uid.starts_with("qoder-") {
+        format!("{}.json", sanitize_uid(uid))
+    } else {
+        format!("qoder-{}.json", sanitize_uid(uid))
+    }
 }
 
 /// 把 patch 里的字段应用到账号上（只覆盖 patch 里**存在**的键）。
@@ -444,5 +531,63 @@ mod tests {
         for k in ["uid", "nickname", "note", "region", "disabled", "credits", "creditsTotal"] {
             assert!(v.get(k).is_some(), "视图缺少字段 {k}");
         }
+    }
+
+    // 「停止接流量」开关必须**写进凭证文件**（`account.no_route`）。
+    //
+    // 网关的池是**扫描凭证目录**建立的，宿主的 accounts.json 它**不读**。
+    // 只改账号库的话，界面上的开关是个**摆设**（ZCode 侧实测确认过）。
+    #[test]
+    fn disabled_flag_is_written_to_credential_file() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("qoder-noroute");
+        ensure_dirs().unwrap();
+
+        let uid = "qoder-noroute-test01";
+        let path = auth_dir().join(cred_file_name(uid));
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "auth": {"accessToken":"dt","refreshToken":"drt","expiresAt":1,"domain":"qoder.com.cn"},
+                "account": {"uid": uid, "nickname": "n"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // ① 禁用 → 出现 no_route
+        sync_no_route_to_credential(uid, true).unwrap();
+        assert!(
+            credential_no_route(uid),
+            "禁用后凭证文件里必须有 account.no_route —— 否则网关看不到，账号照常接流量"
+        );
+        // 与 auth 段并存（不能把令牌覆盖掉）
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["auth"]["accessToken"], "dt", "写入标记不得动令牌");
+
+        // ② 启用 → 删除该键（而不是写 false）
+        sync_no_route_to_credential(uid, false).unwrap();
+        assert!(!credential_no_route(uid), "取消禁用后标记必须清除");
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            doc.get("account").and_then(|a| a.get("no_route")).is_none(),
+            "启用时应**删除**该键，而不是写 false"
+        );
+
+        // ③ 凭证不存在时不报错
+        assert!(
+            sync_no_route_to_credential("qoder-nonexistent", true).is_ok(),
+            "凭证文件不存在时不该报错 —— 那是「只加了元信息」的正常状态"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cred_file_name_matches_go_side() {
+        // uid 已带 qoder- 前缀时不能再拼一次（否则文件名会是 qoder-qoder-xxx.json）
+        assert_eq!(cred_file_name("qoder-abc123"), "qoder-abc123.json");
+        assert_eq!(cred_file_name("abc123"), "qoder-abc123.json");
     }
 }
