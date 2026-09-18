@@ -38,6 +38,11 @@ pub mod qoder_account;
 // Qoder 登录编排：调 `gateway qoder-login url|poll` 两个子命令。
 // 协议实现（COSY 签名 / PKCE 设备流）只在 Go 侧有一份，经真实上游验证。
 pub mod qoder_login;
+// ZCode（Z.AI / 智谱 GLM 编码套餐）：账号库 + 登录编排。
+// 凭证由 Go 侧 internal/zcode 管理；与 Qoder 的差异是**服务商**而非区域，
+// 且凭证是用户可复制的字符串（故"导入"是主路径）。
+pub mod zcode_account;
+pub mod zcode_login;
 pub mod refresh;
 pub mod rotate;
 // Windows 计划任务（Trae 签到 / 豆包保活 / 额度巡检）

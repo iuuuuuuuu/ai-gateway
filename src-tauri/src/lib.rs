@@ -314,6 +314,17 @@ pub fn run() {
             commands_apps::qoder_login_poll,
             commands_apps::qoder_import_credentials,
             commands_apps::qoder_summary,
+            // ---- ZCode（Z.AI / 智谱）：账号元信息 + 凭证导入 + 登录编排 ----
+            // 与 Qoder 的差异：ZCode 凭证是用户可复制的字符串，
+            // 故 import_credential 是主路径
+            commands_apps::zcode_list_accounts,
+            commands_apps::zcode_save_account,
+            commands_apps::zcode_delete_account,
+            commands_apps::zcode_summary,
+            commands_apps::zcode_import_credential,
+            commands_apps::zcode_import_from_dir,
+            commands_apps::zcode_login_start,
+            commands_apps::zcode_login_poll,
             // ---- 本地 MITM 代理（设备身份隔离 + 凭证抓取） ----
             commands_proxy::proxy_config,
             commands_proxy::proxy_status,

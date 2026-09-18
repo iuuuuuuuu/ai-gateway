@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
-import { ArrowUp, Bot, Braces, MessageCircle, MessagesSquare, Server, Settings, Sparkles, Terminal, User } from "lucide-react";
+import { ArrowUp, Bot, Braces, MessageCircle, MessagesSquare, Server, Settings, Sparkles, Terminal, User, Zap } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
@@ -14,6 +14,7 @@ import SettingsPage from "@/pages/SettingsPage";
 import TraePage from "@/pages/TraePage";
 import DoubaoPage from "@/pages/DoubaoPage";
 import QoderPage from "@/pages/QoderPage";
+import ZcodePage from "@/pages/ZcodePage";
 import { StatusDot, AppIconMark } from "@/components/product-marks";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { Badge } from "@/components/ui/badge";
@@ -169,6 +170,24 @@ function Layout() {
             <Braces className="size-4" />
             Qoder 账号
           </NavLink>
+          {/* ZCode 账号：第三个「XX账号」入口（Z.AI / 智谱 GLM 编码套餐）。
+              路由独立（/zcode），账号库与凭证也独立 —— 各产品互不干扰。
+              与 Qoder 的区别：ZCode 的凭证是用户可复制的字符串，
+              故页面上「粘贴凭证」是主路径而不是浏览器授权。 */}
+          <NavLink
+            to="/zcode"
+            className={({ isActive }) =>
+              cn(
+                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+                isActive
+                  ? "bg-foreground/[0.06] font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+              )
+            }
+          >
+            <Zap className="size-4" />
+            ZCode 账号
+          </NavLink>
           <NavLink to="/token-stats" className={({ isActive }) => cn("flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors", isActive ? "bg-foreground/[0.06] font-medium text-foreground" : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground")}><MessagesSquare className="size-4" />Token 统计</NavLink>
           <NavLink
             to="/credit-stats"
@@ -279,6 +298,7 @@ export default function App() {
           <Route element={<Layout />}>
             <Route path="/" element={<AccountsPage />} />
             <Route path="/qoder" element={<QoderPage />} />
+            <Route path="/zcode" element={<ZcodePage />} />
             <Route path="/credit-stats" element={<CreditStatsPage />} />
             <Route path="/token-stats" element={<TokenStatsPage />} />
             <Route path="/gateway" element={<GatewayPage />} />

@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use ai_gateway_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits, export_import,
     oauth, process, qoder_account, qoder_login, refresh, rotate, session, switch, token_stats, travel, update,
+    zcode_account, zcode_login,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
@@ -155,6 +156,16 @@ pub fn router() -> Router {
         .route("/api/qoder/login/start", post(api_qoder_login_start))
         .route("/api/qoder/login/poll", post(api_qoder_login_poll))
         .route("/api/qoder/import", post(api_qoder_import))
+        // ---- ZCode（Z.AI / 智谱）----
+        // 与 Qoder 的差异：凭证是用户可复制的字符串，故导入是主路径。
+        .route("/api/zcode/accounts", get(api_zcode_list_accounts))
+        .route("/api/zcode/accounts/save", post(api_zcode_save_account))
+        .route("/api/zcode/accounts/delete", post(api_zcode_delete_account))
+        .route("/api/zcode/summary", get(api_zcode_summary))
+        .route("/api/zcode/import-credential", post(api_zcode_import_credential))
+        .route("/api/zcode/import-dir", post(api_zcode_import_dir))
+        .route("/api/zcode/login/start", post(api_zcode_login_start))
+        .route("/api/zcode/login/poll", post(api_zcode_login_poll))
         .fallback(static_handler)
 }
 
@@ -316,6 +327,122 @@ async fn api_qoder_import(Json(body): Json<Value>) -> Response {
         Ok(Ok(v)) => json_ok(v),
         Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
         Err(e) => json_err(format!("导入 Qoder 凭证失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ZCode（Z.AI / 智谱）
+// ---------------------------------------------------------------------------
+//
+// 与 Tauri 命令层一一对应（commands_apps.rs 的 zcode_* 系列）。
+// 两者都只做编排：协议实现（OAuth 流程 / 凭证兑换）在 Go 侧 internal/zcode。
+//
+// 为什么 HTTP 形态也要有：dev 模式（浏览器预览）走的是 HTTP，
+// 缺这些路由会让 ZCode 页在 dev 下整页 404 —— 而 dev 正是迭代最快的路径。
+
+/// GET /api/zcode/accounts
+async fn api_zcode_list_accounts() -> Response {
+    match tokio::task::spawn_blocking(zcode_account::list_with_credentials).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("读取 ZCode 账号失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// GET /api/zcode/summary
+async fn api_zcode_summary() -> Response {
+    match tokio::task::spawn_blocking(|| zcode_account::summary()).await {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(format!("读取 ZCode 概览失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/zcode/accounts/save —— body: `{ "uid": "...", "patch": {...} }`
+async fn api_zcode_save_account(Json(body): Json<Value>) -> Response {
+    let uid = body
+        .get("uid")
+        .or_else(|| body.get("userId"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if uid.trim().is_empty() {
+        return json_err("缺少账号 uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let patch = body.get("patch").cloned().unwrap_or_else(|| json!({}));
+    match tokio::task::spawn_blocking(move || zcode_account::upsert_account(&uid, &patch)).await {
+        Ok(Ok(acc)) => json_ok(json!({ "ok": true, "account": acc.to_view() })),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("保存 ZCode 账号失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/zcode/accounts/delete —— body: `{ "uid": "..." }`
+async fn api_zcode_delete_account(Json(body): Json<Value>) -> Response {
+    let uid = body
+        .get("uid")
+        .or_else(|| body.get("userId"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if uid.trim().is_empty() {
+        return json_err("缺少账号 uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+    match tokio::task::spawn_blocking(move || zcode_account::delete_account(&uid)).await {
+        Ok(Ok(removed)) => json_ok(json!({ "ok": removed })),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("删除 ZCode 账号失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/zcode/import-credential
+/// body: `{ "credential": "...", "provider": "zai", "nickname": "..." }`
+async fn api_zcode_import_credential(Json(body): Json<Value>) -> Response {
+    let credential = body.get("credential").and_then(Value::as_str).unwrap_or("").to_string();
+    let provider = body.get("provider").and_then(Value::as_str).unwrap_or("").to_string();
+    let nickname = body.get("nickname").and_then(Value::as_str).unwrap_or("").to_string();
+    match tokio::task::spawn_blocking(move || {
+        zcode_login::import_credential(&credential, &provider, &nickname)
+    })
+    .await
+    {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("导入 ZCode 凭证失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/zcode/import-dir —— body: `{ "path": "..." }`
+async fn api_zcode_import_dir(Json(body): Json<Value>) -> Response {
+    let path = body.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+    match tokio::task::spawn_blocking(move || zcode_login::import_from_dir(&path)).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("批量导入 ZCode 凭证失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/zcode/login/start —— body: `{ "provider": "zai" | "bigmodel" }`
+async fn api_zcode_login_start(Json(body): Json<Value>) -> Response {
+    let provider = body.get("provider").and_then(Value::as_str).unwrap_or("").to_string();
+    match tokio::task::spawn_blocking(move || zcode_login::login_start(&provider)).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("发起 ZCode 登录失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/zcode/login/poll —— body: `{ "sessionId": "..." }`
+async fn api_zcode_login_poll(Json(body): Json<Value>) -> Response {
+    let sid = body
+        .get("sessionId")
+        .or_else(|| body.get("session_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    match tokio::task::spawn_blocking(move || zcode_login::login_poll(&sid)).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("轮询 ZCode 登录失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 

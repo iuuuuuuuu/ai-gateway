@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 use ai_gateway_core::modules::{
     app_profile::{profile_for, TargetApp},
     config, doubao_account, doubao_chats, doubao_quota, doubao_session, qoder_account, qoder_login,
-    scheduler, switcher, trae_account, trae_checkin, trae_device, trae_discover,
+    scheduler, switcher, trae_account, trae_checkin, trae_device, trae_discover, zcode_account,
+    zcode_login,
 };
 
 // ---------------------------------------------------------------------------
@@ -937,4 +938,89 @@ pub async fn qoder_summary() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(|| Ok(qoder_account::summary()))
         .await
         .map_err(|e| format!("读取 Qoder 概览失败: {e}"))?
+}
+
+// ---------------------------------------------------------------------------
+// ZCode（Z.AI / 智谱 GLM 编码套餐）
+// ---------------------------------------------------------------------------
+//
+// 与 Qoder 的差异：ZCode 的凭证是**用户可复制的字符串**，
+// 故 `zcode_import_credential` 是主路径，OAuth 是备选。
+
+/// ZCode 账号列表（含凭证存在性）。
+#[tauri::command]
+pub async fn zcode_list_accounts() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(zcode_account::list_with_credentials)
+        .await
+        .map_err(|e| format!("读取 ZCode 账号失败: {e}"))?
+}
+
+/// 新增/更新 ZCode 账号（局部更新）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn zcode_save_account(uid: String, patch: Value) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let acc = zcode_account::upsert_account(&uid, &patch)?;
+        Ok(json!({ "ok": true, "account": acc.to_view() }))
+    })
+    .await
+    .map_err(|e| format!("保存 ZCode 账号失败: {e}"))?
+}
+
+/// 删除 ZCode 账号（连同凭证文件）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn zcode_delete_account(uid: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let removed = zcode_account::delete_account(&uid)?;
+        Ok(json!({ "ok": removed }))
+    })
+    .await
+    .map_err(|e| format!("删除 ZCode 账号失败: {e}"))?
+}
+
+/// ZCode 账号库概览。
+#[tauri::command]
+pub async fn zcode_summary() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| Ok(zcode_account::summary()))
+        .await
+        .map_err(|e| format!("读取 ZCode 概览失败: {e}"))?
+}
+
+/// **导入凭证**（ZCode 的主路径）——用户粘贴 `{apiKey}.{secret}`。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn zcode_import_credential(
+    credential: String,
+    provider: Option<String>,
+    nickname: Option<String>,
+) -> Result<Value, String> {
+    let prov = provider.unwrap_or_default();
+    let nick = nickname.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        zcode_login::import_credential(&credential, &prov, &nick)
+    })
+    .await
+    .map_err(|e| format!("导入 ZCode 凭证失败: {e}"))?
+}
+
+/// 从目录批量导入凭证文件。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn zcode_import_from_dir(path: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || zcode_login::import_from_dir(&path))
+        .await
+        .map_err(|e| format!("批量导入 ZCode 凭证失败: {e}"))?
+}
+
+/// 发起 ZCode 登录（OAuth 设备流，备选路径）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn zcode_login_start(provider: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || zcode_login::login_start(&provider))
+        .await
+        .map_err(|e| format!("发起 ZCode 登录失败: {e}"))?
+}
+
+/// 轮询一次 ZCode 登录结果。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn zcode_login_poll(session_id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || zcode_login::login_poll(&session_id))
+        .await
+        .map_err(|e| format!("轮询 ZCode 登录失败: {e}"))?
 }

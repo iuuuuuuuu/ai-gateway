@@ -189,3 +189,38 @@ export function QoderMark({ size = 32, className }: MarkProps) {
     </span>
   );
 }
+
+/**
+ * ZCode 图标。
+ *
+ * 用「闪电 + 折线」表达「编码加速」，与 ZCode 的定位（GLM 编码套餐代理）一致。
+ * 配色用青绿→翠绿渐变，与同排的 WorkBuddy（蓝）、Qoder（紫）、Trae（深灰）、
+ * 豆包（蓝紫）都能一眼区分 —— 多个产品图标并列时靠**色相**而非细节区分，
+ * 小尺寸下更可靠。
+ *
+ * 与 QoderMark 同样的理由**不**抓官方 logo：本仓库是公开仓库，
+ * 引入第三方商标资源有授权问题；自绘也更符合现有各 mark 的一致风格。
+ */
+export function ZcodeMark({ size = 32, className }: MarkProps) {
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        "inline-flex shrink-0 items-center justify-center rounded-[22%] bg-gradient-to-br from-teal-400 to-emerald-600 text-white shadow-sm",
+        className,
+      )}
+      style={{ width: size, height: size }}
+    >
+      <svg viewBox="0 0 24 24" fill="none" className="size-[62%]" aria-hidden="true">
+        {/* 闪电：表达"加速" */}
+        <path
+          d="M13.2 3.2 6.6 13h4.4l-.8 7.8 6.6-9.8h-4.4l.8-7.8Z"
+          stroke="currentColor"
+          strokeWidth="1.8"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+    </span>
+  );
+}

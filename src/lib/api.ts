@@ -234,6 +234,16 @@ const ROUTES: Record<string, Route> = {
   qoder_login_start: { method: "POST", path: "/api/qoder/login/start" },
   qoder_login_poll: { method: "POST", path: "/api/qoder/login/poll" },
   qoder_import_credentials: { method: "POST", path: "/api/qoder/import" },
+  // ---- ZCode（Z.AI / 智谱）----
+  // 与 Qoder 的差异：凭证是用户可复制的字符串，故导入是主路径。
+  zcode_list_accounts: { method: "GET", path: "/api/zcode/accounts" },
+  zcode_save_account: { method: "POST", path: "/api/zcode/accounts/save" },
+  zcode_delete_account: { method: "POST", path: "/api/zcode/accounts/delete" },
+  zcode_summary: { method: "GET", path: "/api/zcode/summary" },
+  zcode_import_credential: { method: "POST", path: "/api/zcode/import-credential" },
+  zcode_import_from_dir: { method: "POST", path: "/api/zcode/import-dir" },
+  zcode_login_start: { method: "POST", path: "/api/zcode/login/start" },
+  zcode_login_poll: { method: "POST", path: "/api/zcode/login/poll" },
 };
 
 function queryString(args?: Record<string, unknown>): string {
@@ -1299,6 +1309,127 @@ export interface QoderImportResult {
 
 export function qoderImportCredentials(path: string): Promise<QoderImportResult> {
   return call<QoderImportResult>("qoder_import_credentials", { path });
+}
+
+// ---------------------------------------------------------------------------
+// ZCode（Z.AI / 智谱 GLM 编码套餐）
+// ---------------------------------------------------------------------------
+
+/**
+ * ZCode 服务商。
+ *
+ * **注意这是"服务商"而不是"区域"** —— 与 Qoder 的国服/国际版不同，
+ * Z.AI 与智谱是两家不同公司，各有独立域名与凭证来源。
+ * 空串 = 未指定（不猜，让用户自己选）。
+ */
+export type ZcodeProvider = "zai" | "bigmodel" | "";
+
+/** ZCode 账号元信息。 */
+export interface ZcodeAccount {
+  uid: string;
+  nickname: string;
+  note: string;
+  provider: ZcodeProvider;
+  disabled: boolean;
+  createdAt: string;
+  lastSeenAt: string;
+  /**
+   * 剩余额度；0 = 未知。
+   *
+   * ⚠ ZCode 的额度查询需要 **JWT**（OAuth 登录时才有）。只导入了凭证的
+   * 账号查不到额度 —— 界面应显示"未知"而不是 0，因为 0 会被误读成"额度耗尽"。
+   */
+  credits: number;
+  creditsTotal: number;
+  /** 最近到期时刻（Unix 秒）；0 = 未知。 */
+  expireAt: number;
+}
+
+/** 列表项：账号 + 凭证是否存在。 */
+export interface ZcodeAccountRow extends ZcodeAccount {
+  hasCredential: boolean;
+}
+
+export interface ZcodeSummary {
+  total: number;
+  enabled: number;
+  disabled: number;
+  totalCredits: number;
+  authDir: string;
+  storeDir: string;
+}
+
+/** ZCode 账号列表。 */
+export function zcodeListAccounts(): Promise<{
+  accounts: ZcodeAccountRow[];
+  orphanCredentials: string[];
+  summary: ZcodeSummary;
+}> {
+  return call("zcode_list_accounts");
+}
+
+/** 新增/更新 ZCode 账号（局部更新）。 */
+export function zcodeSaveAccount(
+  uid: string,
+  patch: Partial<Pick<ZcodeAccount, "nickname" | "note" | "provider" | "disabled" | "credits" | "creditsTotal" | "expireAt">>,
+): Promise<{ ok: boolean; account: ZcodeAccount }> {
+  return call("zcode_save_account", { uid, patch });
+}
+
+/** 删除 ZCode 账号（连同凭证文件）。 */
+export function zcodeDeleteAccount(uid: string): Promise<{ ok: boolean }> {
+  return call("zcode_delete_account", { uid });
+}
+
+/** ZCode 账号库概览。 */
+export function zcodeSummary(): Promise<ZcodeSummary> {
+  return call("zcode_summary");
+}
+
+/**
+ * **导入凭证**（ZCode 的主路径）。
+ *
+ * 用户从控制台复制 `{apiKey}.{secret}` 粘贴进来。
+ */
+export function zcodeImportCredential(args: {
+  credential: string;
+  provider?: string;
+  nickname?: string;
+}): Promise<{ status: string; uid: string; provider: ZcodeProvider; account: ZcodeAccount }> {
+  return call("zcode_import_credential", {
+    credential: args.credential,
+    provider: args.provider ?? null,
+    nickname: args.nickname ?? null,
+  });
+}
+
+/** 从目录批量导入凭证文件。 */
+export interface ZcodeImportDirResult {
+  imported: Array<{ file: string; uid: string; provider: ZcodeProvider }>;
+  failed: Array<{ file: string; error: string }>;
+  importedCount: number;
+  failedCount: number;
+}
+
+export function zcodeImportFromDir(path: string): Promise<ZcodeImportDirResult> {
+  return call<ZcodeImportDirResult>("zcode_import_from_dir", { path });
+}
+
+/** 发起 ZCode 登录（OAuth 设备流，备选路径）。 */
+export function zcodeLoginStart(provider: Exclude<ZcodeProvider, "">): Promise<{
+  authUrl: string;
+  sessionId: string;
+  provider: ZcodeProvider;
+}> {
+  return call("zcode_login_start", { provider });
+}
+
+/** 轮询一次 ZCode 登录结果。 */
+export function zcodeLoginPoll(sessionId: string): Promise<
+  | { status: "pending" }
+  | { status: "ok"; uid: string; account: ZcodeAccount }
+> {
+  return call("zcode_login_poll", { sessionId });
 }
 
 /** 本机发现到的 Trae 账号候选。 */
