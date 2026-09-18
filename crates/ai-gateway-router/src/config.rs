@@ -64,6 +64,13 @@ pub struct Config {
     #[serde(rename = "session_sticky")]
     pub session_sticky: SessionStickyConfig,
 
+    /// 出站代理（空 = 不显式设置，回落环境变量）。
+    ///
+    /// 宿主（ai-gateway-core）会把它从「设置 → 更新代理」透传过来，用户无需配两遍。
+    /// 为什么网关需要它：国际版（workbuddy.ai）在国内直连不稳定，走代理才稳。
+    #[serde(default)]
+    pub proxy: String,
+
     /// normalize 后的解析值（不参与反序列化）。
     #[serde(skip)]
     pub parsed: ParsedConfig,
@@ -100,6 +107,7 @@ impl Default for Config {
             upstash: UpstashConfig::default(),
             pool: PoolConfig::default(),
             session_sticky: SessionStickyConfig::default(),
+            proxy: String::new(),
             parsed: ParsedConfig::default(),
         }
     }
@@ -233,6 +241,17 @@ pub struct PoolConfig {
     /// 积分到期巡检开关，缺省 true。
     #[serde(rename = "credit_refresh_enabled", default = "default_true")]
     pub credit_refresh_enabled: bool,
+    /// 「单一模型 + 积分轮转」模式开关；缺省 false = 负载均衡。
+    ///
+    /// 由宿主的**工作模式**推导（不读独立开关），避免「模式是轮转、
+    /// rotation 却是 false」这类不一致状态。
+    #[serde(default)]
+    pub rotation: bool,
+    /// 「单一模型」锁定；非空时网关只放行该模型。
+    ///
+    /// 只在轮转模式下有意义 —— 负载均衡不限制模型（保持原有行为）。
+    #[serde(rename = "allowed_model", default)]
+    pub allowed_model: String,
 }
 
 impl Default for PoolConfig {
@@ -246,6 +265,8 @@ impl Default for PoolConfig {
             idle_weight_max: 5.0,
             credit_refresh_interval: "15m".into(),
             credit_refresh_enabled: true,
+            rotation: false,
+            allowed_model: String::new(),
         }
     }
 }

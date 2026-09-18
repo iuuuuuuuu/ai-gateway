@@ -57,6 +57,8 @@ pub struct AppState {
     pub redis_mode: String,
     /// 「单一模型」锁定；非空时只放行该模型。
     pub allowed_model: String,
+    /// Token 用量统计（`/usage` 的数据来源）。
+    pub usage: Arc<crate::usage::Stats>,
 }
 
 /// 构建路由。
@@ -72,6 +74,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/messages", axum::routing::post(messages))
         .route("/v1/models", get(models))
         .route("/status", get(status))
+        .route("/usage", get(usage_report))
         .route("/healthz", get(healthz))
         .with_state(state)
 }
@@ -473,14 +476,11 @@ async fn chat_completions(
     match result {
         Some(crate::forward::ChatResult::Stream {
             uid,
+            model,
             response,
-            ..
-        }) => {
-            let resp = sse_response(response);
-            // 流式租约由读取任务在流结束后释放。
-            spawn_release_on_end(state.clone(), uid, resp)
-        }
-        Some(crate::forward::ChatResult::Response { body, .. }) => {
+        }) => chat_stream_response(response, state.clone(), uid, model),
+        Some(crate::forward::ChatResult::Response { body, uid, model }) => {
+            record_usage(&state, &uid, &model, body.get("usage"));
             json_response(StatusCode::OK, Value::Object(body))
         }
         None => openai_error(
@@ -488,6 +488,40 @@ async fn chat_completions(
             "no_healthy_account",
             "all accounts unavailable (cooling/disabled)",
         ),
+    }
+}
+
+/// `GET /usage` —— 网关侧 Token 用量聚合快照（宿主「Token 统计」页读它）。
+///
+/// 与本地客户端日志统计**相互独立**：这里统计的是网关自己记录的每次成功请求的
+/// 上游 usage。`?days=N` 限定最近 N 天；缺省或非正数表示全部历史。
+async fn usage_report(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: axum::http::Uri) -> Response {
+    if let Some(r) = check_auth(&state, &headers) {
+        return r;
+    }
+    let days = uri
+        .query()
+        .and_then(|q| {
+            q.split('&')
+                .find_map(|kv| kv.strip_prefix("days="))
+                .and_then(|v| v.parse::<i64>().ok())
+        })
+        .filter(|d| *d > 0)
+        .unwrap_or(0);
+    let mut snap = state.usage.snapshot(days);
+    if let Some(obj) = snap.as_object_mut() {
+        obj.insert("enabled".into(), json!(true));
+    }
+    json_response(StatusCode::OK, snap)
+}
+
+/// 记录一次成功请求的用量。
+///
+/// 只统计**上游返回了可用 usage** 的请求（失败请求不计入）—— 与 Go 侧
+/// `recordUsage` 的 `hasCounters` 门控一致。
+fn record_usage(state: &Arc<AppState>, uid: &str, model: &str, usage: Option<&Value>) {
+    if let Some(c) = crate::usage::parse_openai_usage(usage) {
+        state.usage.record(uid, model, c);
     }
 }
 
@@ -686,10 +720,11 @@ async fn messages(State(state): State<Arc<AppState>>, request: Request<axum::bod
 
     match result {
         Some(crate::forward::ChatResult::Stream { uid, response, .. }) => {
-            let stream = anthropic_stream_response(response, &req.model);
-            spawn_release_on_end(state.clone(), uid, stream)
+            anthropic_stream_response(response, &req.model, state.clone(), uid)
         }
-        Some(crate::forward::ChatResult::Response { body, .. }) => {
+        Some(crate::forward::ChatResult::Response { body, uid, .. }) => {
+            // 非流式：usage 就在聚合后的 body 里，直接记。
+            record_usage(&state, &uid, &req.model, body.get("usage"));
             let out = crate::protocol::anthropic::chat_to_anthropic(&body, &req.model);
             json_response(StatusCode::OK, out)
         }
@@ -748,10 +783,11 @@ async fn responses(State(state): State<Arc<AppState>>, request: Request<axum::bo
 
     match result {
         Some(crate::forward::ChatResult::Stream { uid, response, .. }) => {
-            let stream = responses_stream_response(response, &req.model);
-            spawn_release_on_end(state.clone(), uid, stream)
+            responses_stream_response(response, &req.model, state.clone(), uid)
         }
-        Some(crate::forward::ChatResult::Response { body, .. }) => {
+        Some(crate::forward::ChatResult::Response { body, uid, .. }) => {
+            // 非流式：usage 就在聚合后的 body 里，直接记。
+            record_usage(&state, &uid, &req.model, body.get("usage"));
             let out = crate::protocol::responses::chat_to_responses(&body, &req.model);
             json_response(StatusCode::OK, out)
         }
@@ -763,10 +799,19 @@ async fn responses(State(state): State<Arc<AppState>>, request: Request<axum::bo
     }
 }
 
-/// 把上游 SSE 包成 Anthropic SSE 流。
+/// 把上游 SSE 包成 Anthropic SSE 流，并在流结束后记录用量、释放账号租约。
 ///
 /// 事件序列与顺序约束见 [`crate::protocol::anthropic_stream`] 的模块文档。
-fn anthropic_stream_response(upstream: reqwest::Response, model: &str) -> Response {
+///
+/// 为什么用量与租约都在这里收尾：流式响应的 usage 只在上游**末帧**才到，
+/// 而租约也要等流真正结束才能释放。两者共用同一次流遍历，避免为了统计
+/// 把整条流缓存下来（那会让首字节延迟退化）。
+fn anthropic_stream_response(
+    upstream: reqwest::Response,
+    model: &str,
+    state_ref: Arc<AppState>,
+    uid: String,
+) -> Response {
     use crate::protocol::anthropic_stream::{AnthropicStreamState, SseOut};
     let mut frames = crate::upstream::sse::SseFramesIter::new(upstream.bytes_stream());
     let model = model.to_string();
@@ -774,6 +819,7 @@ fn anthropic_stream_response(upstream: reqwest::Response, model: &str) -> Respon
         let mut state = AnthropicStreamState::new(&model);
         let mut out = SseOut::new();
         if state.start(&mut out).is_err() {
+            if let Ok(mut pool) = state_ref.pool.lock() { pool.release(&uid); }
             return;
         }
         yield Ok::<_, std::io::Error>(out.take());
@@ -781,7 +827,6 @@ fn anthropic_stream_response(upstream: reqwest::Response, model: &str) -> Respon
             match frames.next_frame().await {
                 Some(Ok(text)) => {
                     // 上游帧是 OpenAI 形状；取出 data: 后的 JSON 交给状态机。
-                    let mut consumed = false;
                     for line in text.lines() {
                         if let Some(payload) = line.strip_prefix("data: ") {
                             if payload == "[DONE]" {
@@ -790,14 +835,13 @@ fn anthropic_stream_response(upstream: reqwest::Response, model: &str) -> Respon
                             if let Ok(serde_json::Value::Object(chunk)) =
                                 serde_json::from_str::<serde_json::Value>(payload)
                             {
-                                consumed = true;
                                 if state.consume(&mut out, &chunk).is_err() {
+                                    if let Ok(mut pool) = state_ref.pool.lock() { pool.release(&uid); }
                                     return;
                                 }
                             }
                         }
                     }
-                    let _ = consumed;
                     if !out.is_empty() {
                         yield Ok(out.take());
                     }
@@ -808,6 +852,7 @@ fn anthropic_stream_response(upstream: reqwest::Response, model: &str) -> Respon
                     // 「本轮正常结束」，客户端会把截断的半截回复当成完整回答收下。
                     let _ = state.write_error(&mut out, &format!("upstream stream error: {e}"));
                     yield Ok(out.take());
+                    if let Ok(mut pool) = state_ref.pool.lock() { pool.release(&uid); }
                     return;
                 }
                 None => break,
@@ -815,6 +860,11 @@ fn anthropic_stream_response(upstream: reqwest::Response, model: &str) -> Respon
         }
         if state.finish(&mut out).is_ok() && !out.is_empty() {
             yield Ok(out.take());
+        }
+        // 收尾：记用量 + 释放租约（流已结束，二者都不再依赖连接）。
+        record_usage(&state_ref, &uid, &model, state.usage());
+        if let Ok(mut pool) = state_ref.pool.lock() {
+            pool.release(&uid);
         }
     };
     sse_headers().body(axum::body::Body::from_stream(body)).unwrap_or_else(|_| {
@@ -826,8 +876,13 @@ fn anthropic_stream_response(upstream: reqwest::Response, model: &str) -> Respon
     })
 }
 
-/// 把上游 SSE 包成 Responses SSE 流。
-fn responses_stream_response(upstream: reqwest::Response, model: &str) -> Response {
+/// 把上游 SSE 包成 Responses SSE 流，并在流结束后记录用量、释放账号租约。
+fn responses_stream_response(
+    upstream: reqwest::Response,
+    model: &str,
+    state_ref: Arc<AppState>,
+    uid: String,
+) -> Response {
     use crate::protocol::anthropic_stream::SseOut;
     use crate::protocol::responses_stream::ResponsesStreamState;
     let mut frames = crate::upstream::sse::SseFramesIter::new(upstream.bytes_stream());
@@ -836,6 +891,7 @@ fn responses_stream_response(upstream: reqwest::Response, model: &str) -> Respon
         let mut state = ResponsesStreamState::new(&model);
         let mut out = SseOut::new();
         if state.created_event(&mut out).is_err() {
+            if let Ok(mut pool) = state_ref.pool.lock() { pool.release(&uid); }
             return;
         }
         yield Ok::<_, std::io::Error>(out.take());
@@ -851,6 +907,7 @@ fn responses_stream_response(upstream: reqwest::Response, model: &str) -> Respon
                                 serde_json::from_str::<serde_json::Value>(payload)
                             {
                                 if state.consume(&mut out, &chunk).is_err() {
+                                    if let Ok(mut pool) = state_ref.pool.lock() { pool.release(&uid); }
                                     return;
                                 }
                             }
@@ -865,6 +922,7 @@ fn responses_stream_response(upstream: reqwest::Response, model: &str) -> Respon
                     // response.completed（两者自相矛盾，客户端只认最后一个）。
                     let _ = state.fail(&mut out, &format!("upstream stream error: {e}"));
                     yield Ok(out.take());
+                    if let Ok(mut pool) = state_ref.pool.lock() { pool.release(&uid); }
                     return;
                 }
                 None => break,
@@ -872,6 +930,11 @@ fn responses_stream_response(upstream: reqwest::Response, model: &str) -> Respon
         }
         if state.finish(&mut out).is_ok() && !out.is_empty() {
             yield Ok(out.take());
+        }
+        // 收尾：记用量 + 释放租约。
+        record_usage(&state_ref, &uid, &model, state.usage());
+        if let Ok(mut pool) = state_ref.pool.lock() {
+            pool.release(&uid);
         }
     };
     sse_headers().body(axum::body::Body::from_stream(body)).unwrap_or_else(|_| {
@@ -895,25 +958,51 @@ fn sse_headers() -> axum::http::response::Builder {
 /// 把上游 SSE 响应包成 `text/event-stream`，逐帧规范化后流式透传。
 ///
 /// 空流（0 有效帧）时补一帧 error 与 `[DONE]`，与 Go 侧 `upstream.Stream` 一致。
-fn sse_response(upstream: reqwest::Response) -> Response {
+///
+/// 顺带在流末尾抓取上游的 `usage`（它只在末帧到达）记入统计，并释放账号租约 ——
+/// 三件事共用同一次流遍历，不需要为了统计把整条流缓存下来。
+fn chat_stream_response(
+    upstream: reqwest::Response,
+    state_ref: Arc<AppState>,
+    uid: String,
+    model: String,
+) -> Response {
     let stream = upstream.bytes_stream();
     let mut frames = crate::upstream::sse::SseFramesIter::new(stream);
     let body = async_stream::stream! {
+        let mut last_usage: Option<Value> = None;
         while let Some(item) = frames.next_frame().await {
             match item {
-                Ok(text) => yield Ok::<_, std::io::Error>(text),
+                Ok(text) => {
+                    // 抓末帧 usage：只有含 usage 字段的帧才覆盖（避免被后续无
+                    // usage 的帧清空）。
+                    for line in text.lines() {
+                        if let Some(payload) = line.strip_prefix("data: ") {
+                            if let Ok(Value::Object(obj)) =
+                                serde_json::from_str::<Value>(payload)
+                            {
+                                if let Some(u) = obj.get("usage") {
+                                    if u.is_object() {
+                                        last_usage = Some(u.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    yield Ok::<_, std::io::Error>(text);
+                }
                 Err(e) => {
                     yield Err(std::io::Error::other(e.to_string()));
                     break;
                 }
             }
         }
+        record_usage(&state_ref, &uid, &model, last_usage.as_ref());
+        if let Ok(mut pool) = state_ref.pool.lock() {
+            pool.release(&uid);
+        }
     };
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header("X-Accel-Buffering", "no")
+    sse_headers()
         .body(axum::body::Body::from_stream(body))
         .unwrap_or_else(|_| {
             openai_error(
@@ -922,25 +1011,6 @@ fn sse_response(upstream: reqwest::Response) -> Response {
                 "构造流式响应失败",
             )
         })
-}
-
-/// 在流结束后释放账号在途租约。
-fn spawn_release_on_end(state: Arc<AppState>, uid: String, resp: Response) -> Response {
-    if uid.is_empty() {
-        return resp;
-    }
-    let (parts, body) = resp.into_parts();
-    let wrapped = async_stream::stream! {
-        use futures_util::StreamExt;
-        let mut inner = body.into_data_stream();
-        while let Some(chunk) = inner.next().await {
-            yield chunk;
-        }
-        if let Ok(mut pool) = state.pool.lock() {
-            pool.release(&uid);
-        }
-    };
-    Response::from_parts(parts, axum::body::Body::from_stream(wrapped))
 }
 
 /// 「带图片的该模型请求」应使用的区域。
@@ -1000,6 +1070,7 @@ mod tests {
             refresh_skew: std::time::Duration::from_secs(600),
             redis_mode: String::new(),
             allowed_model: String::new(),
+            usage: Arc::new(crate::usage::Stats::new("")),
         })
     }
 

@@ -428,7 +428,7 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 │  ├─ gateway.rs                                 网关托管与账号桥接        │
 │  └─ gateway_embed.rs                           内嵌网关的释放与缓存      │
 │                                                                        │
-│  内嵌网关二进制（Go，gzip 压缩，构建期写入）                              │
+│  内嵌网关二进制（Rust，gzip 压缩，构建期写入）                            │
 │  └─ 运行时释放为 ~/.wb-switch/gateway/bin/gateway-<指纹>.exe            │
 └────────────────────────────────────────────────────────────────────────┘
             │                                        │
@@ -497,16 +497,18 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 
 ### 安装方式三：从源码构建
 
-需要 Go ≥ 1.22、Node.js ≥ 20、Rust 工具链（Windows 需 MSVC 工具链以链接 WebView2）。
+需要 Node.js ≥ 20、Rust 工具链（Windows 需 MSVC 工具链以链接 WebView2）。
+网关已是 Rust 实现，**不再需要 Go**。
 
-> 网关源码随仓库分发在 `go-gateway/`，无需另行 clone 上游、也不需要打补丁。
+> 网关源码在 `crates/ai-gateway-router/`，随仓库分发，无需另行 clone 上游。
+> Go 版实现保留在 `go-gateway/` 作为回退，不再参与分发。
 
 ```bash
-# 1) 构建网关（Go）—— 产物落到 crates/ai-gateway-core/embedded/，
+# 1) 构建网关（Rust）—— 产物落到 crates/ai-gateway-core/embedded/，
 #    cargo build 时由 build.rs 压缩内嵌进主程序
 sh scripts/build-gateway.sh                              # 当前平台
-GOOS=windows GOARCH=amd64 sh scripts/build-gateway.sh    # 交叉编译到指定平台
-GOOS=darwin  GOARCH=arm64 sh scripts/build-gateway.sh
+CARGO_BUILD_TARGET=x86_64-pc-windows-msvc sh scripts/build-gateway.sh  # 交叉编译
+pwsh scripts/build-gateway.ps1                           # Windows 等价脚本
 
 # 2) 前端 + 桌面应用
 npm ci
@@ -533,7 +535,7 @@ npm run tauri build      # 构建当前平台安装包
 ### 发布新版本
 
 推一个 `v*` tag 即可，`.github/workflows/release.yml` 会构建 Windows x64 / macOS arm64 /
-Linux x64 三个平台并建 Release。日常 push 走 `.github/workflows/ci.yml`，三平台编译校验 + 单测 + Go 网关单测，不产出安装包。
+Linux x64 三个平台并建 Release。日常 push 走 `.github/workflows/ci.yml`，三平台编译校验 + 单测（含 Go 回退实现的单测），不产出安装包。
 
 **npm 版（webui）发布**：
 
@@ -547,9 +549,9 @@ src-tauri/src/       # Tauri command 薄包装与托盘
 crates/
   ai-gateway-core/    # 核心逻辑：账号/认证/切换/会话/签到/刷新/更新/配置/智能体接入
   ai-gateway-server/  # HTTP server + CLI：axum API + rust-embed 前端
-  ai-gateway-router/ # 网关内核（Rust 移植版，chat_completions 仍为占位）
+  ai-gateway-router/ # 网关内核（Rust）：账号池 + 三协议入口，编译为内嵌的 gateway.exe
 src/                 # 前端：components/pages/lib（api.ts 双通道：Tauri invoke / HTTP fetch）
-go-gateway/          # Go 版网关源码（当前实际构建依赖，编译后内嵌）
+go-gateway/          # Go 版网关源码（**回退实现**，不再参与分发，见下）
 npm/                 # npm 包：package.json + bin + scripts/install.js
 scripts/             # 构建与发布脚本
 ```

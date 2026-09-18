@@ -92,7 +92,7 @@ jobs:
       - name: 全 workspace 编译校验
         run: cargo check --workspace --all-targets --profile test
 
-      - name: Go 网关单测
+      - name: Go 网关单测（回退实现，不参与分发）
         working-directory: go-gateway
         run: go test ./...
 
@@ -217,11 +217,14 @@ jobs:
 
       # 必须在前端与 Rust 构建之前：build.rs 会把网关 gzip 后编进主程序，
       # 缺了它应用能起来但网关功能会报「本构建未内嵌网关二进制」。
-      - name: 构建内嵌网关（Go）
+      #
+      # Rust 版网关：交叉编译走 CARGO_BUILD_TARGET（矩阵里的 target 三元组）。
+      # 脚本据此定位 target/<triple>/<profile>/ 下的产物并判断 .exe 后缀 ——
+      # 不能用 `uname -s`，那反映的是**构建机**系统而非目标系统。
+      - name: 构建内嵌网关（Rust）
         shell: bash
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
         run: sh scripts/build-gateway.sh
 
       - run: npm ci

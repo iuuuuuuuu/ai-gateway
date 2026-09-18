@@ -3,17 +3,18 @@
 # 产物：dist/ai-gateway.exe （一个文件，无需额外的 gateway.exe）
 #
 # 流程：
-#   1. 用 Go 构建网关，输出到 crates/ai-gateway-core/embedded/gateway.exe
+#   1. 构建**Rust 版**网关，输出到 crates/ai-gateway-core/embedded/gateway.exe
 #   2. 构建前端（rust-embed 需要仓库根 dist/）
 #   3. cargo build：build.rs 会把网关 gzip 后编进主程序
 #
-# 依赖：Go >= 1.22、Node >= 16、Rust（MinGW 亦可，无需 Visual Studio）
+# 依赖：Node >= 16、Rust（MinGW 亦可，无需 Visual Studio）。
+#       **不再需要 Go** —— 网关已由 Go 换成 Rust 实现（见 build-gateway.ps1）。
 [CmdletBinding()]
 param(
     [string]$GatewaySource = "",
     [string]$OutputDir = "dist-single",
     [switch]$SkipFrontend,
-    # 跳过 Go 网关重建，直接沿用 embedded/ 下已有的产物。
+    # 跳过网关重建，直接沿用 embedded/ 下已有的产物。
     # 网关内容没变时，重建会刷新文件 mtime，进而让 ai-gateway-core 重编一次（约 25s）——
     # 只想改 Rust/前端时用这个开关省掉这一轮。
     [switch]$SkipGateway
@@ -27,27 +28,15 @@ try {
     New-Item -ItemType Directory -Force -Path $embedded | Out-Null
 
     # ---- 1) 构建网关 ----
-    Write-Host "==> [1/4] 构建网关 (Go)" -ForegroundColor Cyan
+    Write-Host "==> [1/4] 构建网关 (Rust)" -ForegroundColor Cyan
     if ($GatewaySource) {
         Copy-Item $GatewaySource (Join-Path $embedded "gateway.exe") -Force
         Write-Host "    直接使用: $GatewaySource"
     } elseif ($SkipGateway -and (Test-Path (Join-Path $embedded "gateway.exe"))) {
         Write-Host "    跳过（-SkipGateway，沿用现有 embedded/gateway.exe）"
-    } elseif (Test-Path (Join-Path $embedded "gateway.exe")) {
-        $age = (Get-Date) - (Get-Item (Join-Path $embedded "gateway.exe")).LastWriteTime
-        Write-Host ("    已有 embedded/gateway.exe（{0:N0} 小时前构建），如需重建请加 -GatewaySource" -f $age.TotalHours)
     } else {
-        $gwDir = Join-Path $root "go-gateway"
-        if (-not (Test-Path $gwDir)) {
-            throw "未找到网关源码目录 $gwDir；可用 -GatewaySource 指定已有的 gateway.exe"
-        }
-        $env:GOFLAGS = "-mod=mod"
-        Push-Location $gwDir
-        go build -trimpath -ldflags "-s -w" -o (Join-Path $embedded "gateway.exe") ./cmd/server
-        $code = $LASTEXITCODE
-        Pop-Location
-        if ($code -ne 0) { throw "网关构建失败" }
-        Write-Host "    已从源码构建网关"
+        & (Join-Path $PSScriptRoot "build-gateway.ps1")
+        if ($LASTEXITCODE -ne 0) { throw "网关构建失败" }
     }
 
     # ---- 2) 前端 ----

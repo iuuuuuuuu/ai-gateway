@@ -4,6 +4,18 @@ version = "1.0.4"
 edition = "2021"
 description = "workbuddy2api 网关内核（Rust 版）：账号池 + OpenAI 兼容 HTTP 接口，替代原 Go gateway.exe"
 
+# 网关可执行文件。产物名就是 `gateway[.exe]`，与宿主
+# `resolve_gateway_exe()` 查找的文件名一致 —— 构建脚本把它拷到
+# `crates/ai-gateway-core/embedded/` 后由 build.rs 压缩内嵌。
+[[bin]]
+name = "gateway"
+path = "src/bin/gateway.rs"
+
+# 诊断探针（读 state.json 打印账号数），不参与分发。
+[[bin]]
+name = "probe_state"
+path = "src/bin/probe_state.rs"
+
 [dependencies]
 ai-gateway-core = { path = "../ai-gateway-core" }
 

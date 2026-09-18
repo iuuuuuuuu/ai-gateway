@@ -81,7 +81,7 @@ jobs:
         run: cargo check --workspace --all-targets --target x86_64-apple-darwin
 
   gateway:
-    name: gateway / Go 单测与构建
+    name: gateway / Go 单测（网关已换 Rust 实现，Go 版保留作回退）
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -94,15 +94,17 @@ jobs:
           go-version: "1.24"
           cache-dependency-path: go-gateway/go.sum
 
-      # 网关源码随仓库分发（Go 版本），这里验证单测与三平台交叉构建链路。
-      - name: Go 单测
+      # 实际分发的是 **Rust 版**网关（scripts/build-gateway.sh 构建它）。
+      # Go 版源码仍在仓库里作为回退实现，这里继续跑它的单测保证回退路径可用，
+      # 但它不再参与分发产物。
+      - name: Go 单测（回退实现）
         working-directory: go-gateway
         run: go test ./...
 
-      - name: 构建网关（linux）
-        env:
-          GOOS: linux
-          GOARCH: amd64
+      # Rust 网关的 release 构建校验。单测由上面的 cargo test 覆盖，
+      # 这一条补「release 二进制能不能编出来」——
+      # LTO / 优化期才炸的错误只有它暴露（与下面 release-bin job 同一理由）。
+      - name: 构建 Rust 网关（linux）
         run: sh scripts/build-gateway.sh
 
   # 这一路补上 build.yml 被摘掉 tag 触发后失去的覆盖：

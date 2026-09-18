@@ -31,5 +31,6 @@ pub mod protocol;
 pub mod server;
 pub mod session;
 pub mod upstream;
+pub mod usage;
 
 pub use error::{GatewayError, Result};
