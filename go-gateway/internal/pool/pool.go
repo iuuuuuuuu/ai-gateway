@@ -165,6 +165,23 @@ type entry struct {
 	// 而网关会因切换工作模式、应用重启等原因重启；不持久化的话重启即遗忘，
 	// 立刻重新撞同一批 6004，用户看到的仍是「频繁不可用」。
 	modelCools map[string]modelCool
+
+	// costRate 该账号当前请求模型的「单位额度消耗率」；0 = 未声明。
+	//
+	// 跨产品可比性的载体：两产品的额度单位不同（WorkBuddy 积分 ≠ Qoder 积分），
+	// 绝对值不可比，但"这个模型在这份额度上消耗得多快"是可比的。
+	//
+	// 语义（三态，与全仓库口径一致）：
+	//	> 0  已声明：值越大越贵，权重越小
+	//	= 0  **未声明** → 中性（不猜测、不惩罚）
+	//
+	// ⚠ 为什么不复用 credits：现有 tierWeightOf **刻意不含 credits**
+	//（pool.go 的注释说明了原因：同档内按积分分配会让高积分账号长期吃掉流量）。
+	// 所以"按成本路由"必须另立维度，塞回 credits 是无效的 —— 只要有任何账号
+	// 带到期信息就会走 tiered 分支，credits 会被整个丢掉。
+	//
+	// 运行态，不持久化：它取决于**当前请求的模型**，跨请求无意义。
+	costRate float64
 }
 
 // expiryDayKey 返回账号「最近到期积分」的到期日（本地时区，YYYY-MM-DD）。
@@ -336,6 +353,20 @@ type Pool struct {
 	// persistFails 本地 state.json 连续落盘失败计数（仅 saveLocked 在持锁下读写，无需 atomic）。
 	// 用于落盘失败的日志节流：首败/每 N 次提醒/恢复各打一条，避免磁盘满时刷屏。
 	persistFails int
+
+	// ---- 多产品路由（默认关闭，关闭时行为与单产品逐字相同）----
+	//
+	// 为什么做成开关：跨产品权重是最容易"悄悄改变现有行为"的地方，
+	// 而现有行为（单产品 WorkBuddy）已在生产环境跑了很久、有真实用户依赖。
+	// 开关关闭时：不读成本字段、不做产品区分，所有既有路径**逐字不变**。
+	multiProductOn bool
+
+	// costWeight 成本乘子的强度（0 = 成本不参与，1 = 满强度）。
+	//
+	// 设计意图（见 design.md §2.3）：成本是**小幅微调**，不是主导项。
+	// 主导项仍是"同档内平均分摊"——那关系到一旦过期就净损失的额度。
+	// 具体量级由单测断言份额比例来校准，不硬编码魔数。
+	costWeight float64
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
@@ -416,6 +447,55 @@ func (p *Pool) SetMaxInFlight(n int) {
 	defer p.mu.Unlock()
 	if n >= 0 {
 		p.maxInFlight = n
+	}
+}
+
+// SetMultiProduct 开关多产品路由，并注入成本乘子强度。
+//
+// 关闭时（默认）所有既有路径**逐字不变**：不读 costRate、不加成本乘子。
+// 这是 design.md §5 要求的回滚点 —— 产品维度出问题就关掉它，
+// 立刻回到已验证的单产品行为，而不需要回滚代码。
+//
+// costWeight <= 0 时保留默认强度（0.3）。传 0 想表达"成本不参与"时，
+// 应关闭开关而不是设 0 —— 两者语义不同：关闭=完全没有产品维度；
+// 设 0=有产品维度但成本中性（仍可用于产品级统计与派发）。
+func (p *Pool) SetMultiProduct(on bool, costWeight float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.multiProductOn = on
+	if costWeight > 0 {
+		p.costWeight = costWeight
+	}
+}
+
+// MultiProductOn 报告多产品路由是否开启（供诊断与测试断言）。
+func (p *Pool) MultiProductOn() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.multiProductOn
+}
+
+// SetCostRate 设置某账号对**当前模型**的单位额度消耗率（0 = 未声明）。
+//
+// 调用方（server 的派发层）在每次请求前按"该模型在该产品的成本倍率"
+// 计算好并注入。传 0 表示未声明 → 权重中性。
+//
+// 为什么不在这里按模型查倍率：倍率表来自上游（WorkBuddy 的 /v3/config、
+// Qoder 的 model/list），pool 不该依赖 upstream（会循环依赖）。
+func (p *Pool) SetCostRate(uid string, rate float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.costRate = rate
+	}
+}
+
+// ClearCostRates 清空全部账号的成本率（跨请求复用池时调用，避免残留）。
+func (p *Pool) ClearCostRates() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, e := range p.byUID {
+		e.costRate = 0
 	}
 }
 
@@ -1283,7 +1363,42 @@ func (p *Pool) tierWeightOf(e *entry, now time.Time) float64 {
 	} else {
 		w += 1.5 // 无请求记录 → 中性偏信任
 	}
+
+	// 成本微调（仅多产品模式）：同样是"紧迫度相同"的额度，更便宜的一份额度
+	// 应该多承担一些流量。
+	//
+	// 为什么是**乘子**而不是加项：加项会与上面的闲置/成功率项线性叠加，
+	// 而成本在跨产品场景下只应是"同等条件下略作区分"。乘子的影响随权重
+	// 成比例，不会因为账号闲置久而淹没。
+	//
+	// 三态语义：costRate = 0（未声明）→ 乘子 1.0（中性，不惩罚）。
+	// 若误把未声明当"很便宜"或"很贵"，都会让某产品被系统性冷落。
+	if p.multiProductOn && p.costWeight > 0 && e.costRate > 0 {
+		w *= p.costMultiplierLocked(e.costRate)
+	}
 	return w
+}
+
+// costMultiplierLocked 把「消耗率」映射成权重乘子。
+//
+// 设计取舍（见 design.md §2.3）：
+//   · 消耗率越低（越便宜）→ 乘子越接近上限 1 + costWeight
+//   · 消耗率越高（越贵）  → 乘子越接近下限 1 - costWeight
+//
+// 用 costRate/(1+costRate) 做归一化而不是线性：消耗率的量纲不确定
+//（各产品自定义），线性映射会让某个产品的大数值把乘子压到 0 附近、
+// 等于永久冷落它。这个映射天然落在 [0,1)，不会产生极端值。
+//
+// costWeight 取 0.3 左右时，最便宜与最贵之间的权重差异约 60% ——
+// 足以让份额有可观测的差异，又不足以压过"同档平均分摊"。
+func (p *Pool) costMultiplierLocked(costRate float64) float64 {
+	if costRate <= 0 {
+		return 1.0 // 未声明 → 中性
+	}
+	// 归一化到 [0,1)：便宜 → 接近 0，贵 → 接近 1
+	norm := costRate / (1 + costRate)
+	// norm=0 → 1+costWeight；norm→1 → 1-costWeight
+	return 1 + p.costWeight*(1-2*norm)
 }
 
 // weightOf 计算单个账号的三因子权重。
@@ -1316,6 +1431,19 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 		w += float64(e.successCount) / float64(totalReq) * 3
 	} else {
 		w += 1.5 // 无请求记录 → 中性偏信任
+	}
+
+	// 4. 成本微调（仅多产品模式）。
+	//
+	// ⚠ 两条路径都要加：tiered=false 时走本函数（**所有账号都无到期信息**），
+	// 而 tiered=true 时走 tierWeightOf。只在其中一处加会导致
+	// 「没有到期信息的池子里成本完全不生效」—— 实测就是先漏了这里，
+	// 表现为份额精确 50/50（成本维度形同虚设）。
+	//
+	// 为什么放在最后乘：前三个因子决定"谁更该被用"，成本只在此基础上
+	// 做小幅倾斜。放前面乘会让成本与 credits 项互相放大。
+	if p.multiProductOn && p.costWeight > 0 && e.costRate > 0 {
+		w *= p.costMultiplierLocked(e.costRate)
 	}
 	return w
 }

@@ -39,7 +39,40 @@ type Auth struct {
 	// 或由网关自身的签到任务刷新。账号池据此做「先烧快过期额度」的分层选号。
 	// 只读元数据，不参与 token 刷新与写回。
 	SoonestExpireAt int64
+
+	// Product 账号所属产品；空串等价于 ProductWorkBuddy。
+	//
+	// 存在的意义：两个产品的**同名模型可能是完全不同的后端**，且凭证形态、
+	// 签名方式、端点全都不同。选号时需要知道"这个号是谁的"，转发时才派发到
+	// 正确的上游实现（见 server 的 dispatch 层）。
+	//
+	// ⚠ 这个字段**不参与** WorkBuddy 单产品下的任何决策 —— 默认空串，
+	// 所有既有路径的行为逐字不变（多产品路由由 pool 的开关控制）。
+	Product string
 }
+
+// 产品标识。
+const (
+	// ProductWorkBuddy 默认产品（空串等价于此）。
+	ProductWorkBuddy = "workbuddy"
+	// ProductQoder QoderWork。
+	ProductQoder = "qoder"
+)
+
+// ProductOf 返回账号所属产品，空串归一成 ProductWorkBuddy。
+//
+// 归一化而非保留空串：调用方写 `a.ProductOf() == ProductWorkBuddy` 比
+// 到处判 `== "" || == "workbuddy"` 更不容易漏（漏判会把 WorkBuddy 账号
+// 当成未知产品，走进 Qoder 的派发分支）。
+func (a *Auth) ProductOf() string {
+	if a.Product == "" {
+		return ProductWorkBuddy
+	}
+	return a.Product
+}
+
+// IsQoder 报告该账号是否属于 Qoder。
+func (a *Auth) IsQoder() bool { return a.Product == ProductQoder }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
 func (a *Auth) Lock() { a.mu.Lock() }
