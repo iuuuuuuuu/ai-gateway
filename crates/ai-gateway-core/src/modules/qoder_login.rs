@@ -14,13 +14,20 @@
 //!
 //! ## 两个子命令的形状
 //!
-//!     gateway.exe qoder-login url  --region cn|intl
-//!       → stdout: {"authUrl":"...","sessionId":"...","region":"cn"}
+//! ```text
+//! gateway.exe qoder-login url  --region cn|intl
+//!   → stdout: {"authUrl":"...","sessionId":"...","region":"cn"}
 //!
-//!     gateway.exe qoder-login poll --session <id> --auth-dir <dir>
-//!       → stdout: {"status":"pending"}
-//!                 {"status":"ok","uid":"...","nickname":"...","region":"cn"}
-//!                 {"status":"error","message":"..."}
+//! gateway.exe qoder-login poll --session <id> --auth-dir <dir>
+//!   → stdout: {"status":"pending"}
+//!             {"status":"ok","uid":"...","nickname":"...","region":"cn"}
+//!             {"status":"error","message":"..."}
+//! ```
+//!
+//! ⚠ 上面必须写成 ```text 围栏块，**不能**只用 4 空格缩进 ——
+//! rustdoc 会把缩进块当成 **Rust doctest** 编译，而这里的 `→` 不是合法
+//! Rust 记号，于是 `cargo test` 报 `unknown start of token: \u{2192}`
+//! （`cargo build` 却正常，因为构建不跑 doctest）。实测踩到过。
 //!
 //! 会话状态由 Go 侧自己持有（内存 + 临时文件），宿主只传 sessionId。
 
@@ -83,9 +90,11 @@ pub fn login_start(region: &str) -> Result<Value, String> {
 ///
 /// 三种返回（对应 Go 侧的三种状态）：
 ///
-///     待授权 → {"status":"pending"}
-///     成功   → {"status":"ok","uid":...,"account":{...}}  （并已登记进账号库）
-///     失败   → Err(...)
+/// ```text
+/// 待授权 → {"status":"pending"}
+/// 成功   → {"status":"ok","uid":...,"account":{...}}  （并已登记进账号库）
+/// 失败   → Err(...)
+/// ```
 ///
 /// **成功时顺带登记账号库**：让调用方（界面）只需调一个命令，
 /// 不必再单独调一次 upsert —— 少一步就少一处「忘了调」的可能。
