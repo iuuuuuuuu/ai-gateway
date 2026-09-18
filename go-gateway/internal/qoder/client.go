@@ -13,8 +13,8 @@ package qoder
 // 本包把它们收在同一个 Client 上，但用**方法名区分**（签名的方法带 Cosy 前缀）。
 
 import (
-	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,12 +32,29 @@ type Client struct {
 }
 
 // New 生产默认客户端。
+//
+// ⚠ 两处**必须**与参考实现一致，否则请求会静默失败（详见各自注释）：
+//  1. 强制 HTTP/1.1 —— Qoder 的 gateway 对 HTTP/2 不友好，流式响应会
+//     以 stream INTERNAL_ERROR 中断。参考实现明确禁用了 h2（TLSNextProto 置空）。
+//  2. 对话请求体必须经 QoderEncode 编码（见 ChatStream）。
 func New() *Client {
+	tr := &http.Transport{
+		// 默认 MaxIdleConnsPerHost=2 在高并发下会频繁重建 TLS 连接
+		//（参考实现把它提到 20，实测有必要）。
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+		// 置空 TLSNextProto = 禁用 HTTP/2（Go 的标准做法）。
+		// 不禁用的话流式对话会被上游中途断开，而错误信息只说 "stream error"，
+		// 很难联想到协议版本。
+		TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{},
+	}
 	return &Client{
 		HTTP: &http.Client{
-			// 不用 http.Transport 的默认 0（无超时）：上游偶发挂起会让
-			// 一次额度查询拖住整个界面刷新。
-			Timeout: 60 * time.Second,
+			Transport: tr,
+			// 不用 0（无超时）：上游偶发挂起会让一次额度查询拖住整个界面刷新。
+			// 流式对话另走无总超时的 client（见 ChatStream 的注释）。
+			Timeout: 180 * time.Second,
 		},
 		Timeout: 30 * time.Second,
 	}
@@ -181,7 +198,17 @@ const ChatPath = "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=l
 
 // ChatStream 发起对话（流式），返回原始响应体供上层解析。
 //
-// body 必须与实际发送的字节完全一致 —— 签名覆盖它。
+// ## 请求体必须编码
+//
+// 端点 URL 里带 `Encode=1`，请求体要经 `QoderEncode` 编码后发送。
+// **签名覆盖的是编码后的字符串**（即实际发送的字节），故先编码再签名。
+// 直接发明文 JSON 会让上游无法解析（表现为流挂起）。
+//
+// ## 为什么用独立的 client（不带总超时）
+//
+// 流式对话可能持续数分钟（长回答 + 推理），总超时会在中途掐断连接，
+// 表现为"回答被截断"。这里用底层 Transport 但把 Timeout 置 0，
+// 靠 ResponseHeaderTimeout 保证连接阶段不会无限等待。
 func (c *Client) ChatStream(ctx context.Context, cr *Cred, body []byte) (io.ReadCloser, int, []byte, error) {
 	if cr == nil || cr.DT == "" {
 		return nil, 0, nil, fmt.Errorf("账号没有可用令牌")
@@ -194,15 +221,18 @@ func (c *Client) ChatStream(ctx context.Context, cr *Cred, body []byte) (io.Read
 		return nil, 0, nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
+	// 先编码，再签名（签名必须覆盖**实际发送的字节**）。
+	encoded := QoderEncode(body)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, strings.NewReader(encoded))
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	if err := sess.ApplyHeaders(req, string(body), rawURL, cr.UID, true, modelKeyOf(body)); err != nil {
+	if err := sess.ApplyHeaders(req, encoded, rawURL, cr.UID, true, modelKeyOf(body)); err != nil {
 		return nil, 0, nil, err
 	}
 
-	resp, err := c.http().Do(req)
+	resp, err := c.streamHTTP().Do(req)
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("连接上游失败: %w", err)
 	}
@@ -212,6 +242,31 @@ func (c *Client) ChatStream(ctx context.Context, cr *Cred, body []byte) (io.Read
 		return nil, resp.StatusCode, raw, nil
 	}
 	return resp.Body, resp.StatusCode, nil, nil
+}
+
+// streamHTTP 流式请求专用 client：复用 Transport 但**不设总超时**。
+//
+// 为什么不直接用 c.http()：它带 180s 总超时，长回答会在中途被掐断
+//（表现为"回答被截断"）。
+//
+// 为什么不干脆用零值 client：那会丢掉已经配好的 Transport
+//（连接池参数 + 禁用 HTTP/2），于是又回到 HTTP/2 流中断的问题。
+//
+// 首字节仍要有上限：ResponseHeaderTimeout 设在 Transport 上（它是
+// Transport 的字段，不是 Client 的）—— 若上游压根不响应，
+// 没有它会永久挂住一个 goroutine。
+func (c *Client) streamHTTP() *http.Client {
+	base := c.http()
+	tr, ok := base.Transport.(*http.Transport)
+	if !ok || tr == nil {
+		// 调用方注入了自定义 Transport（测试用）：尊重它，只加首字节超时。
+		return &http.Client{Transport: base.Transport}
+	}
+	// 克隆一份并设首字节超时，避免改动共享 Transport 影响短请求路径
+	//（短请求靠 Client.Timeout 兜底，不需要 Transport 级超时）。
+	clone := tr.Clone()
+	clone.ResponseHeaderTimeout = 60 * time.Second
+	return &http.Client{Transport: clone}
 }
 
 // ---------------------------------------------------------------------------
