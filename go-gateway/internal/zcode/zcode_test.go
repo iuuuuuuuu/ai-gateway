@@ -622,6 +622,77 @@ func TestPlatformUsesNodeNaming(t *testing.T) {
 	}
 }
 
+// TestClassifyQuotaBeatsRateLimit 额度不足必须**先于** 429 判定。
+//
+// ## 为什么这条很重要
+//
+// 实测（uitest/diag-zcode-upstream-error.cjs）：额度不足返回的是
+//
+//	HTTP 429  {"error":{"code":"1113","message":"余额不足或无可用资源包,请充值。"}}
+//
+// 上游用 **429** 同时表示"限流"与"余额不足"两种完全不同的情况。
+// 若先按状态码判，会得到 ErrRateLimited → 界面提示"请求过于频繁，请稍后重试"
+// —— 用户会一直重试，而正确动作是**去充值**。
+//
+// 这类"错误分类错了"的 bug 很隐蔽：请求确实失败了，日志也记录了，
+// 但给用户的**行动指引是错的**。
+func TestClassifyQuotaBeatsRateLimit(t *testing.T) {
+	// 实测的真实响应
+	body := `{"error":{"code":"1113","message":"余额不足或无可用资源包,请充值。"}}`
+	kind := Classify(429, body)
+	if kind != ErrQuotaExhausted {
+		t.Errorf("1113 + HTTP 429 应判为额度耗尽，实际 %q —— "+
+			"若判成限流，用户会一直重试而不是去充值", kind)
+	}
+
+	// 真的限流（429 但没有业务码）仍应判为限流
+	if k := Classify(429, `{"error":{"message":"too many requests"}}`); k != ErrRateLimited {
+		t.Errorf("无业务码的 429 应判为限流，实际 %q", k)
+	}
+
+	// 中文文案兜底（上游有时不给数字码）
+	if k := Classify(429, `{"error":{"message":"余额不足，请充值"}}`); k != ErrQuotaExhausted {
+		t.Errorf("中文「余额不足」文案应判为额度耗尽，实际 %q", k)
+	}
+}
+
+// TestClassifyModelNotFound 模型不存在（11102）要单独成类。
+//
+// 实测：用 `GLM-5.3`（客户端展示名）请求会得到
+//
+//	400 {"code":11102,"msg":"model [GLM-5.3] service info not found"}
+//
+// 因为**上游严格区分大小写**（正确写法是 `glm-5.3`）。
+// 不单独分类的话，用户会以为"上游不支持这个模型"。
+func TestClassifyModelNotFound(t *testing.T) {
+	body := `{"error":{"code":"11102","message":"model [GLM-5.3] service info not found"}}`
+	kind := Classify(400, body)
+	if kind != ErrModelNotFound {
+		t.Errorf("11102 应判为模型不存在，实际 %q", kind)
+	}
+
+	// 文案里要提到大小写 —— 那是最常见的原因
+	e := &Error{Kind: kind, Status: 400, Code: CodeModelNotFound, Msg: "service info not found"}
+	msg := e.FriendlyMessage()
+	if !strings.Contains(msg, "大小写") {
+		t.Errorf("模型不存在的提示应点明大小写问题，实际 %q", msg)
+	}
+}
+
+// TestClassifyQuotaMessageSaysRecharge 额度耗尽的提示要指向"充值"而不是"重试"。
+func TestClassifyQuotaMessageSaysRecharge(t *testing.T) {
+	e := &Error{Kind: ErrQuotaExhausted, Status: 429, Code: CodeQuotaExhausted, Msg: "余额不足"}
+	msg := e.FriendlyMessage()
+	if !strings.Contains(msg, "充值") {
+		t.Errorf("额度耗尽的提示应包含「充值」，实际 %q", msg)
+	}
+	if strings.Contains(msg, "稍后") {
+		t.Errorf("额度耗尽的提示**不该**说「稍后」（会让用户白等），实际 %q", msg)
+	}
+}
+
+// TestClassifyAuthMissingVsFailed 已在上文覆盖（1001 vs 1000 的区分）。
+
 // TestOSCategoryMapping 平台名归一。
 func TestOSCategoryMapping(t *testing.T) {
 	cases := map[string]string{

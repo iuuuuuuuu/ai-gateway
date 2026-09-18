@@ -1128,30 +1128,95 @@ func olderLastUsed(a, b *entry) bool {
 //
 // 到期日未知的账号视为最晚（排最后）：只有全部候选都没有到期信息时，
 // 它们才会成为唯一的一档。调用方必须已持有 p.mu。
+//
+// ## 「未知到期日排最后」是**刻意**的（WorkBuddy 语境下）
+//
+// 见 `TestPickUnknownExpiryGoesLast`：无到期信息的账号在还有别的账号可用时
+// 不该被选中。理由是在 WorkBuddy 语境下，到期日未知通常意味着该账号的积分
+// 数据还没拉到（可能是死号/僵尸号），拿它接流量风险更高。
+//
+// ## ⚠ 但这条规则**不能跨产品套用**（多产品场景的真实 bug）
+//
+// 到期分层是**积分**（credits）概念的一部分：它回答"哪份积分先过期"。
+// 而 **ZCode 账号根本没有积分与到期概念**（`expireAt` 恒为 0）——
+// 对它套用"未知到期日排最后"是**范畴错误**：那不是"数据没拉到"，
+// 而是"这个产品没有这个东西"。
+//
+// 实测后果（uitest/diag-zcode-debug6.cjs，19 个 WorkBuddy + 1 个 ZCode）：
+// ZCode 账号虽然进了池（`/status` 可见、`byUID=20`），却**永远进不了候选集**：
+//
+//	[TIER-DEBUG] 候选=20 scored=19 exempt=1 byUID=20   ← 第一次（修复后可见）
+//	[TIER-DEBUG] 候选=19 scored=19 exempt=0 byUID=20   ← 之后
+//
+// 表现为「界面显示账号正常、日志显示已载入，但请求永远走 WorkBuddy」，
+// 一个从界面完全看不出来的静默故障。
+//
+// ## 修法：分层**只在 WorkBuddy 账号之间**生效
+//
+// 非 WorkBuddy 产品（Qoder / ZCode）不参与积分分层，原样进入候选集。
+// 这样：
+//   · WorkBuddy 的「先烧快过期」与「未知排最后」**逐字不变**（既有测试仍过）
+//   · 其它产品不会被积分维度的规则误伤
+//
+// 之所以不改成"未知档也保留"：那会推翻 WorkBuddy 那条刻意的设计决定
+//（`TestPickUnknownExpiryGoesLast` 明确要求未知档在还有别的账号时不被选中）。
+// 这里要修的是**跨产品误用**，不是那条决定本身。
 func (p *Pool) earliestExpiryTierLocked(cands []*entry) ([]*entry, bool) {
 	if len(cands) <= 1 {
 		return cands, false
 	}
-	best := ""
+
+	// 先把候选分成「参与积分分层的」与「不参与的（其它产品）」。
+	//
+	// 只有参与分层的账号才有"未知到期日"这个概念。
+	var scored []*entry
+	var exempt []*entry
 	for _, e := range cands {
+		if e.a != nil && e.a.ProductOf() != auth.ProductWorkBuddy {
+			exempt = append(exempt, e)
+			continue
+		}
+		scored = append(scored, e)
+	}
+
+	// 其它产品原样保留（它们不受积分维度约束）
+	keep := func(out []*entry) []*entry {
+		if len(exempt) == 0 {
+			return out
+		}
+		merged := make([]*entry, 0, len(out)+len(exempt))
+		merged = append(merged, out...)
+		merged = append(merged, exempt...)
+		return merged
+	}
+
+	if len(scored) == 0 {
+		// 全是其它产品：没有积分维度可分，退化为随机
+		return cands, false
+	}
+
+	best := ""
+	for _, e := range scored {
 		key := e.expiryDayKey()
 		if key == "" {
-			continue // 未知不参与比较
+			continue // 未知不参与比较（WorkBuddy 语境下它们排最后，见上）
 		}
 		if best == "" || key < best {
 			best = key
 		}
 	}
 	if best == "" {
-		return cands, false // 全员未知：不分档，退化为原三因子随机
+		// WorkBuddy 侧全员未知：不分档，退化为原三因子随机
+		return cands, false
 	}
+
 	out := make([]*entry, 0, len(cands))
-	for _, e := range cands {
+	for _, e := range scored {
 		if e.expiryDayKey() == best {
 			out = append(out, e)
 		}
 	}
-	return out, true
+	return keep(out), true
 }
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。

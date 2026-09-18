@@ -22,6 +22,16 @@ import (
 )
 
 // mkProductAuth 造一个指定产品的账号。
+// mkProductAuth 造一个指定产品的账号。
+//
+// ⚠ 每新增一个产品都必须在这里补分支：**漏掉时它会被当成 WorkBuddy**
+//（`ProductOf()` 把空串归一成 workbuddy），于是测试会在错误的语义下跑，
+// 而且不会报错 —— 只是断言变得没有意义。
+//
+// 实测踩到：加 ZCode 分支前，`mkProductAuth(uid, ProductZcode)` 造出的账号
+// `Product` 是空串，被当成 WorkBuddy 参与积分分层，于是我的
+// `TestNonWorkbuddyNotStarvedByExpiryTier` 一直失败 —— 而真正的原因是
+// **测试夹具**没跟上，不是被验证的代码有问题。
 func mkProductAuth(uid, product string) *auth.Auth {
 	a := &auth.Auth{
 		UID:         uid,
@@ -30,10 +40,20 @@ func mkProductAuth(uid, product string) *auth.Auth {
 		ExpiresAt:   time.Now().Add(24 * time.Hour).Unix(),
 		Domain:      "copilot.tencent.com",
 	}
-	if product == auth.ProductQoder {
+	switch product {
+	case auth.ProductQoder:
 		a.Product = auth.ProductQoder
 		// Qoder 的域名不同（区域判定也走这条）
 		a.Domain = "qoder.sh"
+	case auth.ProductZcode:
+		a.Product = auth.ProductZcode
+		// ZCode 的服务商通过 Domain 承载（见 zcode.DomainOfProvider）
+		a.Domain = "open.bigmodel.cn"
+		// ⚠ ZCode **没有令牌刷新**（凭证长期有效），故不设 ExpiresAt ——
+		// 这正是"它不参与积分分层"的由来，测试夹具必须如实反映。
+		a.ExpiresAt = 0
+	case auth.ProductWorkBuddy, "":
+		a.Product = auth.ProductWorkBuddy
 	}
 	return a
 }
@@ -180,11 +200,22 @@ func TestUndeclaredCostIsNeutral(t *testing.T) {
 // 这是最重要的边界：到期分层关系到"一旦过期就净损失的额度"，
 // 而成本只是微调。若便宜的账号下个月才到期、贵的明天就到期，
 // 必须先烧贵的 —— 否则明天就损失掉那份额度。
+//
+// ## ⚠ 两个账号**都必须是 WorkBuddy**
+//
+// 到期分层是**积分**维度的事，只在 WorkBuddy 账号之间生效。
+// 其它产品（Qoder / ZCode）**没有积分与到期概念**，不参与分层 ——
+// 详见 `earliestExpiryTierLocked` 的注释（那里记录了一个真实 bug：
+// 跨产品套用"未知到期日排最后"会让新产品账号永不入选）。
+//
+// 本测试第一版拿 Qoder 账号当"下个月才到期"的一方，于是在那条修复后
+// 失败 —— 那不是回归，是**测试本身**把两个不同维度混在了一起。
+// 这里改成两个 WorkBuddy 账号，测的才是它真正想测的东西。
 func TestCostDoesNotOverrideExpiryTier(t *testing.T) {
 	const rounds = 3000
 
 	soon := mkProductAuth("expires-soon", auth.ProductWorkBuddy)
-	late := mkProductAuth("expires-late", auth.ProductQoder)
+	late := mkProductAuth("expires-late", auth.ProductWorkBuddy)
 	p := newTestPool(t, soon, late)
 
 	// 制造到期分层：soon 明天到期，late 下个月到期。
@@ -208,6 +239,77 @@ func TestCostDoesNotOverrideExpiryTier(t *testing.T) {
 	if counts["expires-late"] != 0 {
 		t.Errorf("下个月才到期的一方不应分到流量（分层应只保留最早一档），实际 %d 次",
 			counts["expires-late"])
+	}
+}
+
+// TestNonWorkbuddyNotStarvedByExpiryTier 其它产品的账号**不得**被积分分层饿死。
+//
+// ## 这是一个真实 bug 的回归测试
+//
+// `earliestExpiryTierLocked` 的语义是「只保留最早到期那一档」。
+// 原实现是「只要有任一账号有到期日，就丢掉所有**未知到期日**的账号」——
+// 这在单产品下没问题（WorkBuddy 全员都有积分到期日），但多产品下是致命的：
+//
+// **ZCode / Qoder 的账号没有积分到期概念**（`expireAt` 恒为 0），
+// 于是只要池里有任何一个 WorkBuddy 账号，它们就**永远不会被选中**。
+//
+// 现场症状（uitest/diag-zcode-pick.cjs，19 个 WorkBuddy + 1 个 ZCode）：
+// 连发两次请求，选中 uid **都是 WorkBuddy**，ZCode 账号零次命中 ——
+// 而界面上 ZCode 账号显示"正常"、日志显示"已载入 1 个账号"。
+// 这是一个**从界面完全看不出来**的静默故障。
+//
+// 本测试用 1 个带到期日的 WorkBuddy + 1 个无到期日的 ZCode，
+// 断言两者都能被选中。
+func TestNonWorkbuddyNotStarvedByExpiryTier(t *testing.T) {
+	const rounds = 2000
+
+	wb := mkProductAuth("wb-with-expiry", auth.ProductWorkBuddy)
+	zc := mkProductAuth("zcode-no-expiry", auth.ProductZcode)
+	p := newTestPool(t, wb, zc)
+
+	// WorkBuddy 有明确到期日；ZCode **没有**（它的凭证长期有效）
+	p.SetCreditsAndExpiry("wb-with-expiry", 1000, time.Now().Add(24*time.Hour).Unix())
+
+	counts := pickCounts(p, rounds)
+	t.Logf("份额：WorkBuddy=%d ZCode=%d", counts["wb-with-expiry"], counts["zcode-no-expiry"])
+
+	if counts["wb-with-expiry"] == 0 {
+		t.Error("WorkBuddy 账号应参与选号")
+	}
+	if counts["zcode-no-expiry"] == 0 {
+		t.Error(
+			"ZCode 账号一次都没被选中 —— 被积分分层饿死了。\n" +
+				"到期分层是**积分**维度的事，不该套用到没有积分概念的产品上。\n" +
+				"（这不是「未知到期日排最后」那条设计决定的错 —— 那条对 WorkBuddy 是对的，" +
+				"错的是把它跨产品套用。）",
+		)
+	}
+}
+
+// TestWorkbuddyUnknownExpiryStillGoesLast WorkBuddy 的「未知到期日排最后」不变。
+//
+// 上面那条修复**只**豁免其它产品，**没有**推翻 WorkBuddy 的既有语义：
+// 对 WorkBuddy 而言，到期日未知通常意味着积分数据还没拉到（可能是死号），
+// 拿它接流量风险更高 —— 见 TestPickUnknownExpiryGoesLast。
+//
+// 这条测试确保修复没有把那个刻意行为一起改掉。
+func TestWorkbuddyUnknownExpiryStillGoesLast(t *testing.T) {
+	const rounds = 500
+
+	known := mkProductAuth("wb-known", auth.ProductWorkBuddy)
+	unknown := mkProductAuth("wb-unknown", auth.ProductWorkBuddy)
+	p := newTestPool(t, known, unknown)
+	p.SetCreditsAndExpiry("wb-known", 10, time.Now().Add(24*time.Hour).Unix())
+
+	counts := pickCounts(p, rounds)
+	t.Logf("份额：known=%d unknown=%d", counts["wb-known"], counts["wb-unknown"])
+
+	if counts["wb-unknown"] != 0 {
+		t.Errorf(
+			"WorkBuddy 的「未知到期日排最后」语义被改坏了（unknown 被选中 %d 次）。\n"+
+				"修复跨产品饿死问题时**不该**动 WorkBuddy 的这条刻意设计。",
+			counts["wb-unknown"],
+		)
 	}
 }
 

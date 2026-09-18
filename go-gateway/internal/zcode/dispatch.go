@@ -93,14 +93,23 @@ func (d *Dispatch) Aggregate(r io.Reader, model string) (map[string]any, error) 
 
 // normalizeModel 把客户端模型名映射成上游 id（映射不到时回退原样）。
 //
-// ## 为什么需要映射
+// ## 为什么需要映射（这不是"锦上添花"，是必需的）
 //
-// 客户端可能用**显示名**（`GLM 5.3 Flash`）或大小写变体（`glm-5.3-flash`）
-// 请求，而上游要的是精确的 `modelId`。映射表来自上游的 config 端点。
+// **上游严格区分大小写**，而客户端/内置清单用的是另一种写法。实测
+// （2026-09-19，uitest/z7-live-zcode.cjs）用内置清单里的 `GLM-5.3`
+// 发请求，上游回：
+//
+//	400 {"code":11102,"msg":"model [GLM-5.3] service info not found"}
+//
+// 而真实可用的 id 是**小写** `glm-5.3`（`GET /api/coding/paas/v4/models`
+// 实测返回的 11 个模型全是小写：glm-4.5 / glm-4.6 / glm-5.3 / glm-5.3-flash …）。
+//
+// 若不做这层映射，用户看到的是"模型不存在"，会以为是上游不支持那个模型，
+// 而真正原因是**大小写**。
 //
 // ## 映射不到时为什么回退而不是报错
 //
-// 上游的模型清单会变（实测当前只有 2 个模型，而参考实现硬编码了 11 个）。
+// 上游的模型清单会变（实测当前 11 个，而参考实现硬编码了 11 个别的名字）。
 // 若严格校验，**上游新增模型时会先失败一段时间**（我们的缓存还没刷新）；
 // 回退原样让上游去判断，它若真不认识会回明确错误。
 func (d *Dispatch) normalizeModel(ctx context.Context, cr *Cred, body []byte) []byte {
@@ -119,7 +128,8 @@ func (d *Dispatch) normalizeModel(ctx context.Context, cr *Cred, body []byte) []
 	}
 
 	if cache.keys != nil {
-		if id, hit := cache.keys[strings.ToLower(strings.TrimSpace(name))]; hit {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if id, hit := cache.keys[key]; hit {
 			if id != name {
 				return replaceModel(body, id)
 			}
@@ -140,13 +150,16 @@ func (d *Dispatch) refreshModels(ctx context.Context, cr *Cred) modelCache {
 			cr.Provider, err)
 		return modelCache{fetched: time.Now()}
 	}
-	keys := make(map[string]string, len(models)*3)
+	keys := make(map[string]string, len(models)*4)
 	for _, m := range models {
-		// 三种形态都能命中：id 本身、显示名、规范化后的显示名
+		// 上游要的 id 是**权威值**（实测小写 glm-5.3）
 		keys[strings.ToLower(m.ID)] = m.ID
 		if m.Name != "" {
+			// 显示名也建索引：客户端可能用「GLM-5.3」这种展示名请求，
+			// 而 API 只认小写 —— 这层映射正是为了消除这个差异。
 			keys[strings.ToLower(strings.TrimSpace(m.Name))] = m.ID
 			keys[strings.ToLower(strings.ReplaceAll(m.Name, " ", "-"))] = m.ID
+			keys[strings.ToLower(strings.ReplaceAll(m.Name, " ", ""))] = m.ID
 		}
 	}
 	cache := modelCache{keys: keys, fetched: time.Now()}

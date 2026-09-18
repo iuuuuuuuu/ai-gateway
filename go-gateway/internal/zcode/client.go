@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -37,44 +38,45 @@ type Client struct {
 
 // New 生产默认客户端。
 //
-// ## ⚠ 关于 HTTP/2：**不要**照抄 Qoder 的"禁用 h2"
+// ## ⚠ 必须基于 `http.DefaultTransport`，**不能**手工构造 `&http.Transport{}`
 //
-// Qoder 的 `New()` 里有 `TLSNextProto: map[...]{}`（置空）来禁用 h2 ——
-// 那是必要的，因为 Qoder 的 gateway 对 h2 不友好、流会中断。
+// 这是一个**确定性**的坑（实测对照，见下表），不是网络波动：
 //
-// **ZCode 相反：必须保留 h2。** 排查过程记录在这里，因为它很容易被误判：
+//	配置                                        8 次真实请求
+//	──────────────────────────────────────────  ────────────
+//	A 手工 `&http.Transport{}`                    ✓ 8/8
+//	B 手工 + ForceAttemptHTTP2=true               ✓ 8/8
+//	C **`(&http.Transport{}).Clone()`**           ✗ **0/8 全失败**
+//	D `http.DefaultTransport.Clone()`             ✓ 8/8
+//	E 手工 + 显式禁用 h2（TLSNextProto 空 map）    ✓ 8/8
 //
-// 现象：测试时报
+// 复现脚本：`uitest/diag-zcode-transport-compare.cjs`
 //
-//	malformed HTTP response "\x00\x00\x12\x04\x00\x00\x00\x00..."
+// ## 为什么 C 会坏
 //
-// `\x00\x00\x12\x04` 是 HTTP/2 的 SETTINGS 帧（type=4）。Go 把 h2 帧
-// 当 h1 响应文本解析 —— 这个错误信息**完全不提协议版本**，
-// 很容易被误判成"上游返回了坏数据"或"网络问题"。
+// 手工构造的 `&http.Transport{}` 里 `ForceAttemptHTTP2` 是 **false**，
+// 而 `http.DefaultTransport` 是 **true**。Go 的 h2 自动升级在
+// `onceSetNextProtoDefaults()` 里按这些字段决定是否注册 h2 处理器；
+// `Clone()` 会**触发**那个 once。两条路径的时机不同 → ALPN 声明了 h2
+// 但处理器没注册 → 服务端发 h2 帧、客户端按 h1 解析：
 //
-// 排查结论（三组对照，见 uitest/probe-zcode-transport-stability.cjs）：
+//	net/http: HTTP/1.x transport connection broken:
+//	malformed HTTP response "\x00\x00\x12\x04..."
 //
-//	A 默认（声明 h2 + 有 h2 处理器）      20/20
-//	B 置空 TLSNextProto + NextProtos=h1   20/20（另有一次 context deadline）
-//	C 置空 TLSNextProto，不设 NextProtos   20/20
+// 那串 `\x00\x00\x12\x04` 是 HTTP/2 的 SETTINGS 帧（type=4）。这个错误
+// 信息**完全不提协议版本**，极易被误判成"上游返回坏数据"或"网络波动" ——
+// 我最初就误判了两次（先怪 TLSNextProto，又怪网络）。
 //
-// **三种配置都稳定通过** —— 说明那个报错**不是** transport 配置问题，
-// 而是**网络层波动**（本机到上游的链路偶发不稳定）。复跑 6 轮实测全过。
+// ## 所以：以 DefaultTransport 为模板 Clone
 //
-// 我最初把原因归给"置空 TLSNextProto 禁用了 h2"，那是**错的**：
-// Go 里 `TLSNextProto: nil` 与"不设该字段"是同一个意思（都会注册默认
-// h2 处理器），只有设成**非 nil 的空 map** 才真的禁用。
-//
-// 故本配置保持 Go 的默认行为（支持 h2），这是最稳的：
-//   · 上游尊重 ALPN（实测 12/12），声明 h2 就走 h2；
-//   · 不引入任何非常规配置，行为与标准 Go 客户端一致。
+// 它带正确的 `ForceAttemptHTTP2` / 超时 / 连接池默认值，
+// 我们只覆盖需要的几项。
 func New() *Client {
-	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		// 刻意保持默认：不禁用 h2（见上面的排查记录）。
-	}
+	// 以标准 Transport 为模板 —— 见上面的对照表，这一条是必需的。
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConns = 100
+	tr.MaxIdleConnsPerHost = 20
+	tr.IdleConnTimeout = 90 * time.Second
 	return &Client{
 		HTTP: &http.Client{
 			Transport: tr,
@@ -104,6 +106,13 @@ func (c *Client) timeout() time.Duration {
 //
 // 为什么不直接用 c.http()：它带 60s 总超时，长回答会在中途被掐断
 //（表现为"回答被截断"）。
+//
+// ## ⚠ 这里 clone 的是**已经正确的** Transport，不要再手工构造
+//
+// 见 `New()` 的对照表：`(&http.Transport{}).Clone()` 会破坏 h2 的 ALPN
+// 协商（8/8 全失败）。本方法 clone 的是 `New()` 里基于
+// `http.DefaultTransport` 做出来的那个，其 `ForceAttemptHTTP2` 是对的，
+// 故 clone 后仍然正确。
 func (c *Client) streamHTTP() *http.Client {
 	base := c.http()
 	tr, ok := base.Transport.(*http.Transport)
@@ -382,20 +391,76 @@ const ConfigPath = "/api/v1/client/configs"
 // ConfigOrigin 免认证配置端点的 origin。
 const ConfigOrigin = "https://zcode.z.ai"
 
-// FetchModels 拉取模型清单（**优先走免认证的 client/configs**）。
+// FetchModels 拉取模型清单。
 //
-// 失败时返回错误 —— 调用方应回退到 BuiltinModels() 并标注来源。
+// ## ⚠ 两个来源的语义**不同**，必须合并（实测踩过坑）
+//
+//	来源                              给出什么                        大小写
+//	────────────────────────────────  ──────────────────────────────  ────────
+//	{provider}/api/coding/paas/v4/models  **API 真正接受的 model 值**    小写 glm-5.3
+//	zcode.z.ai/api/v1/client/configs      ZCode **客户端**的展示信息     大写 GLM-5.3
+//
+// 我第一版只用了 `client/configs`，于是把客户端的展示名当成了 API 的模型名，
+// 实测被上游拒绝：
+//
+//	400 {"code":11102,"msg":"model [GLM-5.3] service info not found"}
+//
+// **上游严格区分大小写** —— 展示名不能当请求参数用。
+//
+// ## 合并策略
+//
+//	① 以**账号端点的 /models** 为权威 ID 来源（那是 API 接受的值）
+//	② 用 client/configs 的元信息（上下文窗口、视觉、推理）**按大小写不敏感**去补
+//	③ 账号端点拿不到时，退化为只用 client/configs（并**统一转小写**，
+//	   因为实测 API 接受的是小写）
 func (c *Client) FetchModels(ctx context.Context, cr *Cred) ([]Model, error) {
-	// 主路径：免认证的 client/configs（不依赖凭证，信息也最全）
-	if models, err := c.fetchConfigModels(ctx); err == nil && len(models) > 0 {
-		return models, nil
+	// 元信息（可能拿不到，不致命）
+	meta := map[string]Model{}
+	if ms, err := c.fetchConfigModels(ctx); err == nil {
+		for _, m := range ms {
+			meta[strings.ToLower(m.ID)] = m
+		}
 	}
 
-	// 备选：走账号自己端点的 /models（需要认证，且通常只给 id）
-	if cr == nil || cr.Credential == "" {
-		return nil, fmt.Errorf("拉取模型清单失败（config 端点不可用，且账号没有凭证）")
+	// ① 权威 ID 来源：账号自己的端点
+	if cr != nil && cr.Credential != "" {
+		if models, err := c.fetchProviderModels(ctx, cr); err == nil && len(models) > 0 {
+			out := make([]Model, 0, len(models))
+			for _, m := range models {
+				id := strings.ToLower(strings.TrimSpace(m.ID))
+				if id == "" {
+					continue
+				}
+				if b, ok := meta[id]; ok {
+					// 用端点给的 **id 原值**（保持 API 接受的大小写），
+					// 元信息只补能力字段
+					b.ID = m.ID
+					b.Source = "upstream"
+					out = append(out, b)
+					continue
+				}
+				out = append(out, Model{ID: m.ID, Name: m.ID, Source: "upstream"})
+			}
+			if len(out) > 0 {
+				return out, nil
+			}
+		}
 	}
-	return c.fetchProviderModels(ctx, cr)
+
+	// ② 退化为 client/configs（统一转小写 —— 实测 API 接受小写）
+	if len(meta) > 0 {
+		out := make([]Model, 0, len(meta))
+		for _, m := range meta {
+			m.ID = strings.ToLower(m.ID)
+			m.Name = firstNonEmpty(m.Name, m.ID)
+			m.Source = "upstream"
+			out = append(out, m)
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+		return out, nil
+	}
+
+	return nil, fmt.Errorf("拉取模型清单失败（账号端点与 config 端点都不可用）")
 }
 
 // fetchConfigModels 从免认证的 client/configs 拉模型清单。
