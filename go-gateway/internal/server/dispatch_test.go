@@ -47,7 +47,7 @@ func (f *fakeQoder) Aggregate(io.Reader, string) (map[string]any, error) {
 }
 
 // newDispatchTestHandler 造一个带 Qoder 派发的 Handler。
-func newDispatchTestHandler(t *testing.T, q QoderUpstream, auths ...*auth.Auth) *Handler {
+func newDispatchTestHandler(t *testing.T, q ProductUpstream, auths ...*auth.Auth) *Handler {
 	t.Helper()
 	p := pool.New("")
 	for _, a := range auths {

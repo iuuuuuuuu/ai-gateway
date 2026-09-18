@@ -282,7 +282,7 @@ func main() {
 	//
 	// 开启后：加载 Qoder 账号进同一个池，并注入 Qoder 的请求派发实现。
 	// 关闭时两者都不做 —— 行为与单产品时代逐字相同（回滚点）。
-	var qoderDispatch server.QoderUpstream
+	var qoderDispatch server.ProductUpstream
 	if cfg.Pool.MultiProduct {
 		qoderDir := cfg.Pool.QoderAuthDir
 		if qoderDir == "" {

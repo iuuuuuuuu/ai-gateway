@@ -55,16 +55,16 @@ type Config struct {
 	// 因此被链接器的死代码消除剔出了二进制 —— 表现为「代码写了但根本调不到」。
 	GrowthTasks *GrowthTaskAPI
 
-	// Qoder Qoder 产品的上游客户端；nil = 不支持 Qoder（多产品关闭）。
+	// Qoder Qoder 产品的上游实现；nil = 该产品不可用（多产品关闭）。
 	//
-	// 为什么单独一个字段而不是让 upstream.Client 兼容两个产品：
-	// 两者的鉴权（COSY 签名 vs Bearer）、端点、请求体编码、响应形状**全都不同**，
-	// 硬塞进一个客户端会让每个方法都长出产品分支。分开后各自独立演进，
-	// 派发只在 forwardChat 的**一个点**上做（见 dispatchUpstream）。
-	//
-	// 用接口而不是具体类型：server 包不该依赖 qoder 包的全部实现细节，
-	// 只需「把请求发出去、把流拿回来」这一个能力（便于单测注入假实现）。
-	Qoder QoderUpstream
+	// 为什么每个产品一个字段而不是一张 map：
+	//   · 产品数量是**固定的少数几个**（WorkBuddy 走默认路径，其余各一个）；
+	//   · 字段能让"哪些产品已接入"在 Config 上一眼看清，而 map 要读代码才知道；
+	//   · 编译期类型安全（map 要 interface{} 或统一接口，丢失具体类型）。
+	Qoder ProductUpstream
+
+	// Zcode ZCode（Z.AI / 智谱）产品的上游实现；nil = 该产品不可用。
+	Zcode ProductUpstream
 
 	// AllowedModels 「限制使用的模型」白名单：**非空时只放行列表内的模型**，
 	// 其余一律拒绝；空（或 nil）= 不限制（默认，向后兼容）。

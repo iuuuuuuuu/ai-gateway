@@ -1,0 +1,43 @@
+{
+  "id": "add-zcode-provider",
+  "name": "add-zcode-provider",
+  "title": "接入 ZCode（Z.AI / 智谱 GLM 编码套餐）作为第三个产品",
+  "description": "参考 TriDefender/zcode-api，把 ZCode 作为第三个产品接入：凭证（{apiKey}.{secret}）、两个服务商（Z.AI/智谱）、OAuth 设备流 + 凭证导入、账号页、网关多产品路由、全流程实测。实测确认上游不需要客户端签名，故省掉整套 Ed25519+PoW 逻辑。",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": "ai-gateway-core",
+  "priority": "P1",
+  "creator": "杨鹏豪",
+  "assignee": "杨鹏豪",
+  "createdAt": "2026-09-19",
+  "completedAt": null,
+  "branch": "migrate/aigw-v1.0.2",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [
+    { "id": "Z1", "title": "接口重命名 QoderUpstream → ProductUpstream（纯重命名）", "status": "pending" },
+    { "id": "Z2", "title": "ZCode 后端（凭证 / 服务商 / 额度 / 模型 / 对话）", "status": "pending" },
+    { "id": "Z3", "title": "ZCode 登录（OAuth 设备流 + 凭证兑换 + 导入）", "status": "pending" },
+    { "id": "Z4", "title": "宿主接入（Rust 命令 + 账号库 + HTTP 路由）", "status": "pending" },
+    { "id": "Z5", "title": "ZCode 账号页", "status": "pending" },
+    { "id": "Z6", "title": "网关派发（接进多产品路由）", "status": "pending" },
+    { "id": "Z7", "title": "全流程实测 + 打包", "status": "pending" }
+  ],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "go-gateway/internal/zcode/",
+    "crates/ai-gateway-core/src/modules/zcode_account.rs",
+    "crates/ai-gateway-core/src/modules/zcode_login.rs",
+    "src/pages/ZcodePage.tsx"
+  ],
+  "notes": "参考实现：https://github.com/TriDefender/zcode-api（本地克隆在 test-bin/ref-zcode-api）。关键实测：上游不校验客户端签名头（5 组对照实验见 uitest/probe-zcode-signing-control.cjs）。",
+  "meta": {
+    "reference": "https://github.com/TriDefender/zcode-api",
+    "reference_local": "test-bin/ref-zcode-api",
+    "key_finding": "上游不需要客户端签名（Ed25519+PoW），可省约 600 行密码学逻辑"
+  }
+}

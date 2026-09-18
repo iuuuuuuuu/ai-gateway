@@ -57,13 +57,15 @@ const (
 	ProductWorkBuddy = "workbuddy"
 	// ProductQoder QoderWork。
 	ProductQoder = "qoder"
+	// ProductZcode ZCode（Z.AI / 智谱 GLM 编码套餐）。
+	ProductZcode = "zcode"
 )
 
 // ProductOf 返回账号所属产品，空串归一成 ProductWorkBuddy。
 //
 // 归一化而非保留空串：调用方写 `a.ProductOf() == ProductWorkBuddy` 比
 // 到处判 `== "" || == "workbuddy"` 更不容易漏（漏判会把 WorkBuddy 账号
-// 当成未知产品，走进 Qoder 的派发分支）。
+// 当成未知产品，走进其它产品的派发分支）。
 func (a *Auth) ProductOf() string {
 	if a.Product == "" {
 		return ProductWorkBuddy
@@ -73,6 +75,9 @@ func (a *Auth) ProductOf() string {
 
 // IsQoder 报告该账号是否属于 Qoder。
 func (a *Auth) IsQoder() bool { return a.Product == ProductQoder }
+
+// IsZcode 报告该账号是否属于 ZCode。
+func (a *Auth) IsZcode() bool { return a.Product == ProductZcode }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
 func (a *Auth) Lock() { a.mu.Lock() }
