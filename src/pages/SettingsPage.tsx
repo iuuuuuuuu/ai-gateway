@@ -368,6 +368,35 @@ const TASK_RECORD_TITLE: Record<GatewayTaskName, string> = {
   trial: "trial 加油包",
 };
 
+/**
+ * 「跑了但一条记录都没有」时，**按任务**解释为什么 —— 每个任务的原因并不相同。
+ *
+ * 为什么需要它：零记录路径此前只有一句通用解释（「记录只在成功且有新变化/
+ * 失败/重要跳过时写入」），对活跃上报说得通，但对开学季就答非所问 ——
+ * 所有者点完开学季看到的是「已触发一轮」+ 一句与开学季无关的套话，
+ * 于是来问「是不是我装的版本不对 / 记录没生效」。
+ *
+ * 各任务的真实原因（来自 Go 侧实现）：
+ *   - school   只在真的领到奖励时才写记录（`school.go`）。活动在期但
+ *              任务未达标、或今天已经领过，都是「无事发生」的正常形态。
+ *   - nightowl 时段外整轮被跳过，不会有任何账号记录。
+ *   - activity 同一账号同一结果每天最多一条，当天已跑过就什么都不写。
+ *   - trial    同上，且只有国际版账号参与。
+ *
+ * 文案一律**纯文本**：这里渲染进 Alert 正文，Markdown 记号（如 **加粗**）
+ * 会原样显示成星号，看起来像没写完的富文本（实测确认，见 skipExplanation）。
+ */
+const TASK_EMPTY_HINT: Record<GatewayTaskName, string> = {
+  activity:
+    "同一账号同一结果每天最多一条，因此今天已经跑过的话，再点也不会产生新记录。",
+  nightowl:
+    "夜猫子只在 23:00–08:00（北京时间）内才会计入；时段外点击会被整轮跳过，因此没有任何记录。",
+  school:
+    "开学季任务只在真的领到奖励时才写记录。若本轮没有可领的（活动任务尚未达标，或今天已经领过），就是「无事发生」的正常形态 —— 不是没生效。可到活动页确认各任务的完成进度。",
+  trial:
+    "trial 加油包只在真的领到、且本周期尚未领取时才写记录；该任务仅国际版账号参与。",
+};
+
 /** 跳过原因码 → 面向用户的解释（与 Go `scheduler.TaskRunResult.Skip` 一一对应）。 */
 function skipExplanation(skip: string | null | undefined): string | null {
   switch (skip) {
@@ -773,14 +802,18 @@ function AutoCareTasksCard() {
         // 网关确实跑了，但没有写任何记录。这是**正常**的：记录只在
         // 成功且无变化 / 失败 / 重要跳过时才写，且按天去重（TaskDaily）。
         // 必须说清楚，否则用户会以为「跑了但没生效」。
+        //
+        // 解释**按任务**给（TASK_EMPTY_HINT）：通用那句对活跃上报成立，
+        // 但开学季/夜猫子的零记录各有完全不同的原因，套用通用解释等于答非所问。
         setOutcomes((prev) => ({
           ...prev,
           [task]: {
             ran: true,
             headline: "已执行一轮：本轮没有账号产生新记录",
             details: [
+              TASK_EMPTY_HINT[task],
               res.message || "网关已跑完这一轮。",
-              "记录只在「成功且有新变化 / 失败 / 重要跳过」时写入，同一账号同一结果每天最多一条 —— 因此这里为空通常表示本周期该做的都已完成。",
+              "记录只在「成功且有新变化 / 失败 / 重要跳过」时写入，同一账号同一结果每天最多一条。",
             ],
             tone: "ok",
             at: Date.now(),
@@ -912,7 +945,14 @@ function AutoCareTasksCard() {
         {cfg ? (
           <>
             {tasks.map((task) => (
-              <div key={task.name} className="border-b border-border/60">
+              <div
+                key={task.name}
+                // 语义钩子：按任务精确定位卡片（探针/测试要点某一张卡的
+                // 「立即执行」，此前只能按「第一个匹配」——实测点错到了活跃上报）。
+                data-slot="task-card"
+                data-task={task.name}
+                className="border-b border-border/60"
+              >
                 <SettingsFieldRow
                   label={task.label}
                   description={task.description}
