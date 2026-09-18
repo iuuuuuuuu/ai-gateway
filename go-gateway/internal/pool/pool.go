@@ -185,9 +185,16 @@ func (e *entry) healthy(now time.Time) bool {
 	}
 	// 用户手动禁用 = **只不接流量**，养号任务照跑。
 	//
-	// 放在这里（而不是并入上面的 disabled）是刻意的：本函数是**选号路径**的
-	// 统一闸门 —— pickLocked / pickEarliestExpiryLocked / routedTierDayLocked
-	// 都靠它筛候选，一处即覆盖全部分流场景。
+	// ⚠ 本函数**不是**所有选号路径的统一闸门 —— 这里曾经写着「pickLocked /
+	// pickEarliestExpiryLocked / routedTierDayLocked 都靠它筛候选，一处即覆盖
+	// 全部分流场景」，但那是**错的**：pickEarliestExpiryLocked 因为要选
+	// 「冷却中的账号」（本函数会把它们判掉），自己手写了一遍筛选，**不经过这里**。
+	// 结果是它的 NoRoute 检查缺失，被标「不接流量」的账号在兜底时仍会被选中
+	//（现场症状：用户禁用了国际版账号，国服冷却后请求仍打到连不通的国际版 → 503）。
+	//
+	// 教训：**「统一闸门」是承诺，不是事实** —— 加检查时要逐个调用点核对，
+	// 不能凭这里的注释认为已经覆盖。现已补上该检查，并有回归测试
+	//（fallback_noroute_test.go::TestSelectionPathsAgreeOnNoRoute）防止再次分叉。
 	//
 	// 而养号任务**不走**本函数：它们只判 `st.Disabled`（网关自判定的死号：
 	// session 死 / 额度冻结，那种跑了也白跑）。于是「禁用 = 不接流量、但照常养号」
@@ -1083,6 +1090,19 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, mo
 		}
 		if e.disabled {
 			continue // 禁用的账号永不参与兜底
+		}
+		// 用户手动禁用（不接流量）同样永不参与兜底。
+		//
+		// 为什么必须显式写在这里：本函数**没有**调 healthy()（它自己手写筛选，
+		// 因为 healthy() 会把「正在冷却」也判掉，而兜底恰恰要选冷却中的账号）。
+		// 于是 healthy() 里的 NoRoute 检查在这里**不会生效** —— 实测确认：
+		// 一个被标 NoRoute 且处于冷却期的账号，会被本函数选中（有回归测试钉住）。
+		//
+		// 现场症状：所有者把国际版账号全部标为「不接流量」（因为不禁用就没法用），
+		// 国服账号因上游限流冷却后，兜底把这些他明确禁用的账号又选了回来，
+		// 请求打到连不通的国际版 → 503。用户看到的是「禁用也没用」。
+		if e.a != nil && e.a.NoRoute {
+			continue
 		}
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
