@@ -487,7 +487,7 @@ export default function DoubaoPage() {
           <div>
             <h1 className="flex items-center gap-2 text-xl font-semibold tracking-tight">
               <DoubaoMark size={26} />
-              豆包账号管理
+              豆包账号
             </h1>
             <p className="mt-1 text-sm text-muted-foreground">
               豆包客户端在 Chromium 加密之外还有一层客户端级加密，离线读不出明文凭证 ——

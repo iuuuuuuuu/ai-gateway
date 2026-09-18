@@ -459,7 +459,7 @@ export default function TraePage() {
           <div>
             <h1 className="flex items-center gap-2 text-xl font-semibold tracking-tight">
               <TraeMark size={26} variant={activeApp.variant} />
-              Trae 账号管理
+              Trae 账号
             </h1>
             <p className="mt-1 text-sm text-muted-foreground">
               Trae Work 与 Trae 共用同一份账号库，但登录态快照互相独立。

@@ -1452,7 +1452,7 @@ export default function CreditStatsPage() {
             <Alert>
               <CircleAlert />
               <AlertTitle>暂无当前账号</AlertTitle>
-              <AlertDescription>可以先去账号管理导入或登录账号；历史事件仍会保留在下方最近事件中。</AlertDescription>
+              <AlertDescription>可以先去「WorkBuddy 账号」导入或登录账号；历史事件仍会保留在下方最近事件中。</AlertDescription>
             </Alert>
           )}
 

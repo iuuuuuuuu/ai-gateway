@@ -803,7 +803,7 @@ function formatUntil(iso?: string): string | null {
 }
 
 /**
- * 积分格式化：与账号管理页卡片逐字一致的输出（最多两位小数 + 千分位）。
+ * 积分格式化：与「WorkBuddy 账号」页卡片逐字一致的输出（最多两位小数 + 千分位）。
  *
  * 刻意不 import 账号卡片的同名函数：那个文件正在被并行修改，
  * 跨文件引用会把两处改动耦合成一个编译单元；而「显示成什么样」必须一致，
@@ -1286,7 +1286,7 @@ function modelCoolingTitle(acc: GatewayPoolAccount): string {
  * 界面上标识一个账号的名字：**备注 → 上游昵称 → uid 前缀**。
  *
  * 为什么不直接用昵称：上游昵称对国服账号常为空，回退到 uid 只剩一串随机串，
- * 用户根本对不上「这是谁的号」；备注是用户自己在「账号管理」里填的标签
+ * 用户根本对不上「这是谁的号」；备注是用户自己在「WorkBuddy 账号」里填的标签
  * （如「公司号」「备用」），正是为这个场景准备的，所以排在最前。
  * 两者都缺时才退到 uid 前缀，保证任何账号都有一个稳定、可点选的显示名。
  *
@@ -1388,7 +1388,7 @@ function PoolAccountRow({
         title:
           "你已手动把该账号标记为「不接流量」：网关不会把请求路由到它，" +
           "但签到、活跃上报、成长任务等养号任务**仍在正常执行**。" +
-          "在「账号管理」里取消禁用即可重新接流量。",
+          "在「WorkBuddy 账号」里取消禁用即可重新接流量。",
       }
     : acc.disabled
       ? {
@@ -1627,7 +1627,7 @@ function PoolAccountRow({
         <td className="px-2.5 py-1 text-right">
           <span
             className={cn("tabular-nums", balance !== null ? "text-foreground/90" : "text-muted-foreground")}
-            title="网关侧记录的最新积分余额（与账号管理页的实时查询口径不同，可能差一个刷新周期）"
+            title="网关侧记录的最新积分余额（与「WorkBuddy 账号」页的实时查询口径不同，可能差一个刷新周期）"
           >
             {balance !== null ? exactTokenFormatter.format(balance) : "—"}
           </span>
@@ -1775,7 +1775,7 @@ function ManualAccountOption({
   onToggle: () => void;
   /** 账号库元信息（区域 / Token 到期）—— 网关 /status 不提供这些。 */
   meta?: AccountMeta;
-  /** 逐账号积分（与账号管理页卡片同源：`POST /api/credits`）。 */
+  /** 逐账号积分（与「WorkBuddy 账号」页卡片同源：`POST /api/credits`）。 */
   credit?: CreditExpiry;
   creditLoading?: boolean;
 }) {
@@ -2061,7 +2061,7 @@ export default function GatewayPage() {
   }, []);
 
   /**
-   * 账号元信息与逐账号积分，直接复用账号管理页那个 store。
+   * 账号元信息与逐账号积分，直接复用「WorkBuddy 账号」页那个 store。
    *
    * 为什么必须复用而不是在本页另拉一份：账号卡片（`account-card.tsx`）展示的
    * 「剩余积分 / N 个积分包 / 到期时间」全部来自这里的 `creditMap`，其数据源是
@@ -3581,7 +3581,7 @@ export default function GatewayPage() {
     //   去除上限（本版）      → 0（仅 px-8 内边距）
     // 结论：只要保留居中定宽，宽屏上就一定有留白；本页内容（状态块、设置行、
     // 账号池卡片、用量表）都是横向铺开的行式布局，能自然拉伸，故完全放开。
-    // 账号管理页同步做了相同处理，两页留白表现保持一致。
+    // 「WorkBuddy 账号」页同步做了相同处理，两页留白表现保持一致。
     // Radix Tooltip 必须有 TooltipProvider 祖先，否则抛错导致整页白屏
     //（本页此前没有 Tooltip，故一直没有该 Provider；本轮新增了页头 tooltip）。
     <TooltipProvider delayDuration={250}>
@@ -3643,7 +3643,7 @@ export default function GatewayPage() {
               {/* 也走统一口径：这条提示同样是「标识一个账号」，显示 uid
                   会让用户不知道是哪个号要去重登（备注/昵称都有的号尤其明显）。 */}
               {excludedAccounts.map((a) => accountLabel({ uid: a.uid, nickname: a.nickname, note: a.note })).join("、")}
-              ：refresh token 已失效，继续使用只会让每次请求失败一次。请到「账号管理」页重新登录，
+              ：refresh token 已失效，继续使用只会让每次请求失败一次。请到「WorkBuddy 账号」页重新登录，
               恢复后会自动重新加入账号池。
             </div>
           </div>
@@ -3832,7 +3832,7 @@ export default function GatewayPage() {
             </div>
             {availableAccounts.length === 0 ? (
               <div className="rounded-lg border border-dashed px-3 py-4 text-center text-xs text-muted-foreground">
-                账号库为空，请先在「账号管理」添加账号。
+                账号库为空，请先在「WorkBuddy 账号」添加账号。
               </div>
             ) : (
               <div className="max-h-56 min-w-0 overflow-y-auto rounded-lg border">

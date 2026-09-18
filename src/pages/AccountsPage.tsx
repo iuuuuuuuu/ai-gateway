@@ -895,7 +895,7 @@ export default function AccountsPage() {
       <header className="mb-6">
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0">
-            <h1 className="text-[28px] font-semibold tracking-tight">账号管理</h1>
+            <h1 className="text-[28px] font-semibold tracking-tight">WorkBuddy 账号</h1>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
               统一管理 WorkBuddy、CodeBuddy IDE 与 CodeBuddy CLI 账号、积分和签到状态。
             </p>

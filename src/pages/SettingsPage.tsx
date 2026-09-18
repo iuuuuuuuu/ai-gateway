@@ -791,7 +791,7 @@ function AutoCareTasksCard() {
             headline: "已执行一轮（结果明细读取失败）",
             details: [
               res.message || "网关已跑完这一轮。",
-              "无法读取账号记录，因此看不到本轮跑了哪些账号；结果可能已经写入，请到「账号管理 → 查看记录」确认。",
+              "无法读取账号记录，因此看不到本轮跑了哪些账号；结果可能已经写入，请到「WorkBuddy 账号 → 查看记录」确认。",
             ],
             tone: "warn",
             at: Date.now(),

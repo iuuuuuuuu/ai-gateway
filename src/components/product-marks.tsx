@@ -154,3 +154,38 @@ export function DoubaoMark({ size = 32, className }: MarkProps) {
     </span>
   );
 }
+
+/**
+ * Qoder 图标。
+ *
+ * 用「尖括号 + 中心点」表达「代码 + 智能体」，与 Qoder 的定位一致。
+ * 配色用 Qoder 品牌的深紫蓝渐变，与豆包（蓝紫）、Trae（深灰）在同排时
+ * 能一眼区分 —— 三个产品图标并列时靠**色相**而非细节区分，小尺寸下更可靠。
+ *
+ * 刻意**不**去抓官方 logo 图片：本仓库是公开仓库，引入第三方商标资源有
+ * 授权问题；且现有各产品的 mark 也都是自绘几何图形（见 WorkBuddyMark 等），
+ * 统一自绘比混用图片更一致。
+ */
+export function QoderMark({ size = 32, className }: MarkProps) {
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        "inline-flex shrink-0 items-center justify-center rounded-[22%] bg-gradient-to-br from-violet-500 to-purple-700 text-white shadow-sm",
+        className,
+      )}
+      style={{ width: size, height: size }}
+    >
+      <svg viewBox="0 0 24 24" fill="none" className="size-[62%]" aria-hidden="true">
+        <path
+          d="M8.6 7.4 4.2 12l4.4 4.6M15.4 7.4 19.8 12l-4.4 4.6"
+          stroke="currentColor"
+          strokeWidth="1.9"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+        <circle cx="12" cy="12" r="1.85" fill="currentColor" />
+      </svg>
+    </span>
+  );
+}

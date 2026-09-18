@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
-import { ArrowUp, Bot, MessageCircle, MessagesSquare, Server, Settings, Sparkles, Terminal, User } from "lucide-react";
+import { ArrowUp, Bot, Braces, MessageCircle, MessagesSquare, Server, Settings, Sparkles, Terminal, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
@@ -13,6 +13,7 @@ import AgentsPage from "@/pages/AgentsPage";
 import SettingsPage from "@/pages/SettingsPage";
 import TraePage from "@/pages/TraePage";
 import DoubaoPage from "@/pages/DoubaoPage";
+import QoderPage from "@/pages/QoderPage";
 import { StatusDot, AppIconMark } from "@/components/product-marks";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { Badge } from "@/components/ui/badge";
@@ -148,7 +149,25 @@ function Layout() {
             }
           >
             <User className="size-4" />
-            账号管理
+            WorkBuddy 账号
+          </NavLink>
+          {/* Qoder 账号：与 Trae / 豆包 并列的第二个「XX账号」入口。
+              路由独立（/qoder），账号库与凭证也独立 —— 三个产品互不干扰。
+              放在 WorkBuddy 之后，是因为它与 WorkBuddy 一样属于「主力产品」，
+              而 Trae / 豆包 是各自客户端的辅助工具。 */}
+          <NavLink
+            to="/qoder"
+            className={({ isActive }) =>
+              cn(
+                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+                isActive
+                  ? "bg-foreground/[0.06] font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+              )
+            }
+          >
+            <Braces className="size-4" />
+            Qoder 账号
           </NavLink>
           <NavLink to="/token-stats" className={({ isActive }) => cn("flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors", isActive ? "bg-foreground/[0.06] font-medium text-foreground" : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground")}><MessagesSquare className="size-4" />Token 统计</NavLink>
           <NavLink
@@ -259,6 +278,7 @@ export default function App() {
         <Routes>
           <Route element={<Layout />}>
             <Route path="/" element={<AccountsPage />} />
+            <Route path="/qoder" element={<QoderPage />} />
             <Route path="/credit-stats" element={<CreditStatsPage />} />
             <Route path="/token-stats" element={<TokenStatsPage />} />
             <Route path="/gateway" element={<GatewayPage />} />

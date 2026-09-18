@@ -891,7 +891,7 @@ export interface GatewayPoolAccount {
   uid: string;
   nickname?: string;
   /**
-   * 用户自己在「账号管理」里填的备注（如「公司号」「备用」）。
+   * 用户自己在「WorkBuddy 账号」里填的备注（如「公司号」「备用」）。
    *
    * **不是网关下发的**：网关根本不知道备注，池里原本只有 `nickname`。
    * 宿主在 `gateway_status()` 里用本地账号库把它**合并**进池快照
@@ -980,7 +980,7 @@ export interface GatewayStatusAccount {
   uid: string;
   nickname?: string;
   /**
-   * 用户自己在「账号管理」里填的备注。
+   * 用户自己在「WorkBuddy 账号」里填的备注。
    *
    * 界面取名口径是 **备注 → 昵称 → uid 前缀**（见 `accountLabel`）：
    * 上游昵称对国服账号常为空，uid 又是一串随机串，备注才是分辨
