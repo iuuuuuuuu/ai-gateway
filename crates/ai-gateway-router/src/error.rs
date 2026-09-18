@@ -38,6 +38,10 @@ pub enum GatewayError {
     #[error("upstream parse: {0}")]
     UpstreamParse(String),
 
+    /// 上游按业务语义返回的失败（带分类），驱动账号池冷却策略。
+    #[error("{0}")]
+    UpstreamError(crate::upstream::classify::UpstreamError),
+
     /// 无可用账号（全冷却/禁用/占满）。
     #[error("all accounts unavailable (cooling/disabled)")]
     NoHealthyAccount,

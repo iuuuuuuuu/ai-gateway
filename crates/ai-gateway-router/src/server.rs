@@ -17,7 +17,7 @@
 
 use axum::{
     extract::State,
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, Request, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -37,7 +37,14 @@ pub const SERVICE_NAME: &str = "workbuddy2api";
 /// 网关共享状态。
 pub struct AppState {
     /// 账号池。
-    pub pool: Mutex<Pool>,
+    ///
+    /// 用 `Arc` 是因为会话粘性路由需要一个「读可用账号列表」的回调，
+    /// 而它必须在 `AppState` 之外独立持有池引用（`SessionRouter::new` 时就要给出）。
+    pub pool: Arc<Mutex<Pool>>,
+    /// 上游客户端（转发用）。
+    pub client: crate::upstream::client::Client,
+    /// 会话粘性路由；`None` = 不启用。
+    pub session: Option<crate::session::Router>,
     /// API Key；空 = 不鉴权。
     pub api_key: String,
     /// 单请求最多换号次数。
@@ -48,8 +55,8 @@ pub struct AppState {
     pub refresh_skew: std::time::Duration,
     /// Redis 观测模式字符串（`"upstash"` / `"noop"`），供 /status 透出。
     pub redis_mode: String,
-    /// 粘性会话绑定数（无粘性路由时为 0）。
-    pub sticky_count: usize,
+    /// 「单一模型」锁定；非空时只放行该模型。
+    pub allowed_model: String,
 }
 
 /// 构建路由。
@@ -166,7 +173,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             "cooling": cooling,
             "disabled": disabled,
             "in_flight_full": inflight_full,
-            "sticky_sessions": state.sticky_count,
+            "sticky_sessions": state.session.as_ref().map(|s| s.count()).unwrap_or(0),
             "redis_mode": redis_mode,
         }),
     )
@@ -358,22 +365,198 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     )
 }
 
-/// `POST /v1/chat/completions` —— 占位实现（流式/非流式在后续步骤接入）。
+/// `POST /v1/chat/completions` —— OpenAI Chat Completions 入口。
 ///
-/// 当前返回 503 `no_healthy_account`：先将路由/鉴权/响应骨架打通并对齐，
-/// 避免在 upstream 客户端就绪前引入不可验证的转发逻辑。
+/// 流程：读体 → 鉴权 → 取流式标志与会话键 → 交给 [`crate::forward::forward_chat`]
+/// 完成「选号 → 刷新 token → 转发 → 失败换号」，再按请求是否流式分别：
+///   - 流式：逐帧规范化后透传 SSE
+///   - 非流式：上游 SSE 已聚合为 `chat.completion`，直接返回
+///
+/// 错误码与 Go 侧契约一致：默认 503 `no_healthy_account`，
+/// 只有**请求侧**错误（单一模型拒绝、上下文超长）才偏离，让客户端看到真实原因。
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    request: Request<axum::body::Body>,
 ) -> Response {
+    let headers = request.headers().clone();
     if let Some(r) = check_auth(&state, &headers) {
         return r;
     }
-    openai_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "no_healthy_account",
-        "all accounts unavailable (cooling/disabled)",
-    )
+
+    let body = match axum::body::to_bytes(request.into_body(), MAX_REQUEST_BODY).await {
+        Ok(b) => b,
+        Err(_) => {
+            return openai_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                &format!("请求体超过上限（{} MiB）", MAX_REQUEST_BODY / (1 << 20)),
+            )
+        }
+    };
+    if body.is_empty() {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "empty request body",
+        );
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Peek {
+        #[serde(default)]
+        stream: bool,
+    }
+    let stream = serde_json::from_slice::<Peek>(&body).map(|p| p.stream).unwrap_or(false);
+
+    // 会话粘性键：OpenAI 侧用 metadata.conversation_id / conversation_id。
+    let sess_key = if state.session.is_some() {
+        crate::session::extract_key(&body)
+    } else {
+        String::new()
+    };
+
+    // 区域路由：仅对「图像能力两区不同」的模型 + 带图片的请求生效。
+    let model = crate::forward::model_of(&body);
+    let route = image_route_for(&model, crate::forward::request_has_image(&body));
+
+    // 池锁只在 forward 内部按操作短暂持有（网络等待期间不持锁），
+    // 因此这里不需要先取锁 —— 否则会把整个请求串行化。
+    let mut ctx = crate::forward::ForwardCtx {
+        pool: &state.pool,
+        client: &state.client,
+        session: state.session.as_ref(),
+        max_rotate: state.max_rotate,
+        soft_cooldown: state.soft_cooldown,
+        refresh_skew: state.refresh_skew,
+        allowed_model: state.allowed_model.clone(),
+    };
+    let (result, status, failure) =
+        crate::forward::forward_chat(&mut ctx, &body, stream, &sess_key, route).await;
+    if let Some(f) = failure {
+        let code = match f.kind {
+            crate::forward::FailureKind::ContextTooLong => "context_length_exceeded",
+            _ => "no_healthy_account",
+        };
+        return openai_error(
+            StatusCode::from_u16(f.status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            code,
+            &f.message,
+        );
+    }
+
+    match result {
+        Some(crate::forward::ChatResult::Stream {
+            uid,
+            response,
+            ..
+        }) => {
+            let resp = sse_response(response);
+            // 流式租约由读取任务在流结束后释放。
+            spawn_release_on_end(state.clone(), uid, resp)
+        }
+        Some(crate::forward::ChatResult::Response { body, .. }) => {
+            json_response(StatusCode::OK, Value::Object(body))
+        }
+        None => openai_error(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            "no_healthy_account",
+            "all accounts unavailable (cooling/disabled)",
+        ),
+    }
+}
+
+/// 请求体上限。
+///
+/// 从 8MB 提到 32MB：长对话（Claude Code / Codex 一轮带上大量文件内容与工具结果）
+/// 很容易突破 8MB，而**静默截断**会把合法 JSON 切成半截字节透传给上游，
+/// 上游报 `unexpected EOF`，表现为「请求参数有误」—— 客户端完全无法定位到是网关截断。
+const MAX_REQUEST_BODY: usize = 32 << 20;
+
+/// 把上游 SSE 响应包成 `text/event-stream`，逐帧规范化后流式透传。
+///
+/// 空流（0 有效帧）时补一帧 error 与 `[DONE]`，与 Go 侧 `upstream.Stream` 一致。
+fn sse_response(upstream: reqwest::Response) -> Response {
+    let stream = upstream.bytes_stream();
+    let mut frames = crate::upstream::sse::SseFramesIter::new(stream);
+    let body = async_stream::stream! {
+        while let Some(item) = frames.next_frame().await {
+            match item {
+                Ok(text) => yield Ok::<_, std::io::Error>(text),
+                Err(e) => {
+                    yield Err(std::io::Error::other(e.to_string()));
+                    break;
+                }
+            }
+        }
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("X-Accel-Buffering", "no")
+        .body(axum::body::Body::from_stream(body))
+        .unwrap_or_else(|_| {
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "构造流式响应失败",
+            )
+        })
+}
+
+/// 在流结束后释放账号在途租约。
+fn spawn_release_on_end(state: Arc<AppState>, uid: String, resp: Response) -> Response {
+    if uid.is_empty() {
+        return resp;
+    }
+    let (parts, body) = resp.into_parts();
+    let wrapped = async_stream::stream! {
+        use futures_util::StreamExt;
+        let mut inner = body.into_data_stream();
+        while let Some(chunk) = inner.next().await {
+            yield chunk;
+        }
+        if let Ok(mut pool) = state.pool.lock() {
+            pool.release(&uid);
+        }
+    };
+    Response::from_parts(parts, axum::body::Body::from_stream(wrapped))
+}
+
+/// 「带图片的该模型请求」应使用的区域。
+///
+/// 背景（实测逐账号 × 逐模型发图验证）：`glm-5.3` / `glm-5.2` 是**两区共有**的
+/// 模型名，但两区是**不同的后端模型** —— 国服后端能读图，国际版把图片替换成
+/// 固定占位符（`prompt_tokens` 增量恒为 +33，与图片体积无关），模型只能回
+/// 「无法查看图片」。池里两区账号混用而选号只看到期日与冷却、不看区域，
+/// 于是同一个模型名会随机命中两个后端 —— 用户看到「时好时坏」。
+///
+/// 三种情形：
+/// - 不带图片 → 不约束。两区文本能力都正常，没必要为纯文本放弃一半账号的额度。
+/// - 带图片 + 该模型**只在一区**可读 → 强制该区域，选不出就报错。
+/// - 带图片 + 两区都能读 / 无实测结论 → 不约束（不做偏好，偏好只会白损失一半额度）。
+fn image_route_for(model: &str, has_image: bool) -> crate::forward::ImageRoute {
+    use crate::upstream::measured::{measured_image_capability, ImageCapability};
+    if !has_image {
+        return crate::forward::ImageRoute::any();
+    }
+    let cn = measured_image_capability(model, crate::pool::Region::CN) == ImageCapability::Supported;
+    let intl =
+        measured_image_capability(model, crate::pool::Region::Intl) == ImageCapability::Supported;
+    match (cn, intl) {
+        (true, false) => crate::forward::ImageRoute {
+            region: crate::pool::Region::CN,
+            required: true,
+        },
+        (false, true) => crate::forward::ImageRoute {
+            region: crate::pool::Region::Intl,
+            required: true,
+        },
+        // 两区都能读，或都没有实测结论 → 不约束。
+        // 「没实测过」不等于「不行」，把没验过的模型一律拒掉会误伤本可用的图片能力；
+        // 两区都能读时做偏好只会白损失一半账号的额度。
+        _ => crate::forward::ImageRoute::any(),
+    }
 }
 
 #[cfg(test)]
@@ -385,13 +568,18 @@ mod tests {
 
     fn test_state(api_key: &str) -> Arc<AppState> {
         Arc::new(AppState {
-            pool: Mutex::new(Pool::new(String::new())),
+            pool: Arc::new(Mutex::new(Pool::new(String::new()))),
+            client: crate::upstream::client::Client::new(
+                crate::upstream::client::ClientConfig::default(),
+            )
+            .expect("构造测试客户端"),
+            session: None,
             api_key: api_key.into(),
             max_rotate: 3,
             soft_cooldown: std::time::Duration::from_secs(60),
             refresh_skew: std::time::Duration::from_secs(600),
             redis_mode: String::new(),
-            sticky_count: 0,
+            allowed_model: String::new(),
         })
     }
 

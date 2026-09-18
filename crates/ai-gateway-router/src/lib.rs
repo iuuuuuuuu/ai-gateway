@@ -12,6 +12,7 @@
 //! | `pool`      | `internal/pool/pool.go`          |
 //! | `upstream`  | `internal/upstream/*.go`         |
 //! | `session`   | `internal/session/session.go`    |
+//! | `forward`   | `internal/server/forward.go`     |
 //! | `server`    | `internal/server/handler.go`     |
 //! | `logging`   | `internal/server/logging.go`     |
 //! | `scheduler` | `internal/scheduler/*.go`        |
@@ -24,8 +25,10 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod forward;
 pub mod pool;
 pub mod server;
+pub mod session;
 pub mod upstream;
 
 pub use error::{GatewayError, Result};
