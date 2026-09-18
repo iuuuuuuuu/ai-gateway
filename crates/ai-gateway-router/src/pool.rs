@@ -134,6 +134,13 @@ struct Entry {
     /// 详见模块文档「与 Go 实现的关键差异」；对应 Go 侧 `entry.lastUsedSeq`。
     /// 0 表示从未被选中（与 `last_used = None` 对应）。
     last_used_seq: i64,
+
+    /// 模型级冷却：`model → 冷却截止时刻`。
+    ///
+    /// 与账号级 `until` 分开记账是本字段存在的全部理由：`429 code=6004` 只表示
+    /// 该账号的**这个模型**额度用尽，上游明确提示可换模型继续用。若按账号整体冷却，
+    /// 会连带浪费这些仍可用的额度。
+    model_until: std::collections::HashMap<String, SystemTime>,
 }
 
 impl Entry {
@@ -166,6 +173,54 @@ impl Entry {
         }
         true
     }
+
+    /// 报告该账号的**指定模型**当前是否可用。
+    ///
+    /// 模型级冷却（429 code=6004）只影响单个模型，账号其他模型仍然可用 ——
+    /// 上游文案明确写着「您也可以切换其他模型继续使用」。
+    /// 因此模型冷却独立记账，**不碰**账号级的 `until`。
+    fn model_available(&self, model: &str, now: SystemTime) -> bool {
+        if model.is_empty() {
+            return true;
+        }
+        match self.model_until.get(model) {
+            Some(u) => now >= *u,
+            None => true,
+        }
+    }
+}
+
+/// 服务区域。
+///
+/// 与 Go 侧 `auth.Region` 对应；由账号 `domain` 后缀推导（`.ai` → 国际版）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Region {
+    /// 不限区域（不参与过滤）。
+    Any,
+    /// 国服（`.cn` / `copilot.tencent.com`）。
+    CN,
+    /// 国际版（`.ai`）。
+    Intl,
+}
+
+/// 账号所属区域（不返回 `Any`）。
+pub fn region_of(a: &Auth) -> Region {
+    if a.is_intl() {
+        Region::Intl
+    } else {
+        Region::CN
+    }
+}
+
+/// 选号时的区域约束强度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionFilter {
+    /// 不做区域约束。
+    Any,
+    /// 先在该区域挑，挑不到放开到全池（「区域不符但能用」好过没号）。
+    Prefer(Region),
+    /// 只在该区域挑，挑不到返回 `None`（跨区降级会静默丢图片，不可接受）。
+    Strict(Region),
 }
 
 /// 把 Unix 秒时间戳格式化为本地日期 `YYYY-MM-DD`。
@@ -351,6 +406,7 @@ impl Pool {
                 in_flight: 0,
                 expire_at: s.expire_at,
                 last_used_seq: 0,
+                model_until: std::collections::HashMap::new(),
             };
             if let Some(&idx) = self.by_uid.get(&uid) {
                 self.entries[idx] = entry;
@@ -565,6 +621,7 @@ impl Pool {
             in_flight: 0,
             expire_at,
             last_used_seq: 0,
+            model_until: std::collections::HashMap::new(),
         });
         self.by_uid.insert(uid, idx);
     }
@@ -684,6 +741,51 @@ impl Pool {
         e.disabled = true;
         e.reason = reason.to_string();
         self.dirty = true;
+    }
+
+    /// **模型级**冷却：只冷却该账号的这一个模型，账号其他模型不受影响。
+    ///
+    /// 与 [`Pool::cooldown`] 的关键区别：本方法**不喂熔断器** ——
+    /// 模型限流是配额信号而非账号故障，喂熔断会把整个账号封掉，
+    /// 连带浪费该账号其他模型仍可用的额度。
+    ///
+    /// 到期时间优先取上游文案里的重置时刻（见 `classify::parse_reset_time`），
+    /// 解析不出才回退固定软冷却。
+    pub fn cooldown_model(&mut self, uid: &str, model: &str, until: SystemTime, reason: &str) {
+        if model.is_empty() {
+            // 无模型信息时退化为账号级软冷却，避免「模型限流」被静默忽略。
+            let d = until
+                .duration_since(SystemTime::now())
+                .unwrap_or_default();
+            self.cooldown(uid, CoolKind::Soft, d, reason);
+            return;
+        }
+        let Some(&idx) = self.by_uid.get(uid) else { return };
+        let e = &mut self.entries[idx];
+        e.model_until.insert(model.to_string(), until);
+        e.reason = reason.to_string();
+        self.dirty = true;
+    }
+
+    /// 该账号当前处于冷却中的模型列表（`(模型名, 剩余秒数)`），供 `/status` 观测。
+    pub fn cooling_models(&self, uid: &str) -> Vec<(String, i64)> {
+        let now = SystemTime::now();
+        let Some(&idx) = self.by_uid.get(uid) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, i64)> = self.entries[idx]
+            .model_until
+            .iter()
+            .filter_map(|(m, u)| {
+                if now < *u {
+                    Some((m.clone(), u.duration_since(now).map(|d| d.as_secs() as i64).unwrap_or(0)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.sort();
+        out
     }
 
     /// 更新余额。
@@ -836,20 +938,100 @@ impl Pool {
         self.pick_excluding(&[])
     }
 
+    /// 按模型挑号（跳过 `tried`），并**过滤掉该模型正处于冷却中的账号**。
+    ///
+    /// 模型级冷却必须在这里过滤：否则选号会挑中一个该模型已限流的账号，
+    /// 白跑一轮再换号，表现为「一直撞同一个 6004」。
+    pub fn pick_for_model(&mut self, model: &str, tried: &[String]) -> Option<Auth> {
+        self.pick_inner(tried, model, RegionFilter::Any)
+    }
+
+    /// 按模型 + 区域偏好挑号。
+    ///
+    /// `required=true` 时**只**在指定区域挑，挑不到返回 `None`（调用方据此报错）；
+    /// `required=false` 时先在该区域挑，挑不到放开到全池。
+    ///
+    /// 两者语义差别是「带图片请求」的核心：偏好会在该区域没号时静默回退到
+    /// 读不到图的后端，用户拿到一句「抱歉，我无法查看图片」却毫不知情；
+    /// 强制则明确告诉用户「需要哪个区域的账号」，可排查、可行动。
+    pub fn pick_for_model_region(
+        &mut self,
+        model: &str,
+        tried: &[String],
+        region: Region,
+        required: bool,
+    ) -> Option<Auth> {
+        let filter = if required {
+            RegionFilter::Strict(region)
+        } else {
+            RegionFilter::Prefer(region)
+        };
+        self.pick_inner(tried, model, filter)
+    }
+
+    /// 按 UID + 模型 + 区域直取（粘性命中路径用）。
+    pub fn pick_by_uid_for_model_region(
+        &mut self,
+        uid: &str,
+        model: &str,
+        region: Region,
+    ) -> Option<Auth> {
+        let idx = *self.by_uid.get(uid)?;
+        let now = SystemTime::now();
+        let e = &self.entries[idx];
+        if !e.healthy(now) || self.in_flight_full(e) || !e.model_available(model, now) {
+            return None;
+        }
+        // 区域偏好：不匹配则视为不可用（由调用方决定是否改绑）。
+        if region != Region::Any && region_of(&e.a) != region {
+            return None;
+        }
+        self.mark_used(idx);
+        Some(self.entries[idx].a.clone())
+    }
+
     /// 挑号，跳过 `tried` 中的 UID。
     pub fn pick_excluding(&mut self, tried: &[String]) -> Option<Auth> {
+        self.pick_inner(tried, "", RegionFilter::Any)
+    }
+
+    /// 挑号主路径：候选过滤（tried / 健康 / 在途 / 模型冷却 / 区域）→ 到期分层 → 加权抽签。
+    fn pick_inner(&mut self, tried: &[String], model: &str, region: RegionFilter) -> Option<Auth> {
         let now = SystemTime::now();
 
-        // 1) 收集 healthy 且未在途占满、且不在 tried 中的候选（按 UID 排序保证确定性）
+        // 1) 收集候选（按 UID 排序保证确定性）
+        let base = |i: usize, p: &Self| {
+            let e = &p.entries[i];
+            !tried.iter().any(|t| t == &e.a.uid)
+                && e.healthy(now)
+                && !p.in_flight_full(e)
+                && e.model_available(model, now)
+        };
         let mut cands: Vec<usize> = (0..self.entries.len())
-            .filter(|&i| {
-                let e = &self.entries[i];
-                !tried.iter().any(|t| t == &e.a.uid)
-                    && e.healthy(now)
-                    && !self.in_flight_full(e)
-            })
+            .filter(|&i| base(i, self))
             .collect();
         cands.sort_by(|&a, &b| self.entries[a].a.uid.cmp(&self.entries[b].a.uid));
+
+        // 区域过滤：Strict 只留目标区域；Prefer 先试目标区域，为空再放开全池。
+        cands = match region {
+            RegionFilter::Any => cands,
+            RegionFilter::Strict(r) => cands
+                .into_iter()
+                .filter(|&i| region_of(&self.entries[i].a) == r)
+                .collect(),
+            RegionFilter::Prefer(r) => {
+                let narrowed: Vec<usize> = cands
+                    .iter()
+                    .copied()
+                    .filter(|&i| region_of(&self.entries[i].a) == r)
+                    .collect();
+                if narrowed.is_empty() {
+                    cands
+                } else {
+                    narrowed
+                }
+            }
+        };
 
         if cands.is_empty() {
             return self.pick_earliest_expiry(tried, now).map(|a| a);
