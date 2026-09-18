@@ -270,10 +270,32 @@ export function visionDisplay(model: GatewayModelItem): CapabilityDisplay {
 }
 
 /**
+ * 该模型的可选档位**范围是否未声明**（上游没列 supportedEfforts，但有默认档）。
+ *
+ * 网关在 `reasoning_range_undeclared` 里下发（见 capability.go 的 modelReasoningFields）。
+ *
+ * ⚠ 语义是「**不知道确切范围**」，**不是**「不可选」。实测（2026-09-18）这类模型
+ * 接受整个标准阶梯且档位真的生效，所以界面必须鼓励尝试，而不是显示成固定档。
+ */
+export function reasoningRangeUndeclaredOf(model: GatewayModelItem): boolean | undefined {
+  const r = model.reasoning as { range_undeclared?: unknown } | undefined;
+  return firstDefined<boolean>(
+    typeof model.reasoning_range_undeclared === "boolean"
+      ? model.reasoning_range_undeclared
+      : undefined,
+    typeof model.reasoningRangeUndeclared === "boolean" ? model.reasoningRangeUndeclared : undefined,
+    typeof r?.range_undeclared === "boolean" ? r.range_undeclared : undefined,
+  );
+}
+
+/**
  * 该模型是否被网关标记为**固定单档**（有思考能力，但不能选档）。
  *
- * 网关在 `reasoning_fixed` 里下发（见 capability.go 的 modelReasoningFields）。
- * 与「未声明」区分：那时字段缺失，这里是显式 true。
+ * @deprecated 实测（2026-09-18）并不存在「档位不可选」的模型：未声明
+ * supportedEfforts 的那些接受整个标准阶梯、档位真的生效
+ *（deepseek-v4.1-flash 推理长度单调递增 low 397 → medium 420 → high 646 → max 776）。
+ * 上一版据此标成「固定」是**错的** —— 会让用户以为调档没用而放弃。
+ * 保留本函数只为兼容可能残留的旧字段；新代码一律用 reasoningRangeUndeclaredOf。
  */
 export function reasoningFixedOf(model: GatewayModelItem): boolean | undefined {
   const r = model.reasoning as { fixed?: unknown } | undefined;
@@ -287,8 +309,8 @@ export function reasoningFixedOf(model: GatewayModelItem): boolean | undefined {
 /**
  * 该模型是否**支持思考**（上游声明的能力，与「能否选档」正交）。
  *
- * 网关只在确知时下发（缺失 = 未声明）。用途是把「固定单档」与
- * 「不支持思考」分开 —— 前者 supports_reasoning=true 但没有可选档位。
+ * 网关只在确知时下发（缺失 = 未声明）。用于区分「有思考但不支持」与
+ * 「上游根本没声明思考信息」——后者才该显示「—」。
  */
 export function supportsReasoningOf(model: GatewayModelItem): boolean | undefined {
   const r = model.reasoning as { supports_reasoning?: unknown } | undefined;
@@ -315,14 +337,22 @@ export function canDisableThinkingOf(model: GatewayModelItem): boolean | undefin
 /**
  * 思考档位展示态。
  *
- * **三态必须分开**（所有者报过「国服还是国际服都是有思考档位的，你这里数据不对吧」）：
+ * **三态必须分开**（所有者先后报过两次：
+ *「国服还是国际服都是有思考档位的，你这里数据不对吧」、
+ *「我现在就用的这个模型，用的 max 档位，为什么没有拦截报错？」）：
  *
- *	A. 有可选档位 → 列出全部档位名
- *	B. 固定单档   → 显示「固定 <档位>」+ Tooltip 说明「有思考能力、不能选档」
- *	C. 未声明     → 「—」+ 说明「上游未声明，不代表没有」
+ *	A. 上游声明了 supportedEfforts → 列出该模型自己的范围
+ *	B. 未声明范围但有默认档     → 列出**标准阶梯** + 标注「范围未声明」
+ *	C. 什么都没声明             → 「—」+ 说明「上游未声明，不代表没有」
  *
- * 早先把 B 与 C 混成一种（都显示「—」），于是 18 个（国服）/ 8 个（国际版）
- * **确实有思考能力**的模型被显示成「无档位」—— 那是在编造否定结论。
+ * ⚠ 关键教训：B 曾经被显示成「固定 high」—— 那是我上一版的错误推断。
+ * 实测证明这类模型**接受整个标准阶梯且档位真的生效**：
+ *
+ *	deepseek-v4.1-flash 推理长度（各档 2 次均值）
+ *	    low 397 → medium 420 → high 646 → max 776   单调递增
+ *	off / 乱写的值 → HTTP 400（上游确实在校验，只是没逐模型列出范围）
+ *
+ * 「固定」一词让用户以为调档没用而放弃 —— 与「谎报不支持图片」同样有害。
  *
  * 列出全部档位名是所有者明确要求（「信息不能为了清爽而丢」）：
  * 只显示「支持 3 档」会把用户真正要选的 max 藏起来。
@@ -331,38 +361,35 @@ export function effortsDisplay(model: GatewayModelItem): CapabilityDisplay {
   const efforts = effortsOf(model);
   const def = defaultEffortOf(model);
 
-  // ---- B. 固定单档：有思考能力，但不能选 ----
-  // 判据优先看网关的显式标记；supportsReasoning 为真时同样成立
-  //（任一为真即可，避免某条路径漏下发标记时又退回「—」）。
-  const fixed =
-    reasoningFixedOf(model) === true || (supportsReasoningOf(model) === true && !efforts?.length);
-  if ((!efforts || efforts.length === 0) && fixed) {
-    const shown = def || "未声明";
-    const label = def && EFFORT_LABELS[def.toLowerCase()] ? `（${effortLabel(def)}）` : "";
-    return {
-      text: `固定 ${shown}`,
-      title:
-        `该模型**支持思考**，但上游没有提供可选档位 —— 无法手动切换。` +
-        (def ? `固定使用 ${def}${label}。` : "") +
-        `这不是「不支持思考」，只是档位不可选。`,
-      unknown: false,
-      items: [],
-    };
-  }
-
-  if (!efforts) {
+  // ---- C. 上游什么都没声明 ----
+  if (!efforts || efforts.length === 0) {
     return {
       text: UNKNOWN_TEXT,
-      title: "上游未声明思考档位（未下发任何 reasoning 字段），不代表没有档位",
+      title: "上游未声明任何思考档位信息，不代表该模型不能思考",
       unknown: true,
     };
   }
+
   // 显示用**上游原始档位名**（`low`/`high`/`max`）：它是用户真正要写进配置、
   // 也是网关降级逻辑实际比对的值（见 upstream/payload.go 的
   // normalizeReasoningEffort），翻译成中文会让「照着界面上写」写错。
   // 中文含义放 Tooltip 里补充，两者都不丢。
   const known = efforts.filter((e) => EFFORT_LABELS[e.toLowerCase()] !== undefined);
   const cannotDisable = canDisableThinkingOf(model) === false;
+  const undeclared = reasoningRangeUndeclaredOf(model) === true;
+
+  // ---- B. 范围未声明：列出标准阶梯，并说清「这是标准值、确切范围上游未给」 ----
+  if (undeclared) {
+    const title =
+      `上游未声明该模型的确切档位范围；以下是标准档位：${efforts.join(" / ")}` +
+      (known.length > 0 ? `（${known.map(effortLabel).join(" / ")}）` : "") +
+      (def ? ` · 未指定时默认 ${def}` : "") +
+      "。实测指定档位确实生效（越高档推理越长），但范围外的值可能被上游拒绝。" +
+      (cannotDisable ? " · 该模型不能关闭思考（不支持 off）" : "");
+    return { text: efforts.join(" / "), title, unknown: false, items: efforts };
+  }
+
+  // ---- A. 上游声明了范围 ----
   const title =
     `支持 ${efforts.length} 档：${efforts.join(" / ")}` +
     (known.length > 0 ? `（${known.map(effortLabel).join(" / ")}）` : "") +

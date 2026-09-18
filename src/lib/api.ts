@@ -802,14 +802,28 @@ export function getGatewayConfig(): Promise<GatewayConfigResult> {
 }
 
 /**
- * 手动触发一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
+ * 手动触发一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial / 活跃地图）。
  *
- * 这 4 个任务的实现在 Go 网关里，本函数只是把请求转过去。
- * 注意返回 `ran=false` + `skip` 是**正常结果**（如夜猫子不在 23:00–08:00 窗口内），
- * 调用方应当作说明展示而非报错。
+ * 这些任务的实现在 Go 网关里，本函数只是把请求转过去。
+ *
+ * `accountId` 决定**作用范围**（这是一个语义分水岭，不要混用）：
+ *   - 省略 → **全部账号**（右上角「一键操作」的入口）
+ *   - 给出 uid → **只作用于该账号**（账号卡片菜单里的入口）
+ *
+ * 注意返回 `ran=false` + `skip` 是**正常结果**（如夜猫子不在 23:00–08:00
+ * 窗口内、该任务是国服专属而此号是国际版），调用方应当作说明展示而非报错。
  */
-export function runGatewayTask(task: GatewayTaskName): Promise<GatewayTaskRunResult> {
-  return call<GatewayTaskRunResult>("run_gateway_task", { task });
+export function runGatewayTask(
+  task: GatewayTaskName,
+  accountId?: string,
+): Promise<GatewayTaskRunResult> {
+  // 显式转 camelCase：Tauri 按 rename_all="camelCase" 取值，
+  // 传 account_id 会被静默丢弃（于是「只跑这个账号」变成「跑全部账号」——
+  // 静默的语义放大，比报错危险得多）。
+  return call<GatewayTaskRunResult>("run_gateway_task", {
+    task,
+    accountId: accountId ?? null,
+  });
 }
 
 /**

@@ -1675,6 +1675,48 @@ func (p *Pool) AvailableUIDs() []string {
 	return uids
 }
 
+// ProbeUIDs 返回**可用于只读探测**的账号 UID（按 UID 排序）。
+//
+// 与 AvailableUIDs 的唯一区别：**包含被用户标记「不接流量」（NoRoute）的账号**。
+//
+// 为什么探测要包含它们：NoRoute 的语义是「别把**用户请求**路由到它」，
+// 而拉一次 `/v3/config` 是只读的、不产生任何流量或积分消耗 —— 它既不违反
+// 用户意图，又恰恰是这些账号最有价值的用途。
+//
+// 实测踩过的坑：`pickProbeAccountInRegion` 原先用 AvailableUIDs，而我把 NoRoute
+// 加进 healthy() 之后，被禁用的国际版账号**既不接流量、也拿不到区域真值了** ——
+// 表现为「deepseek-v4.1-flash 明明两区都有，界面却标『仅国服』」
+//（因为国际版拉不到清单，于是被当成「该区没有这个模型」）。
+// 这正是「把不接流量与不作为混为一谈」的第二次犯法，与导出侧那个 bug 同源。
+//
+// 仍**排除** e.disabled（网关判定 session 死 / 额度冻结）：那种账号连
+// /v3/config 都会失败，拿来探测只会白跑一轮并写进日志噪音。
+func (p *Pool) ProbeUIDs() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	uids := make([]string, 0, len(p.byUID))
+	for uid, e := range p.byUID {
+		if e.disabled {
+			continue
+		}
+		// 只看「未在冷却/熔断期」：探测失败多半是账号凭证问题，
+		// 与冷却无关，但冷却中的账号同样会失败，跳过即可。
+		if !e.until.IsZero() && now.Before(e.until) {
+			continue
+		}
+		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+			continue
+		}
+		if e.a == nil || e.a.AccessToken == "" {
+			continue
+		}
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	return uids
+}
+
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
 // 否则返回 nil。供会话粘性路由命中校验与直取使用。
 func (p *Pool) PickByUID(uid string) *auth.Auth {

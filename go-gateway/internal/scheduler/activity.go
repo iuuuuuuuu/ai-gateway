@@ -48,6 +48,10 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		if st.Disabled {
 			continue
 		}
+		// 账号作用域：只在「作用于该账号」的手动触发时收窄（排程路径恒为 true）。
+		if !inAccountScope(ctx, st.UID) {
+			continue
+		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessToken == "" {
 			continue

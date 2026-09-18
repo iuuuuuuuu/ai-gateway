@@ -387,6 +387,50 @@ func TestStaticFallbackDoesNotClaimAbsence(t *testing.T) {
 	}
 }
 
+// TestNoRouteAccountStillSuppliesRegionTruth 被用户禁用（no_route）的账号**仍要**
+// 提供它所在区域的上游真值。
+//
+// 这是实测踩出来的回归（所有者报「ds flash 国内外明明都有，怎么你又搞成只有国内有了」）：
+// 把 NoRoute 加进 pool.healthy() 之后，`pickProbeAccountInRegion` 原先用的
+// AvailableUIDs() 就不再返回那些账号 → 拉不到国际版清单 →
+// knownRegion[intl]=false → 该模型被标成「仅国服」，而两区其实都有。
+//
+// 根因：把「不接流量」与「不作为」混为一谈。拉 /v3/config 是**只读探测**，
+// 不产生流量也不消耗积分 —— 用户禁用账号是为了不接请求，不是为了让我们
+// 连它的区域事实都看不到。
+//
+// 夹具里国服账号是**正常可用**的：否则「池里一个可接流量的账号都没有」
+// 会掩盖真实差异，用例就可能因为别的原因通过。
+func TestNoRouteAccountStillSuppliesRegionTruth(t *testing.T) {
+	const model = "shared-model"
+	resetModelsCache()
+
+	h := NewHandler(Config{
+		Pool: testPoolWith(
+			&auth.Auth{UID: authCN, AccessToken: "t", Domain: "copilot.tencent.com", SoonestExpireAt: 1 << 40},
+			&auth.Auth{
+				UID: authIntl, AccessToken: "t", Domain: "www.workbuddy.ai",
+				SoonestExpireAt: 1 << 40, NoRoute: true,
+			},
+		),
+		Upstream:  regionAwareUpstream(t, v3WithModels(model), v3WithModels(model)),
+		MaxRotate: 1,
+	})
+
+	entry := entryOf(t, h, model)
+
+	// 两区都有真值 → 不该下发任何区域字段（尤其**不该**说「仅国服」）。
+	if sup := strList(entry["supported_regions"]); len(sup) != 0 {
+		t.Errorf("两区都有真值（其中国际版账号被用户禁用）时不该标单区，实际 %v", sup)
+	}
+	if uv := strList(entry["unverified_regions"]); len(uv) != 0 {
+		t.Errorf("被禁用的账号仍能提供真值，不该标未验证，实际 %v", uv)
+	}
+	if note, _ := entry["region_note"].(string); note != "" {
+		t.Errorf("不该有区域说明，实际 %q", note)
+	}
+}
+
 // TestRegionNoteHelpersSeparateAssertionFromUnverified 两个文案函数语义不得混用。
 func TestRegionNoteHelpersSeparateAssertionFromUnverified(t *testing.T) {
 	confirmed := regionNote(regionCodeCN)

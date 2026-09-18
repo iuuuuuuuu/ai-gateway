@@ -889,16 +889,31 @@ pub fn save_gateway_config(
     Ok(json!({ "config": v }))
 }
 
-/// POST /tasks/run —— 手动触发网关侧一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
+/// POST /tasks/run —— 手动触发网关侧一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial / 活跃地图）。
 ///
 /// 手动触发**不**检查「启用」开关：该开关只管后台是否自动排程，用户主动点击就该执行
 ///（与 `checkin_all` / `travel_run` 的既有语义一致）。
 ///
-/// 返回值里的 `ran=false` + `skip` 是**正常结果**（如夜猫子不在 23:00–08:00 窗口内），
-/// 界面应当作说明展示而非报错 —— 否则用户点了「立即执行」看到红色错误会以为坏了。
+/// `account_id` 决定作用范围：
+///   - 省略 / 空 → **全部账号**（右上角「一键操作」的入口）
+///   - 给出 uid  → **只作用于该账号**（账号卡片菜单里的入口）
+///
+/// 加这个参数是因为原实现只有「全部账号」一种语义，而账号菜单里的入口位置
+/// 暗示的是一对一 —— 用户在某个账号的卡片上点「活跃上报」，跑的却是整池
+///（所有者明确指出这个语义错误）。
+///
+/// 返回值里的 `ran=false` + `skip` 是**正常结果**（如夜猫子不在 23:00–08:00
+/// 窗口内、该任务是国服专属而此号是国际版），界面应当作说明展示而非报错 ——
+/// 否则用户点了「立即执行」看到红色错误会以为坏了。
 #[tauri::command]
-pub async fn run_gateway_task(task: String) -> Result<Value, String> {
-    Ok(ai_gateway_core::modules::gateway::run_task_now(&task).await)
+pub async fn run_gateway_task(task: String, account_id: Option<String>) -> Result<Value, String> {
+    Ok(
+        ai_gateway_core::modules::gateway::run_task_for(
+            &task,
+            account_id.as_deref().unwrap_or(""),
+        )
+        .await,
+    )
 }
 
 /// POST /tasks/growth —— 成长任务「一键完成」（列表 / 单账号执行 / 全账号执行）。

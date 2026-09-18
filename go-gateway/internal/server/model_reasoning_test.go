@@ -1,21 +1,24 @@
 package server
 
-// 思考等级（reasoning effort）的两条契约：
+// 思考等级（reasoning effort）的契约（2026-09-18 修订）：
 //
-//  1. **下发**：/v1/models 要把上游声明的档位告诉客户端（此前 reasoning.effort
-//     被解析进来却全树无消费方，客户端看不到任何档位信息）。
-//  2. **校验**：客户端显式指定的档位不被该模型支持时**直接拒绝**（400 +
-//     unsupported_reasoning_effort），而不是静默降级。
+//  1. **下发**：/v1/models 要把档位信息告诉客户端，并如实区分三种情形 ——
+//     上游声明了范围 / 未声明范围但有默认档 / 什么都没声明。
+//  2. **透传**：客户端指定的档位**原样发给上游**，网关既不拦也不改写。
 //
-// 第 2 条是本项目对上游行为的**有意收紧**。原作者的做法是静默降级
-//（`normalizeReasoningEffort`：把 max 改写成 ≤max 的最高支持档，或在
-//「支持档全部高于请求档」时取最低档），只在日志里留一行 downgraded。
-// 那在客户端看来是「我明明调了 max，回答却很短」——用户既不知道发生了什么，
-// 也不知道该改成哪个档，只能反复试。既然档位是**显式**指定的，不支持时就该
-// 如实报错并列出支持哪些档。
+// ⚠ 第 2 条曾相反（「不支持就 400 拒绝」），2026-09-18 被实测推翻：
 //
-// 静默降级本身没有删除：它仍服务于「档位名无法识别」之外的场景（例如
-// 客户端从别处抄来一个该模型没有的档位），但**显式且已知的档位**不再被悄悄改写。
+//	hy3     声明 [low, high]     → medium / max / minimal / **off** 全部接受
+//	glm-5.2 声明 [high, xhigh]  → low / max / medium / **off** 全部接受
+//
+// 上游对范围外的档照常接受 ⇒ supportedEfforts 只是「界面建议列出哪些」，
+// 不是可用范围。据它拦截会误拒**合法**请求，而用户拿到 400 后毫无办法。
+//
+// 静默改写（原 normalizeReasoningEffort）同样移除：用户明确调 max 却被降成
+// high，他只会看到「调了没效果」，日志里那行 downgrade 他看不到。
+//
+// 现在唯一的权威判据是**上游自己**：它接受的档正常生效，不接受的它报 400，
+// 错误原样返回客户端。
 
 import (
 	"encoding/json"
@@ -26,6 +29,7 @@ import (
 	"testing"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
 )
 
 // v3WithEfforts 贴近真实的 /v3/config：三个模型的档位声明各不相同。
@@ -178,23 +182,34 @@ func TestModelReasoningFieldsCopiesSlice(t *testing.T) {
 // TestModelReasoningFieldsThreeStates 思考能力的三种情形必须分开表达。
 //
 // 这是所有者报的缺陷（「国服还是国际服都是有思考档位的，你这里数据不对吧」）：
-// 早先本函数只判 `len(efforts)==0 → return nil`，把「固定档」与「不支持思考」
-// 混成一件事，于是 18 个（国服）/ 8 个（国际版）**有思考能力、只是不可选档**
-// 的模型在界面上显示成「—」。
+// 早先本函数只判 `len(efforts)==0 → return nil`，把「未声明范围」与「不支持思考」
+// 混成一件事，于是 18 个（国服）/ 8 个（国际版）模型在界面上显示成「—」。
 //
-// 三种情形（均为 2026-09-18 实测上游 /v3/config 的真实形态）：
+// ⚠ 2026-09-18 二次修正（所有者报「我现在就用的这个模型，用的 max 档位，
+// 为什么没有拦截报错？」）：上一版把这种情况标成 `reasoning_fixed=true`
+//（「固定单档」）—— 那是**错的**。实测 deepseek-v4.1-flash：
 //
-//	有 supportedEfforts       → 列出档位（12 国服 / 12 国际版）
-//	只有 effort/defaultEffort → 支持思考但只有固定一档（18 国服 / 8 国际版）
-//	两者都无                  → 才是真的不支持思考，不下发
+//	off / bogus_value → HTTP 400 "the reasoning effort value is not supported"
+//	minimal/low/medium/high/max/xhigh → **全部接受**
+//	低到高各档推理长度：low 397 → medium 420 → high 646 → max 776（单调递增）
+//
+// 单调序列不可能由随机性产生 ⇒ **档位真的生效**，用户调 max 确实有效。
+// 所以「固定」这个词是谎报（方向与「谎报不支持图片」同样有害：让用户放弃调档）。
+//
+// 三种情形（2026-09-18 实测上游 /v3/config 的真实形态）：
+//
+//	A. 有 supportedEfforts       → 如实例出该模型自己的范围（12 国服 / 12 国际版）
+//	B. 只有 effort/defaultEffort → **范围未声明**：默认档 X，档位可指定，
+//	                               标准阶梯可用（18 国服 / 8 国际版）
+//	C. 两者都无                  → 上游没声明任何思考信息，不下发
 func TestModelReasoningFieldsThreeStates(t *testing.T) {
-	// ---- A. 有可选档位 ----
+	// ---- A. 上游声明了可选档位 ----
 	a := modelReasoningFields([]string{"low", "high"}, "high")
 	if a == nil {
 		t.Fatal("有档位时必须下发字段")
 	}
 	if list, ok := a["supported_efforts"].([]string); !ok || len(list) != 2 {
-		t.Errorf("应下发 2 个档位，实际 %#v", a["supported_efforts"])
+		t.Errorf("应下发上游声明的 2 个档位，实际 %#v", a["supported_efforts"])
 	}
 	if a["reasoning_fixed"] != false {
 		t.Errorf("有可选档位时 reasoning_fixed 应为 false，实际 %#v", a["reasoning_fixed"])
@@ -202,27 +217,56 @@ func TestModelReasoningFieldsThreeStates(t *testing.T) {
 	if a["default_effort"] != "high" {
 		t.Errorf("默认档应为 high，实际 %#v", a["default_effort"])
 	}
+	// 声明了范围时**不得**标「范围未声明」——那会让客户端把上游的确切声明
+	// 当成「不知道」，从而放开本该拒绝的档位。
+	if _, bad := a["reasoning_range_undeclared"]; bad {
+		t.Error("上游已声明 supportedEfforts 时不该标 reasoning_range_undeclared")
+	}
 
-	// ---- B. 只有固定档：**这是本缺陷的核心** ----
+	// ---- B. 未声明可选范围，但有默认档：**本缺陷的核心** ----
 	// 真实形态：reasoning={"effort":"high","summary":"auto"}，无 supportedEfforts。
 	b := modelReasoningFields(nil, "high")
 	if b == nil {
-		t.Fatal("只有固定档时必须下发字段 —— 返回 nil 会让界面显示「—」，" +
-			"用户以为该模型不能思考（这正是所有者报的缺陷）")
+		t.Fatal("有默认档时必须下发字段 —— 返回 nil 会让界面显示「—」，" +
+			"用户以为该模型不能思考")
 	}
-	if b["reasoning_fixed"] != true {
-		t.Errorf("固定档应标 reasoning_fixed=true，实际 %#v", b["reasoning_fixed"])
+	if b["reasoning_fixed"] == true {
+		t.Error("**不得**标成 fixed：实测该类模型接受整个标准阶梯，" +
+			"「固定」会让用户以为调档没用而放弃（所有者正是这么被误导的）")
+	}
+	if b["reasoning_range_undeclared"] != true {
+		t.Errorf("应标 reasoning_range_undeclared=true（范围未声明 ≠ 不可选），实际 %#v",
+			b["reasoning_range_undeclared"])
 	}
 	if b["supports_reasoning"] != true {
-		t.Errorf("固定档也是「支持思考」，supports_reasoning 应为 true，实际 %#v", b["supports_reasoning"])
+		t.Errorf("该类模型确实支持思考，supports_reasoning 应为 true，实际 %#v", b["supports_reasoning"])
 	}
 	if b["default_effort"] != "high" {
-		t.Errorf("固定档必须下发它是哪一档，实际 %#v", b["default_effort"])
+		t.Errorf("必须下发默认档，实际 %#v", b["default_effort"])
 	}
-	// 可选项为空 —— 不能伪造一个 ["high"] 的单元素列表：
-	// 那会让客户端渲染出「只有一个选项的下拉框」，暗示可以选择。
-	if list, ok := b["supported_efforts"].([]string); !ok || len(list) != 0 {
-		t.Errorf("固定档的可选档位应为**空列表**（区别于字段缺失），实际 %#v", b["supported_efforts"])
+	// 必须给出可选档位（标准阶梯）——空列表会让客户端渲染出没有选项的控件，
+	// 用户只能看到「固定」而无法尝试任何档位，那正是本缺陷的表现。
+	list, ok := b["supported_efforts"].([]string)
+	if !ok || len(list) < 4 {
+		t.Fatalf("应下发标准阶梯（实测该类模型接受整套档位），实际 %#v", b["supported_efforts"])
+	}
+	// 不得含 off：实测该模型明确拒绝 off（HTTP 400），列出会让用户选到必然报错的值。
+	for _, e := range list {
+		if e == "off" {
+			t.Error("标准阶梯不得包含 off —— 实测该类模型会拒绝它（HTTP 400）")
+		}
+	}
+	// 顺序必须稳定且由低到高：map 遍历顺序随机，不排序会让客户端下拉框顺序跳变。
+	wantOrder := []string{"minimal", "low", "medium", "high", "xhigh", "max"}
+	if len(list) != len(wantOrder) {
+		t.Errorf("标准阶梯应有 %d 档，实际 %d：%v", len(wantOrder), len(list), list)
+	} else {
+		for i := range wantOrder {
+			if list[i] != wantOrder[i] {
+				t.Errorf("阶梯顺序应由低到高 %v，实际 %v", wantOrder, list)
+				break
+			}
+		}
 	}
 
 	// ---- C. 完全无思考信息：不下发 ----
@@ -243,73 +287,41 @@ func TestModelReasoningFieldsThreeStates(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 二、校验：不支持就拒绝
+// 二、透传：档位**一律原样发给上游**，网关既不拦也不改写
+//
+// ⚠ 这一节在 2026-09-18 被**整体反转**，原内容是「不支持就拒绝」。
+//
+// 原前提：supportedEfforts 是该模型的**硬范围**，范围外的档该拒。
+// 实测推翻（真实流式调用，国服账号）：
+//
+//	hy3     声明 [low, high]     → medium / max / minimal / **off** 全部接受
+//	glm-5.2 声明 [high, xhigh]  → low / max / medium / **off** 全部接受
+//
+// 上游对范围外的档照常接受 ⇒ supportedEfforts 只是「界面建议列出哪些」，
+// 不是可用范围。据它拦截会把**合法请求**拒掉，而且用户拿到 400 后毫无办法
+//（他用的档其实能用）—— 比漏拦严重得多。
+//
+// 现在网关的职责收敛为**如实透传**：
+//   · 上游接受的档 → 正常生效（实测 deepseek-v4.1-flash low→max 推理单调递增）
+//   · 上游不接受的档 → 上游自己报 400，错误原样返回（唯一权威判据）
+//
+// 这几条用例锁住「网关不再自作主张」这个性质。
 // ---------------------------------------------------------------------------
 
-// TestUnsupportedEffortRejectedBeforeUpstream 请求不支持的档位时直接 400，
-// **且一次上游都不打**（请求侧错误，换号重试无意义）。
-func TestUnsupportedEffortRejectedBeforeUpstream(t *testing.T) {
+// TestUndeclaredEffortRangePassesThrough 未声明范围的档位照常放行到上游。
+//
+// 这正是所有者报的那个现象：他用 max 档、没被拦截 —— **那是对的**。
+// 本条把它固化成契约，防止有人再按 supportedEfforts 加回拦截。
+func TestUndeclaredEffortRangePassesThrough(t *testing.T) {
 	var calls int32
 	resetModelsCache()
 	p := testPoolWith(
-		&auth.Auth{UID: "u1", AccessToken: "at1", Domain: "copilot.tencent.com", SoonestExpireAt: 1 << 40},
-		&auth.Auth{UID: "u2", AccessToken: "at2", Domain: "copilot.tencent.com", SoonestExpireAt: 1 << 40},
-		&auth.Auth{UID: "u3", AccessToken: "at3", Domain: "copilot.tencent.com", SoonestExpireAt: 1 << 40},
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999, Domain: "copilot.tencent.com", SoonestExpireAt: 1 << 40},
 	)
-	h := NewHandler(Config{
-		Pool:      p,
-		MaxRotate: 3,
-		Upstream: newFakeUpstream(t, func(string) (int, string, bool) {
-			atomic.AddInt32(&calls, 1)
-			return http.StatusOK, v3WithEfforts, false
-		}),
-	})
-
-	// 先拉一次模型清单填充缓存（正常使用时由 /v1/models 或上一次请求填好）。
-	listModels(t, h)
-	before := atomic.LoadInt32(&calls)
-
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"effort-fixed","reasoning_effort":"max","messages":[{"role":"user","content":"hi"}]}`)))
-
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("不支持的档位应返回 400，实际 %d（body=%s）", rec.Code, rec.Body.String())
-	}
-	if n := atomic.LoadInt32(&calls) - before; n != 0 {
-		t.Errorf("请求侧错误不该打上游（换号无用），实际打了 %d 次", n)
-	}
-
-	var payload map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("响应不是 JSON: %v", err)
-	}
-	errObj, _ := payload["error"].(map[string]any)
-	if code, _ := errObj["code"].(string); code != "unsupported_reasoning_effort" {
-		t.Errorf("错误码应为 unsupported_reasoning_effort，实际 %q", code)
-	}
-	// 文案必须列出**支持哪些档**，否则用户没法改对，只能挨个试。
-	msg, _ := errObj["message"].(string)
-	if !strings.Contains(msg, "medium") {
-		t.Errorf("文案应列出支持档 medium，实际 %q", msg)
-	}
-	if !strings.Contains(msg, "max") {
-		t.Errorf("文案应指出收到的档位 max，实际 %q", msg)
-	}
-}
-
-// TestSupportedEffortPassesThrough 支持的档位正常放行到上游。
-func TestSupportedEffortPassesThrough(t *testing.T) {
-	var calls int32
-	resetModelsCache()
-	// ExpiresAt 必须给未来值：缺省会被判成「需刷新」，账号在选号阶段就被刷掉，
-	// 表现为 503 no_healthy_account（实测踩到，与档位校验无关）。
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999, Domain: "copilot.tencent.com", SoonestExpireAt: 1 << 40})
 	h := NewHandler(Config{
 		Pool: p,
 		Upstream: newFakeUpstream(t, func(string) (int, string, bool) {
 			atomic.AddInt32(&calls, 1)
-			// 走到上游即证明放行；返回一个正常 SSE 让请求成功。
 			return http.StatusOK, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n", true
 		}),
 	})
@@ -318,88 +330,54 @@ func TestSupportedEffortPassesThrough(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"effort-fixed","reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]}`)))
+		strings.NewReader(`{"model":"effort-fixed","reasoning_effort":"max","messages":[{"role":"user","content":"hi"}]}`)))
 
 	if rec.Code == http.StatusBadRequest {
-		t.Errorf("支持的档位不该被拒，实际 400：%s", rec.Body.String())
+		t.Errorf("档位不该被网关拒绝（supportedEfforts 不是硬范围），实际 400：%s", rec.Body.String())
 	}
 	if n := atomic.LoadInt32(&calls) - before; n == 0 {
-		t.Errorf("支持的档位应放行到上游，实际没打上游；响应=%d %s", rec.Code, rec.Body.String())
+		t.Errorf("应放行到上游，实际没打上游；响应=%d %s", rec.Code, rec.Body.String())
 	}
 }
 
-// TestEffortCheckAllowsWhenUnknown 未知情形一律放行（**不能拦**）。
+// TestEffortNotRewrittenInPayload 网关**不得改写** reasoning_effort。
 //
-// 四种放行情形逐一覆盖：没带字段、空串、模型不在能力表、上游未声明档位。
-// 拦错任何一个都会让本可用的请求 400 —— 比漏拦严重得多。
-func TestEffortCheckAllowsWhenUnknown(t *testing.T) {
-	supported := []string{"low", "high"}
+// 除了「不拦」，还要「不改」：曾经的 normalizeReasoningEffort 会把它悄悄
+// 降级成 supportedEfforts 里最接近的档，用户看到「调了 max 却答得很短」，
+// 日志里只有一行 downgrade —— 参数被改了却无从知晓。
+func TestEffortNotRewrittenInPayload(t *testing.T) {
+	const body = `{"model":"effort-fixed","reasoning_effort":"max","messages":[{"role":"user","content":"hi"}]}`
 
-	cases := []struct {
-		name      string
-		requested any
-	}{
-		{"没带该字段（用默认档）", nil},
-		{"空串", ""},
-		{"纯空白", "   "},
-		{"值不是字符串（交给上游报类型错）", 3},
+	// efforts 表里 effort-fixed 只声明了 medium —— 旧实现会把它改成 medium。
+	got := upstream.PrepareBodyOptWithEfforts([]byte(body), false,
+		map[string][]string{"effort-fixed": {"medium"}})
+
+	var out map[string]any
+	if err := json.Unmarshal(got, &out); err != nil {
+		t.Fatalf("改写后的 body 不是 JSON: %v", err)
 	}
-	for _, c := range cases {
-		if err := checkRequestedEffort("m", c.requested, supported); err != nil {
-			t.Errorf("%s：应放行，实际被拒 %v", c.name, err)
+	if out["reasoning_effort"] != "max" {
+		t.Errorf("reasoning_effort 必须原样透传，实际被改成 %#v", out["reasoning_effort"])
+	}
+}
+
+// TestEffortPassthroughKeepsSnakeAndCamel 两种拼写都原样保留。
+//
+// 客户端写法不统一（`reasoning_effort` / `reasoningEffort` 都出现过），
+// 透传时不能只保一个 —— 那会让另一种拼写的用户发现参数被丢了。
+func TestEffortPassthroughKeepsSnakeAndCamel(t *testing.T) {
+	for _, key := range []string{"reasoning_effort", "reasoningEffort"} {
+		body := `{"model":"m","` + key + `":"xhigh","messages":[{"role":"user","content":"hi"}]}`
+		got := upstream.PrepareBodyOptWithEfforts([]byte(body), false,
+			map[string][]string{"m": {"low"}})
+		var out map[string]any
+		if err := json.Unmarshal(got, &out); err != nil {
+			t.Fatalf("[%s] 改写后的 body 不是 JSON: %v", key, err)
+		}
+		if out[key] != "xhigh" {
+			t.Errorf("[%s] 应原样透传 xhigh，实际 %#v", key, out[key])
 		}
 	}
-
-	// 上游未声明档位 → 无从校验 → 放行。
-	if err := checkRequestedEffort("m", "max", nil); err != nil {
-		t.Errorf("上游未声明档位时应放行，实际被拒 %v", err)
-	}
-	if err := checkRequestedEffort("m", "max", []string{}); err != nil {
-		t.Errorf("空档位列表应放行，实际被拒 %v", err)
-	}
-}
-
-// TestEffortCheckIsCaseAndSpaceInsensitive 大小写与空白不敏感。
-//
-// 客户端写法并不统一（`High` / ` high ` 都出现过）。若按字面比较，
-// 这些请求会被误判成「不支持」而 400。
-func TestEffortCheckIsCaseAndSpaceInsensitive(t *testing.T) {
-	supported := []string{"Low", "High"}
-	for _, req := range []string{"high", "HIGH", "High", " high ", "  HIGH  "} {
-		if err := checkRequestedEffort("m", req, supported); err != nil {
-			t.Errorf("档位 %q 应被认作支持，实际被拒 %v", req, err)
-		}
-	}
-}
-
-// TestEffortCheckRejectsUnrecognisedName 档位名本身不认识时也拒绝。
-//
-// 那种拼写错误此前被原样透传给上游，上游多半静默忽略 —— 用户同样看不到原因，
-// 表现和「降级」一样（调了没生效）。文案要与「认识但不被该模型支持」区分开。
-func TestEffortCheckRejectsUnrecognisedName(t *testing.T) {
-	err := checkRequestedEffort("m", "highest", []string{"low", "high"})
-	if err == nil {
-		t.Fatal("无法识别的档位名应被拒")
-	}
-	var ue *unsupportedEffortError
-	if !asUnsupported(err, &ue) {
-		t.Fatalf("应是 unsupportedEffortError，实际 %T", err)
-	}
-	if !ue.unknown {
-		t.Error("应标记为「档位名无法识别」，以便文案给出不同提示")
-	}
-	if !strings.Contains(ue.Error(), "high") {
-		t.Errorf("文案应列出支持档，实际 %q", ue.Error())
-	}
-}
-
-// asUnsupported 小工具：避免在测试里直接 import errors 只为一次 As。
-func asUnsupported(err error, target **unsupportedEffortError) bool {
-	ue, ok := err.(*unsupportedEffortError)
-	if ok {
-		*target = ue
-	}
-	return ok
 }
 
 // TestEffortsForModelReadsCacheOnly 校验路径**只读缓存、不触发上游拉取**。

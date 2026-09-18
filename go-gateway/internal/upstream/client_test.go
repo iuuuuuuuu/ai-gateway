@@ -152,7 +152,20 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 	}
 }
 
-func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
+// TestFetchModelsEffortsDoNotRewriteBody 档位能力**不得**驱动出站改写。
+//
+// ⚠ 本用例在 2026-09-18 被反转：原断言是「glm-5.2 只支持 low/high，
+// 请求 max → 降级为 high」。实测推翻了那个前提（真实流式调用）：
+//
+//	hy3     声明 [low, high]     → medium / max / minimal / **off** 全部接受
+//	glm-5.2 声明 [high, xhigh]  → low / max / medium / **off** 全部接受
+//
+// 上游对「声明外」的档照常接受 ⇒ supportedEfforts 只是界面建议、不是硬范围。
+// 既然原档位有效，降级就是纯粹的改坏：用户调 max 拿到 high 的效果。
+//
+// 本用例仍走完整链路（FetchModels → 缓存 → ChatStream），
+// 验证「拉过模型清单」这件事**不会**让出站 body 被改写。
+func TestFetchModelsEffortsDoNotRewriteBody(t *testing.T) {
 	var outbound []byte
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		switch {
@@ -177,12 +190,12 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 	if len(infos) != 1 {
 		t.Fatalf("infos=%+v", infos)
 	}
-	// ModelInfo.Efforts 应携带 supportedEfforts
+	// ModelInfo.Efforts 应携带 supportedEfforts（能力照常解析，只是不用来改写请求）。
 	if len(infos[0].Efforts) != 2 || infos[0].Efforts[0] != "low" {
 		t.Errorf("infos[0].Efforts=%v", infos[0].Efforts)
 	}
 
-	// glm-5.2 只支持 low/high，请求 max → 降级为 high
+	// glm-5.2 声明只支持 low/high，请求 max → **原样发出**（不被降级）。
 	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`))
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
@@ -192,8 +205,9 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 	if err := json.Unmarshal(outbound, &m); err != nil {
 		t.Fatalf("outbound unmarshal: %v (%s)", err, outbound)
 	}
-	if got, _ := m["reasoning_effort"].(string); got != "high" {
-		t.Errorf("reasoning_effort=%v want high (outbound=%s)", m["reasoning_effort"], outbound)
+	if got, _ := m["reasoning_effort"].(string); got != "max" {
+		t.Errorf("reasoning_effort=%v want max（档位必须原样透传；"+
+			"声明外的档上游实际接受，降级会改坏用户参数）outbound=%s", m["reasoning_effort"], outbound)
 	}
 }
 

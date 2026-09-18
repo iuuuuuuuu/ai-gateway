@@ -6,6 +6,7 @@ package upstream
 import (
 	"encoding/json"
 	"log"
+	"sort"
 	"strings"
 )
 
@@ -86,6 +87,37 @@ func ensureSystemFirst(obj map[string]any) {
 // effortRank 档位从低到高。
 var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
 
+// StandardEfforts 上游的**标准思考档阶梯**（由低到高，不含 off）。
+//
+// 用于「上游没声明 supportedEfforts，但有默认档」的模型：实测这类模型
+// 接受标准阶梯里的全部档，只拒绝 off 与无法识别的值 —— 也就是说上游有
+// 一套全局阶梯在校验，只是没在 /v3/config 里逐模型列出可选范围。
+//
+// 实测依据（2026-09-18，真实流式调用 deepseek-v4.1-flash）：
+//
+//	off / bogus_value → HTTP 400 "the reasoning effort value is not supported"
+//	minimal/low/medium/high/max/xhigh → 全部接受
+//	低到高各档的推理长度：low 397 → medium 420 → high 646 → max 776（单调递增）
+//
+// 不含 off 是刻意的：该模型明确拒绝 off，把它列进可选项会让用户选到一个
+// 必然 400 的值。**注意**这不代表所有此类模型都拒绝 off —— 但既然上游
+// 没声明范围，少列一个「已知可能被拒」的档，比多列一个更安全。
+//
+// 返回**副本**：调用方会把它塞进响应体，共享切片会被下游的 in-place 修改污染。
+func StandardEfforts() []string {
+	names := make([]string, 0, len(effortRank)-1)
+	for name := range effortRank {
+		if name == "off" {
+			continue
+		}
+		names = append(names, name)
+	}
+	// 按档位从低到高排序：map 遍历顺序随机，不排序会让同一模型每次请求
+	// 下发不同顺序的列表，客户端的下拉框顺序会跳变。
+	sort.Slice(names, func(i, j int) bool { return effortRank[names[i]] < effortRank[names[j]] })
+	return names
+}
+
 // KnownEffort 该档位名是否是网关认识的思考档（大小写与空白不敏感）。
 //
 // 导出它而不是让调用方各存一份档位表：档位表一旦分叉，就会出现
@@ -97,67 +129,29 @@ func KnownEffort(name string) bool {
 	return ok
 }
 
-// normalizeReasoningEffort 按模型 supportedEfforts 降级 reasoning_effort（snake/camel 双字段兼容）。
-//   - 请求档位模型支持 → 原样透传
-//   - 请求档位不支持 → 改为 ≤请求档位的最高支持档（降级）
-//   - 支持档全部高于请求档 → 取最低支持档（偏离最小）
-//   - 未知模型/未知档位/未携带字段/模型未缓存 → 一律透传
+// normalizeReasoningEffort 已**废弃**（2026-09-18），保留空实现仅为守住调用点。
+//
+// 原行为：请求档位不在该模型 supportedEfforts 里时**静默改写**为最接近的支持档。
+// 移除理由与 forward.go 里移除 400 拦截同源 —— 实测证明 supportedEfforts
+// 不是硬范围：
+//
+//	hy3     声明 [low, high]     → medium / max / minimal / **off** 全部接受
+//	glm-5.2 声明 [high, xhigh]  → low / max / medium / **off** 全部接受
+//
+// 既然上游对这些「范围外」的档照常接受，静默改写就做了两件坏事：
+//   · 用户明确调了 max，实际被降成 high —— 他看到的是「调了没效果」，
+//     而日志里只有一行 downgrade，完全无从知道自己被改了参数；
+//   · 改写本身基于一个错误前提，等于网关凭空替上游「猜」它能接受什么。
+//
+// 现在网关对 reasoning_effort 一律**原样透传**：
+//   · 上游接受的档 → 正常生效（实测 deepseek-v4.1-flash 的 low→max 单调递增）
+//   · 上游不接受的档 → 上游自己报 400，错误原样返回（那才是权威判据）
+//
+// 保留函数签名而不是删掉：调用点在 client.go 的 prepareBody 链路上，
+// 删签名要动一串接口。空实现 + 本注释能让「为什么这里是空的」可查。
 func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
-	if len(efforts) == 0 {
-		return
-	}
-	model, _ := obj["model"].(string)
-	if model == "" {
-		return
-	}
-	supported, ok := efforts[model]
-	if !ok || len(supported) == 0 {
-		return
-	}
-	key := ""
-	if _, present := obj["reasoning_effort"]; present {
-		key = "reasoning_effort"
-	} else if _, present := obj["reasoningEffort"]; present {
-		key = "reasoningEffort"
-	} else {
-		return
-	}
-	reqStr, ok := obj[key].(string)
-	if !ok {
-		return
-	}
-	reqStr = strings.TrimSpace(strings.ToLower(reqStr))
-	reqIdx, known := effortRank[reqStr]
-	if !known {
-		return
-	}
-	// 在 ≤请求档位的支持档里选最高档；命中且与请求不同才改写。
-	best, bestIdx := "", -1
-	for _, s := range supported {
-		idx, k := effortRank[strings.TrimSpace(strings.ToLower(s))]
-		if k && idx <= reqIdx && idx > bestIdx {
-			best, bestIdx = s, idx
-		}
-	}
-	if best != "" {
-		if !strings.EqualFold(best, reqStr) {
-			obj[key] = best
-			log.Printf("reasoning_effort downgraded model=%s %s -> %s", model, reqStr, best)
-		}
-		return
-	}
-	// 支持档全部高于请求档：取最低支持档。
-	lowest, lowestIdx := "", 1<<30
-	for _, s := range supported {
-		idx, k := effortRank[strings.TrimSpace(strings.ToLower(s))]
-		if k && idx < lowestIdx {
-			lowest, lowestIdx = s, idx
-		}
-	}
-	if lowest != "" {
-		obj[key] = lowest
-		log.Printf("reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
-	}
+	_ = obj
+	_ = efforts
 }
 
 // normalizeRoles 把 messages 里的 developer 角色归一为 system。

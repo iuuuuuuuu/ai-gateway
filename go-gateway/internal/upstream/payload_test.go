@@ -90,36 +90,52 @@ func TestNormalizeRoles(t *testing.T) {
 	})
 }
 
+// TestPrepareBodyOptWithEfforts 档位**一律原样透传**，网关不改写。
+//
+// ⚠ 本用例在 2026-09-18 被**整体反转**：原内容是「降级 / 取最低档」，
+// 即把请求档位改写成 supportedEfforts 里最接近的档。实测推翻了那个前提：
+//
+//	hy3     声明 [low, high]     → medium / max / minimal / **off** 全部接受
+//	glm-5.2 声明 [high, xhigh]  → low / max / medium / **off** 全部接受
+//
+// 上游对范围外的档照常接受 ⇒ supportedEfforts 只是「界面建议列出哪些」，
+// 不是可用范围。既然原档位本来就有效，改写就纯粹是**改坏**：
+// 用户调 max 被悄悄降成 high，他只看到「调了没效果」。
+//
+// 现在唯一的权威判据是上游自己。本用例锁住「网关不碰 reasoning_effort」。
 func TestPrepareBodyOptWithEfforts(t *testing.T) {
 	efforts := map[string][]string{
 		"glm-5.2":      {"off", "low", "high"},
 		"glm-5.2-mini": {"low", "medium"},
 		"glm-5.2-max":  {"high", "xhigh"},
 	}
+	// 每一条的期望值都是**输入原值** —— 这就是本用例的全部含义。
 	cases := []struct {
 		name    string
 		body    string
 		efforts map[string][]string
 		wantKey string // 输出应带有的 effort 字段名；空表示该字段应不存在
-		wantVal string // 期望值
+		wantVal string // 期望值（= 输入值）
 	}{
-		{"downgrade to highest supported at or below request",
-			`{"model":"glm-5.2-mini","reasoning_effort":"high"}`, efforts, "reasoning_effort", "medium"},
-		{"floor to lowest when all supported above request",
-			`{"model":"glm-5.2-max","reasoning_effort":"low"}`, efforts, "reasoning_effort", "high"},
-		{"supported effort passes through unchanged",
+		{"范围外的档原样保留（曾被降级成 medium）",
+			`{"model":"glm-5.2-mini","reasoning_effort":"high"}`, efforts, "reasoning_effort", "high"},
+		{"低于全部支持档时也原样保留（曾被抬成 high）",
+			`{"model":"glm-5.2-max","reasoning_effort":"low"}`, efforts, "reasoning_effort", "low"},
+		{"范围内的档原样保留",
 			`{"model":"glm-5.2","reasoning_effort":"low"}`, efforts, "reasoning_effort", "low"},
-		{"camelCase field name downgrades and keeps key",
-			`{"model":"glm-5.2-mini","reasoningEffort":"high"}`, efforts, "reasoningEffort", "medium"},
-		{"unknown model passes through",
+		{"off 原样保留（上游可能接受，也由它自己拒绝）",
+			`{"model":"glm-5.2","reasoning_effort":"off"}`, efforts, "reasoning_effort", "off"},
+		{"camelCase 拼写同样原样保留",
+			`{"model":"glm-5.2-mini","reasoningEffort":"high"}`, efforts, "reasoningEffort", "high"},
+		{"未知模型原样透传",
 			`{"model":"unknown","reasoning_effort":"max"}`, efforts, "reasoning_effort", "max"},
-		{"unknown effort value passes through",
+		{"无法识别的档位名原样透传（让上游去报错）",
 			`{"model":"glm-5.2","reasoning_effort":"ultra"}`, efforts, "reasoning_effort", "ultra"},
-		{"empty cache passes through",
+		{"缓存为空时原样透传",
 			`{"model":"glm-5.2","reasoning_effort":"max"}`, map[string][]string{}, "reasoning_effort", "max"},
-		{"no effort field untouched",
+		{"没带该字段时不新增",
 			`{"model":"glm-5.2-mini","messages":[]}`, efforts, "", ""},
-		{"nil efforts map passes through",
+		{"efforts 为 nil 时原样透传",
 			`{"model":"glm-5.2","reasoning_effort":"max"}`, nil, "reasoning_effort", "max"},
 	}
 	for _, c := range cases {
@@ -131,16 +147,17 @@ func TestPrepareBodyOptWithEfforts(t *testing.T) {
 			}
 			if c.wantKey == "" {
 				if _, ok := m["reasoning_effort"]; ok {
-					t.Errorf("reasoning_effort should be absent, got %v", m["reasoning_effort"])
+					t.Errorf("reasoning_effort 不该被新增，实际 %v", m["reasoning_effort"])
 				}
 				if _, ok := m["reasoningEffort"]; ok {
-					t.Errorf("reasoningEffort should be absent, got %v", m["reasoningEffort"])
+					t.Errorf("reasoningEffort 不该被新增，实际 %v", m["reasoningEffort"])
 				}
 				return
 			}
 			got, ok := m[c.wantKey].(string)
 			if !ok || got != c.wantVal {
-				t.Errorf("%s: got %v (%T) want %q", c.wantKey, m[c.wantKey], m[c.wantKey], c.wantVal)
+				t.Errorf("%s: got %v (%T) want %q —— 档位必须原样透传，网关不得改写",
+					c.wantKey, m[c.wantKey], m[c.wantKey], c.wantVal)
 			}
 		})
 	}

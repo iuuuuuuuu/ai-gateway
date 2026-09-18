@@ -763,8 +763,15 @@ export interface GatewayTaskRunResult {
   error?: string | null;
 }
 
-/** 养号任务标识（与 Go 网关 /tasks/run 的 task 参数一一对应）。 */
-export type GatewayTaskName = "activity" | "nightowl" | "school" | "trial";
+/**
+ * 养号任务标识（与 Go 网关 `/tasks/run` 的 task 参数一一对应）。
+ *
+ * `school_season`（校园日）**不在**这里 —— 它是成长任务（走 `/tasks/growth`，
+ * 见 `runGrowthTask`）：完成条件是「小程序内对话」，需要专门的小程序指纹上报，
+ * 与调度器那几个遍历式任务不是一套实现。界面上两者并列显示，
+ * 但调用的是不同接口。
+ */
+export type GatewayTaskName = "activity" | "nightowl" | "school" | "trial" | "growthmap";
 
 /**
  * 成长任务的展示状态（Go 侧 growtask 的 View* 常量）。
@@ -1289,17 +1296,26 @@ export interface GatewayModelItem {
   /**
    * 该模型**支持思考**（上游声明；缺失 = 未声明，**不是** false）。
    *
-   * 与 supported_efforts 正交：固定单档模型这里是 true 但没有可选档位。
-   * 界面用它把「固定档」与「不支持思考」分开（后者不该显示成「—」）。
+   * 与 supported_efforts 正交：未声明档位范围的模型这里是 true，
+   * 但它的 supported_efforts 来自标准阶梯而非上游逐模型声明。
    */
   supports_reasoning?: boolean;
   supportsReasoning?: boolean;
   /**
-   * 该模型是**固定单档**：支持思考但不能选档（网关在无 supportedEfforts
-   * 但有默认档时下发）。
+   * 该模型的档位**可选范围未声明**（上游没列 supportedEfforts，但有默认档）。
    *
-   * 显式 true/false 而不是靠「档位数组为空」推断 —— 后者会把
-   * 「固定档」与「未声明」混成一种，正是所有者报的那个缺陷。
+   * ⚠ 语义是「不知道确切范围」，**不是**「不可选」。实测这类模型接受整个
+   * 标准阶梯且档位真的生效（deepseek-v4.1-flash 推理长度单调递增
+   * low 397 → medium 420 → high 646 → max 776），所以界面应鼓励尝试。
+   */
+  reasoning_range_undeclared?: boolean;
+  reasoningRangeUndeclared?: boolean;
+  /**
+   * 该模型是**固定单档**。
+   *
+   * @deprecated 实测（2026-09-18）并不存在「档位不可选」的模型；上一版据此
+   * 标成固定是错的（会让用户以为调档没用）。保留字段只为兼容旧网关；
+   * 新代码一律用 reasoning_range_undeclared。
    */
   reasoning_fixed?: boolean;
   reasoningFixed?: boolean;
@@ -1314,7 +1330,9 @@ export interface GatewayModelItem {
   reasoning?: {
     supported_efforts?: string[];
     default_effort?: string;
-    /** OpenRouter 风格的固定档标记（与顶层 reasoning_fixed 同义）。 */
+    /** 档位范围未声明（与顶层 reasoning_range_undeclared 同义）。 */
+    range_undeclared?: boolean;
+    /** @deprecated 见顶层 reasoning_fixed。 */
     fixed?: boolean;
     supports_reasoning?: boolean;
   };

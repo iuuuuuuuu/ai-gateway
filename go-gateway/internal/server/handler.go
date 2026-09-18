@@ -35,12 +35,15 @@ type Config struct {
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
 	// Usage Token 用量统计器（可选；nil = 不统计，/usage 返回 enabled=false）。
 	Usage *usage.Stats
-	// RunTask 手动触发一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
+	// RunTaskFor 手动触发养号任务（活跃上报 / 夜猫子 / 开学季 / trial / 活跃地图）。
+	//
+	// 第二参数为账号 uid：空串 = 作用于全部账号；非空 = 只作用于该账号
+	//（账号卡片菜单的入口走这条，见 tasksRun 的注释）。
 	//
 	// 用回调而非直接持有 *scheduler.Scheduler：server 包不该依赖调度器的
 	// 内部结构（Config 字段、排程循环），只借一个「按名字跑一轮」的入口，
 	// 依赖方向仍是 main 组装、server 消费。nil = 该能力不可用（如单测）。
-	RunTask func(name string) (scheduler.TaskRunResult, error)
+	RunTaskFor func(name, accountUID string) (scheduler.TaskRunResult, error)
 
 
 	// GrowthTasks 成长任务「一键完成」能力的回调。
@@ -310,30 +313,43 @@ func (h *Handler) growthTasks(w http.ResponseWriter, r *http.Request) {
 // 为什么要有这个入口：这 4 个任务此前只有「按点自动跑」，用户既看不见执行结果、
 // 也没法在改完配置后立刻验证。手动触发是**可观测性**的一部分。
 //
-// 返回 200 + ran=false 表示「被前置条件挡下」（如夜猫子不在时段内）——
-// 这是正常状态而非错误，宿主界面据此给出人话说明；真正的问题（未知任务名）
-// 才返回 400。
+// **accountId 可选**（2026-09-18 新增，所有者要求）：
+//   - 省略 → 作用于**全部账号**（右上角「一键操作」用这条）
+//   - 给出 → 只作用于**该账号**（账号卡片菜单里点任务用这条）
+//
+// 加这个参数是因为原来只有「全部」一种语义，而账号菜单里的入口位置暗示的是
+// 「只影响这个账号」—— 用户在某个账号的卡片上操作，跑的却是整池，
+// 与菜单位置传达的意思相反。
+//
+// 返回 200 + ran=false 表示「被前置条件挡下」（如夜猫子不在时段内、
+// 区域不符、账号不在池中）—— 这是正常状态而非错误，宿主界面据此给出人话说明；
+// 真正的问题（未知任务名）才返回 400。
 func (h *Handler) tasksRun(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(r.URL.Query().Get("task"))
+	accountID := strings.TrimSpace(r.URL.Query().Get("accountId"))
 	if name == "" {
 		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 		var parsed struct {
-			Task string `json:"task"`
+			Task      string `json:"task"`
+			AccountID string `json:"accountId"`
 		}
 		if err := jsonUnmarshal(string(body), &parsed); err == nil {
 			name = strings.TrimSpace(parsed.Task)
+			if accountID == "" {
+				accountID = strings.TrimSpace(parsed.AccountID)
+			}
 		}
 	}
 	if name == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "missing task name")
 		return
 	}
-	if h.cfg.RunTask == nil {
+	if h.cfg.RunTaskFor == nil {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "tasks_unavailable",
 			"task runner not configured on this gateway instance")
 		return
 	}
-	res, err := h.cfg.RunTask(name)
+	res, err := h.cfg.RunTaskFor(name, accountID)
 	if errors.Is(err, scheduler.ErrTaskRunning) {
 		// 与宿主 checkin_all 的 already_running 同一语义：不是故障，是防重入。
 		writeJSON(w, http.StatusOK, res)
@@ -785,12 +801,10 @@ func errorCodeFor(err error) string {
 	if errors.As(err, &locked) {
 		return "model_not_allowed"
 	}
-	// 思考档位不被该模型支持：同样是**请求侧**错误（改请求即可，重试无用），
-	// 因此给独立错误码，而不是让它落进 no_healthy_account 被当成账号故障。
-	var effort *unsupportedEffortError
-	if errors.As(err, &effort) {
-		return "unsupported_reasoning_effort"
-	}
+	// 说明：这里曾有 `unsupported_reasoning_effort` 分支（配套 checkRequestedEffort）。
+	// 2026-09-18 实测推翻了它的前提 —— supportedEfforts 不是硬范围
+	//（hy3 声明 [low,high] 却接受 medium/max/minimal/off），据它拦截会误拒合法请求。
+	// 该拦截与错误码已一并移除；档位现在一律原样透传，真不被接受的由上游报 400。
 	// 带图片请求缺区域账号：不是「账号池暂时不可用、稍后重试」，而是
 	// 「你的池子缺一类账号」。用独立的码让客户端/用户能区分，而不是
 	// 混进 no_healthy_account 里被当成一次普通的负载抖动。

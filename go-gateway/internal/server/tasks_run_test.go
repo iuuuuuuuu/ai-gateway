@@ -25,13 +25,13 @@ import (
 //   - 重入 → 200 + skip=already_running（与宿主 checkin_all 同一语义）
 // ---------------------------------------------------------------------------
 
-// tasksHandler 构建带 RunTask 回调的 handler。
-func tasksHandler(t *testing.T, run func(string) (scheduler.TaskRunResult, error)) *Handler {
+// tasksHandler 构建带 RunTaskFor 回调的 handler。
+func tasksHandler(t *testing.T, run func(string, string) (scheduler.TaskRunResult, error)) *Handler {
 	t.Helper()
 	return NewHandler(Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true }),
-		RunTask:  run,
+		RunTaskFor: run,
 	})
 }
 
@@ -47,7 +47,7 @@ func postTask(t *testing.T, h *Handler, body string) (*httptest.ResponseRecorder
 // TestTasksRunDispatchesNamedTask 正常路径：任务名透传到调度器，结果原样回给宿主。
 func TestTasksRunDispatchesNamedTask(t *testing.T) {
 	var got string
-	h := tasksHandler(t, func(name string) (scheduler.TaskRunResult, error) {
+	h := tasksHandler(t, func(name, _ string) (scheduler.TaskRunResult, error) {
 		got = name
 		return scheduler.TaskRunResult{Task: name, Ran: true, Message: "已触发一轮"}, nil
 	})
@@ -70,7 +70,7 @@ func TestTasksRunDispatchesNamedTask(t *testing.T) {
 // TestTasksRunAcceptsQueryParam 任务名也可走 query（便于 curl 手测）。
 func TestTasksRunAcceptsQueryParam(t *testing.T) {
 	var got string
-	h := tasksHandler(t, func(name string) (scheduler.TaskRunResult, error) {
+	h := tasksHandler(t, func(name, _ string) (scheduler.TaskRunResult, error) {
 		got = name
 		return scheduler.TaskRunResult{Task: name, Ran: true}, nil
 	})
@@ -88,7 +88,7 @@ func TestTasksRunAcceptsQueryParam(t *testing.T) {
 // TestTasksRunSkipIsSuccess 被前置条件挡下时是 200 + ran=false + skip，
 // 不是错误码 —— 界面要能区分「没跑成」与「调用失败」。
 func TestTasksRunSkipIsSuccess(t *testing.T) {
-	h := tasksHandler(t, func(name string) (scheduler.TaskRunResult, error) {
+	h := tasksHandler(t, func(name, _ string) (scheduler.TaskRunResult, error) {
 		return scheduler.TaskRunResult{
 			Task: name, Ran: false, Skip: "outside_window",
 			Message: "当前不在夜猫子时段",
@@ -110,7 +110,7 @@ func TestTasksRunSkipIsSuccess(t *testing.T) {
 // TestTasksRunUnknownTaskIsBadRequest 未知任务名必须 400：界面点了没反应时，
 // 唯一的线索就是这个错误。
 func TestTasksRunUnknownTaskIsBadRequest(t *testing.T) {
-	h := tasksHandler(t, func(name string) (scheduler.TaskRunResult, error) {
+	h := tasksHandler(t, func(name, _ string) (scheduler.TaskRunResult, error) {
 		return scheduler.TaskRunResult{}, errors.New(`unknown task "bogus"`)
 	})
 
@@ -126,7 +126,7 @@ func TestTasksRunUnknownTaskIsBadRequest(t *testing.T) {
 
 // TestTasksRunMissingTaskName 缺任务名 → 400（而不是静默跑了个空任务）。
 func TestTasksRunMissingTaskName(t *testing.T) {
-	h := tasksHandler(t, func(name string) (scheduler.TaskRunResult, error) {
+	h := tasksHandler(t, func(name, _ string) (scheduler.TaskRunResult, error) {
 		t.Errorf("缺任务名时不应调用调度器，实际收到 %q", name)
 		return scheduler.TaskRunResult{}, nil
 	})
@@ -140,7 +140,7 @@ func TestTasksRunMissingTaskName(t *testing.T) {
 // TestTasksRunReentryIsNotAnError 重入返回 200 + already_running：
 // 与宿主 checkin_all 的 already_running 同一语义（不是故障，是防重入）。
 func TestTasksRunReentryIsNotAnError(t *testing.T) {
-	h := tasksHandler(t, func(name string) (scheduler.TaskRunResult, error) {
+	h := tasksHandler(t, func(name, _ string) (scheduler.TaskRunResult, error) {
 		return scheduler.TaskRunResult{
 			Task: name, Skip: "already_running", Message: "该任务正在执行中，请稍后再试",
 		}, scheduler.ErrTaskRunning
@@ -162,7 +162,7 @@ func TestTasksRunRequiresAuth(t *testing.T) {
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true }),
 		APIKey:   "sk-secret",
-		RunTask: func(name string) (scheduler.TaskRunResult, error) {
+		RunTaskFor: func(name, _ string) (scheduler.TaskRunResult, error) {
 			t.Error("未鉴权请求不应触达调度器")
 			return scheduler.TaskRunResult{}, nil
 		},
@@ -186,5 +186,90 @@ func TestTasksRunUnavailableWithoutRunner(t *testing.T) {
 	rec, _ := postTask(t, h, `{"task":"activity"}`)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("code=%d want 503", rec.Code)
+	}
+}
+
+// TestTasksRunPassesAccountID 单账号作用域：body 里的 accountId 要透传到调度器。
+//
+// 这是所有者报的那个语义错误：账号卡片菜单里的任务入口，跑的原先是**整池**。
+// 用户在某个账号的卡片上操作，期望影响那张卡片 —— 菜单位置本身就意味着一对一。
+func TestTasksRunPassesAccountID(t *testing.T) {
+	var gotName, gotUID string
+	h := tasksHandler(t, func(name, uid string) (scheduler.TaskRunResult, error) {
+		gotName, gotUID = name, uid
+		return scheduler.TaskRunResult{Task: name, Ran: true}, nil
+	})
+
+	rec, _ := postTask(t, h, `{"task":"activity","accountId":"uid-target"}`)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if gotName != "activity" || gotUID != "uid-target" {
+		t.Errorf("调度器收到 (%q, %q) want (activity, uid-target)", gotName, gotUID)
+	}
+}
+
+// TestTasksRunWithoutAccountIDMeansAllAccounts 省略 accountId = 全部账号。
+//
+// 右上角「一键操作」走这条，且**必须**保持空串（而不是让网关自己挑一个）——
+// 「作用于全部」与「作用于某一个」是两种不同意图，不能默认成其一。
+func TestTasksRunWithoutAccountIDMeansAllAccounts(t *testing.T) {
+	var gotUID string
+	h := tasksHandler(t, func(_, uid string) (scheduler.TaskRunResult, error) {
+		gotUID = uid
+		return scheduler.TaskRunResult{Ran: true}, nil
+	})
+
+	postTask(t, h, `{"task":"activity"}`)
+	if gotUID != "" {
+		t.Errorf("省略 accountId 时应传空串（= 全部账号），实际 %q", gotUID)
+	}
+}
+
+// TestTasksRunAcceptsAccountIDInQuery accountId 也可走 query（便于 curl 手测）。
+func TestTasksRunAcceptsAccountIDInQuery(t *testing.T) {
+	var gotUID string
+	h := tasksHandler(t, func(_, uid string) (scheduler.TaskRunResult, error) {
+		gotUID = uid
+		return scheduler.TaskRunResult{Ran: true}, nil
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/tasks/run?task=activity&accountId=uid-q", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if gotUID != "uid-q" {
+		t.Errorf("query 里的 accountId 应透传，实际 %q", gotUID)
+	}
+}
+
+// TestTasksRunReturnsAccountScopedSkip 单账号被前置条件挡下时，
+// 要把**原因**回给界面，而不是静默成功。
+//
+// 单账号触发时用户盯着结果看：什么都不发生比一句说明糟糕得多。
+func TestTasksRunReturnsAccountScopedSkip(t *testing.T) {
+	h := tasksHandler(t, func(name, uid string) (scheduler.TaskRunResult, error) {
+		if uid != "" {
+			return scheduler.TaskRunResult{
+				Task: name, Skip: "region_mismatch",
+				Message: "该任务是国服专属：国际版没有对应的数据接口",
+			}, nil
+		}
+		return scheduler.TaskRunResult{Task: name, Ran: true}, nil
+	})
+
+	rec, body := postTask(t, h, `{"task":"activity","accountId":"uid-intl"}`)
+	if rec.Code != 200 {
+		t.Fatalf("跳过是正常状态，应 200，实际 %d", rec.Code)
+	}
+	if body["ran"] == true {
+		t.Error("被挡下时 ran 不该为 true")
+	}
+	if body["skip"] != "region_mismatch" {
+		t.Errorf("skip=%v want region_mismatch", body["skip"])
+	}
+	if msg, _ := body["message"].(string); !strings.Contains(msg, "国服") {
+		t.Errorf("必须带面向用户的原因，实际 %q", msg)
 	}
 }

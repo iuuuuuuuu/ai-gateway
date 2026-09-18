@@ -6,12 +6,17 @@ import {
   Download,
   FileDown,
   FileUp,
+  Gift,
+  GraduationCap,
   Loader2,
+  MapPin,
+  Moon,
   QrCode,
   RefreshCw,
   Rows3,
   Sparkles,
   Terminal,
+  Zap,
 } from "lucide-react";
 
 import { AccountCard } from "@/components/account-card";
@@ -24,6 +29,8 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Separator } from "@/components/ui/separator";
@@ -177,12 +184,21 @@ export default function AccountsPage() {
   /** 一键旅行进行中（下拉菜单项） */
   const [travelRunning, setTravelRunning] = useState(false);
   /**
-   * 正在执行的养号任务名（卡片菜单的「本账号养护 → 养号任务」组）。
+   * 正在执行的养号任务名（账号卡片菜单的「养号任务（仅本账号）」组，
+   * 以及右上角「一键操作 → 一键养号」的全账号版本）。
    *
-   * 单一状态而非按卡片分组：这些任务是**整轮**触发（作用于全部账号），
-   * 同一时刻只应有一个在跑；按卡片分组反而会让人以为每个号各跑各的。
+   * 单一状态而非按卡片分组：同一时刻只应有一个在跑；按卡片分组反而会让人
+   * 以为每个号各跑各的。菜单项据它整体置灰，避免重复触发造成成倍上报。
    */
   const [taskRunning, setTaskRunning] = useState<GatewayTaskName>();
+  /**
+   * 正在执行的**成长任务**码（当前只有校园日 school_season）。
+   *
+   * 与 taskRunning 分开：成长任务与养号任务是两套接口
+   *（`/tasks/growth` 逐任务 vs `/tasks/run` 整轮），
+   * 共用一个状态会让「哪个菜单项该转圈」判断不出来。
+   */
+  const [growthTaskRunning, setGrowthTaskRunning] = useState<string>();
   /**
    * 网关侧正在执行的养号任务（含「哪些账号已跑过」）。
    *
@@ -562,16 +578,79 @@ export default function AccountsPage() {
   }
 
   /**
-   * 手动触发一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
+   * 手动触发养号任务（活跃上报 / 夜猫子 / 开学季 / trial / 活跃地图）。
    *
-   * 与卡片上其它动作的关键区别：这是**整轮**触发，Go 侧 `RunTaskByName`
-   * 会遍历账号池，作用于全部符合区域条件的账号，而不是当前这张卡片。
-   * 菜单里用分组标题写明了这一点，避免用户以为只是跑了这一个号。
+   * **只作用于指定账号**（2026-09-18 修正）：原实现是「整轮触发、作用于全部账号」，
+   * 而入口长在账号卡片上 —— 用户在某个号上点「活跃上报」，跑的却是整池，
+   * 与菜单位置传达的意思相反（所有者明确指出）。
    *
-   * `ran=false` 是正常结果（夜猫子不在时段、开学季不在活动期），
+   * 全账号版本在页面右上角「一键操作」里，走 `onRunAllTasks`。
+   *
+   * `ran=false` 是正常结果（夜猫子不在时段、区域不符、账号不在池中），
    * 按说明展示而非报错 —— 否则用户会把「上游不计入」当成功能坏了。
    */
-  async function onRunTask(task: GatewayTaskName) {
+  async function onRunTask(task: GatewayTaskName, accountId: string) {
+    setTaskRunning(task);
+    try {
+      const res = await api.runGatewayTask(task, accountId);
+      if (!res.ok) {
+        toast.error("任务执行失败", { description: res.error || "未知错误" });
+      } else if (!res.ran) {
+        toast.info("本次未执行", { description: res.message || "前置条件不满足" });
+      } else {
+        toast.success("已执行该账号", { description: res.message || "任务已完成" });
+      }
+      // 任务会写账号记录与积分，回读一次让「账号记录」立刻反映
+      if (res.ok && res.ran) void fetchAll();
+    } catch (e) {
+      toast.error("任务执行失败", { description: api.asError(e) });
+    } finally {
+      setTaskRunning(undefined);
+    }
+  }
+
+  /**
+   * 手动执行一个**成长任务**（当前只有校园日 school_season）。
+   *
+   * 与 onRunTask 的区别不只是接口：成长任务是**逐任务**的，且校园日的完成
+   * 条件是小程序内对话 —— 它走 `/tasks/growth`（带 taskCode），
+   * 而养号任务走 `/tasks/run`（只有任务名）。两者混用会静默调错接口。
+   */
+  async function onRunGrowthTask(taskCode: string, accountId: string) {
+    setGrowthTaskRunning(taskCode);
+    try {
+      const res = await api.runGrowthTask("run", accountId, taskCode);
+      if (!res.ok) {
+        toast.error("成长任务执行失败", { description: res.error || "未知错误" });
+      } else {
+        // 成长任务返回**逐任务**结果：只有把该任务的 message 报出来，
+        // 用户才知道到底成了没有（`status` 区分 done/skipped/error/unsupported）。
+        const item = res.item ?? res.items?.find((i) => i.task_code === taskCode);
+        const detail = item?.message || "任务已执行";
+        if (item?.status === "error") {
+          toast.error("校园日活动未完成", { description: detail });
+        } else if (item?.status === "unsupported") {
+          toast.info("该任务不支持自动完成", { description: detail });
+        } else {
+          toast.success("校园日活动", { description: detail });
+        }
+      }
+      if (res.ok) void fetchAll();
+    } catch (e) {
+      toast.error("成长任务执行失败", { description: api.asError(e) });
+    } finally {
+      setGrowthTaskRunning(undefined);
+    }
+  }
+
+  /**
+   * 对**全部账号**跑一轮养号任务（右上角「一键操作」用）。
+   *
+   * 与 onRunTask 同一接口，只是**不传 accountId** —— 网关据此遍历整池。
+   * 保留这两条路径是刻意的：「只跑这个号」与「跑全部」是两种不同意图，
+   * 不能只留其一（前者用于单个号出问题时重试，后者用于日常一键养护）。
+   */
+  async function onRunAllTasks(task: GatewayTaskName) {
     setTaskRunning(task);
     try {
       const res = await api.runGatewayTask(task);
@@ -580,9 +659,8 @@ export default function AccountsPage() {
       } else if (!res.ran) {
         toast.info("本次未执行", { description: res.message || "前置条件不满足" });
       } else {
-        toast.success("已触发一轮", { description: res.message || "任务已开始执行" });
+        toast.success("已触发一轮（全部账号）", { description: res.message || "任务已开始执行" });
       }
-      // 任务会写账号记录与积分，回读一次让「账号记录」立刻反映
       if (res.ok && res.ran) void fetchAll();
     } catch (e) {
       toast.error("任务执行失败", { description: api.asError(e) });
@@ -1097,6 +1175,48 @@ export default function AccountsPage() {
                     <Sparkles />
                     一键旅行（含领养）
                   </DropdownMenuItem>
+                  {/* 一键养号：作用于**全部账号**（所有者要求 —— 单个账号的入口
+                      在账号卡片菜单里，全账号的入口就该在这一排工具栏上）。
+                      逐项列出而不是只给一个「全部执行」：
+                      用户常常只想补跑某一项（如今天夜猫子漏了），
+                      全跑一遍会在多个账号上产生不必要的上游请求。 */}
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel>一键养号（全部账号）</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    disabled={checkinAllRunning || travelRunning || taskRunning !== undefined}
+                    onSelect={() => void onRunAllTasks("activity")}
+                  >
+                    <Zap />
+                    活跃上报
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={checkinAllRunning || travelRunning || taskRunning !== undefined}
+                    onSelect={() => void onRunAllTasks("nightowl")}
+                  >
+                    <Moon />
+                    夜猫子任务
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={checkinAllRunning || travelRunning || taskRunning !== undefined}
+                    onSelect={() => void onRunAllTasks("school")}
+                  >
+                    <GraduationCap />
+                    开学季活动
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={checkinAllRunning || travelRunning || taskRunning !== undefined}
+                    onSelect={() => void onRunAllTasks("trial")}
+                  >
+                    <Gift />
+                    trial 加油包
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={checkinAllRunning || travelRunning || taskRunning !== undefined}
+                    onSelect={() => void onRunAllTasks("growthmap")}
+                  >
+                    <MapPin />
+                    活跃地图
+                  </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
@@ -1151,6 +1271,8 @@ export default function AccountsPage() {
                 onAdopt={onAdopt}
                 onRunTask={onRunTask}
                 taskRunning={taskRunning}
+                onRunGrowthTask={onRunGrowthTask}
+                growthTaskRunning={growthTaskRunning}
                 runningTask={runningTaskByAccountId.get(a.id) ?? null}
                 todayCheckedIn={checkinMap[a.id]}
                 travelStatus={travelMap[a.id]}

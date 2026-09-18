@@ -101,6 +101,57 @@ func TestNoRouteExcludedFromTierDay(t *testing.T) {
 	}
 }
 
+// TestProbeUIDsIncludeNoRouteAccounts 只读探测**要**包含 no_route 账号。
+//
+// 这是实测踩出来的回归：`pickProbeAccountInRegion`（拉上游 /v3/config 定区域真值）
+// 原先用 AvailableUIDs()，而 NoRoute 被加进 healthy() 之后，被禁用的国际版
+// 账号**既不接流量、也拿不到区域真值** —— 表现为
+//「deepseek-v4.1-flash 两区都有，界面却标『仅国服』」。
+//
+// 根因是把「不接流量」与「不作为」混为一谈：拉一次 /v3/config 是只读探测，
+// 不产生流量也不消耗积分，既不违反用户意图，又恰恰是这些账号最有价值的用途。
+//
+// 与之相对，e.disabled（网关判定 session 死 / 额度冻结）**仍要排除** ——
+// 那种账号连 /v3/config 都会失败，拿来探测只是白跑一轮。
+func TestProbeUIDsIncludeNoRouteAccounts(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u-normal", AccessToken: "t1", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "u-noroute", AccessToken: "t2", ExpiresAt: 9999999999, NoRoute: true})
+
+	probes := p.ProbeUIDs()
+	has := func(uid string) bool {
+		for _, u := range probes {
+			if u == uid {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !has("u-noroute") {
+		t.Error("ProbeUIDs 必须包含 no_route 账号 —— 否则被禁用的区域拿不到真值，" +
+			"会让只在那一区存在的模型被误标成「仅另一区有」")
+	}
+	if !has("u-normal") {
+		t.Error("ProbeUIDs 应包含普通账号")
+	}
+
+	// 与 AvailableUIDs 的差别正是本函数存在的意义。
+	for _, u := range p.AvailableUIDs() {
+		if u == "u-noroute" {
+			t.Error("AvailableUIDs（选号用）**不该**包含 no_route 账号")
+		}
+	}
+
+	// 没有 token 的账号不能被探测（必然失败，只是白跑）。
+	p.Add(&auth.Auth{UID: "u-notoken", ExpiresAt: 9999999999})
+	for _, u := range p.ProbeUIDs() {
+		if u == "u-notoken" {
+			t.Error("无 access token 的账号不该用于探测")
+		}
+	}
+}
+
 // TestNoRouteCountedAsUnavailableNotCooling no_route 账号计入「禁用」而不是「冷却」。
 //
 // 为什么要有这条：healthy() 对 no_route 返回 false，若不单独分一支，

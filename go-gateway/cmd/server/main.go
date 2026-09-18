@@ -242,7 +242,9 @@ func main() {
 		Usage:        usageStore,
 		// 养号任务手动触发：宿主（GUI/webui）的「立即执行」按钮经此转到调度器。
 		// 传方法值而非 *Scheduler —— server 包只需这一个能力，不必知道调度器结构。
-		RunTask: sch.RunTaskByName,
+		// 第二参数为账号 uid：空 = 全部账号（右上角一键操作），非空 = 仅该账号
+		//（账号卡片菜单里的入口）。
+		RunTaskFor: sch.RunTaskFor,
 		// 成长任务「一键完成」：17 个可自动任务的列表 / 单账号执行 / 全账号执行。
 		//
 		// 必须有这个入口，否则 growtask 包会被链接器的死代码消除剔出二进制

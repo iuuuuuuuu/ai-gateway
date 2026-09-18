@@ -146,7 +146,13 @@ func (h *Handler) fetchModelsForRegion(region auth.Region) []upstream.ModelInfo 
 // 返回 nil 让调用方明确知道「该区域这次没有真值」，进而退回保守行为。
 func (h *Handler) pickProbeAccountInRegion(region auth.Region) *auth.Auth {
 	var anyIntl *auth.Auth
-	for _, uid := range h.cfg.Pool.AvailableUIDs() {
+	// **用 ProbeUIDs 而不是 AvailableUIDs**：拉 /v3/config 是只读探测，
+	// 不产生流量也不消耗积分，因此被用户标记「不接流量」的账号同样可用 ——
+	// 而且它们往往是唯一能提供某个区域真值的账号。
+	//
+	// 实测踩过：用 AvailableUIDs 时，被禁用的国际版账号拿不到真值，
+	// 于是 deepseek-v4.1-flash 被误标成「仅国服存在」（两区其实都有）。
+	for _, uid := range h.cfg.Pool.ProbeUIDs() {
 		a := h.cfg.Pool.AuthByUID(uid)
 		if a == nil {
 			continue
@@ -786,18 +792,34 @@ func modelCapabilityFields(supportsImages *bool) map[string]any {
 //	C. 两者都无且 supportsReasoning 未声明 → 才是真的「不支持思考」，不下发
 //
 // 早先这里只判 `len(efforts)==0 → return nil`，把 B 与 C 混成一种，于是
-// 18 个（国服）/ 8 个（国际版）**有思考能力、只是不能选档**的模型在界面上
-// 显示成「—」，用户以为它们不能思考。
+// 18 个（国服）/ 8 个（国际版）模型在界面上显示成「—」，用户以为它们不能思考。
 //
-// 实测依据（真实流式调用，同一账号）：
+// ⚠ **2026-09-18 二次修正（所有者报「我现在就用的这个模型，用的 max 档位，
+// 为什么没有拦截报错？」）**：
 //
-//	多档模型 hy3（supportedEfforts=["low","high"]）：
-//	    low/high → 接受；未声明的档 → 上游拒绝 → 档位是**真限制**
-//	固定档模型 auto（只有 effort="high"，无 supportedEfforts）：
-//	    off/low/medium/high → **全部接受** → 它不是「不能思考」，
-//	    而是「没有声明可选档位」，默认走 high
+// 上一版把这种情况标成「固定单档」（reasoning_fixed=true）—— 那是**错的**。
+// 实测 deepseek-v4.1-flash（未声明 supportedEfforts 的典型）：
 //
-// 所以 B 必须如实下发「有思考能力 + 默认档是哪个」，只标记它不可选档。
+//	reasoning_effort=off         → ✗ HTTP 400 the reasoning effort value is not supported
+//	reasoning_effort=bogus_value → ✗ HTTP 400 同上
+//	minimal/low/medium/high/max/xhigh → ✓ **全部接受**
+//
+//	单调性（各档 2 次，推理字符均值）：
+//	    low 397 → medium 420 → high 646 → max 776   ✓ 单调递增
+//
+// 随机性不会产生单调序列，所以**档位真的生效** —— 用户调 max 确实得到了更长的推理。
+// 上游拒绝 off / 未知值，说明它有一整套**标准档位阶梯**在校验，
+// 只是没在 /v3/config 里逐模型列出 supportedEfforts。
+//
+// 结论：网关的职责是**如实区分两种情况**，而不是替上游「猜」它的能力：
+//
+//	A. 声明了 supportedEfforts → 列出该模型自己的档位（可能是子集，如 ["low","high"]）
+//	B. 未声明但有默认档     → **未声明可选范围**：默认档 X，但档位可指定，
+//	                          标准阶梯全部可用（网关不校验、原样透传）
+//	C. 两者都无             → 上游没声明任何思考信息，不下发
+//
+// 为什么 B 不能标成「固定」：那个词会让用户以为「调了也没用」而放弃调档 ——
+// 而实测证明调了有用。谎报能力的方向与「谎报支持图片」同样有害。
 func modelReasoningFields(efforts []string, defaultEffort string) map[string]any {
 	defaultEffort = strings.TrimSpace(defaultEffort)
 
@@ -807,49 +829,44 @@ func modelReasoningFields(efforts []string, defaultEffort string) map[string]any
 		return nil
 	}
 
-	// 情形 B：只有固定档，没有可选档位数组。
-	if len(efforts) == 0 {
-		nested := map[string]any{
-			// 固定档也是「支持思考」——客户端据此显示思考能力，
-			// 只是不能让它选（可选项应为空，而不是伪造一个单元素列表，
-			// 那会让客户端渲染出一个「只有一个选项的下拉框」）。
-			"supports_reasoning": true,
-			"supportsReasoning":  true,
-			"fixed":              true,
-			"default_effort":     defaultEffort,
-		}
-		return map[string]any{
-			// 显式 false 而不是省略：客户端要能区分「不可选档」与「字段缺失」。
-			"reasoning_fixed":     true,
-			"reasoningFixed":      true,
-			"supports_reasoning":  true,
-			"supportsReasoning":   true,
-			"default_effort":      defaultEffort,
-			"defaultEffort":       defaultEffort,
-			"default_reasoning_effort": defaultEffort,
-			// 空列表：明确「没有可选项」，与「不支持思考」由 reasoning_fixed 区分。
-			"supported_efforts":  []string{},
-			"supportedEfforts":   []string{},
-			"reasoning":          nested,
-		}
+	// 情形 A：上游**声明了**该模型的可选档位 → 如实列出它自己的范围。
+	// 这是唯一能确知「哪些档被支持」的情形（如 hy3 = ["low","high"]，
+	// 范围外的档会被上游拒绝）。不做任何推断或补齐。
+	if len(efforts) > 0 {
+		return withEffortList(efforts, defaultEffort, false)
 	}
 
-	// 情形 A：有可选档位。
+	// 情形 B：未声明可选范围，但有默认档。
 	//
-	// 复制一份：efforts 来自按区域的模型缓存（regionCapability.Efforts），
-	// 是共享切片。直接塞进响应 map 会让调用方对返回值的任何 in-place 修改
-	// 污染缓存 —— 下次请求就会带着被改过的档位列表。
-	list := make([]string, len(efforts))
-	copy(list, efforts)
+	// 下发「范围未声明」标记 + 标准阶梯，让客户端能给出可选项。
+	//
+	// 标准阶梯来自 upstream.StandardEfforts() —— 那是网关**已在用**的档位表
+	//（校验、降级都靠它），实测与上游对该类模型的接受范围一致（除 off）。
+	// 用它而非空列表：空列表会让客户端渲染出一个没有选项的档位控件，
+	// 用户只能看到「固定」而无法尝试任何档位。
+	return withEffortList(upstream.StandardEfforts(), defaultEffort, true)
+}
 
-	nested := map[string]any{"supported_efforts": list}
+// withEffortList 组装档位字段的公共形状（情形 A 与 B 共用）。
+//
+// undeclaredRange 为 true 时额外下发「可选范围未声明」标记 —— 语义是
+// **上游没列出可选值**，而非「不可选」。两者对用户的含义相反：
+// 前者鼓励尝试（实测调档真的生效），后者劝退。
+func withEffortList(list []string, defaultEffort string, undeclaredRange bool) map[string]any {
+	// 复制一份：list 可能是共享切片（情形 A 来自按区域的模型缓存）。
+	// 直接塞进响应 map 会让调用方对返回值的任何 in-place 修改污染缓存 ——
+	// 下次请求就会带着被改过的档位列表。
+	cp := make([]string, len(list))
+	copy(cp, list)
+
+	nested := map[string]any{"supported_efforts": cp}
 	out := map[string]any{
 		// 主拼写：OpenAI / 多数客户端。
-		"supported_efforts": list,
+		"supported_efforts": cp,
 		// 容错拼写。
-		"supportedEfforts":  list,
-		"reasoning_efforts": list,
-		"reasoningEfforts":  list,
+		"supportedEfforts":  cp,
+		"reasoning_efforts": cp,
+		"reasoningEfforts":  cp,
 		// OpenRouter 风格：嵌套在 reasoning 对象下。
 		"reasoning": nested,
 		// 有可选档位 ⇒ 支持思考，且**不是**固定档。
@@ -857,6 +874,11 @@ func modelReasoningFields(efforts []string, defaultEffort string) map[string]any
 		"supportsReasoning":  true,
 		"reasoning_fixed":    false,
 		"reasoningFixed":     false,
+	}
+	if undeclaredRange {
+		nested["range_undeclared"] = true
+		out["reasoning_range_undeclared"] = true
+		out["reasoningRangeUndeclared"] = true
 	}
 	if defaultEffort != "" {
 		nested["default_effort"] = defaultEffort

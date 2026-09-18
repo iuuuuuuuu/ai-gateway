@@ -3055,7 +3055,20 @@ pub async fn fetch_usage(days: Option<i64>) -> Value {
 /// 直接切断本函数正在等待的这条 HTTP 请求（现象就是界面上的
 /// `error sending request for url (...)`）。
 pub async fn run_task_now(task: &str) -> Value {
+    run_task_for(task, "").await
+}
+
+/// 同 [`run_task_now`]，但可**限定到单个账号**。
+///
+/// `account_uid` 为空 = 作用于全部账号（右上角「一键操作」）；
+/// 非空 = 只作用于该账号（账号卡片菜单里的入口）。
+///
+/// 为什么要这个参数：原实现只有「全部账号」一种语义，而账号菜单里的入口位置
+/// 暗示的是一对一 —— 用户在某个账号的卡片上点「活跃上报」，跑的却是整池，
+/// 与菜单位置传达的意思相反（所有者明确指出）。
+pub async fn run_task_for(task: &str, account_uid: &str) -> Value {
     let task = task.trim();
+    let account_uid = account_uid.trim();
     if task.is_empty() {
         return json!({
             "ok": false, "ran": false, "skip": Value::Null,
@@ -3094,7 +3107,14 @@ pub async fn run_task_now(task: &str) -> Value {
         Err(e) => return fail(format!("无法创建 HTTP 客户端: {e}")),
     };
 
-    let mut req = client.post(&url).json(&json!({ "task": task }));
+    // 单账号时把 uid 放进 body（Go 侧 accountId）；全部账号时**不带该键** ——
+    // 空串与「不传」在上游是同一语义，但少发一个字段更不容易被误读成「指定了空账号」。
+    let payload = if account_uid.is_empty() {
+        json!({ "task": task })
+    } else {
+        json!({ "task": task, "accountId": account_uid })
+    };
+    let mut req = client.post(&url).json(&payload);
     if !api_key.is_empty() {
         req = req.header("Authorization", format!("Bearer {api_key}"));
     }

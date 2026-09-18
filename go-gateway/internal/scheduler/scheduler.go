@@ -180,10 +180,40 @@ func (s *Scheduler) releaseTask(name string) {
 //
 // 未知任务名返回错误而非静默成功：宿主拼错名字时必须能看见，否则按钮点了没反应。
 func (s *Scheduler) RunTaskByName(name string) (TaskRunResult, error) {
+	return s.RunTaskFor(name, "")
+}
+
+// RunTaskFor 触发指定任务；accountUID 非空时**只作用于该账号**。
+//
+// 为什么需要按账号跑（所有者明确要求）：
+// 「养号任务」原先只能作用于全部账号 —— 用户在某个账号的菜单里点
+// 「活跃上报」，跑的却是整池。那与菜单的位置所暗示的语义相反
+//（他在那张卡片上操作，期望影响那张卡片）。
+// 现在账号菜单走本入口（单账号），右上角「一键操作」走 RunTaskByName（全账号）。
+//
+// 区域不符时**提前回报原因**而不是静默跑空：单账号触发时用户盯着结果，
+// 什么都不发生比一句说明糟糕得多。共用 checkinScopeAllows / IsIntl 的口径，
+// 保证「为什么这个号不参与」与排程侧的说法一致。
+func (s *Scheduler) RunTaskFor(name, accountUID string) (TaskRunResult, error) {
 	switch name {
 	case TaskNameActivity, TaskNameNightOwl, TaskNameSchool, TaskNameTrial, TaskNameGrowthMap:
 	default:
 		return TaskRunResult{}, fmt.Errorf("unknown task %q", name)
+	}
+
+	// 单账号模式先做可执行性检查（拿不到账号 / 区域不符都是**确定的**结论，
+	// 不必占用任务锁，也不必让用户等一轮）。
+	if accountUID != "" {
+		a := s.cfg.Pool.AuthByUID(accountUID)
+		if a == nil {
+			return TaskRunResult{
+				Task: name, Skip: "account_not_found",
+				Message: "该账号不在网关账号池中（可能已禁用、需重新登录或尚未同步）",
+			}, nil
+		}
+		if msg, ok := s.accountScopeSkip(name, a); !ok {
+			return TaskRunResult{Task: name, Skip: "region_mismatch", Message: msg}, nil
+		}
 	}
 
 	if !s.claimTask(name) {
@@ -205,20 +235,72 @@ func (s *Scheduler) RunTaskByName(name string) (TaskRunResult, error) {
 		}, nil
 	}
 
+	// 把账号作用域放进 ctx：各任务的遍历循环只需加一行
+	// `if !inAccountScope(ctx, st.UID) { continue }`，排程路径不带作用域、
+	// 行为逐字不变（不需要为每个任务再写一份「单账号版」实现）。
+	ctx := context.Background()
+	if accountUID != "" {
+		ctx = withAccountScope(ctx, accountUID)
+	}
+
 	switch name {
 	case TaskNameActivity:
-		s.RunActivityNow()
+		s.runActivity(ctx)
 	case TaskNameNightOwl:
-		s.RunNightOwlNow()
+		s.runNightOwl(ctx)
 	case TaskNameSchool:
-		s.RunSchoolNow()
+		s.runSchool(ctx)
 	case TaskNameTrial:
-		s.RunTrialNow()
+		s.runTrial(ctx)
 	case TaskNameGrowthMap:
-		s.RunGrowthMapNow()
+		s.runGrowthMap(ctx)
+	}
+
+	// 单账号模式回报具体账号，让界面能把结果落到那张卡片上。
+	if accountUID != "" {
+		return TaskRunResult{Task: name, Ran: true, Message: "已触发该账号的一轮"}, nil
 	}
 	return TaskRunResult{Task: name, Ran: true, Message: "已触发一轮"}, nil
 }
+
+// accountScopeSkip 该任务能否作用于这个账号；ok=false 时 msg 说明原因。
+//
+// 口径与各任务遍历循环里的区域过滤**逐条对应** —— 两处若不一致，
+// 就会出现「预检说能跑、实际跑空」的矛盾。
+func (s *Scheduler) accountScopeSkip(name string, a *auth.Auth) (string, bool) {
+	switch name {
+	case TaskNameTrial:
+		// trial 只跑国际版（国服无此端点），与 runTrial 的过滤相反。
+		if !upstream.IsIntl(a) {
+			return "trial 加油包仅国际版可用：国服没有这个端点", false
+		}
+	default:
+		// 活跃上报 / 夜猫子 / 开学季 / 活跃地图都只跑国服
+		//（国际版 growth 接口暂无真实数据），与各 run* 的 checkinScopeAllows 一致。
+		if !s.checkinScopeAllows(a) {
+			return "该任务是国服专属：国际版没有对应的数据接口", false
+		}
+	}
+	return "", true
+}
+
+// accountScopeKey ctx 里承载「只跑这个账号」的键。
+type accountScopeKey struct{}
+
+// withAccountScope 把任务限定到单个账号。
+func withAccountScope(ctx context.Context, uid string) context.Context {
+	return context.WithValue(ctx, accountScopeKey{}, uid)
+}
+
+// inAccountScope 报告 uid 是否在当前作用域内。
+//
+// 无作用域（排程、或「作用于全部账号」的手动触发）时**恒为 true** ——
+// 这是本机制能与既有排程共存的关键：排程路径不设作用域，行为逐字不变。
+func inAccountScope(ctx context.Context, uid string) bool {
+	scoped, _ := ctx.Value(accountScopeKey{}).(string)
+	return scoped == "" || scoped == uid
+}
+
 
 // runCareTask 到点执行一个养号任务，并与手动触发互斥。
 //

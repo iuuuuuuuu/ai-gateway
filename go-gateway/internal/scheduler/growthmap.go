@@ -21,6 +21,7 @@
 package scheduler
 
 import (
+	"context"
 	"log"
 	"strconv"
 	"time"
@@ -53,9 +54,21 @@ const maxGrowthLotteryDraws = 3
 // 重复触发是安全的：上游对兑换/补签的重复请求回业务错误，
 // 而抽奖本就以「有次数」为闸，不会被重复点击刷出额外消耗。
 func (s *Scheduler) RunGrowthMapNow() {
+	s.runGrowthMap(context.Background())
+}
+
+// runGrowthMap 活跃地图闭环遍历，可被 ctx 作用域限定到单个账号。
+//
+// 拆出带 ctx 的版本是为了支持「只跑某一个账号」（宿主账号菜单的手动触发）：
+// 作用域通过 ctx 传递，排程与「全部账号」路径不带作用域，行为逐字不变。
+func (s *Scheduler) runGrowthMap(ctx context.Context) {
 	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
+			continue
+		}
+		// 账号作用域：只在「作用于该账号」的手动触发时收窄（排程路径恒为 true）。
+		if !inAccountScope(ctx, st.UID) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
@@ -68,7 +81,9 @@ func (s *Scheduler) RunGrowthMapNow() {
 			continue
 		}
 		if !first {
-			time.Sleep(growthAccountDelay)
+			if !sleepCtx(ctx, growthAccountDelay) {
+				return
+			}
 		}
 		first = false
 		s.growthMapRound(a, nil, true)

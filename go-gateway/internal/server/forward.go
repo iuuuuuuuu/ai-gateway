@@ -26,80 +26,21 @@ import (
 	"workbuddy2api/internal/upstream"
 )
 
-// unsupportedEffortError 请求的思考档位不被该模型支持。
+// ⚠ unsupportedEffortError 与 checkRequestedEffort 已移除（2026-09-18）。
 //
-// 为什么**直接拒绝**而不是像以前那样静默降级：
-// 静默降级（把 `max` 改写成 `high`）在客户端看来是「我明明调了 max，回答却很短」，
-// 而网关日志里只有一行 `reasoning_effort downgraded`——用户既不知道发生了什么，
-// 也不知道该改成哪个档，只能反复试。既然档位是客户端**显式**指定的，
-// 不支持时就该如实报错并**列出支持哪些档**，让它一次就能改对。
+// 它们实现了「客户端指定的档位不在该模型 supportedEfforts 里 → 400 拒绝」，
+// 前提是**supportedEfforts 是该模型的硬范围**。实测推翻了它：
 //
-// 单独成型（而不是拼字符串）是为了让调用方识别它并回以 400 + 专用错误码。
-type unsupportedEffortError struct {
-	model     string   // 请求的模型（裸名）
-	requested string   // 客户端请求的档位
-	supported []string // 该模型支持的档位（非空；空则根本不会走到这里）
-	unknown   bool     // true = 请求的档位名本身无法识别（拼写错误之类）
-}
-
-func (e *unsupportedEffortError) Error() string {
-	got := e.requested
-	if got == "" {
-		got = "(未指定)"
-	}
-	// 必须**列出全部**支持档：只说「不支持 max」用户没法改对，只能挨个试。
-	// 这与 modelLockedError 的文案口径一致（列出全部允许项）。
-	list := strings.Join(e.supported, " / ")
-	if e.unknown {
-		return "模型 " + e.model + " 不认识思考档位 " + got + "；它支持的是 " + list +
-			"。请改为其中之一，或去掉 reasoning_effort 使用默认档。"
-	}
-	return "模型 " + e.model + " 不支持思考档位 " + got + "；它支持的是 " + list +
-		"。请改为其中之一，或去掉 reasoning_effort 使用默认档。"
-}
-
-// checkRequestedEffort 校验客户端显式指定的思考档位是否被该模型支持。
+//	hy3     声明 [low, high]     → medium / max / minimal / **off** 全部接受
+//	glm-5.2 声明 [high, xhigh]  → low / max / medium / **off** 全部接受
 //
-// 返回 nil 表示放行。放行情形（**都不算错**，不能拦）：
+// 上游对这些「范围外」的档照常接受，说明 supportedEfforts 只是
+// 「界面上建议列出哪些」，**不是**可用范围。据它拦截会把合法请求拒掉，
+// 而且用户拿到 400 后毫无办法 —— 他用的档其实能用。
 //
-//	请求体没带 reasoning_effort      → 用上游默认档，无需校验
-//	档位值为空串 / 非字符串           → 交给上游处理（网关不替它判错）
-//	模型不在能力表里                  → 未知即不拦（宁可不拦也不错拦）
-//	该模型未声明 supportedEfforts     → 上游没说支持什么，网关无从校验
-//
-// 只有「模型**明确**声明了支持档、而请求的档不在其中」才拒绝 —— 这正是
-// 以前会被静默改写的那些请求。档位名无法识别（不在 effortRank 里）也算拒绝：
-// 那种拼写错误此前被原样透传给上游，上游多半静默忽略，用户同样看不到原因。
-//
-// 比较一律小写 + trim：客户端写法并不统一（`High` / ` high ` 都出现过）。
-func checkRequestedEffort(model string, requested any, supported []string) error {
-	if len(supported) == 0 {
-		// 上游未声明该模型的档位 → 无从校验，放行（与 /v1/models 不下发档位一致）。
-		return nil
-	}
-	raw, ok := requested.(string)
-	if !ok {
-		// 缺字段或类型不对：前者是「用默认档」，后者让上游去报类型错。
-		return nil
-	}
-	req := strings.TrimSpace(strings.ToLower(raw))
-	if req == "" {
-		return nil
-	}
-	for _, s := range supported {
-		if strings.TrimSpace(strings.ToLower(s)) == req {
-			return nil
-		}
-	}
-	return &unsupportedEffortError{
-		model:     model,
-		requested: strings.TrimSpace(raw),
-		supported: supported,
-		// 档位名本身不认识（拼写错误之类）与「认识但不被该模型支持」分开表达：
-		// 前者用户多半是打错了，后者是模型能力问题，文案要给不同的提示。
-		unknown: !upstream.KnownEffort(req),
-	}
-}
+// 现在网关对 reasoning_effort 一律原样透传；真不被接受的档由上游自己报 400，
+// 错误原样返回（那是唯一权威的判据）。详见 forward.go 里 chatCompletions
+// 中「思考档位**不在这里校验**」那段注释。
 
 // modelLockedError 请求的模型不在「限制使用的模型」白名单内。
 //
@@ -253,18 +194,21 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 			&modelLockedError{requested: model, allowed: h.allowed}
 	}
 
-	// 思考档位校验：客户端**显式**指定了该模型不支持的档时直接拒绝。
+	// 思考档位**不在这里校验**（2026-09-18 移除，实测推翻了原假设）。
 	//
-	// 为什么放在选号之前（与上面的白名单同一位置）：这是**请求侧**错误，
-	// 换账号、重试都无济于事。若等到出站才由 normalizeReasoningEffort 静默降级，
-	// 用户看到的是「调了 max 却答得很短」，而网关侧只有一行降级日志 ——
-	// 既不知道发生了什么，也不知道该改成哪个档。
+	// 原实现：客户端指定的档不在该模型 supportedEfforts 里 → 直接 400。
+	// 前提是「supportedEfforts 是该模型的**硬范围**」。实测证明前提不成立：
 	//
-	// 放在这里还有一个实际好处：**不消耗账号**。此前每个被静默改写的请求
-	// 都照常占用一个账号名额并真的发出去了。
-	if err := checkRequestedEffort(model, effortOf(body), h.effortsForModel(model)); err != nil {
-		return &chatResult{Model: model}, http.StatusBadRequest, err
-	}
+	//	hy3    声明 [low, high]      → medium / max / minimal / **off** 全部接受
+	//	glm-5.2 声明 [high, xhigh]   → low / max / medium / **off** 全部接受
+	//
+	// 也就是说 supportedEfforts 描述的是「界面上建议列出哪些档」，
+	// **不是**「只接受这些档」。据它拦截会把上游本来接受的合法请求拒掉 ——
+	// 而这类误拒比静默降级更糟：用户拿到 400 却毫无办法（他用的档其实能用）。
+	//
+	// 于是网关对档位的职责收敛为**如实透传**：既不拦、也不改写。
+	// 真不被上游接受的档（如 deepseek-v4.1-flash 的 off）由上游自己报 400，
+	// 错误信息原样返回给客户端 —— 那才是唯一权威的判据。
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		var acct *auth.Auth

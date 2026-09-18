@@ -366,6 +366,7 @@ const TASK_RECORD_TITLE: Record<GatewayTaskName, string> = {
   nightowl: "夜猫子任务",
   school: "开学季活动",
   trial: "trial 加油包",
+  growthmap: "活跃地图",
 };
 
 /**
@@ -395,6 +396,8 @@ const TASK_EMPTY_HINT: Record<GatewayTaskName, string> = {
     "开学季任务只在真的领到奖励时才写记录。若本轮没有可领的（活动任务尚未达标，或今天已经领过），就是「无事发生」的正常形态 —— 不是没生效。可到活动页确认各任务的完成进度。",
   trial:
     "trial 加油包只在真的领到、且本周期尚未领取时才写记录；该任务仅国际版账号参与。",
+  growthmap:
+    "活跃地图只在真的领到礼包/补偿、成功补签、或兑换/抽奖有变化时才写记录，且同一账号每天最多一条。今天已经跑过的话，再点也不会有新记录 —— 不是没生效。",
 };
 
 /** 跳过原因码 → 面向用户的解释（与 Go `scheduler.TaskRunResult.Skip` 一一对应）。 */

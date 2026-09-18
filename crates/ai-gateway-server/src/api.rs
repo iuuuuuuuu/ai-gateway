@@ -1303,10 +1303,18 @@ async fn api_gateway_usage(Query(params): Query<HashMap<String, String>>) -> Res
 
 /// POST /api/gateway/task-run —— 手动触发网关侧一轮养号任务。
 ///
-/// body: { "task": "activity" | "nightowl" | "school" | "trial" }
+/// body: { "task": "activity" | "nightowl" | "school" | "trial" | "growthmap",
+///         "accountId": "<uid>" }   ← 可选
+///
+/// `accountId` 决定作用范围：
+///   - 省略 / 空 → **全部账号**（右上角「一键操作」的入口）
+///   - 给出 uid  → **只作用于该账号**（账号卡片菜单里的入口）
+///
+/// 加这个参数是因为原实现只有「全部账号」一种语义，而账号菜单里的入口位置
+/// 暗示的是一对一 —— 用户在某个账号的卡片上点「活跃上报」，跑的却是整池。
 ///
 /// 与 /api/checkin/all 的分工：那个是宿主自己实现的签到，本接口只是把请求
-/// 转给网关的 /tasks/run —— 这 4 个任务的实现（上报事件形状、夜猫时间窗、
+/// 转给网关的 /tasks/run —— 这些任务的实现（上报事件形状、夜猫时间窗、
 /// 只领已达标奖励的边界）都在网关里且已有测试覆盖，宿主不复制业务逻辑。
 async fn api_gateway_task_run(Json(body): Json<Value>) -> Response {
     let task = body
@@ -1318,7 +1326,13 @@ async fn api_gateway_task_run(Json(body): Json<Value>) -> Response {
     if task.is_empty() {
         return json_err("缺少 task 参数".to_string(), StatusCode::BAD_REQUEST);
     }
-    json_ok(ai_gateway_core::modules::gateway::run_task_now(&task).await)
+    let account_id = body
+        .get("accountId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    json_ok(ai_gateway_core::modules::gateway::run_task_for(&task, &account_id).await)
 }
 
 /// POST /api/gateway/growth-task —— 成长任务「一键完成」。

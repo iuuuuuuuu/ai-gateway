@@ -1,4 +1,4 @@
-import { ArrowRight, Ban, CalendarCheck, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Gift, Globe, GraduationCap, History, Info, Loader2, Moon, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2, Zap } from "lucide-react";
+import { ArrowRight, Ban, CalendarCheck, CalendarHeart, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Gift, Globe, GraduationCap, History, Info, Loader2, MapPin, Moon, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2, Zap } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
@@ -393,6 +393,36 @@ function trialAvailability(account: AccountMeta): TaskAvailability {
 }
 
 /**
+ * 活跃地图闭环（补签 / 兑换 / 抽奖 / 礼包）：国服专属。
+ *
+ * 与活跃上报同一约束：这个闭环的地基是 growth 连登天数，
+ * 而连登只有国服 growth 接口有真实数据 —— 国际版跑它等于空转。
+ */
+function growthMapAvailability(account: AccountMeta): TaskAvailability {
+  if (isIntlAccount(account)) {
+    return { enabled: false, reason: "国际版 growth 接口无数据，活跃地图无法推进" };
+  }
+  return { enabled: true, reason: null };
+}
+
+/**
+ * 校园日活动（school_season）：限时活动，**只在小程序内完成**。
+ *
+ * 两点与「开学季活动」不同，菜单文案要能让人分得清：
+ *   - 它是**成长任务**（走 /tasks/growth），不是调度器那五个遍历任务；
+ *   - 完成条件是「小程序内对话一次」，奖励 100 积分 + 5 能量。
+ *
+ * 活动 2026-09-24 截止，下线后上游不再下发该任务码 —— 与开学季一样，
+ * 「在期与否」只有问上游才知道，前端**不猜**，这里只按区域置灰。
+ */
+function schoolSeasonAvailability(account: AccountMeta): TaskAvailability {
+  if (isIntlAccount(account)) {
+    return { enabled: false, reason: "该活动仅国服下发（国际版清单里没有这个任务）" };
+  }
+  return { enabled: true, reason: null };
+}
+
+/**
  * 这个账号**有没有 Buddy**——菜单文案要回答的真正问题。
  *
  * 为什么不能直接读 `travelStatus.label`：那个标签回答的是「**今天旅行到哪一步**」，
@@ -579,14 +609,27 @@ interface Props {
   /** 领养 Buddy（仅领养，不派猫；与「一键旅行」的重叠部分单独暴露出来） */
   onAdopt?: (a: AccountMeta) => void;
   /**
-   * 手动触发一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial）。
+   * 手动触发一轮养号任务（活跃上报 / 夜猫子 / 开学季 / trial / 活跃地图）。
    *
-   * 注意语义：这是**整轮**触发，作用于全部账号，不是只跑当前卡片这个号
-   *（Go 侧 `RunTaskByName` 遍历账号池）。菜单用分组标题把这一点说清楚。
+   * **只作用于当前卡片这个账号**（区别于右上角「一键操作」的全账号版本）：
+   * 账号菜单里的入口位置本身就意味着「针对这个号」，用户在卡片上操作、
+   * 期望影响的就是这张卡片。全账号的入口放在页面右上角。
+   *
+   * 第二参数是账号库 id，由本组件传下去；父级把它翻成网关 uid。
    */
-  onRunTask?: (task: GatewayTaskName) => void;
+  onRunTask?: (task: GatewayTaskName, accountId: string) => void;
   /** 正在执行的任务名；用于临时置灰并避免重复触发。 */
   taskRunning?: GatewayTaskName;
+  /**
+   * 手动执行一个**成长任务**（当前只有「校园日」school_season）。
+   *
+   * 与 onRunTask 分开是必要的：成长任务走 `/tasks/growth`（逐任务、可指定 code），
+   * 而养号任务走 `/tasks/run`（整轮、只有任务名）。两者语义与接口都不同，
+   * 混成一个回调会让父级只能靠字符串猜该调哪个接口。
+   */
+  onRunGrowthTask?: (taskCode: string, accountId: string) => void;
+  /** 正在执行的成长任务码（用于置灰与转圈）。 */
+  growthTaskRunning?: string;
   /**
    * 本账号参与了**正在跑的那一轮**养号任务时下发的标记；否则为 null/undefined。
    *
@@ -653,7 +696,7 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
   );
 }
 
-export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, onCheckin, onRefresh, onAdopt, onRunTask, taskRunning, runningTask, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, onCheckin, onRefresh, onAdopt, onRunTask, taskRunning, onRunGrowthTask, growthTaskRunning, runningTask, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
   /** 备注编辑弹窗；`noteDraft` 是受控输入（打开时用当前备注初始化）。 */
   const [noteOpen, setNoteOpen] = useState(false);
@@ -866,17 +909,19 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   disabled: featuresDisabled || !onAdopt,
                   hint: adoptMenuHint(travelStatus, buddyKnowledge(travelStatus)),
                 })}
-                {/* 以下 4 项是养号任务，均由网关（Go 侧）按账号区域过滤：
-                    活跃上报 / 夜猫子 / 开学季只跑国服，trial 只跑国际版。
-                    菜单项本身仍逐号列出 —— 目的是让用户看懂「这个号为什么不参与」，
-                    这一组的可点项触发的是**整轮**任务，故用分组标题明确边界。 */}
+                {/* 以下 5 项是养号任务，**只作用于当前这张卡片的账号**
+                    （全账号版本在页面右上角「一键操作」里）。
+                    菜单项仍逐号列出，目的是让用户看懂「这个号能不能做这件事」：
+                    网关（Go 侧）会按区域过滤 —— 活跃上报 / 夜猫子 / 开学季 /
+                    活跃地图只跑国服，trial 只跑国际版，校园日只跑国服。
+                    点不动或点了报「区域不符」都是**预期**，不是故障。 */}
                 <DropdownMenuSeparator />
-                <DropdownMenuLabel>养号任务（触发一整轮，作用于全部账号）</DropdownMenuLabel>
+                <DropdownMenuLabel>养号任务（仅本账号）</DropdownMenuLabel>
                 {careTaskItem({
                   icon: <Zap />,
                   label: "活跃上报",
                   availability: activityAvailability(account),
-                  onSelect: () => onRunTask?.("activity"),
+                  onSelect: () => onRunTask?.("activity", account.id),
                   disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
                   busy: taskRunning === "activity",
                 })}
@@ -884,7 +929,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   icon: <Moon />,
                   label: "夜猫子任务",
                   availability: nightOwlAvailability(account),
-                  onSelect: () => onRunTask?.("nightowl"),
+                  onSelect: () => onRunTask?.("nightowl", account.id),
                   disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
                   busy: taskRunning === "nightowl",
                 })}
@@ -892,7 +937,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   icon: <GraduationCap />,
                   label: "开学季活动",
                   availability: schoolAvailability(account),
-                  onSelect: () => onRunTask?.("school"),
+                  onSelect: () => onRunTask?.("school", account.id),
                   disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
                   busy: taskRunning === "school",
                 })}
@@ -900,9 +945,28 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   icon: <Gift />,
                   label: "trial 加油包",
                   availability: trialAvailability(account),
-                  onSelect: () => onRunTask?.("trial"),
+                  onSelect: () => onRunTask?.("trial", account.id),
                   disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
                   busy: taskRunning === "trial",
+                })}
+                {careTaskItem({
+                  icon: <MapPin />,
+                  label: "活跃地图（补签/兑换/抽奖）",
+                  availability: growthMapAvailability(account),
+                  onSelect: () => onRunTask?.("growthmap", account.id),
+                  disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
+                  busy: taskRunning === "growthmap",
+                })}
+                {careTaskItem({
+                  icon: <CalendarHeart />,
+                  label: "校园日活动",
+                  availability: schoolSeasonAvailability(account),
+                  // 校园日是**成长任务**（走 /tasks/growth），不是调度器任务 ——
+                  // 它的完成条件是小程序内对话，需要专门的小程序指纹上报。
+                  // 这里复用同一个回调，由父级按 code 分流到对应接口。
+                  onSelect: () => onRunGrowthTask?.("school_season", account.id),
+                  disabled: featuresDisabled || !onRunGrowthTask || growthTaskRunning !== undefined,
+                  busy: growthTaskRunning === "school_season",
                 })}
                 <DropdownMenuSeparator />
                 {/* 备注：授权进来的账号常只带邮箱/手机号/随机 uid，看不出「这是谁的号」，
