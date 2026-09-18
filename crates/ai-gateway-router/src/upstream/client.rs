@@ -426,6 +426,13 @@ pub struct ModelInfo {
     pub max_tokens: i64,
     /// 支持的 reasoning 档位（空 = 未知 / 固定档）。
     pub efforts: Vec<String>,
+    /// 上游给的**默认**思考档 = `reasoning.effort`（空 = 未声明）。
+    ///
+    /// 与 [`ModelInfo::efforts`] 分开：`efforts` 是「允许哪些档」，
+    /// `default_effort` 是「不指定时用哪档」。上游同时给了两者，但默认档未必在
+    /// `supported_efforts` 里（上游数据未保证），因此**不要**用它去推导
+    /// `efforts`，也不要拿 `efforts[0]` 去冒充它。
+    pub default_effort: String,
     /// 是否接受图片输入。
     ///
     /// `None` **不等于** `Some(false)`：上游只给对话模型写 `supportsImages`，
@@ -573,6 +580,15 @@ fn parse_models(raw: &[u8]) -> Result<Vec<ModelInfo>> {
                             .collect()
                     })
                     .unwrap_or_default(),
+                // 上游的默认思考档。原 Go 版把它解析进匿名结构体后**全树零消费方**，
+                // 客户端在 /v1/models 里看不到档位信息 —— 用户只能靠猜档位名，
+                // 猜错就被 normalize_reasoning_effort 悄悄改写。这里接上。
+                default_effort: m
+                    .get("reasoning")
+                    .and_then(|r| r.get("effort"))
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 // 账号级多模态开关优先：上游用它表达「该账号不能发图片」，
                 // 与模型自身能力无关，此时宣称支持会让客户端发出必然失败的请求。
                 supports_images: if disabled_multimodal { Some(false) } else { supports },

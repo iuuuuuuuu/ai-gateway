@@ -307,6 +307,9 @@ fn image_capability_fields() -> Value {
 /// 本 crate 目前只内置静态表（无动态拉取），因此统一标注为支持图片。
 /// 不标注的话，客户端会把所有模型当纯文本 —— 图片能力整个消失，而网关
 /// 看起来完全正常（返回 200 + 完整列表），是最难排查的一类问题。
+///
+/// **刻意不补思考等级**：上游未声明档位时网关也不声明。谎报的档位要么被上游
+/// 降级、要么被忽略，用户看到的是「调了没生效」，比不下发更难排查。
 fn with_image_capability(mut entries: Vec<Value>) -> Vec<Value> {
     for entry in entries.iter_mut() {
         if let Some(obj) = entry.as_object_mut() {
@@ -414,17 +417,154 @@ fn static_models_all() -> Vec<Value> {
 }
 
 /// `GET /v1/models` —— 模型列表（需鉴权）。
+/// 生成思考等级（reasoning effort）字段。
+///
+/// 与 [`image_capability_fields`] 是**正交**的两个维度（一个是「能不能收图」，
+/// 一个是「思考用哪档」），因此独立成函数、独立调用，不合并成一个 map。
+///
+/// `efforts` 为空 = 上游未声明（含固定档模型、静态兜底表）→ 返回 `None`，
+/// **不下发任何键**。这与图片能力的三态语义一致：宁可不写，也不要凭空编造档位 ——
+/// 客户端会拿着编造的档位去发请求，而该档位要么被上游降级、要么被忽略，
+/// 用户看到的是「我明明调了 max 却没生效」这类无从排查的现象。
+///
+/// 一次下发**多种拼写**的理由与图片能力相同：各客户端读的字段名不统一，且没有
+/// 统一约定。所有已知解析器都只取自己认识的键，多余键不会报错。
+///
+/// ```text
+/// OpenAI 风格     → supported_efforts / reasoning_efforts
+/// OpenRouter 风格 → reasoning.supported_efforts / reasoning.default_effort
+/// 通用容错        → supportedEfforts / reasoningEfforts / defaultEffort
+/// ```
+///
+/// 默认档只在非空时下发。**不要**用 `efforts[0]` 之类的猜测填充：
+/// 上游没声明默认档时，网关也不知道，编一个反而误导。
+fn model_reasoning_fields(efforts: &[String], default_effort: &str) -> Option<Value> {
+    if efforts.is_empty() {
+        return None;
+    }
+    let list = Value::Array(efforts.iter().map(|s| json!(s)).collect());
+    let mut nested = serde_json::Map::new();
+    nested.insert("supported_efforts".into(), list.clone());
+    let mut out = serde_json::Map::new();
+    // 主拼写：OpenAI / 多数客户端。
+    out.insert("supported_efforts".into(), list.clone());
+    // 容错拼写。
+    out.insert("supportedEfforts".into(), list.clone());
+    out.insert("reasoning_efforts".into(), list.clone());
+    out.insert("reasoningEfforts".into(), list);
+    // OpenRouter 风格：嵌套在 reasoning 对象下。
+    let d = default_effort.trim();
+    if !d.is_empty() {
+        nested.insert("default_effort".into(), json!(d));
+        out.insert("default_effort".into(), json!(d));
+        out.insert("defaultEffort".into(), json!(d));
+        out.insert("default_reasoning_effort".into(), json!(d));
+    }
+    out.insert("reasoning".into(), Value::Object(nested));
+    Some(Value::Object(out))
+}
+
+/// `GET /v1/models` —— 模型列表（需鉴权）。
+///
+/// # 动态优先，静态兜底
+///
+/// 优先抽一个账号向上游拉真实清单（带 `context_length` / `max_tokens` /
+/// **思考档位** / 图片能力），失败或池为空时退回内置静态表。
+///
+/// 为什么必须动态拉：思考等级（`reasoning.supportedEfforts` / `effort`）**只有**
+/// 上游知道 —— 静态表里没有任何档位信息，只靠它下发会让客户端永远看不到档位，
+/// 用户只能靠猜档位名，猜错就被 `normalize_reasoning_effort` 悄悄改写
+///（降级或在「支持档全部高于请求档」时被 floor 抬升），界面上表现为
+/// 「我明明调了 max 却没生效」。
+///
+/// 静态兜底表**刻意不补档位**：上游没暴露时网关也不编造 —— 编造的档位要么被
+/// 上游降级、要么被忽略，比不下发更难排查。
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(r) = check_auth(&state, &headers) {
         return r;
     }
-    json_response(
-        StatusCode::OK,
-        json!({
-            "object": "list",
-            "data": static_models_all(),
-        }),
-    )
+
+    let data = match fetch_dynamic_models(&state).await {
+        Some(list) => list,
+        None => static_models_all(),
+    };
+    json_response(StatusCode::OK, json!({ "object": "list", "data": data }))
+}
+
+/// 抽一个健康账号向上游拉模型清单，包装成 OpenAI `/v1/models` 条目。
+///
+/// 返回 `None` 表示拿不到（池为空 / 上游失败 / 解析失败），由调用方退回静态表。
+///
+/// 只试一个账号即可：模型清单是**产品级**的，同一个区域里任何账号看到的都一样。
+/// 多试几个只会在上游故障时放大延迟，不会提高成功率。
+async fn fetch_dynamic_models(state: &Arc<AppState>) -> Option<Vec<Value>> {
+    // 取一个可用账号（短暂持锁，不跨 await）。
+    let acct = {
+        let mut pool = match state.pool.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        pool.pick()
+    }?;
+
+    let infos = match state.client.fetch_models(&acct).await {
+        Ok(v) if !v.is_empty() => v,
+        Ok(_) => return None,
+        Err(e) => {
+            // 拉取失败是**预期**路径（国际版模型接口实测会返回 500），
+            // 不是错误，降级到静态表即可，不打 error 级日志。
+            eprintln!("[models] 动态拉取失败，回退静态表: {e}");
+            return None;
+        }
+    };
+
+    // 释放刚占用的租约（`pick()` 不计在途，这里只是对称起见）。
+    if let Ok(mut pool) = state.pool.lock() {
+        pool.release(&acct.uid);
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let mut out = Vec::with_capacity(infos.len());
+    for mi in infos {
+        let region = crate::pool::region_of(&acct);
+        // 实测真值覆盖上游声明：上游对「两区同名、后端不同」的模型会给出
+        // 同一份错误答案（如 glm-5.2/5.3 国际版实际读不到图却报 true）。
+        let supports = crate::upstream::measured::measured_override(
+            &mi.id,
+            region,
+            mi.supports_images,
+        );
+        let mut entry = serde_json::Map::new();
+        entry.insert("id".into(), json!(mi.id));
+        entry.insert("object".into(), json!("model"));
+        entry.insert("created".into(), json!(now));
+        entry.insert("owned_by".into(), json!("workbuddy"));
+        if mi.context_window > 0 {
+            entry.insert("context_length".into(), json!(mi.context_window));
+            entry.insert("max_input_tokens".into(), json!(mi.context_window));
+        }
+        if mi.max_tokens > 0 {
+            entry.insert("max_output_tokens".into(), json!(mi.max_tokens));
+        }
+        if let Some(v) = supports {
+            entry.insert("supportsImages".into(), json!(v));
+            if let Some(caps) = image_capability_fields().as_object() {
+                for (k, val) in caps {
+                    entry.entry(k.clone()).or_insert_with(|| val.clone());
+                }
+            }
+        }
+        // 思考档位：只有上游声明了才下发。
+        if let Some(rf) = model_reasoning_fields(&mi.efforts, &mi.default_effort) {
+            if let Some(o) = rf.as_object() {
+                for (k, v) in o {
+                    entry.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        out.push(Value::Object(entry));
+    }
+    Some(out)
 }
 
 /// `POST /v1/chat/completions` —— OpenAI Chat Completions 入口。
@@ -1413,5 +1553,81 @@ mod tests {
         let v = body_json(res).await;
         // Anthropic 词汇表
         assert_eq!(v["error"]["type"], json!("invalid_request_error"));
+    }
+
+    /// 思考等级下发：多种拼写并存，值与顺序保真。
+    #[test]
+    fn reasoning_fields_expose_multiple_spellings() {
+        let efforts = vec!["low".to_string(), "medium".to_string(), "max".to_string()];
+        let f = model_reasoning_fields(&efforts, "medium").expect("有档位就应下发");
+
+        // 各客户端读的拼写都不同，逐条锁住，避免以后有人「清理重复字段」。
+        for key in [
+            "supported_efforts",
+            "supportedEfforts",
+            "reasoning_efforts",
+            "reasoningEfforts",
+        ] {
+            assert_eq!(
+                f[key],
+                json!(["low", "medium", "max"]),
+                "{key} 应保真且保序"
+            );
+        }
+        // OpenRouter 风格：嵌套在 reasoning 下
+        assert_eq!(f["reasoning"]["supported_efforts"], json!(["low", "medium", "max"]));
+        assert_eq!(f["reasoning"]["default_effort"], json!("medium"));
+        // 默认档的容错拼写
+        assert_eq!(f["default_effort"], json!("medium"));
+        assert_eq!(f["defaultEffort"], json!("medium"));
+        assert_eq!(f["default_reasoning_effort"], json!("medium"));
+    }
+
+    /// 上游未声明档位时**不下发任何键**（不是空数组）。
+    ///
+    /// 空数组会被客户端当成「有该字段但没档位」，与「未声明」语义不同 ——
+    /// 前者会让它认为该模型不支持思考。
+    #[test]
+    fn reasoning_fields_omitted_when_unmeasured() {
+        assert!(model_reasoning_fields(&[], "medium").is_none(), "无档位不下发");
+        assert!(model_reasoning_fields(&[], "").is_none());
+    }
+
+    /// 默认档只在有真值时下发，不用 `efforts[0]` 猜测填充。
+    #[test]
+    fn default_effort_not_fabricated() {
+        let efforts = vec!["low".to_string(), "high".to_string()];
+        let f = model_reasoning_fields(&efforts, "").expect("档位仍应下发");
+        assert_eq!(f["supported_efforts"], json!(["low", "high"]));
+        // 上游没声明默认档 → 网关也不猜
+        assert!(f.get("default_effort").is_none(), "不得用 efforts[0] 冒充默认档");
+        assert!(f["reasoning"].get("default_effort").is_none());
+        // 首档不应被当作默认值写进去
+        assert_ne!(f.get("default_effort"), Some(&json!("low")));
+    }
+
+    /// 默认档首尾空白应被裁掉（上游偶发带空格）。
+    #[test]
+    fn default_effort_is_trimmed() {
+        let efforts = vec!["low".to_string()];
+        let f = model_reasoning_fields(&efforts, "  low  ").unwrap();
+        assert_eq!(f["default_effort"], json!("low"));
+    }
+
+    /// 静态兜底表**不编造**档位：上游不暴露，网关也不暴露。
+    #[test]
+    fn static_table_does_not_fabricate_efforts() {
+        let data = static_models_all();
+        assert!(!data.is_empty());
+        for m in &data {
+            assert!(
+                m.get("supported_efforts").is_none(),
+                "静态表不得编造档位: {}",
+                m["id"]
+            );
+            assert!(m.get("reasoning").is_none(), "{}", m["id"]);
+            // 图片能力仍要有（那是实测确认存在的）
+            assert_eq!(m["supportsImages"], json!(true), "{}", m["id"]);
+        }
     }
 }

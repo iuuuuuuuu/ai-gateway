@@ -34,9 +34,13 @@ OUT_DIR="$ROOT/crates/ai-gateway-core/embedded"
 mkdir -p "$OUT_DIR"
 
 PROFILE=release
+OUT_DIR_NAME=release
 CARGO_FLAGS="--release"
 if [ "${DEV_BUILD:-}" = "1" ]; then
   PROFILE=dev
+  # 产物**目录名**与 profile 名不同：dev profile 的产物在 target/debug/ 下
+  #（cargo 的历史命名）。用 profile 名当目录名会找不到产物。
+  OUT_DIR_NAME=debug
   CARGO_FLAGS=""
 fi
 
@@ -44,9 +48,9 @@ fi
 # 用 CARGO_BUILD_TARGET 而不是 --target，这样下面的产物路径判断只需看
 # 环境变量，且与 cargo 自身的约定一致（cargo 会把它写进 target/<triple>/）。
 if [ -n "${CARGO_BUILD_TARGET:-}" ]; then
-  TARGET_DIR="$ROOT/target/$CARGO_BUILD_TARGET/$PROFILE"
+  TARGET_DIR="$ROOT/target/$CARGO_BUILD_TARGET/$OUT_DIR_NAME"
 else
-  TARGET_DIR="$ROOT/target/$PROFILE"
+  TARGET_DIR="$ROOT/target/$OUT_DIR_NAME"
 fi
 
 echo "==> 构建 Rust 网关（$PROFILE${CARGO_BUILD_TARGET:+, target=$CARGO_BUILD_TARGET}）"

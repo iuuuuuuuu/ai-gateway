@@ -41,6 +41,9 @@ New-Item -ItemType Directory -Force -Path $embedded | Out-Null
 $out = Join-Path $embedded "gateway.exe"
 
 $profile = if ($DevBuild) { "dev" } else { "release" }
+# 产物**目录名**与 profile 名不同：dev profile 的产物在 target/debug/ 下
+#（cargo 的历史命名，`--release` 才用 release/）。用 profile 名当目录名会找不到产物。
+$outDirName = if ($DevBuild) { "debug" } else { "release" }
 Write-Host "==> [1/2] 构建 Rust 网关（$profile）" -ForegroundColor Cyan
 
 $cargoArgs = @("build", "-p", "ai-gateway-router", "--bin", "gateway")
@@ -58,7 +61,7 @@ finally {
 
 # 定位产物：指定了 --target-dir 时不在仓库的 target/ 下。
 $targetRoot = if ($TargetDir) { $TargetDir } else { Join-Path $root "target" }
-$built = Join-Path $targetRoot "$profile/gateway.exe"
+$built = Join-Path $targetRoot "$outDirName/gateway.exe"
 if (-not (Test-Path -LiteralPath $built)) {
     throw "未找到构建产物 $built"
 }
