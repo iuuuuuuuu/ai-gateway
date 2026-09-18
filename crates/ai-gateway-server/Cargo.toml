@@ -1,6 +1,6 @@
 [package]
 name = "ai-gateway-server"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2021"
 description = "ai-gateway HTTP server + CLI（npm 安装形态：ai-gateway 命令启动本地 webui）"
 
