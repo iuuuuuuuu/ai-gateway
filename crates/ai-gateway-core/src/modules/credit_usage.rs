@@ -1,8 +1,31 @@
 //! 本地积分观察快照与统计投影。
 //!
 //! WorkBuddy 只返回当前资源余额，没有可复用的历史账单序列。因此这里把
-//! 成功查询到的余额保存为本地观察值，再用相邻快照的正向下降量推导“观察到
-//! 的消耗”。首次快照和余额增加只建立新的基线，不产生负数消耗。
+//! 成功查询到的余额保存为本地观察值，再用这些观察值推导「观察到的消耗」。
+//!
+//! # 两条并存的统计口径
+//!
+//! 1. **逐区间累加**（`credit_delta` / 逐日序列 / `usageToday` 等时间窗）——
+//!    把每一对相邻快照的下降量相加。它能切出「今日 / 近 7 天 / 本月」，
+//!    也能喂事件流与逐日趋势图。代价是必须**为每一笔扣减猜一个归属**，
+//!    因此单次不完整读数就会污染它（见下）。
+//! 2. **快照做差**（`compare_snapshots` / 返回值的 `comparison` 与逐账号
+//!    `change`）—— `本次余额 − 上次余额`，直接给出这段区间的净变化。
+//!    它不需要猜归属，因为它只回答「变了多少」，不回答「为什么变」。
+//!
+//! 为什么要有第 2 条（所有者原话：「关于积分消耗并不准确，其实只要对比上次积分快照，
+//! 就能看到完整的积分变化了，我想了想还是这个靠谱」）：
+//! 上游偶发返回**不完整的积分包列表**，聚合 `total`/`remaining` 会凭空下跌再涨回，
+//! 第 1 条口径据此记出 `-380` 紧跟 `+380` 的**幻影配对**（详见 `reading_trust`
+//! 与 `pair_reading_is_phantom` 的注释）。第 2 条口径对这类抖动天然免疫 ——
+//! 不可信的那次读数不会被当作基线。
+//!
+//! 两者**并存而非取代**：汇总（差值）回答「一共少了多少」，明细（事件流 +
+//! `CREDIT_SOURCE_*` 分来源记录）回答「每一笔是什么性质」。所有者的明确要求是
+//! 后者必须保留，故 `account_records.rs` 的写入路径原样不动。
+//!
+//! 边界处理（每条都有单测）：首次运行无基线、余额增加、账号缺席后重现、
+//! 上游查询失败、差值区间的时间跨度，均见 `compare_snapshots` 与 tests 模块。
 
 use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone};
 use serde_json::{json, Value};
@@ -20,6 +43,23 @@ use crate::modules::official_usage;
 pub const CREDIT_SNAPSHOT_RETENTION_DAYS: i64 = 90;
 pub const CREDIT_SNAPSHOT_MAX_RECORDS: usize = 5_000;
 pub const CREDIT_SNAPSHOT_DEDUPE_WINDOW_MS: i64 = 5 * 60 * 1000;
+/// 相邻快照之间允许的最大观测缺口（2 小时）。
+///
+/// 为什么需要这个常量：本模块的汇总口径是「末次余额 − 上次余额」，
+/// 这个差**只有在两次读数之间一直在观测时**才代表「这段时间的变化」。
+/// 中间若有一大段没有快照（账号被禁用、被移除后重新出现、程序没在跑），
+/// 两端做差会把**空档里发生的一切**（消耗、发放、整包过期）都算进当前窗口，
+/// 而那是无据的归因 —— 正是所有者反馈的「积分消耗不准确」的另一种形态。
+///
+/// 2 小时的取值依据（所有者真实快照，4974 个相邻间隔实测）：
+///   p50 = 30.0 min、p95 = 30.3 min、p99 = 41.8 min、最大 = 61.4 min；
+///   **没有任何一个间隔超过 62 分钟**（>60min 的仅 21 个，>180min 的为 0 个）。
+/// 也就是说正常运行时缺口恒 < 1.1h，2h 已是它的近 2 倍余量，
+/// 而「账号缺席一整天」这类空档会被稳稳挡在外面。
+///
+/// 宁可截断也不硬算：截断只会让覆盖区间变短（界面会如实标出从哪一刻开始），
+/// 而硬算会报出一个用户无法核对、也无法解释的数字。
+pub const CREDIT_SNAPSHOT_MAX_GAP_MS: i64 = 2 * 3600 * 1000;
 const CREDIT_STATS_MAX_EVENTS: usize = 200;
 
 static SNAPSHOT_WRITE_LOCK: Mutex<()> = Mutex::new(());
@@ -581,6 +621,221 @@ fn parse_snapshots(values: &[Value], at_ms: i64) -> Vec<Snapshot> {
     snapshots
 }
 
+// ---------------------------------------------------------------------------
+// 汇总口径：与上一次积分快照做差
+//
+// 为什么在「逐事件累加」之外还要这一套：逐事件那条路（`credit_delta` +
+// `add_credit_record`）必须**为每一笔扣减猜一个归属** —— 它只能在两次邻近读数
+// 之间把差值归类成发放/消耗/到期/调整。只要有一次读数不完整，那个差值就是错的，
+// 而错的那一条会永久留在记录里。所有者实测到过 `-380` 紧跟 `+380` 的幻影配对，
+// 就是这条路产生的（`reading_trust` 的注释记录了完整踩坑史）。
+//
+// 快照做差不需要猜归属：`本次余额 − 上次余额` 就是这段区间的**净变化**，
+// 它天然免疫「某一次读数不可信」—— 因为不可信的那次不会被当作基线。
+// 代价是它只能给出**汇总值**，给不出「这笔是调用扣减、那笔是签到发放」。
+// 所以两者并存而不是互相取代：明细看事件，总量看差值。
+// ---------------------------------------------------------------------------
+
+/// 无可用基准：首次运行还没有「上一次快照」。
+///
+/// 为什么必须是一个**显式状态**而不是 0：0 会被读成「这段时间没有消耗」，
+/// 而事实是「我们根本不知道」。0 与「不知道」是两件事。
+pub const CREDIT_COMPARISON_NO_BASELINE: &str = "no_baseline";
+/// 读数过旧：最后一次快照距今超过 `CREDIT_SNAPSHOT_MAX_GAP_MS`。
+///
+/// **注意它不与 `ok` 互斥** —— 见 `CreditComparison::stale` 的说明。
+/// 保留这个取值是为了让「最近一次对比发生在很久以前」这件事有名字，
+/// 供日志与调试使用；界面上的表达由 `stale` 布尔字段承担。
+pub const CREDIT_COMPARISON_STALE: &str = "stale";
+/// 基准或本次读数已被判为不可信（上游返回了不完整的包列表）。
+pub const CREDIT_COMPARISON_UNRELIABLE: &str = "unreliable";
+/// 可给出可信差值。
+pub const CREDIT_COMPARISON_OK: &str = "ok";
+
+/// 一次「与上次快照做差」的结果。
+///
+/// 字段设计说明：
+/// - `decrease` / `increase` 分开存，而不是只给一个带符号的 `net`：
+///   所有者明确要求「余额增加（签到/发放）要与消耗分开表达」。
+///   只给 net 的话，`-100 消耗` 与 `+50 发放` 会互相抵消成 `-50`，
+///   用户看到「消耗 50」而实际消耗了 100 —— 这正是旧口径被抱怨的形态。
+/// - `net` 仍然保留：它是「这段时间积分到底净变了多少」的完整答案，
+///   而 `decrease - increase == net` 恒成立，两者可互相校验。
+/// - `from_ts` / `to_ts` 是**必填语义**：差值覆盖的区间必须能说清楚是哪一段，
+///   否则「消耗 380」无从核对（是今天的？还是这一周的？）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CreditComparison {
+    /// 是否有可信差值。false 时 `decrease`/`increase`/`net` 恒为 0 且无意义。
+    pub ok: bool,
+    /// 无可信差值的原因（`CREDIT_COMPARISON_*`）；ok 时为 `CREDIT_COMPARISON_OK`。
+    pub reason: &'static str,
+    /// 差值区间起点（上次快照时刻）；无基准时为 None。
+    pub from_ts: Option<i64>,
+    /// 差值区间终点（本次快照时刻）；无快照时为 None。
+    pub to_ts: Option<i64>,
+    /// 区间内余额**下降**的总量（≥ 0）= 消耗。
+    pub decrease: f64,
+    /// 区间内余额**上升**的总量（≥ 0）= 发放/返还。与消耗分开表达。
+    pub increase: f64,
+    /// 净变化 = to 余额 − from 余额 = increase − decrease。
+    pub net: f64,
+    /// 这份差值**不是最新的**：末次快照距统计时刻已超过 `CREDIT_SNAPSHOT_MAX_GAP_MS`。
+    ///
+    /// 为什么不与 `ok` 合并成一个三态枚举：两者是**正交**的事实。
+    /// 一份 30 分钟区间的差值即使算得完全正确（`ok = true`），
+    /// 只要最近 5 小时没再采集过，它就是**陈旧**的。把陈旧说成「不可信」
+    /// 会丢掉一个真实可信的数字；把陈旧当成「当前」又会让用户以为
+    /// 那就是此刻的消耗。故分开表达，界面用「数据截至 …」的措辞如实标注。
+    pub stale: bool,
+}
+
+impl CreditComparison {
+    fn none(reason: &'static str) -> Self {
+        CreditComparison {
+            ok: false,
+            reason,
+            from_ts: None,
+            to_ts: None,
+            decrease: 0.0,
+            increase: 0.0,
+            net: 0.0,
+            stale: false,
+        }
+    }
+}
+
+/// 这一对相邻快照之间**读数结构上是否不可信**（差值不能当作真实变化）。
+///
+/// 抽成独立函数的理由：这个判据有**两个**消费方，且两处必须完全一致 ——
+///   · 汇总口径 `compare_snapshots`（末次 vs 上次）；
+///   · 逐区间累加（逐日序列 / 时间窗 / 事件流）。
+/// 若各写一份，早晚会出现「汇总说不可信、累加却照样把 -350 算进今日消耗」
+/// 这种自相矛盾的界面（而 GatewayPage 的「消耗积分」列读的正是后者）。
+///
+/// 两条判据都取自 `reading_trust` 的既有结论，不新增猜测：
+///   · `suspect`：写入该快照时已判定上游包列表不完整；
+///   · `total` 下降：额度容量不会因消耗而变小，故下降即「包集合变了」。
+/// 幅度**不**作为判据 —— 消耗快时余额确实可能快速下跌，那会误杀真实消耗。
+///
+/// 实测效果（所有者真实快照 5000 条、25 个账号，只读回放）：
+/// 旧口径把逐区间下降量全部相加 = 11165.4；套用本判据后 = 9391.2，
+/// 即 **剔除 6 个幻影区间、共 1774.2 积分（占原报数 15.9%）**。
+/// 那 6 个区间的形态就是 `350→0→350` / `380→30→380`（`total` 同步塌到 0/30）。
+fn pair_reading_is_phantom(prev: &Snapshot, latest: &Snapshot) -> bool {
+    prev.suspect || latest.suspect || latest.total < prev.total - f64::EPSILON
+}
+
+/// 比较两个快照，得出这段区间的积分变化。
+///
+/// 纯函数，便于逐条边界钉死（写盘路径只剩调用）。
+///
+/// **为什么区间有上限**（`CREDIT_SNAPSHOT_MAX_GAP_MS`）：
+/// 「末次 − 上次」只有在两次读数**之间一直在观测**时才等于「这段时间的变化」。
+/// 账号被禁用/移除期间不会有快照，重新出现时若直接与禁用前那次做差，
+/// 空档里发生的消耗、发放、整包过期会被整体算进当前窗口 —— 那是无据的归因。
+/// 故缺口过大直接判为「无基准」，宁可显示「暂无对比基准」也不报一个假数字。
+///
+/// **为什么容量下降要判不可信**：`total`（额度容量）是各包总额度之和，
+/// 消耗只减 `remaining`，不会让 `total` 变小（见 `reading_trust` 判据 2）。
+/// 所以 `total` 下降必然意味着**包集合变了**（少读到包 / 包被回收），
+/// 此时两端做差会把「没读到的那些包」算成消耗 —— 所有者那 5 对幻影记录
+/// （实测 350→0→350、380→30→380）全部落在这个形态上。
+/// 保守处理与 `reading_trust` 保持一致：宁可漏记一次真到期，也不报一个幻影消耗。
+///
+/// **已知残留**（如实记录，不掩饰）：若某次抖动**恰好没有改变 `total`**
+/// （例如只读到部分包且总额度凑巧相同），且该快照又没有 `suspect` 标记
+///（本标记是修复幻影配对那一版才引入，历史快照均无），
+/// 本函数无法把它与真实变化区分开。`suspect` 一旦写入即可拦住同类情况，
+/// 故这是**历史数据**的残留，不是新数据的缺陷。
+///
+/// 不对外 `pub`：参数类型 `Snapshot` 是本模块的私有解析产物，
+/// 暴露出去会让 crate 外无法构造参数（`private_interfaces`）。调用点只有
+/// 本模块的 `build_statistics`，单测与本模块同处一个 `mod`，照样能覆盖。
+fn compare_snapshots(prev: &Snapshot, latest: &Snapshot) -> CreditComparison {
+    // 缺口过大 → 中间没有观测，不构成基准。
+    if latest.ts - prev.ts > CREDIT_SNAPSHOT_MAX_GAP_MS {
+        return CreditComparison::none(CREDIT_COMPARISON_NO_BASELINE);
+    }
+
+    // 任一端被标记为不可信读数（上游包列表不完整）→ 差值测的是抖动，不是现实。
+    // 为什么两端都要查：`prev` 可疑时本次是「恢复」（会假报发放），
+    // `latest` 可疑时本次是「读数掉了」（会假报消耗）—— 两种都会污染汇总值。
+    //
+    // 与逐区间累加共用 `pair_reading_is_phantom`，保证两条口径同进同退。
+    if pair_reading_is_phantom(prev, latest) {
+        return CreditComparison {
+            from_ts: Some(prev.ts),
+            to_ts: Some(latest.ts),
+            ..CreditComparison::none(CREDIT_COMPARISON_UNRELIABLE)
+        };
+    }
+
+    let net = latest.remaining - prev.remaining;
+    CreditComparison {
+        ok: true,
+        reason: CREDIT_COMPARISON_OK,
+        from_ts: Some(prev.ts),
+        to_ts: Some(latest.ts),
+        // 分开取正负：`net` 为负时 increase 恒为 0，反之亦然。
+        // 这样「消耗 100 + 发放 50」报的是 decrease=100 / increase=50（净 −50），
+        // 而不是把两者抵消成「消耗 50」—— 后者会让用户以为只烧了 50。
+        decrease: (-net).max(0.0),
+        increase: net.max(0.0),
+        net,
+        // 由调用方按统计时刻回填（见 `compare_account_snapshots`）：
+        // 本函数刻意不接收 `at_ms`，保持「两个快照 → 一个差值」的纯语义。
+        stale: false,
+    }
+}
+
+/// 为一个账号的全部快照算出「末次 vs 上次」的汇总差值。
+///
+/// 输入要求按 `ts` 升序（`build_statistics` 已排序）。少于 2 条时即「首次运行」，
+/// 返回 `NO_BASELINE` —— 这正是「首次运行不该报出巨额虚假消耗」那条边界的实现点。
+///
+/// `at_ms` 只用于判定 `stale`（这份差值是不是已经不再反映「当前」）。
+/// 之所以不放进 `compare_snapshots`：那个函数是纯的两快照比较，
+/// 与「统计发生在什么时候」无关；把 `at_ms` 混进去会让它的语义变模糊，
+/// 单测也得凭空造一个与断言无关的时间戳。
+fn compare_account_snapshots(snapshots: &[Snapshot], at_ms: i64) -> CreditComparison {
+    let Some(latest) = snapshots.last() else {
+        return CreditComparison::none(CREDIT_COMPARISON_NO_BASELINE);
+    };
+    let Some(prev) = snapshots.len().checked_sub(2).map(|index| &snapshots[index]) else {
+        // 只有一条快照：它是基线本身，还没有可比的对象。
+        return CreditComparison {
+            to_ts: Some(latest.ts),
+            ..CreditComparison::none(CREDIT_COMPARISON_NO_BASELINE)
+        };
+    };
+    let mut comparison = compare_snapshots(prev, latest);
+    // 陈旧判定与可信判定**正交**：算得再准的差值，只要末次读数太旧，
+    // 它反映的就不是「此刻」而是「那一刻」。界面据此改用「数据截至 …」措辞。
+    //
+    // 用 `saturating_sub` 而不是直接相减：`at_ms` 理论上可能早于快照
+    // （时钟回拨、测试构造），相减会溢出成负数从而把新鲜数据误判为陈旧。
+    comparison.stale = at_ms.saturating_sub(latest.ts) > CREDIT_SNAPSHOT_MAX_GAP_MS;
+    comparison
+}
+
+/// 汇总差值的 JSON 形态（顶层 `comparison` 与逐账号 `change` 共用同一套字段名）。
+///
+/// 为什么 `decrease` / `increase` 恒为数字而**不用 null**：只有「有没有可信差值」
+/// 这一件事需要三态，而它已经由 `ok` + `reason` 表达；再给两个数值字段加 null
+/// 会让前端要判三次空。前端只需认 `ok`：false 就显示「—」，绝不显示 0。
+fn comparison_value(comparison: &CreditComparison) -> Value {
+    json!({
+        "ok": comparison.ok,
+        "reason": comparison.reason,
+        "fromTs": comparison.from_ts,
+        "toTs": comparison.to_ts,
+        "decrease": comparison.decrease,
+        "increase": comparison.increase,
+        "net": comparison.net,
+        "stale": comparison.stale,
+    })
+}
+
 fn usage_in_windows(date: &str, today: NaiveDate) -> (bool, bool, bool) {
     let Some(date) = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok() else {
         return (false, false, false);
@@ -685,16 +940,39 @@ fn build_statistics(
     let mut usage_totals: HashMap<String, (f64, f64, f64)> = HashMap::new();
     let mut daily_usage: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let mut latest_snapshots = HashMap::new();
+    // 逐账号的「末次 vs 上次」差值，汇总口径的唯一来源（见 `compare_snapshots`）。
+    let mut account_comparisons: HashMap<String, CreditComparison> = HashMap::new();
     for (account_id, mut snapshots) in by_account {
         snapshots.sort_by_key(|snapshot: &Snapshot| snapshot.ts);
         if let Some(latest) = snapshots.last() {
             latest_snapshots.insert(account_id.clone(), latest.clone());
         }
+        // 汇总口径在这里算：本账号全部快照已按 ts 排序，末次与上次的差就是
+        // 「这段区间净变了多少」。与下面的逐事件累加**并行**存在 ——
+        // 累加值继续喂逐日趋势图与事件流（明细），差值则作为总量口径。
+        account_comparisons.insert(
+            account_id.clone(),
+            compare_account_snapshots(&snapshots, at_ms),
+        );
         for pair in snapshots.windows(2) {
             let previous = &pair[0];
             let current = &pair[1];
             let amount = previous.remaining - current.remaining;
             if amount <= f64::EPSILON {
+                continue;
+            }
+            // 幻影区间不得进入逐日序列 / 时间窗 / 事件流。
+            //
+            // 为什么这条必须补上（改动前这里是**唯一**漏掉的判据）：
+            // 逐事件写记录那条路（`record_snapshot`）已经用 `reading_trust` 拦住了
+            // 幻影，但本函数是**从快照文件重新回放**的，它不读 `record_snapshot`
+            // 的结论。于是 owner 真实的 `380 → 30 → 380` 序列在这里照样会累加出
+            // 「今日消耗 350」—— 而 GatewayPage「消耗积分」列与统计页的
+            // 「今日 / 近 7 天 / 本月消耗」读的正是这几个字段。
+            // 也就是说：只修记录不修这里，用户看到的数字依旧是错的。
+            //
+            // 与汇总口径共用同一判据，避免两条口径各说一套。
+            if pair_reading_is_phantom(previous, current) {
                 continue;
             }
             let Some(date) = local_date_string(current.ts) else {
@@ -809,6 +1087,20 @@ fn build_statistics(
                 "currentRemaining": is_current.then(|| latest.map(|snapshot| snapshot.remaining)).flatten(),
                 "totalCapacity": is_current.then(|| latest.map(|snapshot| snapshot.total)).flatten(),
                 "lastSnapshotAt": latest.map(|snapshot| snapshot.ts),
+                // 汇总口径：该账号「末次快照 vs 上次快照」的完整变化。
+                // 与下面三个 usage* 字段**并存**：usage* 是逐事件累加（明细派生的
+                // 时间窗切分），change 是快照做差（可信的总量）。前端总量展示优先
+                // 用 change，明细与趋势图继续用 usage* / daily。
+                //
+                // 为什么逐账号也要给：所有者要能看出「是哪个号在烧」，
+                // 只给全局汇总的话，一个号的异常会被其他号摊平而看不出来。
+                "change": comparison_value(
+                    account_comparisons
+                        .get(account_id)
+                        .unwrap_or(&CreditComparison::none(CREDIT_COMPARISON_NO_BASELINE)),
+                ),
+                // 账号不在了（被禁用/移除）时，这个差值已不再刷新 —— 如实告诉前端，
+                // 否则界面会把一个陈旧数字当成「当前消耗」。
                 "usageToday": usage_today,
                 "usage7Days": usage_week,
                 "usageThisMonth": usage_month,
@@ -870,10 +1162,79 @@ fn build_statistics(
         .map(|(_, event)| event)
         .collect();
 
+    // 全局汇总差值：只累加**可信**的账号差值。
+    //
+    // 为什么不可信的账号直接跳过而不是当 0 加：当 0 加会让「一个账号缺基准」
+    // 静默地把总量算低，用户看不出总量其实只覆盖了一部分账号。
+    // 故单独统计可信账号数，前端据此说明「该差值覆盖了几个账号」。
+    let mut total_decrease = 0.0;
+    let mut total_increase = 0.0;
+    let mut comparison_accounts = 0usize;
+    // 区间取**可信账号的并集**：不同账号的最后两次快照时刻不必相同，
+    // 报一个全局 from/to 才说得清「这个总量是哪段时间的」。
+    // 起点取最早、终点取最晚 —— 与「各账号差值之和」实际覆盖的范围一致。
+    let mut comparison_from_ts: Option<i64> = None;
+    let mut comparison_to_ts: Option<i64> = None;
+    // 全局陈旧 = **所有**可信账号的差值都陈旧。只要有一个账号刚采集过，
+    // 这份汇总就不是「完全过期」的 —— 用 all 而非 any，避免一个新账号
+    // 就把整块数据标成陈旧。
+    let mut comparison_all_stale = true;
+    for comparison in account_comparisons.values() {
+        if !comparison.ok {
+            continue;
+        }
+        comparison_accounts += 1;
+        total_decrease += comparison.decrease;
+        total_increase += comparison.increase;
+        comparison_all_stale &= comparison.stale;
+        if let Some(from) = comparison.from_ts {
+            comparison_from_ts = Some(comparison_from_ts.map_or(from, |current| current.min(from)));
+        }
+        if let Some(to) = comparison.to_ts {
+            comparison_to_ts = Some(comparison_to_ts.map_or(to, |current| current.max(to)));
+        }
+    }
+    // 全局是否可信：至少要有一个账号有可信差值，否则「无对比基准」。
+    // reason 的取值与逐账号同一套，前端 switch 一次即可覆盖两种粒度。
+    let comparison_ok = comparison_accounts > 0;
+    let comparison_reason = if comparison_ok {
+        CREDIT_COMPARISON_OK
+    } else if account_comparisons.is_empty() {
+        CREDIT_COMPARISON_NO_BASELINE
+    } else if account_comparisons
+        .values()
+        .any(|comparison| comparison.reason == CREDIT_COMPARISON_NO_BASELINE)
+    {
+        CREDIT_COMPARISON_NO_BASELINE
+    } else {
+        CREDIT_COMPARISON_UNRELIABLE
+    };
+    let comparison = json!({
+        "ok": comparison_ok,
+        "reason": comparison_reason,
+        "fromTs": comparison_from_ts,
+        "toTs": comparison_to_ts,
+        "decrease": total_decrease,
+        "increase": total_increase,
+        "net": total_increase - total_decrease,
+        // 该差值覆盖了几个账号。为 0 时前端必须显示「暂无对比基准」而不是 0。
+        "accounts": comparison_accounts,
+        // 可信账号全为 0 时 all() 恒真，但那属于「无基准」而非「陈旧」，
+        // 故显式要求至少有一个可信账号，避免把两种状态混为一谈。
+        "stale": comparison_ok && comparison_all_stale,
+    });
+
     json!({
         "generatedAt": at_ms,
         "retentionDays": record_retention_days(),
         "coverageStartAt": coverage_start_at,
+        // 汇总口径（本次修复的核心）：与上一次积分快照做差。
+        //
+        // 为什么放在**顶层**而不是塞进 summary：它和 summary 里那些字段
+        // **不是同一层语义** —— summary.usageToday 等是逐事件累加派生的
+        // 时间窗切分，而 comparison 是「末次快照 − 上次快照」的实测差值。
+        // 混在一起，调用方迟早会把两者当成同一口径相加或互相校验。
+        "comparison": comparison,
         "summary": {
             "currentRemaining": current_remaining,
             "currentCapacity": current_capacity,
@@ -900,6 +1261,20 @@ pub async fn get_statistics(refresh: bool) -> Value {
     let accounts = load_accounts();
     let mut statistics =
         build_statistics(&load_snapshots(), &load_checkin_logs(), &accounts, at_ms);
+    // 免费模型的调用**不扣积分**，因此「只用了免费模型」的账号消耗必为 0。
+    //
+    // 为什么必须在统计出口做这一步（而不是改 record_snapshot 的归因）：
+    // 余额下降是**可观测事实** —— 免费模型也可能伴随余额抖动（实测：读上游
+    // 包列表失败时聚合值会短暂掉到 0，被记成 -350 又涨回，即「幻影配对」）。
+    // 那是「读数问题」，与「该不该扣分」正交，不能靠删除记录来掩盖。
+    // 这里只纠正**展示口径**：既然确定这些调用不产生消耗，就把消耗如实
+    // 显示为 0（而不是「—」，因为「—」表示不知道，0 是确定的）。
+    //
+    // 判定依据是上游权威数据（`/v3/config` 的 credits 倍率，经网关按区域
+    // 透出），见 `model_billing` 模块头部的完整说明。拿不到真值 → 全部
+    // Unknown → 本步不改任何数字，统计页退化为原有口径。
+    let verdicts = crate::modules::model_billing::collect_window_verdicts(&accounts).await;
+    crate::modules::model_billing::zero_out_free_windows(&mut statistics, &verdicts);
     statistics["officialUsage"] =
         official_usage::official_usage_for_statistics(&accounts, at_ms, refresh).await;
     statistics
@@ -1501,5 +1876,615 @@ mod tests {
             .find(|s| s.account_id == "acc-pk")
             .expect("应写入快照");
         assert_eq!(mine.packages.get("p380"), Some(&380.0));
+    }
+
+    // =======================================================================
+    // 汇总口径：与上一次积分快照做差
+    //
+    // 所有者原话：「关于积分消耗并不准确，其实只要对比上次积分快照，就能看到
+    // 完整的积分变化了，我想了想还是这个靠谱」。
+    //
+    // 下面按**他点名的每一条边界**逐一钉死。这些断言之所以写成独立单测而不是
+    // 藏在端到端里：每一条都对应一种会把数字算错的具体情形，坏了要能一眼看出
+    // 是哪一种坏的（端到端只会报「总数不对」，还得再猜）。
+    // =======================================================================
+
+    /// 带 `total` / `packages` / `suspect` 的快照值，供汇总口径的单测构造输入。
+    ///
+    /// 与 `snap` 分开：`snap` 固定 total=100，用来测逐事件那条路；
+    /// 汇总口径必须能独立控制 total（容量下降是它的一条判据）与 suspect。
+    /// 包级明细默认给一个与 remaining 同值的包 —— 让两侧包集合一致，
+    /// 免得判据 1（包凭空消失）在无关用例里意外生效。
+    fn full_snap(ts: i64, total: f64, remaining: f64) -> Value {
+        json!({
+            "ts": ts,
+            "accountId": "account-1",
+            "accountName": "one@example.com",
+            "total": total,
+            "remaining": remaining,
+            "packages": { "p0": remaining },
+        })
+    }
+
+    fn snap_of(ts: i64, total: f64, remaining: f64) -> Snapshot {
+        snapshot_from_value(&full_snap(ts, total, remaining)).expect("valid snapshot")
+    }
+
+    /// 边界一：**首次运行没有「上次快照」→ 不报虚假巨额消耗**。
+    ///
+    /// 这是所有者最担心的一种错法：一条快照就把它的余额整份报成「消耗」。
+    /// 故必须 `ok = false` 且 decrease/increase 都是 0，界面据此显示「—」。
+    #[test]
+    fn first_run_without_baseline_reports_nothing() {
+        let now = at_local_date(0, 12);
+        let stats = build_statistics(&[snap(now, 380.0)], &[], &[], now);
+
+        assert_eq!(stats["comparison"]["ok"], false, "首次运行不该给出可信差值");
+        assert_eq!(
+            stats["comparison"]["reason"],
+            CREDIT_COMPARISON_NO_BASELINE
+        );
+        assert_eq!(stats["comparison"]["decrease"], 0.0);
+        assert_eq!(stats["comparison"]["increase"], 0.0);
+        assert_eq!(stats["comparison"]["accounts"], 0);
+
+        // 逐账号那一份同样是「无基准」，前端不会拿它显示 0。
+        assert_eq!(stats["accounts"][0]["change"]["ok"], false);
+        assert_eq!(
+            stats["accounts"][0]["change"]["reason"],
+            CREDIT_COMPARISON_NO_BASELINE
+        );
+    }
+
+    /// 完全没有任何快照时也不能崩，同样报「无基准」。
+    #[test]
+    fn no_snapshots_at_all_reports_no_baseline() {
+        let now = at_local_date(0, 12);
+        let stats = build_statistics(&[], &[], &[], now);
+
+        assert_eq!(stats["comparison"]["ok"], false);
+        assert_eq!(stats["comparison"]["reason"], CREDIT_COMPARISON_NO_BASELINE);
+        assert_eq!(stats["comparison"]["accounts"], 0);
+    }
+
+    /// 边界二：**余额增加（签到/发放）要与消耗分开表达**。
+    ///
+    /// 序列 `380 → 430`：这是纯发放。若只给一个带符号的 net，界面会把
+    /// 「发放 50」显示成「消耗 -50」；故 decrease=0 / increase=50 必须分开。
+    #[test]
+    fn balance_increase_is_reported_as_increase_not_negative_usage() {
+        let now = at_local_date(0, 12);
+        let prev = now - 30 * 60 * 1000;
+        let stats = build_statistics(
+            &[full_snap(prev, 380.0, 380.0), full_snap(now, 430.0, 430.0)],
+            &[],
+            &[],
+            now,
+        );
+
+        assert_eq!(stats["comparison"]["ok"], true);
+        assert_eq!(stats["comparison"]["decrease"], 0.0, "发放不该被算成消耗");
+        assert_eq!(stats["comparison"]["increase"], 50.0);
+        assert_eq!(stats["comparison"]["net"], 50.0);
+        // 区间必须说清是哪一段（所有者点名要求）
+        assert_eq!(stats["comparison"]["fromTs"], prev);
+        assert_eq!(stats["comparison"]["toTs"], now);
+    }
+
+    /// 同一区间内**又消耗又发放**：两者都要如实报出，净额是它们的差。
+    ///
+    /// 序列 `500 → 400 → 450`：消耗 100、发放 50。若只报净额 −50，
+    /// 用户会以为只烧了 50 —— 而实际烧了 100（这正是旧口径被抱怨的形态）。
+    #[test]
+    fn consumption_and_grant_in_the_same_window_are_both_reported() {
+        let now = at_local_date(0, 12);
+        let mid = now - 30 * 60 * 1000;
+        let start = now - 60 * 60 * 1000;
+        let stats = build_statistics(
+            &[
+                full_snap(start, 500.0, 500.0),
+                full_snap(mid, 500.0, 400.0),
+                full_snap(now, 500.0, 450.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+
+        // 汇总口径只看**末次 vs 上次**：400 → 450 是发放 50，消耗 0。
+        // 这是刻意的：差值只覆盖最后一次快照区间，不把更早的消耗重复计入。
+        assert_eq!(stats["comparison"]["fromTs"], mid);
+        assert_eq!(stats["comparison"]["increase"], 50.0);
+        assert_eq!(stats["comparison"]["decrease"], 0.0);
+
+        // 而更早那次（500 → 400）的消耗仍完整保留在**明细**口径里，
+        // 证明「汇总」没有吃掉「明细」—— 两者并存正是本次设计的要求。
+        assert_eq!(stats["summary"]["usageToday"], 100.0, "逐事件累加仍是全量");
+        let usage_amounts: Vec<f64> = stats["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["kind"] == "usage")
+            .map(|event| event["amount"].as_f64().unwrap())
+            .collect();
+        assert!(usage_amounts.contains(&100.0), "明细里应留着那 100 的消耗");
+    }
+
+    /// 边界三：**账号被禁用/移除后重新出现 → 中间空档不算消耗**。
+    ///
+    /// 构造：上次快照在 10 小时前（远超 `CREDIT_SNAPSHOT_MAX_GAP_MS`），
+    /// 余额从 1000 掉到 400。若直接做差就会报「消耗 600」，
+    /// 但那 600 是账号缺席这段时间里发生的，不是本区间可归因的消耗。
+    /// 必须判为无基准。
+    #[test]
+    fn account_reappearing_after_a_gap_does_not_count_the_gap_as_usage() {
+        let now = at_local_date(0, 12);
+        let stale = now - 10 * 3600 * 1000;
+        let stats = build_statistics(
+            &[full_snap(stale, 1000.0, 1000.0), full_snap(now, 1000.0, 400.0)],
+            &[],
+            &[],
+            now,
+        );
+
+        assert_eq!(
+            stats["comparison"]["ok"], false,
+            "空档过大时不该报出一个假消耗"
+        );
+        assert_eq!(stats["comparison"]["decrease"], 0.0);
+        assert_eq!(stats["accounts"][0]["change"]["ok"], false);
+    }
+
+    /// 空档的**边界值**：刚好等于上限放行，超过 1ms 就拦下。
+    ///
+    /// 为什么测这个而不是只测「10 小时」：只有钉住阈值两侧，
+    /// 才算证明是**这个**判据在起作用，而不是碰巧因为别的原因通过。
+    #[test]
+    fn gap_threshold_is_inclusive_at_the_limit() {
+        let now = at_local_date(0, 12);
+        let at_limit = now - CREDIT_SNAPSHOT_MAX_GAP_MS;
+        let over_limit = now - CREDIT_SNAPSHOT_MAX_GAP_MS - 1;
+
+        let ok = compare_snapshots(
+            &snap_of(at_limit, 1000.0, 1000.0),
+            &snap_of(now, 1000.0, 900.0),
+        );
+        assert!(ok.ok, "恰好等于上限应放行");
+        assert_eq!(ok.decrease, 100.0);
+
+        let rejected = compare_snapshots(
+            &snap_of(over_limit, 1000.0, 1000.0),
+            &snap_of(now, 1000.0, 900.0),
+        );
+        assert!(!rejected.ok, "超过上限 1ms 就该判无基准");
+        assert_eq!(rejected.reason, CREDIT_COMPARISON_NO_BASELINE);
+    }
+
+    /// 边界四：**上游查询失败 → 不得把失败写成 0**。
+    ///
+    /// 「查询失败」在本模块的体现是：那次读数**根本没有写进快照**
+    ///（`credits::get_credit_expiry` 失败时直接返回 ok:false，不调 record_snapshot）。
+    /// 所以快照序列里只会看到「成功的那几次」，中间没有 0。
+    ///
+    /// 这里用两条真实存在的快照做差时，若上一次快照已经**过旧**
+    ///（说明中间多次查询都没成功），必须报无基准而不是硬算 —— 这正是
+    /// 「0 和不知道是两件事」在汇总口径上的落点。
+    #[test]
+    fn failed_upstream_queries_do_not_become_zero_usage() {
+        let now = at_local_date(0, 12);
+        // 上一次成功采集在 5 小时前；中间若干次查询失败 → 没有快照。
+        let last_success = now - 5 * 3600 * 1000;
+        let stats = build_statistics(
+            &[
+                full_snap(last_success, 800.0, 800.0),
+                full_snap(now, 800.0, 750.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+
+        // 关键断言：要么给可信值，要么明确「不知道」；**绝不允许**是 0 却 ok=true。
+        let ok = stats["comparison"]["ok"].as_bool().unwrap();
+        let decrease = stats["comparison"]["decrease"].as_f64().unwrap();
+        assert!(!ok, "中途大量查询失败时不该声称知道区间消耗");
+        assert_ne!(
+            (ok, decrease),
+            (true, 0.0),
+            "不得把失败静默写成 0 消耗"
+        );
+        assert_eq!(decrease, 0.0);
+        assert_eq!(stats["comparison"]["accounts"], 0, "可信账号数必须为 0");
+    }
+
+    /// 查询失败后恢复：下一次成功采集（间隔正常）应立刻给出可信差值。
+    ///
+    /// 证明「无基准」不是粘性状态 —— 它是数据不足，不是功能坏了。
+    #[test]
+    fn comparison_recovers_after_a_successful_follow_up() {
+        let now = at_local_date(0, 12);
+        let stats = build_statistics(
+            &[
+                full_snap(now - 30 * 60 * 1000, 800.0, 800.0),
+                full_snap(now, 800.0, 750.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+
+        assert_eq!(stats["comparison"]["ok"], true);
+        assert_eq!(stats["comparison"]["decrease"], 50.0);
+        assert_eq!(stats["comparison"]["accounts"], 1);
+    }
+
+    /// 边界五：**时间跨度要说清** —— 差值覆盖的是「两次快照之间」。
+    ///
+    /// 断言 fromTs/toTs 恰好等于最后两条快照的时刻，而不是「今天 0 点」或
+    /// 「统计时刻」之类想当然的区间。前端就是拿这两个值渲染
+    /// 「MM-DD HH:mm 至 MM-DD HH:mm」的。
+    #[test]
+    fn comparison_reports_the_exact_window_it_covers() {
+        let now = at_local_date(0, 12);
+        let prev = now - 47 * 60 * 1000;
+        let stats = build_statistics(
+            &[full_snap(prev, 380.0, 380.0), full_snap(now, 380.0, 300.0)],
+            &[],
+            &[],
+            now,
+        );
+
+        assert_eq!(stats["comparison"]["fromTs"], prev);
+        assert_eq!(stats["comparison"]["toTs"], now);
+        assert_eq!(stats["comparison"]["decrease"], 80.0);
+        // 逐账号那一份的区间必须与全局一致（同一份数据，不该有两个说法）
+        assert_eq!(stats["accounts"][0]["change"]["fromTs"], prev);
+        assert_eq!(stats["accounts"][0]["change"]["toTs"], now);
+    }
+
+    /// 多条快照时，汇总口径只认**最后两条**，不是首尾做差。
+    ///
+    /// 为什么这是对的：区间被定义为「上一次快照到现在」。若拿首尾做差，
+    /// 区间会横跨整个保留期，与界面标的 from/to 不符。
+    #[test]
+    fn comparison_uses_the_last_two_snapshots_only() {
+        let now = at_local_date(0, 12);
+        let stats = build_statistics(
+            &[
+                full_snap(now - 90 * 60 * 1000, 1000.0, 1000.0),
+                full_snap(now - 30 * 60 * 1000, 1000.0, 600.0),
+                full_snap(now, 1000.0, 550.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+
+        // 末次 vs 上次 = 600 → 550，消耗 50（而不是首尾的 450）
+        assert_eq!(stats["comparison"]["decrease"], 50.0);
+        assert_eq!(stats["comparison"]["fromTs"], now - 30 * 60 * 1000);
+    }
+
+    /// 抖动读数（`suspect`）不得进入汇总 —— 两端任一可疑就判不可信。
+    ///
+    /// 这是幻影配对（`-380` / `+380`）在汇总口径上的防复发：
+    /// 逐事件那条路由 `reading_trust` 拦，汇总这条路由 `suspect` 拦。
+    #[test]
+    fn suspect_readings_are_excluded_from_the_comparison() {
+        let now = at_local_date(0, 12);
+        let mut suspicious = full_snap(now, 380.0, 380.0);
+        suspicious["suspect"] = json!(true);
+
+        let result = compare_snapshots(
+            &snap_of(now - 30 * 60 * 1000, 380.0, 380.0),
+            &snapshot_from_value(&suspicious).unwrap(),
+        );
+
+        assert!(!result.ok, "可疑读数不该产生可信差值");
+        assert_eq!(result.reason, CREDIT_COMPARISON_UNRELIABLE);
+        assert_eq!(result.decrease, 0.0);
+        assert_eq!(result.increase, 0.0);
+        // 区间仍要如实给出 —— 用户需要知道「哪一段没测准」
+        assert_eq!(result.from_ts, Some(now - 30 * 60 * 1000));
+        assert_eq!(result.to_ts, Some(now));
+    }
+
+    /// 容量下降（包集合变了）不得算成消耗 —— owner 真实幻影数据的回归。
+    ///
+    /// 实测：`350 → 0 → 350`（total 同步 350→0→350）与 `380 → 30 → 380`。
+    /// `total` 不会因消耗而变小，故 total 下降即是「没读全」。
+    #[test]
+    fn dropped_capacity_is_not_counted_as_consumption() {
+        let now = at_local_date(0, 12);
+        let result = compare_snapshots(
+            &snap_of(now - 30 * 60 * 1000, 350.0, 350.0),
+            &snap_of(now, 0.0, 0.0),
+        );
+
+        assert!(!result.ok, "容量从 350 掉到 0 是读数不完整，不是消耗 350");
+        assert_eq!(result.reason, CREDIT_COMPARISON_UNRELIABLE);
+        assert_eq!(result.decrease, 0.0);
+    }
+
+    /// 真实消耗（容量不变、余额跌）必须照常报出 —— 不能因修幻影而把真消耗吞掉。
+    #[test]
+    fn real_consumption_with_stable_capacity_is_still_reported() {
+        let now = at_local_date(0, 12);
+        let result = compare_snapshots(
+            &snap_of(now - 30 * 60 * 1000, 380.0, 380.0),
+            &snap_of(now, 380.0, 30.0),
+        );
+
+        assert!(result.ok);
+        assert_eq!(result.decrease, 350.0);
+        assert_eq!(result.increase, 0.0);
+        assert_eq!(result.net, -350.0);
+    }
+
+    /// 端到端：`record_snapshot` 落盘后，`build_statistics` 给出的差值
+    /// 必须与真实写入的快照一致（证明读路径与写路径口径对齐）。
+    #[test]
+    fn recorded_snapshots_produce_a_matching_comparison() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("credit-comparison-e2e");
+
+        // 首次采集：只建立基线，差值应为「无基准」
+        assert!(record_snapshot("acc-cmp", "n", 1000.0, 1000.0, packs(&[("p1", 1000.0)])));
+        let after_first = build_statistics(&load_snapshots(), &[], &[], now_ms());
+        assert_eq!(
+            after_first["comparison"]["ok"], false,
+            "只有一条快照时不该给出差值"
+        );
+
+        // 第二次采集：余额跌 120、容量不变 → 消耗 120
+        assert!(record_snapshot("acc-cmp", "n", 1000.0, 880.0, packs(&[("p1", 880.0)])));
+        let after_second = build_statistics(&load_snapshots(), &[], &[], now_ms());
+        assert_eq!(after_second["comparison"]["ok"], true);
+        assert_eq!(after_second["comparison"]["decrease"], 120.0);
+        assert_eq!(after_second["comparison"]["accounts"], 1);
+
+        let account = after_second["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|account| account["accountId"] == "acc-cmp")
+            .expect("应有该账号的统计");
+        assert_eq!(account["change"]["decrease"], 120.0);
+        assert_eq!(account["change"]["ok"], true);
+    }
+
+    /// 汇总口径与明细口径**并存**：`comparison` 存在的同时，
+    /// `summary.usage*` 与 `events` 必须照旧可用（所有者的明确要求）。
+    #[test]
+    fn summary_and_detail_sources_are_preserved_alongside_the_comparison() {
+        let now = at_local_date(0, 12);
+        let stats = build_statistics(
+            &[
+                full_snap(now - 60 * 60 * 1000, 500.0, 500.0),
+                full_snap(now - 30 * 60 * 1000, 500.0, 400.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+
+        // 汇总口径给出末次区间
+        assert_eq!(stats["comparison"]["ok"], true);
+        // 明细口径（逐事件累加）同时保留，且给得出同一个消耗
+        assert_eq!(stats["summary"]["usageToday"], 100.0);
+        assert_eq!(stats["events"][0]["kind"], "usage");
+        assert_eq!(stats["events"][0]["amount"], 100.0);
+        // 逐日序列也照旧
+        assert!(stats["daily"].as_array().is_some_and(|daily| !daily.is_empty()));
+    }
+
+    /// 多个账号时，全局差值 = 各**可信**账号之和，且区间取并集。
+    ///
+    /// 同时钉住：不可信的账号（这里让它容量下降）被跳过，
+    /// 且不会被当成 0 混进总数。
+    #[test]
+    fn aggregate_sums_only_trustworthy_accounts() {
+        let now = at_local_date(0, 12);
+        let prev = now - 30 * 60 * 1000;
+        let snapshots = vec![
+            // 账号 A：真实消耗 60
+            json!({"ts": prev, "accountId": "a", "accountName": "A", "total": 100.0, "remaining": 100.0}),
+            json!({"ts": now,  "accountId": "a", "accountName": "A", "total": 100.0, "remaining": 40.0}),
+            // 账号 B：真实发放 25
+            json!({"ts": prev, "accountId": "b", "accountName": "B", "total": 50.0, "remaining": 50.0}),
+            json!({"ts": now,  "accountId": "b", "accountName": "B", "total": 75.0, "remaining": 75.0}),
+            // 账号 C：容量下降（读数不完整）→ 必须被跳过
+            json!({"ts": prev, "accountId": "c", "accountName": "C", "total": 350.0, "remaining": 350.0}),
+            json!({"ts": now,  "accountId": "c", "accountName": "C", "total": 0.0, "remaining": 0.0}),
+        ];
+
+        let stats = build_statistics(&snapshots, &[], &[], now);
+
+        assert_eq!(stats["comparison"]["accounts"], 2, "只应统计 A 与 B");
+        assert_eq!(stats["comparison"]["decrease"], 60.0);
+        assert_eq!(stats["comparison"]["increase"], 25.0);
+        assert_eq!(stats["comparison"]["net"], -35.0);
+        // 区间取可信账号的并集
+        assert_eq!(stats["comparison"]["fromTs"], prev);
+        assert_eq!(stats["comparison"]["toTs"], now);
+    }
+
+    /// 账号不可信时，全局 reason 要如实说明「不可信」而不是「无基准」。
+    ///
+    /// 两者处置不同：无基准要等下一次采集，不可信只要上游恢复正常即可。
+    #[test]
+    fn global_reason_distinguishes_unreliable_from_no_baseline() {
+        let now = at_local_date(0, 12);
+        let prev = now - 30 * 60 * 1000;
+        let stats = build_statistics(
+            &[
+                json!({"ts": prev, "accountId": "a", "accountName": "A", "total": 350.0, "remaining": 350.0}),
+                json!({"ts": now,  "accountId": "a", "accountName": "A", "total": 0.0, "remaining": 0.0}),
+            ],
+            &[],
+            &[],
+            now,
+        );
+
+        assert_eq!(stats["comparison"]["ok"], false);
+        assert_eq!(stats["comparison"]["reason"], CREDIT_COMPARISON_UNRELIABLE);
+    }
+
+    /// **回归：幻影区间不得进入逐日序列 / 时间窗 / 事件流。**
+    ///
+    /// 改动前这里是唯一漏判据的地方：`record_snapshot` 已用 `reading_trust`
+    /// 拦住了幻影**记录**，但 `build_statistics` 是**从快照文件重新回放**的，
+    /// 不读那个结论，于是 owner 真实的 `350 → 0 → 350` 仍会累加出
+    /// 「今日消耗 350」—— 而 GatewayPage「消耗积分」列、统计页
+    /// 「今日 / 近 7 天 / 本月消耗」读的正是这几个字段。
+    /// 只修记录不修这里，用户看到的数字依旧是错的。
+    #[test]
+    fn phantom_pair_does_not_leak_into_daily_or_window_totals() {
+        let now = at_local_date(0, 12);
+        let stats = build_statistics(
+            &[
+                // 基线：完整读到 350
+                full_snap(now - 60 * 60 * 1000, 350.0, 350.0),
+                // 上游只返回了 0（total 同步掉到 0）→ 读数不完整，不是消耗
+                full_snap(now - 30 * 60 * 1000, 0.0, 0.0),
+                // 读全了，回到 350 → 是恢复，不是发放
+                full_snap(now, 350.0, 350.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+
+        assert_eq!(stats["summary"]["usageToday"], 0.0, "幻影不得计入今日消耗");
+        assert_eq!(stats["summary"]["usage7Days"], 0.0);
+        assert_eq!(stats["summary"]["usageThisMonth"], 0.0);
+        assert_eq!(
+            stats["events"].as_array().unwrap().len(),
+            0,
+            "幻影不该产生任何事件，实际 {:?}",
+            stats["events"]
+        );
+        let daily_sum: f64 = stats["daily"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|point| point["usage"].as_f64().unwrap_or(0.0))
+            .sum();
+        assert_eq!(daily_sum, 0.0, "逐日序列里也不该有幻影");
+    }
+
+    /// 对照：真实的「消耗后再发放」序列**仍要**照常累加，
+    /// 不能因为修幻影把真实变化一起吞掉。
+    ///
+    /// 序列 `380 → 30（真消耗，包还在）→ 410（真发放，来了新包）`：
+    /// 消耗那一段必须留在今日消耗里；发放那一段不是消耗，故不计入。
+    #[test]
+    fn real_consumption_still_accumulates_after_the_phantom_guard() {
+        let now = at_local_date(0, 12);
+        let stats = build_statistics(
+            &[
+                full_snap(now - 90 * 60 * 1000, 380.0, 380.0),
+                // 容量不变、余额跌 → 真实消耗 350
+                full_snap(now - 60 * 60 * 1000, 380.0, 30.0),
+                // 容量上升到 760、余额 410 → 新包到账（发放），不是消耗
+                full_snap(now - 30 * 60 * 1000, 760.0, 410.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+
+        assert_eq!(stats["summary"]["usageToday"], 350.0, "真实消耗必须被累加");
+        let amounts: Vec<f64> = stats["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["kind"] == "usage")
+            .map(|event| event["amount"].as_f64().unwrap())
+            .collect();
+        assert_eq!(amounts, vec![350.0]);
+    }
+
+    /// `stale` 与 `ok` **正交**：算得准的差值也可能已经不再反映「此刻」。
+    ///
+    /// 构造：两条快照间隔 30 分钟（差值本身完全可信），但统计时刻在
+    /// 末次快照 5 小时之后（很久没再采集）。此时 `ok` 仍为 true
+    ///（那个差值是真发生过的），同时 `stale` 为 true（它不是当前的）。
+    /// 界面据 `stale` 改用「数据截至 …」措辞，而不是把数字丢掉或谎称最新。
+    #[test]
+    fn a_trustworthy_but_old_comparison_is_marked_stale_not_discarded() {
+        let now = at_local_date(0, 12);
+        let last_scan = now - 5 * 3600 * 1000;
+        let stats = build_statistics(
+            &[
+                full_snap(last_scan - 30 * 60 * 1000, 800.0, 800.0),
+                full_snap(last_scan, 800.0, 750.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+
+        assert_eq!(stats["comparison"]["ok"], true, "差值本身是可信的");
+        assert_eq!(stats["comparison"]["decrease"], 50.0);
+        assert_eq!(stats["comparison"]["stale"], true, "但它已不是当前读数");
+        // 间隔正常时不应被误标为陈旧
+        let fresh = build_statistics(
+            &[
+                full_snap(now - 30 * 60 * 1000, 800.0, 800.0),
+                full_snap(now, 800.0, 750.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+        assert_eq!(fresh["comparison"]["stale"], false);
+    }
+
+    /// 时钟回拨（`at_ms` 早于末次快照）不得把新鲜数据误判为陈旧。
+    ///
+    /// 分两层验证，因为这两件事是**分开**成立的：
+    ///
+    /// 1. 走 `build_statistics` 时，`parse_snapshots` 的 `ts <= at_ms` 过滤
+    ///    已经把「未来」快照挡在外面，所以根本到不了陈旧判定 ——
+    ///    这里钉住这个上游保证（同时说明为什么会写 `saturating_sub` 仍不多余）。
+    /// 2. 直接在函数边界上验证：一旦有未来快照真的传到
+    ///    `compare_account_snapshots`（例如将来有人放宽了那条过滤），
+    ///    `saturating_sub` 必须把它当「刚刚」而不是「很久以前」。
+    ///    若这里写成普通相减，`at_ms - latest.ts` 是负数，虽不触发阈值，
+    ///    但换写成 `latest.ts - at_ms` 就会溢出 —— 这一步锁的就是那个语义。
+    #[test]
+    fn clock_skew_does_not_mark_a_fresh_comparison_stale() {
+        let now = at_local_date(0, 12);
+        // 1) 未来快照被 parse_snapshots 过滤 → 只剩一条 → 无基准（而非陈旧）
+        let filtered = build_statistics(
+            &[
+                full_snap(now - 30 * 60 * 1000, 800.0, 800.0),
+                full_snap(now + 10 * 60 * 1000, 800.0, 750.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+        assert_eq!(
+            filtered["comparison"]["reason"],
+            CREDIT_COMPARISON_NO_BASELINE,
+            "未来快照应被上游过滤，不该参与对比"
+        );
+
+        // 2) 直接喂给函数：末次快照在未来 → 不得判为陈旧
+        let future = at_local_date(0, 13);
+        let comparison = compare_account_snapshots(
+            &[
+                snap_of(now, 800.0, 800.0),
+                snap_of(future, 800.0, 750.0),
+            ],
+            now,
+        );
+        assert!(comparison.ok);
+        assert!(
+            !comparison.stale,
+            "末次快照晚于统计时刻时应视为最新，而不是过旧"
+        );
+        assert_eq!(comparison.decrease, 50.0);
     }
 }

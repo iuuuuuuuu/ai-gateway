@@ -322,8 +322,31 @@ export interface CreditStatsDailyPoint {
   models?: { model: string; requestCount: number; credit: number }[];
 }
 
-export interface CreditStatsAccount {
-  accountId: string;
+/**
+ * 免费模型判定（`model_billing.rs` 的 `WindowVerdicts`）。
+ *
+ * 三个窗口**各自独立**判定：某个号可能今天只跑了免费模型、本月早些时候
+ * 跑过计费模型，合成一个结论会让今日的「免费」污染本月。
+ */
+export interface CreditStatsBilling {
+  /** 今日窗口：`all_free`（确定免费）/ `has_paid`（有计费调用）/ `unknown`（不知道）。 */
+  today: CreditBillingVerdict;
+  sevenDays: CreditBillingVerdict;
+  month: CreditBillingVerdict;
+  /** 三个窗口是否**全部**判定为「只用免费模型」。 */
+  allFree: boolean;
+}
+
+/**
+ * 单个窗口的免费判定结果。
+ *
+ * `all_free` 是**确定**的（上游明确声明这些模型倍率为 0），因此消耗如实显示 0；
+ * `unknown` 是**不知道**，界面必须显示「—」——把「不知道」说成 0 会谎报
+ * 「这个号没消耗」，而它可能正在烧积分。
+ */
+export type CreditBillingVerdict = "all_free" | "has_paid" | "unknown";
+
+export interface CreditStatsAccount {  accountId: string;
   accountName: string;
   isCurrent: boolean;
   currentRemaining: number | null;
@@ -332,6 +355,25 @@ export interface CreditStatsAccount {
   usageToday: number;
   usage7Days: number;
   usageThisMonth: number;
+  /**
+   * 该账号「末次快照 vs 上次快照」的完整变化（汇总口径）；缺省兼容旧后端。
+   *
+   * 与上面三个 `usage*` 并存：`usage*` 是逐事件累加派生（明细），
+   * `change` 是快照做差（可信总量）。总量展示优先用 `change`。
+   */
+  change?: CreditComparison;
+  /**
+   * 免费模型判定结果（缺省兼容旧后端）。
+   *
+   * 为什么界面需要它：`usage*` 为 0 有两种完全不同的来源 ——
+   * 「确定免费」（免费模型的调用不扣积分）与「确实没消耗」，
+   * 而缺数据时又是「不知道」（界面显示「—」）。只靠数字 0 分不出前两者，
+   * 而这三者在界面上必须表达不同（本项目「—」= 不知道，0 = 确定的零）。
+   *
+   * 判定依据是上游 `/v3/config` 的 `credits` 计费倍率（经网关按区域透出），
+   * 见 Rust 侧 `model_billing` 模块头部说明。
+   */
+  billing?: CreditStatsBilling;
   checkedInToday: boolean | null;
   checkinStatusToday: string | null;
   lastCheckinAt: number | null;
@@ -425,6 +467,55 @@ export interface CreditOfficialUsage {
   errors: CreditOfficialUsageError[];
 }
 
+/**
+ * 与上一次积分快照做差的结果（**汇总口径**）。
+ *
+ * 为什么要有这一套而不是继续用 `summary.usageToday` 那几个字段：
+ * 那几个是逐事件累加出来的（把每对相邻快照的下降量相加），它必须为每一笔
+ * 扣减猜一个归属，一旦有一次读数不完整就会把「没读到的包」算成消耗 ——
+ * 所有者实测到过 `-380` 紧跟 `+380` 的幻影配对。而
+ * `本次余额 − 上次余额` 不需要猜归属，它天然免疫单次不可信读数。
+ *
+ * 两者**并存**：`comparison` 给可信的总量，`usageToday` 等继续供时间窗
+ * 与明细视图。前端展示总量时优先用 `comparison`。
+ *
+ * 关键约定：`ok === false` 时必须显示「—」/「暂无对比基准」，**绝不能显示 0**。
+ * 0 会被读成「这段时间没有消耗」，而事实是「我们不知道」。
+ */
+export interface CreditComparison {
+  /** 是否有可信差值。false 时 decrease/increase/net 无意义（恒为 0）。 */
+  ok: boolean;
+  /**
+   * 无可信差值的原因：
+   * - `no_baseline`：还没有「上一次快照」（首次运行），或中间空档过大
+   * - `unreliable`：读数不完整（上游返回的包列表缺失），差值测的是抖动
+   * - `ok`：可信
+   */
+  reason: "ok" | "no_baseline" | "unreliable" | string;
+  /** 差值区间起点（上次快照时刻）；无基准时为 null。 */
+  fromTs: number | null;
+  /** 差值区间终点（本次快照时刻）；无快照时为 null。 */
+  toTs: number | null;
+  /** 区间内余额下降总量（≥ 0）= 消耗。 */
+  decrease: number;
+  /** 区间内余额上升总量（≥ 0）= 发放/返还。与消耗分开表达。 */
+  increase: number;
+  /** 净变化 = increase − decrease。 */
+  net: number;
+  /**
+   * 差值覆盖了几个账号。为 0 时界面必须显示「暂无对比基准」。
+   * 只在统计接口的顶层 `comparison` 上出现。
+   */
+  accounts?: number;
+  /**
+   * 这份差值已不再反映「此刻」（末次快照距统计时刻太久）。
+   *
+   * 与 `ok` 正交：算得准的差值也可能陈旧。为 true 时界面应改用
+   * 「数据截至 …」措辞，而不是丢弃数字或谎称最新。
+   */
+  stale?: boolean;
+}
+
 export interface CreditStatistics {
   generatedAt: number;
   retentionDays: number;
@@ -433,6 +524,8 @@ export interface CreditStatistics {
   daily: CreditStatsDailyPoint[];
   accounts: CreditStatsAccount[];
   events: CreditStatsEvent[];
+  /** 汇总口径：与上一次积分快照做差。缺省兼容旧后端。 */
+  comparison?: CreditComparison;
   /** 官方接口不可用时仍使用上述本地观察字段；缺省兼容旧后端。 */
   officialUsage?: CreditOfficialUsage;
 }
@@ -790,6 +883,18 @@ export interface GatewayModelCooling {
 export interface GatewayPoolAccount {
   uid: string;
   nickname?: string;
+  /**
+   * 用户自己在「账号管理」里填的备注（如「公司号」「备用」）。
+   *
+   * **不是网关下发的**：网关根本不知道备注，池里原本只有 `nickname`。
+   * 宿主在 `gateway_status()` 里用本地账号库把它**合并**进池快照
+   * （Rust 侧 `merge_account_notes`），所以这里能拿到。
+   *
+   * 界面取名口径是 **备注 → 昵称 → uid 前缀**（见 `accountLabel`）：
+   * 上游昵称对国服账号常为空，uid 又是一串随机串，备注才是分辨
+   * 「这是谁的号」的唯一可靠线索。缺省 = 没填（回退到昵称）。
+   */
+  note?: string;
   credits?: number;
   cooling?: boolean;
   cool_kind?: string;
@@ -893,6 +998,11 @@ export interface GatewayStatus {
   excludedAccounts?: Array<{
     uid: string;
     nickname?: string;
+    /**
+     * 备注，与账号池/勾选列表同一取名口径（**备注 → 昵称 → uid 前缀**）。
+     * 界面提示里用它标识账号，缺了会退到 uid（用户认不出是哪个号）。
+     */
+    note?: string;
     reason?: string | null;
   }>;
   authDir: string;
@@ -1028,6 +1138,21 @@ export interface GatewayPortHolder {
   ours: boolean;
 }
 
+/**
+ * 查询端口占用者的响应。
+ *
+ * `hint` 是查不到占用者时给用户的**可操作**排查命令（由后端按自身所在系统
+ * 生成，例如 macOS 给 `sudo lsof -nP -iTCP:<port> -sTCP:LISTEN`）。
+ * 为什么不由前端按 UA 拼：WebUI 模式下浏览器与后端可能不在同一台机器上，
+ * 决定「用哪条命令」的是后端所在的系统。
+ */
+export interface GatewayPortHolderResult {
+  port: number;
+  holder: GatewayPortHolder | null;
+  /** 查不到占用者时展示的排查提示；后端始终会填。 */
+  hint?: string;
+}
+
 /** 网关 Token 用量中的一组计量（口径与本地 Token 统计页一致）。 */
 export interface GatewayUsageTotals {
   /** input + output + cacheWrite（不含 cacheRead，避免重复计数）。 */
@@ -1114,13 +1239,60 @@ export interface AgentDetectionResult {
   targets: AgentClientTarget[];
 }
 
-/** 网关模型项。 */
+/**
+ * 网关模型项（`GET /v1/models` 的一条，由 Rust `fetch_models` 原样透传）。
+ *
+ * 能力字段**全部可选**，且可选性本身就是语义的一部分：网关只在有真值时才下发
+ * 某个键（见 go-gateway/internal/server/capability.go 的
+ * `modelCapabilityFields` / `modelReasoningFields`）。因此
+ * `字段缺失` = 上游未声明（不知道）≠ `false` / `[]` = 上游明确否定。
+ * 前端必须把这两种情况渲染成**不同**的表达，否则「不知道」会被谎报成「不支持」。
+ *
+ * 同一语义的字段在响应里有**多种拼写**（各客户端解析器读的键名不统一），
+ * 因此下面按「主拼写 + 容错拼写」成对声明，取用时优先主拼写。
+ */
 export interface GatewayModelItem {
   id: string;
   name?: string;
+  /** 上下文窗口（token 数）。 */
   context_length?: number;
   max_output_tokens?: number;
   owned_by?: string;
+  /** 是否支持图片输入（三态：缺失 = 未声明）。 */
+  supportsImages?: boolean;
+  input_modalities?: string[];
+  inputModalities?: string[];
+  capabilities?: {
+    vision?: boolean;
+    supports?: { vision?: boolean };
+  };
+  architecture?: {
+    input_modalities?: string[];
+    modality?: string;
+  };
+  /** 支持的思考档位（主拼写）。缺失或空数组 = 未声明。 */
+  supported_efforts?: string[];
+  supportedEfforts?: string[];
+  reasoning_efforts?: string[];
+  reasoningEfforts?: string[];
+  reasoning?: {
+    supported_efforts?: string[];
+    default_effort?: string;
+  };
+  /** 默认思考档（缺失 = 未声明；**不要**用档位列表首项猜）。 */
+  default_effort?: string;
+  defaultEffort?: string;
+  default_reasoning_effort?: string;
+  /**
+   * 该模型名**确有真值**的上游区域（`"cn"` / `"intl"`）。
+   *
+   * 只在单区可用时下发。「只在一侧存在」**不等于**「不支持图片」——
+   * 网关会按区域把请求路由到它所在的那一侧，所以能力照常展示，
+   * 这个字段只用来解释 `11102 model service info not found`。
+   */
+  supported_regions?: string[];
+  /** 面向人的区域说明（网关生成，客户端不读时至少人能看见）。 */
+  region_note?: string;
 }
 
 /** POST /api/gateway/agents/import 接入响应。 */

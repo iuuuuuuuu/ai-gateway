@@ -47,7 +47,9 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { ModelCapabilityRow } from "@/components/model-capability-chip";
 import * as api from "@/lib/api";
+import { capabilityViewOf, summarizeCapabilities } from "@/lib/model-capability";
 import type {
   AgentBackupItem,
   AgentClientTarget,
@@ -453,6 +455,50 @@ export default function AgentsPage() {
     }
   }, [targets, filterTab]);
 
+  /**
+   * 每个模型的能力视图（上下文 / 视觉 / 思考档位 / 区域）。
+   *
+   * 只算一次并缓存：这三项在渲染模型列表与客户端卡片上的模型标签时都要用，
+   * 而 `capabilityViewOf` 内部要按多种拼写嗅探字段，逐处重算既浪费也让
+   * 「同一个模型在两处显示不一致」成为可能。
+   */
+  const capabilityViews = useMemo(
+    () => new Map(gatewayModels.map((m) => [m.id, capabilityViewOf(m)])),
+    [gatewayModels],
+  );
+
+  /**
+   * 能力真值覆盖率。
+   *
+   * 用途：单个模型显示「—」时，用户无法判断这是**那个模型**没声明，还是网关
+   * 整体拉不到真值。给出计数后两种情形一眼可分 —— 前者是模型自身情况，
+   * 后者要去查网关/上游（此时「全选」这类操作的风险也更高）。
+   */
+  const capabilitySummary = useMemo(
+    () => summarizeCapabilities(gatewayModels),
+    [gatewayModels],
+  );
+
+  /** 三个简短的能力标签文本，供客户端卡片上的模型 chip 做悬浮说明。 */
+  const capabilityHintOf = useCallback(
+    (modelId: string): string | undefined => {
+      const view = capabilityViews.get(modelId);
+      if (!view) return undefined;
+      const parts = [
+        `上下文 ${view.context.text}`,
+        // 「未知」时补一句「未声明」：只显示「—」的话，用户不知道它是
+        // 「拿不到」还是「这个模型就是这么写的」。
+        view.vision.unknown ? `视觉未声明（${view.vision.text}）` : view.vision.text,
+        view.efforts.unknown
+          ? `思考档位未声明（${view.efforts.text}）`
+          : `思考档位 ${view.efforts.text}`,
+      ];
+      if (view.region) parts.push(view.region.label);
+      return parts.join(" · ");
+    },
+    [capabilityViews],
+  );
+
   return (
     <div className="mx-auto max-w-6xl space-y-5 p-4 sm:p-6">
       {/* 顶部主横幅与一键更新操作栏 */}
@@ -560,6 +606,25 @@ export default function AgentsPage() {
               <p className="mt-0.5 text-xs text-muted-foreground">
                 选中的模型将批量注入各智能体配置文件；排在第 1 位的模型自动作为默认主模型。
               </p>
+              {/*
+                能力覆盖率说明。
+                为什么必须给「已知 / 总数」而不是不写：单个模型显示「—」时用户分不清
+                是**那个模型**没声明，还是网关整体拿不到真值（后者要去查网关与上游）。
+                两处计数分开列也是刻意的：视觉与思考档位在上游是**独立字段**，
+                一个可能拿到、另一个拿不到（见 capability.go 中
+                `modelCapabilityFields` 与 `modelReasoningFields` 正交的注释）。
+              */}
+              {gatewayModels.length > 0 && (
+                <p className="mt-0.5 text-[11px] text-muted-foreground" data-slot="model-capability-summary">
+                  能力真值覆盖：上下文 {capabilitySummary.contextKnown}/{capabilitySummary.total} ·
+                  视觉 {capabilitySummary.visionKnown}/{capabilitySummary.total} ·
+                  思考档位 {capabilitySummary.effortsKnown}/{capabilitySummary.total}
+                  {capabilitySummary.singleRegion > 0
+                    ? ` · ${capabilitySummary.singleRegion} 个模型仅单区可用`
+                    : ""}
+                  ；显示「—」表示上游未声明（并非不支持）。
+                </p>
+              )}
             </div>
 
             {/* 快捷选择预设 */}
@@ -608,39 +673,74 @@ export default function AgentsPage() {
               </div>
             </div>
           ) : (
-            <div className="flex flex-wrap gap-2 pt-1 max-h-56 overflow-y-auto p-0.5">
-              {gatewayModels.map((m) => {
+            /*
+              模型列表：每个模型一张小卡，卡内展示**三项能力**。
+              为什么从「一行一个 chip」改成网格卡：需求是「看到模型所支持的上下文是多少、
+              是否是视觉模型、思考强度支持哪些」。三行挤在原来那种扁 chip 里会截断
+              档位列表（而所有者明确要求信息不能为了清爽而丢），所以每张卡给足两行。
+              列表高度也跟着放大（max-h-56 → max-h-96）：卡片变高后原来的高度
+              只能装下 2 行，「模型一多就看不到下面」这个既有反馈会立刻复现。
+            */
+            <div className="grid grid-cols-1 gap-2 pt-1 max-h-96 overflow-y-auto p-0.5 sm:grid-cols-2 lg:grid-cols-3">
+              {gatewayModels.map((m, index) => {
                 const selected = selectedGlobalModels.includes(m.id);
                 const isPrimary = selectedGlobalModels[0] === m.id;
+                // 每张卡都需要能力视图；map 里查表而不是现算，保证与
+                // capabilitySummary 的口径完全一致（同一份 view）。
+                const view = capabilityViews.get(m.id) ?? capabilityViewOf(m);
 
                 return (
                   <button
                     key={m.id}
                     type="button"
+                    data-slot="agent-model-card"
+                    data-model={m.id}
+                    data-selected={selected ? "true" : "false"}
+                    data-primary={isPrimary ? "true" : "false"}
                     onClick={() => toggleGlobalModel(m.id)}
                     className={cn(
-                      "flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs transition-all",
+                      "flex flex-col gap-1.5 rounded-lg border px-2.5 py-2 text-left text-xs transition-all",
                       selected
-                        ? "border-primary/50 bg-primary/10 font-medium text-foreground shadow-2xs"
+                        ? "border-primary/50 bg-primary/10 text-foreground shadow-2xs"
                         : "border-border/60 bg-muted/20 text-muted-foreground hover:bg-muted/40 hover:text-foreground",
                     )}
                   >
-                    <div
-                      className={cn(
-                        "flex size-3.5 items-center justify-center rounded-sm border text-[9px]",
-                        selected ? "border-primary bg-primary text-primary-foreground" : "border-muted-foreground/50",
-                      )}
-                    >
-                      {selected && <Check className="size-2.5 stroke-[3]" />}
+                    <div className="flex items-start gap-1.5">
+                      <div
+                        className={cn(
+                          "mt-0.5 flex size-3.5 shrink-0 items-center justify-center rounded-sm border text-[9px]",
+                          selected ? "border-primary bg-primary text-primary-foreground" : "border-muted-foreground/50",
+                        )}
+                      >
+                        {selected && <Check className="size-2.5 stroke-[3]" />}
+                      </div>
+
+                      <span
+                        className={cn("min-w-0 flex-1 break-all font-mono", selected && "font-medium")}
+                        title={m.id}
+                      >
+                        {m.id}
+                      </span>
+
+                      {/* 序号：与卡片下方的「默认主模型」一起说明「第 1 位」是怎么算的 */}
+                      <span className="shrink-0 text-[9px] tabular-nums text-muted-foreground/70">
+                        #{index + 1}
+                      </span>
                     </div>
 
-                    <span className="font-mono">{m.id}</span>
-
                     {isPrimary && (
-                      <Badge variant="default" className="h-4 px-1 text-[9px] font-normal">
+                      <Badge variant="default" className="h-4 w-fit px-1 text-[9px] font-normal">
                         默认主模型
                       </Badge>
                     )}
+
+                    {/* 三项能力：上下文 / 视觉 / 思考档位（+ 单区提示） */}
+                    <ModelCapabilityRow
+                      context={view.context}
+                      vision={view.vision}
+                      efforts={view.efforts}
+                      region={view.region}
+                    />
                   </button>
                 );
               })}
@@ -832,8 +932,21 @@ export default function AgentsPage() {
                     {!isExpanded && (
                       <div className="flex flex-wrap gap-1 text-[10px]">
                         {assignedModels.map((m, i) => (
+                          /*
+                            模型 chip 挂 `title` 给出该模型的能力摘要。
+                            为什么这里也补一层：用户在**这个客户端卡片**上决定选哪些模型，
+                            而能力卡在页面上方的分发区 —— 让他为了确认「这个模型收不收图」
+                            来回滚动，等于把刚加的信息又藏回去了。
+                            用原生 `title` 而不是 Tooltip：chip 已经嵌在 Card 里、
+                            同一卡片下方还有 TooltipProvider，再包一层会让
+                            Provider 嵌套且每个 chip 都多一个 portal；这里只要
+                            「悬浮能看到」这个最低保证，不引入新交互。
+                          */
                           <span
                             key={m}
+                            data-slot="agent-assigned-model"
+                            data-model={m}
+                            title={capabilityHintOf(m)}
                             className={cn(
                               "rounded px-1.5 py-0.5 font-mono",
                               i === 0
@@ -856,6 +969,9 @@ export default function AgentsPage() {
                             <button
                               key={m.id}
                               type="button"
+                              data-slot="agent-target-model-toggle"
+                              data-model={m.id}
+                              title={capabilityHintOf(m.id)}
                               onClick={() => toggleTargetModel(target.id, m.id)}
                               className={cn(
                                 "rounded px-1.5 py-0.5 font-mono text-[10px] border transition-colors",

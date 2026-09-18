@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -1077,7 +1078,102 @@ type ModelInfo struct {
 	// 补全/图片生成等条目整条缺失该字段。缺失时是「未声明」，不是「不支持」——
 	// 谎报成纯文本会让客户端把本可用的图片能力关掉，所以这里保留三态。
 	SupportsImages *bool
+	// CreditMultiplier 该模型的**计费倍率**，来自上游 /v3/config 的 `credits` 字段。
+	//
+	// 这是「这个模型免不免费」的**上游权威依据**，不是本地清单：
+	// 上游对每个模型给出倍率字符串，倍率 0 即不扣积分。所有者报的
+	// 「国际版 deepseek-v4.1-flash 免费却统计出积分消耗」正是本字段此前
+	// 被静默丢弃导致的 —— /v3/config 的解析用的是**手写匿名结构体**，
+	// 没写进结构体的字段会被 json 包直接忽略，所以读代码看不出上游给过它。
+	//
+	// **必须三态**（与 SupportsImages 同一约定，理由也相同）：
+	//
+	//	nil   = 上游未声明该字段 → 「不知道」，**不能当作免费**
+	//	0     = 明确免费
+	//	>0    = 按该倍率计费
+	//
+	// 把「未声明」当免费是**反方向**的错（把该计费的显示成免费），
+	// 与本缺陷同样属于「统计与实际不符」，因此这里绝不退化成 bool。
+	//
+	// 实测（2026-09-18 直接拉两区 /v3/config 的真实响应）：
+	//
+	//	国际版 22 个模型**全部**带该字段，其中倍率 0 的有 4 个：
+	//	    default-model ""            deepseek-v4.1-flash "x0.00"
+	//	    hy4-preview-f "x0.00"       hy3                 "x0.00"
+	//	  计费样例：fast-model "x0.34 credits"、primary-model "x3.31 credits"
+	//	国服 52 个模型里**只有 33 个**带该字段，倍率 0 的只有 1 个（hy3 "x0.00"），
+	//	  其余 19 个（auto / deepseek-r1-0528-* / codewise-* 等）整条缺失该字段。
+	//
+	// 同一个模型名在两区结论可能**相反**，这是本字段不能做成全局清单的原因：
+	//
+	//	deepseek-v4.1-flash   国服 "x0.03"（计费）  国际版 "x0.00"（免费）
+	//
+	// 故判定免费必须**同时**看模型 ID 与账号所属区域，见 server 侧
+	// regionCapability / /v1/models/regions 的 credit_multiplier。
+	CreditMultiplier *float64
+	// CreditsRaw 上游 `credits` 字段的**原文**（仅诊断用，不参与判定）。
+	//
+	// 为什么把原文也留着：CreditMultiplier 是解析结果，"x0.34 credits" 与
+	// "x0.34" 解析后同为 0.34，看不出上游到底怎么写的。一旦出现
+	// 「倍率与实际扣费对不上」，第一个要问的就是「上游原文是什么」——
+	// 把它一并透出到 /v1/models/regions，排查时不必再手工拉一次上游。
+	//
+	// 字段缺失时为 ""（与「有字段且值为空串」同形）：解析结果仍由
+	// CreditMultiplier 的三态区分，本字段只供人看。
+	CreditsRaw string
 }
+
+// parseCreditMultiplier 解析上游 /v3/config 的 `credits` 计费倍率字符串。
+//
+// 返回 (倍率, 是否已声明)：declared=false 表示**上游没给这个字段**，
+// 是「不知道」而不是「免费」——调用方必须把两者分开表达（界面上「—」与「0」
+// 语义不同，「—」表示不知道，0 是确定值）。
+//
+// 实测出现过 4 种形态，都必须吃下（2026-09-18 两区真实响应）：
+//
+//	""              空串        → 0（无倍率即不计费）
+//	"x0.00"         零倍率      → 0（免费）
+//	"x0.34"         纯倍率      → 0.34
+//	"x0.34 credits" 带单位后缀  → 0.34（**抓数字，不能整串匹配**）
+//
+// 为什么用正则抓第一个数字而不是 TrimPrefix("x") + ParseFloat：
+// 带单位后缀那种形态下 ParseFloat("0.34 credits") 会失败，而失败会被上层
+// 当成「未声明」→ 计费模型被显示成未知。整串匹配更糟：上游换个后缀
+// （credits / 积分 / 空）就会静默失配。抓数字对这些变体都成立。
+//
+// 解析不出数字（如上游改成 "free" / "N/A" 这类纯文字）时返回 declared=false：
+// **宁可说不知道，也不要猜**。猜「free」= 把计费的说成免费，
+// 猜「收费」= 把免费的说成计费，两个方向都直接造成本缺陷同类的问题。
+func parseCreditMultiplier(raw string) (float64, bool) {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return 0, true
+	}
+	match := creditMultiplierPattern.FindString(text)
+	if match == "" {
+		return 0, false
+	}
+	value, err := strconv.ParseFloat(match, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, false
+	}
+	// 负倍率上游从未出现过，出现即说明语义变了（可能是「返还」之类）：
+	// 不猜语义，按未声明处理，让上层显示「不知道」而不是把它当免费。
+	if value < 0 {
+		return 0, false
+	}
+	return value, true
+}
+
+// creditMultiplierPattern 从 `credits` 字段里抓倍率数字。
+//
+// 只认十进制（含小数、可带负号）；不认指数形式 —— 上游给的是 "x0.34" 这种展示串，
+// 出现科学计数法说明字段语义已经变了，那时应当人工复核而不是静默解析。
+//
+// **负号必须一起抓**：漏掉它时 "x-1.5" 会匹配出 "1.5" 并被当成正常倍率，
+// 于是「上游语义已变」被静默读成「计费 1.5」。带上负号才能让下面的
+// `value < 0` 判定生效，把这类值按未声明处理。
+var creditMultiplierPattern = regexp.MustCompile(`-?\d+(?:\.\d+)?`)
 
 // modelsConfigUA 拉模型配置用的 User-Agent。
 //
@@ -1107,6 +1203,35 @@ const modelsConfigUA = "WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/2.137.1"
 // 与认证方式/请求头无关），导致国际版永远只能靠硬编码静态表。
 // /v3/config 返回同一份模型数据且两个区域都可用（实测国际版 21、国服 52）。
 const modelsConfigPath = "/v3/config"
+
+// creditMultiplierOf 把上游 `credits` 字段的可选原始串折成三态倍率。
+//
+// 为什么要单独一层而不是直接调 parseCreditMultiplier：
+//
+//	nil（字段缺失） → 未声明
+//	非 nil          → 交给 parseCreditMultiplier（其中 "" → 0 = 免费）
+//
+// 两者结果都是 nil 指针，但**语义不同**（一个是上游没说，一个是说了但说得
+// 无法解析）。当前对消费方而言两者都等于「不知道」，故合并成同一个返回值；
+// 若将来需要区分（例如排查上游字段变更），在这里分流即可。
+func creditMultiplierOf(raw *string) *float64 {
+	if raw == nil {
+		return nil
+	}
+	value, declared := parseCreditMultiplier(*raw)
+	if !declared {
+		return nil
+	}
+	return &value
+}
+
+// creditsRawOf 取上游 `credits` 字段原文（字段缺失时为 ""，仅诊断用）。
+func creditsRawOf(raw *string) string {
+	if raw == nil {
+		return ""
+	}
+	return *raw
+}
 
 // effectiveSupportsImages 合并「模型是否支持图片」与「账号级多模态是否被禁用」。
 //
@@ -1174,6 +1299,27 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 				// disabledMultimodal：账号级多模态开关。实测当前恒为 false/缺失，
 				// 但一旦为 true，即便 supportsImages=true 也不能收图片。
 				DisabledMultimodal bool `json:"disabledMultimodal"`
+				// Credits 计费倍率的**原始字符串**（如 "x0.00" / "x0.34 credits" / ""）。
+				//
+				// 必须声明在这里 —— 这个匿名结构体是手写的，**没写进来的字段会被
+				// json 包静默丢弃**。这正是本字段此前虽在上游响应里、却全树无消费方
+				// 的原因（所有者报的「免费模型统计出积分消耗」由此而来）。
+				//
+				// 用 string 而不是 float64 接：上游给的是展示串（带 "x" 前缀与
+				// "credits" 后缀），直接按数字接会在带后缀时整体解析失败。
+				// 解析交给纯函数 parseCreditMultiplier，可单测。
+				//
+				// **必须是指针**：字段缺失与空串是**相反**的结论，而 string 的零值
+				// 会把两者混成同一个 ""。实测国服 52 个模型里 19 个（auto /
+				// deepseek-r1-0528-* / codewise-* 等）整条没有该字段，国际版
+				// default-model 则是**有字段且值为空串**：
+				//
+				//	字段缺失 → 不知道（不能当免费）
+				//	""      → 免费
+				//
+				// 用非指针 string 会让那 19 个模型全部被判成免费 —— 正是
+				// 「把该计费的算成免费」，与本缺陷反方向但同样错。
+				Credits *string `json:"credits"`
 				Reasoning          struct {
 					Effort           string   `json:"effort"`
 					SupportedEfforts []string `json:"supportedEfforts"`
@@ -1216,6 +1362,10 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			// 账号级多模态开关为 true 时强制降级为 false：上游语义是
 			// 「即便模型本身支持，该账号也不许用图片」，此时不能宣称支持。
 			SupportsImages: effectiveSupportsImages(m.SupportsImages, m.DisabledMultimodal),
+			// 计费倍率：字段缺失 → 保持 nil（未声明）；有值但解析不出数字 →
+			// 同样保持 nil（见 parseCreditMultiplier 的「宁可说不知道」）。
+			CreditMultiplier: creditMultiplierOf(m.Credits),
+			CreditsRaw:       creditsRawOf(m.Credits),
 		}
 		if m.Disabled {
 			disabled[m.ID] = true

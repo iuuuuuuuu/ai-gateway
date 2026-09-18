@@ -939,15 +939,20 @@ pub fn check_gateway_port(port: u16) -> Result<Value, String> {
 
 /// 查询占用指定端口的进程（供「结束占用进程」对话框展示）。
 ///
-/// **按需调用**：会 spawn netstat/tasklist/powershell，不要在页面挂载或轮询里调
-///（那正是热路径 `check_gateway_port` 刻意不查进程的原因）。
+/// **按需调用**：会 spawn netstat/tasklist/powershell（macOS 上是 lsof），
+/// 不要在页面挂载或轮询里调（那正是热路径 `check_gateway_port` 刻意不查进程的原因）。
 /// 同样用 async + spawn_blocking：进程调用是阻塞的，不该占用主线程或异步运行时线程。
+///
+/// 响应里的 `hint` 是「查不到占用者」时给用户的**可操作**排查命令，由后端按
+/// 自身所在系统生成（见 `port_holder_manual_hint`）—— 不让前端按 UA 猜平台：
+/// WebUI 模式下浏览器与后端甚至可能不在同一台机器上。
 #[tauri::command]
 pub async fn get_gateway_port_holder(port: u16) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         Ok(json!({
             "port": port,
             "holder": ai_gateway_core::modules::gateway::port_holder(port).unwrap_or(Value::Null),
+            "hint": ai_gateway_core::modules::gateway::port_holder_manual_hint(port),
         }))
     })
     .await

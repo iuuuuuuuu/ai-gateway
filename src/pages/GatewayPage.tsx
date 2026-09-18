@@ -22,7 +22,6 @@ import {
   RefreshCw,
   RotateCw,
   Rows3,
-  Save,
   Server,
   Shuffle,
   Skull,
@@ -61,10 +60,12 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
+import { SENSITIVE_STRING_INPUT_PROPS } from "@/lib/sensitive-input";
 import { useAccountsStore } from "@/stores/accounts";
 import { useVisibilityInterval } from "@/lib/use-visibility-interval";
 import type {
   AccountMeta,
+  CreditBillingVerdict,
   CreditExpiry,
   CreditResource,
   CreditStatistics,
@@ -709,6 +710,47 @@ function validatePort(value: number): string | null {
   return null;
 }
 
+/**
+ * 接口配置（端口 / API Key）自动保存的**输入静默期**。
+ *
+ * 为什么必须是「停手之后才存」，而不是 onChange 直接存 —— 这正是原来那个
+ * 保存按钮存在的理由，不能因为去掉按钮就把这个保护也去掉：
+ *
+ *   文本输入框每按一个键都会改值。若边打字边保存，`sk-abcdef` 会被依次写成
+ *   `s`、`sk`、`sk-`、`sk-a`…… 其中**每一个半截值都会被真的落盘**。
+ *   而 `api_key` 是网关的鉴权口令：配置文件里留下一个半截 key，用户下一次
+ *   启动/重启网关时就会按那个半截值鉴权，所有客户端立刻 401 —— 且因为
+ *   界面上显示的 key 是完整的，用户根本看不出配置里存的是残缺的。
+ *   端口同理：`7863` 输到一半是 `78`（合法端口！），半截值落盘会让网关
+ *   下次在 78 端口上监听 —— 一个谁都连不上的端口。
+ *
+ * 800ms 的取值权衡：
+ *   - 太短（如 200ms）→ 打字稍慢就会被判定为"停手"，仍然存下半截值；
+ *   - 太长（如 3s）→ 用户改完立刻关窗口就来不及保存。
+ *   正常人手速的按键间隔约 100~250ms，800ms 已能覆盖绝大多数连续输入；
+ *   而失焦与卸载兜底（见 `flushTextConfig` / 卸载 effect）保证再怎么快也不丢。
+ */
+const AUTOSAVE_DEBOUNCE_MS = 800;
+
+/**
+ * 接口配置里**已确认落盘**的文本值。
+ *
+ * 为什么要单独记一份、而不是直接拿 `port` / `apiKey` 两个 state 去比较：
+ * 自动保存必须在「值确实变了」时才发请求。而 `port` / `apiKey` 是**受控输入**的
+ * 即时值，每按一个键就变一次 —— 拿它们判断"变了"等于每次按键都判定为变化。
+ * 这份快照只在**保存成功之后**更新，因此「与它不等」精确地等价于
+ * 「有未落盘的改动」，防抖结束后据此决定"这次到底要不要发请求"。
+ */
+type SavedTextConfig = { port: number; apiKey: string };
+
+/** 自动保存的界面状态：idle 空闲 / pending 有改动待存 / saving 正在存 / saved 刚存成功 / error 存失败。 */
+type AutoSaveState =
+  | { kind: "idle" }
+  | { kind: "pending" }
+  | { kind: "saving" }
+  | { kind: "saved"; at: number; description: string }
+  | { kind: "error"; message: string };
+
 /** 把「距今毫秒数」格式化成「刚刚 / 12 秒前 / 3 分钟前」。 */
 function formatRelativeTime(deltaMs: number): string {
   const sec = Math.max(0, Math.floor(deltaMs / 1000));
@@ -1060,8 +1102,19 @@ interface PoolRowMetrics {
   rank: number;
   /** 当前范围内的积分消耗；null = 该范围给不出可信值（「全部」）。 */
   creditUsed: number | null;
+  /**
+   * 当前范围的免费模型判定（`model_billing.rs` 的逐窗口结论）。
+   *
+   * 为什么显示层需要它：`creditUsed === 0` 有两种来源 ——「确定没消耗」
+   * 与「这些调用全是免费模型」。前者界面显示「—」，后者必须显示 **0**：
+   * 0 是确定的事实（免费调用不扣积分），而「—」在本项目里表示「不知道」。
+   * 把确定的 0 显示成「—」会让所有者又看到「统计不出消耗」，与报的这个问题同类。
+   */
+  creditVerdict: CreditBillingVerdict;
   /** 今日消耗积分；null = 宿主没给积分统计（旧版后端，或还没拉到）。 */
   creditToday: number | null;
+  /** **今日**窗口的免费判定（二级行「今日消耗积分」的说明用，固定档）。 */
+  creditTodayVerdict: CreditBillingVerdict;
   /** 积分余额（网关侧快照）；null = 未取到。 */
   balance: number | null;
   /** 到期档位的可比较键（毫秒；无档位 = +∞ ⇒ 恒排最后）。 */
@@ -1223,10 +1276,6 @@ function modelCoolingTitle(acc: GatewayPoolAccount): string {
   return [head, tail, accountLevel].filter(Boolean).join(" ");
 }
 
-function poolAccountName(acc: GatewayPoolAccount): string {
-  return acc.nickname || acc.uid;
-}
-
 /**
  * 界面上标识一个账号的名字：**备注 → 上游昵称 → uid 前缀**。
  *
@@ -1237,12 +1286,28 @@ function poolAccountName(acc: GatewayPoolAccount): string {
  *
  * `trim()` 顺带挡掉纯空白的备注，避免下拉出现一项看不见字的条目。
  *
- * 与 `poolAccountName` 的分工：那个用于**账号池**（名字来自网关进程的 /status，
- * 昵称随凭证一起导出），而备注只存宿主侧 —— 要让那里的卡片也显示备注，
- * 得先把备注导出给网关，属另一处改动。本函数用于**宿主侧**的下拉与用量列表。
+ * **本函数是全站唯一口径**：账号池表格、指定账号勾选列表、用量列表、
+ * 排序比较器都走它。此前账号池另有一个 `poolAccountName` 的同义实现
+ *（`nickname || uid`），于是同一个号在勾选列表里显示备注、在池表格里显示昵称，
+ * 两处对不上（所有者反馈：「兼容网关，已备注的账号 却不会显示备注」）——
+ * 两份手写副本迟早走偏，故收敛成一处。
+ *
+ * 账号池之所以以前拿不到备注：它的名字来自网关进程的 `/status`，而备注只存宿主侧。
+ * 现在宿主在 `gateway_status()` 里把备注**合并**进池快照（见 Rust 侧
+ * `merge_account_notes` 的方案论证），所以这里能和其它地方共用同一口径。
  */
 function accountLabel(account: { uid: string; nickname?: string; note?: string }): string {
   return account.note?.trim() || account.nickname?.trim() || account.uid.slice(0, 8);
+}
+
+/**
+ * 账号池行/排序用的账号名。
+ *
+ * 保留这个名字（而不是各处直接写 `accountLabel`）是为了让池相关的调用点一眼可见，
+ * 但**不再自己实现回退链** —— 直接委托给唯一口径，避免两份副本再次走偏。
+ */
+function poolAccountName(acc: GatewayPoolAccount): string {
+  return accountLabel(acc);
 }
 
 /**
@@ -1281,7 +1346,7 @@ function PoolAccountRow({
   /** 网关侧的**池级**粘性会话绑定数（后端没有逐账号口径）。 */
   stickySessions: number;
 }) {
-  const { acc, total, records, percent, rank, creditUsed, creditToday, balance, expiryKey } = metrics;
+  const { acc, total, records, percent, rank, creditUsed, creditVerdict, creditToday, creditTodayVerdict, balance, expiryKey } = metrics;
   const modelCools = acc.model_cooling ?? [];
   const coolingModelCount = modelCools.length;
   /**
@@ -1361,8 +1426,27 @@ function PoolAccountRow({
           {/* 行高刻意钉在「一行名字 + 一行 uid 前缀」≈ 28px（leading-4 + leading-3）：
               草稿要求概览行约 30px/行、一屏十几个账号。不给显式 leading 的话
               Tailwind 的默认行高（1.5×）会把两行撑到 34px，行高直接多出 20%。 */}
-          <div className="truncate text-[12.5px] font-medium leading-4" title={acc.nickname || acc.uid}>
-            {acc.nickname || acc.uid}
+          {/*
+            名字口径 = **备注 → 昵称 → uid 前缀**，与勾选列表/用量列表同一处
+            （`accountLabel`）。此前这里是 `acc.nickname || acc.uid`，于是设了备注
+            的账号在池里依旧显示昵称或一串 uid —— 所有者反馈的「已备注的账号却不
+            会显示备注」正是这一行。备注由宿主合并进 /status（见 Rust
+            `merge_account_notes`），因此这里直接读 `acc.note` 即可。
+
+            `data-slot="pool-account-name"` 供 UI 测试锁定**名字本身**：
+            账号列有两行（名字 + uid 前缀），整格 innerText 会把两者粘在一起，
+            断言「显示的是备注」时无法与「顺带显示了 uid」区分。
+
+            `title` 必须跟着同一口径：一处显示备注、悬浮却冒出 uid，等于让人
+            以为自己看错了账号（该列的悬浮提示此前正是 `nickname || uid`）。
+            完整 uid 仍由下一行与二级行承担，信息不丢。
+          */}
+          <div
+            data-slot="pool-account-name"
+            className="truncate text-[12.5px] font-medium leading-4"
+            title={poolAccountName(acc)}
+          >
+            {poolAccountName(acc)}
           </div>
           {/* uid 在概览行给短前缀（完整值在二级行「积分」块里，信息不丢），
               因为 36 字符的 uuid 会把「账号」列撑到吃掉「消耗」列的宽度。 */}
@@ -1488,12 +1572,25 @@ function PoolAccountRow({
             creditUsed && creditUsed > 0 ? "text-foreground/90" : "text-muted-foreground",
           )}
           title={
-            creditUsed === null
-              ? "「全部」范围给不出可信的积分消耗：积分快照只保留 30 天"
-              : `账号库积分记录里累计的消耗（${usageRangeLabel}）`
+            creditVerdict === "all_free"
+              ? `该账号${usageRangeLabel}只用了免费模型（上游声明计费倍率为 0），因此消耗为 0 —— 免费模型的调用不扣积分`
+              : creditUsed === null
+                ? "「全部」范围给不出可信的积分消耗：积分快照只保留 30 天"
+                : `按连续快照的余额下降累计的消耗（${usageRangeLabel}）`
           }
         >
-          {creditUsed !== null && creditUsed > 0 ? exactTokenFormatter.format(Math.round(creditUsed)) : "—"}
+          {/*
+            免费模型必须显示**确定的 0**，而不是「—」。
+            本项目里「—」= 不知道（`creditUsed === null` 与
+            `creditVerdict === "unknown"` 两种情形），0 = 确定没消耗。
+            免费调用不扣积分是**确定**的事实，显示成「—」会把已知说成未知 ——
+            所有者要的正是「别把它统计出积分」，而不是「继续看不到」。
+          */}
+          {creditVerdict === "all_free"
+            ? "0"
+            : creditUsed !== null && creditUsed > 0
+              ? exactTokenFormatter.format(Math.round(creditUsed))
+              : "—"}
         </td>
         <td className="px-2.5 py-1 text-right">
           <span
@@ -1584,9 +1681,14 @@ function PoolAccountRow({
                       // 刻意给**今日**这一档，而不是复述上面的筛选范围：`CreditStatisticsResource`
                       // 里只有今日 / 近 7 天 / 本月三个窗口，「近 30 天」与「全部」都落回本月，
                       // 复述筛选范围会把「本月」说成「近 30 天」。列名如实写「今日」。
-                      creditStatsLoaded
-                        ? exactTokenFormatter.format(Math.round(creditToday ?? 0))
-                        : "—"
+                      //
+                      // 今日只用免费模型时显示确定的 0（与主表那一列同一约定）：
+                      // 免费调用不扣积分是事实，不是说不出数字。
+                      !creditStatsLoaded
+                        ? "—"
+                        : creditTodayVerdict === "all_free"
+                          ? "0"
+                          : exactTokenFormatter.format(Math.round(creditToday ?? 0))
                     }
                   />
                   <PoolKV
@@ -1830,6 +1932,15 @@ export default function GatewayPage() {
   const [killTarget, setKillTarget] = useState<GatewayPortCheck | null>(null);
   /** 对话框里展示的占用者：点开对话框后按需查询（不在热路径上查）。 */
   const [killHolder, setKillHolder] = useState<GatewayPortHolder | null>(null);
+  /**
+   * 「查不到占用者」时展示的可操作排查提示，由后端按**它自己所在的系统**生成
+   *（macOS 给 `sudo lsof …`、Windows 给 `Get-NetTCPConnection …`）。
+   *
+   * 为什么不让前端按 UA 拼命令：WebUI 模式下浏览器与后端可能不是同一台机器，
+   * 决定「该敲哪条命令」的是后端所在的系统。后端没给（旧版本宿主）时前端
+   * 退化为一句通用提示，而不是硬编码某个平台的命令。
+   */
+  const [killHint, setKillHint] = useState<string | null>(null);
   const [killHolderLoading, setKillHolderLoading] = useState(false);
 
   /** 网关 Token 用量：范围选择、数据与加载态。默认「今日」——看用量多为盯当天消耗。 */
@@ -2000,19 +2111,94 @@ export default function GatewayPage() {
   }, [storeAccounts, creditLoadingMap]);
 
   /**
-   * 端口 / API Key 是否存在「已编辑但未保存」的内容。
+   * 接口配置（端口 / API Key）的**自动保存**状态与三道闸门。
    *
-   * 5 秒轮询会用后端配置刷新界面；若无条件覆盖，用户正在输入的内容会被
-   * 中途改回去。因此在用户编辑期间暂停对这两个文本字段的覆盖。
-   * 模式与自动启动是开关型操作，改为即时保存，不受此影响。
+   * ## 原来那个保存按钮在防什么，现在怎么防
+   *
+   * 被替换掉的按钮上有这样一段注释：它「只管文本字段（端口 / API Key）」，
+   * 因为**文本输入框每按一个键都在改值** —— 若边打字边保存，会把半截的 key
+   *（例如只输了 3 个字符）写进配置。去掉按钮不等于这个风险消失，只是换防法。
+   * 下面三道闸门叠加，缺一不可：
+   *
+   *   1. **防抖**（`AUTOSAVE_DEBOUNCE_MS` = 800ms）：每次按键都重置计时器，
+   *      只有用户**停手** 800ms 之后才真正发请求。连续打字期间一次都不发。
+   *   2. **只提交真的变了的字段**：防抖到期后还要与 `savedRef`（已确认落盘的
+   *      值）逐字段比对，没变的字段**根本不进请求体**。这条同时解决端口的诉求 ——
+   *      用户改 API Key 时不会顺带把端口重写一遍。
+   *   3. **端口额外要求合法**：`validatePort` 不过（空串、0、>65535、
+   *      正在删字改写的中间态）一律跳过。因此「每敲一个数字就重启一次网关」
+   *      不可能发生：中间态非法直接不存，只有停手后的**完整合法端口**才落盘。
+   *
+   * 半截 API Key 被写进配置的后果比"值不对"严重得多：`api_key` 是网关的鉴权
+   * 口令，落盘一个半截值等于在用户输完之前就把网关切成了「拒绝所有客户端」
+   *（客户端带的仍是完整 key），表现是一连串 401。
+   *
+   * ## 保存时机（三条互补的路径）
+   *
+   *   - **停手 800ms** → 正常路径：用户改完不必做任何动作，稍等即自动生效。
+   *   - **失焦（blur）** → 用户改完直接去点别处/切页，不等防抖，立刻存。
+   *   - **卸载** → 兜底：切路由离开本页时把待存内容补发一次。
+   *
+   * 三条合起来把「输入后没等保存就切走 / 关窗口」的丢数据窗口压到 0：
+   * 只要发生过输入，至少有一条会被触发。
+   *
+   * ## 为什么保存不能挂在 state 变化（useEffect）上
+   *
+   * 本页有 5 秒轮询（`refresh` → `applyConfig`）会写 `port` / `apiKey` 两个
+   * state。若防抖挂在这些 state 的变化上，轮询的写入会被误判成「用户又改了」，
+   * 形成「轮询 → 判定有改动 → 保存 → 再轮询」的自激循环。因此保存只由
+   * **用户事件**驱动：onChange 重启计时器、blur、卸载。
    */
-  const dirtyRef = useRef(false);
+  const [autoSave, setAutoSave] = useState<AutoSaveState>({ kind: "idle" });
+  /** 已确认落盘的文本配置；与当前 state 不等 ⇒ 有未保存的改动。 */
+  const savedRef = useRef<SavedTextConfig | null>(null);
+  /** 防抖计时器句柄；null 表示当前没有待存的改动。 */
+  const debounceRef = useRef<number | null>(null);
+  /**
+   * 「用户编辑后的待存值」。
+   *
+   * 三条保存路径都读它，而**不能**读 `port` / `apiKey` 的闭包值：卸载 effect
+   * 的依赖数组为空，闭包里捕获的永远是首次渲染那份 state（初始的 7863 与
+   * 空串），拿它去保存会把用户刚配好的值**重置掉**。ref 每次输入都更新，
+   * 三条路径读到的都是最新值。
+   */
+  const pendingRef = useRef<SavedTextConfig | null>(null);
+  /**
+   * 用户**实际编辑过**的字段名。
+   *
+   * 为什么必须有它：首次轮询返回之前 `savedRef` 还是 null，此时「与已存值比对」
+   * 无从谈起。若据此把两个字段一起提交，用户只改了 API Key 也会把 `port`
+   * 按本地默认值（7863）写回去 —— 而后端可能配的是别的端口，这就是一次
+   * 静默的配置破坏（还会顺带触发网关重启）。有了这个集合，
+   * **没碰过的字段永远不会进请求体**。
+   */
+  const touchedRef = useRef<Set<keyof SavedTextConfig>>(new Set());
+  /**
+   * 最新一次渲染看到的值。
+   *
+   * 只用来给「第一次编辑」提供基线（见 `noteTextEdit`）：那时 `pendingRef`
+   * 还是 null，需要知道另一个字段当前是什么。用 ref 而不是把 `port` / `apiKey`
+   * 写进依赖数组，避免每次按键都重建回调。
+   */
+  const latestRef = useRef<SavedTextConfig>({ port: 7863, apiKey: "" });
+  latestRef.current = { port, apiKey };
+  /**
+   * 保存请求的序号，用于丢弃**过期响应**。
+   *
+   * 场景：一次保存进行中用户又改了，且新值的防抖抢在旧请求返回前发出 ——
+   * 旧请求随后返回，若不加判断就会把 `savedRef` 覆盖成**上一版**的值，
+   * 表现为「刚存好的值又跳回去了」。只认最后一次发起的那次结果即可。
+   */
+  const saveSeqRef = useRef(0);
 
   const applyConfig = useCallback((cfg: GatewayConfig) => {
-    if (!dirtyRef.current) {
-      setPort(cfg.port || portOf(cfg.listen) || 7863);
-      setApiKey(cfg.api_key || "");
-    }
+    const nextPort = cfg.port || portOf(cfg.listen) || 7863;
+    const nextKey = cfg.api_key || "";
+    // 有未落盘的改动时**不覆盖**：用户正在输入，轮询把它改回去就是「打字被打断」
+    //（这是原 `dirtyRef` 的职责，语义完全保留）。否则无条件跟随后端 ——
+    // 包括保存成功后回读拿到新值的那一次刷新。
+    setPort((current) => (pendingRef.current ? current : nextPort));
+    setApiKey((current) => (pendingRef.current ? current : nextKey));
     setAutoStart(Boolean(cfg.auto_start));
     setMode(cfg.mode === "manual" ? "manual" : cfg.mode === "rotation" ? "rotation" : "balance");
     // 勾选列表：新字段优先；旧配置只有 pinned_uid 时读作「只勾了那一个」
@@ -2024,6 +2210,199 @@ export default function GatewayPage() {
           : [],
     );
     setAllowedModels(normalizeAllowedModels(cfg.allowed_model));
+    // 首次拿到后端配置时建立基线：那一刻磁盘上的值就是「已保存」的值。
+    // 没有这一步，之后每次输入都会被判成「与已存值不同」而多发一次
+    // 其实没变的保存请求。
+    if (!savedRef.current) {
+      savedRef.current = { port: nextPort, apiKey: nextKey };
+    }
+  }, []);
+
+  /** 清掉待执行的防抖计时器。 */
+  function cancelDebounce() {
+    if (debounceRef.current !== null) {
+      window.clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+  }
+
+  /**
+   * 算出「相对已落盘值真正变化了」的字段补丁。
+   *
+   * 抽成纯函数是因为它被两条路径共用（正常保存 / 卸载兜底），
+   * 两处各写一遍判定必然漂移 —— 本项目已有太多「两处各算一遍然后对不上」的教训。
+   * 返回空补丁 ⇒ 没有需要提交的内容。
+   */
+  function textConfigPatch(pending: SavedTextConfig): { patch: Partial<GatewayConfig>; labels: string[] } {
+    const saved = savedRef.current;
+    const touched = touchedRef.current;
+    const patch: Partial<GatewayConfig> = {};
+    const labels: string[] = [];
+    // 只有**用户碰过**的字段才可能进补丁（见 touchedRef 的说明：没碰过的字段
+    // 即使本地值与后端不同，那也是"还没拉到后端配置"，不是"用户的改动"）。
+    // 端口额外要求合法：它可能正处于「正在删字改写」的中间态（空串 → NaN）。
+    // 非法就跳过这一项，但**不影响** API Key 的保存 —— 两者各自独立判定。
+    if (touched.has("port")) {
+      const portInvalid = validatePort(pending.port) !== null;
+      if (!portInvalid && (saved === null || saved.port !== pending.port)) {
+        patch.port = pending.port;
+        labels.push(`端口 ${pending.port}`);
+      }
+    }
+    if (touched.has("apiKey") && (saved === null || saved.apiKey !== pending.apiKey)) {
+      patch.api_key = pending.apiKey;
+      labels.push(pending.apiKey.trim() === "" ? "API Key（已清空，网关不再鉴权）" : "API Key");
+    }
+    return { patch, labels };
+  }
+
+  /**
+   * 立刻把待存内容落盘。**幂等**：没有待存内容时是空操作。
+   *
+   * 所有保存路径（防抖到期 / 失焦）都汇聚到这里，保证判定口径完全一致。
+   * 写成普通函数（而非 useCallback）是刻意的：函数体只读写 ref 与模块级导入，
+   * 没有任何闭包变量，因此不存在过期闭包问题，也就不必维护依赖数组。
+   */
+  async function flushTextConfig() {
+    cancelDebounce();
+    const pending = pendingRef.current;
+    if (!pending) return;
+    const { patch, labels } = textConfigPatch(pending);
+    if (Object.keys(patch).length === 0) {
+      // 值与已落盘的一致（例如用户改了又改回来）：不发请求。这里**不能**报
+      //「已保存」—— 那会让用户以为刚刚那次输入被单独处理过。
+      pendingRef.current = null;
+      setAutoSave({ kind: "idle" });
+      return;
+    }
+    const description = labels.join(" · ");
+    setAutoSave({ kind: "saving" });
+    /*
+     * 请求期间**刻意保留** `pendingRef`（而不是先清空）。
+     *
+     * 因为它是「本地的值优先于后端」的唯一标记（见 applyConfig）：一旦提前清空，
+     * 保存往返的这一两百毫秒里若正好撞上 5 秒轮询，`applyConfig` 就会拿**后端
+     * 尚未更新**的旧值把用户刚输入的内容覆盖掉 —— 表现为「刚打完字，输入框里的
+     * 值自己跳回上一个」。保留它，轮询在这段时间内就不会动这两个字段。
+     *
+     * 判断「保存期间用户又改了」改为比较引用：`noteTextEdit` 每次都会赋一个
+     * **新对象**，因此 `pendingRef.current !== pending` 就等价于「有新输入」。
+     */
+    const seq = ++saveSeqRef.current;
+    try {
+      const res = await api.saveGatewayConfig(patch);
+      // 过期响应：期间已发起了更新的保存，它的结果才是权威的。
+      // 不丢弃的话旧结果会把 savedRef 覆盖回上一版的值。
+      if (seq !== saveSeqRef.current) return;
+      if (res?.config) {
+        savedRef.current = {
+          port: res.config.port || portOf(res.config.listen) || pending.port,
+          apiKey: res.config.api_key ?? pending.apiKey,
+        };
+      } else {
+        savedRef.current = pending;
+      }
+      // 已落盘 ⇒ 这两个字段的「用户改动」已被消化，清掉编辑标记。
+      // 留着的话，下一次编辑另一个字段时会把它们再比一遍（虽无害，
+      // 但会让 touchedRef 的语义变成「历史上碰过」而不是「有未存的改动」）。
+      if (patch.port !== undefined) touchedRef.current.delete("port");
+      if (patch.api_key !== undefined) touchedRef.current.delete("apiKey");
+      // 只有在用户于本次请求期间**没有**新输入时才清空；有的话保留，
+      // 让下面的收尾逻辑接着把它存掉。
+      const hasNewerEdits = pendingRef.current !== pending;
+      if (!hasNewerEdits) pendingRef.current = null;
+      setAutoSave({ kind: "saved", at: Date.now(), description });
+      // 只用 toast 额外提示**端口**：改端口会牵动网关重启，用户必须知道。
+      // API Key 是高频输入项（可能反复微调），每次都弹一次会变成刷屏 ——
+      // 它的反馈常驻在输入框旁的状态文字里（见 JSX 的 data-slot="gw-autosave-hint"）。
+      if (patch.port !== undefined) {
+        // 固定 `id`：同一件事的提示**替换**而不是堆叠。端口是数字输入，
+        // 手速慢的用户可能触发多次保存，没有 id 时右侧会连成一串相同提示。
+        toast.success(`端口已自动保存为 ${pending.port}`, {
+          id: "gw-port-autosave",
+          description: "网关重启后按新端口监听",
+        });
+      }
+    } catch (e) {
+      if (seq !== saveSeqRef.current) return;
+      // 失败**必须**显式告知，且绝不假装成功。待存值会被放回去，这样下一次
+      // 停手/失焦会自然重试，用户也不会以为已经存上了。
+      //
+      // 注意只在「用户没在请求期间继续输入」时才把旧值放回：若已有更新的输入，
+      // `pendingRef` 里那份是新值的**超集**（noteTextEdit 以它为 base 合并），
+      // 用旧的 `pending` 覆盖反而会丢掉刚敲的那几个字符。
+      if (pendingRef.current === null) pendingRef.current = pending;
+      const message = api.asError(e);
+      setAutoSave({ kind: "error", message });
+      toast.error(`自动保存失败：${message}`);
+      return;
+    }
+    // 保存期间用户又改了 ⇒ 再起一轮防抖，否则这最后几个字符会一直悬着，
+    // 直到用户失焦才被保存。
+    if (pendingRef.current) {
+      debounceRef.current = window.setTimeout(() => void flushTextConfig(), AUTOSAVE_DEBOUNCE_MS);
+    }
+  }
+
+  /**
+   * 记下一次用户编辑，并重启防抖计时器。
+   *
+   * 由两个输入框的 onChange 调用。**只在这里**更新 `pendingRef` 与 `touchedRef`，
+   * 因此轮询写 state 不会被误认成用户编辑。
+   */
+  function noteTextEdit(patch: Partial<SavedTextConfig>) {
+    const base = pendingRef.current ?? latestRef.current;
+    pendingRef.current = { ...base, ...patch };
+    for (const key of Object.keys(patch) as Array<keyof SavedTextConfig>) {
+      touchedRef.current.add(key);
+    }
+    setAutoSave({ kind: "pending" });
+    cancelDebounce();
+    debounceRef.current = window.setTimeout(() => void flushTextConfig(), AUTOSAVE_DEBOUNCE_MS);
+  }
+
+  /**
+   * 失焦即存：用户改完直接去点别处（切页、改别的设置），不必等防抖到期。
+   * 这是「输入后没等保存就切走」的第二道保险（最后一道见下面的卸载兜底）。
+   */
+  function handleTextBlur() {
+    void flushTextConfig();
+  }
+
+  /**
+   * 「选好了端口」的**离散**动作（点「自动」挑一个空闲端口 / 点「用 78xx」采纳建议）
+   * —— 记下新值并**立即**保存，不等防抖。
+   *
+   * 为什么这两条路径必须单独处理而不是只 setPort：它们是「一次点击 = 一个确定值」，
+   * 不存在半截输入的问题，所以没有理由让用户再等 800ms。更要紧的是，
+   * 若不落盘，5 秒轮询会用后端配置把刚点出来的端口**拨回去**，
+   * 用户看到的是「点了自动，端口跳了一下又变回原来的」。
+   */
+  function choosePort(next: number) {
+    setPort(next);
+    noteTextEdit({ port: next });
+    void flushTextConfig();
+  }
+
+  /**
+   * 卸载兜底：离开本页时把待存内容补发一次。
+   *
+   * 依赖数组为空 ⇒ 只在**卸载**时执行清理，这是最后一道保险。
+   *
+   * 这里刻意**不**复用 `flushTextConfig`：它内部会 `setAutoSave`，而卸载之后
+   * 更新 state 毫无意义（React 会忽略）。所以走一条只管发请求、不碰 state 的
+   * 窄路径 —— 判定复用的仍是同一个 `textConfigPatch`，口径不会分叉。
+   */
+  useEffect(() => {
+    return () => {
+      const pending = pendingRef.current;
+      if (!pending) return;
+      const { patch } = textConfigPatch(pending);
+      if (Object.keys(patch).length === 0) return;
+      void api.saveGatewayConfig(patch).catch((e) => {
+        toast.error(`离开页面时保存配置失败：${api.asError(e)}`);
+      });
+    };
   }, []);
 
   /** 手动模式的可选账号：排除已禁用与需重登的（它们不会进池，勾了也没用）。 */
@@ -2288,7 +2667,9 @@ export default function GatewayPage() {
       for (let candidate = Math.max(port, 1024); candidate < port + 60; candidate += 1) {
         const res = await api.checkGatewayPort(candidate);
         if (res.available || res.inUseByGateway) {
-          setPort(candidate);
+          // 走 choosePort 而不是裸 setPort：这是一次「确定值」的点击，
+          // 必须立刻落盘，否则 5 秒轮询会把刚挑到的端口拨回旧值。
+          choosePort(candidate);
           setPortCheck(res);
           toast.success(`已选择端口 ${candidate}`);
           return;
@@ -2314,12 +2695,15 @@ export default function GatewayPage() {
     setKillTarget(target);
     setKillHolderLoading(true);
     setKillHolder(null);
+    setKillHint(null);
     try {
       const res = await api.getGatewayPortHolder(target.port);
       setKillHolder(res.holder);
+      setKillHint(res.hint ?? null);
     } catch {
       // 查不到占用者不阻断：对话框会提示「无法识别」，用户仍可尝试结束
       setKillHolder(null);
+      setKillHint(null);
     } finally {
       setKillHolderLoading(false);
     }
@@ -2951,6 +3335,34 @@ export default function GatewayPage() {
   const usageRangeLabel = USAGE_RANGE_OPTIONS.find((o) => o.key === usageRange)?.label ?? "统计范围";
 
   /**
+   * 当前日期筛选对应的免费判定键（与 `billing` 的三个字段一一对应）。
+   *
+   * 「近 30 天」与「全部」没有独立窗口，落回 `month`（本月）—— 与
+   * `creditUsedByUid` 取 `usageThisMonth` 的口径**必须一致**：两边取不同的
+   * 窗口会让「数字来自本月、判定来自今日」，出现「显示 0 但其实本月有计费调用」
+   * 这类自相矛盾的组合。「全部」在下面被显式置为 unknown（那一列本就给不出可信值）。
+   */
+  const creditVerdictKey: keyof NonNullable<CreditStatistics["accounts"][number]["billing"]> =
+    usageRange === "today" ? "today" : usageRange === "7d" ? "sevenDays" : "month";
+
+  /**
+   * 网关池 uid → 当前范围内的免费模型判定。
+   *
+   * 键换算与 `creditUsedByUid` 完全同源（统计接口按账号库 `id` 分组，
+   * 池里查的是 `uid`）。查不到 → `unknown`（不臆断免费）。
+   */
+  const creditVerdictByUid = useMemo(() => {
+    const map = new Map<string, CreditBillingVerdict>();
+    for (const a of creditStats?.accounts ?? []) {
+      const uid = uidByAccountId.get(a.accountId);
+      if (!uid) continue;
+      const verdict = a.billing?.[creditVerdictKey];
+      map.set(uid, verdict === "all_free" || verdict === "has_paid" ? verdict : "unknown");
+    }
+    return map;
+  }, [creditStats, creditVerdictKey, uidByAccountId]);
+
+  /**
    * 网关池 uid → **今日**消耗积分（二级行「积分」块用）。
    *
    * 为什么不复用 `creditUsedByUid`：那一份跟着上面的日期筛选走，而二级行的
@@ -2966,6 +3378,24 @@ export default function GatewayPage() {
       const uid = uidByAccountId.get(a.accountId);
       if (!uid) continue;
       map.set(uid, a.usageToday ?? 0);
+    }
+    return map;
+  }, [creditStats, uidByAccountId]);
+
+  /**
+   * 网关池 uid → **今日**免费判定（与上面那份今日消耗同一窗口）。
+   *
+   * 必须固定取 `billing.today` 而不是复用跟着筛选走的 `creditVerdictByUid`：
+   * 二级行的这一格列名写死了「今日」，判定若跟着筛选走，会出现
+   * 「数字取自今日（本月有计费调用）→ 判定说 all_free」这种自相矛盾。
+   */
+  const creditTodayVerdictByUid = useMemo(() => {
+    const map = new Map<string, CreditBillingVerdict>();
+    for (const a of creditStats?.accounts ?? []) {
+      const uid = uidByAccountId.get(a.accountId);
+      if (!uid) continue;
+      const verdict = a.billing?.today;
+      map.set(uid, verdict === "all_free" || verdict === "has_paid" ? verdict : "unknown");
     }
     return map;
   }, [creditStats, uidByAccountId]);
@@ -2997,6 +3427,9 @@ export default function GatewayPage() {
       // 0 会被读成「这个号今天没消耗」，而事实是「这个范围查不到」。
       const creditUsed =
         usageRange === "all" ? null : (creditUsedByUid.get(acc.uid) ?? (creditStats ? 0 : null));
+      // 「全部」范围没有对应的免费判定窗口 → unknown（与上面的 null 一致）。
+      const creditVerdict =
+        usageRange === "all" ? "unknown" : (creditVerdictByUid.get(acc.uid) ?? "unknown");
       return {
         acc,
         total,
@@ -3005,7 +3438,11 @@ export default function GatewayPage() {
         // 排名先占位，下面按消耗排序后统一回填。
         rank: 0,
         creditUsed,
+        creditVerdict,
         creditToday: creditStats ? (creditTodayByUid.get(acc.uid) ?? 0) : null,
+        creditTodayVerdict: creditStats
+          ? (creditTodayVerdictByUid.get(acc.uid) ?? "unknown")
+          : "unknown",
         balance: typeof acc.credits === "number" ? acc.credits : null,
         expiryKey: poolExpiryKey(acc.expire_day),
         stateRank: poolStateRank(acc),
@@ -3161,7 +3598,9 @@ export default function GatewayPage() {
               {excludedAccounts.length} 个账号需重新登录，已排除出账号池
             </div>
             <div className="mt-1 leading-5 opacity-90">
-              {excludedAccounts.map((a) => a.nickname || a.uid).join("、")}
+              {/* 也走统一口径：这条提示同样是「标识一个账号」，显示 uid
+                  会让用户不知道是哪个号要去重登（备注/昵称都有的号尤其明显）。 */}
+              {excludedAccounts.map((a) => accountLabel({ uid: a.uid, nickname: a.nickname, note: a.note })).join("、")}
               ：refresh token 已失效，继续使用只会让每次请求失败一次。请到「账号管理」页重新登录，
               恢复后会自动重新加入账号池。
             </div>
@@ -3438,9 +3877,12 @@ export default function GatewayPage() {
               max={65535}
               value={Number.isFinite(port) ? port : ""}
               onChange={(e) => {
-                dirtyRef.current = true;
+                // 每次按键只**记下待存值并重启防抖**，不直接保存 ——
+                // 端口在这种情况下常常是半截的（删字改写中会是空串）。
                 setPort(Number(e.target.value));
+                noteTextEdit({ port: Number(e.target.value) });
               }}
+              onBlur={handleTextBlur}
               placeholder="7863"
               className="h-8 w-24 font-mono text-xs"
               aria-invalid={portState.tone === "bad"}
@@ -3465,7 +3907,8 @@ export default function GatewayPage() {
                 variant="outline"
                 size="sm"
                 className="h-8 px-2 text-xs"
-                onClick={() => setPort(portCheck.suggest as number)}
+                // 采纳建议端口同样走 choosePort：立刻落盘，否则会被轮询拨回去。
+                onClick={() => choosePort(portCheck.suggest as number)}
               >
                 用 {portCheck.suggest}
               </Button>
@@ -3501,11 +3944,16 @@ export default function GatewayPage() {
             id="gw-key"
             value={apiKey}
             onChange={(e) => {
-              dirtyRef.current = true;
               setApiKey(e.target.value);
+              noteTextEdit({ apiKey: e.target.value });
             }}
+            onBlur={handleTextBlur}
             placeholder="sk-..."
             className="h-8 w-44 shrink-0 font-mono text-xs"
+            // 关掉浏览器的自动大写 / 自动纠错 / 拼写检查（见该常量的说明）。
+            // API Key 是大小写敏感的随机串：被自动改成大写后**错一个字符且
+            // 用户完全看不出来**，表现就是所有者反馈的「明明粘贴对了却 401」。
+            {...SENSITIVE_STRING_INPUT_PROPS}
           />
         </Row>
         <Row>
@@ -3515,24 +3963,55 @@ export default function GatewayPage() {
           </div>
           <div className="flex shrink-0 items-center gap-2">
             <Switch checked={autoStart} onCheckedChange={(v) => void changeAutoStart(v)} />
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 gap-1.5 text-xs"
-              onClick={() =>
-                // 保存按钮只管文本字段（端口 / API Key）：
-                // 模式与自动启动是开关型，已在点击时即时保存，不在这里重复提交。
-                void run("save", async () => {
-                  dirtyRef.current = false;
-                  await api.saveGatewayConfig({ port, api_key: apiKey });
-                  toast.success("配置已保存");
-                })
-              }
-              disabled={busy !== null}
+            {/*
+              自动保存状态：这里原本是「保存」按钮。
+
+              去掉按钮之后**必须**把状态显示出来 —— 按钮本身就兼任「存没存」的
+              指示器（点一下就有反馈），取消了它又不补一个，用户就再也没有任何
+              线索判断刚才那次输入到底落盘没有，只能反复改动试探。
+
+              四种状态各有明确文案，且**不撒谎**：
+                - idle    空闲，只说明「改动会自动保存」这一模式（用户得知道
+                          按钮为什么不见了，否则会以为功能被删了）；
+                - pending 有改动、防抖等待中 —— 让用户看到"还没存"，
+                          而不是让他在这个窗口期误以为已经生效；
+                - saving  正在请求；
+                - saved   带**具体保存了什么**（如「端口 7863」），
+                          比光说「已保存」有用得多；
+                - error   失败原因原样透出，并提示会重试。
+            */}
+            <span
+              data-slot="gw-autosave-hint"
+              data-state={autoSave.kind}
+              className={cn(
+                "flex min-w-0 items-center gap-1 text-[11px]",
+                autoSave.kind === "error" ? "text-destructive" : "text-muted-foreground",
+              )}
+              aria-live="polite"
             >
-              {busy === "save" ? <Loader2 className="size-3.5 animate-spin" /> : <Save className="size-3.5" />}
-              保存
-            </Button>
+              {autoSave.kind === "saving" ? (
+                <>
+                  <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden="true" />
+                  保存中…
+                </>
+              ) : autoSave.kind === "pending" ? (
+                <>待保存…</>
+              ) : autoSave.kind === "saved" ? (
+                <>
+                  <Check className="size-3 shrink-0 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+                  <span className="truncate">已自动保存{autoSave.description ? `：${autoSave.description}` : ""}</span>
+                </>
+              ) : autoSave.kind === "error" ? (
+                <>
+                  <AlertTriangle className="size-3 shrink-0" aria-hidden="true" />
+                  <span className="truncate" title={autoSave.message}>
+                    保存失败，改动会在下次输入时重试：{autoSave.message}
+                  </span>
+                </>
+              ) : (
+                <>改动自动保存</>
+              )}
+            </span>
           </div>
         </Row>
         </Section>
@@ -4350,9 +4829,23 @@ ANTHROPIC_AUTH_TOKEN=${apiKey || "<你的 api_key>"}`}</code>
             ) : null}
           </div>
         ) : (
-          <p className="text-xs text-muted-foreground">
-            无法识别占用该端口的进程（可能需要管理员权限）。结束操作可能失败。
-          </p>
+          /*
+            查不到占用者时的提示。
+
+            原文案「无法识别占用该端口的进程（可能需要管理员权限）」被所有者反馈
+            为无从下手：它只说「可能没权限」，不告诉用户下一步做什么。现在改为
+            展示后端给出的**可复制执行**的排查命令（`killHint`）。
+
+            注意 `killHint` 由后端按自身所在系统生成，这里不做平台判断 —— 前端
+            的 UA 不一定代表后端所在的机器（WebUI 模式下尤其如此）。
+            旧版本宿主/网关没有该字段时退回一句通用提示，不硬编码命令。
+          */
+          <div className="space-y-1.5 text-xs text-muted-foreground">
+            <p>无法识别占用该端口的进程。可手动排查后结束它：</p>
+            <p className="break-all rounded-lg border bg-muted/40 px-3 py-2.5 font-mono text-[11px] leading-relaxed">
+              {killHint ?? "请在系统自带的进程/端口查看工具中确认占用该端口的进程，再手动结束它。"}
+            </p>
+          </div>
         )}
         {killHolder && !killHolder.ours ? (
           <p className="text-xs text-destructive">

@@ -1025,15 +1025,29 @@ fn extract_manual_uids(body: &Value) -> Vec<String> {
         .collect()
 }
 
-/// POST /api/gateway/config —— 保存网关配置。
-async fn api_save_gateway_config(Json(body): Json<Value>) -> Response {
-    // 前端 camelCase → 配置 snake_case。
-    //
-    // 必须逐个显式映射而不是「原样透传」：原样写下去会在配置文件里留下
-    // camelCase 键，而读取方（write_native_config / 前端 applyConfig）找的是
-    // snake_case —— 表现为「保存成功但值丢了」。
-    let mut body = body;
-    const ALIASES: &[(&str, &str)] = &[
+/// 前端 camelCase → 配置 snake_case（`POST /api/gateway/config` 的入参归一化）。
+///
+/// 必须逐个显式映射而不是「原样透传」：原样写下去会在配置文件里留下
+/// camelCase 键，而读取方（write_native_config / 前端 applyConfig）找的是
+/// snake_case —— 表现为「保存成功但值丢了」。
+///
+/// **这张表必须与 `src/lib/api.ts::saveGatewayConfig` 的转发键逐条对齐**：
+/// 那边把 snake_case 的配置字段显式改成 camelCase 再发给宿主（桌面版 Tauri
+/// 按 `rename_all = "camelCase"` 取值），WebUI 版收下同一份 camelCase JSON
+/// 后，就靠这里的表转回 snake_case。**表里漏一个键，那一个字段就静默丢失**
+/// 且保存接口照样返回 200。
+///
+/// 抽成独立函数是为了能单测：内联在 handler 里就只能起 HTTP 服务才验得到，
+/// 而这类「键名对不上」的缺陷恰恰是最容易漏测、后果又最隐蔽的一种
+///（保存看似成功，实际值从来没进过配置文件）。
+fn normalize_gateway_config_body(body: &Value) -> Value {
+    let mut body = body.clone();
+    let aliases: &[(&str, &str)] = &[
+        // ---- 与本轮「接口配置自动保存」直接相关：漏掉这两个键，
+        // 界面上会显示「已自动保存」，磁盘上却是空的（或残留一个无用的
+        // camelCase 键），用户重启网关后 API Key 归零、客户端全部 401。
+        ("apiKey", "api_key"),
+        ("autoStart", "auto_start"),
         ("pinnedUid", "pinned_uid"),
         ("manualUids", "manual_uids"),
         ("activityHours", "activity_hours"),
@@ -1045,17 +1059,27 @@ async fn api_save_gateway_config(Json(body): Json<Value>) -> Response {
         ("schoolEnabled", "school_enabled"),
         ("trialEnabled", "trial_enabled"),
         ("activityReportCount", "activity_report_count"),
+        // 自定义系统提示词：与 save_gateway_config 的 Tauri 版同一组字段，
+        // 漏掉会让 WebUI 用户「配了提示词却总被重置」。
+        ("promptMode", "prompt_mode"),
+        ("promptFile", "prompt_file"),
     ];
-    for (camel, snake) in ALIASES {
-        if let Some(v) = body.get(*camel).cloned() {
-            body[*snake] = v;
-            // 删掉 camelCase 键：否则它会被浅合并原样写进配置文件，
-            // 下次读取时既无用又会让人误以为配置生效了。
-            if let Some(map) = body.as_object_mut() {
+    for (camel, snake) in aliases {
+        if let Some(map) = body.as_object_mut() {
+            if let Some(v) = map.get(*camel).cloned() {
+                map.insert((*snake).to_string(), v);
+                // 删掉 camelCase 键：否则它会被浅合并原样写进配置文件，
+                // 下次读取时既无用又会让人误以为配置生效了。
                 map.remove(*camel);
             }
         }
     }
+    body
+}
+
+/// POST /api/gateway/config —— 保存网关配置。
+async fn api_save_gateway_config(Json(body): Json<Value>) -> Response {
+    let body = normalize_gateway_config_body(&body);
     match ai_gateway_core::modules::gateway::save_gateway_config(&body) {
         Ok(v) => json_ok(json!({ "config": v })),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
@@ -1210,14 +1234,22 @@ async fn api_gateway_port_check(Json(body): Json<Value>) -> Response {
 ///
 /// 与 port-check 的分工：port-check 在页面挂载/端口变化时就会被调用（热路径），
 /// 因此**不查进程**；本接口由用户主动点开「结束占用进程」对话框时才调用，
-/// 此时才值得付出 spawn netstat/tasklist/powershell 的开销。
+/// 此时才值得付出 spawn netstat/tasklist/powershell（macOS 上是 lsof）的开销。
+///
+/// 响应里的 `hint` 是「查不到占用者」时给用户的**可操作**排查命令（按服务端
+/// 所在系统生成）—— WebUI 模式下浏览器与网关可能不在同一台机器上，因此不能
+/// 由前端按 UA 猜平台。
 async fn api_gateway_port_holder(Json(body): Json<Value>) -> Response {
     let port = body.get("port").and_then(Value::as_u64).unwrap_or(0);
     if port == 0 || port > 65535 {
         return json_err("端口号需在 1-65535 之间".to_string(), StatusCode::BAD_REQUEST);
     }
     let holder = ai_gateway_core::modules::gateway::port_holder(port as u16);
-    json_ok(json!({ "port": port, "holder": holder.unwrap_or(Value::Null) }))
+    json_ok(json!({
+        "port": port,
+        "holder": holder.unwrap_or(Value::Null),
+        "hint": ai_gateway_core::modules::gateway::port_holder_manual_hint(port as u16),
+    }))
 }
 
 /// POST /api/gateway/port-kill —— 结束占用端口的进程，让本网关接管该端口。
@@ -1648,5 +1680,94 @@ mod update_config_body_tests {
             Some("http://127.0.0.1:1"),
             "config=null 时应回落整个 body（此时 body 自己就是配置）"
         );
+    }
+}
+
+/// `POST /api/gateway/config` 的 camelCase → snake_case 归一化。
+///
+/// 回归背景（本轮实测发现，且**真实存在过**）：
+/// ALIASES 表里漏了 `apiKey` / `autoStart` / `promptMode` / `promptFile`
+/// 四个键，而前端 `saveGatewayConfig` 一律发 camelCase。后果是 WebUI 模式下
+/// 保存 API Key **看似成功（HTTP 200）**，但配置文件里写进去的是一个没人读的
+/// `"apiKey"` 键，`api_key` 仍是空串 —— 重启网关后鉴权丢失，所有客户端 401。
+/// 桌面版（Tauri 按 `rename_all = "camelCase"` 取值）不受影响，因此这个缺陷
+/// 只在 WebUI 模式下出现，更难被发现。
+///
+/// ui 用例此前也没能拦住它：`uitest/mock-host-api.cjs` 自己实现了一套别名映射
+/// 且**包含了**这几个键，于是 mock 的"正确行为"把真实后端的缺陷整个盖住了。
+#[cfg(test)]
+mod gateway_config_body_tests {
+    use super::normalize_gateway_config_body;
+    use serde_json::json;
+
+    // 本轮的核心：API Key 必须落到 `api_key`，且 camelCase 键要被删掉。
+    #[test]
+    fn maps_api_key_and_auto_start() {
+        let out = normalize_gateway_config_body(&json!({"apiKey": "sk-x", "autoStart": true}));
+        assert_eq!(
+            out.get("api_key").and_then(|v| v.as_str()),
+            Some("sk-x"),
+            "apiKey 必须归一化成 api_key，实际: {out}"
+        );
+        assert_eq!(out.get("auto_start"), Some(&json!(true)));
+        assert!(
+            out.get("apiKey").is_none(),
+            "camelCase 键必须被删掉，否则会被原样写进配置文件: {out}"
+        );
+        assert!(out.get("autoStart").is_none());
+    }
+
+    // 「接口配置自动保存」发的就是这两个键的最小补丁：只传端口时不能顺带
+    // 塞进 api_key（那会把用户已有的 key 清成空串）。
+    #[test]
+    fn partial_patch_stays_partial() {
+        let out = normalize_gateway_config_body(&json!({ "port": 7868 }));
+        assert_eq!(out.get("port"), Some(&json!(7868)));
+        assert!(
+            out.get("api_key").is_none(),
+            "只改端口时不得凭空出现 api_key: {out}"
+        );
+    }
+
+    // 自定义提示词同样是 WebUI 下曾经丢失的字段。
+    #[test]
+    fn maps_prompt_fields() {
+        let out = normalize_gateway_config_body(
+            &json!({"promptMode": "custom", "promptFile": "C:/p.txt"}),
+        );
+        assert_eq!(
+            out.get("prompt_mode").and_then(|v| v.as_str()),
+            Some("custom")
+        );
+        assert_eq!(
+            out.get("prompt_file").and_then(|v| v.as_str()),
+            Some("C:/p.txt")
+        );
+        assert!(out.get("promptMode").is_none());
+    }
+
+    // snake_case 入参（旧前端 / 脚本 / curl）必须原样透传，不能被这次归一化改坏。
+    #[test]
+    fn snake_case_passes_through() {
+        let out = normalize_gateway_config_body(&json!({"api_key": "sk-y", "port": 7863}));
+        assert_eq!(out.get("api_key").and_then(|v| v.as_str()), Some("sk-y"));
+        assert_eq!(out.get("port"), Some(&json!(7863)));
+    }
+
+    // camelCase 与 snake_case 同时出现时，以 **camelCase（新前端）** 为准 ——
+    // 与「显式传入的界面意图优先于历史残留字段」一致。
+    #[test]
+    fn camel_case_wins_over_legacy_snake() {
+        let out = normalize_gateway_config_body(&json!({"apiKey": "new", "api_key": "old"}));
+        assert_eq!(out.get("api_key").and_then(|v| v.as_str()), Some("new"));
+    }
+
+    // 非对象入参不能让服务端 panic（真实请求可能是任意 JSON）。
+    #[test]
+    fn non_object_body_is_safe() {
+        for body in [json!(null), json!([]), json!("x"), json!(42)] {
+            let out = normalize_gateway_config_body(&body);
+            assert_eq!(out, body, "非对象应原样返回");
+        }
     }
 }

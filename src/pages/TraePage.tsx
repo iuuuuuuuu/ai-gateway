@@ -34,6 +34,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
+import { SENSITIVE_STRING_INPUT_PROPS } from "@/lib/sensitive-input";
 import type {
   AppEnvStatus,
   SnapshotItem,
@@ -724,10 +725,16 @@ export default function TraePage() {
                   onChange={(e) => setAddJwt(e.target.value)}
                   placeholder="Cloud-IDE-JWT eyJ..."
                   className="font-mono text-xs"
+                  // JWT 是 Base64 大小写敏感的随机串：被浏览器自动大写/纠错后
+                  // 解析出的账号 id 会变，而用户看不出是哪一位被改了。
+                  {...SENSITIVE_STRING_INPUT_PROPS}
                 />
               </div>
               <div className="space-y-1.5">
                 <Label htmlFor="trae-name">备注名（可选）</Label>
+                {/* 备注名是**人类语言**（「主号」「公司号」），刻意**不**套
+                    SENSITIVE_STRING_INPUT_PROPS：关掉自动大写会让移动端写
+                    中文/英文句子时更难用，而这里改错大小写用户一眼能看出来。 */}
                 <Input
                   id="trae-name"
                   value={addName}
@@ -743,6 +750,8 @@ export default function TraePage() {
                   onChange={(e) => setAddRefresh(e.target.value)}
                   placeholder="填写后可自动续期"
                   className="font-mono text-xs"
+                  // 同为大小写敏感的机器串，理由同上。
+                  {...SENSITIVE_STRING_INPUT_PROPS}
                 />
               </div>
             </div>

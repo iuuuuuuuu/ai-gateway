@@ -35,6 +35,7 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
+import { SENSITIVE_STRING_INPUT_PROPS } from "@/lib/sensitive-input";
 import type { AppEnvStatus, DoubaoAccountView, DoubaoQuotaView } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -712,11 +713,17 @@ export default function DoubaoPage() {
                   disabled={!isNew}
                   placeholder="豆包 user_id"
                   className="font-mono text-xs"
+                  // user_id 是**机器标识**（数字/随机串），不是人名 ——
+                  // 它同时是凭证文件的文件名（见 ensure_uid_safe），
+                  // 被自动大写后写入的路径都会跟着变，而用户看不出来。
+                  {...SENSITIVE_STRING_INPUT_PROPS}
                 />
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div className="space-y-1.5">
                   <Label htmlFor="db-name">显示名</Label>
+                  {/* 显示名与备注是**人类语言**，刻意不套该常量（理由见其注释：
+                      关掉自动大写会让移动端输入变难，而这里改错大小写看得见）。 */}
                   <Input
                     id="db-name"
                     value={editName}
@@ -748,6 +755,7 @@ export default function DoubaoPage() {
                   value={editSession}
                   onChange={(e) => setEditSession(e.target.value)}
                   className="font-mono text-xs"
+                  {...SENSITIVE_STRING_INPUT_PROPS}
                 />
               </div>
               <div className="space-y-1.5">
@@ -757,6 +765,7 @@ export default function DoubaoPage() {
                   value={editGuard}
                   onChange={(e) => setEditGuard(e.target.value)}
                   className="font-mono text-xs"
+                  {...SENSITIVE_STRING_INPUT_PROPS}
                 />
               </div>
               <div className="space-y-1.5">
@@ -766,6 +775,9 @@ export default function DoubaoPage() {
                   value={editTtwid}
                   onChange={(e) => setEditTtwid(e.target.value)}
                   className="font-mono text-xs"
+                  // 会话凭证（sessionid / sid_guard / ttwid）：大小写敏感的
+                  // 机器串，被自动大写后服务端直接判定为无效凭证。
+                  {...SENSITIVE_STRING_INPUT_PROPS}
                 />
                 <p className="text-xs text-muted-foreground">导出对话需要 ttwid。</p>
               </div>

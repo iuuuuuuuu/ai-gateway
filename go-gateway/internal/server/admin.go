@@ -48,6 +48,18 @@ func (h *Handler) modelsRegions(w http.ResponseWriter, r *http.Request) {
 				"supportsImages": effective,
 				"context_length": mi.ContextWindow,
 				"max_tokens":     mi.MaxTokens,
+				// 上游声明的**计费倍率**（credit_multiplier）：0 = 免费、>0 = 计费、
+				// null = 上游未声明该字段（**不是免费**）。
+				//
+				// 这是宿主判断「这个账号调这个模型该不该扣分」的**唯一权威依据**：
+				// 宿主不自己硬编码免费清单，而是读这里按区域给出的上游真值。
+				// 之所以必须按区域暴露：同名模型两区计费不同（实测
+				// deepseek-v4.1-flash 国服 x0.03 / 国际版 x0.00），
+				// 合并成一份全局清单必然在其中一侧出错。
+				"credit_multiplier": mi.CreditMultiplier,
+				// 上游原文（如 "x0.00" / "x0.34 credits" / ""），便于人工核对
+				// 「倍率是不是解析错了」。解析后与原文并列展示，排查时不必再拉上游。
+				"credits_raw": mi.CreditsRaw,
 			}
 			// 上游说的与网关实际用的不一致时，把上游原话也列出来。
 			// 这正是本次缺陷的核心：上游对国际版 glm-5.x 报 true，实测 false。

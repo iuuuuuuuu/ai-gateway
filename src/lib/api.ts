@@ -30,7 +30,7 @@ import type {
   GatewayStartResult,
   GatewayStatus,
   GatewayPortCheck,
-  GatewayPortHolder,
+  GatewayPortHolderResult,
   GatewaySyncResult,
   GatewayTaskName,
   GrowthTaskResult,
@@ -889,11 +889,12 @@ export function killGatewayPortHolder(
  *
  * 与 checkGatewayPort 的分工：后者在页面挂载/端口变化时就会调用（热路径），
  * 因此**不查进程**；本函数只在用户点开对话框时调用，那时才值得付出
- * spawn netstat/tasklist/powershell 的开销。
+ * spawn netstat/tasklist/powershell（macOS 上是 lsof）的开销。
+ *
+ * 返回值里的 `hint` 是「查不到占用者」时的可操作排查命令，由后端按自身
+ * 所在系统生成 —— 前端直接展示即可，不要自己拼平台相关的命令。
  */
-export function getGatewayPortHolder(
-  port: number,
-): Promise<{ port: number; holder: GatewayPortHolder | null }> {
+export function getGatewayPortHolder(port: number): Promise<GatewayPortHolderResult> {
   return call("get_gateway_port_holder", { port });
 }
 

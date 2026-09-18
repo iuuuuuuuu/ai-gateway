@@ -210,6 +210,21 @@ type regionCapability struct {
 	// 与 Efforts 正交：Efforts 答「允许哪些」，本字段答「不指定时用哪档」。
 	// 上游未保证默认档一定在 Efforts 里，故两者分别保存、分别下发。
 	DefaultEffort string
+	// CreditMultiplier 该区域上游声明的**计费倍率**（nil = 未声明）。
+	//
+	// 为什么按区域存而不是按模型名存：同名模型在两区可能是不同的后端、
+	// 计费也不同。实测（2026-09-18 拉两区 /v3/config）：
+	//
+	//	deepseek-v4.1-flash   国服 "x0.03"（计费）   国际版 "x0.00"（免费）
+	//
+	// 把两区合并成一份「全局免费清单」会让国服的 ds4.1 被误判成免费，
+	// 或者反过来让国际版的被误判成计费 —— 两个方向都是「统计与实际不符」，
+	// 正是所有者报的那个问题。故这里有区域维度的桶是必需的。
+	//
+	// 三态语义与 SupportsImages 一致：nil = 未声明（**不是**免费）。
+	// 上游只给部分模型写该字段（实测国服 52 个里只有 33 个），
+	// 把未声明当免费会把该计费的统计成 0。
+	CreditMultiplier *float64
 }
 
 // capabilityIndex 按区域索引的模型能力表。
@@ -267,6 +282,10 @@ func (h *Handler) buildCapabilityIndex() *capabilityIndex {
 				//（手抄表里没有 reasoning 信息，编一个会让客户端调了没生效）。
 				Efforts:       mi.Efforts,
 				DefaultEffort: mi.DefaultEffort,
+				// 计费倍率：动态路径透传上游真值；静态兜底表**不编造**
+				//（手抄表里没有 credits，且 infosFromStatic 造不出倍率）。
+				// 未声明保持 nil，由消费方显示「不知道」而不是「免费」。
+				CreditMultiplier: mi.CreditMultiplier,
 			}
 		}
 	}

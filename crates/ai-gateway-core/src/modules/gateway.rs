@@ -15,6 +15,7 @@
 //!     expiresAt 较新者胜出的规则合并回来（见 `sync_auth_to_accounts`）。
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1210,7 +1211,11 @@ fn is_our_process(name: &str, path: &str) -> bool {
         || n == "wb-switch-rust.exe"
         || p.contains("ai-gateway")
         || p.contains("wb-switch")
+        // 落地目录 ~/.wb-switch/gateway/bin/：Windows 用 `\`、macOS/Linux 用 `/`，
+        // 两种分隔符都要认（只认 `\` 会让 macOS 上「是不是自己的进程」判错，
+        // 进而给出错误的警告措辞）。
         || p.contains("gateway\\bin\\")
+        || p.contains("gateway/bin/")
 }
 
 /// 查询占用指定端口的进程，返回其 JSON 描述。
@@ -1218,7 +1223,8 @@ fn is_our_process(name: &str, path: &str) -> bool {
 /// 返回 None 表示「查不到」：可能是端口其实空闲、进程已退出、或权限不足。
 /// 调用方应把 None 当作「无法提供占用者信息」，而不是「没有占用」。
 ///
-/// **慎用**：本函数会 spawn netstat + tasklist + powershell 三个控制台进程，
+/// **慎用**：本函数要 spawn 子进程才能查到占用者 —— Windows 是
+/// netstat + tasklist + powershell 三个控制台进程，macOS 是 lsof（取路径时要两次）。
 /// 开销是毫秒到秒级。不要在轮询或页面挂载路径上调用（见 `inspect_port` 的说明）。
 /// 目前只在「用户确认要结束占用进程」这条按需路径上使用。
 #[allow(dead_code)]
@@ -1239,6 +1245,8 @@ pub fn port_holder(port: u16) -> Option<Value> {
 ///   2. 不允许杀死当前进程自己（自杀会让调用方拿不到返回值）；
 ///   3. 不允许杀死本程序启动的网关 —— 那种情况应走「停止网关」，
 ///      直接杀掉会让宿主与网关的状态不一致。
+///   4. 不允许杀死系统启动进程（PID 1，仅非 Windows：macOS 上是 launchd）——
+///      见 `forbidden_kill_reason`。
 ///
 /// 不限制「只能杀自己人」：用户明确要求「把占用端口的进程杀死」，
 /// 第三方进程（如误开的其他服务）也是合法目标，但前端会给出更强的警告。
@@ -1250,13 +1258,17 @@ pub fn kill_port_holder(port: u16) -> Result<Value, String> {
         return Err(format!("端口 {port} 当前空闲，无需清理"));
     }
     let Some((pid, name, _path)) = find_port_holder(port) else {
+        // 关键：这里必须**明确失败**，不能让前端以为清理成功了 ——
+        // 端口确实被占用（上面 port_free 已确认），但我们没能力指出是谁。
+        // 因此错误里要带一条可操作的排查命令，而不是笼统的「可能需要管理员权限」。
         return Err(format!(
-            "端口 {port} 被占用，但无法识别占用进程（可能需要管理员权限）"
+            "端口 {port} 被占用，但无法识别占用进程。{}",
+            port_holder_manual_hint(port)
         ));
     };
 
-    if pid == std::process::id() {
-        return Err("占用该端口的是本程序自身，请改用「停止网关」".to_string());
+    if let Some(reason) = forbidden_kill_reason(pid) {
+        return Err(reason.to_string());
     }
     let lower = name.to_ascii_lowercase();
     if is_running() && lower.starts_with("gateway-") {
@@ -1285,7 +1297,7 @@ pub fn kill_port_holder(port: u16) -> Result<Value, String> {
 /// 查找占用端口的进程：返回 (pid, 进程名, 可执行文件路径)。
 ///
 /// Windows 用 `netstat -ano` 找 PID，再用 `tasklist` 换进程名、`powershell` 取路径。
-/// 其它平台暂不支持（返回 None），前端会退化为「无法识别占用者」的提示。
+/// 非 Windows（macOS/Linux）用 `lsof -Fpcn`，见下方同名函数的实现。
 ///
 /// **必须走 `process::run_cmd_timeout` 而不是裸 `Command::output()`**：
 ///  1. 它带 `CREATE_NO_WINDOW`。裸 spawn 控制台程序会闪出 cmd 黑窗口
@@ -1369,11 +1381,393 @@ fn find_port_pid(port: u16) -> Option<u32> {
     None
 }
 
-#[cfg(not(windows))]
-fn find_port_holder(_port: u16) -> Option<(u32, String, String)> {
-    // 非 Windows 平台暂不实现：前端会提示「无法识别占用进程」，
-    // 用户仍可手动处理。留出接口便于后续按平台补 lsof/ss 实现。
+// ---------------------------------------------------------------------------
+// 非 Windows 的占用者查询：`lsof -F` 字段输出（当前主要服务于 macOS）
+// ---------------------------------------------------------------------------
+//
+// 为什么是 lsof：macOS 既没有 /proc（Linux 那套）、也没有 Get-NetTCPConnection
+// （Windows 那套），「进程 ↔ 端口」的权威映射只有 lsof 提供，而它是 macOS 自带的
+// （/usr/sbin/lsof），不需要用户额外安装任何东西。
+//
+// 为什么解析 `-F` 字段输出而不是人类可读的表格：
+//   1. 表格的列宽是 lsof 每次运行**动态算出来的**，只保证列间「至少一个空格」，
+//      按空格切分本身就脆；
+//   2. COMMAND 列默认只取前 9 个字符（`+c` 可调），长进程名会被截断；
+//   3. 表格是给人看的，措辞随 lsof 版本变化；而 `-F` 是手册里明文承诺给
+//      「另一个程序」处理的稳定接口（见 lsof(8) 的 OUTPUT FOR OTHER PROGRAMS）。
+//
+// 用到的字段标识（本文件只取三个）：
+//   `p` = 进程 ID   —— 每个「进程集」的第一行，lsof **恒定输出**
+//   `c` = 命令名     —— 内核里保存的全部字符，不受列宽影响
+//   `n` = 文件名 / Internet 地址
+//
+// ⚠ `-F` 的取值是**可选参数**，手册专门警告过歧义（`-Fn` 可能被读成 `-F` + `-n`）：
+// 所以字段列表**必须与 `-F` 连写**（写成 `-Fpcn`），不能拆成 `-F` `pcn` 两个参数
+// —— 拆开后 `pcn` 会被当成「要搜索的文件名」；同时它必须放在参数列表**末尾**，
+// 后面不能再跟别的选项。
+// ---------------------------------------------------------------------------
+
+/// 解析 `lsof -nP -iTCP:<port> -sTCP:LISTEN -Fpcn` 的字段输出。
+///
+/// 返回每个进程集的 `(pid, 命令名)`，按 lsof 的输出顺序，按 pid 去重。
+///
+/// 为什么返回 `Vec` 而不是 `Option`：SO_REUSEPORT 下**同一端口确实可能被多个
+/// 进程同时监听**，「占用者」在那种场景下不是单数。调用方取第一个（与 Windows
+/// 分支语义一致：`netstat -ano` 对同一端口同样只给出一行）。
+///
+/// 字段行格式：行首一个字符是字段标识，其余到行尾是内容（字段以 NL 结尾）。
+/// 进程集以 `p` 开头 —— 因此在见到 `p` 之前出现的字段一律忽略：正常不会出现，
+/// 但这样写可以容忍 lsof 的版本差异而不至于把字段错配到别的进程上。
+///
+/// 命令名为空的进程集会被丢弃：没有名字就无法给用户任何可读提示，而且会让
+/// `kill_port_holder` 里「本程序启动的网关不许杀」那道**按名字判断**的防线
+/// 静默失效 —— 宁可报「无法识别」让用户手动处理，也不要盲杀。
+#[cfg(any(not(windows), test))]
+fn parse_lsof_listener_fields(stdout: &str) -> Vec<(u32, String)> {
+    let mut out: Vec<(u32, String)> = Vec::new();
+    let mut cur: Option<(u32, String)> = None;
+
+    for line in stdout.lines() {
+        let mut chars = line.chars();
+        let Some(tag) = chars.next() else { continue };
+        let value = chars.as_str().trim();
+        match tag {
+            // 新的进程集开始：先把上一个收尾
+            'p' => {
+                if let Some(h) = cur.take() {
+                    push_holder_unique(&mut out, h);
+                }
+                // pid 0 一律不收：unix 上 `kill -9 0` 的语义是「给调用者所在的
+                // **整个进程组**发信号」，一旦流到 terminate_process 就是事故。
+                if let Ok(pid) = value.parse::<u32>() {
+                    if pid > 0 {
+                        cur = Some((pid, String::new()));
+                    }
+                }
+            }
+            'c' => {
+                if let Some((_, name)) = cur.as_mut() {
+                    if name.is_empty() {
+                        *name = value.to_string();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(h) = cur.take() {
+        push_holder_unique(&mut out, h);
+    }
+    out.retain(|(_, name)| !name.is_empty());
+    out
+}
+
+/// 按 pid 去重追加（同一进程可能有 IPv4/IPv6 两个监听套接字 → 多个进程集）。
+#[cfg(any(not(windows), test))]
+fn push_holder_unique(out: &mut Vec<(u32, String)>, holder: (u32, String)) {
+    if !out.iter().any(|(p, _)| *p == holder.0) {
+        out.push(holder);
+    }
+}
+
+/// 从 `lsof -a -p <pid> -d txt -Fn` 的字段输出里取出可执行文件路径。
+///
+/// 只看 `ftxt` 之后的第一个 `n`：`f` 开启一个新的「文件集」，`n` 是它的名字。
+/// 不做「取最后一个 n」之类的猜测 —— `-d txt` 只选进程映像这一个 fd。
+#[cfg(any(not(windows), test))]
+fn parse_lsof_txt_path(stdout: &str) -> Option<String> {
+    let mut in_txt = false;
+    for line in stdout.lines() {
+        let mut chars = line.chars();
+        let Some(tag) = chars.next() else { continue };
+        let value = chars.as_str().trim();
+        match tag {
+            'p' => in_txt = false,
+            'f' => in_txt = value == "txt",
+            'n' if in_txt => {
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
     None
+}
+
+/// lsof 的候选路径（按顺序尝试）。
+///
+/// 为什么要写绝对路径回退：从 Finder 启动的 macOS .app 继承的是 launchd 给的
+/// 最小 PATH（`/usr/bin:/bin:/usr/sbin:/sbin`），而 lsof 装在 **`/usr/sbin`**。
+/// 默认 PATH 下能命中，但用户若通过 `open`/自建启动器改了 PATH，裸名 `lsof`
+/// 就会 `No such file or directory` —— 那种失败会伪装成「端口没人占用」，
+/// 极难排查。先用裸名（尊重用户 PATH，也兼容 Linux 的 /usr/bin），
+/// 再按绝对路径兜底。
+#[cfg(any(not(windows), test))]
+const LSOF_CANDIDATES: [&str; 3] = ["lsof", "/usr/sbin/lsof", "/usr/bin/lsof"];
+
+/// 定位监听者的 lsof 参数（纯函数，便于单测断言参数本身）。
+///
+/// ⚠ `-Fpcn` 必须**连写**且置于**末尾**：`-F` 的取值是可选参数，手册专门警告过
+/// 歧义 —— 拆成 `-F` `pcn` 两个参数时，`pcn` 会被当成「要搜索的文件名」。
+///
+/// `-sTCP:LISTEN` 与 Windows 分支 `find_port_pid` 只认 `LISTENING` 同理：
+/// 不加这个过滤，本机某个**客户端连接**的临时端口恰好等于目标端口时，
+/// 会把它误判成占用者，让用户去杀一个完全无关的进程。
+#[cfg(any(not(windows), test))]
+fn lsof_listener_args(port: u16) -> Vec<String> {
+    vec![
+        "-nP".to_string(),
+        format!("-iTCP:{port}"),
+        "-sTCP:LISTEN".to_string(),
+        "-Fpcn".to_string(),
+    ]
+}
+
+/// 取进程映像路径的 lsof 参数（纯函数）。
+///
+/// `-a` 把 `-p` 与 `-d txt` 两个选择集**与**起来 —— 不加 `-a` 时 lsof 默认是
+/// **或**，会把全系统所有进程的 txt 都列出来。`txt` 是进程映像本身，
+/// 语义等价于 Windows 分支的 `Get-Process .Path`。
+#[cfg(any(not(windows), test))]
+fn lsof_txt_args(pid: u32) -> Vec<String> {
+    vec![
+        "-a".to_string(),
+        "-p".to_string(),
+        pid.to_string(),
+        "-d".to_string(),
+        "txt".to_string(),
+        "-Fn".to_string(),
+    ]
+}
+
+/// 依次尝试 lsof 候选路径，返回**第一个成功 spawn** 的结果。
+///
+/// 只把「spawn 失败」（程序不存在）当作「换下一个候选」的理由；
+/// 拿到了输出就立刻返回，**不看退出码** —— lsof 在「没匹配到任何文件」时
+/// 退出码是 1，那是正常结果而非错误（见 `find_port_holder_with` 的处理）。
+#[cfg(not(windows))]
+fn run_lsof(args: &[&str], timeout_secs: u64) -> Option<std::process::Output> {
+    use crate::modules::process::run_cmd_timeout;
+
+    for cand in LSOF_CANDIDATES {
+        if let Some(out) = run_cmd_timeout(cand, args, timeout_secs) {
+            return Some(out);
+        }
+    }
+    // 所有候选都不可用（未安装 / 全部超时）：记日志后返回 None，
+    // 让调用方走「无法识别占用进程」的可操作提示分支。
+    eprintln!("[gateway] 未找到可用的 lsof（尝试过: {}）", LSOF_CANDIDATES.join(", "));
+    None
+}
+
+/// 占用者查询的**全部决策逻辑**，命令执行通过 `run` 注入。
+///
+/// 为什么要把执行器抽成参数：本机是 Windows，**跑不了真实的 lsof**，
+/// 而交叉编译 macOS 目标又被 C 依赖（ring / libsqlite3-sys 需要 Apple 的 cc）
+/// 挡住。把「跑命令」注入进来后，这套逻辑在 Windows 上也能被真实执行、
+/// 真实断言 —— 覆盖「找到占用者 / 端口空闲 / lsof 不存在 / 输出是垃圾 /
+/// 权限报错 / 多个监听者」全部分支，而不是只做静态推演。
+///
+/// 生产路径传 `run_lsof`，行为与直接调用完全一致。
+#[cfg(any(not(windows), test))]
+fn find_port_holder_with<F>(port: u16, run: F) -> Option<(u32, String, String)>
+where
+    F: Fn(&[&str], u64) -> Option<std::process::Output>,
+{
+    // 端口 0 无意义（`-iTCP:0` 会匹配一堆临时端口）。kill_port_holder 已经挡了
+    // 一层，这里再挡一层是因为本函数也被 port_holder 单独调用。
+    if port == 0 {
+        return None;
+    }
+
+    let listener_args = lsof_listener_args(port);
+    let listener_refs: Vec<&str> = listener_args.iter().map(String::as_str).collect();
+    let out = run(&listener_refs, 8)?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let holders = parse_lsof_listener_fields(&stdout);
+    if holders.is_empty() {
+        // 空结果**不等于**出错：端口没人监听时 lsof 就是一个字段都不输出。
+        // 但如果 lsof 确实报了错（权限不足 / 用法不对），把 stderr 记下来 ——
+        // 否则线上排查「为什么查不到」时完全无从下手。
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let err = err.trim();
+            if !err.is_empty() {
+                eprintln!("[gateway] lsof 未能识别端口 {port} 的占用者: {err}");
+            }
+        }
+        return None;
+    }
+
+    // SO_REUSEPORT 下可能有多个监听者：取第一个与 Windows 分支语义一致，
+    // 但把「不止一个」写进日志 —— 杀掉其中一个后端口通常仍被其余的占用，
+    // kill_port_holder 的等待循环会失败并如实报「仍被占用」，日志是唯一线索。
+    if holders.len() > 1 {
+        let pids: Vec<String> = holders.iter().map(|(p, _)| p.to_string()).collect();
+        eprintln!(
+            "[gateway] 端口 {port} 有多个监听进程 ({}), 按第一个处理",
+            pids.join(", ")
+        );
+    }
+    let (pid, lsof_name) = holders.into_iter().next()?;
+
+    // 路径取不到不影响主流程（与 Windows 分支一致：那里 powershell 取路径失败
+    // 时同样留空），所以失败时留空而不是整条失败。
+    let txt_args = lsof_txt_args(pid);
+    let txt_refs: Vec<&str> = txt_args.iter().map(String::as_str).collect();
+    let path = run(&txt_refs, 8)
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .and_then(|s| parse_lsof_txt_path(&s))
+        .unwrap_or_default();
+
+    // 进程名优先取路径的文件名：lsof 的 `c` 字段受内核 MAXCOMLEN 限制
+    //（macOS 约 16 字符），长名字会被截断成一个看不懂的前缀；而 Windows 分支的
+    // tasklist 给的是完整映像名。用 basename 才能让两个平台的提示口径一致。
+    let name = path
+        .rsplit(['/', '\\'])
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(lsof_name);
+    if name.is_empty() {
+        return None;
+    }
+
+    Some((pid, name, path))
+}
+
+/// 非 Windows 的占用者查询（生产入口）。
+///
+/// 真正跑两条 lsof：
+///   1. `-nP -iTCP:<port> -sTCP:LISTEN -Fpcn` 定位监听者（pid + 命令名）；
+///   2. `-a -p <pid> -d txt -Fn` 取可执行文件路径。
+///
+/// 决策逻辑全在 `find_port_holder_with` 里（执行器可注入，因此那套逻辑在本机
+/// Windows 上也有真实单测覆盖）；这里只负责把生产用的 `run_lsof` 传进去。
+///
+/// 返回 None 的三种情况（调用方据此提示「无法识别」，而**不是**「端口空闲」）：
+///   * 没有监听者（端口空闲，或进/出 TIME_WAIT 的残留）；
+///   * lsof 不可用（未安装 / 被 PATH 挡掉）或超时；
+///   * 输出非预期（版本差异、命令名缺失）。
+/// 三种都只返回 None 并记日志，绝不 panic —— 查不到占用者只应让 UI 降级提示，
+/// 不该让整条命令失败。
+#[cfg(not(windows))]
+fn find_port_holder(port: u16) -> Option<(u32, String, String)> {
+    find_port_holder_with(port, run_lsof)
+}
+
+/// 「绝不杀」的目标 → 拒绝原因。返回 `Some` 表示必须拒绝。
+///
+/// 抽成纯函数是为了让这些判断能被单测覆盖：真实目标（本进程自己、PID 1）没法在
+/// 单测里造出来，而这里一旦写错就是系统级事故。
+fn forbidden_kill_reason(pid: u32) -> Option<&'static str> {
+    if pid == std::process::id() {
+        return Some("占用该端口的是本程序自身，请改用「停止网关」");
+    }
+    // PID 1 在 macOS 是 launchd、在 Linux 是 init/systemd：`kill -9 1` 会让系统
+    // 重启或直接 panic。Windows 没有对应物，故这条只在非 Windows 生效。
+    #[cfg(not(windows))]
+    if pid == 1 {
+        return Some("占用该端口的是系统启动进程 (PID 1)，结束它会导致系统重启，已拒绝");
+    }
+    None
+}
+
+/// 提示文案所针对的平台。
+///
+/// 抽成枚举（而不是直接用 `#[cfg]` 分支）是为了让**每个平台的文案都能被单测
+/// 断言** —— 本机是 Windows，macOS 分支的代码根本不会被编译进去，只靠肉眼看
+/// 字符串是验证不了「命令拼得对不对」的。有了这个枚举，macOS 的提示可以在
+/// Windows 上真实断言。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HintPlatform {
+    Macos,
+    Linux,
+    Windows,
+    Other,
+}
+
+impl HintPlatform {
+    /// 当前编译目标对应的平台。
+    ///
+    /// 写成 `const fn` 是为了让步态能在**编译期**被断言（见
+    /// `HintPlatform::current()` 的 target 断言测试）—— 选中错误的变体会让
+    /// macOS 用户看到 Windows 的命令，而这在 Windows 本机是跑不出来的。
+    const fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            HintPlatform::Macos
+        } else if cfg!(target_os = "linux") {
+            HintPlatform::Linux
+        } else if cfg!(windows) {
+            HintPlatform::Windows
+        } else {
+            HintPlatform::Other
+        }
+    }
+}
+
+/// 按平台生成「查不到占用者」的**可操作**提示（纯函数，可测）。
+///
+/// 刻意不写「可能需要管理员权限」这种笼统话术：用户看到它也不知道下一步做什么。
+/// 这里给的是可以原样复制到终端执行的命令。
+fn hint_for_platform(platform: HintPlatform, port: u16) -> String {
+    match platform {
+        // macOS：lsof 自带于 /usr/sbin，无需安装；查别的用户的进程才需要 sudo。
+        HintPlatform::Macos => format!(
+            "可在「终端」执行 `sudo lsof -nP -iTCP:{port} -sTCP:LISTEN` 查看占用进程\
+             （会要求输入开机密码），再用 `sudo kill -9 <上一步看到的 PID>` 结束它"
+        ),
+        HintPlatform::Linux => format!(
+            "可在终端执行 `sudo lsof -nP -iTCP:{port} -sTCP:LISTEN`（未安装 lsof 时改用 \
+             `sudo ss -ltnp`）查看占用进程，再用 `sudo kill -9 <PID>` 结束它"
+        ),
+        HintPlatform::Windows => format!(
+            "可用管理员身份打开 PowerShell，执行 \
+             `Get-NetTCPConnection -LocalPort {port} -State Listen` 查看占用进程，\
+             再用 `Stop-Process -Id <PID> -Force` 结束它"
+        ),
+        // 其它 unix（FreeBSD 等）：lsof 语义相同，但不保证装了，措辞保守一些。
+        HintPlatform::Other => format!(
+            "可在终端执行 `lsof -nP -iTCP:{port} -sTCP:LISTEN` 查看占用进程，\
+             再用 `kill -9 <PID>` 结束它"
+        ),
+    }
+}
+
+/// 「查不到占用者」时给用户的**可操作**排查提示。
+///
+/// 为什么由后端给、而不是前端按 UA 猜：真正决定「能不能查到、要不要加权限」的是
+/// **后端进程所在的系统**，不是浏览器 UA（WebUI 模式下两者甚至可能不是同一台机器）。
+pub fn port_holder_manual_hint(port: u16) -> String {
+    hint_for_platform(HintPlatform::current(), port)
+}
+
+/// 把 `kill` 失败时的 stderr 映射为给用户的错误。
+///
+/// 抽成纯函数以便单测覆盖各分支（尤其 EPERM —— 那是唯一能给出**明确下一步**的
+/// 失败：目标属于别的用户/root，GUI 自己提不了权，只能让用户手动 sudo）。
+///
+/// macOS/Linux 的 `kill` 在权限不足时写的是 `kill: <pid>: Operation not permitted`
+/// 或 `Operation not permitted`；不同 BSD 变体措辞略有差异，故做子串匹配。
+///
+/// `allow(dead_code)`：生产路径上只有非 Windows 的 `terminate_process` 调它，
+/// 但它的单测在**所有平台**都要跑（Windows 上正是靠这些用例才能验证 macOS
+/// 的错误映射写对了）。因此单元测试构建下它必须是活的，普通 Windows 构建下
+/// 会是死代码 —— 两者都合理，用 allow 明确表达，而不是删掉测试或加无意义的引用。
+#[cfg_attr(windows, allow(dead_code))]
+fn kill_failure_message(pid: u32, stderr: &str) -> String {
+    let msg = stderr.trim();
+    if msg.is_empty() {
+        return format!("结束进程 {pid} 失败（kill 未返回原因）");
+    }
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("not permitted") || lower.contains("operation not permitted") {
+        return format!("结束进程 {pid} 失败：权限不足。请在「终端」执行 `sudo kill -9 {pid}`");
+    }
+    format!("结束进程 {pid} 失败: {msg}")
 }
 
 /// 强制结束进程。
@@ -1394,18 +1788,26 @@ fn terminate_process(pid: u32) -> Result<(), String> {
     })
 }
 
+/// 强制结束进程（非 Windows：`kill -9`）。
+///
+/// 与 Windows 分支同样走 `run_cmd_timeout`：裸 `Command::output()` 没有超时，
+/// 一旦 `kill` 卡住（例如目标处于不可中断睡眠 D 状态）调用方会永久挂起。
+/// 同时它把 stderr 读出来 —— 权限不足时 `kill` 会在 stderr 写
+/// `Operation not permitted`，那正是「要不要 sudo」的唯一判据，
+/// 丢掉它就只剩一句无从下手的「可能需要权限」。
 #[cfg(not(windows))]
 fn terminate_process(pid: u32) -> Result<(), String> {
-    use std::process::Command;
-    let out = Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .output()
-        .map_err(|e| format!("调用 kill 失败: {e}"))?;
+    use crate::modules::process::run_cmd_timeout;
+
+    let out = run_cmd_timeout("kill", &["-9", &pid.to_string()], 10)
+        .ok_or_else(|| format!("调用 kill 失败或超时（PID {pid}）"))?;
     if out.status.success() {
-        Ok(())
-    } else {
-        Err(format!("结束进程 {pid} 失败（可能需要权限）"))
+        return Ok(());
     }
+    Err(kill_failure_message(
+        pid,
+        &String::from_utf8_lossy(&out.stderr),
+    ))
 }
 
 /// 出站代理地址：复用「设置 → 更新代理」里已填的值（`github_config.json` 的 `proxy`）。
@@ -1982,6 +2384,88 @@ fn pinned_account_option(acc: &Value) -> Option<Value> {
     }))
 }
 
+/// 把宿主账号库里的**备注**合并进网关 `/status` 的账号池快照。
+///
+/// 缺陷背景（所有者反馈：「兼容网关，已备注的账号 却不会显示备注」）：
+/// 账号池每行的名字原本取 `nickname || uid`，而**备注只存宿主侧账号库**
+///（`~/.wb-switch/accounts.json` 的 `note`），从不随凭证下发，于是用户填的备注
+/// 在账号池里完全不可见 —— 上游昵称对国服账号常为空，回退成 uid 就只剩一串
+/// 随机字符，用户对不上「这是谁的号」。界面上其它地方（指定账号勾选列表、
+/// 用量列表）早已统一为 **备注 → 昵称 → uid 前缀**，账号池是最后一处漏网的。
+///
+/// ## 为什么在宿主侧合并（方案乙），而不是把备注导出给网关（方案甲）
+///
+/// 三条各自都足以否决方案甲：
+///
+///   1. **凭证文件会被网关自己抹掉。** 网关刷新 token 时走 `auth.SaveAtomic`，
+///      它按**固定字段表**重写整个凭证文件（auth / account / credit），
+///      备注不在表里。也就是说导出过去的 `note` 会在第一次保活或 token 刷新后
+///      无声消失 —— 表现为「备注显示一阵子又没了」。网关为 `credit` 踩过同一个坑，
+///      已在那边显式保留并注释说明；再加一个纯展示字段只会复制这个坑。
+///
+///   2. **改了也不会立刻生效，还要重启网关。** 网关的账号池是**启动时**扫描
+///      凭证目录建立的（见 `switch_mode` 的说明），`/status` 反映的是那一刻的
+///      内存快照。更糟的是 `accounts_fingerprint()` 刻意只包含
+///      uid / token 尾部 / expiresAt / needs_relogin —— 改备注不会让指纹变化，
+///      于是 `sync_if_changed()` 返回 false，**既不会重导凭证、也不会重启网关**，
+///      备注永远不会出现在池里，除非用户碰巧因别的原因重启。若把 note 计入指纹
+///      来强制重启，则每次改备注都会 `stop_gateway()` —— 那会**切断在途请求**，
+///      而这正是 `TASK_BUSY_COUNT` / `decide_sync_action` 一整套机制要避免的事。
+///      为了一个纯展示标签去打断正在服务的请求，代价与收益完全不成比例。
+///
+///   3. **方案甲还要改 Go 网关并重新内嵌。** 网关是 `include_bytes!` 编进主程序的
+///      （见 `gateway_embed`），加字段意味着改 Go 源码、单测、构建、重新内嵌，
+///      再让所有已发布版本升级网关二进制。收益只是一个显示名。
+///
+/// 方案乙则天然正确：备注在**每次** `gateway_status()` 调用时从账号库现读现合并，
+/// 与凭证目录、网关状态、重启时机全都无关。生效延迟只取决于前端轮询周期（5 秒），
+/// 用户改完备注**下一轮轮询就能看到**，不必等 30 秒的账号同步，更不必重启网关。
+/// 顺带保住了分层：`gateway_auths/*.json` 是 0600 的凭证文件，不该塞 UI 专用元数据。
+///
+/// 合并是**增量**的：只补 `note` 一个字段，其余字段（在途数、冷却、积分、
+/// 到期档位……）原样保留 —— 它们是网关的实时运行态，宿主无从重建。uid 不在
+/// 账号库里的账号（例如凭证还在、账号已被删）保持原样，不会被塞进空备注。
+///
+/// 用 `account::account_note` 而不是直接读 `acc["note"]`：它带 `get_str` 的
+/// `trim`，纯空白备注会归一成空串，前端据此回退到昵称/uid —— 否则界面上会出现
+/// 一行「名字看不见字」的账号。
+fn merge_account_notes(pool: &Value, accounts: &[Value]) -> Value {
+    // 只收有 uid 且有备注的账号：没有备注就不必改这条池记录，
+    // 让「未填备注」的账号保持网关原样（也少一次对象克隆）。
+    let notes: HashMap<String, String> = accounts
+        .iter()
+        .filter_map(|acc| {
+            let uid = account::get_str(acc, "uid")?;
+            let note = account::account_note(acc);
+            if note.is_empty() {
+                return None;
+            }
+            Some((uid, note))
+        })
+        .collect();
+
+    if notes.is_empty() {
+        return pool.clone();
+    }
+
+    let mut merged = pool.clone();
+    let Some(list) = merged.get_mut("accounts").and_then(Value::as_array_mut) else {
+        // 网关没跑 / 不可达时 `pool` 是 Null，或形状意外：原样返回，不臆造结构。
+        return merged;
+    };
+    for item in list.iter_mut() {
+        let Some(uid) = item.get("uid").and_then(Value::as_str).map(str::to_string) else {
+            continue;
+        };
+        if let Some(note) = notes.get(uid.as_str()) {
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("note".to_string(), json!(note));
+            }
+        }
+    }
+    merged
+}
+
 /// 网关综合状态：配置 + 运行态 + 健康 + 账号池详情。
 pub async fn gateway_status() -> Value {
     let cfg = load_gateway_config();
@@ -2019,9 +2503,18 @@ pub async fn gateway_status() -> Value {
         }
     }
 
-    let account_count = account::load_accounts().len();
+    // 账号库只读一次，供下面三处共用（池备注合并 / 排除列表 / 指定账号下拉）：
+    // 三次 `load_accounts()` 不仅多两次读盘，还可能落在**不同的写入时刻**上
+    // —— 用户刚改完备注时，池里显示的是新备注、下拉里却是旧的，很难解释。
+    let accounts = account::load_accounts();
+    let account_count = accounts.len();
+
+    // 把宿主侧备注合并进网关账号池快照（为什么走宿主侧合并见 `merge_account_notes`）。
+    // 放在最后一步：`pool` 此时已是网关 `/status` 的完整投影，只补 note 一个字段。
+    pool = merge_account_notes(&pool, &accounts);
+
     // 需重登的账号不导出到网关，界面需要能看到「为什么某个账号不在池里」。
-    let excluded_accounts: Vec<Value> = account::load_accounts()
+    let excluded_accounts: Vec<Value> = accounts
         .iter()
         .filter(|a| needs_relogin(a))
         .filter_map(|a| {
@@ -2029,6 +2522,9 @@ pub async fn gateway_status() -> Value {
             Some(json!({
                 "uid": uid,
                 "nickname": account::get_str(a, "nickname").unwrap_or_default(),
+                // 备注与账号池、勾选列表同一口径：界面上凡是标识账号的地方
+                // 都按 备注 → 昵称 → uid 取名，缺了它这条提示会显示成 uid。
+                "note": account::account_note(a),
                 "reason": account::get_str(a, "needs_relogin_reason"),
             }))
         })
@@ -2049,7 +2545,7 @@ pub async fn gateway_status() -> Value {
         // 被排除出网关池的账号（需重新登录），供界面提示
         "excludedAccounts": excluded_accounts,
         // 供前端下拉选择「指定账号」
-        "accounts": account::load_accounts()
+        "accounts": accounts
             .iter()
             .filter_map(pinned_account_option)
             .collect::<Vec<Value>>(),
@@ -2744,6 +3240,147 @@ mod tests {
         // 无 uid 的脏记录不得进下拉：SelectItem 的 value 为空串会让 Radix 抛错，
         // 进而整页白屏（实测过）。
         assert!(super::pinned_account_option(&json!({"nickname": "无 uid"})).is_none());
+    }
+
+    // 账号池的每一行都必须带上宿主侧备注，界面才能按「备注 → 昵称 → uid 前缀」取名。
+    //
+    // 所有者反馈的原缺陷：「兼容网关，已备注的账号 却不会显示备注」。
+    // 根因是池数据来自网关 `/status`，而备注只存宿主账号库、从不随凭证导出，
+    // 于是前端只能退到 `nickname || uid`。本测试锁住合并逻辑的三态与边界。
+    #[test]
+    fn pool_merge_carries_note_for_three_states() {
+        // 网关 /status 的池快照：**只有 nickname，没有 note**（网关根本不知道备注）。
+        let pool = json!({
+            "total": 3,
+            "accounts": [
+                // 有备注 + 有昵称 → 界面应显示备注（不是昵称）
+                {"uid": "uid-1", "nickname": "上游昵称甲", "credits": 800, "in_flight": 2},
+                // 无备注 + 有昵称 → 回退到昵称
+                {"uid": "uid-2", "nickname": "上游昵称乙", "credits": 400, "in_flight": 0},
+                // 无备注 + 无昵称 → 回退到 uid 前缀（前端负责截断）
+                {"uid": "uid-3", "credits": 88, "in_flight": 0},
+            ],
+        });
+        let accounts = vec![
+            json!({"uid": "uid-1", "nickname": "上游昵称甲", "note": "公司号"}),
+            json!({"uid": "uid-2", "nickname": "上游昵称乙"}),
+            json!({"uid": "uid-3"}),
+        ];
+
+        let merged = super::merge_account_notes(&pool, &accounts);
+        let list = merged["accounts"].as_array().expect("accounts 数组应保留");
+
+        // 1) 有备注：note 下发，且**网关原有字段一个都不能丢**。
+        assert_eq!(list[0]["note"], "公司号");
+        assert_eq!(list[0]["nickname"], "上游昵称甲");
+        assert_eq!(list[0]["credits"], 800);
+        assert_eq!(list[0]["in_flight"], 2);
+
+        // 2) 无备注：**不加** note 键，由前端回退到昵称。
+        //    这里断言键不存在而不是 note==""：不臆造字段，也让「有没有备注」
+        //    在调试时是可信线索。
+        assert!(list[1].get("note").is_none(), "无备注不该被塞入 note: {}", list[1]);
+        assert_eq!(list[1]["nickname"], "上游昵称乙");
+
+        // 3) 两者皆空：不加 note，前端退到 uid 前缀。
+        assert!(list[2].get("note").is_none(), "两者皆空不该被塞入 note: {}", list[2]);
+        assert!(list[2].get("nickname").is_none());
+        assert_eq!(list[2]["uid"], "uid-3");
+
+        // 池级字段（total 等）必须原样保留：界面上的统计块读的就是它们。
+        assert_eq!(merged["total"], 3);
+    }
+
+    // 纯空白备注必须归一成「无备注」，否则账号池会出现一行看不见名字的账号。
+    #[test]
+    fn pool_merge_treats_blank_note_as_absent() {
+        let pool = json!({"accounts": [{"uid": "uid-1", "nickname": "昵称"}]});
+        let accounts = vec![json!({"uid": "uid-1", "note": "   \t  "})];
+        let merged = super::merge_account_notes(&pool, &accounts);
+        assert!(
+            merged["accounts"][0].get("note").is_none(),
+            "纯空白备注应视为未填（否则界面显示空白名）: {}",
+            merged["accounts"][0]
+        );
+
+        // 首尾空白要裁掉：显示「公司号」而不是「 公司号 」。
+        let accounts = vec![json!({"uid": "uid-1", "note": "  公司号  "})];
+        let merged = super::merge_account_notes(&pool, &accounts);
+        assert_eq!(merged["accounts"][0]["note"], "公司号");
+    }
+
+    // 合并不得凭空造出账号、也不得因网关侧 uid 缺失而崩。
+    #[test]
+    fn pool_merge_ignores_unknown_and_uidless_entries() {
+        // 账号库里有、但池里没有的账号：不应被追加进池（池是网关的真实视图）。
+        let pool = json!({"accounts": [{"uid": "uid-1"}]});
+        let accounts = vec![
+            json!({"uid": "uid-1", "note": "在池里"}),
+            json!({"uid": "uid-not-in-pool", "note": "不在池里"}),
+        ];
+        let merged = super::merge_account_notes(&pool, &accounts);
+        assert_eq!(merged["accounts"].as_array().unwrap().len(), 1, "不得追加池外账号");
+        assert_eq!(merged["accounts"][0]["note"], "在池里");
+
+        // 无 uid 的脏账号库记录：跳过，不得 panic。
+        let merged = super::merge_account_notes(&pool, &[json!({"note": "无 uid"})]);
+        assert!(merged["accounts"][0].get("note").is_none());
+
+        // 池里某条没有 uid（脏数据）：跳过它，其余照常合并、不得 panic。
+        let pool = json!({"accounts": [{"nickname": "无 uid"}, {"uid": "uid-1"}]});
+        let accounts = vec![json!({"uid": "uid-1", "note": "备注"})];
+        let merged = super::merge_account_notes(&pool, &accounts);
+        assert!(merged["accounts"][0].get("note").is_none());
+        assert_eq!(merged["accounts"][1]["note"], "备注");
+    }
+
+    // 网关未运行（pool 为 Null）或形状意外时，必须原样返回而不是 panic/臆造结构。
+    //
+    // 这条是真实场景：`gateway_status()` 在网关没跑时把 `pool` 留成 `Value::Null`，
+    // 合并若直接索引 `["accounts"]` 就会在「用户没开网关」时崩掉整个状态接口。
+    #[test]
+    fn pool_merge_is_safe_when_pool_absent_or_malformed() {
+        let accounts = vec![json!({"uid": "uid-1", "note": "公司号"})];
+
+        assert_eq!(super::merge_account_notes(&Value::Null, &accounts), Value::Null);
+        // 没有 accounts 键：保持原样。
+        let no_key = json!({"total": 0});
+        assert_eq!(super::merge_account_notes(&no_key, &accounts), no_key);
+        // accounts 不是数组：保持原样（不把对象改写成数组）。
+        let wrong_type = json!({"accounts": {"uid": "uid-1"}});
+        assert_eq!(super::merge_account_notes(&wrong_type, &accounts), wrong_type);
+
+        // 账号库为空时走早退分支，池内容逐字节不变。
+        let pool = json!({"accounts": [{"uid": "uid-1", "nickname": "昵称"}]});
+        assert_eq!(super::merge_account_notes(&pool, &[]), pool);
+    }
+
+    // 回归保护：备注**绝不能**被导出进网关凭证文件。
+    //
+    // 这是本修复刻意选择的边界（见 `merge_account_notes` 的方案论证）：
+    // 网关刷新 token 时用固定字段表重写凭证（Go 侧 `auth.SaveAtomic`），
+    // 导出过去的 note 会被无声抹掉，表现为「备注显示一阵子又没了」。
+    // 若哪天有人「顺手」把 note 加进 build_auth_doc，这条会立刻失败。
+    #[test]
+    fn auth_doc_never_leaks_note_to_gateway() {
+        let acc = json!({
+            "uid": "uid-1",
+            "access_token": "at",
+            "refresh_token": "rt",
+            "nickname": "n1",
+            "note": "公司号",
+            "expiresAt": 1_793_263_003_967i64,
+        });
+        let (_, text) = super::build_auth_doc(&acc, None).expect("doc");
+        assert!(
+            !text.contains("公司号") && !text.contains("note"),
+            "备注不得写入网关凭证（会被网关重写抹掉）: {text}"
+        );
+        // 昵称仍照常导出：它是网关侧本来就认识的字段。
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap()["account"]["nickname"],
+            "n1"
+        );
     }
 
     // 回归保护：局部更新（如启动后回写 last_status）不得覆盖用户设置。
@@ -3478,6 +4115,11 @@ mod tests {
         // 按路径兜底（进程名被改名时仍能认出）
         assert!(is_our_process("whatever.exe", r"C:\Users\x\.ai-gateway\gateway\bin\a.exe"));
         assert!(is_our_process("whatever.exe", r"D:\proj\ai-gateway\target\release\a.exe"));
+        // macOS/Linux：路径分隔符是 `/`。之前只认 `gateway\bin\`，
+        // 导致 macOS 上「是不是自己的进程」判错、提示措辞走偏。
+        assert!(is_our_process("whatever", "/Users/x/.wb-switch/gateway/bin/a"));
+        assert!(is_our_process("whatever", "/Users/x/.ai-gateway/gateway/bin/a"));
+        assert!(is_our_process("whatever", "/Applications/AI Gateway.app/Contents/MacOS/ai-gateway"));
     }
 
     #[test]
@@ -3486,6 +4128,9 @@ mod tests {
         assert!(!is_our_process("node.exe", r"C:\Program Files\nodejs\node.exe"));
         assert!(!is_our_process("chrome.exe", r"C:\Program Files\Google\Chrome\chrome.exe"));
         assert!(!is_our_process("nginx.exe", r"C:\nginx\nginx.exe"));
+        // macOS 上的第三方进程同样不能误判
+        assert!(!is_our_process("gunicorn", "/usr/local/bin/gunicorn"));
+        assert!(!is_our_process("node", "/opt/homebrew/bin/node"));
         assert!(!is_our_process("", ""));
     }
 
@@ -3605,13 +4250,16 @@ mod tests {
         drop(listener);
     }
 
-    /// 非 Windows 平台上「查不到占用者」是**预期行为**，不是缺陷。
+    /// 非 Windows（macOS/Linux）上「查不到占用者」仍然是**可能**的，但不再是
+    /// 「因为没实现」：`find_port_holder` 现在真的会去调 lsof。
     ///
-    /// 单独写这条而不是简单删掉上面的测试：让「这个平台不支持」这件事被显式
-    /// 记录在测试里，而不是留白。将来有人补了 lsof/ss 实现，这条会提醒他改。
+    /// 因此这条测试只断言「不 panic、且返回类型正确」，**不再**断言 `is_none()`
+    /// —— 本机若真装了 lsof 并且端口确实被本进程监听，返回 Some 才是对的。
+    /// 旧版本断言的是 `is_none()`（当时实现刻意返回 None），补完实现后那条断言
+    /// 就变成了「实现越正确越失败」的反向测试，必须改掉。
     #[cfg(not(windows))]
     #[test]
-    fn port_holder_returns_none_on_unsupported_platform() {
+    fn port_holder_does_not_panic_on_non_windows() {
         let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
             Ok(l) => l,
             Err(_) => return,
@@ -3620,21 +4268,532 @@ mod tests {
             Ok(a) => a.port(),
             Err(_) => return,
         };
-        assert!(
-            port_holder(port).is_none(),
-            "非 Windows 平台尚未实现占用者查询，应返回 None"
-        );
+
+        // 不断言结果：本机可能没装 lsof（容器/精简系统），那时返回 None 也正确。
+        // 真正要守的是「任何情况下都不 panic、不挂起」。
+        let holder = port_holder(port);
+        if let Some(h) = holder {
+            assert!(
+                h.get("pid").and_then(Value::as_u64).unwrap_or(0) > 0,
+                "查到的 PID 必须是有效正数，实际: {h}"
+            );
+        }
+
         drop(listener);
+    }
+
+    // -----------------------------------------------------------------------
+    // lsof 字段输出解析（macOS / Linux 实现的核心）
+    //
+    // 本机是 Windows，**跑不了真实的 lsof**，所以这些用例全部用手写的固定输出
+    // 字符串驱动 —— 字符串取自 lsof(8) 的 OUTPUT FOR OTHER PROGRAMS 一节所描述
+    // 的字段格式（每行首字符是字段标识，其余到行尾是内容）。
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_lsof_finds_listener_pid_and_command() {
+        // 典型成功输出：p=pid、c=命令名、f/n 是文件集，我们只关心进程集。
+        let stdout = "p4242\ncgunicorn\nf12\nn*:7864\nf13\nn*:7864\n";
+        assert_eq!(
+            parse_lsof_listener_fields(stdout),
+            vec![(4242, "gunicorn".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_lsof_dedupes_ipv4_and_ipv6_sockets() {
+        // 同一进程同时监听 IPv4 与 IPv6（两个进程集），只应产出**一条**。
+        // 不去重的话 holders.len() > 1 会触发「多个监听进程」的误报日志，
+        // 更糟的是给用户看两个一模一样的条目。
+        let stdout = "p900\ncnode\nf20\nn*:3000\np900\ncnode\nf21\nn*:3000\n";
+        assert_eq!(
+            parse_lsof_listener_fields(stdout),
+            vec![(900, "node".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_lsof_keeps_distinct_pids_for_reuseport() {
+        // SO_REUSEPORT：同一端口真被两个进程监听，两条都要保留（调用方取第一条，
+        // 但必须知道还有第二个 —— 日志里会提示）。
+        let stdout = "p111\ncnginx\nf3\nn*:8080\np222\ncnginx\nf3\nn*:8080\n";
+        assert_eq!(
+            parse_lsof_listener_fields(stdout),
+            vec![(111, "nginx".to_string()), (222, "nginx".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_lsof_empty_output_means_no_listener() {
+        // 端口空闲时 lsof 一个字段都不输出（且退出码为 1）。
+        // 这是「没有占用者」的正常表示，不是错误。
+        assert!(parse_lsof_listener_fields("").is_empty());
+        assert!(parse_lsof_listener_fields("\n").is_empty());
+        // 只有文件集、没有进程集：不该凭空造出一个占用者
+        assert!(parse_lsof_listener_fields("f12\nn*:7864\n").is_empty());
+    }
+
+    #[test]
+    fn parse_lsof_tolerates_garbage_and_partial_output() {
+        // 权限不足 / 版本差异时可能混进非字段行或半截字段。要求：不 panic、
+        // 不把垃圾当成 pid、能救回来的部分仍救回来。
+        let stdout = "\
+lsof: WARNING: can't stat() fuse.gvfsd-fuse file system /run/user/1000/gvfs\n\
+p\ncbroken\n\
+p42\ncjava\nf9\nn*:8080\n";
+        // 第一行没有合法 pid → 丢弃；`p` 后无值 → 丢弃；只有 p42 存活。
+        assert_eq!(
+            parse_lsof_listener_fields(stdout),
+            vec![(42, "java".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_lsof_rejects_pid_zero() {
+        // PID 0 绝不能流到 `kill -9`：unix 上它表示「整个进程组」，
+        // 会连带杀掉本程序自己。必须在这里就挡掉。
+        let stdout = "p0\ncevil\nf1\nn*:9999\n";
+        assert!(
+            parse_lsof_listener_fields(stdout).is_empty(),
+            "PID 0 必须被丢弃，绝不能返回给调用方"
+        );
+    }
+
+    #[test]
+    fn parse_lsof_drops_entries_without_command_name() {
+        // 没有命令名 → 丢弃。理由：kill_port_holder 里「本程序启动的网关不许杀」
+        // 那道防线是按**名字**判断的，名字为空会让它静默放行；宁可报「无法识别」
+        // 让用户手动处理，也不要盲杀一个连名字都不知道的进程。
+        let stdout = "p777\nf4\nn*:5000\n";
+        assert!(parse_lsof_listener_fields(stdout).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // `find_port_holder_with`：占用者查询的完整决策逻辑
+    //
+    // 命令执行器是注入的，所以以下用例在 **Windows 上也能真实执行**这套逻辑
+    //（本机没有 lsof，也没法交叉编译出 macOS 二进制 —— 见 Cargo check 的
+    // cc 缺失）。覆盖：找到占用者 / 端口空闲 / lsof 不存在 / 输出是垃圾 /
+    // 权限不足 / 多个监听者 / 非法端口。
+    // -----------------------------------------------------------------------
+
+    /// 造一个假的 `Output`（测试专用）。
+    ///
+    /// `ExitStatus` 的构造方式是平台相关的（Windows 收 u32 退出码，Unix 收
+    /// wait status），两边都只用到 `status.success()`，因此 `code == 0` 视为成功、
+    /// 非 0 视为失败 —— 语义在两平台上一致。
+    fn fake_output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        let status = {
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::ExitStatusExt as _;
+                std::process::ExitStatus::from_raw(code as u32)
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt as _;
+                std::process::ExitStatus::from_raw(code)
+            }
+        };
+        std::process::Output {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn find_holder_happy_path_uses_lsof_fields() {
+        // 第一次调用（定位监听者）给 p/c 字段，第二次（取路径）给 ftxt/n。
+        let out = find_port_holder_with(7864, |args, _| {
+            if args.contains(&"-Fpcn") {
+                Some(fake_output(0, "p4242\ncgunicorn\n", ""))
+            } else {
+                Some(fake_output(0, "p4242\nftxt\nn/usr/local/bin/gunicorn\n", ""))
+            }
+        })
+        .expect("应识别出占用者");
+
+        assert_eq!(out.0, 4242, "PID 应来自 lsof 的 p 字段");
+        // 名字取路径的 basename（lsof 的 c 字段会被内核截断，不适合展示）
+        assert_eq!(out.1, "gunicorn");
+        assert_eq!(out.2, "/usr/local/bin/gunicorn");
+    }
+
+    #[test]
+    fn find_holder_uses_full_path_basename_not_truncated_lsof_name() {
+        // 真实场景：macOS 上内核只给前 ~16 字符，`c` 字段会是截断的前缀。
+        // 必须用路径的 basename，否则界面上显示一个看不懂的名字。
+        let out = find_port_holder_with(7864, |args, _| {
+            if args.contains(&"-Fpcn") {
+                Some(fake_output(0, "p77\ncvery-long-trunc\n", ""))
+            } else {
+                Some(fake_output(
+                    0,
+                    "p77\nftxt\nn/Users/x/.wb-switch/gateway/bin/gateway-abc\n",
+                    "",
+                ))
+            }
+        })
+        .expect("应识别出占用者");
+
+        assert_eq!(
+            out.1, "gateway-abc",
+            "应使用路径 basename 而不是被截断的 lsof 命令名"
+        );
+    }
+
+    #[test]
+    fn find_holder_returns_none_when_port_free() {
+        // 端口空闲：lsof 无输出且退出码 1。这**不是**错误。
+        let out = find_port_holder_with(59870, |_args, _| Some(fake_output(1, "", "")));
+        assert_eq!(out, None, "没有监听者时应返回 None");
+    }
+
+    #[test]
+    fn find_holder_returns_none_when_lsof_missing() {
+        // lsof 未安装 / 被 PATH 挡掉：所有候选都 spawn 失败 → 执行器返回 None。
+        let out = find_port_holder_with(7864, |_args, _| None);
+        assert_eq!(out, None, "lsof 不可用时应返回 None 而不是 panic");
+    }
+
+    #[test]
+    fn find_holder_returns_none_and_logs_on_permission_error() {
+        // 权限不足：lsof 报错、无 stdout。绝不能 panic，且必须返回 None。
+        let out = find_port_holder_with(7864, |_args, _| {
+            Some(fake_output(
+                1,
+                "",
+                "lsof: WARNING: can't open /dev/... : Operation not permitted\n",
+            ))
+        });
+        assert_eq!(out, None, "权限不足时应返回 None");
+    }
+
+    #[test]
+    fn find_holder_returns_none_on_garbage_output() {
+        // 输出格式意外（版本差异 / 被别的程序占了 stdout）：不 panic，返回 None。
+        let out = find_port_holder_with(7864, |_args, _| {
+            Some(fake_output(0, "<<< not lsof field output at all >>>\n", ""))
+        });
+        assert_eq!(out, None, "无法解析的输出应返回 None");
+    }
+
+    #[test]
+    fn find_holder_still_works_when_path_lookup_fails() {
+        // 路径取不到不该让整条失败（与 Windows 分支一致：那里 powershell
+        // 取路径失败同样留空）。进程名此时回退到 lsof 的 c 字段。
+        let out = find_port_holder_with(7864, |args, _| {
+            if args.contains(&"-Fpcn") {
+                Some(fake_output(0, "p4242\ncnode\n", ""))
+            } else {
+                None // 取路径这一路失败
+            }
+        })
+        .expect("取不到路径也应返回占用者");
+
+        assert_eq!(out.0, 4242);
+        assert_eq!(out.1, "node", "回退到 lsof 的命令名");
+        assert_eq!(out.2, "", "路径取不到时留空串");
+    }
+
+    #[test]
+    fn find_holder_rejects_port_zero_without_running_commands() {
+        // 端口 0 非法：必须**在跑命令之前**就拒绝（`-iTCP:0` 会匹配一堆临时端口，
+        // 误报占用者）。用 panic 的执行器证明它根本没被调用。
+        let out = find_port_holder_with(0, |_args, _| {
+            panic!("端口 0 时不得执行任何命令");
+        });
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn find_holder_picks_first_of_multiple_listeners() {
+        // SO_REUSEPORT：同一端口多个监听者。取第一个（与 Windows 的 netstat
+        // 行为一致），但要能正常返回而不是崩掉。
+        let out = find_port_holder_with(8080, |args, _| {
+            if args.contains(&"-Fpcn") {
+                Some(fake_output(0, "p111\ncnginx\np222\ncnginx\n", ""))
+            } else {
+                Some(fake_output(0, "p111\nftxt\nn/usr/sbin/nginx\n", ""))
+            }
+        })
+        .expect("多监听者也应返回一个占用者");
+
+        assert_eq!(out.0, 111, "应取第一个监听者");
+        assert_eq!(out.1, "nginx");
+    }
+
+    /// 参数本身也是契约：`-Fpcn` 必须连写且置于末尾（`-F` 的取值是可选参数，
+    /// 拆开会让 lsof 把 `pcn` 当成要搜索的文件名）；`-sTCP:LISTEN` 不可省。
+    #[test]
+    fn lsof_listener_args_are_well_formed() {
+        let args = lsof_listener_args(7864);
+        assert_eq!(args.last().map(String::as_str), Some("-Fpcn"), "字段列表必须置于末尾");
+        assert!(args.contains(&"-iTCP:7864".to_string()), "应带上目标端口");
+        assert!(
+            args.contains(&"-sTCP:LISTEN".to_string()),
+            "必须过滤 LISTEN —— 否则会把客户端连接的临时端口误判成占用者"
+        );
+        // `-nP` 不可省：否则 lsof 会做 DNS 反查与 /etc/services 端口名解析，
+        // 在大网络上会明显变慢，且输出里出现主机名（解析更脆）。
+        assert!(args.contains(&"-nP".to_string()), "-nP 不可省");
+    }
+
+    #[test]
+    fn lsof_txt_args_use_and_operator() {
+        let args = lsof_txt_args(4242);
+        // 没有 `-a` 时 `-p` 与 `-d txt` 是**或**关系，会把全系统进程都列出来。
+        assert!(args.contains(&"-a".to_string()), "必须有 -a 才能与起来");
+        assert!(args.contains(&"4242".to_string()));
+        assert!(args.contains(&"txt".to_string()));
+    }
+
+    /// 候选路径必须覆盖 macOS 上 lsof 的**真实**位置。
+    ///
+    /// 从 Finder 启动的 .app 拿到的是 launchd 给的最小 PATH
+    ///（`/usr/bin:/bin:/usr/sbin:/sbin`）；lsof 装在 `/usr/sbin`。
+    /// 一旦 PATH 被改成不含 `/usr/sbin`，裸名 `lsof` 就会 spawn 失败 ——
+    /// 那种失败会伪装成「端口没人占用」，所以绝对路径兜底不能少。
+    #[test]
+    fn lsof_candidates_cover_macos_location() {
+        assert!(
+            LSOF_CANDIDATES.contains(&"/usr/sbin/lsof"),
+            "macOS 的 lsof 在 /usr/sbin/lsof，必须是候选之一"
+        );
+        assert_eq!(
+            LSOF_CANDIDATES[0], "lsof",
+            "先试裸名以尊重用户 PATH（也兼容 Linux 的 /usr/bin）"
+        );
+    }
+
+    #[test]
+    fn parse_lsof_txt_path_reads_executable() {
+        // `lsof -a -p <pid> -d txt -Fn` 的典型输出。
+        let stdout = "p4242\nftxt\nn/usr/local/bin/gunicorn\n";
+        assert_eq!(
+            parse_lsof_txt_path(stdout),
+            Some("/usr/local/bin/gunicorn".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_lsof_txt_path_ignores_non_txt_files() {
+        // 同一个 pid 下的 cwd / 普通 fd 不是进程映像，不能当成路径返回
+        //（返回错的路径会让「是不是自己的进程」判断和 UI 展示全部走偏）。
+        let stdout = "p4242\nfcwd\nn/home/user\nf5\nn/tmp/sock\n";
+        assert_eq!(parse_lsof_txt_path(stdout), None);
+    }
+
+    #[test]
+    fn parse_lsof_txt_path_handles_other_pid_sets() {
+        // 若 lsof 因参数不生效而吐出多个进程集，也必须只认带 ftxt 的那个文件集，
+        // 不能顺手把第一个进程的任意文件名当成路径。
+        let stdout = "p1\nfcwd\nn/\np2\nftxt\nn/opt/app/bin/app\n";
+        assert_eq!(
+            parse_lsof_txt_path(stdout),
+            Some("/opt/app/bin/app".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_lsof_txt_path_empty_output_is_none() {
+        // 进程已退出 / 权限不足：取不到路径不该是错误（与 Windows 分支一致，
+        // 那里取不到路径同样留空而不是整条失败）。
+        assert_eq!(parse_lsof_txt_path(""), None);
+    }
+
+    #[test]
+    fn forbidden_kill_reason_always_rejects_self() {
+        // 跨平台的核心守卫：杀自己会让调用方拿不到返回值，前端表现为请求悬挂。
+        let reason = forbidden_kill_reason(std::process::id())
+            .expect("必须拒绝杀死本进程自身");
+        assert!(
+            reason.contains("自身") || reason.contains("停止网关"),
+            "错误文案应说明是自身/应走停止网关，实际: {reason}"
+        );
+    }
+
+    #[test]
+    fn forbidden_kill_reason_allows_ordinary_pids() {
+        // 反例守卫：普通的第三方进程必须放行（用户明确要求清理端口占用者），
+        // 否则整个功能形同虚设。刻意用一个几乎不可能是本进程 pid 的值。
+        let other = if std::process::id() == 12345 { 12346 } else { 12345 };
+        assert_eq!(forbidden_kill_reason(other), None);
+    }
+
+    /// PID 1 是 macOS 上的 launchd / Linux 上的 init：`kill -9 1` 会导致系统
+    /// 重启（macOS）或内核 panic。这条只在非 Windows 上存在，因为 Windows
+    /// 没有 PID 1 这个概念（System Idle Process 的 PID 是 0）。
+    #[cfg(not(windows))]
+    #[test]
+    fn forbidden_kill_reason_rejects_pid_one_on_unix() {
+        let reason = forbidden_kill_reason(1).expect("必须拒绝杀死 PID 1");
+        assert!(
+            reason.contains("PID 1") || reason.contains("系统"),
+            "错误文案应说明这是系统启动进程，实际: {reason}"
+        );
+    }
+
+    #[test]
+    fn port_holder_zero_port_hint_never_panics() {
+        // 端口 0 走到「查不到」分支时也要能给出文案（find_port_holder 对 0
+        // 直接返回 None），不能 panic。
+        let hint = port_holder_manual_hint(0);
+        assert!(!hint.is_empty(), "提示文案不能为空");
+    }
+
+    /// 「无法识别占用者」的提示必须是**可操作**的：给出能复制到终端执行的
+    /// 具体命令，而不是笼统的「可能需要管理员权限」。
+    ///
+    /// 这条是本次修复的验收点之一：所有者反馈原提示「无法识别占用进程
+    ///（可能需要管理员权限）」无从下手。
+    #[test]
+    fn manual_hint_is_actionable_not_vague() {
+        let hint = port_holder_manual_hint(7864);
+        assert!(
+            hint.contains("7864"),
+            "提示里应带上具体端口号，实际: {hint}"
+        );
+        assert!(
+            hint.contains("lsof") || hint.contains("Get-NetTCPConnection"),
+            "提示里应给出可执行的排查命令，实际: {hint}"
+        );
+        assert!(
+            !hint.contains("可能需要管理员权限"),
+            "不得退回笼统话术『可能需要管理员权限』，实际: {hint}"
+        );
+    }
+
+    /// **macOS 分支的提示必须能在此处（Windows）被断言**。
+    ///
+    /// 本机的 `#[cfg(target_os = "macos")]` 代码根本不会被编译，改错只会在
+    /// macOS 上才暴露 —— 那正是这次要交付的平台。所以文案走
+    /// `hint_for_platform` 纯函数，这里直接对 macOS 分支做断言。
+    #[test]
+    fn macos_hint_names_lsof_and_sudo() {
+        let hint = hint_for_platform(HintPlatform::Macos, 7864);
+        // 所有者拿到的必须是一条**能直接复制执行**的命令。
+        assert!(
+            hint.contains("sudo lsof -nP -iTCP:7864 -sTCP:LISTEN"),
+            "macOS 提示必须给出完整的 lsof 查询命令（含端口），实际: {hint}"
+        );
+        // 结束动作也要给出，否则用户查到 PID 仍不知道下一步。
+        assert!(
+            hint.contains("sudo kill -9"),
+            "macOS 提示必须给出结束进程的命令，实际: {hint}"
+        );
+        // 提示里不能出现别的平台的命令（说明跑错了分支）。
+        assert!(
+            !hint.contains("Get-NetTCPConnection"),
+            "macOS 提示里不该出现 Windows 的命令，实际: {hint}"
+        );
+    }
+
+    #[test]
+    fn linux_hint_mentions_lsof_and_ss_fallback() {
+        let hint = hint_for_platform(HintPlatform::Linux, 7864);
+        assert!(hint.contains("lsof -nP -iTCP:7864 -sTCP:LISTEN"), "实际: {hint}");
+        // 精简容器里常常没装 lsof，必须给出 ss 兜底
+        assert!(hint.contains("ss -ltnp"), "应给出未装 lsof 时的替代命令，实际: {hint}");
+    }
+
+    #[test]
+    fn windows_hint_uses_powershell() {
+        let hint = hint_for_platform(HintPlatform::Windows, 7864);
+        assert!(
+            hint.contains("Get-NetTCPConnection -LocalPort 7864 -State Listen"),
+            "实际: {hint}"
+        );
+        assert!(hint.contains("Stop-Process -Id"), "实际: {hint}");
+    }
+
+    #[test]
+    fn every_platform_hint_is_non_empty_and_has_port() {
+        // 穷举所有平台，确保没有任何一个分支返回空串 ——
+        // 空串会让前端弹出一个没有任何信息的错误框。
+        for platform in [
+            HintPlatform::Macos,
+            HintPlatform::Linux,
+            HintPlatform::Windows,
+            HintPlatform::Other,
+        ] {
+            let hint = hint_for_platform(platform, 9999);
+            assert!(!hint.trim().is_empty(), "{platform:?} 的提示为空");
+            assert!(hint.contains("9999"), "{platform:?} 的提示未带端口");
+            assert!(
+                !hint.contains("可能需要管理员权限"),
+                "{platform:?} 退回了笼统话术"
+            );
+        }
+    }
+
+    /// `current()` 必须在**当前编译目标**上选中正确的变体。
+    ///
+    /// 这条断言在三个平台的 CI 上各验一次（Windows 选 Windows、macos-14 选
+    /// Macos、ubuntu 选 Linux），因此 macOS 上「选中了 Windows 的提示」这类
+    /// 错误会在 CI 被抓住，而不是等用户看到错命令。
+    #[test]
+    fn hint_platform_current_matches_compile_target() {
+        let expected = if cfg!(target_os = "macos") {
+            HintPlatform::Macos
+        } else if cfg!(target_os = "linux") {
+            HintPlatform::Linux
+        } else if cfg!(windows) {
+            HintPlatform::Windows
+        } else {
+            HintPlatform::Other
+        };
+        assert_eq!(
+            HintPlatform::current(),
+            expected,
+            "current() 选中的平台与编译目标不一致"
+        );
+        // 提示里必须真的带上当前平台的命令
+        let hint = port_holder_manual_hint(7864);
+        assert!(hint.contains("7864"), "实际: {hint}");
+    }
+
+    /// 权限不足（EPERM）时必须给出**可执行的下一步**（sudo 命令），
+    /// 而不是笼统的「可能需要权限」。
+    #[test]
+    fn kill_eperm_message_tells_user_exactly_what_to_run() {
+        // macOS/Linux 上 `kill` 的典型 EPERM 输出
+        let msg = kill_failure_message(4242, "kill: 4242: Operation not permitted\n");
+        assert!(
+            msg.contains("sudo kill -9 4242"),
+            "权限不足时必须给出可直接执行的命令，实际: {msg}"
+        );
+    }
+
+    #[test]
+    fn kill_other_failure_keeps_raw_reason() {
+        // 非权限类失败（例如进程已不存在）应把原始原因透出来，便于排查，
+        // 且不能谎称是权限问题（那会把用户引向错误的排查方向）。
+        let msg = kill_failure_message(4242, "kill: 4242: No such process\n");
+        assert!(msg.contains("No such process"), "应保留原始原因，实际: {msg}");
+        assert!(!msg.contains("sudo"), "不该把非权限失败说成权限问题，实际: {msg}");
+    }
+
+    #[test]
+    fn kill_empty_stderr_still_gives_a_reason() {
+        let msg = kill_failure_message(4242, "   \n");
+        assert!(!msg.trim().is_empty(), "错误文案不能为空");
+        assert!(msg.contains("4242"), "应带上 PID，实际: {msg}");
     }
 
     /// 「不许杀掉自己」这条守卫。
     ///
     /// Windows：`find_port_holder` 能认出占用者就是本进程 → 命中「自身」分支。
-    /// 非 Windows：查询未实现，先撞上「无法识别占用进程」→ 同样拒绝，只是文案不同。
+    /// macOS/Linux：补完 lsof 实现后**同样**能认出（本测试自己就是监听者），
+    /// 于是也命中「自身」分支 —— 正是本次修复要达到的效果。
     ///
-    /// **两种平台都必须拒绝**，这正是本测试要守的核心行为；但断言文案时必须区分
-    /// 平台 —— 曾因只断言「自身」文案，在 Linux/macOS 的 CI 上失败（那不是缺陷）。
-    /// 这里把「拒绝」与「文案」拆成两条断言，前者跨平台、后者按平台。
+    /// **两种平台都必须拒绝**，这正是本测试要守的核心行为。
+    ///
+    /// 文案断言为什么按平台分开：非 Windows 上如果本机**没有 lsof**，会先撞上
+    /// 「无法识别占用进程」→ 同样拒绝、只是文案不同。那种环境下「拒绝」成立、
+    /// 「文案是自身」不成立 —— 曾因只断言「自身」文案，在 Linux/macOS 的 CI 上
+    /// 失败（那不是缺陷）。所以这里：跨平台断言「必须拒绝」，文案按平台放宽。
     #[test]
     fn kill_refuses_to_kill_itself() {
         // 自己占住端口，然后尝试「清理」它 —— 必须被拒绝，
@@ -3660,13 +4819,34 @@ mod tests {
             err.contains("自身") || err.contains("停止网关"),
             "Windows 上错误文案应说明是自身/应走停止网关，实际: {err}"
         );
+        // 非 Windows：认出来了就必须说「自身」；没认出来（本机无 lsof）时
+        // 允许退化为「无法识别」—— 但两种情况都**不能**是成功。
         #[cfg(not(windows))]
         assert!(
-            err.contains("无法识别"),
-            "非 Windows 平台应因「未实现占用者查询」而拒绝，实际: {err}"
+            err.contains("自身") || err.contains("无法识别"),
+            "非 Windows 上错误文案应是「自身」或（无 lsof 时）「无法识别」，实际: {err}"
         );
 
         drop(listener);
+    }
+
+    /// 端口被占用但**查不到占用者**时，`kill_port_holder` 必须明确失败，
+    /// 绝不能让前端以为清理成功了。
+    ///
+    /// 这里直接测 is_err 的那条分支语义：用一个必然被占用、但不可能被任何
+    /// 实现识别出的端口是做不到的，因此改为验证「错误文案里带可操作提示」。
+    #[test]
+    fn kill_failure_message_carries_actionable_hint() {
+        // 用一个必然空闲的端口触发「空闲」分支是另一条测试；这里针对的是
+        // 「无法识别」分支的文案本身（它由 port_holder_manual_hint 提供）。
+        // 直接调用被 kill_port_holder 复用的那个函数，保证两边不会漂移。
+        let hint = port_holder_manual_hint(59_876);
+        assert!(
+            hint.contains("59") || hint.contains("59876"),
+            "提示应包含端口信息，实际: {hint}"
+        );
+        // 关键：提示不能是空串 —— 空串会让前端弹出一个没有任何信息的错误框
+        assert!(!hint.trim().is_empty(), "无法识别时必须给出可操作的提示");
     }
 
     // -----------------------------------------------------------------------

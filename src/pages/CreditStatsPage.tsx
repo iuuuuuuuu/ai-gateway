@@ -36,6 +36,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSepara
 import * as api from "@/lib/api";
 import { getStackedSegmentVisualLayout } from "@/lib/stacked-bar-visuals";
 import type {
+  CreditComparison,
   CreditExpiry,
   CreditOfficialUsage,
   CreditOfficialUsageAccount,
@@ -101,6 +102,67 @@ function formatChartDate(date: string): string {
 
 function accountLabel(account: { accountName?: string | null; accountId: string }): string {
   return account.accountName || account.accountId;
+}
+
+/**
+ * 「与上次快照做差」结果的展示规则 —— **本页所有总量展示的唯一入口**。
+ *
+ * 为什么必须收敛成一个函数：这个口径有三态（可信 / 无基准 / 不可信）
+ * 加一个正交的「陈旧」标志，散落在各卡片里各写一遍 `ok ? ... : "—"`
+ * 迟早会出现「这张卡片显示 0、那张显示 —」的自相矛盾。
+ *
+ * 三条规则（都对应所有者点名的边界）：
+ *  1. `ok === false` → 显示「—」，**绝不显示 0**。0 会被读成「这段时间没消耗」，
+ *     而事实是「我们不知道」（首次运行还没有上次快照 / 读数不完整）。
+ *  2. 消耗与发放**分开表达**。只给净额的话，「烧了 100 又发了 50」会被
+ *     显示成「消耗 50」，用户以为只烧了 50 —— 这正是旧口径被抱怨的形态。
+ *  3. 必须能说出差值覆盖的是**哪段时间**，否则「消耗 380」无从核对。
+ */
+function comparisonDisplay(comparison: CreditComparison | undefined): {
+  /** 主数值文案；无基准时为「—」。 */
+  value: string;
+  /** 副标题：说清区间或不可用的原因。 */
+  caption: string;
+  /** 是否是一份可信的数值（决定配色）。 */
+  usable: boolean;
+} {
+  if (!comparison || !comparison.ok) {
+    // 不可用时的文案要区分原因：无基准 = 等下一次采集；
+    // 不可信 = 上游这次读数不完整，下次读数恢复正常即可。
+    const caption =
+      comparison?.reason === "unreliable"
+        ? "上游读数不完整，本区间无法给出可信差值"
+        : "暂无对比基准（需要至少两次成功采集）";
+    return { value: "—", caption, usable: false };
+  }
+
+  const parts: string[] = [];
+  if (comparison.decrease > 0) parts.push(`消耗 ${formatCredits(comparison.decrease)}`);
+  // 发放单独成句，且明确写「非消耗」—— 否则用户会把它和消耗混在一起看。
+  if (comparison.increase > 0) parts.push(`发放 ${formatCredits(comparison.increase)}`);
+  if (parts.length === 0) parts.push("无变化");
+
+  return {
+    value: parts.join(" · "),
+    caption: comparisonCaption(comparison),
+    usable: true,
+  };
+}
+
+/**
+ * 差值区间的说明文案。
+ *
+ * 为什么一定要写出来：这个差值覆盖的是「上次快照 → 本次快照」，
+ * 而**不是**「今天」或「本月」。用户拿它跟官方账单对不上时，
+ * 第一件要确认的就是「这个数字算的是哪一段」。
+ */
+function comparisonCaption(comparison: CreditComparison): string {
+  const window =
+    comparison.fromTs != null && comparison.toTs != null
+      ? `${formatDateTime(comparison.fromTs)} 至 ${formatDateTime(comparison.toTs)}`
+      : "最近两次采集之间";
+  // stale 与 ok 正交：数值可信但已经不反映「此刻」，必须如实标注而不丢弃。
+  return comparison.stale ? `${window}（数据截至上次采集）` : window;
 }
 
 /**
@@ -295,6 +357,71 @@ function StatMetric({
         {value}
       </div>
     </div>
+  );
+}
+
+/**
+ * 「与上次快照做差」卡片。
+ *
+ * 为什么需要这张卡片（所有者原话）：
+ * 「关于积分消耗并不准确，其实只要对比上次积分快照，就能看到完整的积分变化了，
+ *   我想了想还是这个靠谱」。
+ *
+ * 逐事件累加必须为每一笔扣减**猜一个归属**，一旦上游某次返回的包列表不完整，
+ * 就会把「没读到的包」算成消耗（实测出现过 `-380` / `+380` 的幻影配对）。
+ * 快照做差不需要猜：`本次余额 − 上次余额` 就是这段区间的净变化。
+ *
+ * 三条呈现规则见 `comparisonDisplay`；这里只负责把它们摆到界面上。
+ */
+function SnapshotComparisonCard({ comparison }: { comparison?: CreditComparison }) {
+  const display = comparisonDisplay(comparison);
+  const accounts = comparison?.accounts ?? 0;
+
+  return (
+    <section className="min-w-0 space-y-2.5" aria-labelledby="snapshot-comparison-title">
+      <div className="px-1">
+        <h2 id="snapshot-comparison-title" className="text-[13px] font-medium leading-5">
+          与上次快照的变化
+        </h2>
+      </div>
+      <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
+        <CardHeader className="gap-1 border-b px-4 py-3 sm:px-5">
+          <CardDescription className="text-xs">
+            余额做差：本次采集的余额减去上一次采集的余额。不需要猜测每笔扣减的归属，
+            因此不会出现「读数不完整被当成消耗」的幻影记录。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="min-w-0 px-4 py-4 sm:px-5">
+          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+            <span
+              data-slot="credit-comparison-value"
+              className={`text-[22px] font-semibold leading-7 tabular-nums ${
+                display.usable ? "text-foreground" : "text-muted-foreground"
+              }`}
+            >
+              {display.value}
+            </span>
+            {display.usable && accounts > 0 && (
+              <span className="text-xs text-muted-foreground">（{accounts} 个账号）</span>
+            )}
+          </div>
+          {/*
+            区间必须写在界面上：这个差值覆盖的是「上次快照 → 本次快照」，
+            不是「今天」也不是「本月」。不写清，用户拿它对不上官方账单时
+            无从判断是口径不同还是算错了 —— 这正是所有者抱怨「不准确」的一部分。
+          */}
+          <p data-slot="credit-comparison-caption" className="mt-2 text-xs text-muted-foreground">
+            {display.caption}
+          </p>
+          {display.usable && (comparison?.net ?? 0) !== 0 && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              净变化 {comparison && comparison.net > 0 ? "+" : ""}
+              {formatCredits(comparison?.net)}（发放与消耗相抵后的结果）
+            </p>
+          )}
+        </CardContent>
+      </Card>
+    </section>
   );
 }
 
@@ -1375,6 +1502,22 @@ export default function CreditStatsPage() {
               />
             </CardContent>
           </Card>
+
+          {/*
+            「与上次快照做差」——本次改动新增的**汇总口径**卡片，刻意放在总览正下方。
+
+            为什么它要单独成卡、而不并进上面那四个格子：
+            上面那四个是「时间窗切分」（今日 / 近 7 天 / 本月），靠逐事件累加得出；
+            这一张是「末次快照 − 上次快照」的实测差值，覆盖的是**两次采集之间**，
+            与自然日边界无关。混进同一行会让用户以为「今日消耗」和它是一回事，
+            从而在两者对不上时不知道该信哪个。分开摆、各自标清区间，才不误导。
+
+            为什么用 `stats.comparison` 而不是 official：
+            官方用量接口给的是**逐请求**的 credit 明细（另一个数据源），
+            而这一张要回答的是「本地观察到的余额变化是多少」——
+            它正是官方数据不可用、或用户想核对官方数字时的交叉验证依据。
+          */}
+          <SnapshotComparisonCard comparison={stats.comparison} />
 
           {!official && !stats.coverageStartAt && stats.events.some((event) => event.kind === "checkin") && (
             <Alert>

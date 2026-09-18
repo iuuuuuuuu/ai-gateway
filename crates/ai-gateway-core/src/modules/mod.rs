@@ -26,6 +26,9 @@ pub mod gateway;
 pub mod gateway_embed;
 // 数据目录迁移（~/.ai-gateway → ~/.wb-switch，复制式、幂等）
 pub mod migrate_store;
+// 模型计费真值（哪些模型在哪个区域免费）：判定依据是上游 /v3/config 的
+// credits 倍率，经 Go 网关 /v1/models/regions 按区域透出，**不硬编码清单**。
+pub mod model_billing;
 pub mod oauth;
 pub mod official_usage;
 pub mod process;
