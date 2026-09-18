@@ -85,7 +85,10 @@ impl ParsedQuota {
                 }
             }
         }
-        for item in self.items.iter().take(4 - parts.len().min(4)) {
+        // 剩余名额：`parts` 最多 4 项，用 saturating_sub 保证不为负。
+        // 早期写成 `4 - parts.len().min(4)`，当窗口数 ≥4 时结果恒为 0，
+        // 兜底项永远进不来（虽然 items 与 windows 通常互斥，但不该靠这个前提）。
+        for item in self.items.iter().take(4usize.saturating_sub(parts.len())) {
             let name = item.get("name").and_then(Value::as_str).unwrap_or("额度");
             if let (Some(left), Some(total)) = (
                 item.get("left").and_then(Value::as_f64),

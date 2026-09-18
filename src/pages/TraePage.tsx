@@ -643,7 +643,8 @@ export default function TraePage() {
                   <CardHeader className="pb-3">
                     <CardTitle className="text-base">本机发现</CardTitle>
                     <CardDescription>
-                      uid 由客户端使用痕迹推导。标记为「无法确认」的候选**不会**入池 ——
+                      uid 由客户端使用痕迹推导。标记为「无法确认」的候选
+                      <strong className="text-foreground">不会</strong>入池 ——
                       它的 uid 属于账户中心编号体系，与账号库不是同一套编号。
                     </CardDescription>
                   </CardHeader>

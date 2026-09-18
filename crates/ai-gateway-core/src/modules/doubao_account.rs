@@ -293,10 +293,27 @@ pub fn apply_credential(
             let sg = sg.trim();
             if sg.is_empty() {
                 obj.insert("sid_guard".to_string(), Value::Null);
-            } else {
-                obj.insert("sid_guard".to_string(), json!(sg));
-                // 换了新凭证，旧的过期判定作废
                 obj.insert("session_expire_at".to_string(), Value::Null);
+            } else {
+                // 只有 sid_guard **确实变了**才作废旧的过期判定。
+                //
+                // 早期实现无条件清空，导致「改个备注点保存」也会把 `session_expire_at`
+                // 抹掉 —— 界面上的「会话到期」整行随之消失，而且这条路径上没有任何
+                // 地方会把它重新算回来（`parse_sid_guard` 只在续期拿到新 guard 时才写），
+                // 于是过期时间会一直空到下次服务端下发新 guard 为止。
+                let changed = obj.get("sid_guard").and_then(Value::as_str) != Some(sg);
+                obj.insert("sid_guard".to_string(), json!(sg));
+                if changed {
+                    // 服务端给了新 guard 但没给新 sessionid 时，过期时间可由 guard 自算
+                    match crate::modules::doubao_session::parse_sid_guard(sg) {
+                        Some(expire) => {
+                            obj.insert("session_expire_at".to_string(), json!(expire));
+                        }
+                        None => {
+                            obj.insert("session_expire_at".to_string(), Value::Null);
+                        }
+                    }
+                }
             }
         }
         // ttwid 只在显式给值时才覆盖（抓包可能没带 ttwid，清掉会让对话导出失效）
@@ -495,6 +512,50 @@ mod tests {
         apply_credential("123456", Some("sid-2"), None, None, "manual", true).unwrap();
         let acc = find_account("123456").unwrap();
         assert_eq!(acc["ttwid"], "tw-1", "未提供 ttwid 时不得清掉原值");
+    }
+
+    #[test]
+    fn 重复提交同一_sid_guard_不清掉会话到期时间() {
+        // 回归：早期实现只要 sid_guard 非空就无条件把 `session_expire_at` 置空。
+        // 于是「改个备注点保存」也会让界面上的「会话到期」整行消失，
+        // 而且没有任何路径会把它算回来（只有续期拿到新 guard 时才写）。
+        let _iso = Isolated::new("guard-expire");
+        upsert_account("123456", None, None, true).unwrap();
+
+        let guard = "abc|1767225600|2592000";
+        apply_credential("123456", Some("sid-1"), Some(guard), None, "manual", true).unwrap();
+        let expire = find_account("123456").unwrap()["session_expire_at"]
+            .as_str()
+            .map(str::to_string);
+        assert!(
+            expire.is_some(),
+            "首次写入 sid_guard 时应由 guard 算出会话到期时间"
+        );
+
+        // 再次提交**同一个** guard（模拟只改备注后保存）→ 到期时间必须保留
+        apply_credential("123456", Some("sid-1"), Some(guard), None, "manual", true).unwrap();
+        assert_eq!(
+            find_account("123456").unwrap()["session_expire_at"]
+                .as_str()
+                .map(str::to_string),
+            expire,
+            "sid_guard 未变化时不得清掉会话到期时间"
+        );
+
+        // guard 真的换了 → 到期时间随新 guard 重算
+        let new_guard = "def|1767225600|86400";
+        apply_credential("123456", Some("sid-1"), Some(new_guard), None, "manual", true).unwrap();
+        let new_expire = find_account("123456").unwrap()["session_expire_at"]
+            .as_str()
+            .map(str::to_string);
+        assert!(new_expire.is_some());
+        assert_ne!(new_expire, expire, "换 guard 后到期时间应重算");
+
+        // 显式清空 guard → 到期时间也清空
+        apply_credential("123456", Some("sid-1"), Some(""), None, "manual", true).unwrap();
+        let acc = find_account("123456").unwrap();
+        assert!(acc["sid_guard"].is_null());
+        assert!(acc["session_expire_at"].is_null());
     }
 
     #[test]

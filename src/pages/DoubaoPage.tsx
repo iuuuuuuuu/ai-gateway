@@ -203,6 +203,9 @@ export default function DoubaoPage() {
   const [editGuard, setEditGuard] = useState("");
   const [editTtwid, setEditTtwid] = useState("");
   const [isNew, setIsNew] = useState(false);
+  // 编辑已有账号时，凭证是否已成功回填。未回填（读取失败）时禁止保存凭证区，
+  // 否则空串会被后端当成「清除凭证」。
+  const [credPrefilled, setCredPrefilled] = useState(false);
 
   // 抓包凭证轮询的请求序号：慢响应回来时若已过期就丢弃，
   // 否则会把旧数据盖在新状态上。
@@ -269,6 +272,7 @@ export default function DoubaoPage() {
     setEditSession("");
     setEditGuard("");
     setEditTtwid("");
+    setCredPrefilled(true);
     setEditOpen(true);
   };
 
@@ -277,6 +281,7 @@ export default function DoubaoPage() {
     setEditUid(account.userId);
     setEditName(account.name ?? "");
     setEditNote(account.note ?? "");
+    setCredPrefilled(false);
     setEditOpen(true);
     const seq = ++editFillSeqRef.current;
     try {
@@ -287,12 +292,17 @@ export default function DoubaoPage() {
       setEditSession(cred.sessionId ?? "");
       setEditGuard(cred.sidGuard ?? "");
       setEditTtwid(cred.ttwid ?? "");
+      setCredPrefilled(true);
     } catch (e) {
       if (seq !== editFillSeqRef.current) return;
       toast.error(api.asError(e));
+      // **不能**把字段清空后当作用户输入保存：后端把空串解释为「清除凭证」，
+      // 一次读取失败再点保存就会把好账号的 sessionid/sid_guard 抹掉。
+      // 这里保持空白并锁住凭证区，强制用户显式重填或改从抓包填充。
       setEditSession("");
       setEditGuard("");
       setEditTtwid("");
+      setCredPrefilled(false);
     }
   };
 
@@ -308,6 +318,8 @@ export default function DoubaoPage() {
       setEditSession(captured.sessionId ?? "");
       setEditGuard(captured.sidGuard ?? "");
       setEditTtwid(captured.ttwid ?? "");
+      // 抓包填充是可用的凭证来源，解除「读取失败」的保存锁
+      setCredPrefilled(true);
       toast.success(
         `已填入抓包凭证${captured.uid ? `（账号 ${captured.uid}）` : ""}${
           captured.capturedAt ? `，抓取于 ${captured.capturedAt}` : ""
@@ -322,6 +334,12 @@ export default function DoubaoPage() {
   const saveAccount = async () => {
     if (!editUid.trim()) {
       toast.error("请填写账号标识");
+      return;
+    }
+    // 凭证未成功回填时只允许改昵称/备注，绝不提交凭证 ——
+    // 后端的空串语义是「清除凭证」，提交空白会把好账号的凭证抹掉。
+    if (!credPrefilled) {
+      toast.error("凭证未能读取，请点「从代理抓包填充」或手动填入后再保存（留空会清除凭证）");
       return;
     }
     setBusy(true);
@@ -756,6 +774,16 @@ export default function DoubaoPage() {
                   从代理抓包填充
                 </Button>
               </div>
+              {!credPrefilled && (
+                <Alert variant="destructive">
+                  <AlertTriangle className="size-4" />
+                  <AlertTitle>凭证未能读取</AlertTitle>
+                  <AlertDescription>
+                    已在下方清空。<strong className="text-foreground">空值提交会清除该账号的凭证</strong>
+                    ，请先点「从代理抓包填充」或手动填入后再保存。
+                  </AlertDescription>
+                </Alert>
+              )}
               <div className="space-y-1.5">
                 <Label htmlFor="db-session">sessionid</Label>
                 <Input
