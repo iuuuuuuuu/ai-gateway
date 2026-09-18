@@ -18,6 +18,7 @@ package upstream
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -107,6 +108,90 @@ func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID stri
 	}
 	// 走 billingBase（国服 = codebuddy.cn，国际版 = workbuddy.ai），
 	// 与 travel 的 growthJSON（chatBase）分属两个域，不可混用。
+	_, err = c.billingJSON(a, http.MethodPost, reportPath, json.RawMessage(raw))
+	return err
+}
+
+// SchoolSeasonActivityID 开学季/校园日活动的关联 id。
+//
+// 事件带上它才会被归到该活动；不带则**不计分**（上游实测）。
+const SchoolSeasonActivityID = "school_open_day_2026"
+
+// miniChatRequestEvent 小程序（微信容器）指纹的 chat_request_send 事件。
+//
+// 与桌面版 chatRequestEvent 的差异（都来自实测的上游小程序客户端形状）：
+//
+//	source     = "mini_program"     ← 服务端据此判定来自小程序
+//	ideName    = "wx_app_cloud"
+//	ideType    = "WorkBuddy_MP"
+//	extName    = "workbuddy-mp"     ← 关键指纹，缺了不计分
+//	extVersion = "SaaS"
+//	mode       = "chat"
+//	activityId = school_open_day_2026
+//
+// 桌面版那套字段（requestModelId / agentName / traceId 等）小程序**不发**，
+// 因此这里刻意用独立结构体而不是给 chatRequestEvent 加字段 —— 后者会让桌面版
+// 也带上小程序字段，把两种指纹混成一个（上游会看出异常）。
+type miniChatRequestEvent struct {
+	EventCode           string `json:"eventCode"`
+	Timestamp           int64  `json:"timestamp"`
+	ReportDelay         int    `json:"reportDelay"`
+	Source              string `json:"source"`
+	IDEName             string `json:"ideName"`
+	IDEType             string `json:"ideType"`
+	ExtName             string `json:"extName"`
+	ExtVersion          string `json:"extVersion"`
+	Mode                string `json:"mode"`
+	ConversationID      string `json:"conversationId"`
+	RequestID           string `json:"requestId"`
+	InputLength         int    `json:"inputLength"`
+	ActivityID          string `json:"activityId"`
+	MentionContexts     []any  `json:"mentionContexts"`
+	MentionContextCount int    `json:"mentionContextCount"`
+	UserID              string `json:"userId"`
+}
+
+// ReportSchoolSeasonActivity 发一条小程序指纹的对话事件，点亮「校园日」任务。
+//
+// 为什么必须用小程序指纹而不是复用桌面版上报：实测（2026-09-18，真实账号）
+// 桌面版形状的事件发出去 HTTP 200 但 growth 域进度**恒为 0**；
+// 换成这套小程序指纹 + activityId 后 current 从 0 变 1、accept_status 变 completed、
+// claim 成功到账 100 积分 + 5 能量。
+//
+// 域的选择：report 走 billingBase（codebuddy.cn），与 account_records 一致 ——
+// 上游小程序的 /v2/report 也在这个域。
+//
+// 一个重要陷阱（本次踩过）：**回读时必须带身份头**（X-User-Id / X-Domain，
+// 由 BillingHeaders 提供）。缺这两个头时查询接口照样返回 200，但返回的是
+// 「不带身份」的口径 —— 进度永远显示 0，让人误以为事件没生效。
+// 本函数只负责上报；调用方回读请走 GrowthTask 查询（那里已带身份头）。
+func (c *Client) ReportSchoolSeasonActivity(a *auth.Auth, conversationID string) error {
+	if conversationID == "" {
+		conversationID = fmt.Sprintf("wb-run-%d", time.Now().UnixMilli())
+	}
+	now := time.Now().UnixMilli()
+	ev := miniChatRequestEvent{
+		EventCode:           "chat_request_send",
+		Timestamp:           now,
+		ReportDelay:         0,
+		Source:              "mini_program",
+		IDEName:             "wx_app_cloud",
+		IDEType:             "WorkBuddy_MP",
+		ExtName:             "workbuddy-mp",
+		ExtVersion:          "SaaS",
+		Mode:                "chat",
+		ConversationID:      conversationID,
+		RequestID:           conversationID,
+		InputLength:         12,
+		ActivityID:          SchoolSeasonActivityID,
+		MentionContexts:     []any{},
+		MentionContextCount: 0,
+		UserID:              a.UID,
+	}
+	raw, err := json.Marshal([]miniChatRequestEvent{ev})
+	if err != nil {
+		return err
+	}
 	_, err = c.billingJSON(a, http.MethodPost, reportPath, json.RawMessage(raw))
 	return err
 }

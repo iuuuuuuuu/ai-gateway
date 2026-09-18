@@ -53,6 +53,13 @@ const (
 	TaskAcceptAccepted = "accepted"
 	// TaskAcceptInProgress 已报名且进度已大于 0。
 	TaskAcceptInProgress = "in_progress"
+	// TaskAcceptCompleted 进度已达标、尚未领奖。
+	//
+	// 实测（2026-09-18，校园日任务）：进度到 target 后 accept_status 变成
+	// completed，此时 claim 才会成功。它与 in_progress 的区别是「够不够领」——
+	// 只看 progress.current >= target 也能判断，但**状态字段更权威**：
+	// 上游可能下发 current<target 却已是 completed（如期数型任务的口径差异）。
+	TaskAcceptCompleted = "completed"
 	// TaskAcceptClaimed 奖励已领取。
 	TaskAcceptClaimed = "claimed"
 )
@@ -195,8 +202,12 @@ type growthTaskWire struct {
 //（first_chat / skill_installed / ...，无奖励字段、无 progress），
 // 本函数的解析对两套形状都成立，但调用方应据 realm 决定是否推进
 //（国际版没有可领的成长任务奖励，见 growtask.Runner 的区域过滤）。
+//
+// **走 growthJSONNoUA**：上游按 User-Agent 裁剪任务清单，而 Go 的 net/http
+// 会自动补 `Go-http-client/1.1`，导致「小程序限定」的 school_season 与
+// Sequential_Tasks_1 被过滤掉（18 项而非 20 项）。实测详见 growthJSONNoUA 的注释。
 func (c *Client) ListGrowthTasks(a *auth.Auth) ([]GrowthTask, error) {
-	data, err := c.growthJSON(a, http.MethodGet, growthTasksListPath, nil)
+	data, err := c.growthJSONNoUA(a, http.MethodGet, growthTasksListPath, nil)
 	if err != nil {
 		return nil, err
 	}

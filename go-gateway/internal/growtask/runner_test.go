@@ -258,8 +258,7 @@ func (f *fakeUpstream) roundTrip(r *http.Request) (*http.Response, error) {
 			// 让 chat_request_send / 对话链的上报真的推进进度，
 			// 以便端到端验证「上报 → 计分 → 领奖」闭环。
 			for _, ev := range arr {
-				code, _ := ev["eventCode"].(string)
-				f.applyEvent(code)
+				f.applyEvent(ev)
 			}
 		}
 		f.reports[path]++
@@ -300,7 +299,12 @@ func (f *fakeUpstream) roundTrip(r *http.Request) (*http.Response, error) {
 //
 // scoreDelayListCalls > 0 时进度不立即生效，而是变成"待落定"，
 // 由后续的列表查询在到点时提交 —— 这就是真实上游的异步计分行为。
-func (f *fakeUpstream) applyEvent(code string) {
+//
+// 入参是**整个事件**而非只 eventCode：校园日（school_season）与桌面版
+// chat_request_send 的 eventCode 相同，靠指纹字段（source/extName）与
+// activityId 区分 —— 只传 code 就复刻不出「桌面事件不计分」这个实测语义。
+func (f *fakeUpstream) applyEvent(ev map[string]any) {
+	code, _ := ev["eventCode"].(string)
 	set := func(taskCode string, current int64) {
 		if f.scoreDelayListCalls > 0 {
 			f.pendingProgress[taskCode] = current
@@ -319,6 +323,21 @@ func (f *fakeUpstream) applyEvent(code string) {
 				next = t.target
 			}
 			set("chat_5", next)
+		}
+	}
+	// school_season：只有**小程序指纹 + activityId** 才计分。
+	//
+	// 这是对真实上游的复刻（2026-09-18 实测）：桌面版形状的事件发到同一端点
+	// 返回 200 但进度恒为 0；必须 source=mini_program、extName=workbuddy-mp
+	// 且带 activityId=school_open_day_2026 才点亮。
+	// 若把这里放宽成「只看 eventCode」，就会让「误用桌面指纹」的实现也通过测试 ——
+	// 那正是本次要锁住的回归。
+	if t := f.tasks["school_season"]; t != nil {
+		src, _ := ev["source"].(string)
+		ext, _ := ev["extName"].(string)
+		act, _ := ev["activityId"].(string)
+		if src == "mini_program" && ext == "workbuddy-mp" && act == upstream.SchoolSeasonActivityID {
+			set("school_season", t.target)
 		}
 	}
 	// 对话成功回执点亮 RichMeow_Chat。
@@ -733,8 +752,14 @@ func TestAccountLock(t *testing.T) {
 	}
 }
 
-// TestSupportedCodesMatchActionTable 动作表与需求里的任务清单一致：
-// 17 个可自动任务 + 1 个不可自动。
+// TestSupportedCodesMatchActionTable 动作表与需求里的任务清单一致。
+//
+// 这个断言是**刻意的双向守卫**：既防漏实现（需求点名的没做），
+// 也防多实现（表里冒出没人要求、也没被测过的任务）——
+// 后者比漏实现更危险：多出来的动作会在「一键完成」里被执行，
+// 而它可能伪造了不该伪造的行为。
+//
+// 因此**新增动作时必须同时在这里加上 code**，并补一个覆盖它的用例。
 func TestSupportedCodesMatchActionTable(t *testing.T) {
 	codes := SupportedCodes()
 	if len(codes) != len(actions) {
@@ -746,6 +771,11 @@ func TestSupportedCodesMatchActionTable(t *testing.T) {
 		"Buddy_App", "Buddy_App_QQ", "automation_1", "Library_read", "template_5",
 		"playbook_prompt", "expert_5", "Expert_team_use_3", "Hp_Appearance",
 		"Expert_lighthouse", "skill_1", "black_cat",
+		// 校园日（限时活动，growth 域下发但判据在 school 域：
+		// 需小程序指纹 + activityId 才计分，见 runSchoolSeason 的注释）。
+		// 活动 2026-09-24 截止；它过期后上游不再下发该 code，
+		// RunOne 会走「该账号没有此任务」分支，动作表留着无害。
+		"school_season",
 	}
 	have := map[string]bool{}
 	for _, c := range codes {
@@ -757,7 +787,7 @@ func TestSupportedCodesMatchActionTable(t *testing.T) {
 		}
 	}
 	if len(have) != len(want) {
-		t.Errorf("动作表有多余任务: have=%d want=%d", len(have), len(want))
+		t.Errorf("动作表多余或缺少任务: have=%d want=%d（新增动作请同步更新本清单）", len(have), len(want))
 	}
 	// 不可自动的任务**不能**出现在动作表里。
 	if actionFor("Expert_Philanthropy") != nil {
@@ -946,5 +976,96 @@ func TestReportPayloadIsEventArray(t *testing.T) {
 	// 桌面指纹必须被注入。
 	if events[0]["extName"] != "workbuddy-desktop" {
 		t.Errorf("缺少桌面指纹 extName, got %v", events[0]["extName"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// school_season（校园日）
+// ---------------------------------------------------------------------------
+
+// TestSchoolSeasonSendsMiniFingerprintWithActivityID 校园日事件必须是
+// **小程序指纹 + activityId**。
+//
+// 实测背景（2026-09-18，真实账号）：桌面版形状的 chat_request_send 发到同一端点
+// 返回 HTTP 200，但 growth 域进度**恒为 0**；换成小程序指纹后 current 0→1、
+// accept_status 变 completed、claim 到账 100 积分 + 5 能量。
+//
+// 所以这条断言锁的是「别为了图省事复用桌面版上报」——
+// 复用会让任务永远停在 0/1，而且**不报错**（最难排查的一类）。
+func TestSchoolSeasonSendsMiniFingerprintWithActivityID(t *testing.T) {
+	f := newFakeUpstream().add("school_season", 0, 1, upstream.TaskAcceptAccepted)
+	r := testRunner(f)
+
+	item := r.RunOne(context.Background(), testAuth(), "school_season")
+	if item.Status != StatusDone {
+		t.Fatalf("status=%s msg=%s", item.Status, item.Message)
+	}
+
+	// 找到那条上报，逐字段核对指纹。
+	var ev map[string]any
+	for _, batch := range f.reportBodies {
+		for _, e := range batch {
+			if e["eventCode"] == "chat_request_send" {
+				ev = e
+			}
+		}
+	}
+	if ev == nil {
+		t.Fatal("没有发出 chat_request_send 事件")
+	}
+
+	checks := map[string]any{
+		"source":     "mini_program",
+		"ideName":    "wx_app_cloud",
+		"ideType":    "WorkBuddy_MP",
+		"extName":    "workbuddy-mp",
+		"extVersion": "SaaS",
+		"mode":       "chat",
+		"activityId": upstream.SchoolSeasonActivityID,
+	}
+	for k, want := range checks {
+		if got := ev[k]; got != want {
+			t.Errorf("事件字段 %s = %v，want %v（小程序指纹缺一不可）", k, got, want)
+		}
+	}
+	// userId 必须带：缺它服务端返回 200 但静默丢弃（与桌面版上报同一个坑）。
+	if got, _ := ev["userId"].(string); got == "" {
+		t.Error("事件缺 userId —— 服务端会静默丢弃")
+	}
+	// **不得**混入桌面版字段：两种指纹混用会被上游看出异常。
+	for _, k := range []string{"agentName", "traceId", "requestModelId"} {
+		if _, ok := ev[k]; ok {
+			t.Errorf("小程序事件不该带桌面版字段 %s", k)
+		}
+	}
+}
+
+// TestSchoolSeasonProgressesAndClaims 端到端：上报 → 计分 → 可领。
+func TestSchoolSeasonProgressesAndClaims(t *testing.T) {
+	f := newFakeUpstream().add("school_season", 0, 1, upstream.TaskAcceptAccepted)
+	r := testRunner(f)
+
+	item := r.RunOne(context.Background(), testAuth(), "school_season")
+	if item.Status != StatusDone {
+		t.Fatalf("上报应成功，实际 status=%s msg=%s", item.Status, item.Message)
+	}
+	// 假上游按真实语义计分：只有小程序指纹 + activityId 才会推进。
+	if t2 := f.tasks["school_season"]; t2 == nil || t2.current < t2.target {
+		t.Fatalf("上报后进度未达标：%+v", t2)
+	}
+}
+
+// TestSchoolSeasonSkipsWhenAlreadyDone 已达标时不重复上报（幂等）。
+func TestSchoolSeasonSkipsWhenAlreadyDone(t *testing.T) {
+	f := newFakeUpstream().add("school_season", 1, 1, upstream.TaskAcceptCompleted)
+	r := testRunner(f)
+
+	before := len(f.reportBodies)
+	item := r.RunOne(context.Background(), testAuth(), "school_season")
+	if item.Status != StatusDone {
+		t.Fatalf("status=%s", item.Status)
+	}
+	if got := len(f.reportBodies) - before; got != 0 {
+		t.Errorf("已达标不该再上报，实际发了 %d 批", got)
 	}
 }

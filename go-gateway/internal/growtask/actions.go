@@ -80,6 +80,10 @@ var actions = []action{
 	{Code: "playbook_prompt", Desc: "上报灵感案例「做同款」发送事件组", run: runPlaybookPrompt},
 	{Code: "create_canvas", Desc: "上报设计创意画布创建事件组", run: runCreateCanvas},
 	{Code: "Hp_Appearance", Desc: "设置主题并上报皮肤生效事件", run: runAppearance},
+	// school_season（校园日）：growth 域任务，但判据是 **school 域 activityId 关联** ——
+	// 必须发小程序指纹（mini_program / workbuddy-mp）+ activityId 才计分。
+	// 挂在 C 类之前是因为它零对话消耗（纯事件上报）。
+	{Code: "school_season", Desc: "上报校园日活动对话事件（小程序指纹 + activityId）", run: runSchoolSeason},
 
 	// ---- B 类：真实对话（消耗 token） ----
 
@@ -162,6 +166,57 @@ func runChat5(r *Runner, ctx context.Context, a *auth.Auth, before *upstream.Gro
 		}
 	}
 	return fmt.Sprintf("已补报 %d 条对话活跃事件", need), nil
+}
+
+// runSchoolSeason 「校园日」活动任务（school_season）。
+//
+// 这是 growth 域下发的任务，但**判据在 school 域**：发一条带
+// activityId=school_open_day_2026 的**小程序指纹**对话事件即点亮（target=1）。
+//
+// 为什么不能复用 runChat5 的 ReportChatActivity（桌面版指纹）：
+// 实测（2026-09-18，真实账号）桌面版形状的事件发出去 HTTP 200，但
+// growth 域进度**恒为 0**；换小程序指纹后 current 从 0 变 1、
+// accept_status 变 completed、claim 到账 100 积分 + 5 能量。
+// 两者差别就在 source/ideName/ideType/extName/mode 这几个指纹字段上。
+//
+// 与其它动作一样，**只发一次**（target=1，按差额补足），不循环刷。
+func runSchoolSeason(r *Runner, ctx context.Context, a *auth.Auth, before *upstream.GrowthTask) (string, error) {
+	if before == nil {
+		return "", errors.New("任务不存在")
+	}
+	target := before.Target
+	if target <= 0 {
+		// 未报名时上游不下发 progress；RunOne 已先报名，这里兜底为 1。
+		target = 1
+	}
+	need := target - before.Current
+	if need <= 0 {
+		return "进度已达标，无需上报", nil
+	}
+
+	sent := int64(0)
+	for i := int64(0); i < need; i++ {
+		cid := fmt.Sprintf("wb-run-%d-%d", time.Now().UnixMilli(), i)
+		if err := r.up.ReportSchoolSeasonActivity(a, cid); err != nil {
+			// 部分成功如实汇报：已发的那些条可能已经计分，
+			// 返回 error 会让调用方跳过回读，连已达标的进度都发现不了。
+			return fmt.Sprintf("已上报 %d/%d 条后中断: %v", sent, need, err), nil
+		}
+		sent++
+		if i < need-1 {
+			if err := sleepCtx(ctx, r.reportGap); err != nil {
+				return fmt.Sprintf("已上报 %d/%d 条（本轮被取消）", sent, need), nil
+			}
+		}
+	}
+
+	// 服务端归账需要一点时间：实测上报后**立即回读仍可能是 0/1**，
+	// 等约 2 秒才稳定变成 1/1。睡在这里是为了让调用方的回读能拿到新进度 ——
+	// 否则会读出旧值，表现为「报了但没生效」，而实际上只是读早了。
+	if err := sleepCtx(ctx, 2*time.Second); err != nil {
+		return fmt.Sprintf("已上报 %d 条（等待归账时被取消）", sent), nil
+	}
+	return fmt.Sprintf("已上报 %d 条校园日活动事件", sent), nil
 }
 
 // runFirstBuddy 领养第一只 Buddy：上报（解锁前置）→ 同意协议 → 领养。

@@ -64,6 +64,35 @@ type TravelState struct {
 // growthJSON 发 growth 域请求并解信封；body 为 nil 时不带请求体。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
 func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	return c.growthJSONOpt(a, method, path, body, false)
+}
+
+// growthJSONNoUA 同 growthJSON，但**不发 User-Agent**。
+//
+// 为什么需要它（2026-09-18 实测，真实账号 + 逐 UA 对照）：
+// 上游按 User-Agent 判定「请求来自哪个客户端平台」，并据此过滤任务清单。
+// 我们此前所有 growth 请求都不设 UA，而 Go 的 net/http 会**自动补**
+// `Go-http-client/1.1` —— 上游把这个 UA 当作未知平台，于是把「小程序限定」的
+// 两个任务（school_season、Sequential_Tasks_1）过滤掉：只返回 18 项。
+//
+// 实测对照（同一账号、同一端点，唯一变量是 UA）：
+//
+//	Go-http-client/1.1（默认）→ 18 项，无小程序任务
+//	WorkBuddy/CLI 客户端 UA   → 18 项，无小程序任务
+//	小程序 UA                 → 10 项，含小程序任务（但少了 8 个其它任务）
+//	**不发 UA（本函数）**      → 20 项，含小程序任务 **且** 保留全部其它任务
+//
+// 也就是说「不发 UA」是唯一能拿到完整 20 项的口径。这不是绕过什么限制 ——
+// 服务端对未声明平台的请求返回的是**全量**清单，反而是声明了平台才会被按平台裁剪。
+//
+// 只对任务列表用：其它 growth 端点（签到、旅行、领奖）没有这个行为，
+// 全局去掉 UA 会改变它们的指纹，属无谓的改动面扩大。
+func (c *Client) growthJSONNoUA(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	return c.growthJSONOpt(a, method, path, body, true)
+}
+
+// growthJSONOpt growthJSON 的实现，omitUA 控制是否抑制 User-Agent。
+func (c *Client) growthJSONOpt(a *auth.Auth, method, path string, body any, omitUA bool) (json.RawMessage, error) {
 	var rdr io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -77,6 +106,13 @@ func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.R
 		return nil, err
 	}
 	BillingHeaders(req, a)
+	if omitUA {
+		// **必须用 Set("") 而不是留空**：留空时 Go 的 net/http 会自动补
+		// `Go-http-client/1.1`，正是要避开的那个值。
+		// Set("") 之后 wire 上仍会出现 `User-Agent: `（空值），实测上游对
+		// 空值 UA 与「无 UA」的处理一致（都是 20 项）。
+		req.Header.Set("User-Agent", "")
+	}
 	return c.doJSON(a, req)
 }
 
