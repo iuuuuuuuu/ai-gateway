@@ -208,6 +208,14 @@ export default function DoubaoPage() {
   // 否则会把旧数据盖在新状态上。
   const applySeqRef = useRef(0);
 
+  // 编辑弹窗三条回填路径（openEdit 的明文回填、fillFromCapture 的抓包回填）共用的
+  // 请求序号。两条路径会真并发：打开弹窗时明文凭证还在路上，用户已经点了
+  // 「从代理抓包填充」—— 先回来的那个会被后回来的整组覆盖（三个输入框是一起写的），
+  // 用户看到「已填入抓包凭证」的成功 toast，框里却是另一个账号的凭证，
+  // 点保存就把错误凭证写进该账号、原本正确的明文被覆盖丢失。
+  // 后发起的写入权更高：每次发起前自增，回来时序号不匹配就丢弃。
+  const editFillSeqRef = useRef(0);
+
   const load = useCallback(async () => {
     try {
       const [list, envStatus] = await Promise.all([
@@ -270,13 +278,17 @@ export default function DoubaoPage() {
     setEditName(account.name ?? "");
     setEditNote(account.note ?? "");
     setEditOpen(true);
+    const seq = ++editFillSeqRef.current;
     try {
       // 列表里的凭证是掩码，编辑需要明文回填
       const cred = await api.doubaoGetCredential(account.userId);
+      // 期间用户可能已经点了「从代理抓包填充」，别覆盖它填进去的值。
+      if (seq !== editFillSeqRef.current) return;
       setEditSession(cred.sessionId ?? "");
       setEditGuard(cred.sidGuard ?? "");
       setEditTtwid(cred.ttwid ?? "");
     } catch (e) {
+      if (seq !== editFillSeqRef.current) return;
       toast.error(api.asError(e));
       setEditSession("");
       setEditGuard("");
@@ -285,8 +297,10 @@ export default function DoubaoPage() {
   };
 
   const fillFromCapture = async () => {
+    const seq = ++editFillSeqRef.current;
     try {
       const captured = await api.doubaoCapturedCredential();
+      if (seq !== editFillSeqRef.current) return;
       if (!captured.available) {
         toast.info("还没有抓包凭证。请先在「设置」中开启本地代理，然后用豆包客户端访问一次。");
         return;
@@ -300,6 +314,7 @@ export default function DoubaoPage() {
         }`,
       );
     } catch (e) {
+      if (seq !== editFillSeqRef.current) return;
       toast.error(api.asError(e));
     }
   };

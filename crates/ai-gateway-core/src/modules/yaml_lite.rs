@@ -21,6 +21,7 @@ use serde_json::{Map, Value};
 pub fn parse_mapping(text: &str) -> Result<Map<String, Value>, String> {
     let lines: Vec<&str> = text
         .lines()
+        .map(strip_trailing_comment)
         .filter(|line| {
             let t = line.trim();
             !t.is_empty() && !t.starts_with('#')
@@ -215,7 +216,15 @@ fn parse_scalar(raw: &str) -> Value {
     if (t.starts_with('"') && t.ends_with('"') && t.len() >= 2)
         || (t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2)
     {
-        return Value::String(t[1..t.len() - 1].to_string());
+        let inner = &t[1..t.len() - 1];
+        // 双引号是转义形式、单引号是字面量 —— 必须与 render_string 的转义表互逆，
+        // 否则「读取→渲染→再读取」每往返一次就给值多累积一层反斜杠
+        //（`C:\x` → `C:\\x` → `C:\\\\x`），最终写回客户端的是错误的路径/凭据。
+        return Value::String(if t.starts_with('"') {
+            unescape_double(inner)
+        } else {
+            inner.to_string()
+        });
     }
     if let Ok(n) = t.parse::<i64>() {
         return Value::Number(n.into());
@@ -226,6 +235,63 @@ fn parse_scalar(raw: &str) -> Value {
         }
     }
     Value::String(t.to_string())
+}
+
+/// 反转义 render_string 写入的双引号字符串（`\\` `\"` `\n`）。
+///
+/// 必须与该函数的 replace 链严格互逆：渲染把 `\` → `\\`、`"` → `\"`、
+/// 换行 → `\n`，这里逐一还原。无法识别的转义保守地原样保留（含反斜杠），
+/// 宁可多一个字符也不要静默丢字符。
+fn unescape_double(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('n') => out.push('\n'),
+            // 非法/未知转义：原样保留（含反斜杠），避免丢字符。
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// 剥离行尾注释：`#` 前必须是行首或空白，且不在引号内。
+///
+/// 为什么必须剥：`split_key_value` 取冒号之后到行尾的全部内容作为值，注释会
+/// 一并进入。于是 `logLevel: info  # 调试用` 解析出字符串 `"info  # 调试用"`，
+/// 布尔 `true # 待验证` 变成字符串，而 `baseURL: https://x/v1 # 官方地址`
+/// 会带着注释去请求一个不存在的地址 —— 接入后请求直接失败。
+///
+/// 只认「前面是空白」的 `#`，因此 `apiKey: abc#def`（密码里的 `#` 无空格）
+/// 原样保留；引号内的 `#` 同样不算注释。按 char_indices 切分，对中文安全。
+fn strip_trailing_comment(line: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    for (i, ch) in line.char_indices() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single
+                && !in_double
+                && i > 0
+                && line.as_bytes()[i - 1].is_ascii_whitespace() =>
+            {
+                return &line[..i];
+            }
+            _ => {}
+        }
+    }
+    line
 }
 
 // ---------------------------------------------------------------------------
@@ -480,5 +546,81 @@ defaultModel: minimax/MiniMax-M3
         let rendered = render_mapping(&Value::Object(map.clone())).expect("render");
         let reparsed = parse_mapping(&rendered).expect("reparse");
         assert_eq!(Value::Object(map), Value::Object(reparsed));
+    }
+
+    /// 渲染与解析必须严格互逆：含反斜杠 / 双引号 / 换行的值往返后不得被改坏。
+    ///
+    /// 历史 bug：render_string 把 `\` → `\\`、`"` → `\"`，而 parse_scalar 只做
+    /// `t[1..len-1]` 剥壳、不做反转义，于是每「重新接入」一次就多累积一层反斜杠
+    /// （Windows 路径 `C:\x` → `C:\\x` → `C:\\\\x`），写回客户端后指向不存在的
+    /// 文件；网关 API Key 若含特殊字符则直接 401。
+    #[test]
+    fn round_trip_preserves_escapes() {
+        let value = json!({
+            "winPath": "C:\\Users\\me\\config.yaml",
+            "quoted": "he said \"hi\"",
+            "newline": "line1\nline2",
+            "loneBackslash": "\\",
+            "loneQuote": "\"",
+            "mixed": "a\\\"b",
+        });
+        let rendered = render_mapping(&value).expect("render");
+        let back = parse_mapping(&rendered).expect("reparse");
+        assert_eq!(
+            Value::Object(back.clone()),
+            value,
+            "渲染与解析必须互逆，否则每次重新接入都会改坏值：\n{rendered}"
+        );
+
+        // 再往返一次，确认稳定（不累积转义）
+        let rendered2 = render_mapping(&Value::Object(back.clone())).expect("render2");
+        let back2 = parse_mapping(&rendered2).expect("reparse2");
+        assert_eq!(back2, back, "二次往返必须仍然稳定：\n{rendered2}");
+    }
+
+    /// 单引号是字面量，不做反转义（与 YAML 规范一致）。
+    #[test]
+    fn single_quoted_is_literal() {
+        let map = parse_mapping("a: 'C:\\x'\n").expect("parse");
+        assert_eq!(map["a"], "C:\\x", "单引号内不应被反转义");
+    }
+
+    /// 行尾注释必须被剥离，否则注释会被并入值写回客户端配置。
+    ///
+    /// 历史 bug：`baseURL: https://x/v1 # 官方地址` 解析出带注释的 URL，
+    /// 客户端据此请求一个不存在的地址，接入后请求直接失败。
+    #[test]
+    fn strips_trailing_comments() {
+        let text = "\
+baseURL: https://agent.minimax.cn/v1 # 官方地址
+logLevel: info  # 调试用
+reasoning: true # 待验证
+plain: value
+";
+        let map = parse_mapping(text).expect("parse");
+        assert_eq!(map["baseURL"], "https://agent.minimax.cn/v1");
+        assert_eq!(map["logLevel"], "info");
+        assert_eq!(map["reasoning"], true, "布尔值不应被注释污染成字符串");
+        assert_eq!(map["plain"], "value");
+
+        // 渲染回来不得再含注释
+        let rendered = render_mapping(&Value::Object(map)).expect("render");
+        assert!(!rendered.contains('#'), "渲染结果不应带注释：\n{rendered}");
+    }
+
+    /// 注释识别的边界：无空格的 `#`、引号内的 `#` 都不算注释。
+    #[test]
+    fn comment_stripping_respects_quotes_and_tight_hash() {
+        // 密码里的 # 无空格 → 属于值
+        let map = parse_mapping("apiKey: abc#def\n").expect("parse");
+        assert_eq!(map["apiKey"], "abc#def", "无空格的 # 不是注释");
+
+        // 引号内的 # → 属于值
+        let map = parse_mapping("url: \"http://x/#frag\" # 尾注\n").expect("parse");
+        assert_eq!(map["url"], "http://x/#frag", "引号内的 # 不是注释");
+
+        // 中文注释按字符边界切分，不应 panic
+        let map = parse_mapping("name: 测试账号 # 中文注释\n").expect("parse");
+        assert_eq!(map["name"], "测试账号");
     }
 }

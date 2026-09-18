@@ -132,7 +132,7 @@ pub fn default_gateway_config() -> Value {
     json!({
         "enabled": false,
         "port": 7863,
-        "listen": ":7863",
+        "listen": "127.0.0.1:7863",
         "api_key": "",
         "auto_start": false,
         // 网关工作模式：
@@ -356,6 +356,39 @@ pub fn sync_if_changed() -> bool {
     }
 }
 
+/// 网关「停止 → 启动」序列的串行化锁。
+///
+/// 为什么必须有：`is_running()` 判断、`stop_gateway()`、`start_gateway()` 三步之间
+/// 没有任何互斥，而后台 `run_auto_sync_loop`（保活循环 / 账号变动 / 积分巡检每
+/// 30s 一轮）与用户手动操作（切模式、锁模型、点重启）是**完全并发**的。
+/// 两者交错时的破坏顺序是：A 判定 is_running() 后被抢占 → B 完成整轮 stop+start
+/// 并把新 child 存进 proc_slot → A 这才执行它早已决定要做的 stop_gateway()，
+/// 把 B 刚启动的子进程 taskkill 掉、清空槽位并置 GATEWAY_RUNNING=false，
+/// 而 B 已认为自己成功、界面显示「运行中」。
+/// 结果：状态与事实不符、刚启动的进程被无谓杀掉、端口可能残留占用。
+///
+/// 用 tokio 的 Mutex 是因为要跨 `.await` 持有（std 的 guard 不能跨 await）。
+static RELOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// 串行化地重启网关：在锁内重新判断运行态，避免与并发的重启序列交错。
+///
+/// 返回 `Ok(true)` = 确实重启了；`Ok(false)` = 网关本来就没在跑（无需空转重启，
+/// 调用方落盘的新配置会在下次启动时生效）。
+///
+/// `cfg` 由调用方在**锁外**读好传入：重启要用的是「本次改动后」的配置，
+/// 而锁只负责让 stop/start 这一对不被别的序列插进来。
+async fn restart_gateway_locked(cfg: &Value) -> Result<bool, String> {
+    let _guard = RELOAD_LOCK.lock().await;
+    if !is_running() {
+        return Ok(false);
+    }
+    stop_gateway();
+    // 停止后端口需要一点时间释放（TIME_WAIT / 子进程退出），
+    // 否则紧接着的 start 会因端口被占用而失败。
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    start_gateway(cfg).await.map(|_| true)
+}
+
 /// 后台自动同步：账号库变化 → 推送凭证；网关运行中且账号有变动 → 重启使新账号生效。
 ///
 /// 由 GUI / server 的启动流程调用，永续运行。
@@ -364,8 +397,7 @@ pub async fn run_auto_sync_loop(interval_secs: u64) {
     // 启动先同步一次，保证首屏即是最新
     if sync_if_changed() && is_running() {
         let cfg = load_gateway_config();
-        stop_gateway();
-        let _ = start_gateway(&cfg).await;
+        let _ = restart_gateway_locked(&cfg).await;
     }
     loop {
         tokio::time::sleep(interval).await;
@@ -375,9 +407,9 @@ pub async fn run_auto_sync_loop(interval_secs: u64) {
         // 账号库有变化：网关在跑才需要重启才能加载新凭证
         if is_running() {
             let cfg = load_gateway_config();
-            stop_gateway();
-            match start_gateway(&cfg).await {
-                Ok(_) => eprintln!("[gateway] 检测到账号变化，已自动重启网关以加载新账号"),
+            match restart_gateway_locked(&cfg).await {
+                Ok(true) => eprintln!("[gateway] 检测到账号变化，已自动重启网关以加载新账号"),
+                Ok(false) => {}
                 Err(e) => eprintln!("[gateway] 账号变化后重启网关失败: {e}"),
             }
         }
@@ -759,13 +791,14 @@ pub fn port_of(listen: &str) -> u16 {
 
 /// 把端口规范化成网关的监听地址（`7863` → `127.0.0.1:7863`）。
 ///
-/// **只绑 127.0.0.1**，不是 `:{port}`（全网卡）。
+/// 只绑回环是刻意的：网关默认 `api_key` 为空（= 不鉴权）——若绑到全网卡，
+/// 同一局域网内任何设备都能直接调用 `/v1/chat/completions`，把本机账号的付费
+/// 额度烧掉，`/status` 还会暴露账号 uid 列表。而宿主与应用本身只在 127.0.0.1 上
+/// 探活与接入，绑回环零功能回归。
 ///
-/// 为什么这是安全要求而非偏好：`api_key` 默认为空（= 不鉴权），若同时监听全网卡，
-/// 同一局域网内任何设备都能直接调用本网关、烧掉本机账号额度，`/status` 还会
-/// 暴露账号标识。两者叠加就是一个默认敞开的代理。
-///
-/// 需要对外暴露时**必须同时设置 `api_key`**（README 有说明）。
+/// 确需对外暴露（Docker、反向代理）时，在 `gateway_native_config.json` 里手写
+/// `"listen": "0.0.0.0:7863"` 即可 —— 该文件本就是「需手动编辑」的那一层，
+/// UI 只暴露端口号。**此时务必同时设置 `api_key`。**
 pub fn normalize_listen(port: u16) -> String {
     format!("127.0.0.1:{port}")
 }
@@ -830,7 +863,7 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
     }
 
     let native = json!({
-        "listen": cfg.get("listen").and_then(Value::as_str).unwrap_or(":7863"),
+        "listen": cfg.get("listen").and_then(Value::as_str).unwrap_or("127.0.0.1:7863"),
         "api_key": cfg.get("api_key").and_then(Value::as_str).unwrap_or(""),
         "auth_dir": auth_dir.to_string_lossy(),
         "state_file": state_file.to_string_lossy(),
@@ -1066,7 +1099,7 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
         .map(|p| p as u16)
         .filter(|p| *p > 0)
         .unwrap_or_else(|| {
-            port_of(cfg.get("listen").and_then(Value::as_str).unwrap_or(":7863"))
+            port_of(cfg.get("listen").and_then(Value::as_str).unwrap_or("127.0.0.1:7863"))
         });
     let mut cfg = cfg.clone();
     cfg["port"] = json!(port);
@@ -1172,7 +1205,7 @@ pub fn stop_gateway() -> Value {
 /// 网关综合状态：配置 + 运行态 + 健康 + 账号池详情。
 pub async fn gateway_status() -> Value {
     let cfg = load_gateway_config();
-    let listen = cfg.get("listen").and_then(Value::as_str).unwrap_or(":7863");
+    let listen = cfg.get("listen").and_then(Value::as_str).unwrap_or("127.0.0.1:7863");
     let port = port_of(listen);
     let exe = resolve_gateway_exe();
     let running = is_running();
@@ -1304,12 +1337,9 @@ pub async fn sync_and_reload(restart_if_changed: bool) -> Value {
     let from_gateway = sync_auth_to_accounts().unwrap_or_default();
 
     let mut reloaded = false;
-    if restart_if_changed && !changed.is_empty() && is_running() {
+    if restart_if_changed && !changed.is_empty() {
         let cfg = load_gateway_config();
-        stop_gateway();
-        if start_gateway(&cfg).await.is_ok() {
-            reloaded = true;
-        }
+        reloaded = restart_gateway_locked(&cfg).await.unwrap_or(false);
     }
 
     json!({
@@ -1384,25 +1414,22 @@ pub async fn set_allowed_model(model: &str) -> Value {
         Err(e) => return json!({ "ok": false, "error": e }),
     };
     // 立即生效：网关只在启动时读配置。
-    // 重启方式与 switch_mode 保持一致（先停、等端口释放、再启动）——
-    // 端口未释放就启动会因占用而失败。
-    let mut reloaded = false;
-    if is_running() {
-        stop_gateway();
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        match start_gateway(&cfg).await {
-            Ok(_) => {
-                reloaded = true;
+    // 重启走串行化入口，避免与后台自动同步循环的交错互相杀掉刚启动的进程。
+    let reloaded;
+    match restart_gateway_locked(&cfg).await {
+        Ok(did) => {
+            reloaded = did;
+            if did {
                 update_runtime_state("started", None);
             }
-            Err(e) => {
-                update_runtime_state("failed", Some(e.clone()));
-                return json!({
-                    "ok": false,
-                    "error": format!("模型已保存，但重启网关失败：{e}"),
-                    "config": cfg,
-                });
-            }
+        }
+        Err(e) => {
+            update_runtime_state("failed", Some(e.clone()));
+            return json!({
+                "ok": false,
+                "error": format!("模型已保存，但重启网关失败：{e}"),
+                "config": cfg,
+            });
         }
     }
     json!({
@@ -1447,27 +1474,23 @@ pub async fn switch_mode(mode: GatewayMode, pinned_uid: Option<String>) -> Value
         Err(e) => return json!({ "ok": false, "error": e, "config": cfg }),
     };
 
-    let mut reloaded = false;
-    if is_running() {
-        stop_gateway();
-        // 停止后端口需要一点时间释放（TIME_WAIT / 子进程退出），
-        // 否则紧接着的 start 会因端口被占用而失败。
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        match start_gateway(&cfg).await {
-            Ok(_) => {
-                reloaded = true;
+    let reloaded;
+    match restart_gateway_locked(&cfg).await {
+        Ok(did) => {
+            reloaded = did;
+            if did {
                 update_runtime_state("started", None);
             }
-            Err(e) => {
-                update_runtime_state("failed", Some(e.clone()));
-                return json!({
-                    "ok": false,
-                    "error": format!("模式已保存，但重启网关失败：{e}"),
-                    "accounts": count,
-                    "changed": changed,
-                    "config": cfg,
-                });
-            }
+        }
+        Err(e) => {
+            update_runtime_state("failed", Some(e.clone()));
+            return json!({
+                "ok": false,
+                "error": format!("模式已保存，但重启网关失败：{e}"),
+                "accounts": count,
+                "changed": changed,
+                "config": cfg,
+            });
         }
     }
 
@@ -1624,7 +1647,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wb-gw-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         // 直接验证 overlay/merge 的语义（不依赖真实 store 目录）
-        let defaults = json!({"listen": ":7863", "api_key": "", "auto_start": false});
+        let defaults = json!({"listen": "127.0.0.1:7863", "api_key": "", "auto_start": false});
         let disk = json!({"listen": ":7899", "api_key": "sk-user", "auto_start": true});
         let with_disk = super::overlay(defaults, &disk);
         let after_runtime = super::overlay(with_disk, &json!({"last_status": "started"}));
@@ -1714,7 +1737,7 @@ mod tests {
     #[test]
     fn finalize_fills_listen_default() {
         let cfg = super::finalize_gateway_config(json!({"listen": "  "}));
-        assert_eq!(cfg["listen"], ":7863");
+        assert_eq!(cfg["listen"], "127.0.0.1:7863");
     }
 
     // 回归保护：被标记「需重新登录」的账号不得导出到网关。
