@@ -10,6 +10,29 @@ use std::path::Path;
 use crate::modules::auth_file::{self, CredentialFreshness};
 use crate::modules::config::{accounts_file, atomic_write, Region};
 
+/// 账号的**本地身份键**：`(区域, uid)`。
+///
+/// 这是账号库自身的判重口径，`upsert_*` 与数据目录迁移（`migrate_store`）都必须
+/// 用它，否则同一个账号会在两条路径里被判成两个，进而出现重复条目。
+///
+/// 返回 `None` 表示该条目**没有可用身份**（uid 缺失/空白）：既不能判重、
+/// 也不能与任何东西合并。调用方应当跳过它。
+pub fn account_identity(account: &Value) -> Option<(String, String)> {
+    let uid = get_str(account, "uid")?;
+    Some((region_key(account).to_string(), uid))
+}
+
+/// 区域键（`"cn"` / `"intl"`），供身份匹配与迁移共用。
+///
+/// 国服与国际版的 uid / 邮箱是**相互独立的命名空间**，同一串 uid 在两个区域可以
+/// 同时存在，因此一切身份比较都必须带上区域，否则跨区域会互相覆盖。
+pub fn region_key(account: &Value) -> &'static str {
+    match Region::of(account) {
+        Region::Cn => "cn",
+        Region::Intl => "intl",
+    }
+}
+
 fn load_accounts_from_path(path: &Path) -> Vec<Value> {
     if let Ok(text) = std::fs::read_to_string(path) {
         if let Ok(Value::Array(accounts)) = serde_json::from_str::<Value>(&text) {
@@ -23,7 +46,8 @@ fn save_accounts_to_path(path: &Path, accounts: &[Value]) -> std::io::Result<()>
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let content = serde_json::to_string_pretty(accounts).unwrap_or_default();
+    let accounts = sanitize_accounts(accounts.to_vec());
+    let content = serde_json::to_string_pretty(&accounts).unwrap_or_default();
     atomic_write(path, &content)
 }
 
@@ -173,7 +197,7 @@ fn identity_email(account: &Value) -> Option<String> {
 /// 因此身份匹配必须带上区域，否则新采集的国际版账号会直接顶掉同 uid 的国服账号。
 /// domain 缺失按国服处理，与 `Region::from_domain` 的历史默认一致。
 fn same_region(a: &Value, b: &Value) -> bool {
-    crate::modules::config::Region::of(a) == crate::modules::config::Region::of(b)
+    Region::of(a) == Region::of(b)
 }
 
 /// 按稳定身份将采集结果合并到账号列表，并返回最终持久化的账号。
@@ -185,7 +209,7 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
     let collected_uid = get_str(&collected, "uid");
     let collected_email = identity_email(&collected);
     let matches_identity = |existing: &Value| {
-        if !same_region(existing, &collected) {
+        if region_key(existing) != region_key(&collected) {
             return false;
         }
         if let Some(uid) = collected_uid.as_deref() {
@@ -225,6 +249,152 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
     }
 
     collected
+}
+
+/// 账号是否**没有任何凭据**（access_token 与 refresh_token 皆空）。
+///
+/// 这是「空壳记录」的准确判据 —— 也是本次事故中 `legacy-user` 那条记录唯一
+/// 站得住脚的剔除理由。
+///
+/// ## 为什么不能拿别的特征当判据（都踩过）
+///
+/// - **不能看 uid 名字**（黑名单 / 形态匹配）：会误删用户真实在用的账号。
+/// - **不能看 `needs_relogin`**：这是**正常**的持久状态 —— refresh token 过期后
+///   用户点一次「刷新」，应用就会把 `needs_relogin: true` 写回账号库
+///   （见 `rotate` / `refresh_account_token`）。拿它当垃圾标志会把**真实账号**
+///   在用户最需要它的时候删掉。实测 `legacy-user` 恰好带这个字段，是最容易
+///   误判的一条特征。
+/// - **不能看有没有 uid**：`legacy-user` 有 uid，光看这个它就被放行（实测踩到：
+///   第一版过滤规则就是这么写的，迁移探针当场抓出它仍被搬进新库）。
+///
+/// 而「两个 token 都没有」的条目**在功能上不可用**：既不能直接调 API（无
+/// access_token），也不能自动续期（无 refresh_token），只能靠用户重新登录 ——
+/// 届时会以**新记录**重新入库（携带完整凭据），不依赖这条空壳。
+///
+/// 供 `migrate_store` 共用，保证「写库」与「迁移」两条路径判据永不漂移。
+pub fn has_no_credentials(account: &Value) -> bool {
+    get_str(account, "access_token").is_none() && get_str(account, "refresh_token").is_none()
+}
+
+/// 该条目是否为**无凭据残留** —— 无法登录、无法被引用、且从未真正登录过。
+///
+/// ## 为什么这是一个独立的窄判据（而不是写入口/迁移的通用过滤）
+///
+/// `legacy-user` 那条事故记录（见 `sanitize_accounts` 注释）的形态是：
+/// `{"uid": "...", "email": "...", "needs_relogin": true}` —— 有 uid，但
+/// **没有 access_token、没有 refresh_token、没有 id、没有 expiresAt**。
+///
+/// 试过在 `save_accounts` 与 `migrate_store` 里按形态过滤它，两次都被既有测试
+/// 挡下（合计 13 条失败），原因一致：**「有 uid、暂时没 token」在账号库里是
+/// 合法形态**（测试夹具 `[{"uid":"u1"}]`、外部导入中间态、待重新登录账号都这样）。
+/// 通用过滤必然先误伤它们 —— 而真实数据里那正是**用户待重新登录的账号**。
+///
+/// 所以这个判据**只用于启动期的一次性残留清理**，语义明确、影响面可控，
+/// 且与 `refresh::repair_false_relogin_flags` 是同一种套路（仓库已有先例）。
+///
+/// 判据要求四个条件**同时**成立，其中 `expiresAt` 与 `createdAt` 两个时间戳
+/// 是最有区分度的一条：真实账号无论是否过期，都必然带这两个字段（由采集/刷新
+/// 流程写入），而测试种子数据从来没有。
+pub fn is_credentialless_leftover(account: &Value) -> bool {
+    has_no_credentials(account)          // 两个 token 都没有 → 登录不了
+        && get_str(account, "id").is_none() // 无 id → find_account 引用不到
+        && account.get("expiresAt").is_none() // 无过期时间 → 从未经过采集/刷新
+        && account.get("createdAt").is_none() // 无创建时间 → 同上
+}
+
+/// 清理账号库里**无凭据的残留记录**，返回清理条数。
+///
+/// 供启动流程调用一次（与 `refresh::repair_false_relogin_flags` 并列）。
+///
+/// ## 为什么需要它（而不是让写入边界或迁移去过滤）
+///
+/// 实测事故（2026-09-16）：用户账号库里出现 16 条
+/// `{"uid":"legacy-user","email":"old@example.com","needs_relogin":true}`。
+/// 「重复 16 条」由 `upsert_account` 的身份匹配缺陷造成（已修）；但即便不再
+/// 新增，**已有的 16 条仍会永远留在界面上**，每条都是一张「需重新登录 / 等待
+/// 积分数据…」的僵尸卡片。写入边界与迁移都不适合删它们（见
+/// `is_credentialless_leftover` 注释），所以在这里做一次显式清理。
+///
+/// ## 安全性
+///
+/// - 只删**四个条件同时成立**的条目，判据见上；带任何凭据、id 或时间戳的
+///   条目一律不动。
+/// - 有清理才落盘（无变化不写文件），并打印条数与 uid 便于事后追溯。
+/// - 删除不可逆，但代价极低：这类条目本来就登录不了，用户重新登录后会产生
+///   一条**携带完整凭据的新记录**，不依赖被删的这条。
+pub fn purge_credentialless_leftovers() -> usize {
+    let accounts = load_accounts();
+    let (kept, removed): (Vec<Value>, Vec<Value>) = accounts
+        .into_iter()
+        .partition(|a| !is_credentialless_leftover(a));
+
+    if removed.is_empty() {
+        return 0;
+    }
+
+    let uids: Vec<String> = removed.iter().filter_map(|a| get_str(a, "uid")).collect();
+    eprintln!(
+        "[account] 清理 {} 条无凭据残留记录（无法登录、从未采集）：{}",
+        removed.len(),
+        uids.join(", ")
+    );
+
+    // 落盘失败则不改动文件（`save_accounts` 内部是原子写，失败时原文件完好）。
+    if let Err(e) = save_accounts(&kept) {
+        eprintln!("[account] 清理残留记录落盘失败，保持原样: {e}");
+        return 0;
+    }
+    removed.len()
+}
+
+/// 写入账号库前按身份**去重**（保留最先出现的一条）。
+///
+/// ## 为什么只在写入口做去重、不在写入口做「空壳过滤」
+///
+/// 这是本次事故（2026-09-16）最关键的取舍，别再退回上一层：
+///
+/// - **去重放在写入口是对的**：账号库出现 16 条一模一样的 `legacy-user`，
+///   根因是 `upsert_account` 只按 `id` 匹配的老缺陷（已修）。写入口加一道去重，
+///   等于给「任何未来路径再次塞进重复项」兜底，且它**只影响真正的重复项**，
+///   对正常条目零副作用 —— 有测试钉住「跨区域同 uid 不算重复」。
+/// - **空壳过滤放在写入口是错的**：账号库必须允许「有 uid、暂时没有 token」的
+///   条目存在 —— 外部导入、迁移中断、用户手工编辑都会合法地产生这种中间态，
+///   `needs_relogin` 就是给它们准备的重新登录入口。按「没有 token」在写入口
+///   过滤会误删真实数据（实测：该实现直接打断 8 条既有测试，它们都依赖
+///   「无 token 的账号能被保存」这一契约）。
+///
+/// 空壳的清理因此只发生在**迁移**这一处（`migrate_store::should_migrate`），
+/// 那里「旧目录 → 新库」的语义明确，且判据 `is_empty_shell` 要求
+/// 「无凭据 + 无 id + 有 uid」，不会误伤中间态条目。
+fn sanitize_accounts(accounts: Vec<Value>) -> Vec<Value> {
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut kept = Vec::with_capacity(accounts.len());
+    let mut dropped_duplicate = 0usize;
+
+    for account in accounts {
+        // 身份键优先取 (区域, uid)；无 uid 时退回到 id（id 是库内唯一标识，
+        // 因此不带区域也不会误判）。
+        let identity = account_identity(&account)
+            .or_else(|| get_str(&account, "id").map(|id| (String::new(), id)));
+
+        match identity {
+            Some(key) => {
+                if seen.insert(key) {
+                    kept.push(account);
+                } else {
+                    dropped_duplicate += 1;
+                }
+            }
+            // 既无 uid 又无 id：无从判重，也无法被引用，但**不丢** ——
+            // 宽容的写入边界是本函数的契约，见上方注释。
+            None => kept.push(account),
+        }
+    }
+
+    if dropped_duplicate > 0 {
+        eprintln!("[account] 写入账号库前清理：丢弃 {dropped_duplicate} 条重复条目");
+    }
+    kept
 }
 
 /// 使用统一身份规则保存采集到的账号。
@@ -362,7 +532,10 @@ mod tests {
         let meta = account_meta(&acc);
         assert_eq!(meta["note"], "公司号");
         assert_eq!(meta["domain"], "copilot.tencent.com");
-        assert_eq!(meta["phoneNumber"], "13800138000", "手机号是国服账号的主要身份线索");
+        assert_eq!(
+            meta["phoneNumber"], "13800138000",
+            "手机号是国服账号的主要身份线索"
+        );
         assert_eq!(meta["accountType"], "personal");
         assert!(meta.get("access_token").is_none(), "新增字段不得带出 token");
     }
@@ -381,10 +554,18 @@ mod tests {
     #[test]
     fn account_note_reads_and_defaults_empty() {
         assert_eq!(account_note(&json!({"note": "备用"})), "备用");
-        assert_eq!(account_note(&json!({"note": "  备用  "})), "备用", "应去掉首尾空白");
+        assert_eq!(
+            account_note(&json!({"note": "  备用  "})),
+            "备用",
+            "应去掉首尾空白"
+        );
         assert_eq!(account_note(&json!({})), "");
         assert_eq!(account_note(&json!({"note": ""})), "");
-        assert_eq!(account_note(&json!({"note": "   "})), "", "纯空白视为无备注");
+        assert_eq!(
+            account_note(&json!({"note": "   "})),
+            "",
+            "纯空白视为无备注"
+        );
     }
 
     #[test]
@@ -600,6 +781,187 @@ mod tests {
         delete_account_from_path(&path, "account-2").expect("second account should delete");
         assert!(load_accounts_from_path(&path).is_empty());
         std::fs::remove_dir_all(&test_dir).expect("temporary account store should clean up");
+    }
+
+    // ---- 账号库卫生（无身份 / 重复条目的持久化防线）----
+
+    /// **契约测试**：写入边界必须**宽容** —— 「有 uid、暂时没有 token」的条目
+    /// 是合法中间态（外部导入 / 迁移中断 / 待重新登录），不得被写入口过滤掉。
+    ///
+    /// 这条测试是刻意用来**挡住两种诱人的错误修法**：本次 `legacy-user` 事故很
+    /// 容易让人（a）在 `save_accounts` 里按「有没有 token」过滤垃圾，或（b）在
+    /// 迁移时按记录形态过滤。两种实现合计打断了 13 条既有测试，根因是同一个：
+    /// 真实场景里那正是**用户待重新登录的账号**。残留清理只允许发生在启动期
+    /// 那一次（`purge_credentialless_leftovers`），判据更窄、且有日志。
+    #[test]
+    fn 保存账号库时不按有无凭据过滤() {
+        let dir = crate::modules::config::test_isolation::Isolated::new("save-keep-tokenless");
+        let _ = dir;
+
+        save_accounts(&[
+            // 无 token 但有待重新登录标记：合法中间态，必须保留
+            json!({"uid": "u-relogin", "email": "a@b.c", "needs_relogin": true}),
+            // 无 token、无 id、有 uid：legacy-user 的形态 —— 写入口**不负责**
+            // 判断它该不该存在（那是启动期清理的职责），因此这里必须原样保留
+            json!({"uid": "legacy-shaped", "email": "old@example.com"}),
+            // 完全无身份：同样保留（无从判重但也不该静默丢）
+            json!({"email": "anonymous@example.com"}),
+            // 正常带凭据的账号
+            json!({"uid": "u-normal", "access_token": "t", "refresh_token": "r"}),
+        ])
+        .expect("save");
+
+        assert_eq!(
+            load_accounts().len(),
+            4,
+            "写入边界不得按有无凭据/有无身份过滤，实际 {:?}",
+            load_accounts()
+        );
+    }
+
+    /// **回归测试**：同 `(区域, uid)` 的重复条目在落盘时收敛为一条。
+    ///
+    /// 这正是本机出现过 16 条 `legacy-user` 的那个缺陷在**持久化层**的兜底：
+    /// upsert 的匹配缺陷已单独修复（见 `upsert_account_对无_id_的账号按_uid_去重`），
+    /// 但只要有任何一条路径塞进重复项，这里必须保证它们不会同时存活。
+    #[test]
+    fn 保存账号库时同身份重复条目去重() {
+        let dir = crate::modules::config::test_isolation::Isolated::new("save-dedup");
+        let _ = dir;
+
+        save_accounts(&[
+            json!({"uid": "dup", "domain": "www.workbuddy.ai", "nickname": "第一条"}),
+            json!({"uid": "dup", "domain": "www.workbuddy.ai", "nickname": "第二条"}),
+            json!({"uid": "dup", "domain": "www.workbuddy.ai", "nickname": "第三条"}),
+            // 跨区域同 uid：**不得**被当成重复（两套独立命名空间）
+            json!({"uid": "dup", "domain": "www.workbuddy.cn", "nickname": "国服同名"}),
+        ])
+        .expect("save");
+
+        let accounts = load_accounts();
+        assert_eq!(
+            accounts.len(),
+            2,
+            "同区域同 uid 只保留第一条，跨区域同名 uid 必须保留，实际 {:?}",
+            accounts
+        );
+        assert_eq!(
+            accounts
+                .iter()
+                .find(|a| a["domain"] == "www.workbuddy.cn")
+                .unwrap()["nickname"],
+            "国服同名"
+        );
+        assert_eq!(
+            accounts
+                .iter()
+                .find(|a| a["domain"] == "www.workbuddy.ai")
+                .unwrap()["nickname"],
+            "第一条",
+            "保留最先出现的那条（顺序稳定，避免抖动）"
+        );
+    }
+
+    /// 残留判据 `is_credentialless_leftover` 的边界。
+    ///
+    /// 每个 `false` 分支都是一次**差点删掉真实数据**的误判，逐条钉住。
+    #[test]
+    fn 残留判据只认无凭据无id无时间戳() {
+        // 事故原形：无 access、无 refresh、无 id、无时间戳 → 判为残留
+        assert!(is_credentialless_leftover(&json!({
+            "uid": "legacy-user", "email": "old@example.com", "needs_relogin": true,
+            "needs_relogin_reason": "缺少 refresh token"
+        })));
+        // 同理：只有 uid 的裸记录
+        assert!(is_credentialless_leftover(
+            &json!({"uid": "u", "email": "a@b.c"})
+        ));
+
+        // 有 access_token → 真实可用
+        assert!(!is_credentialless_leftover(
+            &json!({"uid": "u", "access_token": "t"})
+        ));
+        // 只有 refresh_token（access 过期是常态）→ 能自动续期
+        assert!(!is_credentialless_leftover(
+            &json!({"uid": "u", "refresh_token": "r"})
+        ));
+        // 有 id → 仍可被 find_account 引用
+        assert!(!is_credentialless_leftover(&json!({"uid": "u", "id": "i"})));
+        // **有 expiresAt → 经过真实采集/刷新，绝不删**（最有区分度的一条）
+        assert!(!is_credentialless_leftover(
+            &json!({"uid": "u", "expiresAt": 1})
+        ));
+        // 有 createdAt 同理
+        assert!(!is_credentialless_leftover(
+            &json!({"uid": "u", "createdAt": 1})
+        ));
+        // 待重新登录的**真实**账号：带时间戳 → 保留（最危险的误删场景）
+        assert!(!is_credentialless_leftover(&json!({
+            "uid": "u", "needs_relogin": true, "createdAt": 1_789_485_629_946i64
+        })));
+    }
+
+    /// **回归测试**：启动期清理只删残留记录，真实账号一条不动。
+    ///
+    /// 用本机事故的真实字段形态构造（`momo0410` 那条为样板）。
+    #[test]
+    fn 启动清理只删残留记录() {
+        let dir = crate::modules::config::test_isolation::Isolated::new("purge-leftovers");
+        let _ = dir;
+
+        save_accounts(&[
+            // 3 条残留：同 uid 在本机曾复制成 16 条。注意写入口的去重会让
+            // **完全同身份**的残留先收敛成 1 条，因此这里给它们不同的 uid，
+            // 模拟真实情况（残留记录来自不同时期的采集，uid 各不相同）。
+            json!({"uid": "legacy-user-1", "email": "old@example.com", "needs_relogin": true}),
+            json!({"uid": "legacy-user-2", "email": "old@example.com", "needs_relogin": true}),
+            json!({"uid": "legacy-user-3", "email": "old@example.com", "needs_relogin": true}),
+            // 真实账号：带凭据 + 时间戳（照抄本机 momo0410 的字段形态）
+            json!({
+                "uid": "79d73748-b895-41f9-91fd-0c45be2bc588", "id": "88350254",
+                "access_token": "a", "refresh_token": "r", "domain": "www.workbuddy.ai",
+                "createdAt": 1_789_485_629_946i64, "expiresAt": 1_820_847_547_352i64, "nickname": "momo0410"
+            }),
+            // 待重新登录的真实账号：无凭据但有时间戳
+            json!({
+                "uid": "real-2", "id": "id-2", "needs_relogin": true,
+                "createdAt": 1_789_485_629_946i64, "expiresAt": 1_794_717_140_382i64
+            }),
+        ])
+        .expect("seed");
+
+        assert_eq!(purge_credentialless_leftovers(), 3, "应清理 3 条残留");
+
+        let remaining = load_accounts();
+        assert_eq!(
+            remaining.len(),
+            2,
+            "真实账号必须全部保留，实际 {remaining:?}"
+        );
+        assert!(remaining.iter().any(|a| a["nickname"] == "momo0410"));
+        assert!(
+            remaining.iter().any(|a| a["uid"] == "real-2"),
+            "待重新登录的真实账号不得被清理（这是最危险的误删）"
+        );
+    }
+
+    /// 无残留时清理不写盘、返回 0（幂等，避免每次启动都重写文件）。
+    #[test]
+    fn 无残留时清理不落盘() {
+        let dir = crate::modules::config::test_isolation::Isolated::new("purge-noop");
+        let _ = dir;
+
+        save_accounts(&[json!({
+            "uid": "real", "id": "i", "access_token": "a", "createdAt": 1
+        })])
+        .expect("seed");
+        let path = crate::modules::config::accounts_file();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        assert_eq!(purge_credentialless_leftovers(), 0);
+
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(before, after, "无残留时不得重写账号库");
     }
 
     // ---- 本机历史账号发现与导入 ----
@@ -922,7 +1284,9 @@ pub fn import_local_selected(
         .into_iter()
         .enumerate()
         .filter(|(index, candidate)| {
-            paths.iter().any(|p| candidate.path.to_string_lossy() == p.as_str())
+            paths
+                .iter()
+                .any(|p| candidate.path.to_string_lossy() == p.as_str())
                 || indexes.contains(index)
         })
         .map(|(_, candidate)| candidate)

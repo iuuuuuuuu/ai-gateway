@@ -29,6 +29,14 @@ fn spawn_background_loops() {
         eprintln!("[refresh] 已清除 {repaired} 个账号因网络失败误报的「需重新登录」标记");
     }
 
+    // 启动时清理无凭据的残留记录（实测：一次测试隔离失效把种子数据写进了
+    // 用户真实账号库，又被数据目录迁移原样搬运，界面上出现永远登录不了的僵尸
+    // 账号）。判据窄且带日志，见 account::purge_credentialless_leftovers。
+    let purged = account::purge_credentialless_leftovers();
+    if purged > 0 {
+        eprintln!("[account] 已清理 {purged} 条无凭据的残留账号记录");
+    }
+
     tokio::spawn(async move {
         if let Err(error) = config::compact_checkin_logs() {
             eprintln!("[签到] 历史日志整理失败: {error}");
