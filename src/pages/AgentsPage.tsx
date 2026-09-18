@@ -479,19 +479,15 @@ export default function AgentsPage() {
     [gatewayModels],
   );
 
-  /** 三个简短的能力标签文本，供客户端卡片上的模型 chip 做悬浮说明。 */
+  /** 客户端卡片上模型 chip 的悬浮说明（只讲视觉与区域，见 ModelCapabilityRow 的注释）。 */
   const capabilityHintOf = useCallback(
     (modelId: string): string | undefined => {
       const view = capabilityViews.get(modelId);
       if (!view) return undefined;
       const parts = [
-        `上下文 ${view.context.text}`,
         // 「未知」时补一句「未声明」：只显示「—」的话，用户不知道它是
         // 「拿不到」还是「这个模型就是这么写的」。
         view.vision.unknown ? `视觉未声明（${view.vision.text}）` : view.vision.text,
-        view.efforts.unknown
-          ? `思考档位未声明（${view.efforts.text}）`
-          : `思考档位 ${view.efforts.text}`,
       ];
       if (view.region) parts.push(view.region.label);
       return parts.join(" · ");
@@ -610,15 +606,12 @@ export default function AgentsPage() {
                 能力覆盖率说明。
                 为什么必须给「已知 / 总数」而不是不写：单个模型显示「—」时用户分不清
                 是**那个模型**没声明，还是网关整体拿不到真值（后者要去查网关与上游）。
-                两处计数分开列也是刻意的：视觉与思考档位在上游是**独立字段**，
-                一个可能拿到、另一个拿不到（见 capability.go 中
-                `modelCapabilityFields` 与 `modelReasoningFields` 正交的注释）。
+                只统计**视觉**：上下文与思考档位已按所有者要求从模型卡片撤下，
+                统计它们会让用户去找一个界面上并不存在的标记。
               */}
               {gatewayModels.length > 0 && (
                 <p className="mt-0.5 text-[11px] text-muted-foreground" data-slot="model-capability-summary">
-                  能力真值覆盖：上下文 {capabilitySummary.contextKnown}/{capabilitySummary.total} ·
-                  视觉 {capabilitySummary.visionKnown}/{capabilitySummary.total} ·
-                  思考档位 {capabilitySummary.effortsKnown}/{capabilitySummary.total}
+                  视觉能力真值覆盖：{capabilitySummary.visionKnown}/{capabilitySummary.total}
                   {capabilitySummary.singleRegion > 0
                     ? ` · ${capabilitySummary.singleRegion} 个模型仅单区可用`
                     : ""}
@@ -734,13 +727,17 @@ export default function AgentsPage() {
                       </Badge>
                     )}
 
-                    {/* 三项能力：上下文 / 视觉 / 思考档位（+ 单区提示） */}
-                    <ModelCapabilityRow
-                      context={view.context}
-                      vision={view.vision}
-                      efforts={view.efforts}
-                      region={view.region}
-                    />
+                    {/* 能力展示：**只保留视觉**。
+                        上下文与思考档位已按所有者要求撤下（2026-09-18）：
+                          · 上下文窗口由上游 /v3/config 的 maxInputTokens 给出，
+                            但它对「该选哪个模型」几乎没有决策价值，占位却最宽；
+                          · 思考档位的「可选范围」上游并无逐模型清单
+                            （实测 supportedEfforts 不是硬范围：hy3 声明 [low,high]
+                            却接受 medium/max/off），在我们给出可靠范围之前，
+                            显示它只会误导 —— 宁可不显示。
+                        相关字段仍由网关下发（/v1/models 的 supported_efforts 等），
+                        需要时可随时恢复展示。 */}
+                    <ModelCapabilityRow vision={view.vision} region={view.region} />
                   </button>
                 );
               })}

@@ -1,4 +1,4 @@
-import { CircleHelp, Eye, EyeOff, Gauge, Globe, Ruler } from "lucide-react";
+import { CircleHelp, Eye, EyeOff, Globe } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -61,36 +61,35 @@ function CapabilityChip({
 }
 
 export interface ModelCapabilityRowProps {
-  context: CapabilityDisplay;
   vision: CapabilityDisplay;
-  efforts: CapabilityDisplay;
   region?: RegionHint;
   className?: string;
 }
 
 /**
- * 一个模型的「上下文 · 视觉 · 思考档位」能力行。
+ * 一个模型的能力行：**视觉**（+ 可选区域徽标）。
  *
- * 档位**逐档列出**（所有者要求「信息不能为了清爽而丢」）：只给「支持 3 档」
- * 会把他真正要选的 `max` 藏起来，那正是这次需求要解决的问题。
+ * ⚠ `context`（上下文窗口）与 `efforts`（思考档位）已按所有者要求撤下
+ *（2026-09-18）。撤下的理由不同，两条都记在这里，避免后人「顺手加回来」：
+ *
+ *   · 上下文窗口：值本身可信（上游 maxInputTokens），但对「该选哪个模型」
+ *     几乎没有决策价值，而它占的横向空间最大；
+ *   · 思考档位：我们**给不出可靠的范围** —— 实测 supportedEfforts 不是硬范围
+ *     （hy3 声明 [low,high] 却接受 medium/max/off；off 在 16 个模型里
+ *     14 个可用、2 个 deepseek 拒绝）。在拿到逐模型可信清单之前，
+ *     显示一组「候选」比不显示更容易误导。
+ *
+ * 网关**仍然**下发这些字段（supported_efforts / reasoning_range_undeclared 等），
+ * 需要恢复展示时数据是现成的。
  */
 export function ModelCapabilityRow({
-  context,
   vision,
-  efforts,
   region,
   className,
 }: ModelCapabilityRowProps) {
-  // 思考档位可能很长（实测 gpt-6-astra 有 5 档：low/medium/high/xhigh/max），
-  // 因此它单独占一行、允许折行；上下文与视觉属于短标量，与区域徽标同排。
   return (
     <div className={cn("flex flex-col gap-1", className)} data-slot="model-capability-row">
       <div className="flex flex-wrap items-center gap-1">
-        <CapabilityChip
-          icon={Ruler}
-          display={context}
-          dataSlot="model-capability-context"
-        />
         <CapabilityChip
           icon={vision.unknown ? CircleHelp : vision.text === "视觉" ? Eye : EyeOff}
           display={vision}
@@ -111,80 +110,6 @@ export function ModelCapabilityRow({
               </TooltipTrigger>
               <TooltipContent className="max-w-xs text-[11px] leading-relaxed">
                 {region.title}
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
-        )}
-      </div>
-
-      <div className="flex flex-wrap items-center gap-1">
-        <Gauge
-          className={cn(
-            "size-2.5 shrink-0",
-            efforts.unknown ? "text-muted-foreground/60" : "text-muted-foreground",
-          )}
-        />
-        {efforts.unknown ? (
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span
-                  data-slot="model-capability-efforts"
-                  data-unknown="true"
-                  className="rounded border border-dashed border-border/70 px-1.5 py-0.5 text-[10px] text-muted-foreground"
-                >
-                  {efforts.text}
-                </span>
-              </TooltipTrigger>
-              <TooltipContent className="max-w-xs text-[11px] leading-relaxed">
-                {efforts.title}
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
-        ) : (
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span
-                  data-slot="model-capability-efforts"
-                  data-unknown="false"
-                  className="flex flex-wrap items-center gap-1"
-                >
-                  {/*
-                    `items` 在 `unknown=true` 时才可能缺省，而这一支只处理已知态；
-                    仍用 `?? []` 兜底是为了让类型契约与运行时行为一致 ——
-                    真出现「已知但没条目」的坏数据时渲染成空的档位行，
-                    而不是抛异常把整页带崩。
-                  */}
-                  {/*
-                    **有 items 才逐档渲染；没有则回落到 text。**
-                    固定单档模型（支持思考但不可选档）的 items 是**空数组**，
-                    只渲染 items 会让单元格变成空白 —— 用户看到的是一个
-                    什么都没有的档位行（实测踩过：断言读到 text 为 ""）。
-                    它的 text 是「固定 high」这类说明，必须显示出来。
-                  */}
-                  {(efforts.items ?? []).length > 0 ? (
-                    (efforts.items ?? []).map((effort) => (
-                      <span
-                        key={effort}
-                        data-slot="model-capability-effort"
-                        className="rounded bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] text-foreground"
-                      >
-                        {effort}
-                      </span>
-                    ))
-                  ) : (
-                    <span
-                      data-slot="model-capability-effort-fixed"
-                      className="rounded border border-border/70 bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground"
-                    >
-                      {efforts.text}
-                    </span>
-                  )}
-                </span>
-              </TooltipTrigger>
-              <TooltipContent className="max-w-xs text-[11px] leading-relaxed">
-                {efforts.title}
               </TooltipContent>
             </Tooltip>
           </TooltipProvider>

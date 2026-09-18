@@ -85,37 +85,80 @@ func ensureSystemFirst(obj map[string]any) {
 }
 
 // effortRank 档位从低到高。
+//
+// ⚠ 这张表的来源与依据（所有者问过「这个思考档位你是怎么推断出来的？」）：
+//
+//	它随 e592377「纳入 Go 版网关源码作为长期构建依赖」一起 vendor 进来，
+//	原文只有一句「// effortRank 档位从低到高。」，**没有任何依据说明**。
+//
+// 用上游自己的数据检验它（2026-09-18，两区 /v3/config 的 supportedEfforts 全量取值）：
+//
+//	上游声明过的名字：high(24) low(15) xhigh(11) max(9) medium(6)
+//	上游**从未声明**的：off(0) minimal(0)
+//
+// 再逐模型实测（16 个国服可调用模型 × 7 个档位，真实流式调用）：
+//
+//	minimal  16/16 接受
+//	off      14/16 接受 —— deepseek-v4.1-flash 与 deepseek-v4-pro **拒绝**
+//	其余     16/16 接受
+//
+// 结论：**不存在一张放之四海皆准的阶梯**。「档位是否被接受」按模型而定 ——
+// off 在 14/16 个模型可用，却被那两个 deepseek 模型拒（HTTP 400
+// "the reasoning effort value is not supported by the current model"）。
+//
+// 所以这张表的用途收敛为两件事，且都**不做**「替上游判断」：
+//   · 认得出客户端写的档位名（KnownEffort），以及需要时比较高低；
+//   · 界面在「上游未声明范围」时给出一组**候选值**，并明确标注这是候选而非承诺。
+//
+// off 与 minimal 都保留 —— 它们是真实可用的值（14/16、16/16）。此前我把它俩
+// 当成「该类模型会拒绝」而删掉 off，那是从**单模型单次观测**推到「一类模型」，
+// 与最初 vendor 那张表的毛病同源（都是拿一个样本当规律）。
 var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
 
-// StandardEfforts 上游的**标准思考档阶梯**（由低到高，不含 off）。
+// upstreamDeclaredEfforts 上游在 supportedEfforts 里**真实使用过**的档位名。
 //
-// 用于「上游没声明 supportedEfforts，但有默认档」的模型：实测这类模型
-// 接受标准阶梯里的全部档，只拒绝 off 与无法识别的值 —— 也就是说上游有
-// 一套全局阶梯在校验，只是没在 /v3/config 里逐模型列出可选范围。
+// 与 effortRank 的区别是「有没有上游清单背书」：这 5 个名字在两个区域的
+// /v3/config 里都出现过（2026-09-18 全量统计），而 off / minimal 从未出现
+//（但实测可用：14/16 与 16/16）。
 //
-// 实测依据（2026-09-18，真实流式调用 deepseek-v4.1-flash）：
+// 用途：让界面把「上游声明过的」与「实测可用但清单里没写的」分开表达。
+// 两者都能用，但依据不同 —— 混在一起会让用户以为后者也有上游承诺。
+var upstreamDeclaredEfforts = map[string]bool{
+	"low": true, "medium": true, "high": true, "xhigh": true, "max": true,
+}
+
+// StandardEfforts 界面用的**候选档位阶梯**（由低到高）。
 //
-//	off / bogus_value → HTTP 400 "the reasoning effort value is not supported"
-//	minimal/low/medium/high/max/xhigh → 全部接受
-//	低到高各档的推理长度：low 397 → medium 420 → high 646 → max 776（单调递增）
+// 用于「上游没声明 supportedEfforts，但有默认档」的模型。
 //
-// 不含 off 是刻意的：该模型明确拒绝 off，把它列进可选项会让用户选到一个
-// 必然 400 的值。**注意**这不代表所有此类模型都拒绝 off —— 但既然上游
-// 没声明范围，少列一个「已知可能被拒」的档，比多列一个更安全。
+// ⚠ 名称刻意叫「候选」而不是「标准/支持」：实测证明档位可用性**按模型而定**，
+// 没有任何一张表是被上游背书的通用范围。这组值来自两处证据：
+//
+//	① 上游 supportedEfforts 全量出现过的 5 个名字（有清单背书）
+//	② 加上 off / minimal —— 它们从未被声明过，但逐模型实测可用
+//	   （off 14/16、minimal 16/16）
+//
+// 调用方**必须**把它当作「可尝试的候选」展示，而不是「承诺支持的集合」：
+// 用法说明、Tooltip 文案都要带上「上游未声明确切范围」这层含义。
 //
 // 返回**副本**：调用方会把它塞进响应体，共享切片会被下游的 in-place 修改污染。
 func StandardEfforts() []string {
-	names := make([]string, 0, len(effortRank)-1)
+	names := make([]string, 0, len(effortRank))
 	for name := range effortRank {
-		if name == "off" {
-			continue
-		}
 		names = append(names, name)
 	}
 	// 按档位从低到高排序：map 遍历顺序随机，不排序会让同一模型每次请求
 	// 下发不同顺序的列表，客户端的下拉框顺序会跳变。
 	sort.Slice(names, func(i, j int) bool { return effortRank[names[i]] < effortRank[names[j]] })
 	return names
+}
+
+// UpstreamDeclaredEffort 该档位名是否有上游 supportedEfforts 的清单背书。
+//
+// 用于区分「上游声明过」与「实测可用但清单里没写」——后者只有我们的测量，
+// 没有上游的承诺，界面措辞应更保守。
+func UpstreamDeclaredEffort(name string) bool {
+	return upstreamDeclaredEfforts[strings.TrimSpace(strings.ToLower(name))]
 }
 
 // KnownEffort 该档位名是否是网关认识的思考档（大小写与空白不敏感）。

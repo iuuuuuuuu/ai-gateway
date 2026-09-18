@@ -829,21 +829,25 @@ func modelReasoningFields(efforts []string, defaultEffort string) map[string]any
 		return nil
 	}
 
-	// 情形 A：上游**声明了**该模型的可选档位 → 如实列出它自己的范围。
-	// 这是唯一能确知「哪些档被支持」的情形（如 hy3 = ["low","high"]，
-	// 范围外的档会被上游拒绝）。不做任何推断或补齐。
+	// 情形 A：上游**声明了**该模型的可选档位 → 如实列出它自己的范围，不做任何推断。
+	//
+	// ⚠ 注意「声明了」**不等于**「只有这些可用」：实测 hy3 声明 [low,high]
+	// 却接受 medium/max/minimal/off。所以这组值只是「上游愿意列出来的」，
+	// 不是硬范围 —— 这也是我们**不能**据此拦截请求的原因（见 forward.go）。
 	if len(efforts) > 0 {
 		return withEffortList(efforts, defaultEffort, false)
 	}
 
 	// 情形 B：未声明可选范围，但有默认档。
 	//
-	// 下发「范围未声明」标记 + 标准阶梯，让客户端能给出可选项。
+	// 下发「范围未声明」标记 + **候选档位**，让客户端能给出可选项。
 	//
-	// 标准阶梯来自 upstream.StandardEfforts() —— 那是网关**已在用**的档位表
-	//（校验、降级都靠它），实测与上游对该类模型的接受范围一致（除 off）。
-	// 用它而非空列表：空列表会让客户端渲染出一个没有选项的档位控件，
-	// 用户只能看到「固定」而无法尝试任何档位。
+	// ⚠ 这组值是**候选**而非承诺：逐模型实测（16 个国服模型 × 7 档）证明
+	// 档位可用性按模型而定 —— off 在 14/16 个模型可用，却被两个 deepseek
+	// 模型拒绝。因此字段名与文案都不能暗示「上游保证支持这些」。
+	//
+	// 用候选列表而非空列表：空列表会让客户端渲染出一个没有选项的档位控件，
+	// 用户只能看到「固定」而无法尝试任何档位（那正是我上一版的错误）。
 	return withEffortList(upstream.StandardEfforts(), defaultEffort, true)
 }
 
@@ -879,6 +883,15 @@ func withEffortList(list []string, defaultEffort string, undeclaredRange bool) m
 		nested["range_undeclared"] = true
 		out["reasoning_range_undeclared"] = true
 		out["reasoningRangeUndeclared"] = true
+		// 逐个标注该档位**有没有上游清单背书**：
+		// 上游 supportedEfforts 里出现过的是「声明过的」（low/medium/high/xhigh/max），
+		// off 与 minimal 从未出现、只有我们的实测结果 —— 客户端可据此措辞更保守。
+		backed := make(map[string]bool, len(cp))
+		for _, e := range cp {
+			backed[e] = upstream.UpstreamDeclaredEffort(e)
+		}
+		nested["declared_by_upstream"] = backed
+		out["upstream_declared_efforts"] = backed
 	}
 	if defaultEffort != "" {
 		nested["default_effort"] = defaultEffort

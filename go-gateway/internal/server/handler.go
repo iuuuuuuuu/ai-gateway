@@ -703,12 +703,20 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // 稍后重试」）；只有**请求侧**错误才偏离 —— 那些错误重试多少次都一样，
 // 必须让客户端看到真实原因，而不是被误导去等账号恢复。
 //
-// 两类请求侧错误（两者都是「重试无用、要改请求」）：
+// 三类请求侧错误（都是「重试无用、要改请求」）：
 //   - 模型不在白名单 → model_not_allowed（见 modelLockedError）
 //   - 上下文超长       → context_length_exceeded
+//   - 思考档位被上游拒 → reasoning_effort_rejected
 func openAIFailure(err error) (code, msg string) {
 	if f := failureOf(err); f != nil && f.Kind == FailureContextTooLong {
 		return "context_length_exceeded", f.Message
+	}
+	if f := failureOf(err); f != nil && f.Kind == FailureEffortRejected {
+		// 带回上游原文（在 f.Message 里）：用户据此换档位。
+		// 状态码由调用方原样透出（forwardChat 返回的 400），不走 503 ——
+		// 报 503 会把「你的参数上游不接受」说成「服务端暂时不可用」，
+		// 客户端会去重试而不是改参数。
+		return "reasoning_effort_rejected", f.Message
 	}
 	// 其余交给 errorCodeFor（当前只有 model_not_allowed 与 no_healthy_account），
 	// 即 chat/completions 一直以来的行为。
@@ -719,8 +727,12 @@ func openAIFailure(err error) (code, msg string) {
 //
 // 上下文超长在 Anthropic 语义里是 invalid_request_error（其真实文案即
 // "prompt is too long: ..."），而非 request_too_large（那是请求**字节数**超限）。
+// 思考档位被拒同属 invalid_request_error（参数问题）。
 func anthropicFailure(err error) (code, msg string) {
 	if f := failureOf(err); f != nil && f.Kind == FailureContextTooLong {
+		return "invalid_request_error", f.Message
+	}
+	if f := failureOf(err); f != nil && f.Kind == FailureEffortRejected {
 		return "invalid_request_error", f.Message
 	}
 	if errorCodeFor(err) != "no_healthy_account" {
@@ -740,6 +752,9 @@ func anthropicFailure(err error) (code, msg string) {
 func responsesFailure(err error) (code, msg string) {
 	if f := failureOf(err); f != nil && f.Kind == FailureContextTooLong {
 		return "context_length_exceeded", f.Message
+	}
+	if f := failureOf(err); f != nil && f.Kind == FailureEffortRejected {
+		return "invalid_request_error", f.Message
 	}
 	if errorCodeFor(err) != "no_healthy_account" {
 		return "invalid_request_error", errText(err)
@@ -801,15 +816,24 @@ func errorCodeFor(err error) string {
 	if errors.As(err, &locked) {
 		return "model_not_allowed"
 	}
-	// 说明：这里曾有 `unsupported_reasoning_effort` 分支（配套 checkRequestedEffort）。
-	// 2026-09-18 实测推翻了它的前提 —— supportedEfforts 不是硬范围
+	// 说明：这里曾有 `unsupported_reasoning_effort` 分支（配套 checkRequestedEffort
+	// 的**预校验**）。2026-09-18 实测推翻了它的前提 —— supportedEfforts 不是硬范围
 	//（hy3 声明 [low,high] 却接受 medium/max/minimal/off），据它拦截会误拒合法请求。
-	// 该拦截与错误码已一并移除；档位现在一律原样透传，真不被接受的由上游报 400。
+	// 预校验已移除；档位原样透传给上游。
+	//
+	// 但「上游拒绝之后」仍要单独成型（下面那个分支）—— 两者性质完全不同：
+	// 预校验是网关替上游猜它能接受什么；如实转达是上游已经给了结论。
 	// 带图片请求缺区域账号：不是「账号池暂时不可用、稍后重试」，而是
 	// 「你的池子缺一类账号」。用独立的码让客户端/用户能区分，而不是
 	// 混进 no_healthy_account 里被当成一次普通的负载抖动。
 	if f := failureOf(err); f != nil && f.Kind == FailureImageRegionUnavailable {
 		return "image_region_unavailable"
+	}
+	// 思考档位被上游拒绝：同样是**请求侧**错误（改请求即可，重试无用），
+	// 给独立错误码而不是落进 no_healthy_account 被当成账号故障。
+	// 用户拿到它就知道该换档位，而不是去查账号池。
+	if f := failureOf(err); f != nil && f.Kind == FailureEffortRejected {
+		return "reasoning_effort_rejected"
 	}
 	return "no_healthy_account"
 }

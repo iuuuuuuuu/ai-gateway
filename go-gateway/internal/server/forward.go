@@ -324,6 +324,31 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 				}
 			}
 
+			// 思考档位被上游拒绝：**同样是请求侧错误**，但它比上下文超长更需要
+			// 「原样转达」—— 用户要看到上游到底说了什么（如
+			// "the reasoning effort value is not supported by the current model"），
+			// 才能知道该换成哪个档位。
+			//
+			// 为什么不能让它落进下面的轮转：
+			//   · 换号毫无意义（同一请求体给任何账号都会被拒）；
+			//   · 轮转结束后消息会被包装成 503「账号全部不可用」，
+			//     用户会去查账号，而真实原因在请求里；
+			//   · 上游原文在那一层已被 FriendlyMessage 吞掉。
+			//
+			// 注意这里**不罚账号也不换号**：账号状态完全不动（上游拒绝的是参数，
+			// 不是这个账号）。status 原样透出（通常 400），客户端据此判断是请求问题。
+			if kind == upstream.ErrEffortRejected {
+				uid := acct.UID
+				releaseHeld()
+				return &chatResult{UID: uid}, status, &forwardFailure{
+					Kind:   FailureEffortRejected,
+					Status: status,
+					// 保留上游 msg 原文；取不到时回退截断的 body。
+					Message: "上游不接受本次指定的思考档位（reasoning_effort）：" +
+						upstream.EffortRejectedDetail(string(respBody)),
+				}
+			}
+
 			h.applyErrorPolicy(acct.UID, model, kind, string(respBody))
 			fail(acct.UID)
 			continue
@@ -388,6 +413,13 @@ const (
 	// 单独成型是为了让错误文案说清「缺什么、该怎么办」—— 与账号池耗尽的
 	// 503 不同，这不是「稍后重试就好」，而是「你得加一个那个区域的账号」。
 	FailureImageRegionUnavailable
+	// FailureEffortRejected 上游不接受本次指定的思考档位：请求侧错误，换号无用。
+	//
+	// 与 FailureContextTooLong 同一性质（用户的请求需要改，而不是账号有问题），
+	// 但它更依赖**上游原文**：该换哪个档位取决于具体模型，没有任何通用表
+	//（实测 off 在 14/16 个模型被接受，却被两个 deepseek 模型拒绝），
+	// 所以文案必须带回上游说的话，而不是替用户猜一个「可用范围」。
+	FailureEffortRejected
 )
 
 // imageRegionUnavailableMessage 生成「带图片请求缺少该区域账号」的说明。

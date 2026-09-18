@@ -179,6 +179,16 @@ func TestModelReasoningFieldsCopiesSlice(t *testing.T) {
 // 而实测固定档模型的 effort 是有效的（上面用例的 B 情形）。保留它会把 bug 锁死，
 // 故删除；三态语义改由 TestModelReasoningFieldsThreeStates 覆盖。
 
+// hasEffort 判断档位列表里是否含某个值（大小写不敏感）。
+func hasEffort(list []string, want string) bool {
+	for _, e := range list {
+		if strings.EqualFold(strings.TrimSpace(e), want) {
+			return true
+		}
+	}
+	return false
+}
+
 // TestModelReasoningFieldsThreeStates 思考能力的三种情形必须分开表达。
 //
 // 这是所有者报的缺陷（「国服还是国际服都是有思考档位的，你这里数据不对吧」）：
@@ -244,22 +254,16 @@ func TestModelReasoningFieldsThreeStates(t *testing.T) {
 	if b["default_effort"] != "high" {
 		t.Errorf("必须下发默认档，实际 %#v", b["default_effort"])
 	}
-	// 必须给出可选档位（标准阶梯）——空列表会让客户端渲染出没有选项的控件，
+	// 必须给出可选档位（候选阶梯）——空列表会让客户端渲染出没有选项的控件，
 	// 用户只能看到「固定」而无法尝试任何档位，那正是本缺陷的表现。
 	list, ok := b["supported_efforts"].([]string)
 	if !ok || len(list) < 4 {
-		t.Fatalf("应下发标准阶梯（实测该类模型接受整套档位），实际 %#v", b["supported_efforts"])
-	}
-	// 不得含 off：实测该模型明确拒绝 off（HTTP 400），列出会让用户选到必然报错的值。
-	for _, e := range list {
-		if e == "off" {
-			t.Error("标准阶梯不得包含 off —— 实测该类模型会拒绝它（HTTP 400）")
-		}
+		t.Fatalf("应下发候选档位阶梯，实际 %#v", b["supported_efforts"])
 	}
 	// 顺序必须稳定且由低到高：map 遍历顺序随机，不排序会让客户端下拉框顺序跳变。
-	wantOrder := []string{"minimal", "low", "medium", "high", "xhigh", "max"}
+	wantOrder := []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 	if len(list) != len(wantOrder) {
-		t.Errorf("标准阶梯应有 %d 档，实际 %d：%v", len(wantOrder), len(list), list)
+		t.Errorf("候选阶梯应有 %d 档，实际 %d：%v", len(wantOrder), len(list), list)
 	} else {
 		for i := range wantOrder {
 			if list[i] != wantOrder[i] {
@@ -267,6 +271,26 @@ func TestModelReasoningFieldsThreeStates(t *testing.T) {
 				break
 			}
 		}
+	}
+	// ⚠ off 必须**在**列表里。此前我把它删了，理由是「deepseek-v4.1-flash
+	// 拒绝 off（HTTP 400）」—— 那是从**单模型单次观测**推到「一类模型」。
+	// 逐模型实测（16 个国服模型 × 7 档）显示 off 在 14/16 个模型上被接受，
+	// 只有两个 deepseek 模型拒绝。删掉它会让那 14 个模型的用户少一个可用档位。
+	if !hasEffort(list, "off") {
+		t.Error("候选阶梯应包含 off —— 实测 14/16 个模型接受它，" +
+			"删掉会让多数模型的用户少一个可用档位（我此前正是这么错的）")
+	}
+	// 必须标注**哪些档有上游清单背书**：off/minimal 从未出现在任何模型的
+	// supportedEfforts 里，只有我们的实测结果 —— 客户端据此措辞更保守。
+	backed, ok := b["upstream_declared_efforts"].(map[string]bool)
+	if !ok {
+		t.Fatalf("应下发 upstream_declared_efforts 标注，实际 %#v", b["upstream_declared_efforts"])
+	}
+	if !backed["high"] || !backed["low"] {
+		t.Errorf("low/high 有上游清单背书，应为 true，实际 %#v", backed)
+	}
+	if backed["off"] || backed["minimal"] {
+		t.Errorf("off/minimal 从未被上游声明过，应为 false，实际 %#v", backed)
 	}
 
 	// ---- C. 完全无思考信息：不下发 ----

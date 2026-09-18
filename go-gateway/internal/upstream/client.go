@@ -43,6 +43,22 @@ const (
 	// 对着每个账号重传一遍（2026-09-15 实测：1.12M token 的请求被重传 3 次），
 	// 最后还被包装成 503 no_healthy_account，把排查方向引向「账号故障」。
 	ErrContextTooLong
+	// ErrEffortRejected 上游不接受本次指定的思考档位（HTTP 400）。
+	//
+	// 实测原文（2026-09-18，真实流式调用）：
+	//	the reasoning effort value is not supported by the current model
+	//
+	// 同样是**请求侧**错误：换号无用，而且必须让用户看到上游说了什么
+	//（他据此换一个档位即可）。归进通用 ErrClient 会有两个后果：
+	//   · 被 applyErrorPolicy 当成账号问题轮转，用户最后看到的是
+	//     「账号全部不可用」——与真实原因完全无关；
+	//   · 上游原文在最后一轮失败里被 FriendlyMessage 吞掉，
+	//     用户拿不到「是档位不被接受」这条信息。
+	//
+	// 注意：**不要**据此在网关侧预校验档位 —— supportedEfforts 不是硬范围
+	//（hy3 声明 [low,high] 却接受 medium/max/off），预校验会误拒合法请求。
+	// 这条路径是「上游已经拒绝了」之后的如实转达，不是我们替它判断。
+	ErrEffortRejected
 )
 
 func (k ErrKind) String() string {
@@ -63,6 +79,8 @@ func (k ErrKind) String() string {
 		return "model_rate"
 	case ErrContextTooLong:
 		return "context_too_long"
+	case ErrEffortRejected:
+		return "effort_rejected"
 	default:
 		return "none"
 	}
@@ -332,10 +350,73 @@ func FriendlyMessage(kind ErrKind, status int, body string) string {
 		return "账号登录态已失效，需在「账号管理」页重新登录"
 	case kind == ErrNotFound:
 		return "上游返回 404（接口或模型不存在），已短暂冷却并切换账号"
+	case kind == ErrEffortRejected:
+		// 保留上游原文 —— 这是**请求侧**错误，用户要原样看到上游说了什么
+		//（如 "the reasoning effort value is not supported by the current model"），
+		// 自己换一个档位即可，与账号状态无关。
+		return "上游不接受本次指定的思考档位（reasoning_effort）：" + EffortRejectedDetail(body)
 	case kind == ErrServer && status > 0:
 		return "上游服务异常（HTTP " + strconv.Itoa(status) + "），已切换到其他账号"
 	}
 	return ""
+}
+
+// effortRejectedMarkers 上游拒绝思考档位时的响应特征。
+//
+// 实测原文（2026-09-18，真实流式调用，HTTP 400）：
+//
+//	the reasoning effort value is not supported by the current model
+//
+// 这是**请求侧**错误：同一个请求体发给任何账号都会同样失败，换号毫无意义。
+// 必须单独识别出来，否则它会落进通用 4xx（ErrClient）被当成账号故障轮转 ——
+// 那正是所有者遇到的「我用的档位到底行不行」看不出来的原因。
+var effortRejectedMarkers = []string{
+	"reasoning effort value is not supported",
+	"reasoning_effort is not supported",
+	"unsupported reasoning effort",
+}
+
+// IsEffortRejected 上游是否在拒绝本次请求的思考档位。
+func IsEffortRejected(body string) bool {
+	lower := strings.ToLower(body)
+	for _, m := range effortRejectedMarkers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// EffortRejectedDetail 从上游响应体里取出可读的原始说明。
+//
+// 保留原文很重要：用户要据此判断该换哪个档位，而我们的猜测未必对
+//（实测不同模型接受的范围并不相同：off 在 14/16 个模型被接受，
+// 却被两个 deepseek 模型拒绝 —— 没有任何一张通用表能替他判断）。
+//
+// 取不到 msg 字段时回退到原始 body（截断），而不是编一句像是我们判断的话。
+func EffortRejectedDetail(body string) string {
+	var env struct {
+		Msg      string `json:"msg"`
+		Error    struct {
+			Message string `json:"message"`
+			Msg     string `json:"msg"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &env); err == nil {
+		for _, s := range []string{env.Msg, env.Error.Message, env.Error.Msg} {
+			if t := strings.TrimSpace(s); t != "" {
+				return t
+			}
+		}
+	}
+	t := strings.TrimSpace(body)
+	if len(t) > 300 {
+		t = t[:300] + "…"
+	}
+	if t == "" {
+		return "（上游未给出说明）"
+	}
+	return t
 }
 
 // Classify 按 HTTP 状态码 + body 判定错误类别。
@@ -372,6 +453,11 @@ func Classify(status int, body string) ErrKind {
 	// 放在 429 之后是有意的：429 一律按限流归类，保持既有语义不变。
 	if IsContextTooLong(body) {
 		return ErrContextTooLong
+	}
+	// 思考档位被拒同样必须早于通用 4xx：它是请求侧错误，换号无用，
+	// 而且要保留上游原文让用户知道该换哪个档（见 ErrEffortRejected 的注释）。
+	if IsEffortRejected(body) {
+		return ErrEffortRejected
 	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
