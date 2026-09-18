@@ -2064,6 +2064,21 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
             // `AllowedModels.UnmarshalJSON` 同时吃字符串与数组，因此把老的
             // 单值字符串读成单元素数组、写成数组，两边都自洽。
             "allowed_model": allowed_models_of(cfg),
+            // ---- 多产品路由 ----
+            //
+            // ⚠ 这两个键**必须写**，否则多产品功能在生产里是**不可达**的：
+            // Go 侧只在 `pool.multi_product=true` 时才加载 Qoder / ZCode 账号，
+            // 而缺键 → 默认 false。用户的症状是「账号页里加好了账号、
+            // 状态也正常，但请求永远只走 WorkBuddy」—— 从界面上完全看不出来。
+            //
+            // 我之前只在 Go 侧实现了这两个键，**漏了宿主这一端**，
+            // 端到端实测才发现（`uitest/z7-final-zcode.cjs`）。
+            "multi_product": true,
+            // 凭证目录**显式写出**（而不是让 Go 侧用默认值）：
+            // 两边的默认目录一旦分叉，就会出现「界面里登录成功、网关看不到账号」。
+            // 这里以宿主的真实目录为准，Go 侧拿到的一定是有效的。
+            "qoder_auth_dir": crate::modules::qoder_account::auth_dir().to_string_lossy(),
+            "zcode_auth_dir": crate::modules::zcode_account::auth_dir().to_string_lossy(),
         },
         "session_sticky": { "enabled": true, "ttl": "30m", "gc_interval": "5m" },
         // ---- 账号记录回写（养号任务的执行痕迹）----
@@ -3788,6 +3803,46 @@ mod tests {
         assert!(!derive("balance"));
         assert!(!derive("pinned"));
         assert!(!derive("garbage"));
+    }
+
+    // native config 必须写出多产品路由的**契约键**。
+    //
+    // ## 为什么必须锁住这一条
+    //
+    // Go 网关只在 `pool.multi_product=true` 时才加载 Qoder / ZCode 账号，
+    // 而**缺键 → 默认 false**。我最初只在 Go 侧实现了这两个键，
+    // 漏了宿主这一端 —— 端到端实测才发现（`uitest/z7-final-zcode.cjs`）。
+    //
+    // 症状极具误导性：用户在账号页里加好了账号、状态显示正常、
+    // 日志也显示"已载入 N 个账号"，但**请求永远只走 WorkBuddy**，
+    // 从界面上完全看不出来是配置键缺失。
+    //
+    // 凭证目录也必须**显式写出**：两边默认目录一旦分叉，就会出现
+    // 「界面里登录成功、网关看不到账号」。
+    #[test]
+    fn native_config_writes_multi_product_keys() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-multi-product");
+        let cfg = json!({ "port": 7864, "listen": ":7864" });
+
+        let path = super::write_native_config(&cfg).expect("write native config");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let native: Value = serde_json::from_str(&text).unwrap();
+        let pool = &native["pool"];
+
+        assert_eq!(
+            pool["multi_product"], true,
+            "pool.multi_product 必须写出为 true —— 缺键会让 Go 侧默认关闭多产品路由，\
+             账号页里加好的 Qoder / ZCode 账号永远不参与选号"
+        );
+
+        for key in ["qoder_auth_dir", "zcode_auth_dir"] {
+            let v = pool[key].as_str().unwrap_or("");
+            assert!(
+                !v.trim().is_empty(),
+                "pool.{key} 必须写出非空路径 —— 空值会让 Go 侧回落到它自己的默认目录，\
+                 两边不一致时表现为「界面里登录成功、网关看不到账号」"
+            );
+        }
     }
 
     // write_native_config 必须把 4 个养号任务的排程写进 native config 的 schedule 块。
