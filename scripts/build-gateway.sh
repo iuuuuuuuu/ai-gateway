@@ -1,12 +1,11 @@
 #!/bin/sh
-# 构建**Rust 版**网关，产物落到 crates/ai-gateway-core/embedded/，
+# 构建网关（Rust），产物落到 crates/ai-gateway-core/embedded/，
 # 之后 cargo build 时 build.rs 会把它 gzip 压缩后编进主程序。
 #
 # 与 scripts/build-gateway.ps1 等价（Windows 用 .ps1，CI / Unix 用本脚本）。
-# Go 版实现保留在 scripts/build-gateway-go.sh，供回退与 A/B 对照使用。
 #
-# 产物路径与 Go 版**完全相同**，因此宿主侧（gateway.rs 的 resolve_gateway_exe、
-# build.rs 的 candidate_paths）不需要任何改动 —— 换网关实现只换构建来源。
+# 产物路径与宿主约定一致，因此宿主侧（gateway.rs 的 resolve_gateway_exe、
+# build.rs 的 candidate_paths）不需要任何改动。
 #
 # 保持 POSIX sh 兼容：CI（Ubuntu）用 `sh` 调用时是 dash，不支持 pipefail
 # 等 bash 扩展。与 make-dmg.sh 遵循同一约定。

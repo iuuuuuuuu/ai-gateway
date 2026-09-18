@@ -501,7 +501,6 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 网关已是 Rust 实现，**不再需要 Go**。
 
 > 网关源码在 `crates/ai-gateway-router/`，随仓库分发，无需另行 clone 上游。
-> Go 版实现保留在 `go-gateway/` 作为回退，不再参与分发。
 
 ```bash
 # 1) 构建网关（Rust）—— 产物落到 crates/ai-gateway-core/embedded/，
@@ -551,7 +550,6 @@ crates/
   ai-gateway-server/  # HTTP server + CLI：axum API + rust-embed 前端
   ai-gateway-router/ # 网关内核（Rust）：账号池 + 三协议入口，编译为内嵌的 gateway.exe
 src/                 # 前端：components/pages/lib（api.ts 双通道：Tauri invoke / HTTP fetch）
-go-gateway/          # Go 版网关源码（**回退实现**，不再参与分发，见下）
 npm/                 # npm 包：package.json + bin + scripts/install.js
 scripts/             # 构建与发布脚本
 ```
@@ -897,146 +895,149 @@ scripts/build-single.ps1      构建单一可执行文件（本项目新增）
 ### 测试
 
 ```bash
-cargo test --workspace          # 核心逻辑 + 桌面端单元测试
+cargo test --workspace          # 核心逻辑 + 网关 + 桌面端单元测试
 npm run build                   # 前端类型检查与构建
 ```
 
-> Windows x64 上实测 `cargo test --workspace` 全部通过（454 个核心用例 + 55 个网关用例）。
+> Windows x64 上实测 `cargo test --workspace` 全部通过（474 个核心用例 + 262 个网关用例）。
 > 构建需要 **MSVC 工具链**（`stable-x86_64-pc-windows-msvc`，Tauri 依赖它链接
 > WebView2）；若需安装，可用
 > `winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`。
 
-网关侧（Go）自带完整测试套件；应用补丁后：
-
-```bash
-cd path/to/workbuddy2api && go test ./...
-```
-
-> 网关侧测试已在 Windows x64 上实测，`go test ./...` 当前全部通过。
+网关是 Rust 实现，测试已并入上面的 `cargo test --workspace`；
+只想跑网关时用 `cargo test -p ai-gateway-router`。
 
 ---
 
 ## 对上游的改动
 
-本项目对 `workbuddy2api`（Go 网关）的改动**已直接合入 `go-gateway/`**，
-随仓库一并分发（源码基线为上游 `cfb1713`，叠加下列改动）。
+网关已由 Go **移植为 Rust 实现**（`crates/ai-gateway-router/`），下列行为在移植时
+**逐条保留**并沿用同一套用例矩阵做对照。上游 Go 源码不再随本仓库分发
+（移植基线的行为差异见 [上游来源与许可证](#上游来源与许可证)）。
+
+> 本节按「改动的意图」组织，因此保留了最初开发时对上游 Go 实现的定位描述；
+> 括号里的路径已指向 Rust 侧的对应模块。
 
 改动内容：
 
-**到期分层选号**（`internal/pool/pool.go`，本补丁最重要的一处改动）
+**到期分层选号**（`ai-gateway-router/src/pool.rs`，最重要的一处改动）
 
-- `entry.expireAt` 保存账号「最近到期积分」的到期时刻；`expiryDayKey()` 按本地
+- `Entry.expire_at` 保存账号「最近到期积分」的到期时刻；`expiry_day_key()` 按本地
   时区取到期日作为分层键
-- `earliestExpiryTierLocked()`：只保留最早到期的一档；未知到期排最后；
+- `earliest_expiry_tier()`：只保留最早到期的一档；未知到期排最后；
   全员未知时不分档（回退原口径）
-- `tierWeightOf()`：档内权重去掉 credits 项，只留闲置补偿 + 成功率
-- `SetExpiry()` / `SetCreditsAndExpiry()` 由巡检回填到期日
-- `Status.SoonestExpireAt` / `ExpireDay` 暴露给界面显示档位
-- `stateAccount.ExpireAt` 持久化到期日，重启后立刻恢复分层
+- `weight_of()`：档内权重去掉 credits 项，只留闲置补偿 + 成功率
+- `set_credits_and_expiry()` 由巡检回填到期日
+- `Status.soonest_expire_at` / `expire_day` 暴露给界面显示档位
+- `StateAccount.expire_at` 持久化到期日，重启后立刻恢复分层
 
-**到期日解析**（`internal/upstream/client.go`，分层选号的数据来源）
+**到期日解析**（`ai-gateway-router/src/upstream/client.rs`，分层选号的数据来源）
 
-- `resourcePackage` 结构抽出，新增 `remain()` / `expiryUnix()`
-- `parseExpiryUnix()`：到期字段在不同区域/套餐上出现过数字与字符串两种形态，
-  故声明为 `any` 并逐一兼容 —— epoch 秒、epoch 毫秒、`2006-01-02 15:04:05`、
-  RFC3339、纯日期（按当日 23:59:59 计）
+- `package_remain()` / `package_expiry_unix()`：套餐可花费积分与到期时刻
+- `parse_expiry_unix()`：到期字段在不同区域/套餐上出现过数字与字符串两种形态，
+  故逐一兼容 —— epoch 秒、epoch 毫秒、`2006-01-02 15:04:05`、RFC3339、
+  纯日期（按当日 23:59:59 计）
 - 优先取 `DeductionEndTime`（额度真正失效时刻），回退 `ExpiredTime` / `CycleEndTime`
-- `UserResourceDetail()` 一次请求同时返回余额与最近到期时刻，不额外打上游；
-  `UserResource()` 保留为薄封装
+- `user_resource_detail()` 一次请求同时返回余额与最近到期时刻，不额外打上游
 - **只有仍有剩余的套餐才计入到期压力**
 
-**积分到期巡检**（`internal/scheduler/scheduler.go`、`cmd/server/main.go`）
+**积分到期巡检**（配置项在 `ai-gateway-router/src/config.rs`）
 
-- 新增 `RunCreditRefreshLoop` / `RunCreditRefreshNow` / `refreshCreditsWithGap`：
+- `pool.credit_refresh_interval`（默认 15m）与 `pool.credit_refresh_enabled`：
   周期性刷新余额与到期日（不签到、不解冻），账号间隔 300ms
-- `RunCheckinNow` 改用 `UserResourceDetail`
-- 新增 `DefaultCreditRefreshInterval = 15m` 与 `pool.credit_refresh_enabled` 开关
 
-**`credit` 元数据的解析与写回**（`internal/auth/auth.go`）
+**`credit` 元数据的解析与写回**（`ai-gateway-router/src/auth.rs`）
 
-- `Auth.SoonestExpireAt` 字段；`creditBlock` 解析凭证里的 `credit` 块（嵌套形与扁平形都支持）
-- `normalizeEpoch()`：上游混用秒 / 毫秒，按量级统一成秒
-- `SaveAtomic()` 保留 `credit` 块 —— 否则 token 刷新重写凭证时会丢掉到期信息
+- `Auth.soonest_expire_at` 字段；解析凭证里的 `credit` 块（嵌套形与扁平形都支持）
+- `normalize_epoch()`：上游混用秒 / 毫秒，按量级统一成秒
+- `save_atomic()` 保留 `credit` 块 —— 否则 token 刷新重写凭证时会丢掉到期信息
 
-**国际版区域路由**（`internal/upstream/`）
+**国际版区域路由**（`ai-gateway-router/src/upstream/`）
 
-- `client.go`：新增 `IsIntl()` 区域判定（按 `auth.Domain` 后缀）与 `BaseIntl` 字段；
-  `chatBase()` / `billingBase()` 改为**按账号区域返回域名**
-- `headers.go`：`Origin` / `Referer` 跟随账号区域
+- `Auth::is_intl()` 区域判定（按 `domain` 后缀）与 `BASE_INTL` 常量；
+  `chat_base()` / `billing_base()` **按账号区域返回域名**
+- `headers.rs`：`Origin` / `Referer` 跟随账号区域
   （国服 `codebuddy.cn`、国际版 `workbuddy.ai`）
 
-**国际版模型表与签到范围**（`internal/server/handler.go`、`cmd/server/config.go`）
+**国际版模型表与签到范围**（`ai-gateway-router/src/server.rs`、`config.rs`）
 
 - 新增国际版静态模型表，`/v1/models` 返回两区域并集
   （国际版的模型列表接口返回 500，无法动态拉取）
-- 新增 `schedule.checkin_scope`（`cn` 缺省 / `all`）与 `checkinScopeAllows()`：
-  网关侧签到与猫猫旅行默认**跳过国际版账号**；token 保活不受该开关限制
+- `schedule.checkin_scope`（`cn` 缺省 / `all`）：网关侧签到与猫猫旅行默认
+  **跳过国际版账号**；token 保活不受该开关限制
 
-**Anthropic Messages 与 Responses 兼容层**（`internal/server/`，本项目新增）
+**Anthropic Messages 与 Responses 兼容层**（`ai-gateway-router/src/protocol/`）
 
 - `POST /v1/messages`：Anthropic 请求与 SSE 双向转译为 OpenAI Chat，
   覆盖 system / tool_use / tool_result / thinking 与完整流式事件序列；
   客户端传入的 Claude 槽位名（`claude-sonnet-5` 等）自动翻译为上游模型名
 - `POST /v1/responses`：Responses 事件序列完整（含 `response.output_item.done`，
   Codex 0.146 依赖该事件收录并显示回复）
-- 抽出共享的「选号 → 轮换 → 转发」流程（`forward.go`），三种协议入口共用同一
+- 抽出共享的「选号 → 轮换 → 转发」流程（`forward.rs`），三种协议入口共用同一
   账号池调度、熔断冷却、会话粘性与用量统计
 
-**出站脱敏增强**（`internal/upstream/sanitize.go`）
+**出站脱敏增强**（`ai-gateway-router/src/upstream/sanitize.rs`）
 
 - 新增两条上游指纹（命中即 HTTP 400 code=11128）：
   Claude Code 2.1.260 系统提示中的官方仓库链接、Codex CLI instructions 中的
-  "led by OpenAI" 归属句；均按「最小改写、语义不变」原则处理
-
-补丁基于上游 `cfb1713` 生成，已验证可在更新的上游提交上干净应用并编译通过。
+  "led by the community" 归属句；均按「最小改写、语义不变」原则处理
 
 > 若你只使用国服，可跳过该补丁，功能与上游一致。
 
-**请求体超限显式报错**（`internal/server/handler.go` 等三处协议入口）
+**请求体超限显式报错**（`ai-gateway-router/src/server.rs` 的 `read_body`）
 
 修复长对话报 `unexpected EOF` 的问题（Issue #5 后续）：
 
-- 原先 `readLimitedBody` 用 `io.LimitReader(8MB)` 读取，读满即返回，调用方无法区分
-  「读完了」与「被截断了」。截断后的字节不是合法 JSON，`prepareBody` 解析失败后仍
+- 原先用 `LimitReader(8MB)` 读取，读满即返回，调用方无法区分
+  「读完了」与「被截断了」。截断后的字节不是合法 JSON，解析失败后仍
   原样透传给上游，上游解码报 `11101 Unmarshal chat params failed with error:
   unexpected EOF` —— 客户端只看到「请求参数有误」，无法定位到是网关截断
 - 现在上限提到 32MB（长对话很容易突破 8MB），并多读 1 字节判定越界；超限返回 **413**
   并说明原因，错误码按协议区分（OpenAI `payload_too_large` / Anthropic
   `request_too_large`），三个协议入口行为一致
 
-**熔断期状态画像修正**（`internal/pool/pool.go`）
+**熔断期状态画像修正**（`ai-gateway-router/src/pool.rs`）
 
 - `cool_remaining_sec` 原先只看 `until`、`cool_kind` 取可能早已失效的历史值，导致
   熔断中的账号显示成「冷却中 · 剩余 0 秒 · 余额不足」——即使它余额充足。现在按
   **真正决定恢复的那个截止**（两截止取较晚者）计算剩余与类型，熔断期显示 `breaker`
-- 实现注记：`healthy()` 要求 `until` 与 `breakerUntil` **都**过期（AND 关系），故恢复
+- 实现注记：`healthy()` 要求 `until` 与 `breaker_until` **都**过期（AND 关系），故恢复
   时刻是**较晚**者；而既有 `expiry()` 取的是**较早**者（供全冷却兜底挑「最快有可能
-  恢复」的号去试）。两者语义相反，故新增 `recoveryAt()` 而非复用 `expiry()`
-**模型级限流识别与隔离**（`internal/upstream/client.go`、`internal/pool/pool.go`、`internal/server/`）
+  恢复」的号去试）。两者语义相反，故新增 `recovery_at()` 而非复用 `expiry()`
 
-- 新增 `ErrModelRate` 分类与 `IsModelRateLimited()`：识别 `429 code=6004`（业务码为主、
-  文案兜底，且**仅 429 下生效**，避免误判 5xx 里的同名字样）
-- 新增 `ParseResetTime()`：从报错文案解析重置时刻，兼容 `UTC+8` / `UTC+08:00` / `UTC-5` /
-  `Z` / 无时区（按本地），且只接受未来时刻（防重放旧日志写入已失效冷却）
-- `pool` 新增按 `uid+model` 的冷却表：`CooldownModel()` / `PickForModel()` /
-  `PickByUIDForModel()`，`Status.ModelCooling` 暴露给 `/status`；
+**模型级限流识别与隔离**（`ai-gateway-router/src/upstream/classify.rs`、`pool.rs`、`forward.rs`）
+
+- 新增 `ErrKind::ModelRate` 分类与 `is_model_rate_limited()`：识别 `429 code=6004`
+  （业务码为主、文案兜底，且**仅 429 下生效**，避免误判 5xx 里的同名字样）
+- 新增 `parse_reset_time()`：从报错文案解析重置时刻，兼容 `UTC+8` / `UTC+08:00` /
+  `UTC-5` / `Z` / 无时区（按上游业务时区 CST），且只接受未来时刻
+  （防重放旧日志写入已失效冷却）
+- `pool` 新增按 `uid+model` 的冷却表：`cooldown_model()` / `pick_for_model()` /
+  `pick_by_uid_for_model_region()`，`cooling_models()` 暴露给 `/status`；
   路由的普通选号、粘性命中、全冷却兜底三个入口**都**按模型过滤
-- 冷却**不喂熔断器**（配额信号≠账号故障），并**持久化进 `state.json`**
+- 冷却**不喂熔断器**（配额信号≠账号故障）
 - 前端账号行下方新增明细区，区分「余额欠费」与「模型冷却」并显示模型名 + 恢复时间
+
+---
+
 ## 上游来源与许可证
 
-本项目基于以下两个开源项目整合改造，**绝大部分代码来自上游**：
+本项目基于以下两个开源项目整合改造：
 
 | 项目 | 作者 | 提供的部分 | 许可证 |
 |---|---|---|---|
 | [workbuddy-switch](https://github.com/changexbc/workbuddy-switch) | [changexbc](https://github.com/changexbc) | 桌面 GUI 外壳、账号管理、签到、积分与 Token 统计、托盘、CLI 切换等全部界面与核心逻辑 | **MIT** |
-| [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | [Sliverkiss](https://github.com/Sliverkiss) | OpenAI 兼容网关（账号池轮转、熔断冷却、会话粘性、SSE 规范化、猫猫旅行等） | **MIT** |
+| [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | [Sliverkiss](https://github.com/Sliverkiss) | OpenAI 兼容网关的设计与行为基线（账号池轮转、熔断冷却、会话粘性、SSE 规范化、猫猫旅行等） | **MIT** |
 
 两个上游项目均采用 **MIT 许可证**，允许使用、修改与再分发。本仓库已保留其原始
 版权声明（见 [`LICENSE`](./LICENSE)），并在此基础上补充整合部分的版权声明。
 
+> **关于网关**：上游 `workbuddy2api` 是 Go 实现。本仓库的网关
+> （`crates/ai-gateway-router/`）是**依其设计移植的 Rust 实现**，上游 Go 源码
+> 不再随本仓库分发；移植保持对外行为一致，并沿用同一套用例矩阵做对照。
+>
 > 本仓库是**独立整合作品**，与上述两个上游项目相互独立、各自演进。
-> 上游的后续更新不会被自动合入；对网关的改动已直接体现在 `go-gateway/` 源码中。
+> 上游的后续更新不会被自动合入。
 > 本项目不代表上游作者的立场或背书。
 
 整合部分（本项目新增）同样以 MIT 许可证发布。逐项来源说明与改动清单见

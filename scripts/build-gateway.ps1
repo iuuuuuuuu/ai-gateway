@@ -1,12 +1,11 @@
-# build-gateway.ps1 —— 构建**Rust 版**网关，产物落到 embedded/ 供内嵌。
+# build-gateway.ps1 —— 构建网关（Rust），产物落到 embedded/ 供内嵌。
 #
 # 产物：crates/ai-gateway-core/embedded/gateway.exe
 # 之后 cargo build 时 build.rs 会把它 gzip 压缩后编进主程序，实现单文件分发。
 #
-# 与 scripts/build-gateway.sh（Go 版）的关系：
-#   两者产物路径**完全相同**，因此宿主侧（gateway.rs 的 resolve_gateway_exe、
-#   build.rs 的 candidate_paths）不需要任何改动 —— 换网关实现只换构建来源。
-#   本脚本是当前生效的实现；Go 版保留以便回退对照。
+# 与 scripts/build-gateway.sh（CI / Unix 用的等价脚本）产物路径完全相同，
+# 因此宿主侧（gateway.rs 的 resolve_gateway_exe、build.rs 的 candidate_paths）
+# 不需要任何改动。
 #
 # 用法：
 #   pwsh scripts/build-gateway.ps1              # release 构建
