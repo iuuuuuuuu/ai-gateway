@@ -14,6 +14,7 @@ package zcode
 // `upstream.Stream` / `upstream.Aggregate`，不需要像 Qoder 那样写翻译层。
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -569,6 +570,123 @@ var builtinModels = []Model{
 	{ID: "glm-5.2", Name: "GLM 5.2", ContextWindow: 1000000, MaxOutput: 128000, Reasoning: true},
 	{ID: "glm-5.3", Name: "GLM 5.3", ContextWindow: 1000000, MaxOutput: 128000, Reasoning: true},
 	{ID: "glm-5.3-flash", Name: "GLM 5.3 Flash", ContextWindow: 1000000, MaxOutput: 128000, Reasoning: true},
+}
+
+// ---------------------------------------------------------------------------
+// 非流式聚合
+// ---------------------------------------------------------------------------
+
+// AggregateOpenAI 把标准 OpenAI SSE 流聚合成一个 chat.completion 响应。
+//
+// ## 为什么本包要实现它（而不复用 upstream.Aggregate）
+//
+// server 包的 `ProductUpstream` 接口要求每个产品**自洽** ——
+// 它不能反向依赖 `upstream` 包（那会让"产品适配"与"WorkBuddy 实现"耦合）。
+//
+// ## 为什么这么简单（对比 Qoder）
+//
+// ZCode 上游的响应**本来就是标准 OpenAI 格式**（这是选 OpenAI 端点的收益），
+// 故这里只需把 delta 拼起来，不需要像 Qoder 那样先解开嵌套的 `body` 字段。
+func AggregateOpenAI(r io.Reader, model string) (map[string]any, error) {
+	var content, reasoning strings.Builder
+	finish := ""
+	id := ""
+	created := int64(0)
+	modelOut := ""
+
+	br := bufio.NewReaderSize(r, 64*1024)
+	for {
+		line, err := br.ReadString('\n')
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "data:") {
+			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+			if payload == "[DONE]" {
+				break
+			}
+			if payload != "" {
+				var chunk struct {
+					ID      string `json:"id"`
+					Created int64  `json:"created"`
+					Model   string `json:"model"`
+					Choices []struct {
+						Delta struct {
+							Content          string `json:"content"`
+							ReasoningContent string `json:"reasoning_content"`
+						} `json:"delta"`
+						Message struct {
+							Content          string `json:"content"`
+							ReasoningContent string `json:"reasoning_content"`
+						} `json:"message"`
+						FinishReason string `json:"finish_reason"`
+					} `json:"choices"`
+				}
+				if json.Unmarshal([]byte(payload), &chunk) == nil {
+					if chunk.ID != "" {
+						id = chunk.ID
+					}
+					if chunk.Created != 0 {
+						created = chunk.Created
+					}
+					if chunk.Model != "" {
+						modelOut = chunk.Model
+					}
+					if len(chunk.Choices) > 0 {
+						c := chunk.Choices[0]
+						// delta 是流式增量；message 是非流式整体（有些实现两者都给）
+						content.WriteString(firstNonEmpty(c.Delta.Content, c.Message.Content))
+						reasoning.WriteString(firstNonEmpty(c.Delta.ReasoningContent, c.Message.ReasoningContent))
+						if c.FinishReason != "" {
+							finish = c.FinishReason
+						}
+					}
+				}
+			}
+		}
+		if err != nil {
+			break // io.EOF 或读错误：已读到的内容仍返回
+		}
+	}
+
+	if finish == "" {
+		finish = "stop"
+	}
+	if id == "" {
+		id = "chatcmpl-zcode"
+	}
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+	if modelOut == "" {
+		modelOut = model
+	}
+
+	msg := map[string]any{"role": "assistant", "content": content.String()}
+	// reasoning_content 只在非空时给：空字符串会让部分客户端显示空的思考块
+	if reasoning.Len() > 0 {
+		msg["reasoning_content"] = reasoning.String()
+	}
+	return map[string]any{
+		"id":      id,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   modelOut,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"message":       msg,
+			"finish_reason": finish,
+		}},
+	}, nil
+}
+
+// modelOf 从 OpenAI 请求体里取 model 字段。
+func modelOf(body []byte) string {
+	var b struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &b); err != nil {
+		return ""
+	}
+	return b.Model
 }
 
 // ---------------------------------------------------------------------------

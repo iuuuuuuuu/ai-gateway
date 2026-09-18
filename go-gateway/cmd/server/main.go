@@ -50,6 +50,34 @@ func qoderAuthOf(cr *qoder.Cred) *auth.Auth {
 	}
 }
 
+// zcodeAuthOf 把 ZCode 凭证转成账号池用的 auth.Auth。
+//
+// ## 字段映射的取舍
+//
+// ZCode 的凭证就是一个字符串（`{apiKey}.{secret}`），故复用 auth.Auth 的
+// **AccessToken** 字段承载它（而不是新增一个只对 ZCode 有意义的字段）。
+//
+// **服务商**（Z.AI / 智谱）通过 Domain 承载 —— auth.Auth 已有这个字段
+//（WorkBuddy 用它判区域），复用它避免给池加字段。下游用
+// `zcode.ProviderOfDomain` 反解。
+//
+// ⚠ ZCode **没有令牌刷新**（凭证长期有效），故 RefreshToken / ExpiresAt 留空。
+// 池的"临近过期先刷新"逻辑对它不生效 —— 这是正确的（没有可刷新的东西）。
+func zcodeAuthOf(cr *zcode.Cred) *auth.Auth {
+	return &auth.Auth{
+		UID:      cr.UID,
+		Nickname: cr.Nickname,
+		// 凭证字符串复用 AccessToken 字段
+		AccessToken: cr.Credential,
+		// 服务商通过 Domain 承载（下游用 ProviderOfDomain 反解）
+		Domain:   zcode.DomainOfProvider(cr.Provider),
+		FilePath: cr.FilePath,
+		Product:  auth.ProductZcode,
+		// JWT 不放进 auth.Auth：它只用于额度查询（不在选号/转发热路径上），
+		// 而池也不该关心它。额度查询由宿主侧直接读凭证文件完成。
+	}
+}
+
 // maskUID 脱敏 uid（日志里不出现完整账号标识）。
 //
 // 本仓库是公开仓库，日志可能被用户贴到 issue 里 —— 只留前 8 位足够定位，
@@ -289,10 +317,12 @@ func main() {
 
 	// ---- 多产品路由（默认关闭）----
 	//
-	// 开启后：加载 Qoder 账号进同一个池，并注入 Qoder 的请求派发实现。
+	// 开启后：加载其它产品的账号进同一个池，并注入它们的请求派发实现。
 	// 关闭时两者都不做 —— 行为与单产品时代逐字相同（回滚点）。
 	var qoderDispatch server.ProductUpstream
+	var zcodeDispatch server.ProductUpstream
 	if cfg.Pool.MultiProduct {
+		// ---- Qoder ----
 		qoderDir := cfg.Pool.QoderAuthDir
 		if qoderDir == "" {
 			qoderDir = qoder.DefaultAuthDir()
@@ -326,7 +356,32 @@ func main() {
 		qc := qoder.New()
 		// Qoder 的网关对 HTTP/2 不友好，New() 里已禁用 h2（见 qoder.New 的注释）。
 		qoderDispatch = qoder.NewDispatch(qc)
-		// 成本维度：让两产品按"单位额度消耗率"参与加权（见 design.md §2.3）。
+
+		// ---- ZCode ----
+		zcodeDir := cfg.Pool.ZcodeAuthDir
+		if zcodeDir == "" {
+			zcodeDir = zcode.DefaultAuthDir()
+		}
+		zcreds, zfailed, zerr := zcode.LoadDir(zcodeDir)
+		if zerr != nil {
+			log.Printf("多产品路由已开启，但读取 ZCode 凭证目录失败（%s）：%v", zcodeDir, zerr)
+		}
+		for _, f := range zfailed {
+			log.Printf("ZCode 凭证解析失败，已跳过：%s", f)
+		}
+		zadded := 0
+		for _, cr := range zcreds {
+			if cr.UID == "" {
+				continue
+			}
+			p.Add(zcodeAuthOf(cr))
+			zadded++
+		}
+		log.Printf("多产品路由已开启：ZCode 凭证目录 %s，载入 %d 个账号（解析失败 %d 个）",
+			zcodeDir, zadded, len(zfailed))
+		zcodeDispatch = zcode.NewDispatch(zcode.New())
+
+		// 成本维度：让各产品按"单位额度消耗率"参与加权（见 design.md §2.3）。
 		p.SetMultiProduct(true, 0.3)
 	} else {
 		log.Printf("多产品路由已关闭（pool.multi_product=false）：只使用 WorkBuddy 账号")
@@ -367,10 +422,12 @@ func main() {
 		// Qoder 产品派发：仅在多产品路由开启时注入。
 		//
 		// 关闭时（默认）此字段为 nil → dispatchUpstream 对所有账号返回
-		// "非 Qoder" → 全部走既有 WorkBuddy 路径，行为与单产品时代逐字相同。
+		// "非该产品" → 全部走既有 WorkBuddy 路径，行为与单产品时代逐字相同。
 		// 这是 design.md §5 要求的回滚点：产品维度出问题就关掉开关，
 		// 立刻回到已验证的行为，不需要回滚代码。
 		Qoder: qoderDispatch,
+		// ZCode 产品派发（同上）。
+		Zcode: zcodeDispatch,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

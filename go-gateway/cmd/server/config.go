@@ -175,6 +175,11 @@ type Config struct {
 		// 与宿主侧的 qoder_account::auth_dir() 必须一致，否则会出现
 		// "界面里登录成功了但网关看不到账号"。
 		QoderAuthDir string `json:"qoder_auth_dir"`
+
+		// ZcodeAuthDir ZCode 凭证目录；空 = ~/.wb-switch/zcode/auths。
+		//
+		// 同上，必须与宿主侧的 zcode_account::auth_dir() 一致。
+		ZcodeAuthDir string `json:"zcode_auth_dir"`
 	} `json:"pool"`
 
 	// Proxy 出站 HTTP 代理，形如 "http://127.0.0.1:7890"（缺省空 = 不用显式代理）。

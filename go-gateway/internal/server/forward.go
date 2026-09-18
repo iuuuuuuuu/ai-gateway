@@ -260,8 +260,28 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 		}
 		heldUID = acct.UID
 
-		// token 临近过期 → 先 refresh（失败冷却换号）
-		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
+		// 按账号所属产品派发上游实现。
+		//
+		// 这一处是整个多产品路由的**唯一**分叉点：pool 可能选中任一产品的
+		// 账号，而各产品的鉴权/端点/请求体编码/响应形状完全不同。
+		// 不加这个分支就会拿别人的凭证去请求 WorkBuddy 的端点 ——
+		// 失败信息会显示成"账号不可用"，排查方向被引向凭证，
+		// 完全看不出是派发错了产品。
+		productUp, isProduct := h.dispatchUpstream(acct)
+
+		// token 临近过期 → 先 refresh（失败冷却换号）。
+		//
+		// ⚠ 只对 **WorkBuddy 账号**做这件事。两个原因：
+		//
+		//  1. 其它产品**没有 WorkBuddy 的刷新接口** —— 调
+		//     `Upstream.RefreshToken` 会失败并把账号冷却掉，请求永远走不到派发。
+		//     实测踩到：ZCode 账号没有 ExpiresAt（它的凭证长期有效），
+		//     于是 NeedsRefresh 恒为 true，每次请求都在这里失败退出。
+		//
+		//  2. 各产品的刷新方式完全不同（Qoder 是 deviceToken/refresh + drt 轮换），
+		//     故刷新必须由**产品自己的实现**负责（Qoder 的 Dispatch.ChatStream
+		//     内部就会按需刷新）。
+		if !isProduct && acct.NeedsRefresh(h.cfg.RefreshSkew) {
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
 				lastErr = err
 				var ue *upstream.Error
@@ -288,23 +308,15 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 			}
 		}
 
-		// 按账号所属产品派发上游实现。
-		//
-		// 这一处是整个多产品路由的**唯一**分叉点：pool 可能选中任一产品的
-		// 账号，而两个产品的鉴权/端点/请求体编码/响应形状完全不同。
-		// 不加这个分支就会拿 Qoder 的凭证去请求 WorkBuddy 的端点 ——
-		// 失败信息会显示成"账号不可用"，排查方向被引向凭证，
-		// 完全看不出是派发错了产品。
-		qoderUp, isQoder := h.dispatchUpstream(acct)
-
 		var rc io.ReadCloser
 		var status int
 		var respBody []byte
 		var terr error
-		if isQoder {
-			// Qoder 路径：实现内部负责取模型 key、构造请求体、编码、COSY 签名。
-			// 传的是**客户端原始 OpenAI 请求体**（翻译在 qoder 包内完成）。
-			rc, status, respBody, terr = qoderUp.ChatStream(context.Background(), acct, body)
+		if isProduct {
+			// 产品路径：实现内部负责该产品的一切协议细节
+			//（Qoder 的签名/编码/嵌套 SSE 翻译；ZCode 的模型名映射）。
+			// 传的是**客户端原始 OpenAI 请求体**。
+			rc, status, respBody, terr = productUp.ChatStream(context.Background(), acct, body)
 		} else {
 			rc, status, respBody, terr = h.cfg.Upstream.ChatStream(acct, body)
 		}
@@ -392,19 +404,26 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 		handedOff = true // 租约移交调用方，由其读完/关闭后释放
 
 		product := ""
-		if isQoder {
-			product = auth.ProductQoder
+		if isProduct {
+			product = acct.ProductOf()
 		}
 
 		if stream {
 			return &chatResult{UID: uid, Model: modelOf(body), Product: product, Stream: rc}, status, nil
 		}
 
-		// 非流式：两个产品的聚合方式不同（Qoder 是嵌套 SSE，需要先拍平）。
+		// 非流式：按产品选择聚合方式。
+		//
+		// ⚠ 必须用 isProduct 而不是某个具体产品的判定 —— 我第一版只判了
+		// `isQoder`，于是 **ZCode 的账号会走 WorkBuddy 的聚合器**
+		//（upstream.Aggregate），结果是拿 ZCode 的流去按 WorkBuddy 的
+		// 解析逻辑处理，表现为"无法连接上游"这种与真实原因无关的报错。
+		//
+		// 新增产品时这里容易漏 —— 故用产品无关的 `productUp` 变量。
 		var resp map[string]any
 		var aggErr error
-		if isQoder {
-			resp, aggErr = qoderUp.Aggregate(rc, modelOf(body))
+		if isProduct {
+			resp, aggErr = productUp.Aggregate(rc, modelOf(body))
 		} else {
 			resp, aggErr = upstream.Aggregate(rc)
 		}
