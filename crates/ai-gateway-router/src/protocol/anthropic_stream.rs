@@ -96,6 +96,9 @@ pub struct AnthropicStreamState {
     tool_order: Vec<i64>,
 
     finish_reason: String,
+
+    /// 上游在流中途发过终止性 error 帧时的原因；非空表示本次必须按失败收尾。
+    upstream_err: Option<String>,
 }
 
 impl AnthropicStreamState {
@@ -112,6 +115,7 @@ impl AnthropicStreamState {
             tool_calls: std::collections::BTreeMap::new(),
             tool_order: Vec::new(),
             finish_reason: String::new(),
+            upstream_err: None,
         }
     }
 
@@ -139,6 +143,15 @@ impl AnthropicStreamState {
 
     /// 处理单个 chat SSE chunk。
     pub fn consume(&mut self, out: &mut SseOut, chunk: &Map<String, Value>) -> Result<(), String> {
+        // 上游在 HTTP 200 的流**中途**发 `{"error":{...}}` 表示终止性失败
+        //（渠道未批准、账号被封）。必须记下来并按失败收尾 —— 忽略它会照常补出
+        // message_stop，等于向客户端宣告「模型正常答完了」，Claude Code 会把
+        // 空/截断的回答当成一次成功回合继续推进对话，而网关侧还记成成功。
+        if let Some(e) = chunk.get("error") {
+            if !e.is_null() {
+                self.upstream_err = Some(error_frame_text(e));
+            }
+        }
         if let Some(m) = chunk.get("model").and_then(|v| v.as_str()) {
             if self.model.is_empty() {
                 self.model = m.to_string();
@@ -374,6 +387,53 @@ impl AnthropicStreamState {
     pub fn usage(&self) -> Option<&Value> {
         self.usage.as_ref()
     }
+
+    /// 判定本次流是否应当按**失败**收尾，返回原因（`None` = 可正常收尾）。
+    ///
+    /// `saw_done` / `saw_any_frame` 由调用方从帧迭代器取（见
+    /// [`crate::upstream::sse::SseFramesIter::premature_end`]）。
+    ///
+    /// 判定顺序（与 Go 侧 `streamFailureMessage` 同一口径）：
+    /// 1. 上游显式发过终止性 error 帧 → 失败（根因优先）
+    /// 2. 见过 `[DONE]` → 正常收尾
+    /// 3. 没见过 `[DONE]` 且一个 data 帧都没读到（空流）→ 正常收尾
+    /// 4. 没见过 `[DONE]` 但已吐过内容 → 失败
+    pub fn failure_message(&self, saw_done: bool, saw_any_frame: bool) -> Option<String> {
+        if let Some(e) = &self.upstream_err {
+            return Some(format!("upstream error: {e}"));
+        }
+        if saw_done || !saw_any_frame {
+            return None;
+        }
+        Some("upstream stream ended unexpectedly before [DONE]".to_string())
+    }
+}
+
+/// 把上游流内的 `{"error": ...}` 帧抽成可读文案。
+///
+/// 形态不固定：`{"error":{"message":...}}`（OpenAI 形状）、`{"error":{"msg":...}}`
+/// （部分中转）、以及裸字符串。逐层取第一个非空文案；都取不到时退一步带上 `code`
+///（便于对照上游错误码表定位，如 11128 渠道未批准），保证失败至少可见。
+pub fn error_frame_text(e: &Value) -> String {
+    if let Some(m) = e.as_object() {
+        for k in ["message", "msg", "detail", "error_description"] {
+            let v = m.get(k).and_then(|v| v.as_str()).unwrap_or("");
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+        if let Some(code) = m.get("code").and_then(|c| c.as_i64()) {
+            if code != 0 {
+                return format!("code={code}");
+            }
+        }
+    }
+    if let Some(s) = e.as_str() {
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    "unknown upstream error".to_string()
 }
 
 /// 在已开启的工具块上发出一个 `input_json_delta`。
@@ -709,5 +769,94 @@ mod tests {
         assert_eq!(ps[0]["type"], json!("error"));
         assert_eq!(ps[0]["error"]["type"], json!("upstream_error"));
         assert_eq!(ps[0]["error"]["message"], json!("boom"));
+    }
+
+    /// 上游在 HTTP 200 的流中途发 `{"error":{...}}` 表示终止性失败。
+    ///
+    /// 忽略它会照常补出 `message_stop`，等于向客户端宣告「模型正常答完了」，
+    /// Claude Code 会把截断的回答当成一次成功回合 —— 必须判为失败。
+    #[test]
+    fn mid_stream_error_frame_is_treated_as_failure() {
+        let mut out = SseOut::new();
+        let mut st = AnthropicStreamState::new("m");
+        st.consume(
+            &mut out,
+            &chunk(json!({"choices":[{"index":0,"delta":{"content":"partial"}}]})),
+        )
+        .unwrap();
+        // 上游中途报错
+        st.consume(
+            &mut out,
+            &chunk(json!({"error":{"message":"channel not approved","code":11128}})),
+        )
+        .unwrap();
+
+        let msg = st
+            .failure_message(true, true)
+            .expect("error 帧必须判为失败");
+        assert!(msg.contains("channel not approved"), "{msg}");
+    }
+
+    /// error 帧优先于 [DONE]：即使后来收到了 [DONE]，根因也要报出来。
+    #[test]
+    fn error_frame_wins_over_done() {
+        let mut out = SseOut::new();
+        let mut st = AnthropicStreamState::new("m");
+        st.consume(&mut out, &chunk(json!({"error":{"msg":"boom"}})))
+            .unwrap();
+        assert!(st.failure_message(true, true).is_some(), "error 应优先");
+    }
+
+    /// 见过 [DONE] 且无 error 帧 → 正常收尾。
+    #[test]
+    fn done_means_normal_end() {
+        let st = AnthropicStreamState::new("m");
+        assert!(st.failure_message(true, true).is_none());
+    }
+
+    /// 空流（一个 data 帧都没读到）→ 正常收尾（合法空回合，无损）。
+    #[test]
+    fn empty_stream_is_not_a_failure() {
+        let st = AnthropicStreamState::new("m");
+        assert!(st.failure_message(false, false).is_none());
+    }
+
+    /// 吐过内容却没见过 [DONE] 就断了（空闲超时 / 上游提前关连接）→ 失败。
+    ///
+    /// 不能拿 finish_reason 当收尾标志：上游是先给 finish_reason 再写 [DONE]，
+    /// 而那一瞬正是空闲超时最容易掐断的位置。
+    #[test]
+    fn truncated_stream_without_done_is_a_failure() {
+        let st = AnthropicStreamState::new("m");
+        let msg = st
+            .failure_message(false, true)
+            .expect("吐了内容却没 [DONE] 必须判为失败");
+        assert!(msg.contains("before [DONE]"), "{msg}");
+    }
+
+    /// error 帧文案抽取兼容多种形态。
+    #[test]
+    fn error_frame_text_variants() {
+        assert_eq!(
+            error_frame_text(&json!({"message":"m1"})),
+            "m1",
+            "OpenAI 形状"
+        );
+        assert_eq!(error_frame_text(&json!({"msg":"m2"})), "m2", "中转形状");
+        assert_eq!(
+            error_frame_text(&json!({"detail":"m3"})),
+            "m3",
+            "detail 形状"
+        );
+        assert_eq!(
+            error_frame_text(&json!({"error_description":"m4"})),
+            "m4"
+        );
+        // 只有 code 时退一步带上它（便于对照上游错误码表）
+        assert_eq!(error_frame_text(&json!({"code":11128})), "code=11128");
+        // 裸字符串
+        assert_eq!(error_frame_text(&json!("raw")), "raw");
+        // 都取不到时保证失败可见
+        assert_eq!(error_frame_text(&json!({})), "unknown upstream error");
     }
 }

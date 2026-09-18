@@ -16,8 +16,16 @@ use std::time::Duration;
 use crate::error::{GatewayError, Result};
 
 /// 默认监听地址。
+///
+/// **只绑 127.0.0.1**，不是 `:7863`（全网卡）。
+///
+/// 为什么这是安全要求而非偏好：`api_key` 默认为空（= 不鉴权），若同时监听全网卡，
+/// 同一局域网内任何设备都能直接调用本网关、烧掉本机账号额度，`/status` 还会
+/// 暴露账号标识。两者叠加就是一个默认敞开的代理。
+///
+/// 需要对外暴露时**必须同时设置 `api_key`**（README 有说明）。
 fn default_listen() -> String {
-    ":7863".into()
+    "127.0.0.1:7863".into()
 }
 /// 默认凭证目录。
 fn default_auth_dir() -> String {
@@ -36,7 +44,7 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// 监听地址，如 `":7863"`。裸端口（无冒号）时 normalize 阶段补前导冒号。
+    /// 监听地址，如 `"127.0.0.1:7863"`。裸端口（无冒号）时 normalize 阶段补回环前缀。
     #[serde(default = "default_listen")]
     pub listen: String,
     /// API Key，空 = 不鉴权。
@@ -252,6 +260,17 @@ pub struct PoolConfig {
     /// 只在轮转模式下有意义 —— 负载均衡不限制模型（保持原有行为）。
     #[serde(rename = "allowed_model", default)]
     pub allowed_model: String,
+    /// 单请求最多换号次数。
+    ///
+    /// 缺省 3。此前该值在网关侧从未接线（硬编码为 3），配置里写什么都不生效 ——
+    /// 本次补上字段并接进 [`crate::forward::ForwardCtx`]。
+    #[serde(rename = "max_rotate", default = "default_max_rotate")]
+    pub max_rotate: usize,
+}
+
+/// `pool.max_rotate` 缺省值。
+fn default_max_rotate() -> usize {
+    3
 }
 
 impl Default for PoolConfig {
@@ -267,6 +286,7 @@ impl Default for PoolConfig {
             credit_refresh_enabled: true,
             rotation: false,
             allowed_model: String::new(),
+            max_rotate: default_max_rotate(),
         }
     }
 }
@@ -546,9 +566,12 @@ impl Config {
             self.upstream.idle_timeout_seconds = 300;
         }
 
-        // 裸端口（无冒号）补前导冒号。
+        // 裸端口（无冒号）补成回环地址 —— 不能补成 `:{port}`（全网卡）。
+        //
+        // `:{port}` 会监听所有网卡，而 `api_key` 默认为空（= 不鉴权），
+        // 两者叠加等于把本机账号额度暴露给整个局域网。
         if !self.listen.contains(':') {
-            self.listen = format!(":{}", self.listen);
+            self.listen = format!("127.0.0.1:{}", self.listen);
         }
 
         // 空数组 = 未配置 → 回落默认。
@@ -620,7 +643,8 @@ mod tests {
     #[test]
     fn defaults_match_go_default() {
         let c = Config::default();
-        assert_eq!(c.listen, ":7863");
+        // 默认只绑回环：api_key 缺省为空（不鉴权），全网卡监听会暴露账号额度
+        assert_eq!(c.listen, "127.0.0.1:7863");
         assert_eq!(c.auth_dir, "./auths");
         assert_eq!(c.state_file, "./data/state.json");
         assert_eq!(c.cooldown.soft_rate, "60s");
@@ -681,8 +705,8 @@ mod tests {
     fn normalize_fills_defaults_and_falls_back() {
         let raw = br#"{"listen":"7863"}"#;
         let c = Config::from_json(raw).unwrap();
-        // 裸端口补冒号
-        assert_eq!(c.listen, ":7863");
+        // 裸端口补回环前缀（不是全网卡的 ":"）
+        assert_eq!(c.listen, "127.0.0.1:7863");
         // 开关缺席 → true
         assert!(c.schedule.checkin_enabled);
         assert!(c.pool.credit_refresh_enabled);

@@ -858,6 +858,29 @@ fn anthropic_stream_response(
                 None => break,
             }
         }
+        // 收尾前的失败判定：上游中途发过终止性 error 帧，或吐了内容却没见过
+        // [DONE] 就断了（空闲超时掐断 / 上游提前关连接）。
+        //
+        // 这两种情况都**不能**继续走正常收尾 —— 补一个 stop_reason=end_turn 的
+        // message_delta + message_stop 等于向客户端宣告「模型正常答完了」，
+        // Claude Code 会把空/截断的回答当成一次成功回合继续推进对话，
+        // 用户只看到模型不回答或答了半截，而网关侧 /usage 还记成成功。
+        //
+        // Anthropic 规范里 error 事件本身就是终止事件，发出后不要再补
+        // message_delta / message_stop（那会被理解为正常完成）。
+        if let Some(msg) = state.failure_message(frames.saw_done(), frames.saw_any_frame()) {
+            let _ = state.close_open_blocks(&mut out);
+            let _ = out.write(
+                "error",
+                &serde_json::json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": msg},
+                }),
+            );
+            yield Ok(out.take());
+            if let Ok(mut pool) = state_ref.pool.lock() { pool.release(&uid); }
+            return;
+        }
         if state.finish(&mut out).is_ok() && !out.is_empty() {
             yield Ok(out.take());
         }
@@ -927,6 +950,23 @@ fn responses_stream_response(
                 }
                 None => break,
             }
+        }
+        // 收尾前的失败判定：上游中途发过终止性 error 帧，或吐了内容却没见过
+        // [DONE] 就断了（空闲超时掐断 / 上游提前关连接）。
+        //
+        // 这两种情况都**不能**继续走正常收尾 —— 补一个 stop_reason=end_turn 的
+        // message_delta + message_stop 等于向客户端宣告「模型正常答完了」，
+        // Claude Code 会把空/截断的回答当成一次成功回合继续推进对话，
+        // 用户只看到模型不回答或答了半截，而网关侧 /usage 还记成成功。
+        //
+        // Responses 协议里终止事件是 response.failed，**不是** Anthropic 的
+        // error 事件；发出后同样不能再补 response.completed（两者自相矛盾，
+        // 客户端只认最后一个）。
+        if let Some(msg) = state.failure_message(frames.saw_done(), frames.saw_any_frame()) {
+            let _ = state.fail(&mut out, &msg);
+            yield Ok(out.take());
+            if let Ok(mut pool) = state_ref.pool.lock() { pool.release(&uid); }
+            return;
         }
         if state.finish(&mut out).is_ok() && !out.is_empty() {
             yield Ok(out.take());

@@ -52,6 +52,8 @@ pub struct ResponsesStreamState {
     tool_calls: std::collections::BTreeMap<i64, ToolCall>,
     tool_order: Vec<i64>,
     usage: Option<Value>,
+    /// 上游在流中途发过终止性 error 帧时的原因；非空表示本次必须按失败收尾。
+    upstream_err: Option<String>,
 }
 
 impl ResponsesStreamState {
@@ -68,6 +70,7 @@ impl ResponsesStreamState {
             tool_calls: std::collections::BTreeMap::new(),
             tool_order: Vec::new(),
             usage: None,
+            upstream_err: None,
         }
     }
 
@@ -141,6 +144,13 @@ impl ResponsesStreamState {
         out: &mut super::anthropic_stream::SseOut,
         chunk: &Map<String, Value>,
     ) -> Result<(), String> {
+        // 上游在 HTTP 200 的流**中途**发 `{"error":{...}}` 表示终止性失败。
+        // 忽略它会照常补出 response.completed，客户端把截断的回答当成正常完成。
+        if let Some(e) = chunk.get("error") {
+            if !e.is_null() {
+                self.upstream_err = Some(super::anthropic_stream::error_frame_text(e));
+            }
+        }
         if let Some(id) = chunk.get("id").and_then(|v| v.as_str()) {
             if !id.is_empty() && self.response_id == "resp_wb2api" {
                 self.response_id = id.to_string();
@@ -435,6 +445,18 @@ impl ResponsesStreamState {
     /// 本次累积的 usage。
     pub fn usage(&self) -> Option<&Value> {
         self.usage.as_ref()
+    }
+
+    /// 判定本次流是否应当按**失败**收尾（口径同
+    /// [`crate::protocol::anthropic_stream::AnthropicStreamState::failure_message`]）。
+    pub fn failure_message(&self, saw_done: bool, saw_any_frame: bool) -> Option<String> {
+        if let Some(e) = &self.upstream_err {
+            return Some(format!("upstream error: {e}"));
+        }
+        if saw_done || !saw_any_frame {
+            return None;
+        }
+        Some("upstream stream ended unexpectedly before [DONE]".to_string())
     }
 }
 

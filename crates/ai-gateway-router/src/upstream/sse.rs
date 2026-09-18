@@ -424,6 +424,18 @@ pub struct SseFramesIter<S> {
     done: bool,
     valid_frames: usize,
     wrote_error: bool,
+    /// 是否读到过规范的 `[DONE]` 结束帧。
+    ///
+    /// 这是「上游按约定收尾了」的**权威标志**。不能用 `finish_reason` 代替：
+    /// 上游是在给出 `finish_reason` **之后**才写 `[DONE]` 的，而那一瞬恰恰是
+    /// 空闲超时最容易掐断的位置（`usage` 也还没落下来）。所以见过
+    /// `finish_reason` 不等于流正常结束。
+    saw_done: bool,
+    /// 是否读到过任何一个可解析的 data 帧。
+    ///
+    /// 用于区分「空流」（上游正常解析后发现没什么可发，客户端得到一个合法的
+    /// 空回合，无损）与「吐了一半就断」（必须按失败收尾）。
+    saw_any_frame: bool,
 }
 
 impl<S> SseFramesIter<S> {
@@ -435,12 +447,42 @@ impl<S> SseFramesIter<S> {
             done: false,
             valid_frames: 0,
             wrote_error: false,
+            saw_done: false,
+            saw_any_frame: false,
         }
     }
 
     /// 已转发的有效帧数（JSON 解析成功的数据帧）。
     pub fn valid_frames(&self) -> usize {
         self.valid_frames
+    }
+
+    /// 是否读到过 `[DONE]`。
+    pub fn saw_done(&self) -> bool {
+        self.saw_done
+    }
+
+    /// 是否读到过任何一个可解析的 data 帧。
+    pub fn saw_any_frame(&self) -> bool {
+        self.saw_any_frame
+    }
+
+    /// 判定一次上游流是否应当按**失败**收尾，返回原因（`None` = 可正常收尾）。
+    ///
+    /// 三种情形（与 Go 侧 `streamFailureMessage` 同一口径）：
+    ///
+    /// - 见过 `[DONE]` → 正常收尾
+    /// - 没见过 `[DONE]`，且一个 data 帧都没读到（空流）→ 正常收尾
+    ///   （上游正常解析后发现没什么可发时就是这样，客户端得到合法空回合，无损）
+    /// - 没见过 `[DONE]`，但已经吐过内容 → **失败**
+    ///   （IdleTimeout 取消连接、或上游提前关连接的形态；补一个
+    ///   `stop_reason=end_turn` 等于告诉客户端「模型答完了」，它会据此推进对话，
+    ///   用户只看到回答被从中间截断）
+    pub fn premature_end(&self) -> Option<&'static str> {
+        if self.saw_done || !self.saw_any_frame {
+            return None;
+        }
+        Some("upstream stream ended unexpectedly before [DONE]")
     }
 }
 
@@ -460,6 +502,8 @@ where
                 let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
                 if trimmed.starts_with("data: [DONE]") {
                     // 上游显式结束：DONE 之后的任何数据（含垃圾帧）一律不再透传。
+                    // 记下 saw_done —— 它是「流正常结束」的权威标志。
+                    self.saw_done = true;
                     self.done = true;
                     return Some(Ok(self.finish()));
                 }
@@ -467,6 +511,7 @@ where
                     let (text, valid) = normalize_payload(payload);
                     if valid {
                         self.valid_frames += 1;
+                        self.saw_any_frame = true;
                     }
                     return Some(Ok(format!("data: {text}\n\n")));
                 }
@@ -494,10 +539,14 @@ where
                         let rest = std::mem::take(&mut self.buf);
                         let trimmed = rest.trim_end_matches(['\r', '\n']).to_string();
                         if let Some(payload) = trimmed.strip_prefix("data: ") {
-                            if payload != "[DONE]" {
+                            if payload == "[DONE]" {
+                                // 残缓冲里就是结束帧（上游没写尾随换行）。
+                                self.saw_done = true;
+                            } else {
                                 let (text, valid) = normalize_payload(payload);
                                 if valid {
                                     self.valid_frames += 1;
+                                    self.saw_any_frame = true;
                                 }
                                 return Some(Ok(format!("data: {text}\n\n")));
                             }

@@ -161,7 +161,7 @@ async fn main() {
         client,
         session,
         api_key: cfg.api_key.clone(),
-        max_rotate: 3,
+        max_rotate: cfg.pool.max_rotate.max(1),
         soft_cooldown: cfg.parsed.soft_rate,
         refresh_skew: Duration::from_secs(600),
         redis_mode: "noop".into(),
