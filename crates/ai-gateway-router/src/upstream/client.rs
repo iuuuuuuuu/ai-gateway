@@ -63,6 +63,15 @@ pub struct ClientConfig {
     pub sanitize_fingerprints: bool,
     /// 显式代理（空 = 读环境变量）。
     pub proxy: String,
+    /// 国服 chat 基址覆盖（空 = 用内置常量）。
+    ///
+    /// 存在意义与 Go 侧 `Client.ChatBaseCN` 相同：**A/B 对照测试**要把网关指向
+    /// 假上游，而内置基址是写死的真实域名。生产路径留空即可。
+    pub chat_base_cn: String,
+    /// 国服 billing 基址覆盖（空 = 用内置常量）。
+    pub billing_base_cn: String,
+    /// 国际版基址覆盖（空 = 用内置常量）。
+    pub base_intl: String,
 }
 
 impl Default for ClientConfig {
@@ -73,14 +82,73 @@ impl Default for ClientConfig {
             idle_timeout: Duration::from_secs(300),
             sanitize_fingerprints: true,
             proxy: String::new(),
+            chat_base_cn: String::new(),
+            billing_base_cn: String::new(),
+            base_intl: String::new(),
+        }
+    }
+}
+
+/// 构造出站代理（`None` = 直连）。
+///
+/// 顺序与 Go 侧 `newTransport` 一致：**显式配置优先**，否则回落环境变量。
+/// 无论来源，一律挂上 `NO_PROXY` 豁免表 —— 见 [`Client::new`] 里那段注释。
+fn build_proxy(cfg: &ClientConfig) -> Option<reqwest::Proxy> {
+    let explicit = cfg.proxy.trim();
+    let raw = if explicit.is_empty() {
+        // 环境变量回落。小写优先（curl 传统写法），其次大写；
+        // 与 Go 的 ProxyFromEnvironment 取值顺序一致。
+        [
+            "https_proxy",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "HTTP_PROXY",
+            "all_proxy",
+            "ALL_PROXY",
+        ]
+        .iter()
+        .find_map(|k| std::env::var(k).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())?
+    } else {
+        explicit.to_string()
+    };
+    let url = if raw.contains("://") {
+        raw
+    } else {
+        format!("http://{raw}")
+    };
+    // 解析失败时**不静默直连**：那会让「用户填错代理」表现为「网络不通」。
+    // 这里打日志并退回直连，至少留下线索。
+    match reqwest::Proxy::all(&url) {
+        Ok(p) => Some(p.no_proxy(reqwest::NoProxy::from_env())),
+        Err(e) => {
+            eprintln!("[upstream] 代理地址无效 {url}: {e}，本次直连");
+            None
         }
     }
 }
 
 /// 上游 HTTP 客户端。
+///
+/// # 两个 client，与 Go 侧 `HTTP` / `ChatHTTP` 一一对应
+///
+/// - `http`：短 RPC（refresh / billing / models），有**总时长上限**
+/// - `chat`：聊天 SSE，**无总时长上限**（长回答可能持续很久），
+///   流中空闲由 [`ClientConfig::idle_timeout`] 约束
+///
+/// 为什么不能合成一个：Go 侧用两个 `http.Client` 共享同一个 `Transport`
+///（连接池不重复）来区分「总超时」与「无总超时」。reqwest 的 `ClientBuilder.timeout`
+/// 是**总截止时间**，一旦设了就管所有请求；而聊天流被总超时掐断的表现是
+/// 「回答写到一半突然断流」，且错误被归到传输层，很难定位。
+///
+/// reqwest 没有「共享连接池但超时不同」的等价物（连接池属于 `Client`），
+/// 因此这里建两个 `Client`：连接池各一份，代价是连接数翻倍 —— 相对于
+/// 聊天流被误掐的风险，这个代价可以接受。
 #[derive(Debug, Clone)]
 pub struct Client {
     http: reqwest::Client,
+    chat: reqwest::Client,
     cfg: ClientConfig,
 }
 
@@ -99,42 +167,81 @@ pub enum ChatOutcome {
 impl Client {
     /// 按配置构造客户端。
     pub fn new(cfg: ClientConfig) -> Result<Self> {
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(20)
-            .pool_idle_timeout(Duration::from_secs(90))
-            // 首字节上限：短 RPC 与 SSE 共用（短 RPC 的总时长更先到期，无实际影响）。
-            .timeout(cfg.timeout.max(cfg.header_timeout));
-        if !cfg.proxy.trim().is_empty() {
-            let raw = cfg.proxy.trim();
-            let url = if raw.contains("://") {
-                raw.to_string()
-            } else {
-                format!("http://{raw}")
-            };
-            let proxy = reqwest::Proxy::all(&url)
-                .map_err(|e| GatewayError::Other(format!("代理地址无效 {url}: {e}")))?;
-            builder = builder.proxy(proxy);
+        // 用闭包复用「公共部分」的构造：ClientBuilder 不是 Clone，
+        // 两个 client 必须各自从头搭一遍。
+        let base = || {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(30))
+                .pool_max_idle_per_host(20)
+                .pool_idle_timeout(Duration::from_secs(90))
+        };
+
+        // ── 代理 ──
+        //
+        // 与 Go 侧 `newTransport` 同口径：显式配置优先，否则回落环境变量
+        //（`HTTPS_PROXY` / `HTTP_PROXY`），**且一律带上 `NO_PROXY` 豁免表**。
+        //
+        // 为什么必须显式挂 NoProxy：reqwest 的自动系统代理**只读代理变量、
+        // 不读 `NO_PROXY`**。实测本机 `NO_PROXY=127.0.0.1,localhost,...` 且代理在
+        // 7897 上监听时，发往 `127.0.0.1:18690`（本机假上游）的请求仍被交给代理，
+        // 代理连不上该端口 → 归类成传输层失败 → 只报一句「无法连接上游」，
+        // 日志里看不出任何线索。挂上 NoProxy 后环回地址直连，行为与 curl/Go 一致。
+        //
+        // 生产路径上上游都是公网域名，这条豁免不影响；但它让「把网关指向本机
+        // 假上游做 A/B 对照」以及任何本机部署（反向代理、sidecar）都能正常工作，
+        // 而不是被用户的全局代理设置静默破坏。
+        let proxy = build_proxy(&cfg);
+
+        // 短 RPC：总时长上限（refresh / billing / models 都是短请求）。
+        let mut http_builder = base().timeout(cfg.timeout);
+        // 聊天 SSE：**不设总超时**，只设「流中空闲上限」。
+        //
+        // 不设总超时是硬要求：长回答可能持续数分钟，总超时会在中途掐断流，
+        // 表现为「回答写到一半断了」且被归成传输层错误。
+        // `read_timeout` 的语义正好是「每次读操作的空闲上限、读成功后重置」，
+        // 与 Go 侧 `idleMonitoringBody` 手工实现的效果一致。
+        let mut chat_builder = base();
+        if cfg.idle_timeout > Duration::ZERO {
+            chat_builder = chat_builder.read_timeout(cfg.idle_timeout);
         }
-        let http = builder
+        if let Some(p) = proxy {
+            http_builder = http_builder.proxy(p.clone());
+            chat_builder = chat_builder.proxy(p);
+        }
+
+        let http = http_builder
             .build()
             .map_err(|e| GatewayError::Other(format!("构造 HTTP 客户端失败: {e}")))?;
-        Ok(Self { http, cfg })
+        let chat = chat_builder
+            .build()
+            .map_err(|e| GatewayError::Other(format!("构造聊天 HTTP 客户端失败: {e}")))?;
+
+        Ok(Self { http, chat, cfg })
     }
 
     /// 该账号的 chat 基址。
-    pub fn chat_base(&self, a: &Auth) -> &'static str {
+    pub fn chat_base(&self, a: &Auth) -> &str {
         if a.is_intl() {
+            if !self.cfg.base_intl.is_empty() {
+                return &self.cfg.base_intl;
+            }
             BASE_INTL
+        } else if !self.cfg.chat_base_cn.is_empty() {
+            &self.cfg.chat_base_cn
         } else {
             CHAT_BASE_CN
         }
     }
 
     /// 该账号的 billing 基址。
-    pub fn billing_base(&self, a: &Auth) -> &'static str {
+    pub fn billing_base(&self, a: &Auth) -> &str {
         if a.is_intl() {
+            if !self.cfg.base_intl.is_empty() {
+                return &self.cfg.base_intl;
+            }
             BASE_INTL
+        } else if !self.cfg.billing_base_cn.is_empty() {
+            &self.cfg.billing_base_cn
         } else {
             BILLING_BASE_CN
         }
@@ -153,16 +260,11 @@ impl Client {
         let url = format!("{}/v2/chat/completions", self.chat_base(a));
         let prepared = self.prepare_body(body, a);
         let req = self
-            .http
+            .chat
             .post(&url)
             .headers(headers::chat_headers(a))
             .body(prepared);
-        // SSE 无总时长上限；空闲由 forward 层的读取超时兜底。
-        let req = if self.cfg.idle_timeout > Duration::ZERO {
-            req.timeout(Duration::ZERO)
-        } else {
-            req
-        };
+        // 用 `chat`（无总超时，仅流中空闲上限）：长回答不能被总超时掐断。
         let resp = req.send().await.map_err(transport_err)?;
         let status = resp.status();
         if status.is_success() {

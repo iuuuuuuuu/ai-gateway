@@ -90,6 +90,10 @@ async fn main() {
         idle_timeout: Duration::from_secs(cfg.upstream.idle_timeout_seconds.max(1) as u64),
         sanitize_fingerprints: cfg.features.sanitize_blacklist_fingerprints,
         proxy: std::env::var("WB2A_PROXY").unwrap_or_default(),
+        // 基址覆盖：仅供 A/B 对照测试把网关指向假上游（生产留空走内置常量）。
+        chat_base_cn: std::env::var("WB2A_CHAT_BASE_CN").unwrap_or_default(),
+        billing_base_cn: std::env::var("WB2A_BILLING_BASE_CN").unwrap_or_default(),
+        base_intl: std::env::var("WB2A_BASE_INTL").unwrap_or_default(),
     }) {
         Ok(c) => c,
         Err(e) => {

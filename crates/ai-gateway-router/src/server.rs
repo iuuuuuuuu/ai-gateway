@@ -60,9 +60,16 @@ pub struct AppState {
 }
 
 /// 构建路由。
+///
+/// 路由表与 Go 侧 `internal/server/handler.go` 一致，含**无版本号别名**
+/// （`/responses`、`/messages`）：部分客户端会省略 `/v1` 前缀，缺了别名会 404。
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/chat/completions", axum::routing::post(chat_completions))
+        .route("/v1/responses", axum::routing::post(responses))
+        .route("/responses", axum::routing::post(responses))
+        .route("/v1/messages", axum::routing::post(messages))
+        .route("/messages", axum::routing::post(messages))
         .route("/v1/models", get(models))
         .route("/status", get(status))
         .route("/healthz", get(healthz))
@@ -434,24 +441,10 @@ async fn chat_completions(
     if let Some(r) = check_auth(&state, &headers) {
         return r;
     }
-
-    let body = match axum::body::to_bytes(request.into_body(), MAX_REQUEST_BODY).await {
+    let body = match read_body(request, Wire::Chat).await {
         Ok(b) => b,
-        Err(_) => {
-            return openai_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request_too_large",
-                &format!("请求体超过上限（{} MiB）", MAX_REQUEST_BODY / (1 << 20)),
-            )
-        }
+        Err(resp) => return resp,
     };
-    if body.is_empty() {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "empty request body",
-        );
-    }
 
     #[derive(serde::Deserialize)]
     struct Peek {
@@ -467,28 +460,9 @@ async fn chat_completions(
         String::new()
     };
 
-    // 区域路由：仅对「图像能力两区不同」的模型 + 带图片的请求生效。
-    let model = crate::forward::model_of(&body);
-    let route = image_route_for(&model, crate::forward::request_has_image(&body));
-
-    // 池锁只在 forward 内部按操作短暂持有（网络等待期间不持锁），
-    // 因此这里不需要先取锁 —— 否则会把整个请求串行化。
-    let mut ctx = crate::forward::ForwardCtx {
-        pool: &state.pool,
-        client: &state.client,
-        session: state.session.as_ref(),
-        max_rotate: state.max_rotate,
-        soft_cooldown: state.soft_cooldown,
-        refresh_skew: state.refresh_skew,
-        allowed_model: state.allowed_model.clone(),
-    };
-    let (result, status, failure) =
-        crate::forward::forward_chat(&mut ctx, &body, stream, &sess_key, route).await;
+    let (result, status, failure) = run_forward(&state, &body, stream, &sess_key).await;
     if let Some(f) = failure {
-        let code = match f.kind {
-            crate::forward::FailureKind::ContextTooLong => "context_length_exceeded",
-            _ => "no_healthy_account",
-        };
+        let code = Wire::Chat.failure_code(f.kind);
         return openai_error(
             StatusCode::from_u16(f.status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
             code,
@@ -523,6 +497,400 @@ async fn chat_completions(
 /// 很容易突破 8MB，而**静默截断**会把合法 JSON 切成半截字节透传给上游，
 /// 上游报 `unexpected EOF`，表现为「请求参数有误」—— 客户端完全无法定位到是网关截断。
 const MAX_REQUEST_BODY: usize = 32 << 20;
+
+/// 各协议在「请求体超限 / 读取失败」两种情形下使用的错误码。
+///
+/// 三家协议的词汇表不同：OpenAI 用 `payload_too_large` / `invalid_request`，
+/// Anthropic 用 `request_too_large` / `invalid_request_error`。客户端按自家词汇表
+/// 分支处理，混用会让错误提示退化成未知错误。
+#[derive(Debug, Clone, Copy)]
+struct BodyErrorCodes {
+    too_large: &'static str,
+    bad_request: &'static str,
+}
+
+/// OpenAI 系（chat/completions、responses）的错误码。
+const OPENAI_BODY_CODES: BodyErrorCodes = BodyErrorCodes {
+    too_large: "payload_too_large",
+    bad_request: "invalid_request",
+};
+/// Anthropic Messages 的错误码。
+const ANTHROPIC_BODY_CODES: BodyErrorCodes = BodyErrorCodes {
+    too_large: "request_too_large",
+    bad_request: "invalid_request_error",
+};
+
+/// 协议形状：决定错误体与失败码的词汇表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wire {
+    /// OpenAI Chat Completions。
+    Chat,
+    /// OpenAI Responses。
+    Responses,
+    /// Anthropic Messages。
+    Messages,
+}
+
+impl Wire {
+    /// 该协议在请求体出错时使用的码。
+    fn body_codes(self) -> BodyErrorCodes {
+        match self {
+            Wire::Messages => ANTHROPIC_BODY_CODES,
+            _ => OPENAI_BODY_CODES,
+        }
+    }
+
+    /// 生成该协议形状的错误响应。
+    fn error(self, status: StatusCode, code: &str, msg: &str) -> Response {
+        match self {
+            Wire::Messages => {
+                json_response(status, crate::protocol::anthropic::anthropic_error(code, msg))
+            }
+            Wire::Responses => {
+                json_response(status, crate::protocol::responses::responses_error(code, msg))
+            }
+            Wire::Chat => openai_error(status, code, msg),
+        }
+    }
+
+    /// 把转发失败翻译成该协议的错误码。
+    ///
+    /// 三个入口共享「谁来判定失败类别」这条映射链，但**码面值不同** ——
+    /// 把码面值也一起统一会让各协议的词汇表互相串味：
+    ///
+    /// - 上下文超长：Chat / Responses 用 `context_length_exceeded`；
+    ///   Anthropic 语义里它是 `invalid_request_error`（其真实文案即
+    ///   "prompt is too long: ..."），而非 `request_too_large`（那是字节数超限）。
+    /// - 单一模型拒绝：Chat 用 `model_not_allowed`（本网关为 chat 形状定的码），
+    ///   Responses / Anthropic 用各自的 `invalid_request_error`。
+    /// - 其余：Chat 沿用 `no_healthy_account`；另两个协议用 `api_error` / `upstream_error`。
+    fn failure_code(self, kind: crate::forward::FailureKind) -> &'static str {
+        use crate::forward::FailureKind as F;
+        match (self, kind) {
+            (Wire::Chat, F::ContextTooLong) => "context_length_exceeded",
+            (Wire::Responses, F::ContextTooLong) => "context_length_exceeded",
+            (Wire::Messages, F::ContextTooLong) => "invalid_request_error",
+            (Wire::Chat, F::ImageRegionUnavailable) => "image_region_unavailable",
+            (Wire::Messages, F::ImageRegionUnavailable) => "invalid_request_error",
+            (Wire::Responses, F::ImageRegionUnavailable) => "invalid_request_error",
+            (Wire::Chat, F::Upstream) => "no_healthy_account",
+            (Wire::Messages, F::Upstream) => "api_error",
+            (Wire::Responses, F::Upstream) => "upstream_error",
+        }
+    }
+}
+
+/// 读取请求体；超限或为空时返回该协议形状的错误响应。
+///
+/// 超限返回 413 并给出明确原因：客户端据此知道要缩减历史，而不是收到一个
+/// 「请求参数有误」然后无从下手（静默截断透传时的表现）。
+async fn read_body(
+    request: Request<axum::body::Body>,
+    wire: Wire,
+) -> Result<bytes::Bytes, Response> {
+    match axum::body::to_bytes(request.into_body(), MAX_REQUEST_BODY).await {
+        Ok(b) if b.is_empty() => Err(wire.error(
+            StatusCode::BAD_REQUEST,
+            wire.body_codes().bad_request,
+            "empty request body",
+        )),
+        Ok(b) => Ok(b),
+        Err(_) => Err(wire.error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            wire.body_codes().too_large,
+            &format!(
+                "request body exceeds {} MB limit; reduce the conversation history or attachment size",
+                MAX_REQUEST_BODY >> 20
+            ),
+        )),
+    }
+}
+
+/// 执行转发（三个协议入口共用）。
+///
+/// 返回 `(结果, 状态码, 失败)`。
+async fn run_forward(
+    state: &Arc<AppState>,
+    body: &[u8],
+    stream: bool,
+    sess_key: &str,
+) -> (
+    Option<crate::forward::ChatResult>,
+    u16,
+    Option<crate::forward::ForwardFailure>,
+) {
+    // 区域路由：仅对「图像能力两区不同」的模型 + 带图片的请求生效。
+    let model = crate::forward::model_of(body);
+    let route = image_route_for(&model, crate::forward::request_has_image(body));
+
+    // 池锁只在 forward 内部按操作短暂持有（网络等待期间不持锁），
+    // 因此这里不需要先取锁 —— 否则会把整个请求串行化。
+    let mut ctx = crate::forward::ForwardCtx {
+        pool: &state.pool,
+        client: &state.client,
+        session: state.session.as_ref(),
+        max_rotate: state.max_rotate,
+        soft_cooldown: state.soft_cooldown,
+        refresh_skew: state.refresh_skew,
+        allowed_model: state.allowed_model.clone(),
+    };
+    crate::forward::forward_chat(&mut ctx, body, stream, sess_key, route).await
+}
+
+/// `POST /v1/messages` —— Anthropic Messages 入口（Claude Code / Claude Desktop）。
+///
+/// 流程：读体 → 鉴权 → 转成 Chat 形态 → 转发 → 转回 Anthropic 形状。
+/// 流式走 [`crate::protocol::anthropic_stream`]，非流式走 `chat_to_anthropic`。
+async fn messages(State(state): State<Arc<AppState>>, request: Request<axum::body::Body>) -> Response {
+    let headers = request.headers().clone();
+    if let Some(r) = check_auth(&state, &headers) {
+        return r;
+    }
+    let body = match read_body(request, Wire::Messages).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+
+    // 先解析出 stream 标志（失败也走同一错误路径）。
+    let req = match crate::protocol::anthropic::parse_request(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return Wire::Messages.error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &e,
+            )
+        }
+    };
+
+    let (chat_body, sess_key) = match crate::protocol::anthropic::anthropic_to_chat(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Wire::Messages.error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &e,
+            )
+        }
+    };
+
+    let (result, status, failure) = run_forward(&state, &chat_body, req.stream, &sess_key).await;
+    if let Some(f) = failure {
+        let code = Wire::Messages.failure_code(f.kind);
+        return Wire::Messages.error(
+            StatusCode::from_u16(f.status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            code,
+            &f.message,
+        );
+    }
+
+    match result {
+        Some(crate::forward::ChatResult::Stream { uid, response, .. }) => {
+            let stream = anthropic_stream_response(response, &req.model);
+            spawn_release_on_end(state.clone(), uid, stream)
+        }
+        Some(crate::forward::ChatResult::Response { body, .. }) => {
+            let out = crate::protocol::anthropic::chat_to_anthropic(&body, &req.model);
+            json_response(StatusCode::OK, out)
+        }
+        None => Wire::Messages.error(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            "api_error",
+            "all accounts unavailable (cooling/disabled)",
+        ),
+    }
+}
+
+/// `POST /v1/responses` —— OpenAI Responses 入口（Codex CLI）。
+///
+/// Codex 0.146 起只接受 `wire_api = "responses"`，缺这个入口它无论怎么配都连不上。
+async fn responses(State(state): State<Arc<AppState>>, request: Request<axum::body::Body>) -> Response {
+    let headers = request.headers().clone();
+    if let Some(r) = check_auth(&state, &headers) {
+        return r;
+    }
+    let body = match read_body(request, Wire::Responses).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+
+    let req = match crate::protocol::responses::parse_request(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return Wire::Responses.error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &e,
+            )
+        }
+    };
+
+    let (chat_body, sess_key) = match crate::protocol::responses::responses_to_chat(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Wire::Responses.error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &e,
+            )
+        }
+    };
+
+    let (result, status, failure) = run_forward(&state, &chat_body, req.stream, &sess_key).await;
+    if let Some(f) = failure {
+        let code = Wire::Responses.failure_code(f.kind);
+        return Wire::Responses.error(
+            StatusCode::from_u16(f.status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            code,
+            &f.message,
+        );
+    }
+
+    match result {
+        Some(crate::forward::ChatResult::Stream { uid, response, .. }) => {
+            let stream = responses_stream_response(response, &req.model);
+            spawn_release_on_end(state.clone(), uid, stream)
+        }
+        Some(crate::forward::ChatResult::Response { body, .. }) => {
+            let out = crate::protocol::responses::chat_to_responses(&body, &req.model);
+            json_response(StatusCode::OK, out)
+        }
+        None => Wire::Responses.error(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            "upstream_error",
+            "all accounts unavailable (cooling/disabled)",
+        ),
+    }
+}
+
+/// 把上游 SSE 包成 Anthropic SSE 流。
+///
+/// 事件序列与顺序约束见 [`crate::protocol::anthropic_stream`] 的模块文档。
+fn anthropic_stream_response(upstream: reqwest::Response, model: &str) -> Response {
+    use crate::protocol::anthropic_stream::{AnthropicStreamState, SseOut};
+    let mut frames = crate::upstream::sse::SseFramesIter::new(upstream.bytes_stream());
+    let model = model.to_string();
+    let body = async_stream::stream! {
+        let mut state = AnthropicStreamState::new(&model);
+        let mut out = SseOut::new();
+        if state.start(&mut out).is_err() {
+            return;
+        }
+        yield Ok::<_, std::io::Error>(out.take());
+        loop {
+            match frames.next_frame().await {
+                Some(Ok(text)) => {
+                    // 上游帧是 OpenAI 形状；取出 data: 后的 JSON 交给状态机。
+                    let mut consumed = false;
+                    for line in text.lines() {
+                        if let Some(payload) = line.strip_prefix("data: ") {
+                            if payload == "[DONE]" {
+                                continue;
+                            }
+                            if let Ok(serde_json::Value::Object(chunk)) =
+                                serde_json::from_str::<serde_json::Value>(payload)
+                            {
+                                consumed = true;
+                                if state.consume(&mut out, &chunk).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    let _ = consumed;
+                    if !out.is_empty() {
+                        yield Ok(out.take());
+                    }
+                }
+                Some(Err(e)) => {
+                    // 非 EOF 的读错误 = 上游中途断流。必须发 error 并**返回**：
+                    // 往下走会照常发 message_stop，而它在 Anthropic 协议里表示
+                    // 「本轮正常结束」，客户端会把截断的半截回复当成完整回答收下。
+                    let _ = state.write_error(&mut out, &format!("upstream stream error: {e}"));
+                    yield Ok(out.take());
+                    return;
+                }
+                None => break,
+            }
+        }
+        if state.finish(&mut out).is_ok() && !out.is_empty() {
+            yield Ok(out.take());
+        }
+    };
+    sse_headers().body(axum::body::Body::from_stream(body)).unwrap_or_else(|_| {
+        Wire::Messages.error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            "构造流式响应失败",
+        )
+    })
+}
+
+/// 把上游 SSE 包成 Responses SSE 流。
+fn responses_stream_response(upstream: reqwest::Response, model: &str) -> Response {
+    use crate::protocol::anthropic_stream::SseOut;
+    use crate::protocol::responses_stream::ResponsesStreamState;
+    let mut frames = crate::upstream::sse::SseFramesIter::new(upstream.bytes_stream());
+    let model = model.to_string();
+    let body = async_stream::stream! {
+        let mut state = ResponsesStreamState::new(&model);
+        let mut out = SseOut::new();
+        if state.created_event(&mut out).is_err() {
+            return;
+        }
+        yield Ok::<_, std::io::Error>(out.take());
+        loop {
+            match frames.next_frame().await {
+                Some(Ok(text)) => {
+                    for line in text.lines() {
+                        if let Some(payload) = line.strip_prefix("data: ") {
+                            if payload == "[DONE]" {
+                                continue;
+                            }
+                            if let Ok(serde_json::Value::Object(chunk)) =
+                                serde_json::from_str::<serde_json::Value>(payload)
+                            {
+                                if state.consume(&mut out, &chunk).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    if !out.is_empty() {
+                        yield Ok(out.take());
+                    }
+                }
+                Some(Err(e)) => {
+                    // 上游中途断流：只发 response.failed 并返回，**绝不**再补
+                    // response.completed（两者自相矛盾，客户端只认最后一个）。
+                    let _ = state.fail(&mut out, &format!("upstream stream error: {e}"));
+                    yield Ok(out.take());
+                    return;
+                }
+                None => break,
+            }
+        }
+        if state.finish(&mut out).is_ok() && !out.is_empty() {
+            yield Ok(out.take());
+        }
+    };
+    sse_headers().body(axum::body::Body::from_stream(body)).unwrap_or_else(|_| {
+        Wire::Responses.error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            "构造流式响应失败",
+        )
+    })
+}
+
+/// SSE 响应头（三个协议入口共用）。
+fn sse_headers() -> axum::http::response::Builder {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("X-Accel-Buffering", "no")
+}
 
 /// 把上游 SSE 响应包成 `text/event-stream`，逐帧规范化后流式透传。
 ///
@@ -832,5 +1200,107 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// 两个新协议入口都必须要求鉴权（与 chat 一致）。
+    #[tokio::test]
+    async fn new_protocol_routes_require_auth() {
+        for uri in ["/v1/messages", "/messages", "/v1/responses", "/responses"] {
+            let app = router(test_state("secret"));
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+    }
+
+    /// 无版本号别名必须与带版本号的路径行为一致（部分客户端省略 `/v1`）。
+    #[tokio::test]
+    async fn versionless_aliases_are_routed() {
+        for uri in ["/messages", "/responses"] {
+            let app = router(test_state(""));
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // 不是 404 即说明路由存在（空账号池 → 503）
+            assert_ne!(res.status(), StatusCode::NOT_FOUND, "{uri} 未注册路由");
+        }
+    }
+
+    /// Anthropic 入口的错误体必须是 Anthropic 形状（`{"type":"error",...}`）。
+    #[tokio::test]
+    async fn messages_errors_use_anthropic_shape() {
+        let app = router(test_state(""));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(res).await;
+        assert_eq!(v["type"], json!("error"));
+        assert_eq!(v["error"]["type"], json!("invalid_request_error"));
+    }
+
+    /// Responses 入口的错误体必须是 Responses 形状（`{"error":{...}}`）。
+    #[tokio::test]
+    async fn responses_errors_use_responses_shape() {
+        let app = router(test_state(""));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(res).await;
+        assert_eq!(v["error"]["type"], json!("api_error"));
+        assert_eq!(v["error"]["code"], json!("invalid_request"));
+    }
+
+    /// 空请求体按各协议词汇表报错。
+    #[tokio::test]
+    async fn empty_body_rejected_per_protocol() {
+        let app = router(test_state(""));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(res).await;
+        // Anthropic 词汇表
+        assert_eq!(v["error"]["type"], json!("invalid_request_error"));
     }
 }

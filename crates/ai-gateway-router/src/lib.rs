@@ -27,6 +27,7 @@ pub mod config;
 pub mod error;
 pub mod forward;
 pub mod pool;
+pub mod protocol;
 pub mod server;
 pub mod session;
 pub mod upstream;
