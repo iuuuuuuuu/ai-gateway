@@ -64,6 +64,14 @@ type Status struct {
 	Until           time.Time `json:"until,omitempty"`
 	Reason          string    `json:"reason,omitempty"`
 	Disabled        bool      `json:"disabled"`
+	// NoRoute 用户手动禁用：**只不接流量**，养号任务照跑。
+	//
+	// 与 Disabled 分开下发，界面才能如实区分两种「不接流量」：
+	//   NoRoute  → 用户自己关的；签到 / 上报 / 成长任务**仍在跑**
+	//   Disabled → 网关判定该号已死（session 死 / 额度冻结），任务也会跳过
+	// 两者在界面上若都写成「禁用」，用户就无法判断「这个号还在不在养」——
+	// 而「禁用了但仍在养号」正是本功能的语义。
+	NoRoute         bool      `json:"no_route,omitempty"`
 	SuccessCount    int64     `json:"success_count,omitempty"`
 	ErrTotal        int64     `json:"err_total,omitempty"`
 	LastSuccessTime time.Time `json:"last_success,omitempty"`
@@ -170,9 +178,24 @@ func (e *entry) expiryDayKey() string {
 	return time.Unix(e.expireAt, 0).In(time.Local).Format("2006-01-02")
 }
 
-// healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期）。
+// healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期、未被用户标记不接流量）。
 func (e *entry) healthy(now time.Time) bool {
 	if e.disabled {
+		return false
+	}
+	// 用户手动禁用 = **只不接流量**，养号任务照跑。
+	//
+	// 放在这里（而不是并入上面的 disabled）是刻意的：本函数是**选号路径**的
+	// 统一闸门 —— pickLocked / pickEarliestExpiryLocked / routedTierDayLocked
+	// 都靠它筛候选，一处即覆盖全部分流场景。
+	//
+	// 而养号任务**不走**本函数：它们只判 `st.Disabled`（网关自判定的死号：
+	// session 死 / 额度冻结，那种跑了也白跑）。于是「禁用 = 不接流量、但照常养号」
+	// 这个语义自然成立 —— 这正是所有者要的。
+	//
+	// 注意 NoRoute 账号的凭证**是存在**的（宿主照常导出），所以任务能遍历到它。
+	// 若哪天有人把导出一并去掉，任务会再次静默停跑 —— 那正是本次修的 bug。
+	if e.a != nil && e.a.NoRoute {
 		return false
 	}
 	if !e.until.IsZero() && now.Before(e.until) {
@@ -1714,6 +1737,13 @@ func (p *Pool) PickByUIDForModelRegion(uid, model string, prefer auth.Region) *a
 // 注意：healthy 口径不含 inFlight 维度（是状态机权威判定，只看 disabled/until/breakerUntil）；
 // inFlightFull 是 healthy 的子集——healthy 里已达在途上限的账号数，供 /status 透出满载度。
 // 与 ServableNow 的区别见该函数注释。
+//
+// 计数口径与 healthy 的分支**必须对齐**，否则界面上的数字会互相矛盾：
+// 用户标记「不接流量」的账号（no_route）既不是 disabled（没死），也不是 cooling
+//（没在冷却）—— 它在 healthy() 里为 false，若不单独分一支就会被算进 cooling，
+// 于是界面上「冷却 N 个」凭空多出几个根本没冷却的号。
+// 单独归入 disabled 这一支：两者对**可用性**的含义相同（都不接流量），
+// 界面再按 NoRoute 标记分别显示不同文案。
 func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -1721,7 +1751,9 @@ func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull
 	for _, e := range p.byUID {
 		total++
 		switch {
-		case e.disabled:
+		case e.disabled || (e.a != nil && e.a.NoRoute):
+			// no_route 与 disabled 同归「不可用」：都不参与选号。
+			// 区分它们的是 Status.NoRoute（界面据此显示「不接流量」vs「已停用」）。
 			disabled++
 		case !e.healthy(now):
 			cooling++
@@ -1824,6 +1856,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Cooling:         now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:          e.reason,
 		Disabled:        e.disabled,
+		NoRoute:         e.a != nil && e.a.NoRoute,
 		SuccessCount:    e.successCount,
 		ErrTotal:        e.errTotal,
 		LastSuccessTime: e.lastSuccess,

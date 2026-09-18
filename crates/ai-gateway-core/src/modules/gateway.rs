@@ -325,6 +325,21 @@ fn build_auth_doc(acc: &Value, credit: Option<Value>) -> Option<(String, String)
             "nickname": nickname,
         },
     });
+    // 用户手动禁用 = **只不接流量**，养号任务照跑。
+    //
+    // 为什么必须把标记下发而不是像以前那样「不导出」：
+    // 网关的账号池是**扫描凭证目录**建立的，而所有养号任务（签到 / 活跃上报 /
+    // 成长任务 / 猫猫旅行 / 开学季 / trial）都遍历这个池。禁用意味着不导出凭证，
+    // 于是那些账号**完全不参与任何养号任务** —— 而用户的意图只是「别把请求路由
+    // 到它」。实测确认过：6 个被禁用的账号一个养号任务都没跑。
+    //
+    // 因此改为：凭证照常导出（任务能跑到），另带一个显式标记，
+    // 由网关在**选号**时排除它。标记名用 `no_route` 而不是 `disabled`，
+    // 是为了与网关自己的 disabled（session 死 / 额度冻结，那种跑了也白跑）
+    // 区分开 —— 两者语义不同，混用会让「禁用即停养号」这个 bug 复现。
+    if account::account_disabled(acc) {
+        doc["account"]["no_route"] = json!(true);
+    }
     if let Some(c) = credit {
         if c.is_object() {
             doc["credit"] = c;
@@ -526,7 +541,9 @@ fn task_target_total(task: &str) -> usize {
     account::load_accounts()
         .iter()
         .filter(|a| !needs_relogin(a))
-        .filter(|a| !account::account_disabled(a))
+        // **不滤 account_disabled**：禁用只表示「不接流量」，养号任务照跑，
+        // 因此它们仍计入任务进度的分母。滤掉会让「已记录 N / M」的 M 偏小，
+        // 看起来像任务快做完了。
         .filter(|a| account::get_str(a, "access_token").is_some())
         .filter(|a| {
             let intl = crate::modules::config::Region::of(a) == crate::modules::config::Region::Intl;
@@ -867,19 +884,18 @@ pub fn export_accounts_to_dir(
     // 分开写会导致切换模式时判定不一致（曾被此坑到：清理用账号库全集，
     // 从负载均衡切到指定账号后其余凭证残留，网关仍把它们加载进池）。
     //
-    // 需重登的账号同样不导出：它的 refresh token 已被服务端拒绝，
+    // 需重登的账号不导出：它的 refresh token 已被服务端拒绝，
     // 留在池里只会让每次请求白跑一轮（实测：网关无视该标记持续使用失效账号）。
     // 重新登录成功后 `needs_relogin` 被清除，下次同步会自动把它放回池中。
+    //
+    // **被用户手动禁用的账号要照常导出**（与需重登不同）：
+    // 禁用只表示「别把流量路由给它」，养号任务（签到 / 活跃上报 / 成长任务 /
+    // 猫猫旅行 / 开学季 / trial）仍应照跑 —— 它们全都遍历网关账号池，
+    // 而池是靠扫描本目录建立的。此前这里把禁用也一并排除，导致被禁用的账号
+    // **完全不参与任何养号任务**（实测确认：6 个禁用账号零任务）。
+    // 现在改为导出时带上 `no_route` 标记，由网关在选号阶段排除。
     let should_export = |acc: &Value| -> bool {
         if needs_relogin(acc) {
-            return false;
-        }
-        // 用户手动禁用的账号不进池：这是显式意图，优先级高于任何模式选择
-        //（即使它出现在手动模式的勾选列表里也不导出 —— 否则「禁用」会被模式覆盖，
-        // 用户会看到「明明禁用了却还在接流量」）。
-        // 注意：只影响网关池；签到 / 旅行 / 上报等养号任务照跑
-        //（与所有者确认的语义：禁用 ≠ 停止养号）。
-        if crate::modules::account::account_disabled(acc) {
             return false;
         }
         let uid = account::get_str(acc, "uid").unwrap_or_default();
@@ -910,18 +926,19 @@ pub fn export_accounts_to_dir(
     }
 
     // 清理不再需要的凭证：账号库中已删除的、因模式切换而不再导出的、
-    // 已被标记需重新登录的，以及被用户**手动禁用**的
-    //（留着只会让网关持续把它加载进池）。
+    // 以及已被标记需重新登录的。
     //
     // 这里的过滤条件必须与上面 `should_export` **逐条对应** ——
     // 二者一旦分叉就会出现「导出时不写、清理时又保留」的残留凭证，
     // 网关仍会把旧账号加载进池，表现为「禁用/切换模式不生效」。
-    // （本函数此前正是漏了 disabled 这一条：导出侧已加过滤，
-    //   清理侧只滤了 needs_relogin，导致禁用账号的凭证文件永远留着。）
+    //
+    // **注意不要在这里再滤 account_disabled**：被禁用的账号现在**要保留凭证**
+    //（见 should_export 的注释：禁用只是不接流量，养号任务仍要跑）。
+    // 若这里继续滤掉，就会「刚导出就被删」，禁用账号依然跑不到任务 ——
+    // 与导出侧那个 bug 是同一个后果，只是路径不同。
     let all_uids: Vec<String> = accounts
         .iter()
         .filter(|a| !needs_relogin(a))
-        .filter(|a| !crate::modules::account::account_disabled(a))
         .filter_map(|a| account::get_str(a, "uid"))
         .collect();
     let live: Vec<String> = select_export_uids(&all_uids, &only)
@@ -2220,20 +2237,25 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
         }
         if gateway_mode() == GatewayMode::Manual {
             let picked = manual_uids();
-            // 勾了账号但全都不可用：明确指出问题，而不是笼统说「账号库为空」
+            // 勾了账号但**全都不可导出**：明确指出问题，而不是笼统说「账号库为空」。
+            //
+            // 判据只认 `needs_relogin`（凭证失效 → 不导出，见 should_export）。
+            // **不再把 account_disabled 算作「不可用」**：禁用只表示不接流量，
+            // 凭证仍会导出，网关能正常启动（只是这个账号不会被选号）。
+            // 若把禁用也算进去，用户勾一个被禁用的账号会看到「都不可用」而
+            // 误以为配置有错 —— 实际它只是不接流量而已。
             let dead_picked = picked
                 .iter()
                 .filter(|u| {
                     accounts.iter().any(|a| {
-                        account::get_str(a, "uid").as_deref() == Some(u.as_str())
-                            && (needs_relogin(a) || account::account_disabled(a))
+                        account::get_str(a, "uid").as_deref() == Some(u.as_str()) && needs_relogin(a)
                     })
                 })
                 .count();
             if !picked.is_empty() && dead_picked == picked.len() {
                 return Err(
-                    "手动模式勾选的账号都不可用（需重新登录或已被禁用），\
-                     请在网关页面重新勾选。"
+                    "手动模式勾选的账号都需重新登录（refresh token 已失效），\
+                     请在「账号管理」页重新登录后重试。"
                         .to_string(),
                 );
             }
@@ -4850,14 +4872,21 @@ p42\ncjava\nf9\nn*:8080\n";
     }
 
     // -----------------------------------------------------------------------
-    // 账号禁用：不进网关池（需求1）
+    // 账号禁用：不接流量，但仍导出（养号任务照跑）
     //
-    // 语义（与所有者确认）：禁用 = 不进账号池；签到 / 旅行 / 上报等养号任务照跑。
-    // 因此这里只验证「导出集合」这一个可观测点。
+    // 语义（与所有者确认）：禁用 = **不接流量**；签到 / 旅行 / 上报 / 成长任务照跑。
+    //
+    // 这里有个容易搞反的地方，曾经真的搞反过：早先的实现是「禁用就不导出凭证」，
+    // 看起来实现了「不进池」，但网关的账号池**就是靠扫描凭证目录建立的**，
+    // 而所有养号任务都遍历这个池 —— 于是禁用账号**完全不参与任何养号任务**
+    //（实测：6 个禁用账号零任务）。
+    //
+    // 正确做法：凭证照常导出（任务能遍历到），另带 `account.no_route` 标记，
+    // 由网关在**选号**阶段排除（见 go-gateway 的 pool.healthy）。
     // -----------------------------------------------------------------------
 
     #[test]
-    fn disabled_account_is_excluded_from_gateway_export() {
+    fn disabled_account_is_still_exported_with_no_route_mark() {
         let dir = std::env::temp_dir().join(format!("wb-gw-disabled-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).expect("temp dir");
 
@@ -4871,32 +4900,41 @@ p42\ncjava\nf9\nn*:8080\n";
             "disabled": true,
         });
 
-        // 先让两个账号都在池里（模拟禁用前的状态）。
-        //
-        // 注意：seed 时**不能**带 disabled 字段 —— 禁用账号在任何情况下都不导出，
-        // 因此必须用「未禁用形态」写入，才能构造出「凭证已在池中」这个前置条件。
-        let off_before = json!({
-            "uid": "uid-off", "nickname": "禁用号", "access_token": "AT-OFF",
-            "refresh_token": "RT-OFF", "domain": "copilot.tencent.com", "expiresAt": 1_900_000_000_000i64,
-        });
-        export_accounts_to_dir(&dir, &[active.clone(), off_before], None).expect("seed both");
-        assert!(dir.join("workbuddy-uid-off.json").exists(), "前置条件：禁用号此刻在池中");
+        export_accounts_to_dir(&dir, &[active.clone(), off.clone()], None).expect("export");
 
-        // 打上禁用标记后：它的凭证必须被清理掉
-        export_accounts_to_dir(&dir, &[active.clone(), off.clone()], None).expect("export with disabled");
+        // ① 禁用账号的凭证**必须存在** —— 否则它不在网关池里，养号任务遍历不到。
+        let off_path = dir.join("workbuddy-uid-off.json");
         assert!(
-            !dir.join("workbuddy-uid-off.json").exists(),
-            "禁用账号的凭证必须被删除，否则网关仍会把它加载进池"
+            off_path.exists(),
+            "禁用账号的凭证必须保留：网关池靠扫该目录建立，删了它就等于停掉该账号的全部养号任务"
         );
-        assert!(dir.join("workbuddy-uid-on.json").exists(), "启用账号应保留");
+        assert!(dir.join("workbuddy-uid-on.json").exists(), "启用账号应导出");
+
+        // ② 且必须带上 no_route 标记 —— 否则它会照常接流量。
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&off_path).unwrap()).unwrap();
+        assert_eq!(
+            doc["account"]["no_route"], true,
+            "禁用账号必须带 account.no_route，网关据此在选号时排除它"
+        );
+        // 启用账号不该带该标记（否则它也会被排除出路由）。
+        let on_doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("workbuddy-uid-on.json")).unwrap())
+                .unwrap();
+        assert!(
+            on_doc["account"].get("no_route").is_none(),
+            "启用账号不该带 no_route 标记"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn disabled_takes_priority_over_manual_selection() {
-        // 关键：即使禁用账号出现在手动勾选列表里，也不得导出 ——
-        // 否则「禁用」会被模式覆盖，用户会看到「明明禁用了却还在接流量」。
+    fn disabled_account_is_exported_even_when_manually_selected() {
+        // 手动模式下勾选了一个被禁用的账号：**仍然导出**（带 no_route）。
+        //
+        // 早先的断言是「禁用优先于勾选，不导出」，理由是「否则禁用了还在接流量」。
+        // 但那个担心其实由 no_route 解决了：网关只在选号时排除它，
+        // 所以「不接流量」照样成立，同时养号任务不会断。
         let dir = std::env::temp_dir().join(format!("wb-gw-prio-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).expect("temp dir");
 
@@ -4913,16 +4951,19 @@ p42\ncjava\nf9\nn*:8080\n";
         export_accounts_to_dir(&dir, &[picked, picked_but_disabled], only).expect("export");
 
         assert!(dir.join("workbuddy-uid-picked.json").exists(), "勾选且启用的应导出");
+        let pd = dir.join("workbuddy-uid-pd.json");
         assert!(
-            !dir.join("workbuddy-uid-pd.json").exists(),
-            "勾选但被禁用的不应导出（禁用优先于勾选）"
+            pd.exists(),
+            "勾选但被禁用的**也要导出**（带 no_route）—— 否则它的养号任务会停"
         );
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&pd).unwrap()).unwrap();
+        assert_eq!(doc["account"]["no_route"], true, "被禁用的勾选项应带 no_route");
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn re_enabling_restores_credential() {
+    fn re_enabling_clears_no_route_mark() {
         let dir = std::env::temp_dir().join(format!("wb-gw-reenable-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).expect("temp dir");
 
@@ -4934,13 +4975,17 @@ p42\ncjava\nf9\nn*:8080\n";
         disabled["disabled"] = json!(true);
 
         export_accounts_to_dir(&dir, &[disabled], None).expect("export disabled");
-        assert!(!dir.join("workbuddy-uid-r.json").exists());
+        let path = dir.join("workbuddy-uid-r.json");
+        assert!(path.exists(), "禁用账号仍应导出（供养号任务使用）");
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["account"]["no_route"], true, "禁用时应带标记");
 
-        // 取消禁用后应恢复进池
+        // 取消禁用后：标记必须消失，否则它永远不接流量。
         export_accounts_to_dir(&dir, &[base], None).expect("export enabled");
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(
-            dir.join("workbuddy-uid-r.json").exists(),
-            "取消禁用后凭证应重新写入"
+            doc["account"].get("no_route").is_none(),
+            "取消禁用后 no_route 必须清除，否则该账号永远不会被选号"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -5329,11 +5374,17 @@ p42\ncjava\nf9\nn*:8080\n";
             Some("开学季活动"),
             "标签必须与 Go 侧写账号记录的标题逐字一致，否则进度恒为 0"
         );
-        // 开学季只跑国服：u1 合格，u2 被禁用，u3 是国际版
+        // 开学季只跑国服：u1 与 u2 都是国服且**都参与养号**（u2 虽被禁用，
+        // 但禁用只表示「不接流量」，任务照跑）；u3 是国际版，不在范围内。
+        //
+        // 这个分母**必须**把被禁用的 u2 算进去：它确实会被 Go 侧遍历到并产生记录。
+        // 早先这里期望 1（把 disabled 排除），那是因为当时禁用账号压根不在网关池里；
+        // 现在凭证照常导出（见 should_export），池里有它，任务自然也会跑到它。
+        // 若分母仍按旧口径给 1，界面上的「已记录 N / M」会与实际记录数对不上。
         assert_eq!(
             live.get("total").and_then(Value::as_u64),
-            Some(1),
-            "分母应与 Go 侧的区域 + 禁用过滤口径一致"
+            Some(2),
+            "分母应与 Go 侧的区域 + 导出过滤口径一致：被禁用的账号仍参与养号，应计入"
         );
         assert_eq!(live.get("processed").and_then(Value::as_u64), Some(0));
 

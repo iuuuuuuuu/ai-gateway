@@ -873,7 +873,10 @@ function formatTokenExpiry(expiresAt: number | null | undefined): string {
  * 这两种状态此前在界面上都只显示"冷却中"，用户无法判断是该充值还是换个模型就好。
  */
 function coolReasonText(acc: GatewayPoolAccount): string {
-  if (acc.disabled) return acc.reason || "已禁用";
+  // 两种「不接流量」的说明不同：no_route 是用户自己关的（养号照跑），
+  // disabled 是网关判定账号已死（养号也停）。混成一句会让用户误判该做什么。
+  if (acc.no_route) return "你已手动设为「不接流量」：网关不会把请求路由到它，但养号任务仍在执行";
+  if (acc.disabled) return acc.reason ? `已停用：${acc.reason}` : "已停用（网关判定该账号不可用）";
   if (acc.cool_kind === "hard_credit") return "余额不足（积分欠费），等签到或充值后恢复";
   if (acc.cool_kind === "soft_rate") return "账号被限速，短暂冷却后自动恢复";
   if (acc.cool_kind === "breaker") return "连续失败触发熔断，按退避时间恢复";
@@ -1135,10 +1138,13 @@ interface PoolRowMetrics {
 /**
  * 状态分层与「状态」列的标签**同源**，避免排序与显示各算一遍。
  *
- * 优先级：禁用 > 账号级冷却 > 排队 > 健康 —— 与状态标签的判定顺序逐字相同。
+ * 优先级：不接流量 > 已停用 > 账号级冷却 > 排队 > 健康 —— 与状态标签的判定顺序逐字相同。
+ *
+ * 前两档都是「不可用」，但分属不同档位（0 与 4 之间夹着可用状态）不合适，
+ * 因此给它们**同一档**：都表示「这个号现在不接请求」，用户排序时关心的就是这个。
  */
 function poolStateRank(acc: GatewayPoolAccount): number {
-  if (acc.disabled) return 4;
+  if (acc.no_route || acc.disabled) return 4;
   if (acc.cooling) return 3;
   if (acc.queued) return 2;
   return 1;
@@ -1364,18 +1370,44 @@ function PoolAccountRow({
   const inUse = inFlight > 0;
   /** 空闲时的「N 分钟前用过」；从未成功过则为 null（不编造日期）。 */
   const lastUsedAgo = inUse ? null : poolLastUsedAgo(acc);
-  // 状态标签的优先级：禁用 > 账号级冷却 > 排队 > 健康。
+  // 状态标签的优先级：禁用（用户）> 已停用（网关判定死亡）> 账号级冷却 > 排队 > 健康。
   //
   // 「排队」单独作为一档，因为它最容易让人误判：账号本身完全健康、积分充足，
   // 只是到期档位比当前生效档位晚，所以暂时轮不到（用户看到「健康」却在用量里
   // 找不到它，就会以为账号丢了）。
-  const state = acc.disabled
-    ? { label: "已禁用", cls: "bg-destructive/10 text-destructive" }
-    : acc.cooling
-      ? { label: "冷却中", cls: "bg-amber-500/10 text-amber-600 dark:text-amber-400" }
-      : acc.queued
-        ? { label: "排队中", cls: "bg-muted text-muted-foreground" }
-        : { label: "健康", cls: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" };
+  //
+  // **两种「不接流量」必须分开显示**（否则用户无法判断这个号还在不在养）：
+  //   no_route → 用户自己关的：**养号任务仍在跑**（签到/上报/成长任务都会执行）
+  //   disabled → 网关判定该号已死（session 死/额度冻结）：任务也会跳过
+  // 早先两者都显示「已禁用」，用户看到被禁用的账号就以为它彻底停了 ——
+  // 而实际上（在缺陷修复后）它仍在正常养号，只是不接请求。
+  const state = acc.no_route
+    ? {
+        label: "不接流量",
+        cls: "bg-muted text-muted-foreground",
+        title:
+          "你已手动把该账号标记为「不接流量」：网关不会把请求路由到它，" +
+          "但签到、活跃上报、成长任务等养号任务**仍在正常执行**。" +
+          "在「账号管理」里取消禁用即可重新接流量。",
+      }
+    : acc.disabled
+      ? {
+          label: "已停用",
+          cls: "bg-destructive/10 text-destructive",
+          title:
+            "网关判定该账号已不可用（" +
+            (acc.reason || "session 失效或额度冻结") +
+            "），因此养号任务也会跳过它。需重新登录或恢复额度。",
+        }
+      : acc.cooling
+        ? { label: "冷却中", cls: "bg-amber-500/10 text-amber-600 dark:text-amber-400", title: undefined }
+        : acc.queued
+          ? { label: "排队中", cls: "bg-muted text-muted-foreground", title: undefined }
+          : {
+              label: "健康",
+              cls: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+              title: undefined,
+            };
   // 到期日就是选号分层档位：同一 expire_day 的账号在均衡时同级（平均分摊）。
   const expiry = acc.expire_day
     ? { label: acc.expire_day.slice(5), title: `最近到期积分：${acc.expire_day}（同一天的账号同级平均分摊）` }
@@ -2405,7 +2437,17 @@ export default function GatewayPage() {
     };
   }, []);
 
-  /** 手动模式的可选账号：排除已禁用与需重登的（它们不会进池，勾了也没用）。 */
+  /**
+   * 手动模式的可选账号：排除已禁用与需重登的。
+   *
+   * 为什么**仍然排除被禁用的**（而不是像池那样把它们也列出来）：
+   * 这份列表回答的是「让哪些账号接流量」。被禁用的账号带 no_route 标记，
+   * 网关选号时必然跳过它 —— 勾了也不会接流量。把一个「勾了没反应」的
+   * 选项摆出来，只会让用户以为勾选失效。
+   *
+   * 它**仍在养号**这件事由账号池那边体现（状态列显示「不接流量」并说明
+   * 养号任务照跑），两处各司其职：这里管路由，池那边管状态。
+   */
   const availableAccounts = useMemo(
     () =>
       (status?.accounts ?? []).filter(
@@ -3613,6 +3655,11 @@ export default function GatewayPage() {
             tone={running ? "ok" : "off"}
           />
           <Stat label="健康账号" value={pool?.healthy ?? "—"} tone={(pool?.healthy ?? 0) > 0 ? "ok" : "warn"} />
+          {/*
+            「冷却 / 禁用」里的禁用**包含**用户标记的不接流量账号
+            （网关 CountsDetailed 把两者同归不可用）。文案保持「禁用」是因为
+            这一格统计的是「不可用账号数」；具体是哪种，看账号池那一列的状态标签。
+          */}
           <Stat label="冷却 / 禁用" value={`${pool?.cooling ?? 0} / ${pool?.disabled ?? 0}`} tone="warn" />
           <Stat label="粘性会话" value={pool?.sticky_sessions ?? 0} />
         </div>

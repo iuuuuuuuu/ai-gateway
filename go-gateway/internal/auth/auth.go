@@ -25,6 +25,13 @@ type Auth struct {
 	EnterpriseID string
 	Nickname     string
 	FilePath     string // 来源文件；refresh 后原子写回此处
+	// NoRoute 用户手动禁用：**只不参与选号**，养号任务照跑。
+	//
+	// 由宿主在导出凭证时写入 account.no_route。与 pool 里的 disabled 区分：
+	//   NoRoute  → 用户意图「别把流量给它」；签到/上报/成长任务仍应执行
+	//   disabled → 网关判定该账号已死（session 死 / 额度冻结）；任务跳过多余
+	// 二者混用会导致「禁用即停养号」——那是所有者报过的真实缺陷。
+	NoRoute bool
 
 	// SoonestExpireAt 仍有剩余积分的套餐中最早的到期时刻（Unix 秒）；0 = 未知。
 	//
@@ -127,6 +134,13 @@ func Parse(raw []byte) (*Auth, error) {
 				UID          string `json:"uid"`
 				EnterpriseID string `json:"enterpriseId"`
 				Nickname     string `json:"nickname"`
+				// NoRoute 用户手动禁用 = **只不接流量**，养号任务照跑。
+				//
+				// 与池里的 disabled 完全不同：那个是网关自己判定的
+				//（连续 3 次 12153 session 死 / 额度冻结），跑了也白跑，
+				// 所以养号任务该跳过。而这个只是「别把请求路由到它」，
+				// 签到 / 活跃上报 / 成长任务等仍应照跑 —— 所有者明确过这个语义。
+				NoRoute bool `json:"no_route"`
 			} `json:"account"`
 			Credit creditBlock `json:"credit"`
 		}
@@ -141,6 +155,7 @@ func Parse(raw []byte) (*Auth, error) {
 			UID:             n.Account.UID,
 			EnterpriseID:    n.Account.EnterpriseID,
 			Nickname:        n.Account.Nickname,
+			NoRoute:         n.Account.NoRoute,
 			SoonestExpireAt: normalizeEpoch(n.Credit.SoonestExpireAt),
 		}
 	} else {
@@ -152,6 +167,9 @@ func Parse(raw []byte) (*Auth, error) {
 			UID          string `json:"uid"`
 			EnterpriseID string `json:"enterpriseId"`
 			Nickname     string `json:"nickname"`
+			// 扁平形同样支持 no_route（两种形状的字段语义必须一致，
+			// 否则同一个账号换种写法就会「突然开始接流量」）。
+			NoRoute bool `json:"no_route"`
 			// 扁平形把 credit 字段平铺在顶层（兼容旧版手写凭证）。
 			SoonestExpireAt int64 `json:"soonestExpireAt"`
 		}
@@ -166,6 +184,7 @@ func Parse(raw []byte) (*Auth, error) {
 			UID:             f.UID,
 			EnterpriseID:    f.EnterpriseID,
 			Nickname:        f.Nickname,
+			NoRoute:         f.NoRoute,
 			SoonestExpireAt: normalizeEpoch(f.SoonestExpireAt),
 		}
 	}

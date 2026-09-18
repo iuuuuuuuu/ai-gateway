@@ -168,13 +168,77 @@ func TestModelReasoningFieldsCopiesSlice(t *testing.T) {
 	}
 }
 
-// TestModelReasoningFieldsEmptyReturnsNil 空档位返回 nil（不下发任何键）。
-func TestModelReasoningFieldsEmptyReturnsNil(t *testing.T) {
-	if got := modelReasoningFields(nil, "high"); got != nil {
-		t.Errorf("无档位时应返回 nil，实际 %#v", got)
+// TestModelReasoningFieldsEmptyReturnsNil 已被 TestModelReasoningFieldsThreeStates 取代。
+//
+// 原用例断言 `modelReasoningFields(nil, "high") == nil`（「无档位就不下发任何键」）——
+// 那条断言**本身就是缺陷**：它把「上游没给档位数组」等同于「不支持思考」，
+// 而实测固定档模型的 effort 是有效的（上面用例的 B 情形）。保留它会把 bug 锁死，
+// 故删除；三态语义改由 TestModelReasoningFieldsThreeStates 覆盖。
+
+// TestModelReasoningFieldsThreeStates 思考能力的三种情形必须分开表达。
+//
+// 这是所有者报的缺陷（「国服还是国际服都是有思考档位的，你这里数据不对吧」）：
+// 早先本函数只判 `len(efforts)==0 → return nil`，把「固定档」与「不支持思考」
+// 混成一件事，于是 18 个（国服）/ 8 个（国际版）**有思考能力、只是不可选档**
+// 的模型在界面上显示成「—」。
+//
+// 三种情形（均为 2026-09-18 实测上游 /v3/config 的真实形态）：
+//
+//	有 supportedEfforts       → 列出档位（12 国服 / 12 国际版）
+//	只有 effort/defaultEffort → 支持思考但只有固定一档（18 国服 / 8 国际版）
+//	两者都无                  → 才是真的不支持思考，不下发
+func TestModelReasoningFieldsThreeStates(t *testing.T) {
+	// ---- A. 有可选档位 ----
+	a := modelReasoningFields([]string{"low", "high"}, "high")
+	if a == nil {
+		t.Fatal("有档位时必须下发字段")
+	}
+	if list, ok := a["supported_efforts"].([]string); !ok || len(list) != 2 {
+		t.Errorf("应下发 2 个档位，实际 %#v", a["supported_efforts"])
+	}
+	if a["reasoning_fixed"] != false {
+		t.Errorf("有可选档位时 reasoning_fixed 应为 false，实际 %#v", a["reasoning_fixed"])
+	}
+	if a["default_effort"] != "high" {
+		t.Errorf("默认档应为 high，实际 %#v", a["default_effort"])
+	}
+
+	// ---- B. 只有固定档：**这是本缺陷的核心** ----
+	// 真实形态：reasoning={"effort":"high","summary":"auto"}，无 supportedEfforts。
+	b := modelReasoningFields(nil, "high")
+	if b == nil {
+		t.Fatal("只有固定档时必须下发字段 —— 返回 nil 会让界面显示「—」，" +
+			"用户以为该模型不能思考（这正是所有者报的缺陷）")
+	}
+	if b["reasoning_fixed"] != true {
+		t.Errorf("固定档应标 reasoning_fixed=true，实际 %#v", b["reasoning_fixed"])
+	}
+	if b["supports_reasoning"] != true {
+		t.Errorf("固定档也是「支持思考」，supports_reasoning 应为 true，实际 %#v", b["supports_reasoning"])
+	}
+	if b["default_effort"] != "high" {
+		t.Errorf("固定档必须下发它是哪一档，实际 %#v", b["default_effort"])
+	}
+	// 可选项为空 —— 不能伪造一个 ["high"] 的单元素列表：
+	// 那会让客户端渲染出「只有一个选项的下拉框」，暗示可以选择。
+	if list, ok := b["supported_efforts"].([]string); !ok || len(list) != 0 {
+		t.Errorf("固定档的可选档位应为**空列表**（区别于字段缺失），实际 %#v", b["supported_efforts"])
+	}
+
+	// ---- C. 完全无思考信息：不下发 ----
+	if got := modelReasoningFields(nil, ""); got != nil {
+		t.Errorf("无档位且无默认档时应返回 nil，实际 %#v", got)
 	}
 	if got := modelReasoningFields([]string{}, ""); got != nil {
-		t.Errorf("空切片应返回 nil，实际 %#v", got)
+		t.Errorf("空切片且无默认档应返回 nil，实际 %#v", got)
+	}
+
+	// ---- D. 默认档是 defaultEffort 拼写时同样成立 ----
+	// 上游 12 个多档模型用的是 `defaultEffort` 键（见 ModelInfo.DefaultEffort），
+	// upstream 层合并后这里拿到的是同一个值，行为不该因拼写而变。
+	d := modelReasoningFields([]string{"low", "high", "max"}, "max")
+	if d["default_effort"] != "max" {
+		t.Errorf("defaultEffort 拼写应同样生效，实际 %#v", d["default_effort"])
 	}
 }
 

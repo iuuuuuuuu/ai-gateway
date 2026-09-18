@@ -205,11 +205,26 @@ type regionCapability struct {
 	// 与 SupportsImages 同一套「宁可不写也不编造」的语义：编造的档位会被客户端
 	// 拿去发请求，而它要么被上游降级、要么被忽略，用户看到的是「调了没生效」。
 	Efforts []string
-	// DefaultEffort 该区域上游声明的默认思考档（reasoning.effort，空=未声明）。
+	// DefaultEffort 该区域上游声明的默认思考档（空=未声明）。
 	//
 	// 与 Efforts 正交：Efforts 答「允许哪些」，本字段答「不指定时用哪档」。
 	// 上游未保证默认档一定在 Efforts 里，故两者分别保存、分别下发。
+	//
+	// 上游用**两个键**表达它：reasoning.defaultEffort（带 supportedEfforts 的
+	// 12 个模型）与 reasoning.effort（不带的 18/8 个）。实测两者互斥，
+	// upstream 层已合并，这里只存合并后的结果。
 	DefaultEffort string
+	// SupportsReasoning 上游声明的思考能力（nil = 未声明，**不是** false）。
+	//
+	// 用途：区分「只有固定档」（Efforts 空但 DefaultEffort 有值）与真正的
+	// 「不支持思考」。早先只按 Efforts 是否为空判断，把前者误判成后者 ——
+	// 18 个（国服）/ 8 个（国际版）模型因此在界面上显示成「—」。
+	SupportsReasoning *bool
+	// CanDisableThinking 是否允许关闭思考（reasoning.canDisableThinking）。
+	//
+	// nil = 未声明。实测多档模型都显式给了它；为 false 时**不能传 off**，
+	// 客户端据此把「关闭思考」选项置灰，而不是发一个必然被拒的请求。
+	CanDisableThinking *bool
 	// CreditMultiplier 该区域上游声明的**计费倍率**（nil = 未声明）。
 	//
 	// 为什么按区域存而不是按模型名存：同名模型在两区可能是不同的后端、
@@ -233,6 +248,70 @@ type capabilityIndex struct {
 	// knownRegion 该区域的清单是否来自**真实拉取**（而非静态兜底）。
 	// 静态兜底表是手抄的、可能过期，用它做「不存在」判断会误伤。
 	knownRegion map[auth.Region]bool
+	// gapReason 该区域**没有真值**的原因（面向用户的中文短语，可拼进提示文案）。
+	//
+	// 只在 knownRegion[region]==false 时设置。分开记是因为「为什么没有真值」
+	// 直接决定用户该做什么：没有账号要去启用/同步账号，账号都在冷却要等，
+	// 拉取失败要稍后重试。三者若都说成「未知」，用户只能干瞪眼。
+	gapReason map[auth.Region]string
+}
+
+// regionExplain 一个模型名在**区域维度**上的已知与未知。
+//
+// 为什么必须把「已知」与「未知」分开存，而不是只留一个 supported 列表 ——
+// 这两件事对用户的含义完全不同：
+//
+//	另一区**有真值且清单里没有它** → 「仅某区存在」（可以断言，用户该换模型）
+//	另一区**压根没有真值**         → 只能说「未检测到该区账号，无法确认」
+//	                                 （用户该去补/启用那个区的账号）
+//
+// 所有者反馈的正是后者被说成了前者。完整根因链（逐层可核）：
+//
+//	① 账号库里 6 个国际版账号全部 disabled=true（实测 accounts.json：
+//	   14 个国服 disabled=false + 6 个国际版 disabled=true）；
+//	② 宿主导出凭证到网关目录时**跳过了禁用账号**，于是那份目录里一个
+//	   `.ai` 域名都没有（实测 gateway_auths/ 共 14 个文件，域名全是
+//	   copilot.tencent.com / www.codebuddy.cn）;
+//	③ 网关账号池是**扫描该目录**建立的 → 池里没有国际版账号；
+//	④ pickProbeAccountInRegion(RegionIntl) 返回 nil（它刻意不跨区回退）
+//	   → 拉不到国际版清单 → knownRegion[intl] = false；
+//	⑤ capabilityFieldsFor 只看到 supported=[cn] 一个元素，于是下发
+//	   supported_regions=["cn"]，`regionNote` 便说「该模型名仅在国服上游存在」。
+//
+// 而事实是「你没有可用的国际版账号，所以看不到国际版真值」。
+// **「没拉到」不等于「不存在」** —— 两者对用户是相反的行动指引：
+// 前者要去补账号，后者只能换模型。故这里把结论与原因一并带出。
+type regionExplain struct {
+	// supported 有真值、且确实列出了该模型的区域（静态兜底表不算，见 FromStatic）。
+	supported []string
+	// unverified 本轮**没有真值**的区域及其原因。
+	unverified []regionGap
+}
+
+// regionGap 一个「没有真值」的区域及其原因。
+type regionGap struct {
+	// code 区域码（"cn" / "intl"），与 supported_regions 同一套取值。
+	code string
+	// why 面向用户的原因短语（见 capabilityIndex.gapReason）。
+	why string
+}
+
+// regionCodes 区域码常量。
+//
+// 与 auth.Region.String() 同值：下发字段与 auth 包必须用同一套拼写，
+// 否则前端要认两套码（历史上 region 字段就因拼写不一致出过错）。
+const (
+	regionCodeCN   = "cn"
+	regionCodeIntl = "intl"
+)
+
+// regionByCode 把区域码还原成 auth.Region（未知码按国服处理，与 auth 的
+// 「domain 缺失按国服」保持同一套保守口径）。
+func regionByCode(code string) auth.Region {
+	if code == regionCodeIntl {
+		return auth.RegionIntl
+	}
+	return auth.RegionCN
 }
 
 // buildCapabilityIndex 汇总各区域的能力真值。
@@ -254,6 +333,7 @@ func (h *Handler) buildCapabilityIndex() *capabilityIndex {
 	idx := &capabilityIndex{
 		byRegion:    map[auth.Region]map[string]regionCapability{},
 		knownRegion: map[auth.Region]bool{},
+		gapReason:   map[auth.Region]string{},
 	}
 	add := func(region auth.Region, infos []upstream.ModelInfo, dynamic bool) {
 		m := idx.byRegion[region]
@@ -282,6 +362,9 @@ func (h *Handler) buildCapabilityIndex() *capabilityIndex {
 				//（手抄表里没有 reasoning 信息，编一个会让客户端调了没生效）。
 				Efforts:       mi.Efforts,
 				DefaultEffort: mi.DefaultEffort,
+				// 思考能力三态一并透传，供区分「固定档」与「不支持思考」。
+				SupportsReasoning:  mi.SupportsReasoning,
+				CanDisableThinking: mi.CanDisableThinking,
 				// 计费倍率：动态路径透传上游真值；静态兜底表**不编造**
 				//（手抄表里没有 credits，且 infosFromStatic 造不出倍率）。
 				// 未声明保持 nil，由消费方显示「不知道」而不是「免费」。
@@ -299,9 +382,29 @@ func (h *Handler) buildCapabilityIndex() *capabilityIndex {
 			idx.knownRegion[region] = true
 			continue
 		}
+		// 没有真值：记下**原因**，供 capabilityFieldsFor 生成准确文案。
+		// 顺序即优先级：先排除「池里没有该区账号」（最需要用户动手），
+		// 再区分「有账号但这次没拉到」（稍后重试即可）。
+		idx.gapReason[region] = h.regionGapReason(region)
 		add(region, infosFromStatic(static), false)
 	}
 	return idx
+}
+
+// regionGapReason 说明「该区域为什么没有真值」，返回面向用户的中文短语。
+//
+// 为什么要分三种原因而不是统一说「未知」：它们对应的**用户动作完全不同** ——
+// 没有账号要去启用/同步账号（这是所有者实际遇到的那种），有账号但拉取失败
+// 只需稍后重试，账号都在冷却则要等冷却到期。混成一句「未知」，
+// 用户既不知道该做什么，也不知道这是不是自己造成的。
+func (h *Handler) regionGapReason(region auth.Region) string {
+	if h.pickProbeAccountInRegion(region) == nil {
+		// 该区域一个可用账号都没有。**必须与「拉取失败」区分开** ——
+		// 这是唯一一种「用户自己能修好」的成因，也是所有者本次遇到的。
+		return "账号池里没有" + regionLabel(region.String()) + "的可用账号"
+	}
+	// 有账号，但这次没拉到清单：负缓存期内或上游失败。
+	return regionLabel(region.String()) + "账号清单本次未拉到"
 }
 
 // infosFromStatic 把静态表条目转成 ModelInfo（仅用于国服兜底路径）。
@@ -450,20 +553,14 @@ func (h *Handler) mergedModelList() []map[string]any {
 // 但**区域归属仍要透出**：supported_regions 让客户端/用户知道该模型名只在
 // 某一侧上游存在，出现 11102 model service info not found 时能立刻明白原因
 // （而不是怀疑模型名拼错）。
+//
+// 区域说明**分两种**（见 regionFields）：确知另一区没有（region_note），
+// 与另一区没有真值、无从确认（unverified_regions + unverified_note）。
+// 这两件事的文案绝不可混用 —— 前者是断言，后者只能说「没检查过」。
 func (idx *capabilityIndex) capabilityFieldsFor(id string) map[string]any {
 	cn, cnKnown := idx.lookupRegion(id, auth.RegionCN)
 	intl, intlKnown := idx.lookupRegion(id, auth.RegionIntl)
 
-	// supported 只收「该区域有**真值**且确实列出该模型」的区域 ——
-	// 静态兜底表不算。否则守则会因手抄表过期而误报「国际版没有 glm-5.3」，
-	// 让客户端以为它不可用（实测踩过这个坑，见 regionCapability.FromStatic）。
-	var supported []string
-	if cnKnown && cn.Present && !cn.FromStatic {
-		supported = append(supported, "cn")
-	}
-	if intlKnown && intl.Present && !intl.FromStatic {
-		supported = append(supported, "intl")
-	}
 	// 能力本身仍可用静态兜底的条目（比「没有」强），但**只取有真值的那一侧**；
 	// 两侧都没真值时退回静态值，只是不附 region 说明。
 	var cap regionCapability
@@ -493,28 +590,112 @@ func (idx *capabilityIndex) capabilityFieldsFor(id string) map[string]any {
 	for k, v := range reasoning {
 		fields[k] = v
 	}
-	if len(supported) == 1 {
-		// 只在**真值确认**单区可用时附带说明。字段名用 snake_case 与本响应里
-		// 其它字段（input_modalities、context_length）一致；已知解析器只取
-		// 自己认识的键，多余键不会报错。
-		fields["supported_regions"] = supported
-		fields["region_note"] = regionNote(supported[0])
+	// canDisableThinking 只在**确知**时下发（nil = 上游未声明，不能编造）。
+	// 它决定客户端是否允许选「关闭思考」—— 为 false 时传 off 会被上游拒绝。
+	if cap.CanDisableThinking != nil {
+		fields["can_disable_thinking"] = *cap.CanDisableThinking
+		fields["canDisableThinking"] = *cap.CanDisableThinking
+	}
+	for k, v := range idx.regionFields(id) {
+		fields[k] = v
 	}
 	return fields
 }
 
-// regionNote 生成面向用户的区域说明（客户端不读时至少人能看到）。
-func regionNote(region string) string {
-	other := "国际版"
-	if region == "intl" {
-		other = "国服"
+// regionFields 生成「区域维度」的字段：supported_regions / region_note /
+// unverified_regions / unverified_note。
+//
+// 三种情形**必须分开表达**（这正是所有者反馈的那个缺陷）：
+//
+//	A. 两区都有真值且都列出它 → 不下发任何区域字段（无需说明）
+//	B. 一区有真值并列出它，另一区**有真值但清单里没有** → supported_regions +
+//	   regionNote：「仅某区存在」。此时 11102 的成因是**模型确实不在那一侧**，
+//	   用户可以据此换模型 —— 现状是对的，保留。
+//	C. 一区有真值并列出它，另一区**压根没有真值**（无可用账号 / 拉取失败）→
+//	   **不能说「仅某区存在」**。改发 unverified_regions + unverifiedNote：
+//	   「未检测到另一区账号，无法确认该区是否有此模型」。
+//	   两个字段都发是刻意的：supported_regions 保留「目前只见于这一侧」这个
+//	   已知事实（信息不为清爽而丢），unverified_regions 明确标出它是**未验证**的，
+//	   前端据此用不同措辞与不同徽标（不能与 B 长得一样）。
+func (idx *capabilityIndex) regionFields(id string) map[string]any {
+	cn, cnKnown := idx.lookupRegion(id, auth.RegionCN)
+	intl, intlKnown := idx.lookupRegion(id, auth.RegionIntl)
+
+	// 有真值、且确实列出该模型的区域（静态表不算，见 FromStatic）。
+	var supported []string
+	if cnKnown && cn.Present && !cn.FromStatic {
+		supported = append(supported, regionCodeCN)
 	}
+	if intlKnown && intl.Present && !intl.FromStatic {
+		supported = append(supported, regionCodeIntl)
+	}
+	// 只关心「只见于单一区域」的情形；两区都有或都没有都不附区域说明。
+	if len(supported) != 1 {
+		return nil
+	}
+
+	// 另一侧是否真的被排除过。knownRegion[region] 表示该区清单来自真实拉取。
+	other := regionCodeCN
+	if supported[0] == regionCodeCN {
+		other = regionCodeIntl
+	}
+	otherRegion := regionByCode(other)
+	if !idx.knownRegion[otherRegion] {
+		// C 情形：另一侧没有真值 —— 结论只能是「没检查过」，不是「不存在」。
+		why := idx.gapReason[otherRegion]
+		if why == "" {
+			why = regionLabel(other) + "的模型清单本次未拉到"
+		}
+		return map[string]any{
+			"supported_regions": []string{supported[0]},
+			"unverified_regions": []string{other},
+			"region_note":       unverifiedNote(supported[0], other, why),
+		}
+	}
+	// B 情形：另一侧有真值且清单里确实没有它 —— 可以断言。
+	return map[string]any{
+		"supported_regions": []string{supported[0]},
+		"region_note":       regionNote(supported[0]),
+	}
+}
+
+// regionNote 生成「已确认另一区没有该模型」的说明。
+//
+// 措辞里的「仅在X上游存在」与 11102 都只在**确知另一区没有**时成立，
+// 故本函数只由 regionFields 的 B 情形调用。未验证的情形走 unverifiedNote。
+func regionNote(region string) string {
+	other := regionLabel(otherRegionCode(region))
 	return "该模型名仅在" + regionLabel(region) + "上游存在；账号池里的" +
 		other + "账号调用它会返回 11102 model service info not found。"
 }
 
+// unverifiedNote 生成「另一区未检测到账号 / 未拉到清单，故无法确认」的说明。
+//
+// 为什么必须与 regionNote 分开：那句「仅在X上游存在」是**断言**，
+// 在没有另一区真值时它是编造结论，会把用户引向「换模型」；
+// 而真实可行动作是「去启用/补一个该区账号」。所有者反馈的正是这个偏差。
+func unverifiedNote(region, other, why string) string {
+	return "已确认" + regionLabel(region) + "上游有此模型；但" +
+		regionLabel(other) + "未检测到可用真值（" + why + "），" +
+		"因此**无法确认**" + regionLabel(other) + "是否也有它 —— " +
+		"这不等于该模型" + regionLabel(other) + "没有。" +
+		"补齐" + regionLabel(other) + "账号后刷新即可确认。"
+}
+
+// otherRegionCode 返回另一个区域的码。
+func otherRegionCode(region string) string {
+	if region == regionCodeIntl {
+		return regionCodeCN
+	}
+	return regionCodeIntl
+}
+
+// regionLabel 把**区域码**翻译成中文名（"intl" → 国际版，其余 → 国服）。
+//
+// 入参是码而不是 auth.Region：调用点既有码也有 Region，统一收码可以少一层
+// 转换（auth.Region.String() 产出的正是同一套码）。
 func regionLabel(r string) string {
-	if r == "intl" {
+	if r == regionCodeIntl {
 		return "国际版"
 	}
 	return "国服"
@@ -595,10 +776,66 @@ func modelCapabilityFields(supportsImages *bool) map[string]any {
 //
 // 默认档只在 defaultEffort 非空时下发。**不要**用 efforts[0] 之类的猜测填充：
 // 上游没声明默认档时，网关也不知道，编一个反而误导。
+// modelReasoningFields 生成某模型的思考档位字段。
+//
+// **三种情形必须分开表达**（2026-09-18 实测修正，所有者报的就是这个缺陷）：
+//
+//	A. supportedEfforts 非空        → 列出可指定档位（+ 默认档）
+//	B. supportedEfforts 为空，但有默认档 → **支持思考、但只有固定一档**，
+//	   下发 reasoning_fixed=true / default_effort / supports_reasoning=true
+//	C. 两者都无且 supportsReasoning 未声明 → 才是真的「不支持思考」，不下发
+//
+// 早先这里只判 `len(efforts)==0 → return nil`，把 B 与 C 混成一种，于是
+// 18 个（国服）/ 8 个（国际版）**有思考能力、只是不能选档**的模型在界面上
+// 显示成「—」，用户以为它们不能思考。
+//
+// 实测依据（真实流式调用，同一账号）：
+//
+//	多档模型 hy3（supportedEfforts=["low","high"]）：
+//	    low/high → 接受；未声明的档 → 上游拒绝 → 档位是**真限制**
+//	固定档模型 auto（只有 effort="high"，无 supportedEfforts）：
+//	    off/low/medium/high → **全部接受** → 它不是「不能思考」，
+//	    而是「没有声明可选档位」，默认走 high
+//
+// 所以 B 必须如实下发「有思考能力 + 默认档是哪个」，只标记它不可选档。
 func modelReasoningFields(efforts []string, defaultEffort string) map[string]any {
-	if len(efforts) == 0 {
+	defaultEffort = strings.TrimSpace(defaultEffort)
+
+	// 情形 C：既没有档位数组，也没有默认档 → 上游没声明任何思考信息。
+	// 不下发字段（宁可不写，也不要谎报成「不支持」）。
+	if len(efforts) == 0 && defaultEffort == "" {
 		return nil
 	}
+
+	// 情形 B：只有固定档，没有可选档位数组。
+	if len(efforts) == 0 {
+		nested := map[string]any{
+			// 固定档也是「支持思考」——客户端据此显示思考能力，
+			// 只是不能让它选（可选项应为空，而不是伪造一个单元素列表，
+			// 那会让客户端渲染出一个「只有一个选项的下拉框」）。
+			"supports_reasoning": true,
+			"supportsReasoning":  true,
+			"fixed":              true,
+			"default_effort":     defaultEffort,
+		}
+		return map[string]any{
+			// 显式 false 而不是省略：客户端要能区分「不可选档」与「字段缺失」。
+			"reasoning_fixed":     true,
+			"reasoningFixed":      true,
+			"supports_reasoning":  true,
+			"supportsReasoning":   true,
+			"default_effort":      defaultEffort,
+			"defaultEffort":       defaultEffort,
+			"default_reasoning_effort": defaultEffort,
+			// 空列表：明确「没有可选项」，与「不支持思考」由 reasoning_fixed 区分。
+			"supported_efforts":  []string{},
+			"supportedEfforts":   []string{},
+			"reasoning":          nested,
+		}
+	}
+
+	// 情形 A：有可选档位。
+	//
 	// 复制一份：efforts 来自按区域的模型缓存（regionCapability.Efforts），
 	// 是共享切片。直接塞进响应 map 会让调用方对返回值的任何 in-place 修改
 	// 污染缓存 —— 下次请求就会带着被改过的档位列表。
@@ -615,12 +852,17 @@ func modelReasoningFields(efforts []string, defaultEffort string) map[string]any
 		"reasoningEfforts":  list,
 		// OpenRouter 风格：嵌套在 reasoning 对象下。
 		"reasoning": nested,
+		// 有可选档位 ⇒ 支持思考，且**不是**固定档。
+		"supports_reasoning": true,
+		"supportsReasoning":  true,
+		"reasoning_fixed":    false,
+		"reasoningFixed":     false,
 	}
-	if d := strings.TrimSpace(defaultEffort); d != "" {
-		nested["default_effort"] = d
-		out["default_effort"] = d
-		out["defaultEffort"] = d
-		out["default_reasoning_effort"] = d
+	if defaultEffort != "" {
+		nested["default_effort"] = defaultEffort
+		out["default_effort"] = defaultEffort
+		out["defaultEffort"] = defaultEffort
+		out["default_reasoning_effort"] = defaultEffort
 	}
 	return out
 }

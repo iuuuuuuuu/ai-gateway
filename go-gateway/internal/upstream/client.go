@@ -1063,15 +1063,42 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 type ModelInfo struct {
 	ID            string
 	Name          string
-	ContextWindow int64    // = maxInputTokens
-	MaxTokens     int64    // = maxOutputTokens
-	Efforts       []string // reasoning.supportedEfforts（空=未知/固定档）
-	// DefaultEffort 上游给的默认思考档 = reasoning.effort（空=未声明）。
+	ContextWindow int64 // = maxInputTokens
+	MaxTokens     int64 // = maxOutputTokens
+	// Efforts 该模型**允许指定**的思考档 = reasoning.supportedEfforts。
 	//
-	// 与 Efforts 分开：Efforts 是「允许哪些档」，DefaultEffort 是「不指定时用哪档」。
-	// 上游同时给了两者，但默认档未必在 supportedEfforts 里（上游数据未保证），
-	// 因此**不要**用它去推断 Efforts，也**不要**用 Efforts[0] 去冒充它。
+	// 空表示上游没声明档位数组 —— **不等于「不支持思考」**，见 SupportsReasoning
+	// 与 DefaultEffort：实测存在「只有默认档、没有档位数组」的模型。
+	Efforts []string
+	// DefaultEffort 不指定 reasoning_effort 时上游使用的档位。
+	//
+	// 来源有**两个写法**，必须都读（2026-09-18 实测，国服 52 模型 + 国际版 22 模型）：
+	//
+	//	reasoning.defaultEffort  ← 12（国服）/ 12（国际版）
+	//	reasoning.effort         ← 18（国服）/ 8（国际版）
+	//
+	// 两者**互斥**：实测 0 个模型同时带这两个键。带 supportedEfforts 的模型
+	// 一律用 defaultEffort，不带的用 effort。所以它们不是两种含义，
+	// 而是同一个东西的两种拼写（推测随上游版本演进）。早先只读了 `effort`，
+	// 于是那 12 个多档模型的默认档永远读不到 —— 界面只能列出档位，
+	// 说不出「默认是哪一档」。
 	DefaultEffort string
+	// SupportsReasoning 上游声明的「该模型是否有思考能力」= supportsReasoning。
+	//
+	// nil = **未声明**（不是 false）。上游只给对话模型写这个字段，补全/图片
+	// 生成等条目整条缺失。三态语义与 SupportsImages 同理：把它当成 false 会让
+	// 客户端把本可用的思考能力关掉。
+	SupportsReasoning *bool
+	// OnlyReasoning 该模型是否**只能**以思考模式运行（onlyReasoning）。
+	//
+	// 实测：凡带 reasoning 对象的模型都是 true。它解释了 canDisableThinking
+	// 为 false 的模型为何不能传 off —— 即「思考不可关闭」。
+	OnlyReasoning *bool
+	// CanDisableThinking 是否允许关闭思考 = reasoning.canDisableThinking。
+	//
+	// nil = 未声明。实测 12 个多档模型都显式给了它（false 或 true），
+	// 而只有默认档的模型整条缺失 —— 与「它们能否传 off」正好对应。
+	CanDisableThinking *bool
 	// SupportsImages 是否接受图片输入。
 	//
 	// nil **不等于** false：上游 /v3/config 只给对话模型写 supportsImages，
@@ -1225,6 +1252,19 @@ func creditMultiplierOf(raw *string) *float64 {
 	return &value
 }
 
+// firstNonEmpty 返回第一个非空字符串（都空则空串）。
+//
+// 用途：上游把同一个语义写成两个键（如 reasoning.defaultEffort 与 reasoning.effort），
+// 实测互斥但写入顺序无保证；这里给出确定性的取值顺序。
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // creditsRawOf 取上游 `credits` 字段原文（字段缺失时为 ""，仅诊断用）。
 func creditsRawOf(raw *string) string {
 	if raw == nil {
@@ -1321,9 +1361,20 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 				// 「把该计费的算成免费」，与本缺陷反方向但同样错。
 				Credits *string `json:"credits"`
 				Reasoning          struct {
+					// effort 与 defaultEffort 是**同一个东西的两种拼写**：
+					// 实测 0 个模型同时带这两个键（带 supportedEfforts 的一律用
+					// defaultEffort，不带的用 effort），故两者都读，见 DefaultEffort。
 					Effort           string   `json:"effort"`
+					DefaultEffort    string   `json:"defaultEffort"`
 					SupportedEfforts []string `json:"supportedEfforts"`
+					// canDisableThinking 是否允许关闭思考。用指针保留三态：
+					// 实测「只有默认档」的模型整条缺失该字段，缺失 ≠ false。
+					CanDisableThinking *bool `json:"canDisableThinking"`
 				} `json:"reasoning"`
+				// supportsReasoning / onlyReasoning 是 reasoning 对象**之外**的
+				// 兄弟字段（早期误以为在 reasoning 里）。指针保留三态。
+				SupportsReasoning *bool `json:"supportsReasoning"`
+				OnlyReasoning     *bool `json:"onlyReasoning"`
 			} `json:"models"`
 			Agents []struct {
 				Name   string   `json:"name"`
@@ -1357,8 +1408,15 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			ContextWindow: m.MaxInputTokens,
 			MaxTokens:     m.MaxOutputTokens,
 			Efforts:       m.Reasoning.SupportedEfforts,
-			// 默认档接上原先被丢弃的 reasoning.effort（此前解析进来却全树无消费方）。
-			DefaultEffort: m.Reasoning.Effort,
+			// 默认档：两个写法都读，defaultEffort 优先。
+			//
+			// 二者实测互斥（0 个模型同时有），所以「优先」只是防御上游将来
+			// 同时下发时的确定性选择，不代表它们会冲突。
+			DefaultEffort: firstNonEmpty(m.Reasoning.DefaultEffort, m.Reasoning.Effort),
+			// 思考能力三态：透传上游声明，缺失保持 nil（未声明 ≠ 不支持）。
+			SupportsReasoning:  m.SupportsReasoning,
+			OnlyReasoning:      m.OnlyReasoning,
+			CanDisableThinking: m.Reasoning.CanDisableThinking,
 			// 账号级多模态开关为 true 时强制降级为 false：上游语义是
 			// 「即便模型本身支持，该账号也不许用图片」，此时不能宣称支持。
 			SupportsImages: effectiveSupportsImages(m.SupportsImages, m.DisabledMultimodal),

@@ -156,15 +156,31 @@ export function ModelCapabilityRow({
                     真出现「已知但没条目」的坏数据时渲染成空的档位行，
                     而不是抛异常把整页带崩。
                   */}
-                  {(efforts.items ?? []).map((effort) => (
+                  {/*
+                    **有 items 才逐档渲染；没有则回落到 text。**
+                    固定单档模型（支持思考但不可选档）的 items 是**空数组**，
+                    只渲染 items 会让单元格变成空白 —— 用户看到的是一个
+                    什么都没有的档位行（实测踩过：断言读到 text 为 ""）。
+                    它的 text 是「固定 high」这类说明，必须显示出来。
+                  */}
+                  {(efforts.items ?? []).length > 0 ? (
+                    (efforts.items ?? []).map((effort) => (
+                      <span
+                        key={effort}
+                        data-slot="model-capability-effort"
+                        className="rounded bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] text-foreground"
+                      >
+                        {effort}
+                      </span>
+                    ))
+                  ) : (
                     <span
-                      key={effort}
-                      data-slot="model-capability-effort"
-                      className="rounded bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] text-foreground"
+                      data-slot="model-capability-effort-fixed"
+                      className="rounded border border-border/70 bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground"
                     >
-                      {effort}
+                      {efforts.text}
                     </span>
-                  ))}
+                  )}
                 </span>
               </TooltipTrigger>
               <TooltipContent className="max-w-xs text-[11px] leading-relaxed">

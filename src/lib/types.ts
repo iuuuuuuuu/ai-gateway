@@ -899,7 +899,23 @@ export interface GatewayPoolAccount {
   cooling?: boolean;
   cool_kind?: string;
   cool_remaining_sec?: number;
+  /**
+   * 网关判定该账号已不可用（连续 3 次 session 死 / 额度冻结）。
+   *
+   * 与 `no_route` 是**两件事**，必须分开看：
+   *   disabled → 该号已死，**养号任务也会跳过它**（跑了也白跑）
+   *   no_route → 用户手动关的，**养号任务照跑**，只是不接请求
+   * 早先两者在前端都显示成「已禁用」，用户无法判断账号还在不在养。
+   */
   disabled?: boolean;
+  /**
+   * 用户手动标记「不接流量」（Go 侧 `pool.Status.NoRoute`）。
+   *
+   * 来自凭证里的 `account.no_route`（宿主导出时按账号库的禁用标记写入）。
+   * 语义：**只不接流量，养号照跑** —— 这正是「禁用」对用户应有的含义。
+   * 凭证仍然存在于网关池里，所以签到/活跃上报/成长任务都能遍历到它。
+   */
+  no_route?: boolean;
   reason?: string;
   success_count?: number;
   err_total?: number;
@@ -1270,6 +1286,26 @@ export interface GatewayModelItem {
     input_modalities?: string[];
     modality?: string;
   };
+  /**
+   * 该模型**支持思考**（上游声明；缺失 = 未声明，**不是** false）。
+   *
+   * 与 supported_efforts 正交：固定单档模型这里是 true 但没有可选档位。
+   * 界面用它把「固定档」与「不支持思考」分开（后者不该显示成「—」）。
+   */
+  supports_reasoning?: boolean;
+  supportsReasoning?: boolean;
+  /**
+   * 该模型是**固定单档**：支持思考但不能选档（网关在无 supportedEfforts
+   * 但有默认档时下发）。
+   *
+   * 显式 true/false 而不是靠「档位数组为空」推断 —— 后者会把
+   * 「固定档」与「未声明」混成一种，正是所有者报的那个缺陷。
+   */
+  reasoning_fixed?: boolean;
+  reasoningFixed?: boolean;
+  /** 是否允许关闭思考。false 时不能传 off（上游会拒）。 */
+  can_disable_thinking?: boolean;
+  canDisableThinking?: boolean;
   /** 支持的思考档位（主拼写）。缺失或空数组 = 未声明。 */
   supported_efforts?: string[];
   supportedEfforts?: string[];
@@ -1278,6 +1314,9 @@ export interface GatewayModelItem {
   reasoning?: {
     supported_efforts?: string[];
     default_effort?: string;
+    /** OpenRouter 风格的固定档标记（与顶层 reasoning_fixed 同义）。 */
+    fixed?: boolean;
+    supports_reasoning?: boolean;
   };
   /** 默认思考档（缺失 = 未声明；**不要**用档位列表首项猜）。 */
   default_effort?: string;

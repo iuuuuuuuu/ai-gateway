@@ -270,31 +270,104 @@ export function visionDisplay(model: GatewayModelItem): CapabilityDisplay {
 }
 
 /**
+ * 该模型是否被网关标记为**固定单档**（有思考能力，但不能选档）。
+ *
+ * 网关在 `reasoning_fixed` 里下发（见 capability.go 的 modelReasoningFields）。
+ * 与「未声明」区分：那时字段缺失，这里是显式 true。
+ */
+export function reasoningFixedOf(model: GatewayModelItem): boolean | undefined {
+  const r = model.reasoning as { fixed?: unknown } | undefined;
+  return firstDefined<boolean>(
+    typeof model.reasoning_fixed === "boolean" ? model.reasoning_fixed : undefined,
+    typeof model.reasoningFixed === "boolean" ? model.reasoningFixed : undefined,
+    typeof r?.fixed === "boolean" ? r.fixed : undefined,
+  );
+}
+
+/**
+ * 该模型是否**支持思考**（上游声明的能力，与「能否选档」正交）。
+ *
+ * 网关只在确知时下发（缺失 = 未声明）。用途是把「固定单档」与
+ * 「不支持思考」分开 —— 前者 supports_reasoning=true 但没有可选档位。
+ */
+export function supportsReasoningOf(model: GatewayModelItem): boolean | undefined {
+  const r = model.reasoning as { supports_reasoning?: unknown } | undefined;
+  return firstDefined<boolean>(
+    typeof model.supports_reasoning === "boolean" ? model.supports_reasoning : undefined,
+    typeof model.supportsReasoning === "boolean" ? model.supportsReasoning : undefined,
+    typeof r?.supports_reasoning === "boolean" ? r.supports_reasoning : undefined,
+  );
+}
+
+/**
+ * 是否允许关闭思考（`can_disable_thinking`）。false 时不能传 off。
+ *
+ * 上游为 false 的模型传 `off` 会被拒；界面据此把「关闭思考」置灰，
+ * 而不是让用户发一个必然失败的请求。
+ */
+export function canDisableThinkingOf(model: GatewayModelItem): boolean | undefined {
+  return firstDefined<boolean>(
+    typeof model.can_disable_thinking === "boolean" ? model.can_disable_thinking : undefined,
+    typeof model.canDisableThinking === "boolean" ? model.canDisableThinking : undefined,
+  );
+}
+
+/**
  * 思考档位展示态。
  *
- * **列出全部档位名**（所有者明确要求「信息不能为了清爽而丢」）：
+ * **三态必须分开**（所有者报过「国服还是国际服都是有思考档位的，你这里数据不对吧」）：
+ *
+ *	A. 有可选档位 → 列出全部档位名
+ *	B. 固定单档   → 显示「固定 <档位>」+ Tooltip 说明「有思考能力、不能选档」
+ *	C. 未声明     → 「—」+ 说明「上游未声明，不代表没有」
+ *
+ * 早先把 B 与 C 混成一种（都显示「—」），于是 18 个（国服）/ 8 个（国际版）
+ * **确实有思考能力**的模型被显示成「无档位」—— 那是在编造否定结论。
+ *
+ * 列出全部档位名是所有者明确要求（「信息不能为了清爽而丢」）：
  * 只显示「支持 3 档」会把用户真正要选的 max 藏起来。
- * 未知时是「—」，不是「无档位」—— 后者是确定的否定。
  */
 export function effortsDisplay(model: GatewayModelItem): CapabilityDisplay {
   const efforts = effortsOf(model);
+  const def = defaultEffortOf(model);
+
+  // ---- B. 固定单档：有思考能力，但不能选 ----
+  // 判据优先看网关的显式标记；supportsReasoning 为真时同样成立
+  //（任一为真即可，避免某条路径漏下发标记时又退回「—」）。
+  const fixed =
+    reasoningFixedOf(model) === true || (supportsReasoningOf(model) === true && !efforts?.length);
+  if ((!efforts || efforts.length === 0) && fixed) {
+    const shown = def || "未声明";
+    const label = def && EFFORT_LABELS[def.toLowerCase()] ? `（${effortLabel(def)}）` : "";
+    return {
+      text: `固定 ${shown}`,
+      title:
+        `该模型**支持思考**，但上游没有提供可选档位 —— 无法手动切换。` +
+        (def ? `固定使用 ${def}${label}。` : "") +
+        `这不是「不支持思考」，只是档位不可选。`,
+      unknown: false,
+      items: [],
+    };
+  }
+
   if (!efforts) {
     return {
       text: UNKNOWN_TEXT,
-      title: "上游未声明思考档位（固定档模型或网关无真值时都不下发），不代表没有档位",
+      title: "上游未声明思考档位（未下发任何 reasoning 字段），不代表没有档位",
       unknown: true,
     };
   }
-  const def = defaultEffortOf(model);
   // 显示用**上游原始档位名**（`low`/`high`/`max`）：它是用户真正要写进配置、
   // 也是网关降级逻辑实际比对的值（见 upstream/payload.go 的
   // normalizeReasoningEffort），翻译成中文会让「照着界面上写」写错。
   // 中文含义放 Tooltip 里补充，两者都不丢。
   const known = efforts.filter((e) => EFFORT_LABELS[e.toLowerCase()] !== undefined);
+  const cannotDisable = canDisableThinkingOf(model) === false;
   const title =
     `支持 ${efforts.length} 档：${efforts.join(" / ")}` +
     (known.length > 0 ? `（${known.map(effortLabel).join(" / ")}）` : "") +
-    (def ? ` · 未指定时默认 ${def}` : "");
+    (def ? ` · 未指定时默认 ${def}` : "") +
+    (cannotDisable ? " · 该模型不能关闭思考（不支持 off）" : "");
   return { text: efforts.join(" / "), title, unknown: false, items: efforts };
 }
 
@@ -341,7 +414,15 @@ export function summarizeCapabilities(models: GatewayModelItem[]): CapabilitySum
   let singleRegion = 0;
   for (const m of models) {
     if (visionOf(m) !== undefined) visionKnown++;
-    if (effortsOf(m)) effortsKnown++;
+    // 「档位已知」必须按**展示态**判定，不能只看 effortsOf。
+    //
+    // 固定单档模型（支持思考但不可选档）的 effortsOf 是 undefined，
+    // 而它的档位是**确知**的、界面也照实显示「固定 high」。
+    // 只看 effortsOf 会把它算进「未知」，于是：
+    //   ① 计数偏小，「思考档位 2/5」而实际显示「固定 high」的模型被漏算；
+    //   ② 与界面自相矛盾 —— 卡片写着「固定 high」，概览却说它未声明。
+    // 判据与 effortsDisplay 保持一致（unknown=false 即已知）。
+    if (!effortsDisplay(m).unknown) effortsKnown++;
     if (contextWindowOf(m) !== undefined) contextKnown++;
     if (regionsOf(m).length === 1) singleRegion++;
   }

@@ -203,6 +203,10 @@ func TestActivityStreakZeroWarns(t *testing.T) {
 }
 
 // TestActivitySkipsDisabledAccounts 禁用账号不参与上报。
+//
+// 注意这里的「禁用」是 `Pool.Disable` —— 即**网关自己判定**的禁用
+//（连续 3 次 12153 session 死 / 额度冻结）。那种账号跑了也白跑，该跳过。
+// 与之相对的是用户手动禁用（auth.NoRoute），那个**仍要跑**，见下一个用例。
 func TestActivitySkipsDisabledAccounts(t *testing.T) {
 	rec := &activityRecorder{streak: 1}
 	s := newActivityScheduler(t, rec, 1,
@@ -217,6 +221,41 @@ func TestActivitySkipsDisabledAccounts(t *testing.T) {
 		if ev["userId"] == "u2" {
 			t.Error("被禁用的账号不应参与活跃上报")
 		}
+	}
+}
+
+// TestActivityStillRunsForNoRouteAccounts 用户手动禁用的账号**仍参与养号**。
+//
+// 所有者报过的真实缺陷：6 个被手动禁用的账号完全不参与任何养号任务。
+// 根因是宿主「禁用就不导出凭证」→ 账号不在网关池 → 任务遍历不到。
+//
+// 修正后：宿主导出时带 `no_route` 标记（凭证仍在），网关只在**选号**时排除它，
+// 养号任务照跑。本用例锁住「任务侧不因 no_route 跳过」这一半 ——
+// 另一半（选号侧确实排除）由 pool 的 TestNoRouteAccountIsNeverPicked 覆盖。
+//
+// 若哪天有人图省事把 no_route 并进 entry.disabled，或又在任务循环里加了
+// `if a.NoRoute { continue }`，本用例会立刻失败。
+func TestActivityStillRunsForNoRouteAccounts(t *testing.T) {
+	rec := &activityRecorder{streak: 1}
+	s := newActivityScheduler(t, rec, 1,
+		&auth.Auth{UID: "normal", AccessToken: "tok"},
+		&auth.Auth{UID: "blocked", AccessToken: "tok", NoRoute: true},
+	)
+
+	s.RunActivityNow()
+
+	seen := map[string]bool{}
+	for _, ev := range rec.snapshot() {
+		if uid, ok := ev["userId"].(string); ok {
+			seen[uid] = true
+		}
+	}
+	if !seen["normal"] {
+		t.Error("普通账号应参与上报")
+	}
+	if !seen["blocked"] {
+		t.Error("no_route 账号**仍应参与养号**（禁用只表示不接流量）—— " +
+			"若这里失败，说明「禁用即停养号」的缺陷又回来了")
 	}
 }
 
