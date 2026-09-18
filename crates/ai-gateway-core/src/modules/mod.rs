@@ -32,6 +32,12 @@ pub mod model_billing;
 pub mod oauth;
 pub mod official_usage;
 pub mod process;
+// Qoder（QoderWork）：账号库。凭证由 Go 侧 internal/qoder 管理（COSY 签名
+// 需要机器指纹与 dt/drt 令牌），宿主只存界面需要的元信息。
+pub mod qoder_account;
+// Qoder 登录编排：调 `gateway qoder-login url|poll` 两个子命令。
+// 协议实现（COSY 签名 / PKCE 设备流）只在 Go 侧有一份，经真实上游验证。
+pub mod qoder_login;
 pub mod refresh;
 pub mod rotate;
 // Windows 计划任务（Trae 签到 / 豆包保活 / 额度巡检）

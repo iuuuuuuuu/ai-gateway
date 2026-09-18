@@ -305,6 +305,15 @@ pub fn run() {
             commands_apps::task_register,
             commands_apps::task_unregister,
             commands_apps::task_run_now,
+            // ---- Qoder（QoderWork）：账号元信息 + 登录编排 ----
+            // 凭证与签名在 Go 侧 internal/qoder；这一层只编排
+            commands_apps::qoder_list_accounts,
+            commands_apps::qoder_save_account,
+            commands_apps::qoder_delete_account,
+            commands_apps::qoder_login_start,
+            commands_apps::qoder_login_poll,
+            commands_apps::qoder_import_credentials,
+            commands_apps::qoder_summary,
             // ---- 本地 MITM 代理（设备身份隔离 + 凭证抓取） ----
             commands_proxy::proxy_config,
             commands_proxy::proxy_status,

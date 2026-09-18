@@ -16,6 +16,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/qoder"
 	"workbuddy2api/internal/records"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
@@ -26,6 +27,18 @@ import (
 )
 
 func main() {
+	// 子命令：宿主（Tauri）通过 `gateway qoder-login ...` 完成 Qoder 的设备流登录。
+	//
+	// 为什么走子命令而不是 HTTP 接口：登录属于**配置阶段**的事，
+	// 而网关可能因为配置不完整还没启动 —— 子命令无此依赖，更可靠。
+	// 放在 flag.Parse 之前拦截，避免与网关自身的 -config 等参数冲突。
+	if len(os.Args) > 1 && os.Args[1] == "qoder-login" {
+		// 凭证目录的默认值与网关配置一致（~/.wb-switch/qoder/auths），
+		// 这样宿主不传 --auth-dir 时也能落到正确位置。
+		defaultAuthDir := qoder.DefaultAuthDir()
+		os.Exit(qoder.RunLoginCLI(os.Args[2:], defaultAuthDir))
+	}
+
 	cfgPath := flag.String("config", "config.json", "path to config json")
 	flag.Parse()
 

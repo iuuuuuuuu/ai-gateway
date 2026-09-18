@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use ai_gateway_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits, export_import,
-    oauth, process, refresh, rotate, session, switch, token_stats, travel, update,
+    oauth, process, qoder_account, qoder_login, refresh, rotate, session, switch, token_stats, travel, update,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
@@ -145,6 +145,16 @@ pub fn router() -> Router {
             "/api/update/config",
             get(api_update_config).post(api_save_update_config),
         )
+        // ---- Qoder（QoderWork）：账号元信息 + 登录编排 ----
+        // 凭证与 COSY 签名在 Go 侧 internal/qoder；这里只做编排。
+        // 有这些路由，dev 模式（浏览器）下 Qoder 页才可用。
+        .route("/api/qoder/accounts", get(api_qoder_list_accounts))
+        .route("/api/qoder/accounts/save", post(api_qoder_save_account))
+        .route("/api/qoder/accounts/delete", post(api_qoder_delete_account))
+        .route("/api/qoder/summary", get(api_qoder_summary))
+        .route("/api/qoder/login/start", post(api_qoder_login_start))
+        .route("/api/qoder/login/poll", post(api_qoder_login_poll))
+        .route("/api/qoder/import", post(api_qoder_import))
         .fallback(static_handler)
 }
 
@@ -207,6 +217,105 @@ async fn api_set_account_note(Json(body): Json<Value>) -> Response {
     match account::set_account_note(id, note) {
         Ok(acc) => json_ok(json!({ "ok": true, "account": account::account_meta(&acc) })),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Qoder（QoderWork）
+// ---------------------------------------------------------------------------
+//
+// 与 Tauri 命令层一一对应（commands_apps.rs 的 qoder_* 系列）。
+// 两者都只做编排：凭证与 COSY 签名在 Go 侧 internal/qoder。
+//
+// 为什么 HTTP 形态也要有：dev 模式（浏览器预览）走的是 HTTP，
+// 缺这些路由会让 Qoder 页在 dev 下整页 404 —— 而 dev 正是迭代最快的路径。
+
+/// GET /api/qoder/accounts
+async fn api_qoder_list_accounts() -> Response {
+    match tokio::task::spawn_blocking(qoder_account::list_with_credentials).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("读取 Qoder 账号失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// GET /api/qoder/summary
+async fn api_qoder_summary() -> Response {
+    match tokio::task::spawn_blocking(|| qoder_account::summary()).await {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(format!("读取 Qoder 概览失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/qoder/accounts/save —— body: `{ "uid": "...", "patch": {...} }`
+async fn api_qoder_save_account(Json(body): Json<Value>) -> Response {
+    let uid = body
+        .get("uid")
+        .or_else(|| body.get("userId"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if uid.trim().is_empty() {
+        return json_err("缺少账号 uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let patch = body.get("patch").cloned().unwrap_or_else(|| json!({}));
+    match tokio::task::spawn_blocking(move || qoder_account::upsert_account(&uid, &patch)).await {
+        Ok(Ok(acc)) => json_ok(json!({ "ok": true, "account": acc.to_view() })),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("保存 Qoder 账号失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/qoder/accounts/delete —— body: `{ "uid": "..." }`
+async fn api_qoder_delete_account(Json(body): Json<Value>) -> Response {
+    let uid = body
+        .get("uid")
+        .or_else(|| body.get("userId"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if uid.trim().is_empty() {
+        return json_err("缺少账号 uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+    match tokio::task::spawn_blocking(move || qoder_account::delete_account(&uid)).await {
+        Ok(Ok(removed)) => json_ok(json!({ "ok": removed })),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("删除 Qoder 账号失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/qoder/login/start —— body: `{ "region": "cn" | "intl" }`
+async fn api_qoder_login_start(Json(body): Json<Value>) -> Response {
+    let region = body.get("region").and_then(Value::as_str).unwrap_or("").to_string();
+    match tokio::task::spawn_blocking(move || qoder_login::login_start(&region)).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("发起 Qoder 登录失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/qoder/login/poll —— body: `{ "sessionId": "..." }`
+async fn api_qoder_login_poll(Json(body): Json<Value>) -> Response {
+    let sid = body
+        .get("sessionId")
+        .or_else(|| body.get("session_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    match tokio::task::spawn_blocking(move || qoder_login::login_poll(&sid)).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("轮询 Qoder 登录失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/qoder/import —— body: `{ "path": "..." }`
+async fn api_qoder_import(Json(body): Json<Value>) -> Response {
+    let path = body.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+    match tokio::task::spawn_blocking(move || qoder_login::import_credentials(&path)).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("导入 Qoder 凭证失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 

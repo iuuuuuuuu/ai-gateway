@@ -225,6 +225,15 @@ const ROUTES: Record<string, Route> = {
   task_unregister: { method: "POST", path: "/api/tasks/unregister" },
   task_run_now: { method: "POST", path: "/api/tasks/run" },
   save_app_settings: { method: "POST", path: "/api/apps/settings" },
+  // ---- Qoder（QoderWork）----
+  // 凭证与 COSY 签名在 Go 侧 internal/qoder；这一层只编排账号元信息与登录。
+  qoder_list_accounts: { method: "GET", path: "/api/qoder/accounts" },
+  qoder_save_account: { method: "POST", path: "/api/qoder/accounts/save" },
+  qoder_delete_account: { method: "POST", path: "/api/qoder/accounts/delete" },
+  qoder_summary: { method: "GET", path: "/api/qoder/summary" },
+  qoder_login_start: { method: "POST", path: "/api/qoder/login/start" },
+  qoder_login_poll: { method: "POST", path: "/api/qoder/login/poll" },
+  qoder_import_credentials: { method: "POST", path: "/api/qoder/import" },
 };
 
 function queryString(args?: Record<string, unknown>): string {
@@ -1192,6 +1201,104 @@ export function traeAddAccount(args: {
 /** 删除 Trae 账号。 */
 export function traeDeleteAccount(userId: string): Promise<{ ok: boolean }> {
   return call<{ ok: boolean }>("trae_delete_account", { userId });
+}
+
+// ---------------------------------------------------------------------------
+// Qoder（QoderWork）
+// ---------------------------------------------------------------------------
+
+/** Qoder 账号区域。空串 = 未指定（不猜，让用户自己选）。 */
+export type QoderRegion = "cn" | "intl" | "";
+
+/** Qoder 账号元信息。 */
+export interface QoderAccount {
+  uid: string;
+  nickname: string;
+  /** 用户自己填的备注。 */
+  note: string;
+  region: QoderRegion;
+  /** 用户手动禁用：只不接流量。 */
+  disabled: boolean;
+  createdAt: string;
+  lastSeenAt: string;
+  /** 剩余额度；0 = 未知。 */
+  credits: number;
+  creditsTotal: number;
+  /** 最近到期时刻（Unix 秒）；0 = 未知。 */
+  expireAt: number;
+}
+
+/** 列表项：账号 + 凭证是否存在。 */
+export interface QoderAccountRow extends QoderAccount {
+  /** 凭证文件在不在。为 false 时界面提示「需重新登录」。 */
+  hasCredential: boolean;
+}
+
+export interface QoderSummary {
+  total: number;
+  enabled: number;
+  disabled: number;
+  withCredits: number;
+  totalCredits: number;
+  authDir: string;
+  storeDir: string;
+}
+
+/** Qoder 账号列表。 */
+export function qoderListAccounts(): Promise<{
+  accounts: QoderAccountRow[];
+  /** 有凭证但没登记进账号库的 uid（导入后未登记）。 */
+  orphanCredentials: string[];
+  summary: QoderSummary;
+}> {
+  return call("qoder_list_accounts");
+}
+
+/** 新增/更新 Qoder 账号（局部更新：只覆盖传入的字段）。 */
+export function qoderSaveAccount(
+  uid: string,
+  patch: Partial<Pick<QoderAccount, "nickname" | "note" | "region" | "disabled" | "credits" | "creditsTotal" | "expireAt">>,
+): Promise<{ ok: boolean; account: QoderAccount }> {
+  return call("qoder_save_account", { uid, patch });
+}
+
+/** 删除 Qoder 账号（连同凭证文件）。 */
+export function qoderDeleteAccount(uid: string): Promise<{ ok: boolean }> {
+  return call("qoder_delete_account", { uid });
+}
+
+/** Qoder 账号库概览。 */
+export function qoderSummary(): Promise<QoderSummary> {
+  return call("qoder_summary");
+}
+
+/** 发起 Qoder 登录，返回授权链接与会话标识。 */
+export function qoderLoginStart(region: Exclude<QoderRegion, "">): Promise<{
+  authUrl: string;
+  sessionId: string;
+  region: QoderRegion;
+}> {
+  return call("qoder_login_start", { region });
+}
+
+/** 轮询一次登录结果。 */
+export function qoderLoginPoll(sessionId: string): Promise<
+  | { status: "pending" }
+  | { status: "ok"; uid: string; account: QoderAccount }
+> {
+  return call("qoder_login_poll", { sessionId });
+}
+
+/** 导入已有凭证（单个文件或目录）。 */
+export interface QoderImportResult {
+  imported: Array<{ file: string; uid: string; region: QoderRegion }>;
+  failed: Array<{ file: string; error: string }>;
+  importedCount: number;
+  failedCount: number;
+}
+
+export function qoderImportCredentials(path: string): Promise<QoderImportResult> {
+  return call<QoderImportResult>("qoder_import_credentials", { path });
 }
 
 /** 本机发现到的 Trae 账号候选。 */

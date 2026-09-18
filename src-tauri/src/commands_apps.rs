@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 
 use ai_gateway_core::modules::{
     app_profile::{profile_for, TargetApp},
-    config, doubao_account, doubao_chats, doubao_quota, doubao_session, scheduler, switcher,
-    trae_account, trae_checkin, trae_device, trae_discover,
+    config, doubao_account, doubao_chats, doubao_quota, doubao_session, qoder_account, qoder_login,
+    scheduler, switcher, trae_account, trae_checkin, trae_device, trae_discover,
 };
 
 // ---------------------------------------------------------------------------
@@ -864,4 +864,77 @@ pub async fn task_run_now(kind: String) -> Result<Value, String> {
     })
     .await
     .map_err(|e| format!("执行任务失败: {e}"))?
+}
+
+// ---------------------------------------------------------------------------
+// Qoder（QoderWork）
+// ---------------------------------------------------------------------------
+//
+// 凭证管理（COSY 签名 / 令牌刷新）在 Go 侧 internal/qoder 实现并已通过
+// 真实上游验证；宿主这一层只做**账号元信息**与**登录编排**。
+
+/// Qoder 账号列表（含凭证存在性）。
+#[tauri::command]
+pub async fn qoder_list_accounts() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(qoder_account::list_with_credentials)
+        .await
+        .map_err(|e| format!("读取 Qoder 账号失败: {e}"))?
+}
+
+/// 新增/更新 Qoder 账号（局部更新：只覆盖传入的字段）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_save_account(uid: String, patch: Value) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let acc = qoder_account::upsert_account(&uid, &patch)?;
+        Ok(json!({ "ok": true, "account": acc.to_view() }))
+    })
+    .await
+    .map_err(|e| format!("保存 Qoder 账号失败: {e}"))?
+}
+
+/// 删除 Qoder 账号（连同凭证文件）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_delete_account(uid: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let removed = qoder_account::delete_account(&uid)?;
+        Ok(json!({ "ok": removed }))
+    })
+    .await
+    .map_err(|e| format!("删除 Qoder 账号失败: {e}"))?
+}
+
+/// 发起 Qoder 登录，返回授权链接与会话标识。
+///
+/// 会跑子进程（调 gateway qoder-login url），故放 blocking 线程。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_login_start(region: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || qoder_login::login_start(&region))
+        .await
+        .map_err(|e| format!("发起 Qoder 登录失败: {e}"))?
+}
+
+/// 轮询一次登录结果（pending / ok / 错误）。
+///
+/// 会跑子进程并可能发网络请求，故放 blocking 线程。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_login_poll(session_id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || qoder_login::login_poll(&session_id))
+        .await
+        .map_err(|e| format!("轮询 Qoder 登录失败: {e}"))?
+}
+
+/// 导入已有凭证（单个文件或目录）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_import_credentials(path: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || qoder_login::import_credentials(&path))
+        .await
+        .map_err(|e| format!("导入 Qoder 凭证失败: {e}"))?
+}
+
+/// Qoder 账号库概览（供界面顶部展示）。
+#[tauri::command]
+pub async fn qoder_summary() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| Ok(qoder_account::summary()))
+        .await
+        .map_err(|e| format!("读取 Qoder 概览失败: {e}"))?
 }
