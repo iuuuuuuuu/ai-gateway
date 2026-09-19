@@ -622,7 +622,7 @@ func TestPlatformUsesNodeNaming(t *testing.T) {
 	}
 }
 
-// TestClassifyQuotaBeatsRateLimit 额度不足必须**先于** 429 判定。
+// TestClassifyQuotaBeatsRateLimit 资源包/额度信号必须**先于** 429 判定。
 //
 // ## 为什么这条很重要
 //
@@ -632,17 +632,35 @@ func TestPlatformUsesNodeNaming(t *testing.T) {
 //
 // 上游用 **429** 同时表示"限流"与"余额不足"两种完全不同的情况。
 // 若先按状态码判，会得到 ErrRateLimited → 界面提示"请求过于频繁，请稍后重试"
-// —— 用户会一直重试，而正确动作是**去充值**。
+// —— 用户会一直重试，而正确动作是去处理资源包。
 //
 // 这类"错误分类错了"的 bug 很隐蔽：请求确实失败了，日志也记录了，
 // 但给用户的**行动指引是错的**。
+//
+// ## 2026-09-19 修正：1113 细分为 `ErrNoResourcePack`
+//
+// 此前 1113 判成 `ErrQuotaExhausted`（"额度已耗尽，请充值"）。
+// 但实测发现**同一个账号**：
+//
+//	billing/balance → GLM-5.3-Flash 有 3 亿 token，几乎未用（299999978）
+//	coding/paas/v4  → 429 1113「余额不足或无可用资源包」
+//
+// 即"额度"与"资源包"在**不同通道**上。报"额度已耗尽"会让用户去充值，
+// 而他的额度就在那儿 —— 这正是所有者被误导的那次。
+//
+// 故细分：措辞改成"这条通道上没有可用资源包"，并**不提充值**。
 func TestClassifyQuotaBeatsRateLimit(t *testing.T) {
 	// 实测的真实响应
 	body := `{"error":{"code":"1113","message":"余额不足或无可用资源包,请充值。"}}`
 	kind := Classify(429, body)
-	if kind != ErrQuotaExhausted {
-		t.Errorf("1113 + HTTP 429 应判为额度耗尽，实际 %q —— "+
-			"若判成限流，用户会一直重试而不是去充值", kind)
+	if kind != ErrNoResourcePack {
+		t.Errorf("1113 + HTTP 429 应判为「无可用资源包」，实际 %q —— "+
+			"若判成限流，用户会一直重试；若判成「额度耗尽」，用户会去充值，"+
+			"而实测该账号额度充足（3 亿几乎未用），充值解决不了", kind)
+	}
+	// 它**不该**被当成额度耗尽（那是最容易误判成的一个）
+	if kind == ErrQuotaExhausted {
+		t.Error("1113 不应判为 ErrQuotaExhausted —— 那会误导用户去充值")
 	}
 
 	// 真的限流（429 但没有业务码）仍应判为限流
@@ -651,8 +669,8 @@ func TestClassifyQuotaBeatsRateLimit(t *testing.T) {
 	}
 
 	// 中文文案兜底（上游有时不给数字码）
-	if k := Classify(429, `{"error":{"message":"余额不足，请充值"}}`); k != ErrQuotaExhausted {
-		t.Errorf("中文「余额不足」文案应判为额度耗尽，实际 %q", k)
+	if k := Classify(429, `{"error":{"message":"余额不足，请充值"}}`); k != ErrNoResourcePack {
+		t.Errorf("中文「余额不足」文案应判为「无可用资源包」，实际 %q", k)
 	}
 }
 

@@ -74,6 +74,36 @@ const (
 	// 混在一起报会让用户白充钱。
 	ErrPlanRequired ErrKind = "plan_required"
 
+	// ErrNoResourcePack 该账号**在这条通道上没有可用资源包**（上游 429 + 1113）。
+	//
+	// ## 为什么必须与"额度耗尽"分开（所有者实测踩到的误导）
+	//
+	// 上游原文：
+	//
+	//	HTTP 429 rate_limit_error [1113][余额不足或无可用资源包,请充值。]
+	//
+	// 我们此前把这类 429 一律归类成 `ErrQuotaExhausted`，界面上就说
+	// 「账号额度已耗尽：请为该账号充值」。
+	//
+	// **但实测矛盾**：同一个账号的额度查询（`billing/balance`）明明显示
+	// GLM-5.3-Flash 有 3 亿 token、几乎没动用（remaining=299999978）。
+	//
+	// 原因：**额度与资源包在不同通道上**。
+	//
+	//	billing/balance     → zcode.z.ai 的 zcode-plan 通道（能看到额度）
+	//	coding/paas/v4      → 另一条通道（这 1113 是从这条回的）
+	//
+	// 所以"额度耗尽"是**错的诊断** —— 用户会去充值，而他的额度就在那儿。
+	// 真实原因是这条通道上没有可用资源包（客户端自己把它标成
+	// `systemDisabledReason = "coding_plan_not_entitled"`，与此吻合）。
+	//
+	// 处置也不同：
+	//
+	//	ErrQuotaExhausted → 充值 / 等额度恢复
+	//	ErrNoResourcePack → 换通道（start-plan）或换一个有资格的账号；
+	//	                    充值**不一定**有用
+	ErrNoResourcePack ErrKind = "no_resource_pack"
+
 	// ErrCaptchaRequired 该操作需要**人机验证码**（上游 3007）。
 	//
 	// 实测：`/api/v1/zcode-plan/...` 对话通道回
@@ -160,6 +190,17 @@ func (e *Error) FriendlyMessage() string {
 	case ErrQuotaExhausted:
 		// 点明"要去充值"，而不是"稍后重试" —— 后者会让用户白等
 		return "ZCode 账号额度已耗尽，请为该账号充值或更换账号（上游：" + e.Msg + "）"
+	case ErrNoResourcePack:
+		// ⚠ 这段文案**刻意不提"充值"**。实测该账号的 billing/balance
+		// 显示额度充足（3 亿 token 几乎未用），而这条通道回 1113 ——
+		// 说明问题在"这条通道没有可用资源包"，不在额度。
+		//
+		// 提"充值"会把用户引向一个解决不了问题的方向（我此前就是这么
+		// 误导他的）。
+		return "该 ZCode 账号在**这条通道上没有可用资源包**（上游：" + e.Msg + "）。" +
+			"注意这**不一定是额度不足** —— 实测有账号额度查询显示数亿 token、几乎未用，" +
+			"却仍回这个错，因为额度与资源包在不同通道上。" +
+			"建议改用其他账号，或先在 ZCode 官方客户端里确认该账号的套餐资格。"
 	case ErrModelNotFound:
 		// 最常见的原因是**模型名大小写**（上游严格区分）——
 		// 不点明的话，用户会以为"上游不支持这个模型"
@@ -223,8 +264,16 @@ func Classify(status int, body string) ErrKind {
 		// 「认证失败」—— 凭证无效
 		return ErrAuthFailed
 	case CodeQuotaExhausted:
-		// 「余额不足或无可用资源包」—— 用户要去充值
-		return ErrQuotaExhausted
+		// 1113「余额不足或无可用资源包，请充值」
+		//
+		// ⚠ 归为 ErrNoResourcePack 而**不是** ErrQuotaExhausted。
+		// 实测（2026-09-19）：同一个账号的 billing/balance 显示
+		// GLM-5.3-Flash 有 3 亿 token、几乎没动，而 coding/paas/v4 通道
+		// 回这个 1113 —— 说明**额度与资源包在不同通道上**。
+		//
+		// 报"额度已耗尽"会让用户去充值，而他的额度就在那儿。故细分为
+		// "这条通道上没有可用资源包"，处置建议也不同（换通道/换账号）。
+		return ErrNoResourcePack
 	case CodeModelNotFound:
 		// 「模型不存在」—— 多半是模型名不对（上游大小写敏感）
 		return ErrModelNotFound
@@ -244,10 +293,13 @@ func Classify(status int, body string) ErrKind {
 	//
 	// 上游有时不给数字码，只给中文文案（"余额不足，请充值"），
 	// 而它配的仍是 429。若先按状态码判，会得到"限流"这个错误方向。
+	//
+	// ⚠ 归为 ErrNoResourcePack 而不是 ErrQuotaExhausted —— 理由同上：
+	// 实测有账号"额度充足但该通道无资源包"，报"额度耗尽"是误导。
 	lower := strings.ToLower(body)
 	if strings.Contains(body, "余额不足") || strings.Contains(body, "请充值") ||
-		strings.Contains(lower, "insufficient") || strings.Contains(lower, "quota") {
-		return ErrQuotaExhausted
+		strings.Contains(lower, "insufficient") {
+		return ErrNoResourcePack
 	}
 
 	// 4. HTTP 状态码兜底

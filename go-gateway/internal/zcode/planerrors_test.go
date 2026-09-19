@@ -74,7 +74,7 @@ func TestPlanAndCaptchaNotConfusedWithOtherKinds(t *testing.T) {
 		why    string
 	}{
 		{429, `{"error":{"code":"1113","message":"余额不足或无可用资源包,请充值。"}}`,
-			ErrQuotaExhausted, "1113 必须仍判额度耗尽（不能被 429 抢走）"},
+			ErrNoResourcePack, "1113 必须判「无可用资源包」（不能被 429 抢走成限流）"},
 		{403, `{"code":3101,"msg":"coding plan is required"}`,
 			ErrPlanRequired, "3101 不能被 403 吃成 provider_down"},
 		{400, `{"code":3007,"msg":"captcha verify failed"}`,
@@ -111,9 +111,13 @@ func TestPlanRequiredMessageDoesNotTellUserToRecharge(t *testing.T) {
 // 不是手写的理想 JSON —— 分类器要能处理真实形状。
 func TestClassifyRealResponseShapes(t *testing.T) {
 	// Anthropic 协议下的 1113（形状与 OpenAI 版不同）
+	//
+	// ⚠ 2026-09-19 修正：1113 归为 `ErrNoResourcePack` 而不是
+	// `ErrQuotaExhausted` —— 实测同一账号额度充足（3 亿几乎未用）却回 1113，
+	// 说明"额度"与"资源包"在不同通道上。报"额度耗尽"会误导用户去充值。
 	anthropicQuota := `{"type":"rate_limit_error","code":"1113","message":"[1113][余额不足或无可用资源包,请充值。][20260919110941daa9ea9cccf64197]"}`
-	if got := Classify(429, anthropicQuota); got != ErrQuotaExhausted {
-		t.Errorf("Anthropic 形状的 1113 应判额度耗尽，实际 %q", got)
+	if got := Classify(429, anthropicQuota); got != ErrNoResourcePack {
+		t.Errorf("Anthropic 形状的 1113 应判「无可用资源包」，实际 %q", got)
 	}
 
 	// 真实的 3101（补全请求头后才出现的码）
