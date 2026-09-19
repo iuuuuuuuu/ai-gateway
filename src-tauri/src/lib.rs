@@ -315,6 +315,7 @@ pub fn run() {
             commands_apps::qoder_import_credentials,
         commands_apps::qoder_import_from_client,
         commands_apps::qoder_refresh_account,
+        commands_apps::qoder_campaigns,
             commands_apps::qoder_summary,
             // ---- ZCode（Z.AI / 智谱）：账号元信息 + 凭证导入 + 登录编排 ----
             // 与 Qoder 的差异：ZCode 凭证是用户可复制的字符串，

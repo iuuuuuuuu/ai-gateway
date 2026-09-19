@@ -193,6 +193,12 @@ func RunLoginCLI(args []string, defaultAuthDir string) int {
 	case "models":
 		// 查该账号**实际可用**的模型清单（按账号，不是全局）。
 		return runModels(args[1:], defaultAuthDir)
+	case "campaigns":
+		// 查权益活动（「每天领 100 Credits」那类）。
+		//
+		// ⚠ **只读**。领取要阿里云验证码（服务端防滥用机制），
+		// 本 CLI 刻意不实现代领 —— 见 campaign.go 的说明。
+		return runCampaigns(args[1:], defaultAuthDir)
 	default:
 		fmt.Fprintf(os.Stderr, "未知子命令 %q（应为 url / poll / import-client）\n", sub)
 		return 2
@@ -300,6 +306,51 @@ func runModels(args []string, defaultAuthDir string) int {
 		"uid":    c.UID,
 		"count":  len(list),
 		"models": list,
+	})
+	return 0
+}
+
+// runCampaigns 查一个账号的权益活动并输出 JSON（**只读**）。
+//
+// 用法：`qoder-login campaigns --uid <uid> --auth-dir <dir>`
+//
+// 输出：`{"status":"ok","uid":...,"showCampaign":true,"claimable":true,
+//        "campaignUrl":"...","campaigns":[{...}]}`
+//
+// ⚠ 只查询、**不领取**。领取要阿里云验证码，见 campaign.go 的边界说明。
+func runCampaigns(args []string, defaultAuthDir string) int {
+	fs := flag.NewFlagSet("qoder-login campaigns", flag.ContinueOnError)
+	uid := fs.String("uid", "", "账号 uid")
+	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if strings.TrimSpace(*uid) == "" {
+		fmt.Fprintln(os.Stderr, "缺少 --uid 参数")
+		return 2
+	}
+
+	c, err := loadCredByUID(*authDir, *uid)
+	if err != nil {
+		writeJSON(map[string]any{"status": "error", "uid": *uid, "message": err.Error()})
+		return 0
+	}
+
+	cli := New()
+	st, err := cli.FetchCampaigns(context.Background(), c)
+	if err != nil {
+		writeJSON(map[string]any{"status": "error", "uid": c.UID, "message": err.Error()})
+		return 0
+	}
+
+	writeJSON(map[string]any{
+		"status":       "ok",
+		"uid":          c.UID,
+		"showCampaign": st.ShowCampaign,
+		"claimable":    st.Claimable,
+		"campaignUrl":  st.CampaignURL,
+		"campaigns":    st.Campaigns,
+		"count":        len(st.Campaigns),
 	})
 	return 0
 }

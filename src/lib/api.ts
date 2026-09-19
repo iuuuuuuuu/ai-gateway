@@ -247,6 +247,7 @@ const ROUTES: Record<string, Route> = {
   zcode_import_scanned: { method: "POST", path: "/api/zcode/import-scanned" },
   zcode_refresh_account: { method: "POST", path: "/api/zcode/refresh-account" },
   qoder_refresh_account: { method: "POST", path: "/api/qoder/refresh-account" },
+  qoder_campaigns: { method: "POST", path: "/api/qoder/campaigns" },
   zcode_login_start: { method: "POST", path: "/api/zcode/login/start" },
   zcode_login_poll: { method: "POST", path: "/api/zcode/login/poll" },
 };
@@ -1422,6 +1423,66 @@ export interface AccountModel {
 
 export function qoderRefreshAccount(uid: string): Promise<RefreshAccountResult> {
   return call<RefreshAccountResult>("qoder_refresh_account", { uid });
+}
+
+/**
+ * Qoder 的一条权益活动（「每天领 100 Credits」那类）。
+ *
+ * ## 字段语义（取自上游真实响应，见后端 campaign.go）
+ *
+ * `claimStatus`：
+ *   · `CLAIMABLE` —— 可领取（界面应高亮）
+ *   · `CLAIMED`   —— 已领取（不要显示成可领）
+ *   · 其它/空      —— 未知，按"不可领"处理更安全
+ *
+ * `actionType`：`CLAIM_BENEFIT`（要领取）/ `VIEW_DETAILS`（只看详情）
+ *
+ * `endAt` 是 Unix **秒**（不是毫秒）。当毫秒用会得到 1970 年。
+ */
+export interface QoderCampaign {
+  campaignId: string;
+  campaignKey: string;
+  actionType: "CLAIM_BENEFIT" | "VIEW_DETAILS" | string;
+  claimStatus: "CLAIMABLE" | "CLAIMED" | string;
+  /** Unix 秒。 */
+  startAt: number;
+  /** Unix 秒。 */
+  endAt: number;
+  benefit?: {
+    kind: string;
+    amount: number;
+    validity?: { mode: string; days: number };
+  };
+  placements?: Array<{
+    type: string;
+    campaignUrl: string;
+    content?: Record<string, { buttonText?: string; description?: string; detailUrl?: string }>;
+  }>;
+}
+
+export interface QoderCampaignsResult {
+  status: string;
+  uid: string;
+  /** 上游是否要展示活动入口。 */
+  showCampaign: boolean;
+  /** 是否有**可领取**的活动。 */
+  claimable: boolean;
+  /** 活动页（服务端渲染的 iframe 页面）。 */
+  campaignUrl: string;
+  count: number;
+  campaigns: QoderCampaign[];
+}
+
+/**
+ * 查询 Qoder 账号的权益活动。
+ *
+ * ## 只读，不代领
+ *
+ * 领取要阿里云验证码（服务端的防滥用机制），故本应用**不提供**领取
+ * 动作。界面只展示活动与倒计时，并把 `campaignUrl` 交给用户自己去打开。
+ */
+export function qoderCampaigns(uid: string): Promise<QoderCampaignsResult> {
+  return call<QoderCampaignsResult>("qoder_campaigns", { uid });
 }
 
 // ---------------------------------------------------------------------------

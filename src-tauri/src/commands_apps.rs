@@ -960,6 +960,17 @@ pub async fn qoder_refresh_account(uid: String) -> Result<Value, String> {
         .map_err(|e| format!("刷新 Qoder 账号信息失败: {e}"))?
 }
 
+/// 查询 Qoder 账号的权益活动（「每天领 100 Credits」那类）。
+///
+/// **只读** —— 刻意不提供领取接口：领取要阿里云验证码（服务端防滥用
+/// 机制）。界面展示活动与倒计时，并给出活动页地址让用户自己去领。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_campaigns(uid: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || qoder_login::fetch_campaigns(&uid))
+        .await
+        .map_err(|e| format!("查询 Qoder 权益活动失败: {e}"))?
+}
+
 /// Qoder 账号库概览（供界面顶部展示）。
 #[tauri::command]
 pub async fn qoder_summary() -> Result<Value, String> {

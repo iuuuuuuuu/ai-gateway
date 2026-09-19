@@ -305,6 +305,38 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
     }))
 }
 
+/// 查询账号的**权益活动**（Qoder 的「每天领 100 Credits」那类）。
+///
+/// # 只读，不代领
+///
+/// 领取要阿里云验证码（`X-Aliyun-Captcha-Verify-Param`）—— 那是服务端的
+/// 防滥用机制。本函数**只查询**并返回活动页地址，由用户自己去页面上点
+/// 「领取」。绕过验证码等于帮用户破坏服务端风控，**不做**。
+///
+/// # 这个功能为什么值得单独做
+///
+/// 活动是**限时**的（实测那条 `endAt` 只差 22 小时），且每天重置。
+/// 用户不知道就白白错过。所以界面上要能看到"有 N 个可领取"。
+pub fn fetch_campaigns(uid: &str) -> Result<Value, String> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        return Err("账号 uid 不能为空".into());
+    }
+    let auth_dir = qoder_account::auth_dir();
+    let auth_dir_s = auth_dir.to_string_lossy().to_string();
+
+    let r = run_login_cmd(&["campaigns", "--uid", uid, "--auth-dir", &auth_dir_s])?;
+
+    if r.get("status").and_then(Value::as_str) != Some("ok") {
+        return Err(r
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("查询权益活动失败")
+            .to_string());
+    }
+    Ok(r)
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         return s.to_string();

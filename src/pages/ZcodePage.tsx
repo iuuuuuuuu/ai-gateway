@@ -7,13 +7,12 @@ import {
   Globe,
   KeyRound,
   Loader2,
-  Pencil,
   RefreshCw,
   Search,
-  Trash2,
   Upload,
 } from "lucide-react";
 import { ZcodeMark } from "@/components/product-marks";
+import { ProductAccountCard, ProductAccountGrid } from "@/components/product-account-card";
 import { openInDefaultBrowser } from "@/lib/open-browser";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -32,7 +31,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
 import type { ZcodeAccountRow, ZcodeProvider, ZcodeSummary } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -606,214 +605,56 @@ export default function ZcodePage() {
                 )}
               </div>
             ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b text-left text-muted-foreground">
-                      <th className="py-2 pr-3 font-medium">账号</th>
-                      <th className="py-2 pr-3 font-medium">服务商</th>
-                      <th className="py-2 pr-3 font-medium">状态</th>
-                      <th className="py-2 pr-3 font-medium">额度</th>
-                      <th className="py-2 pr-3 font-medium">支持模型</th>
-                      <th className="py-2 pr-3 font-medium">到期</th>
-                      <th className="py-2 pr-3 font-medium">备注</th>
-                      <th className="py-2 text-right font-medium">操作</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {rows.map((row) => {
-                      const exp = expiryText(row.expireAt);
-                      return (
-                        <tr key={row.uid} className="border-b last:border-0">
-                          <td className="py-3 pr-3">
-                            {/* 头像 + 名称。
-                                使用者的反馈：「已授权后,也不显示头像,也不显示名称」。
-                                两者都来自客户端登录态（`oauth:*:user_info`），
-                                由「刷新」按钮拉到并落进账号库。 */}
-                            <div className="flex items-center gap-2.5">
-                              {row.avatarUrl ? (
-                                <img
-                                  src={row.avatarUrl}
-                                  alt=""
-                                  className="size-8 shrink-0 rounded-full object-cover"
-                                  // 头像加载失败（图床被墙/链接过期）时不留破图
-                                  onError={(e) => {
-                                    (e.currentTarget as HTMLImageElement).style.display = "none";
-                                  }}
-                                />
-                              ) : (
-                                <div className="flex size-8 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-semibold text-muted-foreground">
-                                  {(row.nickname || row.uid).charAt(0).toUpperCase()}
-                                </div>
-                              )}
-                              <div className="min-w-0">
-                                <div className="truncate font-medium">{row.nickname || "（未命名）"}</div>
-                                <div className="font-mono text-xs text-muted-foreground">
-                                  {row.uid.slice(0, 16)}
-                                </div>
-                              </div>
-                            </div>
-                          </td>
-                          <td className="py-3 pr-3">
-                            <Badge variant={providerVariant(row.provider)}>
-                              {providerLabel(row.provider)}
-                            </Badge>
-                          </td>
-                          <td className="py-3 pr-3">
-                            {!row.hasCredential ? (
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Badge variant="destructive">凭证缺失</Badge>
-                                </TooltipTrigger>
-                                <TooltipContent>
-                                  凭证文件不存在，该账号在网关里已不可用，需重新导入
-                                </TooltipContent>
-                              </Tooltip>
-                            ) : row.disabled ? (
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Badge variant="outline">已停用</Badge>
-                                </TooltipTrigger>
-                                <TooltipContent>不参与网关选号；凭证与额度信息仍然保留</TooltipContent>
-                              </Tooltip>
-                            ) : (
-                              <Badge variant="secondary">正常</Badge>
-                            )}
-                          </td>
-                          <td className="py-3 pr-3 tabular-nums">
-                            {row.credits > 0 ? (
-                              <>
-                                {row.credits.toLocaleString()}
-                                {row.creditsTotal > 0 && (
-                                  <span className="text-muted-foreground">
-                                    {" / "}
-                                    {row.creditsTotal.toLocaleString()}
-                                  </span>
-                                )}
-                              </>
-                            ) : (
-                              // 额度未知显示"未知"而不是 0 —— 0 会被误读成"额度耗尽"
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <span className="cursor-help text-muted-foreground underline decoration-dotted">
-                                    未知
-                                  </span>
-                                </TooltipTrigger>
-                                <TooltipContent className="max-w-xs">
-                                  尚未查询到额度。点该行的
-                                  <span className="mx-1 font-medium">刷新</span>
-                                  按钮可立即查询。
-                                </TooltipContent>
-                              </Tooltip>
-                            )}
-                          </td>
-                          {/* 支持模型：该账号**实际可用**的模型（刷新账号时查得）。
-                              此前没有这一列，用户看不到自己能调哪些模型。 */}
-                          <td className="max-w-[16rem] py-3 pr-3">
-                            {row.models && row.models.length > 0 ? (
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <span className="cursor-help text-muted-foreground">
-                                    {row.models.length} 个
-                                  </span>
-                                </TooltipTrigger>
-                                <TooltipContent className="max-w-sm">
-                                  <div className="font-medium">可用模型</div>
-                                  <div className="mt-1 font-mono text-xs">
-                                    {row.models.join("、")}
-                                  </div>
-                                </TooltipContent>
-                              </Tooltip>
-                            ) : (
-                              <span className="text-muted-foreground">—</span>
-                            )}
-                          </td>
-                          <td className={cn("py-3 pr-3", exp.urgent && "text-amber-600")}>{exp.text}</td>
-                          <td className="max-w-[14rem] truncate py-3 pr-3 text-muted-foreground">
-                            {row.note || "—"}
-                          </td>
-                          <td className="py-3 text-right">
-                            <div className="flex justify-end gap-1">
-                              {/* 刷新额度 / 到期 / 支持模型。
-                                  没有这个入口时，后端那三个查询**没有任何
-                                  调用者** —— 用户永远看到"额度未知"。 */}
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    disabled={busy === `refresh:${row.uid}`}
-                                    aria-label={`刷新额度与模型：${row.nickname || row.uid}`}
-                                    onClick={() => void refreshAccount(row)}
-                                  >
-                                    <RefreshCw
-                                      className={cn(
-                                        "h-4 w-4",
-                                        busy === `refresh:${row.uid}` && "animate-spin",
-                                      )}
-                                    />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent>刷新额度、到期与支持模型</TooltipContent>
-                              </Tooltip>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    // 图标按钮**必须**有可访问名：Tooltip 的内容要悬停
-                                    // 才进 DOM，屏幕阅读器（与自动化测试）都拿不到。
-                                    aria-label={`编辑备注：${row.nickname || row.uid}`}
-                                    onClick={() => {
-                                      setEditTarget(row);
-                                      setEditNote(row.note);
-                                    }}
-                                  >
-                                    <Pencil className="h-4 w-4" />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent>编辑备注</TooltipContent>
-                              </Tooltip>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    disabled={busy === row.uid}
-                                    aria-label={`${row.disabled ? "恢复参与路由" : "停止接流量"}：${row.nickname || row.uid}`}
-                                    onClick={() => void toggleDisabled(row)}
-                                  >
-                                    {row.disabled ? (
-                                      <CheckCircle2 className="h-4 w-4" />
-                                    ) : (
-                                      <AlertTriangle className="h-4 w-4" />
-                                    )}
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent>{row.disabled ? "恢复参与路由" : "停止接流量"}</TooltipContent>
-                              </Tooltip>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    disabled={busy === row.uid}
-                                    aria-label={`删除账号：${row.nickname || row.uid}`}
-                                    onClick={() => void remove(row)}
-                                  >
-                                    <Trash2 className="h-4 w-4 text-destructive" />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent>删除账号（含凭证）</TooltipContent>
-                              </Tooltip>
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
+              /* 卡片布局（对齐 WorkBuddy 账号页）。
+                 此前这里是 `<table>` —— 三者形态不一致，且窄屏下会横向溢出。
+                 所有者的要求：「ZCODE和Qoder和Workbuddy采用一样的卡片布局」。 */
+              <ProductAccountGrid>
+                {rows.map((row) => {
+                  const exp = expiryText(row.expireAt);
+                  const creditsText =
+                    row.credits > 0
+                      ? row.creditsTotal > 0
+                        ? `${row.credits.toLocaleString()} / ${row.creditsTotal.toLocaleString()}`
+                        : row.credits.toLocaleString()
+                      : undefined;
+                  return (
+                    <ProductAccountCard
+                      key={row.uid}
+                      mark={(size) => <ZcodeMark size={size} />}
+                      busyKey={
+                        busy === `refresh:${row.uid}`
+                          ? "refresh"
+                          : busy === row.uid
+                            ? "toggle"
+                            : busy === `delete:${row.uid}`
+                              ? "delete"
+                              : null
+                      }
+                      data={{
+                        uid: row.uid,
+                        nickname: row.nickname,
+                        note: row.note,
+                        avatarUrl: row.avatarUrl,
+                        creditsText,
+                        expiryText: exp.text,
+                        expiryUrgent: exp.urgent,
+                        models: row.models,
+                        hasCredential: row.hasCredential,
+                        disabled: row.disabled,
+                        variantLabel: providerLabel(row.provider),
+                        variantKind: providerVariant(row.provider),
+                      }}
+                      onRefresh={() => void refreshAccount(row)}
+                      onEditNote={() => {
+                        setEditTarget(row);
+                        setEditNote(row.note);
+                      }}
+                      onToggleDisabled={() => void toggleDisabled(row)}
+                      onDelete={() => void remove(row)}
+                    />
+                  );
+                })}
+              </ProductAccountGrid>
             )}
           </CardContent>
         </Card>

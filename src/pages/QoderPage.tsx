@@ -3,16 +3,17 @@ import { toast } from "sonner";
 import {
   AlertTriangle,
   CheckCircle2,
+  Clock3,
   Download,
   ExternalLink,
+  Gift,
   Globe,
   Loader2,
-  Pencil,
   RefreshCw,
-  Trash2,
   Upload,
 } from "lucide-react";
 import { QoderMark } from "@/components/product-marks";
+import { ProductAccountCard, ProductAccountGrid } from "@/components/product-account-card";
 import { openInDefaultBrowser } from "@/lib/open-browser";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -30,7 +31,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
 import type { QoderAccountRow, QoderRegion, QoderSummary } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -83,6 +84,26 @@ function expiryText(expireAt: number): { text: string; urgent: boolean } {
   return { text: date, urgent: false };
 }
 
+/**
+ * 把剩余毫秒格式化成倒计时（`22:25:46`）。
+ *
+ * 用于权益活动的"还剩多久可领" —— 活动是**限时**的，用户需要看到
+ * 时间在走才会去领。超过 24 小时时显示天数 + 时分，否则显示时分秒。
+ *
+ * 已过期时返回"已结束"而不是负数（负的倒计时会让人困惑）。
+ */
+function formatCountdown(msLeft: number): string {
+  if (msLeft <= 0) return "已结束";
+  const total = Math.floor(msLeft / 1000);
+  const d = Math.floor(total / 86400);
+  const h = Math.floor((total % 86400) / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const p2 = (n: number) => String(n).padStart(2, "0");
+  if (d > 0) return `${d} 天 ${p2(h)}:${p2(m)}:${p2(s)}`;
+  return `${p2(h)}:${p2(m)}:${p2(s)}`;
+}
+
 export default function QoderPage() {
   const [rows, setRows] = useState<QoderAccountRow[]>([]);
   const [orphans, setOrphans] = useState<string[]>([]);
@@ -116,6 +137,12 @@ export default function QoderPage() {
   //
   // 而客户端已经登录了，登录态就在它的数据目录里。读它即可。
   const [clientImporting, setClientImporting] = useState(false);
+
+  // 权益活动（「每天领 100 Credits」那类）
+  const [campaigns, setCampaigns] = useState<api.QoderCampaignsResult | null>(null);
+  const [campaignsLoading, setCampaignsLoading] = useState(false);
+  // 倒计时用的"now"：每秒更新一次，让剩余时间真的在走。
+  const [now, setNow] = useState(() => Date.now());
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -312,6 +339,67 @@ export default function QoderPage() {
     [refresh],
   );
 
+  /**
+   * 查询权益活动（**只读**）。
+   *
+   * 取第一个有凭证的账号来查 —— 活动是**账号级**的，而页面上通常只有
+   * 一个账号。多账号时逐个查会把界面搞复杂，而这里的目的只是"提醒
+   * 用户有活动可领"。故挑第一个能查的即可。
+   */
+  const openCampaigns = useCallback(async () => {
+    const target = rows.find((r) => r.hasCredential) ?? rows[0];
+    if (!target) return;
+    setCampaignsLoading(true);
+    try {
+      const r = await api.qoderCampaigns(target.uid);
+      setCampaigns(r);
+      if (r.claimable) {
+        toast.success("有可领取的权益活动", {
+          description: "点「打开活动页」去官方页面领取（需人机验证）",
+          duration: 8000,
+        });
+      }
+    } catch (e) {
+      // 查不到活动**不是错误**（可能只是当前没有），故不弹红色错误。
+      // 但要把原因说清楚，而不是静默。
+      toast.message("暂时查不到权益活动", {
+        description: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setCampaignsLoading(false);
+    }
+  }, [rows]);
+
+  /** 在系统默认浏览器里打开活动页（领取要用户自己点，含人机验证）。 */
+  const openCampaignPage = useCallback(async (url: string) => {
+    try {
+      await openInDefaultBrowser(url);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  // 倒计时每秒走一格
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, []);
+
+  // 账号列表就绪后**自动查一次**权益活动。
+  //
+  // 为什么不在页面加载时直接查：那时 rows 还是空的，挑不出账号。
+  //
+  // 为什么只查一次（`campaignsAutoDone` 标记）：`openCampaigns` 依赖
+  // `rows`，而 `rows` 会被 refresh 反复替换 —— 不设标记就会每次刷新
+  // 都打一次上游。用户想更新时点「刷新活动」。
+  const campaignsAutoDone = useRef(false);
+  useEffect(() => {
+    if (campaignsAutoDone.current) return;
+    if (loading || rows.length === 0) return;
+    campaignsAutoDone.current = true;
+    void openCampaigns();
+  }, [loading, rows, openCampaigns]);
+
   const toggleDisabled = useCallback(
     async (row: QoderAccountRow) => {
       setBusy(row.uid);
@@ -439,6 +527,97 @@ export default function QoderPage() {
           </Alert>
         )}
 
+        {/* ── 权益活动（「每天领 100 Credits」那类）──
+            活动是**限时**的（实测那条只差 22 小时），且每天重置 ——
+            用户不知道就白白错过。故用醒目的卡片 + 实时倒计时。
+
+            ⚠ 这里**只展示，不代领**：领取要阿里云验证码（服务端防滥用
+            机制）。故给的是「打开活动页」按钮，由用户自己去点领取。 */}
+        {campaigns && (campaigns.count > 0 || campaigns.claimable) && (
+          <Card
+            data-slot="qoder-campaigns"
+            className={cn(
+              campaigns.claimable && "border-emerald-500/40 bg-emerald-50/20 dark:bg-emerald-950/10",
+            )}
+          >
+            <CardHeader>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <CardTitle className="flex items-center gap-2">
+                    <Gift className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                    权益活动
+                    {campaigns.claimable && (
+                      <Badge className="border-emerald-500/30 bg-emerald-50 text-[10px] text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
+                        有可领取
+                      </Badge>
+                    )}
+                  </CardTitle>
+                  <CardDescription>
+                    活动由 Qoder 官方下发。本应用只做展示 ——
+                    领取需在官方页面完成（含人机验证，我们不代领）。
+                  </CardDescription>
+                </div>
+                <div className="flex gap-2">
+                  <Button variant="outline" size="sm" onClick={() => void openCampaigns()}>
+                    <RefreshCw className={cn("mr-2 h-4 w-4", campaignsLoading && "animate-spin")} />
+                    刷新活动
+                  </Button>
+                  {campaigns.campaignUrl && (
+                    <Button
+                      size="sm"
+                      onClick={() => void openCampaignPage(campaigns.campaignUrl)}
+                    >
+                      <ExternalLink className="mr-2 h-4 w-4" />
+                      打开活动页
+                    </Button>
+                  )}
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              {campaigns.campaigns.map((c) => {
+                const claimable = c.claimStatus === "CLAIMABLE";
+                const left = c.endAt > 1e9 ? c.endAt * 1000 - now : 0;
+                return (
+                  <div
+                    key={c.campaignId || c.campaignKey}
+                    data-slot="qoder-campaign-item"
+                    data-claim-status={c.claimStatus}
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border/70 px-3 py-2"
+                  >
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium">
+                        {c.benefit
+                          ? `每天领 ${c.benefit.amount} ${c.benefit.kind === "CREDITS" ? "Credits" : c.benefit.kind}`
+                          : c.actionType === "VIEW_DETAILS"
+                            ? "活动详情"
+                            : c.campaignKey}
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        {c.benefit?.validity
+                          ? `领取后 ${c.benefit.validity.days} 天内有效`
+                          : "限时活动"}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {claimable ? (
+                        <Badge variant="success" className="gap-1">
+                          <Clock3 className="h-3 w-3" />
+                          {formatCountdown(left)}
+                        </Badge>
+                      ) : (
+                        <Badge variant="secondary">
+                          {c.claimStatus === "CLAIMED" ? "已领取" : "不可领取"}
+                        </Badge>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </CardContent>
+          </Card>
+        )}
+
         {/* 孤儿凭证：有凭证文件但没登记进账号库 */}
         {!loading && orphans.length > 0 && (
           <Alert>
@@ -517,209 +696,55 @@ export default function QoderPage() {
                 )}
               </div>
             ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b text-left text-muted-foreground">
-                      <th className="py-2 pr-3 font-medium">账号</th>
-                      <th className="py-2 pr-3 font-medium">区域</th>
-                      <th className="py-2 pr-3 font-medium">状态</th>
-                      <th className="py-2 pr-3 font-medium">额度</th>
-                      <th className="py-2 pr-3 font-medium">到期</th>
-                      <th className="py-2 pr-3 font-medium">支持模型</th>
-                      <th className="py-2 pr-3 font-medium">备注</th>
-                      <th className="py-2 text-right font-medium">操作</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {rows.map((row) => {
-                      const exp = expiryText(row.expireAt);
-                      return (
-                        <tr key={row.uid} className="border-b last:border-0">
-                          <td className="py-3 pr-3">
-                            {/* 头像 + 名称。
-                                使用者的反馈：「已授权后,也不显示头像,也不显示名称」。
-                                两者都在客户端登录态里（`auth.v1.dat` 的
-                                `user.name` / `user.avatarUrl`），导入时已存下。 */}
-                            <div className="flex items-center gap-2.5">
-                              {row.avatarUrl ? (
-                                <img
-                                  src={row.avatarUrl}
-                                  alt=""
-                                  className="size-8 shrink-0 rounded-full object-cover"
-                                  onError={(e) => {
-                                    (e.currentTarget as HTMLImageElement).style.display = "none";
-                                  }}
-                                />
-                              ) : (
-                                <div className="flex size-8 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-semibold text-muted-foreground">
-                                  {(row.nickname || row.uid).charAt(0).toUpperCase()}
-                                </div>
-                              )}
-                              <div className="min-w-0">
-                                <div className="truncate font-medium">
-                                  {row.nickname || "（未命名）"}
-                                </div>
-                                <div className="font-mono text-xs text-muted-foreground">
-                                  {row.uid.slice(0, 12)}
-                                </div>
-                              </div>
-                            </div>
-                          </td>
-                          <td className="py-3 pr-3">
-                            <Badge variant={regionVariant(row.region)}>{regionLabel(row.region)}</Badge>
-                          </td>
-                          <td className="py-3 pr-3">
-                            <div className="flex flex-wrap items-center gap-1.5">
-                              {!row.hasCredential ? (
-                                <Tooltip>
-                                  <TooltipTrigger asChild>
-                                    <Badge variant="destructive">凭证缺失</Badge>
-                                  </TooltipTrigger>
-                                  <TooltipContent>
-                                    凭证文件不存在，该账号在网关里已不可用，需重新登录
-                                  </TooltipContent>
-                                </Tooltip>
-                              ) : row.disabled ? (
-                                <Tooltip>
-                                  <TooltipTrigger asChild>
-                                    <Badge variant="outline">已停用</Badge>
-                                  </TooltipTrigger>
-                                  <TooltipContent>
-                                    不参与网关选号；凭证与额度信息仍然保留
-                                  </TooltipContent>
-                                </Tooltip>
-                              ) : (
-                                <Badge variant="secondary">正常</Badge>
-                              )}
-                            </div>
-                          </td>
-                          <td className="py-3 pr-3 tabular-nums">
-                            {row.credits > 0 ? (
-                              <>
-                                {row.credits.toLocaleString()}
-                                {row.creditsTotal > 0 && (
-                                  <span className="text-muted-foreground">
-                                    {" / "}
-                                    {row.creditsTotal.toLocaleString()}
-                                  </span>
-                                )}
-                              </>
-                            ) : (
-                              <span className="text-muted-foreground">未知</span>
-                            )}
-                          </td>
-                          <td className={cn("py-3 pr-3", exp.urgent && "text-amber-600")}>
-                            {exp.text}
-                          </td>
-                          {/* 支持模型：该账号实际可用的模型（刷新时查得）。
-                              此前没有这一列，用户看不到自己能调哪些模型。 */}
-                          <td className="max-w-[16rem] py-3 pr-3">
-                            {row.models && row.models.length > 0 ? (
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <span className="cursor-help text-muted-foreground">
-                                    {row.models.length} 个
-                                  </span>
-                                </TooltipTrigger>
-                                <TooltipContent className="max-w-sm">
-                                  <div className="font-medium">可用模型</div>
-                                  <div className="mt-1 font-mono text-xs">
-                                    {row.models.join("、")}
-                                  </div>
-                                </TooltipContent>
-                              </Tooltip>
-                            ) : (
-                              <span className="text-muted-foreground">—</span>
-                            )}
-                          </td>
-                          <td className="max-w-[14rem] truncate py-3 pr-3 text-muted-foreground">
-                            {row.note || "—"}
-                          </td>
-                          <td className="py-3 text-right">
-                            <div className="flex justify-end gap-1">
-                              {/* 刷新额度 / 到期 / 支持模型。
-                                  没有这个入口时，后端 `FetchQuota` / `FetchModels`
-                                  **没有任何调用者** —— 用户永远看到"未知"。 */}
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    disabled={busy === `refresh:${row.uid}`}
-                                    aria-label={`刷新额度与模型：${row.nickname || row.uid}`}
-                                    onClick={() => void refreshAccount(row)}
-                                  >
-                                    <RefreshCw
-                                      className={cn(
-                                        "h-4 w-4",
-                                        busy === `refresh:${row.uid}` && "animate-spin",
-                                      )}
-                                    />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent>刷新额度、到期与支持模型</TooltipContent>
-                              </Tooltip>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    // 图标按钮**必须**有可访问名：Tooltip 的内容要悬停
-                                    // 才进 DOM，屏幕阅读器（与自动化测试）都拿不到。
-                                    aria-label={`编辑备注：${row.nickname || row.uid}`}
-                                    onClick={() => {
-                                      setEditTarget(row);
-                                      setEditNote(row.note);
-                                    }}
-                                  >
-                                    <Pencil className="h-4 w-4" />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent>编辑备注</TooltipContent>
-                              </Tooltip>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    disabled={busy === row.uid}
-                                    aria-label={`${row.disabled ? "恢复参与路由" : "停止接流量"}：${row.nickname || row.uid}`}
-                                    onClick={() => void toggleDisabled(row)}
-                                  >
-                                    {row.disabled ? (
-                                      <CheckCircle2 className="h-4 w-4" />
-                                    ) : (
-                                      <AlertTriangle className="h-4 w-4" />
-                                    )}
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent>
-                                  {row.disabled ? "恢复参与路由" : "停止接流量"}
-                                </TooltipContent>
-                              </Tooltip>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    disabled={busy === row.uid}
-                                    aria-label={`删除账号：${row.nickname || row.uid}`}
-                                    onClick={() => void remove(row)}
-                                  >
-                                    <Trash2 className="h-4 w-4 text-destructive" />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent>删除账号（含凭证）</TooltipContent>
-                              </Tooltip>
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
+              /* 卡片布局（对齐 WorkBuddy 与 ZCode 账号页）。
+                 所有者的要求：「ZCODE和Qoder和Workbuddy采用一样的卡片布局」。 */
+              <ProductAccountGrid>
+                {rows.map((row) => {
+                  const exp = expiryText(row.expireAt);
+                  const creditsText =
+                    row.credits > 0
+                      ? row.creditsTotal > 0
+                        ? `${row.credits.toLocaleString()} / ${row.creditsTotal.toLocaleString()}`
+                        : row.credits.toLocaleString()
+                      : undefined;
+                  return (
+                    <ProductAccountCard
+                      key={row.uid}
+                      mark={(size) => <QoderMark size={size} />}
+                      busyKey={
+                        busy === `refresh:${row.uid}`
+                          ? "refresh"
+                          : busy === row.uid
+                            ? "toggle"
+                            : busy === `delete:${row.uid}`
+                              ? "delete"
+                              : null
+                      }
+                      data={{
+                        uid: row.uid,
+                        nickname: row.nickname,
+                        note: row.note,
+                        avatarUrl: row.avatarUrl,
+                        creditsText,
+                        expiryText: exp.text,
+                        expiryUrgent: exp.urgent,
+                        models: row.models,
+                        hasCredential: row.hasCredential,
+                        disabled: row.disabled,
+                        variantLabel: regionLabel(row.region),
+                        variantKind: regionVariant(row.region),
+                      }}
+                      onRefresh={() => void refreshAccount(row)}
+                      onEditNote={() => {
+                        setEditTarget(row);
+                        setEditNote(row.note);
+                      }}
+                      onToggleDisabled={() => void toggleDisabled(row)}
+                      onDelete={() => void remove(row)}
+                    />
+                  );
+                })}
+              </ProductAccountGrid>
             )}
           </CardContent>
         </Card>

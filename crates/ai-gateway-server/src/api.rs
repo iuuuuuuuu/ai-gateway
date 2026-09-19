@@ -160,6 +160,8 @@ pub fn router() -> Router {
         .route("/api/qoder/import-from-client", post(api_qoder_import_from_client))
         // 刷新额度 / 到期 / 支持模型（此前没有任何生产者调用 FetchQuota）
         .route("/api/qoder/refresh-account", post(api_qoder_refresh_account))
+        // 权益活动（「每天领 100 Credits」那类）。**只读**，不代领。
+        .route("/api/qoder/campaigns", post(api_qoder_campaigns))
         // ---- ZCode（Z.AI / 智谱）----
         // 与 Qoder 的差异：凭证是用户可复制的字符串，故导入是主路径。
         .route("/api/zcode/accounts", get(api_zcode_list_accounts))
@@ -330,6 +332,24 @@ async fn api_qoder_login_poll(Json(body): Json<Value>) -> Response {
         Ok(Ok(v)) => json_ok(v),
         Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
         Err(e) => json_err(format!("轮询 Qoder 登录失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/qoder/campaigns —— body: `{ "uid": "..." }`
+///
+/// 查询该账号的权益活动（「每天领 100 Credits」那类）。**只读**。
+///
+/// ⚠ 刻意**不提供领取接口**：领取要阿里云验证码，那是服务端的防滥用
+/// 机制。界面只展示活动与倒计时，并给出活动页地址让用户自己去领。
+async fn api_qoder_campaigns(Json(body): Json<Value>) -> Response {
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("").to_string();
+    match tokio::task::spawn_blocking(move || qoder_login::fetch_campaigns(&uid)).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(
+            format!("查询 Qoder 权益活动失败: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 

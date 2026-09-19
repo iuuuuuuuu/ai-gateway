@@ -50,6 +50,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { ModelCapabilityRow } from "@/components/model-capability-chip";
 import * as api from "@/lib/api";
 import { capabilityViewOf, summarizeCapabilities } from "@/lib/model-capability";
+import { accentOf } from "@/lib/client-accent";
 import type {
   AgentBackupItem,
   AgentClientTarget,
@@ -880,31 +881,55 @@ export default function AgentsPage() {
             const isOperating = operatingTarget === target.id || batchUpdating;
             const assignedModels = getModelsForTarget(target.id);
             const isExpanded = Boolean(expandedTargetModels[target.id]);
+            // 每个客户端一个色相（所有者的要求：「不同的客户端要采用不同的颜色
+            // 加以区分」）。此前 12 张卡片外观完全相同，扫一眼分不出谁是谁。
+            //
+            // ⚠ 色相只表达"这是哪个客户端"，**不承载"是否已接入"** ——
+            // 后者由边框/背景表达（既有做法）。两个维度正交，
+            // 否则用户无法同时看出"这是 Codex"与"它已接入"。
+            const accent = accentOf(target.id);
 
             return (
               <Card
                 key={target.id}
+                data-slot="agent-client-card"
+                data-client={target.id}
                 className={cn(
-                  "flex flex-col justify-between rounded-xl border border-border/70 p-4 transition-all hover:border-border",
-                  target.configured && "border-emerald-500/40 bg-emerald-50/10 dark:bg-emerald-950/10",
+                  "flex flex-col justify-between rounded-xl border p-4 transition-all",
+                  // 色相：左侧一道色条 + 图标底色，让同类客户端一眼可辨
+                  accent.border,
+                  accent.bg,
+                  "hover:brightness-[1.02]",
+                  // 已接入：**只加粗边框与阴影**，不改色相
+                  target.configured && "ring-1 ring-emerald-500/40",
                 )}
               >
                 <div className="space-y-3">
                   {/* 头部：专属图标 + 标题 + 状态 Badge */}
                   <div className="flex items-start justify-between gap-2.5">
                     <div className="flex items-center gap-2.5 min-w-0">
-                      <img
-                        src={iconSrc}
-                        alt=""
-                        className="size-8 shrink-0 object-contain drop-shadow-2xs"
-                      />
+                      {/* 图标外面套一个本客户端色的圆角底 —— 这是"颜色区分"
+                          最直观的落点：即使图标本身很相似（都是深色 logo），
+                          底色也不同。 */}
+                      <span
+                        className={cn(
+                          "flex size-9 shrink-0 items-center justify-center rounded-lg",
+                          accent.chip,
+                        )}
+                      >
+                        <img
+                          src={iconSrc}
+                          alt=""
+                          className="size-6 shrink-0 object-contain drop-shadow-2xs"
+                        />
+                      </span>
                       <div className="min-w-0">
                         <div className="flex items-center gap-1.5">
                           <span className="truncate text-[13.5px] font-semibold text-foreground">
                             {target.label}
                           </span>
                         </div>
-                        <div className="text-[10.5px] text-muted-foreground truncate">
+                        <div className={cn("truncate text-[10.5px]", accent.text)}>
                           {meta.protocol}
                         </div>
                       </div>
