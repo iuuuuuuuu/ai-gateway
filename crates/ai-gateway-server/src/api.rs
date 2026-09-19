@@ -158,6 +158,8 @@ pub fn router() -> Router {
         .route("/api/qoder/import", post(api_qoder_import))
         // 从**客户端自己的登录态**一键导入（主路径，见 qoder_login 的注释）。
         .route("/api/qoder/import-from-client", post(api_qoder_import_from_client))
+        // 刷新额度 / 到期 / 支持模型（此前没有任何生产者调用 FetchQuota）
+        .route("/api/qoder/refresh-account", post(api_qoder_refresh_account))
         // ---- ZCode（Z.AI / 智谱）----
         // 与 Qoder 的差异：凭证是用户可复制的字符串，故导入是主路径。
         .route("/api/zcode/accounts", get(api_zcode_list_accounts))
@@ -173,6 +175,8 @@ pub fn router() -> Router {
         // 否则是个点了没反应的摆设。详见 zcode_scan.rs 的模块注释。
         .route("/api/zcode/scan-local", post(api_zcode_scan_local))
         .route("/api/zcode/import-scanned", post(api_zcode_import_scanned))
+        // 刷新额度 / 到期 / 支持模型（此前没有任何生产者调用 FetchQuota）
+        .route("/api/zcode/refresh-account", post(api_zcode_refresh_account))
         .route("/api/zcode/login/start", post(api_zcode_login_start))
         .route("/api/zcode/login/poll", post(api_zcode_login_poll))
         .fallback(static_handler)
@@ -340,7 +344,6 @@ async fn api_qoder_import(Json(body): Json<Value>) -> Response {
 }
 
 /// POST /api/qoder/import-from-client —— body: `{ "clientDir": "..." }`（可空）
-///
 /// 读 Qoder 客户端自己的登录态（**主路径**）。clientDir 为空时自动探测。
 async fn api_qoder_import_from_client(Json(body): Json<Value>) -> Response {
     let dir = body
@@ -354,6 +357,21 @@ async fn api_qoder_import_from_client(Json(body): Json<Value>) -> Response {
         Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
         Err(e) => json_err(
             format!("从 Qoder 客户端导入失败: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/qoder/refresh-account —— body: `{ "uid": "..." }`
+///
+/// 刷新该账号的额度 / 到期时间 / 支持模型，并把结果写回账号库。
+async fn api_qoder_refresh_account(Json(body): Json<Value>) -> Response {
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("").to_string();
+    match tokio::task::spawn_blocking(move || qoder_login::refresh_account(&uid)).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(
+            format!("刷新 Qoder 账号信息失败: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
     }
@@ -479,6 +497,24 @@ async fn api_zcode_import_scanned(Json(body): Json<Value>) -> Response {
         Ok(Ok(v)) => json_ok(v),
         Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
         Err(e) => json_err(format!("导入扫描到的凭证失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/zcode/refresh-account —— body: `{ "uid": "..." }`
+///
+/// 刷新该账号的额度 / 到期时间 / 支持模型，并把结果写回账号库。
+///
+/// 此前 `Client.FetchQuota` / `FetchModels` **没有任何生产者调用** ——
+/// 界面上的额度与到期时间因此恒为空。见 `zcode_login::refresh_account`。
+async fn api_zcode_refresh_account(Json(body): Json<Value>) -> Response {
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("").to_string();
+    match tokio::task::spawn_blocking(move || zcode_login::refresh_account(&uid)).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(
+            format!("刷新 ZCode 账号信息失败: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 

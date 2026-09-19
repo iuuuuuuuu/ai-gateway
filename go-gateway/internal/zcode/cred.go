@@ -24,6 +24,7 @@
 package zcode
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -99,8 +100,75 @@ type Cred struct {
 	// 故这里只记录年龄供展示，**不据此判定过期**。
 	JWTIssuedAt int64
 
+	// AccountID 上游**账号**标识（从 JWT 的 `user_id` 解出）；空 = 未知。
+	//
+	// # 为什么需要它（这解决了"重复账号"）
+	//
+	// `UID` 是 **credential 的哈希**：同一把 key 重复导入会得到同一个 uid
+	// （幂等，实测已验证 —— 见 uitest/z15-uid-consistency.cjs）。
+	//
+	// 但**同一个上游账号可以有多把 key**：
+	//
+	//	智谱账号 19331730795565300
+	//	  ├─ key A → uid zcode-aaaa…（本地第 1 条账号）
+	//	  └─ key B → uid zcode-bbbb…（本地第 2 条，用户看来就是"重复"）
+	//
+	// 两把 key 的哈希不同，故 uid 去重**抓不到**这种情况 ——
+	// 而用户眼里那就是同一个账号出现了两次。
+	//
+	// 实测（uitest/diag-zcode-dupe-origin.cjs）：本机三条凭证的 user_id
+	// 全不同 → 它们是**真不同的账号**。但这不代表"多把 key"不存在，
+	// 故记录 AccountID 让界面能识别并标注。
+	//
+	// # 不能自动删
+	//
+	// 多把 key 可能是**故意的**（一把给套餐、一把给别的用途），
+	// 且各自的额度可能不同。故只**标注**，由用户决定是否清理。
+	AccountID string
+
 	// FilePath 来源文件路径；保存时写回此处。
 	FilePath string
+}
+
+// AccountIDFromJWT 从 JWT 里解出上游的 `user_id`（**不验签**）。
+//
+// # 用途
+//
+// 判断"本地这几条账号是不是同一个上游账号的多把 key"。
+// uid 是凭证哈希，抓不到这种情况；`user_id` 才是账号级标识。
+//
+// # 为什么只取 `user_id` 而不复用 jwtIssuedAt 那套
+//
+// 两者都在 payload 里，但用途不同、失败语义也不同：
+// 签发时刻解不出只影响"年龄展示"，而账号标识解不出会影响**去重判断** ——
+// 故这里出错一律返回空串（"未知"），绝**不猜**。
+// 猜错会让界面把两个不同账号标成"重复"，那比不标注更糟。
+func AccountIDFromJWT(token string) string {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	// base64url → 标准 base64
+	payload := strings.NewReplacer("-", "+", "_", "/").Replace(parts[1])
+	if pad := len(payload) % 4; pad != 0 {
+		payload += strings.Repeat("=", 4-pad)
+	}
+	raw, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		UserID string `json:"user_id"`
+		Sub    string `json:"sub"`
+	}
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		return ""
+	}
+	// 优先 user_id；退到 sub（实测两者相同，但 user_id 更明确）
+	if claims.UserID != "" {
+		return claims.UserID
+	}
+	return claims.Sub
 }
 
 // CredKey 从凭证字符串派生稳定的账号 UID。
@@ -311,6 +379,11 @@ func parseBytes(raw []byte, path string) (*Cred, error) {
 	c.Nickname = rawStr(doc, "nickname")
 	c.JWT = firstNonEmpty(rawStr(doc, "jwt"), rawStr(doc, "token"))
 	c.JWTIssuedAt = rawInt(doc, "jwt_issued_at")
+	// 上游账号标识：优先读已存的，没有就从 JWT 里现解一个
+	c.AccountID = rawStr(doc, "account_id")
+	if c.AccountID == "" && c.JWT != "" {
+		c.AccountID = AccountIDFromJWT(c.JWT)
+	}
 	c.Provider = ParseProvider(firstNonEmpty(rawStr(doc, "provider"), rawStr(doc, "vendor")))
 
 	// 用户手动禁用（宿主写入的 `account.no_route`）。
@@ -379,6 +452,14 @@ func (c *Cred) SaveAtomic() error {
 	}
 	if c.JWTIssuedAt > 0 {
 		doc["jwt_issued_at"] = c.JWTIssuedAt
+	}
+	// 上游账号标识：让界面能识别"同一账号的多把 key"（见 Cred.AccountID）。
+	// 有 JWT 而字段为空时现解一次，保证写入的文件里始终有它。
+	if c.AccountID == "" && c.JWT != "" {
+		c.AccountID = AccountIDFromJWT(c.JWT)
+	}
+	if c.AccountID != "" {
+		doc["account_id"] = c.AccountID
 	}
 	// 持久化 deviceMid：同一个账号必须始终表现为同一台设备
 	//（否则服务端会看到"一个账号被大量不同设备查询"）。

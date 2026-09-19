@@ -949,6 +949,17 @@ pub async fn qoder_import_from_client(client_dir: String) -> Result<Value, Strin
     .map_err(|e| format!("从 Qoder 客户端导入失败: {e}"))?
 }
 
+/// 刷新 Qoder 账号的额度 / 到期 / 支持模型。
+///
+/// 此前 `Client.FetchQuota` / `FetchModels` 没有生产者调用 ——
+/// 界面上额度恒为 0、看不到支持模型。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_refresh_account(uid: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || qoder_login::refresh_account(&uid))
+        .await
+        .map_err(|e| format!("刷新 Qoder 账号信息失败: {e}"))?
+}
+
 /// Qoder 账号库概览（供界面顶部展示）。
 #[tauri::command]
 pub async fn qoder_summary() -> Result<Value, String> {
@@ -1046,6 +1057,17 @@ pub async fn zcode_import_scanned(indices: Vec<usize>) -> Result<Value, String> 
     tauri::async_runtime::spawn_blocking(move || zcode_login::import_scanned(&indices))
         .await
         .map_err(|e| format!("导入扫描到的 ZCode 凭证失败: {e}"))?
+}
+
+/// 刷新 ZCode 账号的额度 / 到期 / 支持模型。
+///
+/// 此前 `Client.FetchQuota` / `FetchModels` 没有生产者调用 ——
+/// 界面上额度与到期时间恒为空，使用者以为是"查不到"。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn zcode_refresh_account(uid: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || zcode_login::refresh_account(&uid))
+        .await
+        .map_err(|e| format!("刷新 ZCode 账号信息失败: {e}"))?
 }
 
 /// 发起 ZCode 登录（OAuth 设备流，备选路径）。

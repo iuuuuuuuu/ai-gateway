@@ -66,6 +66,27 @@ pub struct ZcodeAccount {
     pub credits_total: i64,
     /// 最近到期时刻（Unix 秒）；0 = 未知。
     pub expire_at: i64,
+    /// 头像 URL（来自客户端登录态）；空 = 没有。
+    ///
+    /// 使用者的反馈：「已授权后,也不显示头像」—— 头像就在客户端
+    /// `credentials.json` 的 `oauth:*:user_info` 里，登录后刷新即可补上。
+    pub avatar_url: String,
+    /// 上游**账号**标识（如 `19331730795565300`）；空 = 未知。
+    ///
+    /// 用途：识别「同一账号的多把 API key」—— 它们的 `uid` 不同
+    ///（uid 是凭证哈希），但 `account_id` 相同，在用户看来就是重复。
+    /// 只**标注**，不自动删（多把 key 可能是故意的）。
+    pub account_id: String,
+    /// 该账号**实际可用**的模型 id 列表（刷新账号时查得）。
+    ///
+    /// 用途：
+    ///   1. 界面上显示"这个账号能用哪些模型"
+    ///   2. 汇总进网关的 `pool.product_models` → `/v1/models` 的
+    ///      `channels` 字段（"这个模型来自哪个平台"）
+    ///
+    /// 空 = 没查过（与"查了但一个都没有"是两回事，但这里都表现为空 ——
+    /// 界面上按"未刷新"提示，见 refresh_account 的返回值）。
+    pub models: Vec<String>,
 }
 
 impl ZcodeAccount {
@@ -82,6 +103,9 @@ impl ZcodeAccount {
             "credits": self.credits,
             "creditsTotal": self.credits_total,
             "expireAt": self.expire_at,
+            "avatarUrl": self.avatar_url,
+            "accountId": self.account_id,
+            "models": self.models,
         })
     }
 }
@@ -117,6 +141,19 @@ pub fn load_accounts() -> Result<Vec<ZcodeAccount>, String> {
                 credits: i64_of(v, "credits"),
                 credits_total: i64_of(v, "creditsTotal"),
                 expire_at: i64_of(v, "expireAt"),
+                avatar_url: str_of(v, "avatarUrl"),
+                account_id: str_of(v, "accountId"),
+                models: v
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             })
         })
         .collect();
@@ -235,6 +272,30 @@ fn apply_patch(a: &mut ZcodeAccount, patch: &Value) {
             "expireAt" => {
                 if let Some(n) = v.as_i64() {
                     a.expire_at = n;
+                }
+            }
+            // 身份字段：由 `refresh_account` 从客户端登录态补上。
+            // 空串也接受（那是"清除头像"的意思，不要静默忽略）。
+            "avatarUrl" => {
+                if let Some(s) = v.as_str() {
+                    a.avatar_url = s.to_string();
+                }
+            }
+            "accountId" => {
+                if let Some(s) = v.as_str() {
+                    a.account_id = s.to_string();
+                }
+            }
+            // 模型清单：由 `refresh_account` 写入。空数组也接受
+            //（那是"查到了但一个模型都没有"的意思，必须能覆盖旧值）。
+            "models" => {
+                if let Some(arr) = v.as_array() {
+                    a.models = arr
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
                 }
             }
             _ => {}

@@ -68,6 +68,16 @@ pub struct QoderAccount {
     pub credits_total: i64,
     /// 最近到期时刻（Unix 秒）；0 = 未知。
     pub expire_at: i64,
+    /// 头像 URL（来自客户端登录态 `auth.v1.dat` 的 `user.avatarUrl`）；空 = 没有。
+    ///
+    /// 使用者的反馈：「已授权后,也不显示头像,也不显示名称」。
+    /// 导入客户端凭证时就能拿到它，只是此前没有存下来。
+    pub avatar_url: String,
+    /// 该账号**实际可用**的模型（刷新账号时查得）。
+    ///
+    /// 用途：界面上显示"能用哪些模型"，并汇总进网关的
+    /// `pool.product_models` → `/v1/models` 的 `channels` 字段。
+    pub models: Vec<String>,
 }
 
 impl QoderAccount {
@@ -84,6 +94,8 @@ impl QoderAccount {
             "credits": self.credits,
             "creditsTotal": self.credits_total,
             "expireAt": self.expire_at,
+            "avatarUrl": self.avatar_url,
+            "models": self.models,
         })
     }
 }
@@ -119,6 +131,18 @@ pub fn load_accounts() -> Result<Vec<QoderAccount>, String> {
                 credits: i64_of(v, "credits"),
                 credits_total: i64_of(v, "creditsTotal"),
                 expire_at: i64_of(v, "expireAt"),
+                avatar_url: str_of(v, "avatarUrl"),
+                models: v
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             })
         })
         .collect();
@@ -318,6 +342,25 @@ fn apply_patch(a: &mut QoderAccount, patch: &Value) {
             "expireAt" => {
                 if let Some(n) = v.as_i64() {
                     a.expire_at = n;
+                }
+            }
+            // 头像：导入客户端凭证或刷新账号时写入。
+            // 空串也接受（那是"清除头像"的意思，不要静默忽略）。
+            "avatarUrl" => {
+                if let Some(s) = v.as_str() {
+                    a.avatar_url = s.to_string();
+                }
+            }
+            // 模型清单：由 `refresh_account` 写入。空数组也接受
+            //（那是"查到了但一个模型都没有"的意思，必须能覆盖旧值）。
+            "models" => {
+                if let Some(arr) = v.as_array() {
+                    a.models = arr
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
                 }
             }
             _ => {}

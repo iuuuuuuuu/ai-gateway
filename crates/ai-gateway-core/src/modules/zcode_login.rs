@@ -347,6 +347,172 @@ pub fn import_scanned(indices: &[usize]) -> Result<Value, String> {
     }))
 }
 
+/// 刷新一个账号的**额度、到期时间、可用模型**。
+///
+/// # 为什么需要它（这是我漏掉的一整条链路）
+///
+/// `Client.FetchQuota` 与 `Client.FetchModels` 早就实现了，但**从来
+/// 没有生产者调用它们** —— 实测确认（`grep FetchQuota` 只命中测试与
+/// 定义本身）。于是界面上额度恒为 0、到期时间恒为空、看不到支持模型，
+/// 使用者以为是"查不到"。
+///
+/// 本函数补上那个缺口：调 Go 侧的 `zcode-login quota` / `models`，
+/// 把结果**写回账号库**，界面下次读列表就能看到。
+///
+/// # 为什么额度与模型分两次调用
+///
+/// 它们是不同的上游端点、不同的失败模式（额度要 JWT，模型只要凭证）。
+/// 合并成一个调用会让"模型能查到但额度查不到"这种情况无法如实表达 ——
+/// 而那正是只导入对话凭证的账号的常态。
+///
+/// # 失败语义
+///
+/// 单项失败**不返回 Err**，而是记进返回值的 `quotaError` / `modelsError`：
+/// 调用方（界面）要能显示"额度查不到，原因是 X"，而不是一个笼统的失败。
+/// 只有账号本身不存在才返回 Err。
+pub fn refresh_account(uid: &str) -> Result<Value, String> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        return Err("账号 uid 不能为空".into());
+    }
+
+    let auth_dir = zcode_account::auth_dir();
+    let auth_dir_s = auth_dir.to_string_lossy().to_string();
+
+    // ---- 身份（头像 / 显示名 / 上游账号标识）----
+    //
+    // 使用者的反馈：「已授权后,也不显示头像,也不显示名称」。
+    //
+    // 头像与显示名来自客户端登录态里的 `oauth:*:user_info`
+    //（已解密，见 zcode_credstore）。登录后刷新一次就能补上。
+    let identity = crate::modules::zcode_credstore::read_identity();
+    let mut identity_patch = serde_json::Map::new();
+    if let Some(id) = &identity {
+        let name = id.best_name();
+        if !name.is_empty() {
+            identity_patch.insert("nickname".into(), json!(name));
+        }
+        if !id.avatar_url.is_empty() {
+            identity_patch.insert("avatarUrl".into(), json!(id.avatar_url));
+        }
+        if !id.id.is_empty() {
+            identity_patch.insert("accountId".into(), json!(id.id));
+        }
+    }
+
+    // ---- 额度 ----
+    let mut credits: Option<i64> = None;
+    let mut credits_total: Option<i64> = None;
+    let mut expire_at: Option<i64> = None;
+    let mut quota_error: Option<String> = None;
+    let mut quota_entries: Vec<Value> = Vec::new();
+
+    match run_login_cmd(&["quota", "--uid", uid, "--auth-dir", &auth_dir_s]) {
+        Ok(r) => {
+            let status = r.get("status").and_then(Value::as_str).unwrap_or("");
+            match status {
+                "ok" => {
+                    credits = r.get("remaining").and_then(Value::as_i64);
+                    credits_total = r.get("total").and_then(Value::as_i64);
+                    let e = r.get("expiresAt").and_then(Value::as_i64).unwrap_or(0);
+                    if e > 0 {
+                        expire_at = Some(e);
+                    }
+                    if let Some(arr) = r.get("entries").and_then(Value::as_array) {
+                        quota_entries = arr.clone();
+                    }
+                }
+                "no_jwt" => {
+                    // 正常状态：只导入了对话凭证，没有额度查询用的 JWT。
+                    // 界面据此显示「额度未知」而不是 0。
+                    quota_error = Some(
+                        r.get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("该账号没有额度查询用的令牌")
+                            .to_string(),
+                    );
+                }
+                _ => {
+                    quota_error = Some(
+                        r.get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("额度查询失败")
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Err(e) => quota_error = Some(e),
+    }
+
+    // ---- 模型 ----
+    let mut models: Vec<Value> = Vec::new();
+    let mut models_error: Option<String> = None;
+    match run_login_cmd(&["models", "--uid", uid, "--auth-dir", &auth_dir_s]) {
+        Ok(r) => {
+            if r.get("status").and_then(Value::as_str) == Some("ok") {
+                if let Some(arr) = r.get("models").and_then(Value::as_array) {
+                    models = arr.clone();
+                }
+            } else {
+                models_error = Some(
+                    r.get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("模型清单查询失败")
+                        .to_string(),
+                );
+            }
+        }
+        Err(e) => models_error = Some(e),
+    }
+
+    // ---- 写回账号库 ----
+    let mut patch = serde_json::Map::new();
+    if let Some(c) = credits {
+        patch.insert("credits".into(), json!(c));
+    }
+    if let Some(t) = credits_total {
+        patch.insert("creditsTotal".into(), json!(t));
+    }
+    if let Some(e) = expire_at {
+        patch.insert("expireAt".into(), json!(e));
+    }
+    // 身份字段（昵称 / 头像 / 上游账号标识）—— 让界面能显示头像与名称
+    for (k, v) in identity_patch {
+        patch.insert(k, v);
+    }
+    // 模型清单落库：界面显示 + 汇总进网关的 product_models（渠道标签）
+    //
+    // ⚠ 只在**成功取到**时写。取不到（models_error 有值）时不写 ——
+    // 写成空数组会把上一次的好数据抹掉，让界面从"有 11 个模型"
+    // 变成"没有模型"，而原因只是一次网络抖动。
+    if models_error.is_none() {
+        patch.insert("models".into(), json!(models));
+    }
+    let acc = zcode_account::upsert_account(uid, &Value::Object(patch))?;
+
+    Ok(json!({
+        "status": "ok",
+        "account": acc.to_view(),
+        "identity": identity.as_ref().map(|i| json!({
+            "username": i.username,
+            "displayName": i.display_name,
+            "id": i.id,
+            "avatarUrl": i.avatar_url,
+            "activeProvider": i.active_provider,
+        })),
+        "quota": {
+            "remaining": credits,
+            "total": credits_total,
+            "expiresAt": expire_at,
+            "entries": quota_entries,
+            "error": quota_error,
+        },
+        "models": models,
+        "modelsError": models_error,
+    }))
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         return s.to_string();

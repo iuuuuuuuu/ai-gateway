@@ -184,10 +184,147 @@ func RunLoginCLI(args []string, defaultAuthDir string) int {
 		// 而客户端已经登录了，登录态就在它的数据目录里（Electron
 		// safeStorage 加密）。见 internal/qoderclient 的包注释。
 		return runImportClient(args[1:], defaultAuthDir)
+	case "quota":
+		// 查额度并输出 JSON。
+		//
+		// `Client.FetchQuota` 早已实现，但**从来没有生产者调用它** ——
+		// 于是界面上额度恒为 0。这个子命令补上那个缺口。
+		return runQuota(args[1:], defaultAuthDir)
+	case "models":
+		// 查该账号**实际可用**的模型清单（按账号，不是全局）。
+		return runModels(args[1:], defaultAuthDir)
 	default:
 		fmt.Fprintf(os.Stderr, "未知子命令 %q（应为 url / poll / import-client）\n", sub)
 		return 2
 	}
+}
+
+// runQuota 查一个账号的额度并输出 JSON。
+//
+// 用法：`qoder-login quota --uid <uid> --auth-dir <dir>`
+//
+// 输出：`{"status":"ok","uid":...,"remaining":N,"total":N,"planTierName":"...","exceeded":false}`
+// 失败：`{"status":"error","uid":...,"message":"..."}`（退出码仍为 0）
+//
+// ## 为什么失败也返回 0
+//
+// "查不到额度"不是命令执行失败 —— 宿主把它当成一次正常的"没数据"，
+// 而不是崩溃。若用非零退出码，宿主会当成子进程故障并丢掉 message，
+// 用户看到的就是没有原因的空白。
+func runQuota(args []string, defaultAuthDir string) int {
+	fs := flag.NewFlagSet("qoder-login quota", flag.ContinueOnError)
+	uid := fs.String("uid", "", "账号 uid")
+	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if strings.TrimSpace(*uid) == "" {
+		fmt.Fprintln(os.Stderr, "缺少 --uid 参数")
+		return 2
+	}
+
+	c, err := loadCredByUID(*authDir, *uid)
+	if err != nil {
+		writeJSON(map[string]any{"status": "error", "uid": *uid, "message": err.Error()})
+		return 0
+	}
+
+	cli := New()
+	q, err := cli.FetchQuota(context.Background(), c)
+	if err != nil {
+		writeJSON(map[string]any{"status": "error", "uid": c.UID, "message": err.Error()})
+		return 0
+	}
+
+	writeJSON(map[string]any{
+		"status":       "ok",
+		"uid":          c.UID,
+		"remaining":    q.Remaining,
+		"total":        q.Total,
+		"used":         q.Used,
+		"exceeded":     q.Exceeded,
+		"planTierName": q.PlanTierName,
+		"usagePercent": q.UsagePercent,
+		// 到期时刻（Unix 秒）；0 = 未知或永不过期
+		"expiresAt": q.ExpiresAt,
+	})
+	return 0
+}
+
+// runModels 查一个账号实际可用的模型并输出 JSON。
+//
+// 用法：`qoder-login models --uid <uid> --auth-dir <dir>`
+//
+// ⚠ 是**按账号**查（走该账号的凭证）：Qoder 不同区域的可用模型不同，
+// 全局列表会误导用户以为自己能用某个模型。
+func runModels(args []string, defaultAuthDir string) int {
+	fs := flag.NewFlagSet("qoder-login models", flag.ContinueOnError)
+	uid := fs.String("uid", "", "账号 uid")
+	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if strings.TrimSpace(*uid) == "" {
+		fmt.Fprintln(os.Stderr, "缺少 --uid 参数")
+		return 2
+	}
+
+	c, err := loadCredByUID(*authDir, *uid)
+	if err != nil {
+		writeJSON(map[string]any{"status": "error", "uid": *uid, "message": err.Error()})
+		return 0
+	}
+
+	cli := New()
+	models, err := cli.FetchModels(context.Background(), c)
+	if err != nil {
+		writeJSON(map[string]any{"status": "error", "uid": c.UID, "message": err.Error()})
+		return 0
+	}
+
+	list := make([]map[string]any, 0, len(models))
+	for _, m := range models {
+		list = append(list, map[string]any{
+			"key":            m.Key,
+			"displayName":    m.DisplayName,
+			"enable":         m.Enable,
+			"isReasoning":    m.IsReasoning,
+			"isVL":           m.IsVL,
+			"maxInputTokens": m.MaxInputTokens,
+			"priceFactor":    m.PriceFactor,
+		})
+	}
+
+	writeJSON(map[string]any{
+		"status": "ok",
+		"uid":    c.UID,
+		"count":  len(list),
+		"models": list,
+	})
+	return 0
+}
+
+// loadCredByUID 在凭证目录里按 uid 找凭证。
+//
+// 文件名规则见 `DefaultAuthDir` 的说明（`qoder-<uid>.json`）。
+// 找不到时回退到逐个加载比对 —— 用户手工放的文件名可能不同。
+func loadCredByUID(dir, uid string) (*Cred, error) {
+	cands := []string{
+		filepath.Join(dir, "qoder-"+sanitizeUID(uid)+".json"),
+		filepath.Join(dir, sanitizeUID(uid)+".json"),
+	}
+	for _, p := range cands {
+		if _, err := os.Stat(p); err == nil {
+			return LoadFile(p)
+		}
+	}
+	creds, _, _ := LoadDir(dir)
+	for _, c := range creds {
+		if c.UID == uid {
+			return c, nil
+		}
+	}
+	return nil, fmt.Errorf("在 %s 里找不到 uid=%s 的凭证", dir, uid)
 }
 
 // runImportClient 读客户端登录态并落成我们的凭证文件。
@@ -265,6 +402,9 @@ func runImportClient(args []string, defaultAuthDir string) int {
 		"file":      filepath.Base(c.FilePath),
 		"clientDir": dir,
 		"expiresAt": auth.ExpiresAt,
+		// 头像：使用者的反馈是"已授权后不显示头像"，
+		// 而客户端登录态里本来就有 `user.avatarUrl`。
+		"avatarUrl": auth.User.AvatarURL,
 	})
 	return 0
 }

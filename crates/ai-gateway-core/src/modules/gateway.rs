@@ -1919,6 +1919,73 @@ fn gateway_account_identities() -> Value {
     json!(items)
 }
 
+/// 汇总各产品**实际可用**的模型，供网关的 `/v1/models` 打渠道标签。
+///
+/// # 为什么要这个
+///
+/// 使用者的需求：「智能体管理,哪里显示出来的模型,现在可以加一个渠道,
+/// 是来自于哪个平台,如果重叠,就显示多个平台」。
+///
+/// 而网关的 `/v1/models` 此前**只列 WorkBuddy 的模型** ——
+/// Qoder（Qwen3.8-*）与 ZCode（glm-*）的模型根本不在里面
+///（实测：30 个模型的 `owned_by` 只有 workbuddy / workbuddy-intl，
+/// 那是**区域**不是平台）。故用 Qoder 或 ZCode 账号时，客户端模型菜单里
+/// 看不到它们。
+///
+/// # 数据来源
+///
+/// 每个账号的可用模型由「刷新账号」时查得并落进账号库
+///（`ZcodeAccount::models` / `QoderAccount::models`）。这里做**并集**：
+/// 同一产品下多个账号的模型合并去重并按名排序（顺序稳定，便于 diff）。
+///
+/// 返回形状：`{"qoder":["Qwen3.8-Max"],"zcode":["glm-5.3","glm-5.3-flash"]}`
+///
+/// # 为什么不在这里查上游
+///
+/// 写配置发生在**启动 / 保存设置**时，查上游会阻塞且可能失败 ——
+/// 一份过期缓存远好过一次启动失败。用户点「刷新账号」时更新缓存。
+fn product_models_for_gateway() -> Value {
+    let mut out = serde_json::Map::new();
+
+    if let Ok(accounts) = crate::modules::zcode_account::load_accounts() {
+        if let Some(ids) = union_models(accounts.iter().map(|a| a.models.as_slice())) {
+            out.insert("zcode".into(), json!(ids));
+        }
+    }
+    if let Ok(accounts) = crate::modules::qoder_account::load_accounts() {
+        if let Some(ids) = union_models(accounts.iter().map(|a| a.models.as_slice())) {
+            out.insert("qoder".into(), json!(ids));
+        }
+    }
+
+    Value::Object(out)
+}
+
+/// 把多份模型清单并成一份去重、排序后的列表；全空时返回 None。
+///
+/// 返回 None 而不是空数组：调用方据此**不写**该产品的键，
+/// 于是网关那边也不会给出一个空的渠道标签（"这个模型来自 ZCode，
+/// 但 ZCode 一个模型都没有"是自相矛盾的）。
+fn union_models<'a, I>(lists: I) -> Option<Vec<String>>
+where
+    I: Iterator<Item = &'a [String]>,
+{
+    let mut ids: Vec<String> = Vec::new();
+    for list in lists {
+        for m in list {
+            let id = m.trim();
+            if !id.is_empty() && !ids.iter().any(|x| x == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    if ids.is_empty() {
+        return None;
+    }
+    ids.sort();
+    Some(ids)
+}
+
 /// 归一化自定义提示词模式。
 ///
 /// 只认 `custom`（大小写与首尾空白不敏感），其余一律回落 `passthrough`。
@@ -2079,6 +2146,13 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
             // 这里以宿主的真实目录为准，Go 侧拿到的一定是有效的。
             "qoder_auth_dir": crate::modules::qoder_account::auth_dir().to_string_lossy(),
             "zcode_auth_dir": crate::modules::zcode_account::auth_dir().to_string_lossy(),
+            // 各产品**实际可用**的模型清单 —— 供 `/v1/models` 的 `channels`
+            // 字段（"这个模型来自哪个平台"）。
+            //
+            // 为什么由宿主算好透传：`/v1/models` 在**请求路径**上，在那里
+            // 发外部请求会带来延迟与失败面；而"某产品账号能用哪些模型"
+            // 只有宿主知道（它持有账号库、刷新账号时已查过）。
+            "product_models": product_models_for_gateway(),
         },
         "session_sticky": { "enabled": true, "ttl": "30m", "gc_interval": "5m" },
         // ---- 账号记录回写（养号任务的执行痕迹）----

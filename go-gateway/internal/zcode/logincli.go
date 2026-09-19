@@ -122,6 +122,27 @@ func RunLoginCLI(args []string, defaultAuthDir string) int {
 		return runPoll(args[1:], defaultAuthDir)
 	case "import":
 		return runImport(args[1:], defaultAuthDir)
+	case "quota":
+		// 查额度并输出 JSON。
+		//
+		// ## 为什么需要子命令
+		//
+		// `Client.FetchQuota` 早就实现了，但**从来没有生产者调用它** ——
+		// 实测确认（`grep FetchQuota` 只有测试与定义本身）。于是界面上
+		// 额度恒为 0、到期时间恒为空，用户以为"查不到额度"。
+		//
+		// 宿主侧要的是「按 uid 查一次并拿回结构化结果」，故这里给一个
+		// CLI 入口，形状与 import 一致（单行 JSON）。
+		return runQuota(args[1:], defaultAuthDir)
+	case "models":
+		// 查该账号**实际可用**的模型清单。
+		//
+		// 同理：`Client.FetchModels` 早已实现，但没有生产者调用 ——
+		// 界面上看不到"这个账号能用哪些模型"。
+		//
+		// ⚠ 是**按账号**查（走该账号的凭证），不是查全局清单：
+		// 不同账号/服务商的可用模型不同，全局列表会误导。
+		return runModels(args[1:], defaultAuthDir)
 	default:
 		fmt.Fprintf(os.Stderr, "未知子命令 %q（应为 start / poll / import）\n", args[0])
 		return 2
@@ -232,7 +253,162 @@ func runPoll(args []string, defaultAuthDir string) int {
 //
 // ZCode 与 Qoder 不同：凭证是用户能从控制台复制的字符串，
 // 故"粘贴导入"比 OAuth 更常用。
-// jwtIssuedAt 从 JWT 里读出 `iat`（签发时刻），**不验签**。
+// runQuota 查一个账号的额度并输出 JSON。
+//
+// 用法：`zcode-login quota --uid <uid> --auth-dir <dir>`
+//
+// 输出（成功）：
+//
+//	{"status":"ok","uid":"...","remaining":N,"total":N,"used":N,
+//	 "expiresAt":<Unix 秒>,"entries":[{"showName":"...","remaining":N,...}]}
+//
+// 输出（该账号没有 JWT —— 只导入了凭证，额度查不到）：
+//
+//	{"status":"no_jwt","uid":"...","message":"..."}
+//
+// ⚠ `no_jwt` 是**正常状态**而不是错误：ZCode 的额度查询只认 JWT，
+// 而只导入对话凭证的账号本来就没有。宿主据此显示「额度未知」
+// 而不是 0（0 会被用户误读成"额度耗尽"）。
+func runQuota(args []string, defaultAuthDir string) int {
+	fs := flag.NewFlagSet("zcode-login quota", flag.ContinueOnError)
+	uid := fs.String("uid", "", "账号 uid")
+	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if strings.TrimSpace(*uid) == "" {
+		fmt.Fprintln(os.Stderr, "缺少 --uid 参数")
+		return 2
+	}
+
+	c, err := loadCredByUID(*authDir, *uid)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		return 1
+	}
+
+	if strings.TrimSpace(c.JWT) == "" {
+		// 如实说明原因，而不是报错或返回 0
+		writeJSON(map[string]any{
+			"status":  "no_jwt",
+			"uid":     c.UID,
+			"message": "该账号只导入了对话凭证，没有额度查询用的 JWT",
+		})
+		return 0
+	}
+
+	cli := New()
+	q, err := cli.FetchQuota(context.Background(), c)
+	if err != nil {
+		// 把上游错误回传（宿主据此显示具体原因），但**退出码为 0** ——
+		// "查不到额度"不是命令执行失败，不该让调用方当成崩溃。
+		writeJSON(map[string]any{
+			"status":  "error",
+			"uid":     c.UID,
+			"message": err.Error(),
+		})
+		return 0
+	}
+
+	entries := make([]map[string]any, 0, len(q.Entries))
+	for _, e := range q.Entries {
+		entries = append(entries, map[string]any{
+			"showName":  e.ShowName,
+			"remaining": e.Remaining,
+			"total":     e.Total,
+			"used":      e.Used,
+			"unitType":  e.UnitType,
+			"expiresAt": e.ExpiresAt,
+		})
+	}
+
+	writeJSON(map[string]any{
+		"status":    "ok",
+		"uid":       c.UID,
+		"remaining": q.Remaining,
+		"total":     q.Total,
+		"used":      q.Used,
+		// 最早到期时刻 —— 界面用它显示"最快要过期的额度"
+		"expiresAt": q.SoonestExpiry(),
+		"entries":   entries,
+	})
+	return 0
+}
+
+// runModels 查一个账号实际可用的模型并输出 JSON。
+//
+// 用法：`zcode-login models --uid <uid> --auth-dir <dir>`
+//
+// 输出：`{"status":"ok","uid":...,"count":N,"models":[{"id":..,"name":..,"contextWindow":..,"maxOutput":..,"reasoning":..,"vision":..}]}`
+//
+// 失败时同样返回 `{"status":"error",...}` 且退出码 0 —— 见 runQuota 的说明。
+func runModels(args []string, defaultAuthDir string) int {
+	fs := flag.NewFlagSet("zcode-login models", flag.ContinueOnError)
+	uid := fs.String("uid", "", "账号 uid")
+	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if strings.TrimSpace(*uid) == "" {
+		fmt.Fprintln(os.Stderr, "缺少 --uid 参数")
+		return 2
+	}
+
+	c, err := loadCredByUID(*authDir, *uid)
+	if err != nil {
+		writeJSON(map[string]any{"status": "error", "uid": *uid, "message": err.Error()})
+		return 0
+	}
+
+	cli := New()
+	models, err := cli.FetchModels(context.Background(), c)
+	if err != nil {
+		writeJSON(map[string]any{"status": "error", "uid": c.UID, "message": err.Error()})
+		return 0
+	}
+
+	list := make([]map[string]any, 0, len(models))
+	for _, m := range models {
+		list = append(list, map[string]any{
+			"id":            m.ID,
+			"name":          m.Name,
+			"contextWindow": m.ContextWindow,
+			"maxOutput":     m.MaxOutput,
+			"reasoning":     m.Reasoning,
+			"vision":        m.Vision,
+			// builtin 来源 = 上游拿不到时的离线兜底清单
+			"source": m.Source,
+		})
+	}
+
+	writeJSON(map[string]any{
+		"status": "ok",
+		"uid":    c.UID,
+		"count":  len(list),
+		"models": list,
+	})
+	return 0
+}
+
+func loadCredByUID(dir, uid string) (*Cred, error) {
+	want := uid
+	if !strings.HasPrefix(want, "zcode-") {
+		want = "zcode-" + want
+	}
+	p := filepath.Join(dir, want+".json")
+	if _, err := os.Stat(p); err == nil {
+		return LoadFile(p)
+	}
+	// 回退：文件名可能与 uid 不同（用户手工放的文件），逐个比对
+	creds, _, _ := LoadDir(dir)
+	for _, c := range creds {
+		if c.UID == uid || c.UID == want {
+			return c, nil
+		}
+	}
+	return nil, fmt.Errorf("在 %s 里找不到 uid=%s 的凭证", dir, uid)
+}
+
 //
 // 只用于展示 token 年龄（排障用）。参考实现明确说明：这个 JWT
 // **没有 exp 字段**、不因时间过期 —— 故**不能**据此判断"是否过期"，
@@ -304,6 +480,8 @@ func runImport(args []string, defaultAuthDir string) int {
 	if strings.TrimSpace(*jwt) != "" {
 		cred.JWT = strings.TrimSpace(*jwt)
 		cred.JWTIssuedAt = jwtIssuedAt(cred.JWT)
+		// 上游账号标识 —— 让界面能识别"同一账号的多把 key"
+		cred.AccountID = AccountIDFromJWT(cred.JWT)
 	}
 
 	if err := os.MkdirAll(*authDir, 0o700); err != nil {

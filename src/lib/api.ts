@@ -245,6 +245,8 @@ const ROUTES: Record<string, Route> = {
   zcode_import_from_dir: { method: "POST", path: "/api/zcode/import-dir" },
   zcode_scan_local: { method: "POST", path: "/api/zcode/scan-local" },
   zcode_import_scanned: { method: "POST", path: "/api/zcode/import-scanned" },
+  zcode_refresh_account: { method: "POST", path: "/api/zcode/refresh-account" },
+  qoder_refresh_account: { method: "POST", path: "/api/qoder/refresh-account" },
   zcode_login_start: { method: "POST", path: "/api/zcode/login/start" },
   zcode_login_poll: { method: "POST", path: "/api/zcode/login/poll" },
 };
@@ -1239,6 +1241,10 @@ export interface QoderAccount {
   creditsTotal: number;
   /** 最近到期时刻（Unix 秒）；0 = 未知。 */
   expireAt: number;
+  /** 头像 URL（来自客户端登录态 `auth.v1.dat` 的 `user.avatarUrl`）。 */
+  avatarUrl?: string;
+  /** 该账号实际可用的模型（刷新账号时查得）。 */
+  models?: string[];
 }
 
 /** 列表项：账号 + 凭证是否存在。 */
@@ -1343,6 +1349,81 @@ export function qoderImportFromClient(clientDir = ""): Promise<QoderClientImport
   return call<QoderClientImportResult>("qoder_import_from_client", { clientDir });
 }
 
+/**
+ * 刷新账号的额度 / 到期时间 / 支持模型。
+ *
+ * ## 为什么需要它
+ *
+ * 后端的 `FetchQuota` / `FetchModels` 早就实现了，但**没有任何生产者
+ * 调用** —— 于是界面上额度恒为 0、到期时间恒为空、看不到支持模型。
+ * 这个接口补上那条链路（结果会写回账号库）。
+ *
+ * `quota.error` 有值表示"查不到额度"（原因在里面），
+ * 此时 `quota.remaining` 为 null —— 界面应显示「未知」而不是 0，
+ * 因为 0 会被用户误读成"额度耗尽"。
+ */
+export interface RefreshAccountResult {
+  status: string;
+  account: Record<string, unknown>;
+  quota: {
+    remaining: number | null;
+    total: number | null;
+    expiresAt: number | null;
+    /** Qoder：用量百分比（0..1）。 */
+    usagePercent?: number;
+    /** Qoder：套餐/账号等级。 */
+    planTierName?: string;
+    /** Qoder：上游是否判定超额（新账号也会为 true，见后端注释）。 */
+    exceeded?: boolean;
+    /** ZCode：额度明细（可能多项）。 */
+    entries?: Array<{
+      showName: string;
+      remaining: number;
+      total: number;
+      used: number;
+      unitType: string;
+      expiresAt: number;
+    }>;
+    /** 非空表示查不到额度，内容是可读原因。 */
+    error: string | null;
+  };
+  /** 该账号可用的模型（空数组表示没拿到）。 */
+  models: AccountModel[];
+  /** 非空表示模型清单没拿到。 */
+  modelsError: string | null;
+}
+
+/** 账号可用模型的统一形状（两个产品的字段归一到这里）。 */
+export interface AccountModel {
+  /** ZCode：模型 id（如 `glm-5.3`）。 */
+  id?: string;
+  /** ZCode：展示名。 */
+  name?: string;
+  /** Qoder：上游模型 key。 */
+  key?: string;
+  /** Qoder：展示名。 */
+  displayName?: string;
+  /** ZCode。 */
+  contextWindow?: number;
+  maxOutput?: number;
+  /** Qoder。 */
+  maxInputTokens?: number;
+  /** 是否推理模型。 */
+  reasoning?: boolean;
+  isReasoning?: boolean;
+  /** 是否视觉模型。 */
+  vision?: boolean;
+  isVL?: boolean;
+  /** ZCode：来源 `upstream` / `builtin`。 */
+  source?: string;
+  /** Qoder：是否启用。 */
+  enable?: boolean;
+}
+
+export function qoderRefreshAccount(uid: string): Promise<RefreshAccountResult> {
+  return call<RefreshAccountResult>("qoder_refresh_account", { uid });
+}
+
 // ---------------------------------------------------------------------------
 // ZCode（Z.AI / 智谱 GLM 编码套餐）
 // ---------------------------------------------------------------------------
@@ -1375,6 +1456,17 @@ export interface ZcodeAccount {
   creditsTotal: number;
   /** 最近到期时刻（Unix 秒）；0 = 未知。 */
   expireAt: number;
+  /** 头像 URL（来自客户端登录态 `credentials.json`）；空 = 没有。 */
+  avatarUrl?: string;
+  /**
+   * 上游**账号**标识（如 `19331730795565300`）；空 = 未知。
+   *
+   * 用途：识别「同一账号的多把 API key」—— 它们的 `uid` 不同
+   *（uid 是凭证哈希），但 `accountId` 相同，在用户看来就是重复。
+   */
+  accountId?: string;
+  /** 该账号实际可用的模型 id（刷新账号时查得）。 */
+  models?: string[];
 }
 
 /** 列表项：账号 + 凭证是否存在。 */
@@ -1548,6 +1640,11 @@ export interface ZcodeImportScannedResult {
 
 export function zcodeImportScanned(indices: number[]): Promise<ZcodeImportScannedResult> {
   return call<ZcodeImportScannedResult>("zcode_import_scanned", { indices });
+}
+
+/** 刷新 ZCode 账号的额度 / 到期 / 支持模型（形状与 Qoder 侧相同）。 */
+export function zcodeRefreshAccount(uid: string): Promise<RefreshAccountResult> {
+  return call<RefreshAccountResult>("zcode_refresh_account", { uid });
 }
 
 /** 发起 ZCode 登录（OAuth 设备流，备选路径）。 */

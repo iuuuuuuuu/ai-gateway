@@ -14,6 +14,7 @@ import {
   Upload,
 } from "lucide-react";
 import { ZcodeMark } from "@/components/product-marks";
+import { openInDefaultBrowser } from "@/lib/open-browser";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -309,7 +310,21 @@ export default function ZcodePage() {
       const r = await api.zcodeLoginStart(loginProvider);
       setLoginUrl(r.authUrl);
       setLoginState("waiting");
-      window.open(r.authUrl, "_blank", "noopener,noreferrer");
+      // 在**系统默认浏览器**里打开（不是 WebView 内的新窗口）。
+      //
+      // 此前用 window.open —— 在 Tauri 的 WebView 里它不会交给系统浏览器，
+      // 表现为"点了没反应"。见 lib/open-browser.ts 的说明。
+      //
+      // 打开失败**不算登录失败**：弹窗里已经显示可复制的链接与可点的
+      // 原生 <a>，用户仍能继续。故这里只记一个提示，不改登录状态机。
+      try {
+        await openInDefaultBrowser(r.authUrl);
+      } catch (e) {
+        setLoginError(
+          `未能自动打开浏览器（${e instanceof Error ? e.message : String(e)}）。` +
+            `请点下面的链接手动打开。`,
+        );
+      }
       pollTimer.current = window.setTimeout(() => void pollOnce(r.sessionId), 2500);
     } catch (e) {
       setLoginState("error");
@@ -327,6 +342,51 @@ export default function ZcodePage() {
     setLoginError(null);
     setLoginProvider("");
   }, [stopPolling]);
+
+  /**
+   * 刷新单个账号的额度 / 到期时间 / 支持模型。
+   *
+   * ## 为什么必须有这个按钮
+   *
+   * 后端的 `FetchQuota` / `FetchModels` 早已实现，但**没有任何生产者
+   * 调用**（实测 `grep FetchQuota` 只命中定义与测试）—— 于是额度恒为 0
+   *（界面显示"未知"）、到期恒为空、看不到支持模型。用户看到的现象
+   * 就是"查不到额度"。
+   *
+   * 这个按钮补上那条链路：调后端查一次并落库，然后重载列表。
+   *
+   * ## 为什么要显示具体的失败原因
+   *
+   * 取不到的原因有多种（没有 JWT、上游不认、该账号真没额度），
+   * 用户需要知道是哪种才能决定下一步。故把 `quota.error` /
+   * `modelsError` 原样提示，而不是笼统的"刷新失败"。
+   */
+  const refreshAccount = useCallback(
+    async (row: ZcodeAccountRow) => {
+      setBusy(`refresh:${row.uid}`);
+      try {
+        const r = await api.zcodeRefreshAccount(row.uid);
+        const parts: string[] = [];
+        if (r.quota.error) {
+          parts.push(`额度：${r.quota.error}`);
+        } else if (r.quota.remaining !== null && r.quota.remaining !== undefined) {
+          parts.push(`额度 ${r.quota.remaining.toLocaleString()}`);
+        }
+        if (r.modelsError) {
+          parts.push(`模型：${r.modelsError}`);
+        } else if (r.models.length > 0) {
+          parts.push(`模型 ${r.models.length} 个`);
+        }
+        toast.success(parts.length ? `已刷新：${parts.join("；")}` : "已刷新", { duration: 6000 });
+        void refresh();
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : String(e));
+      } finally {
+        setBusy(null);
+      }
+    },
+    [refresh],
+  );
 
   const toggleDisabled = useCallback(async (row: ZcodeAccountRow) => {
     setBusy(row.uid);
@@ -554,6 +614,7 @@ export default function ZcodePage() {
                       <th className="py-2 pr-3 font-medium">服务商</th>
                       <th className="py-2 pr-3 font-medium">状态</th>
                       <th className="py-2 pr-3 font-medium">额度</th>
+                      <th className="py-2 pr-3 font-medium">支持模型</th>
                       <th className="py-2 pr-3 font-medium">到期</th>
                       <th className="py-2 pr-3 font-medium">备注</th>
                       <th className="py-2 text-right font-medium">操作</th>
@@ -565,9 +626,32 @@ export default function ZcodePage() {
                       return (
                         <tr key={row.uid} className="border-b last:border-0">
                           <td className="py-3 pr-3">
-                            <div className="font-medium">{row.nickname || "（未命名）"}</div>
-                            <div className="font-mono text-xs text-muted-foreground">
-                              {row.uid.slice(0, 16)}
+                            {/* 头像 + 名称。
+                                使用者的反馈：「已授权后,也不显示头像,也不显示名称」。
+                                两者都来自客户端登录态（`oauth:*:user_info`），
+                                由「刷新」按钮拉到并落进账号库。 */}
+                            <div className="flex items-center gap-2.5">
+                              {row.avatarUrl ? (
+                                <img
+                                  src={row.avatarUrl}
+                                  alt=""
+                                  className="size-8 shrink-0 rounded-full object-cover"
+                                  // 头像加载失败（图床被墙/链接过期）时不留破图
+                                  onError={(e) => {
+                                    (e.currentTarget as HTMLImageElement).style.display = "none";
+                                  }}
+                                />
+                              ) : (
+                                <div className="flex size-8 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-semibold text-muted-foreground">
+                                  {(row.nickname || row.uid).charAt(0).toUpperCase()}
+                                </div>
+                              )}
+                              <div className="min-w-0">
+                                <div className="truncate font-medium">{row.nickname || "（未命名）"}</div>
+                                <div className="font-mono text-xs text-muted-foreground">
+                                  {row.uid.slice(0, 16)}
+                                </div>
+                              </div>
                             </div>
                           </td>
                           <td className="py-3 pr-3">
@@ -615,10 +699,33 @@ export default function ZcodePage() {
                                     未知
                                   </span>
                                 </TooltipTrigger>
-                                <TooltipContent>
-                                  额度查询需要浏览器授权登录；只粘贴凭证的账号查不到额度，但不影响使用
+                                <TooltipContent className="max-w-xs">
+                                  尚未查询到额度。点该行的
+                                  <span className="mx-1 font-medium">刷新</span>
+                                  按钮可立即查询。
                                 </TooltipContent>
                               </Tooltip>
+                            )}
+                          </td>
+                          {/* 支持模型：该账号**实际可用**的模型（刷新账号时查得）。
+                              此前没有这一列，用户看不到自己能调哪些模型。 */}
+                          <td className="max-w-[16rem] py-3 pr-3">
+                            {row.models && row.models.length > 0 ? (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="cursor-help text-muted-foreground">
+                                    {row.models.length} 个
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent className="max-w-sm">
+                                  <div className="font-medium">可用模型</div>
+                                  <div className="mt-1 font-mono text-xs">
+                                    {row.models.join("、")}
+                                  </div>
+                                </TooltipContent>
+                              </Tooltip>
+                            ) : (
+                              <span className="text-muted-foreground">—</span>
                             )}
                           </td>
                           <td className={cn("py-3 pr-3", exp.urgent && "text-amber-600")}>{exp.text}</td>
@@ -627,6 +734,28 @@ export default function ZcodePage() {
                           </td>
                           <td className="py-3 text-right">
                             <div className="flex justify-end gap-1">
+                              {/* 刷新额度 / 到期 / 支持模型。
+                                  没有这个入口时，后端那三个查询**没有任何
+                                  调用者** —— 用户永远看到"额度未知"。 */}
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    disabled={busy === `refresh:${row.uid}`}
+                                    aria-label={`刷新额度与模型：${row.nickname || row.uid}`}
+                                    onClick={() => void refreshAccount(row)}
+                                  >
+                                    <RefreshCw
+                                      className={cn(
+                                        "h-4 w-4",
+                                        busy === `refresh:${row.uid}` && "animate-spin",
+                                      )}
+                                    />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent>刷新额度、到期与支持模型</TooltipContent>
+                              </Tooltip>
                               <Tooltip>
                                 <TooltipTrigger asChild>
                                   <Button

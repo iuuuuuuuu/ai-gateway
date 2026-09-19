@@ -425,6 +425,12 @@ func main() {
 		// 老配置的 `allowed_model` 字符串由 AllowedModels.UnmarshalJSON 读成
 		// 单元素切片，因此老配置升级后行为逐字不变。
 		AllowedModels: cfg.Pool.AllowedModels,
+		// 各产品**实际可用**的模型清单 —— 供 `/v1/models` 的 `channels`
+		// 字段（"这个模型来自哪个平台"）。
+		//
+		// 由宿主透传（见 config.Pool.ProductModels 的说明）：
+		// `/v1/models` 在请求路径上，不该在那里发外部请求去问上游。
+		ProductModels: cfg.Pool.ProductModels,
 		// 系统提示词替换：mode 缺省 passthrough（透传客户端原始 system），
 		// custom 时用 PromptText（normalizePrompt 已读完盘并缓存）替换
 		// 客户端的 system/developer 消息。

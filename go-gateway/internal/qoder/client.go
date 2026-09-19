@@ -274,22 +274,72 @@ func (c *Client) streamHTTP() *http.Client {
 // ---------------------------------------------------------------------------
 
 // Quota 账号额度（剩余 / 总量）。
+//
+// 字段与上游实测响应一一对应（见 FetchQuota 的注释）——
+// 改字段名前请先回去核对那份响应，不要凭直觉调整。
 type Quota struct {
 	// Remaining 剩余额度（用户套餐 + 附加包）。
 	Remaining int64
 	// Total 总额度。
 	Total int64
+	// Used 已用额度。
+	Used int64
 	// Exceeded 上游是否判定已超额。
+	//
+	// ⚠ 新账号也会返回 true（`total` 为 0 时）—— 那不是"用超了"，
+	// 而是"还没有可用额度"。界面应结合 Total 判断，别只报"已超额"。
 	Exceeded bool
-	// PlanTierName 套餐名（可能为空）。
+	// PlanTierName 套餐/账号等级。
+	//
+	// 实测来自 `userType`（如 `personal_standard`）；
+	// 参考实现里的 `planTierName` 字段**在上游响应中并不存在**。
 	PlanTierName string
+	// UsagePercent 用量百分比（0..1）。
+	UsagePercent float64
+	// ExpiresAt 到期时刻（Unix **秒**）；0 = 未知/永不过期。
+	//
+	// 上游给的是**毫秒**且"永不过期"用 253402214400000（9999 年）表示，
+	// FetchQuota 会把它归零。
+	ExpiresAt int64
 }
 
 // FetchQuota 查询额度（不签名）。
 //
-// 用途：跨产品路由的**成本信号**（剩余比例），以及界面上展示余额。
-// 上游把额度分成 userQuota 与 addOnQuota 两块，本方法把两者相加 ——
-// 用户关心的是"还能用多少"，分开显示没有意义。
+// ## 实测的真实响应结构（2026-09-19 抓到）
+//
+// ```json
+// {
+//   "userId": "019f1772-...",
+//   "userType": "personal_standard",
+//   "usageType": "credits",
+//   "totalUsagePercentage": 0.0,
+//   "isQuotaExceeded": true,
+//   "expiresAt": 253402214400000,
+//   "upgradeUrl": "https://qoder.com.cn/pricing?client=qoder",
+//   "outerProviders": [],
+//   "userQuota": {"total":0.0,"used":0.0,"remaining":0.0,"percentage":0.0,"unit":"credits"},
+//   "isPlanQuotaProrated": false
+// }
+// ```
+//
+// ## ⚠ 我漏掉的三个字段（都真实存在，都有用）
+//
+//   1. **`expiresAt`** —— 到期时间（**毫秒**，不是秒）。
+//      这是所有者明确要的「到期时间」，而我第一版完全没解析它。
+//   2. `totalUsagePercentage` —— 用量百分比。比 remaining 更能说明
+//      "用了多少"：有些套餐 remaining 恒为 0 但 percentage 有意义。
+//   3. `userType` —— 账号等级，界面上比空白的"套餐名"有信息量。
+//
+// ## `planTierName` 是我的臆造
+//
+// 我照参考实现写了 `planTierName`，但实测响应里**根本没有这个字段** ——
+// 所以界面上的"套餐名"永远是空。现在改用真实存在的 `userType`。
+//
+// ## 谨慎处理"看起来超额"的情况
+//
+// 新账号会返回 `isQuotaExceeded: true` 且 `total: 0` —— 那不是真正的
+// "超额"，而是"还没有可用额度"（如未领取活动额度）。两者对用户的
+// 行动指引不同，故保留两个信号让界面自己判断。
 func (c *Client) FetchQuota(ctx context.Context, cr *Cred) (*Quota, error) {
 	if cr == nil || cr.DT == "" {
 		return nil, fmt.Errorf("账号没有可用令牌")
@@ -320,25 +370,88 @@ func (c *Client) FetchQuota(ctx context.Context, cr *Cred) (*Quota, error) {
 	var q struct {
 		UserQuota struct {
 			Total     float64 `json:"total"`
+			Used      float64 `json:"used"`
 			Remaining float64 `json:"remaining"`
+			Unit      string  `json:"unit"`
 		} `json:"userQuota"`
 		AddOnQuota struct {
 			Total     float64 `json:"total"`
 			Remaining float64 `json:"remaining"`
 		} `json:"addOnQuota"`
-		IsQuotaExceeded bool   `json:"isQuotaExceeded"`
-		PlanTierName    string `json:"planTierName"`
+		IsQuotaExceeded bool `json:"isQuotaExceeded"`
+		// 用量百分比（0..1）。有些套餐 remaining 恒为 0 但百分比有意义。
+		TotalUsagePercentage float64 `json:"totalUsagePercentage"`
+		// ⚠ **毫秒**时间戳（实测 253402214400000 = 9999-12-31，
+		// 即"永不过期"）。不要当秒用 —— 那会得到公元 10 万年。
+		ExpiresAtMs int64  `json:"expiresAt"`
+		UserType    string `json:"userType"`
+		UsageType   string `json:"usageType"`
+		// 我第一版照参考实现写了这个，但实测响应里没有它 —— 保留解析，
+		// 有就用，没有不猜。
+		PlanTierName string `json:"planTierName"`
 	}
 	if err := json.Unmarshal(raw, &q); err != nil {
 		return nil, fmt.Errorf("额度响应解析失败: %w（原始内容：%s）", err, truncate(string(raw), 160))
 	}
 
+	// 毫秒 → 秒。上限保护：9999 年那种"永不过期"不该原样传给界面，
+	// 否则格式化出来是天文数字。`0` 表示未知。
+	expiresAt := q.ExpiresAtMs / 1000
+	if expiresAt > 4102444800 { // 2100-01-01
+		expiresAt = 0 // 视为"永不过期/未知"
+	}
+
+	// 套餐名：真实字段是 userType；planTierName 只在有值时用
+	plan := q.PlanTierName
+	if plan == "" {
+		plan = q.UserType
+	}
+
 	return &Quota{
 		Remaining:    int64(q.UserQuota.Remaining + q.AddOnQuota.Remaining),
 		Total:        int64(q.UserQuota.Total + q.AddOnQuota.Total),
+		Used:         int64(q.UserQuota.Used),
 		Exceeded:     q.IsQuotaExceeded,
-		PlanTierName: q.PlanTierName,
+		PlanTierName: plan,
+		UsagePercent: q.TotalUsagePercentage,
+		ExpiresAt:    expiresAt,
 	}, nil
+}
+
+// fetchQuotaRaw 打额度端点并返回**原始响应体**。
+//
+// ## 为什么需要它
+//
+// `FetchQuota` 把响应解析成 `{remaining,total}`。当字段名与我们对不上时，
+// 它会静默返回 0 —— 而那在界面上看起来就像"这个账号没额度"。
+//
+// 实测确认过于此：新登录的账号（客户端里明明能用）返回
+// `{"remaining":0,"total":0,"exceeded":true}` —— 而我当时无从判断
+// 是"真的超额"还是"字段没对上"。看原始 body 才能分辨。
+//
+// 生产路径不走它；它是**排障与字段核对**用的（见 uitest 的诊断脚本）。
+func (c *Client) fetchQuotaRaw(ctx context.Context, cr *Cred) (string, error) {
+	if cr == nil || cr.DT == "" {
+		return "", fmt.Errorf("账号没有可用令牌")
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.timeout())
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cr.Region.OpenAPI()+"/api/v2/quota/usage", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+cr.DT)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Go-http-client/2.0")
+
+	resp, err := c.http().Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return fmt.Sprintf("HTTP %d\n%s", resp.StatusCode, string(raw)), nil
 }
 
 // UserInfo 用户信息（不签名）。

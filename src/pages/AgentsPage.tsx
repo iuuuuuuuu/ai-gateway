@@ -495,6 +495,26 @@ export default function AgentsPage() {
     [capabilityViews],
   );
 
+  /**
+   * 一个模型来自哪些平台（供窄 chip 的悬浮说明用）。
+   *
+   * 需求：「可以加一个渠道，是来自于哪个平台，如果重叠，就显示多个平台」。
+   *
+   * 大卡片上直接显示 chip（见 data-slot="agent-model-channels"），
+   * 这里只是给**窄 chip** 用的文字版 —— 那里放不下标签，
+   * 但悬浮时用户仍要知道这个模型来自哪。
+   *
+   * 未声明（旧网关没这个字段）时返回 undefined，而不是"未知平台"——
+   * 后者会让用户以为网关知道但没告诉我们。
+   */
+  const channelSummaryOf = useCallback(
+    (m: GatewayModelItem): string | undefined => {
+      if (!m.channels || m.channels.length === 0) return undefined;
+      return `来自 ${m.channels.map((c) => c.label).join(" / ")}`;
+    },
+    [],
+  );
+
   return (
     <div className="mx-auto max-w-6xl space-y-5 p-4 sm:p-6">
       {/* 顶部主横幅与一键更新操作栏 */}
@@ -738,6 +758,33 @@ export default function AgentsPage() {
                         相关字段仍由网关下发（/v1/models 的 supported_efforts 等），
                         需要时可随时恢复展示。 */}
                     <ModelCapabilityRow vision={view.vision} region={view.region} />
+
+                    {/* 渠道：这个模型来自哪个平台。
+                        所有者的需求：「可以加一个渠道，是来自于哪个平台，
+                        如果重叠，就显示多个平台」。
+
+                        只在下发时展示（旧网关没有这个字段 = 未声明）。
+                        重叠时每个平台一个 chip —— 那正是需求要的表达。 */}
+                    {m.channels && m.channels.length > 0 && (
+                      <div
+                        className="flex flex-wrap items-center gap-1"
+                        data-slot="agent-model-channels"
+                      >
+                        {m.channels.map((ch) => (
+                          <span
+                            key={ch.product}
+                            className="rounded border border-border/60 bg-muted/50 px-1 py-px text-[9px] leading-4 text-muted-foreground"
+                            title={
+                              ch.regions && ch.regions.length > 0
+                                ? `${ch.label}（${ch.regions.join(" / ")}）`
+                                : ch.label
+                            }
+                          >
+                            {ch.label}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </button>
                 );
               })}
@@ -968,7 +1015,13 @@ export default function AgentsPage() {
                               type="button"
                               data-slot="agent-target-model-toggle"
                               data-model={m.id}
-                              title={capabilityHintOf(m.id)}
+                              title={
+                                // 渠道也进 title：这里 chip 太窄放不下平台标签，
+                                // 但悬浮时用户仍要知道这个模型来自哪。
+                                [capabilityHintOf(m.id), channelSummaryOf(m)]
+                                  .filter(Boolean)
+                                  .join(" · ") || undefined
+                              }
                               onClick={() => toggleTargetModel(target.id, m.id)}
                               className={cn(
                                 "rounded px-1.5 py-0.5 font-mono text-[10px] border transition-colors",

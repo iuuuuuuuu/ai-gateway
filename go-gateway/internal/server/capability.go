@@ -27,6 +27,7 @@ package server
 // 会把「能读图」谎报成事实，客户端据此发出必然被静默降级的请求。
 
 import (
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -453,6 +454,65 @@ func (i *capabilityIndex) lookupRegion(id string, region auth.Region) (regionCap
 //     区域」的真值，另一个区域独有模型靠静态表补 —— 于是同名模型的能力标注
 //     取决于这次探测抽到哪个区，客户端两次启动可能看到不同能力；
 //   - 补进来的静态条目与动态条目在同一个数组里，客户端无法区分。
+// productChannel 一个「模型来自哪个平台」的记录。
+//
+// 使用者的需求：
+//
+//	「智能体管理,哪里显示出来的模型,现在可以加一个渠道,是来自于哪个平台,
+//	  如果重叠,就显示多个平台」
+//
+// ## 为什么需要新字段而不能复用 owned_by
+//
+// `owned_by` 在 OpenAI 惯例里是"归属组织"，我们此前只填了
+// `workbuddy` / `workbuddy-intl` —— 那是**区域**，不是平台。
+// 实测确认（uitest/diag-gateway-model-source.cjs）：30 个模型的
+// owned_by 只有这两个取值，而 Qoder（Qwen3.8）与 ZCode（glm-*）
+// 的模型**根本不在列表里**，因为 `mergedModelList` 只聚合了
+// WorkBuddy 的两区动态清单 + 静态表。
+//
+// 故新增 `channels`：数组，元素是平台标识（`workbuddy` / `qoder` /
+// `zcode`）。用数组而不是单值，正是为了表达"重叠"——
+// 同一个模型名可能同时由多个平台提供（如 `glm-5.3` 既在 ZCode 套餐里、
+// 也可能在 WorkBuddy 的模型清单里），此时要显示多个平台。
+type productChannel struct {
+	// Product 平台标识：workbuddy / qoder / zcode。
+	Product string
+	// Label 给人看的名字（界面直接显示这个）。
+	Label string
+	// Regions 该平台在哪些区域提供此模型（可能为空）。
+	Regions []string
+}
+
+// channelLabels 平台标识 → 显示名。
+//
+// 与账号页用词保持一致（「WorkBuddy」「Qoder」「ZCode」），
+// 避免同一样东西两个页面叫法不同。
+var channelLabels = map[string]string{
+	"workbuddy": "WorkBuddy",
+	"qoder":     "Qoder",
+	"zcode":     "ZCode",
+	"trae":      "Trae",
+	"doubao":    "豆包",
+}
+
+// mergedModelList 生成 /v1/models 的模型清单。
+//
+// ## 渠道（channels）怎么来的
+//
+// 每类平台各贡献一份"它提供哪些模型"：
+//
+//	WorkBuddy → 两区动态清单 + 静态表（既有逻辑）
+//	Qoder     → 账号池里 Qoder 账号实际可用的模型（动态查）
+//	ZCode     → 账号池里 ZCode 账号实际可用的模型（动态查）
+//
+// 同一个 id 被多个来源提供时，`channels` 里就会有多个元素 ——
+// 这正是使用者要的"重叠就显示多个平台"。
+//
+// ## 为什么不在这里给每个平台发网络请求
+//
+// 那是**网关请求路径**上的函数，多一次外部调用就多一份延迟与失败面。
+// 各产品的模型清单由**宿主**（账号页的刷新）预先取好并落盘，
+// 这里只读缓存。见 `probeProducts`。
 func (h *Handler) mergedModelList() []map[string]any {
 	idx := h.buildCapabilityIndex()
 
@@ -498,6 +558,13 @@ func (h *Handler) mergedModelList() []map[string]any {
 		}
 	}
 
+	// 其它产品（Qoder / ZCode）的模型也并入清单 ——
+	// 否则用 Qoder 或 ZCode 账号时，客户端模型菜单里看不到它们。
+	productModels := h.productModels()
+	for _, pm := range productModels {
+		addID(pm.ID)
+	}
+
 	// 动态元数据（context_length/max_output_tokens）比静态表准，优先用。
 	dynMeta := map[string]upstream.ModelInfo{}
 	for _, infos := range [][]upstream.ModelInfo{cnInfos, intlInfos} {
@@ -506,6 +573,33 @@ func (h *Handler) mergedModelList() []map[string]any {
 				dynMeta[mi.ID] = mi
 			}
 		}
+	}
+
+	// 组装：id → 提供它的平台集合
+	channels := map[string][]productChannel{}
+	// WorkBuddy：两区动态清单 + 静态表都算它提供的
+	for _, mi := range cnInfos {
+		channels[mi.ID] = appendChannel(channels[mi.ID], productChannel{Product: "workbuddy", Label: channelLabels["workbuddy"], Regions: []string{"cn"}})
+	}
+	for _, mi := range intlInfos {
+		channels[mi.ID] = appendChannel(channels[mi.ID], productChannel{Product: "workbuddy", Label: channelLabels["workbuddy"], Regions: []string{"intl"}})
+	}
+	for _, entries := range [][]map[string]any{staticModels, staticModelsIntl} {
+		for _, m := range entries {
+			id, _ := m["id"].(string)
+			if id == "" {
+				continue
+			}
+			channels[id] = appendChannel(channels[id], productChannel{Product: "workbuddy", Label: channelLabels["workbuddy"]})
+		}
+	}
+	// Qoder / ZCode：来自账号池的缓存清单
+	for _, pm := range productModels {
+		label := channelLabels[pm.Product]
+		if label == "" {
+			label = pm.Product
+		}
+		channels[pm.ID] = appendChannel(channels[pm.ID], productChannel{Product: pm.Product, Label: label})
 	}
 
 	out := make([]map[string]any, 0, len(order))
@@ -537,7 +631,92 @@ func (h *Handler) mergedModelList() []map[string]any {
 		for k, v := range idx.capabilityFieldsFor(id) {
 			e[k] = v
 		}
+
+		// 渠道字段（使用者要求的「来自哪个平台」）
+		if ch := channels[id]; len(ch) > 0 {
+			e["channels"] = channelsToJSON(ch)
+		}
 		out = append(out, e)
+	}
+	return out
+}
+
+// appendChannel 加一个渠道，去重（同平台只留一条，区域合并）。
+//
+// 去重键是 **Product**：同一平台的多个区域算一条渠道、区域合并显示。
+// 若不去重，WorkBuddy 的国服+国际版会让每个模型都出现两条 "WorkBuddy"，
+// 界面上看起来像重复而不是"两个平台"。
+func appendChannel(list []productChannel, c productChannel) []productChannel {
+	for i := range list {
+		if list[i].Product == c.Product {
+			for _, r := range c.Regions {
+				dup := false
+				for _, have := range list[i].Regions {
+					if have == r {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					list[i].Regions = append(list[i].Regions, r)
+				}
+			}
+			return list
+		}
+	}
+	return append(list, c)
+}
+
+// channelsToJSON 把渠道列表转成下发形状。
+//
+// 同时给 `product`（稳定标识，程序用）与 `label`（显示名，界面用）：
+// 只给标识会让界面自己去映射，只给显示名则界面没法按平台过滤。
+func channelsToJSON(chs []productChannel) []map[string]any {
+	out := make([]map[string]any, 0, len(chs))
+	for _, c := range chs {
+		e := map[string]any{"product": c.Product, "label": c.Label}
+		if len(c.Regions) > 0 {
+			e["regions"] = c.Regions
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// productModel 一个「非 WorkBuddy 平台提供某模型」的记录。
+type productModel struct {
+	ID      string
+	Product string
+}
+
+// productModels 从配置里读出 Qoder / ZCode 提供的模型。
+//
+// ## 为什么从配置读，而不是网关自己去查
+//
+// `/v1/models` 是**请求路径**上的接口 —— 每个客户端列一次模型就打一次
+// 上游会带来延迟与失败面。而"某产品的账号能用哪些模型"只有宿主知道：
+// 它持有账号库，在刷新账号时已查过并缓存（见 refresh_account）。
+//
+// 故宿主把汇总清单放进 `pool.product_models` 透传过来，网关只读 ——
+// 与 `account_records` 的透传方式一致。
+//
+// 配置缺失时返回空：模型清单退化成只有 WorkBuddy 的，**不报错** ——
+// 缺一份可选配置不该让整个 /v1/models 失败。
+func (h *Handler) productModels() []productModel {
+	var out []productModel
+	// 顺序稳定：按产品名排序，让输出的渠道顺序可复现
+	products := make([]string, 0, len(h.cfg.ProductModels))
+	for p := range h.cfg.ProductModels {
+		products = append(products, p)
+	}
+	sort.Strings(products)
+	for _, p := range products {
+		for _, id := range h.cfg.ProductModels[p] {
+			id = strings.TrimSpace(id)
+			if id != "" {
+				out = append(out, productModel{ID: id, Product: p})
+			}
+		}
 	}
 	return out
 }

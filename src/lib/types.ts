@@ -1350,6 +1350,29 @@ export interface GatewayModelItem {
   supported_regions?: string[];
   /** 面向人的区域说明（网关生成，客户端不读时至少人能看见）。 */
   region_note?: string;
+  /**
+   * 该模型**来自哪些平台**（网关生成）。
+   *
+   * 使用者的需求：「哪里显示出来的模型，现在可以加一个渠道，是来自于哪个
+   * 平台，如果重叠，就显示多个平台」。
+   *
+   * 数组而非单值 —— 同一个模型名可能同时由多个平台提供（例如 `glm-5.3`
+   * 既在 ZCode 套餐里、也在 WorkBuddy 的清单里），此时数组有多个元素。
+   *
+   * 旧网关不带这个字段（缺省 = 未声明），界面按"未声明"处理而不是
+   * 当成"没有平台"——后者会给每个模型标一个错误来源。
+   */
+  channels?: ModelChannel[];
+}
+
+/** 模型的一个来源平台。 */
+export interface ModelChannel {
+  /** 稳定标识：`workbuddy` / `qoder` / `zcode`。用于过滤与分组。 */
+  product: string;
+  /** 显示名：`WorkBuddy` / `Qoder` / `ZCode`。界面直接显示。 */
+  label: string;
+  /** 该平台在哪些区域提供此模型（可能缺省）。 */
+  regions?: string[];
 }
 
 /** POST /api/gateway/agents/import 接入响应。 */

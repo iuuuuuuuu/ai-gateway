@@ -180,6 +180,25 @@ type Config struct {
 		//
 		// 同上，必须与宿主侧的 zcode_account::auth_dir() 一致。
 		ZcodeAuthDir string `json:"zcode_auth_dir"`
+
+		// ProductModels 各产品**实际可用**的模型清单（由宿主透传）。
+		//
+		// # 为什么由宿主透传，而不是网关自己去查
+		//
+		// `/v1/models` 是**请求路径**上的接口 —— 在那里发外部请求会带来
+		// 延迟与失败面（每个客户端列一次模型就打一次上游）。
+		//
+		// 而"某产品的账号能用哪些模型"只有宿主知道：它持有账号库、
+		// 在刷新账号时已经查过并按 uid 缓存了（见 zcode/qoder 的
+		// `refresh_account`）。故宿主把**汇总后的清单**放进配置，
+		// 网关只读 —— 与 `account_records` 的透传方式一致。
+		//
+		// 形状：`{"qoder":["qwen3.8-max"],"zcode":["glm-5.3"]}`
+		//
+		// 用途：`/v1/models` 的 `channels` 字段（"这个模型来自哪个平台"）。
+		// 某个 id 出现在多个产品的清单里时，它就有多个渠道 ——
+		// 这正是界面上要表达的"重叠"。
+		ProductModels map[string][]string `json:"product_models"`
 	} `json:"pool"`
 
 	// Proxy 出站 HTTP 代理，形如 "http://127.0.0.1:7890"（缺省空 = 不用显式代理）。

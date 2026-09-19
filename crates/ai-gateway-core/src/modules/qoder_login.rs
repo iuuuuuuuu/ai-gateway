@@ -172,6 +172,117 @@ fn normalize_region(region: &str) -> Result<&'static str, String> {
     }
 }
 
+/// 刷新一个账号的**额度、到期时间、可用模型**。
+///
+/// 与 ZCode 侧同构（见 `zcode_login::refresh_account` 的注释）：
+/// `Client.FetchQuota` / `FetchModels` 早已实现却**没有生产者调用**，
+/// 于是界面上额度恒为 0、看不到支持模型。
+///
+/// ## Qoder 的一个特别之处
+///
+/// 新登录的账号通常返回 `total: 0` 且 `isQuotaExceeded: true` ——
+/// 那**不是**"用超了"，而是"还没有分配额度"。故这里把两个信号都
+/// 回传给界面，由它决定怎么措辞（而不是在这里武断地说"已超额"）。
+pub fn refresh_account(uid: &str) -> Result<Value, String> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        return Err("账号 uid 不能为空".into());
+    }
+
+    let auth_dir = qoder_account::auth_dir();
+    let auth_dir_s = auth_dir.to_string_lossy().to_string();
+
+    // ---- 额度 ----
+    let mut credits: Option<i64> = None;
+    let mut credits_total: Option<i64> = None;
+    let mut expire_at: Option<i64> = None;
+    let mut plan_tier = String::new();
+    let mut exceeded = false;
+    let mut usage_percent = 0.0f64;
+    let mut quota_error: Option<String> = None;
+
+    match run_login_cmd(&["quota", "--uid", uid, "--auth-dir", &auth_dir_s]) {
+        Ok(r) => {
+            if r.get("status").and_then(Value::as_str) == Some("ok") {
+                credits = r.get("remaining").and_then(Value::as_i64);
+                credits_total = r.get("total").and_then(Value::as_i64);
+                let e = r.get("expiresAt").and_then(Value::as_i64).unwrap_or(0);
+                if e > 0 {
+                    expire_at = Some(e);
+                }
+                plan_tier = r.get("planTierName").and_then(Value::as_str).unwrap_or("").to_string();
+                exceeded = r.get("exceeded").and_then(Value::as_bool).unwrap_or(false);
+                usage_percent = r.get("usagePercent").and_then(Value::as_f64).unwrap_or(0.0);
+            } else {
+                quota_error = Some(
+                    r.get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("额度查询失败")
+                        .to_string(),
+                );
+            }
+        }
+        Err(e) => quota_error = Some(e),
+    }
+
+    // ---- 模型 ----
+    let mut models: Vec<Value> = Vec::new();
+    let mut models_error: Option<String> = None;
+    match run_login_cmd(&["models", "--uid", uid, "--auth-dir", &auth_dir_s]) {
+        Ok(r) => {
+            if r.get("status").and_then(Value::as_str) == Some("ok") {
+                if let Some(arr) = r.get("models").and_then(Value::as_array) {
+                    models = arr.clone();
+                }
+            } else {
+                models_error = Some(
+                    r.get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("模型清单查询失败")
+                        .to_string(),
+                );
+            }
+        }
+        Err(e) => models_error = Some(e),
+    }
+
+    // ---- 写回账号库 ----
+    let mut patch = serde_json::Map::new();
+    if let Some(c) = credits {
+        patch.insert("credits".into(), json!(c));
+    }
+    if let Some(t) = credits_total {
+        patch.insert("creditsTotal".into(), json!(t));
+    }
+    if let Some(e) = expire_at {
+        patch.insert("expireAt".into(), json!(e));
+    }
+    // 模型清单落库（界面显示 + 网关的渠道标签）。
+    //
+    // ⚠ 只在**成功取到**时写 —— 取不到时写空数组会抹掉上一次的好数据，
+    // 界面从"有 2 个模型"变成"没有模型"，而原因只是一次网络抖动。
+    if models_error.is_none() {
+        patch.insert("models".into(), json!(models));
+    }
+    let acc = qoder_account::upsert_account(uid, &Value::Object(patch))?;
+
+    Ok(json!({
+        "status": "ok",
+        "account": acc.to_view(),
+        "quota": {
+            "remaining": credits,
+            "total": credits_total,
+            "expiresAt": expire_at,
+            "planTierName": plan_tier,
+            "exceeded": exceeded,
+            "usagePercent": usage_percent,
+            "error": quota_error,
+        },
+        "models": models,
+        "modelsError": models_error,
+    }))
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         return s.to_string();
@@ -230,6 +341,9 @@ pub fn import_from_client(client_dir: &str) -> Result<Value, String> {
     let nickname = r.get("nickname").and_then(Value::as_str).unwrap_or("").to_string();
     let region = r.get("region").and_then(Value::as_str).unwrap_or("cn").to_string();
     let client = r.get("clientDir").and_then(Value::as_str).unwrap_or("").to_string();
+    // 头像也一并存下来 —— 使用者的反馈是"已授权后不显示头像"，
+    // 而客户端登录态里本来就有 `user.avatarUrl`。
+    let avatar = r.get("avatarUrl").and_then(Value::as_str).unwrap_or("").to_string();
 
     // 登记进账号库。
     //
@@ -239,7 +353,7 @@ pub fn import_from_client(client_dir: &str) -> Result<Value, String> {
     // 不如一开始就不传。
     let acc = qoder_account::upsert_account(
         &uid,
-        &json!({ "nickname": nickname, "region": region }),
+        &json!({ "nickname": nickname, "region": region, "avatarUrl": avatar }),
     )?;
 
     Ok(json!({
