@@ -971,6 +971,18 @@ pub async fn qoder_campaigns(uid: String) -> Result<Value, String> {
         .map_err(|e| format!("查询 Qoder 权益活动失败: {e}"))?
 }
 
+/// 领取一个 Qoder 权益活动。
+///
+/// **只由用户显式点击触发** —— 不做定时自动领取。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_claim_campaign(uid: String, campaign_id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        qoder_login::claim_campaign(&uid, &campaign_id)
+    })
+    .await
+    .map_err(|e| format!("领取 Qoder 权益失败: {e}"))?
+}
+
 /// Qoder 账号库概览（供界面顶部展示）。
 #[tauri::command]
 pub async fn qoder_summary() -> Result<Value, String> {

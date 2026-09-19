@@ -337,6 +337,55 @@ pub fn fetch_campaigns(uid: &str) -> Result<Value, String> {
     Ok(r)
 }
 
+/// 领取一个权益活动（**用户显式触发**）。
+///
+/// # 为什么可以做（我此前误判为"不能做"）
+///
+/// 我把两个端点搞混了：
+///
+///	/api/v1/zcode-plan/billing/claim      ← ZCode 的套餐申领，要验证码
+///	/sash/api/v1/me/campaigns/{id}/claim  ← 本函数，**不要验证码**
+///
+/// 所有者实测后者直接返回 `{"status":"CLAIMED"}`（原话「领取接口,经过我实测,
+/// 无需人机验证」）。它只是"领取我自己的每日权益"，与官方客户端点那个
+/// 「领取」按钮完全同构，没有任何风控绕过。
+///
+/// # 为什么仍然不做自动化
+///
+/// 不写定时任务替用户每天自动领 —— 那与"用户点一下"不是一回事，
+/// 且会让账号表现出非人类的活动模式。故本函数**只**由界面按钮调用。
+pub fn claim_campaign(uid: &str, campaign_id: &str) -> Result<Value, String> {
+    let uid = uid.trim();
+    let campaign_id = campaign_id.trim();
+    if uid.is_empty() {
+        return Err("账号 uid 不能为空".into());
+    }
+    if campaign_id.is_empty() {
+        return Err("活动 ID 不能为空".into());
+    }
+    let auth_dir = qoder_account::auth_dir();
+    let auth_dir_s = auth_dir.to_string_lossy().to_string();
+
+    let r = run_login_cmd(&[
+        "claim-campaign",
+        "--uid",
+        uid,
+        "--campaign-id",
+        campaign_id,
+        "--auth-dir",
+        &auth_dir_s,
+    ])?;
+
+    if r.get("status").and_then(Value::as_str) != Some("ok") {
+        return Err(r
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("领取权益失败")
+            .to_string());
+    }
+    Ok(r)
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         return s.to_string();

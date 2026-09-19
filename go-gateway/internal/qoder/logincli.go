@@ -196,9 +196,18 @@ func RunLoginCLI(args []string, defaultAuthDir string) int {
 	case "campaigns":
 		// 查权益活动（「每天领 100 Credits」那类）。
 		//
-		// ⚠ **只读**。领取要阿里云验证码（服务端防滥用机制），
-		// 本 CLI 刻意不实现代领 —— 见 campaign.go 的说明。
+		// ⚠ 只查询。领取见 `claim-campaign`。
 		return runCampaigns(args[1:], defaultAuthDir)
+	case "claim-campaign":
+		// 领取一个权益活动。
+		//
+		// ⚠ 这是**写操作**，只能由用户在界面上显式点击触发。
+		// 不写定时任务替用户自动领 —— 那与"用户点一下"不是一回事，
+		// 且会让账号表现出非人类的活动模式。见 campaign.go 的说明。
+		return runClaimCampaign(args[1:], defaultAuthDir)
+	case "job-token":
+		// 换取短期作业令牌（jt-）。用于诊断与验证。
+		return runJobToken(args[1:], defaultAuthDir)
 	default:
 		fmt.Fprintf(os.Stderr, "未知子命令 %q（应为 url / poll / import-client）\n", sub)
 		return 2
@@ -351,6 +360,105 @@ func runCampaigns(args []string, defaultAuthDir string) int {
 		"campaignUrl":  st.CampaignURL,
 		"campaigns":    st.Campaigns,
 		"count":        len(st.Campaigns),
+	})
+	return 0
+}
+
+// runClaimCampaign 领取一个权益活动。
+//
+// 用法：`qoder-login claim-campaign --uid <uid> --campaign-id <id> --auth-dir <dir>`
+//
+// 输出：`{"status":"ok","uid":...,"grantId":...,"claimed":true,"replayed":false}`
+//
+// ⚠ `replayed:true` 表示这次是**重放**（之前已领过）——
+// 界面必须区分，否则用户重复点会以为又领了一份。
+func runClaimCampaign(args []string, defaultAuthDir string) int {
+	fs := flag.NewFlagSet("qoder-login claim-campaign", flag.ContinueOnError)
+	uid := fs.String("uid", "", "账号 uid")
+	campaignID := fs.String("campaign-id", "", "活动 ID（campaignId，不是 campaignKey）")
+	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if strings.TrimSpace(*uid) == "" {
+		fmt.Fprintln(os.Stderr, "缺少 --uid 参数")
+		return 2
+	}
+	if strings.TrimSpace(*campaignID) == "" {
+		fmt.Fprintln(os.Stderr, "缺少 --campaign-id 参数")
+		return 2
+	}
+
+	c, err := loadCredByUID(*authDir, *uid)
+	if err != nil {
+		writeJSON(map[string]any{"status": "error", "uid": *uid, "message": err.Error()})
+		return 0
+	}
+
+	cli := New()
+	r, err := cli.ClaimCampaign(context.Background(), c, *campaignID)
+	if err != nil {
+		writeJSON(map[string]any{"status": "error", "uid": c.UID, "message": err.Error()})
+		return 0
+	}
+
+	writeJSON(map[string]any{
+		"status":      "ok",
+		"uid":         c.UID,
+		"grantId":     r.GrantID,
+		"campaignId":  r.CampaignID,
+		"campaignKey": r.CampaignKey,
+		"claimed":     true,
+		// 重放 = 之前已领过。界面据此说"已领过"而不是"领取成功"。
+		"replayed":  r.Replayed,
+		"claimedAt": r.ClaimedAt,
+		"grantedAt": r.GrantedAt,
+	})
+	return 0
+}
+
+// runJobToken 换取短期作业令牌并输出 JSON。
+//
+// 用法：`qoder-login job-token --uid <uid> --auth-dir <dir>`
+//
+// ⚠ 输出里**不含**令牌本体（那是秘密）—— 只报长度与到期时间，
+// 便于确认"能不能换到"而不把凭据泄到日志/终端历史里。
+func runJobToken(args []string, defaultAuthDir string) int {
+	fs := flag.NewFlagSet("qoder-login job-token", flag.ContinueOnError)
+	uid := fs.String("uid", "", "账号 uid")
+	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if strings.TrimSpace(*uid) == "" {
+		fmt.Fprintln(os.Stderr, "缺少 --uid 参数")
+		return 2
+	}
+
+	c, err := loadCredByUID(*authDir, *uid)
+	if err != nil {
+		writeJSON(map[string]any{"status": "error", "uid": *uid, "message": err.Error()})
+		return 0
+	}
+
+	cli := New()
+	t, err := cli.FetchJobToken(context.Background(), c)
+	if err != nil {
+		writeJSON(map[string]any{"status": "error", "uid": c.UID, "message": err.Error()})
+		return 0
+	}
+
+	writeJSON(map[string]any{
+		"status": "ok",
+		"uid":    c.UID,
+		// 只报长度，不报令牌本体
+		"tokenLength":        len(t.Token),
+		"refreshTokenLength": len(t.RefreshToken),
+		"expiresAt":          t.ExpiresAt,
+		// 实测是**毫秒**（86400000 = 1 天）；同时给出换算后的小时数便于人读
+		"expiresInMs":     t.ExpiresIn,
+		"expiresInHours":  float64(t.ExpiresIn) / 3600000,
+		"refreshExpiresAt": t.RefreshTokenExpiresAt,
 	})
 	return 0
 }

@@ -212,18 +212,82 @@ type Quota struct {
 	Used int64
 	// Entries 明细（可能有多项，如"编码套餐"+"赠送"）。
 	Entries []QuotaEntry
+	// Plans 已生效的套餐（含**套餐整体到期** `ends_at`）。
+	//
+	// ⚠ 这个字段长期被我们忽略 —— 而体验套餐的到期时间就在里面。
+	// 见 Plan 的说明。
+	Plans []Plan
 	// ServerTime 上游服务器时间（Unix 秒）；0 = 未提供。
 	ServerTime int64
 }
 
+// PlanExpiry 套餐整体到期的**最早**时刻（Unix 秒）；0 = 无套餐或全部未知。
+//
+// 与 `SoonestExpiry()` 的区别（两者**不能混用**）：
+//
+//	SoonestExpiry()  各模型桶的**每日周期**结束（实测是当天 23:59:59）
+//	PlanExpiry()     套餐整体的到期（实测 2026-09-23 23:59:59）
+//
+// 只取前者，用户会以为"明天额度就没了"；只取后者，他会以为
+// "今天用不完就浪费了"。界面两个都要显示，且要说清各自含义。
+func (q *Quota) PlanExpiry() int64 {
+	if q == nil {
+		return 0
+	}
+	var earliest int64
+	for _, p := range q.Plans {
+		if p.EndsAt <= 0 {
+			continue
+		}
+		if earliest == 0 || p.EndsAt < earliest {
+			earliest = p.EndsAt
+		}
+	}
+	return earliest
+}
+
+// ActivePlan 取优先级最高的生效套餐（用于展示套餐名与说明）。
+func (q *Quota) ActivePlan() *Plan {
+	if q == nil {
+		return nil
+	}
+	var best *Plan
+	for i := range q.Plans {
+		p := &q.Plans[i]
+		// 只认 active；上游可能回别的状态（如 expired）
+		if p.Status != "" && p.Status != "active" {
+			continue
+		}
+		if best == nil || p.Priority > best.Priority {
+			best = p
+		}
+	}
+	return best
+}
+
 // QuotaEntry 单条额度明细。
 type QuotaEntry struct {
-	ShowName   string
-	Remaining  int64
-	Total      int64
-	Used       int64
-	UnitType   string
-	ExpiresAt  int64 // Unix 秒；0 = 未知
+	ShowName  string
+	Remaining int64
+	Total     int64
+	Used      int64
+	UnitType  string
+	// ExpiresAt **每日周期**的结束时刻（Unix 秒）；0 = 未知。
+	//
+	// ⚠ 不是套餐到期。见 Quota.PlanExpiry 的说明。
+	ExpiresAt int64
+	// PeriodStart / PeriodEnd 该桶的计费周期（Unix 秒）。
+	//
+	// 与 ExpiresAt 通常相同，但上游两个都给了，故都留下 ——
+	// 取哪个都不该猜。
+	PeriodStart int64
+	PeriodEnd   int64
+	// PlanID / EntitlementID 该桶属于哪个套餐的哪个授权项。
+	// 用于把桶与 Plan 对上（展示"这项来自体验套餐"）。
+	PlanID        string
+	EntitlementID string
+	// GrantUnits 该桶的**每日赠送量**（来自套餐授权，token）。
+	GrantUnits float64
 }
 
 // ErrNoJWT 表示该账号没有 JWT，无法查询额度。
@@ -317,7 +381,38 @@ func (c *Client) FetchQuota(ctx context.Context, cr *Cred) (*Quota, error) {
 				UnitTypeAlt string `json:"unitType"`
 				ExpiresAt   any    `json:"expires_at"`
 				ExpiresAlt  any    `json:"expiresAt"`
+				// 以下三个是**套餐归属**：这个桶来自哪个套餐的哪个授权项。
+				PlanID             string `json:"plan_id"`
+				EntitlementID      string `json:"entitlement_id"`
+				PeriodStart        any    `json:"period_start"`
+				PeriodEnd          any    `json:"period_end"`
 			} `json:"balances"`
+			// Plans 已生效的套餐。
+			//
+			// ⚠ 这个字段长期被我们**完全忽略**，而体验套餐的整体到期
+			//（`ends_at`）就在里面 —— 见 Plan 的说明。
+			Plans []struct {
+				UserPlanID  string  `json:"user_plan_id"`
+				PlanID      string  `json:"plan_id"`
+				Name        string  `json:"name"`
+				Description string  `json:"description"`
+				Priority    float64 `json:"priority"`
+				Status      string  `json:"status"`
+				StartsAt    any     `json:"starts_at"`
+				EndsAt      any     `json:"ends_at"`
+				// endsAt 的驼峰别名（上游两种写法都出现过）
+				EndsAtAlt any `json:"endsAt"`
+				Entitlements []struct {
+					EntitlementID string   `json:"entitlement_id"`
+					ShowName      string   `json:"show_name"`
+					Meter         string   `json:"meter"`
+					UnitType      string   `json:"unit_type"`
+					Capabilities  []string `json:"capabilities"`
+					GrantUnits    any      `json:"grant_units"`
+					Period        string   `json:"period"`
+					EffectiveAt   any      `json:"effective_at"`
+				} `json:"entitlements"`
+			} `json:"plans"`
 			ServerTime int64 `json:"server_time"`
 		} `json:"data"`
 	}
@@ -331,7 +426,19 @@ func (c *Client) FetchQuota(ctx context.Context, cr *Cred) (*Quota, error) {
 	}
 
 	out := &Quota{ServerTime: doc.Data.ServerTime}
+
+	// 先把套餐的「模型 → 每日赠送量」建成索引，供下面的余额项关联。
+	// 这样界面上能说清"这 300 万是体验套餐送的"，而不是一个孤立的数字。
+	type grantKey struct{ planID, entID string }
+	grants := make(map[grantKey]float64)
+	for _, p := range doc.Data.Plans {
+		for _, e := range p.Entitlements {
+			grants[grantKey{p.PlanID, e.EntitlementID}] = toFloat64(e.GrantUnits)
+		}
+	}
+
 	for _, b := range doc.Data.Balances {
+		k := grantKey{b.PlanID, b.EntitlementID}
 		e := QuotaEntry{
 			ShowName:  b.ShowName,
 			Remaining: toInt64(b.Remaining),
@@ -340,14 +447,106 @@ func (c *Client) FetchQuota(ctx context.Context, cr *Cred) (*Quota, error) {
 			UnitType:  firstNonEmpty(b.UnitType, b.UnitTypeAlt),
 			// 字段名 snake_case 与 camelCase 都接受（参考实现两种都读，
 			// 实测两种都存在）
-			ExpiresAt: toInt64(firstAny(b.ExpiresAt, b.ExpiresAlt)),
+			ExpiresAt:   toInt64(firstAny(b.ExpiresAt, b.ExpiresAlt)),
+			PeriodStart: toInt64(b.PeriodStart),
+			PeriodEnd:   toInt64(b.PeriodEnd),
+			PlanID:      b.PlanID,
+
+			EntitlementID: b.EntitlementID,
+			GrantUnits:    grants[k],
 		}
 		out.Entries = append(out.Entries, e)
 		out.Remaining += e.Remaining
 		out.Total += e.Total
 		out.Used += e.Used
 	}
+
+	// 解析套餐 —— **这是本函数此前缺失的部分**。
+	for _, p := range doc.Data.Plans {
+		pl := Plan{
+			UserPlanID:  p.UserPlanID,
+			PlanID:      p.PlanID,
+			Name:        p.Name,
+			Description: p.Description,
+			Priority:    p.Priority,
+			Status:      p.Status,
+			// ⚠ `ends_at` 是**套餐到期**（实测 2026-09-23 23:59:59），
+			// 与余额项的 `expires_at`（每日周期结束，当天 23:59:59）不同。
+			EndsAt:   toInt64(firstAny(p.EndsAt, p.EndsAtAlt)),
+			StartsAt: toInt64(p.StartsAt),
+		}
+		for _, e := range p.Entitlements {
+			pl.Entitlements = append(pl.Entitlements, PlanEntitlement{
+				EntitlementID: e.EntitlementID,
+				ShowName:      e.ShowName,
+				Meter:         e.Meter,
+				UnitType:      e.UnitType,
+				Capabilities:  e.Capabilities,
+				GrantUnits:    toFloat64(e.GrantUnits),
+				Period:        e.Period,
+				EffectiveAt:   toInt64(e.EffectiveAt),
+			})
+		}
+		out.Plans = append(out.Plans, pl)
+	}
 	return out, nil
+}
+
+// Plan 一个已生效的套餐（`billing/balance` 的 `data.plans[]`）。
+//
+// # 为什么必须有这个结构（所有者的实测反馈）
+//
+//	「这个体验套餐是 9月23号23:59 过期时间，这是我刚登录的新账号赠送的
+//	  额度，要区分好」
+//
+// 我们此前**只读 `balances`，完全忽略 `plans`** —— 而套餐级的到期时间
+// （`ends_at`）就在 `plans` 里。实测（2026-09-19）：
+//
+//	plans[0].plan_id   = "zcode-v3-start-plan-0817"
+//	plans[0].name      = "ZCode Start Plan"
+//	plans[0].description = "免费 GLM 旗舰模型体验"
+//	plans[0].status    = "active"
+//	plans[0].starts_at = 1789781287 → 2026-09-19 09:28:07 (UTC+8)
+//	plans[0].ends_at   = 1790179199 → **2026-09-23 23:59:59 (UTC+8)**  ← 与他说的一致
+//
+// ⚠ 注意 `balances[].expires_at` 是**每日周期**的结束（实测是当天 23:59:59），
+// 而 `plans[].ends_at` 才是**套餐整体**的到期。两者语义不同：
+//
+//	balances[].period_end  = 2026-09-19 23:59:59  ← 今天结束，明天重置
+//	plans[].ends_at        = 2026-09-23 23:59:59  ← 套餐到期，之后归零
+//
+// 只展示前者会让用户以为"明天就没了"；只展示后者会让他以为"今天用完就没了"。
+// 两个都要，且要标清含义。
+type Plan struct {
+	UserPlanID string `json:"user_plan_id"`
+	PlanID     string `json:"plan_id"`
+	Name       string `json:"name"`
+	// Description 上游给的说明，实测是"免费 GLM 旗舰模型体验"。
+	Description string  `json:"description"`
+	Priority    float64 `json:"priority"`
+	// Status 实测 "active"。
+	Status string `json:"status"`
+	// StartsAt / EndsAt 套餐生效与**到期**（Unix 秒）。
+	EndsAt   int64 `json:"ends_at"`
+	StartsAt int64 `json:"starts_at"`
+	// Entitlements 该套餐在各模型上的授权（含每日赠送量 grant_units）。
+	Entitlements []PlanEntitlement `json:"entitlements"`
+}
+
+// PlanEntitlement 套餐在**某个模型**上的授权项。
+type PlanEntitlement struct {
+	EntitlementID string   `json:"entitlement_id"`
+	ShowName      string   `json:"show_name"`
+	Meter         string   `json:"meter"`
+	UnitType      string   `json:"unit_type"`
+	Capabilities  []string `json:"capabilities"`
+	// GrantUnits 赠送量（token）。实测体验套餐是 GLM-5.3 300 万、
+	// GLM-5.3-Flash 500 万 —— 与所有者说的一致。
+	GrantUnits float64 `json:"grant_units"`
+	// Period 重置周期，实测 "daily"。
+	Period string `json:"period"`
+	// EffectiveAt 生效时刻（Unix 秒）。
+	EffectiveAt int64 `json:"effective_at"`
 }
 
 // SoonestExpiry 返回明细中最早的到期时刻（Unix 秒）；0 = 全部未知。
@@ -803,6 +1002,33 @@ func toInt64(v any) int64 {
 		}
 	case json.Number:
 		if n, err := x.Int64(); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// toFloat64 与 toInt64 同理，但保留小数。
+//
+// 为什么单独要一个：`grant_units` 这类**赠送量**可能带小数
+//（参考实现 zcode2api 就用 `float(units)` 读它）。
+// 用 toInt64 会截断，而额度数字被截断会让"总量对不上赠送量"，
+// 进而把体验套餐误判成付费套餐。
+func toFloat64(v any) float64 {
+	switch x := v.(type) {
+	case float64:
+		return x
+	case int64:
+		return float64(x)
+	case int:
+		return float64(x)
+	case string:
+		var n float64
+		if _, err := fmt.Sscanf(strings.TrimSpace(x), "%f", &n); err == nil {
+			return n
+		}
+	case json.Number:
+		if n, err := x.Float64(); err == nil {
 			return n
 		}
 	}

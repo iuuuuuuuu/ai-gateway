@@ -498,9 +498,13 @@ export default function ZcodePage() {
             <AlertTriangle className="h-4 w-4" />
             <AlertTitle>有 {totals.unknownCredits} 个账号的额度未知</AlertTitle>
             <AlertDescription>
+              {/* ⚠ 标点必须用 `{"…"}` 表达式紧跟元素，不能写在下一行的文本里。
+                  JSX 会把元素后的换行 + 缩进压成**一个空格**，于是
+                  `</strong>` 与 `，` 之间多出一个空格，中文排版上表现为
+                  "逗号被挤到下一行开头"（实测 1500px 宽就能看到）。 */}
               ZCode 的额度查询需要浏览器授权登录（OAuth）才会拿到查询令牌。
-              <strong>只粘贴了凭证的账号查不到额度</strong>，但完全可以正常使用。
-              若要查看额度，请用「浏览器登录」方式重新添加。
+              <strong>只粘贴了凭证的账号查不到额度</strong>
+              {"，但完全可以正常使用。若要查看额度，请用「浏览器登录」方式重新添加。"}
             </AlertDescription>
           </Alert>
         )}
@@ -510,7 +514,9 @@ export default function ZcodePage() {
             <AlertTriangle className="h-4 w-4" />
             <AlertTitle>有 {totals.missing} 个账号缺少凭证</AlertTitle>
             <AlertDescription>
-              这些账号的凭证文件已不存在，<strong>在网关里已无法使用</strong>。请重新导入凭证。
+              这些账号的凭证文件已不存在，
+              <strong>在网关里已无法使用</strong>
+              {"。请重新导入凭证。"}
             </AlertDescription>
           </Alert>
         )}

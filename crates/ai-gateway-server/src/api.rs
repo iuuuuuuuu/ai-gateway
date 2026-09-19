@@ -162,6 +162,8 @@ pub fn router() -> Router {
         .route("/api/qoder/refresh-account", post(api_qoder_refresh_account))
         // 权益活动（「每天领 100 Credits」那类）。**只读**，不代领。
         .route("/api/qoder/campaigns", post(api_qoder_campaigns))
+        // 领取权益活动。**用户显式触发**，不做自动化（见 campaign.go）。
+        .route("/api/qoder/claim-campaign", post(api_qoder_claim_campaign))
         // ---- ZCode（Z.AI / 智谱）----
         // 与 Qoder 的差异：凭证是用户可复制的字符串，故导入是主路径。
         .route("/api/zcode/accounts", get(api_zcode_list_accounts))
@@ -348,6 +350,28 @@ async fn api_qoder_campaigns(Json(body): Json<Value>) -> Response {
         Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
         Err(e) => json_err(
             format!("查询 Qoder 权益活动失败: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/qoder/claim-campaign —— body: `{ "uid": "...", "campaignId": "..." }`
+///
+/// 领取一个权益活动。**只能由用户显式点击触发** —— 不做定时自动领取
+///（那与"用户点一下"不是一回事，且会让账号表现出非人类的活动模式）。
+async fn api_qoder_claim_campaign(Json(body): Json<Value>) -> Response {
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("").to_string();
+    let cid = body
+        .get("campaignId")
+        .or_else(|| body.get("campaign_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    match tokio::task::spawn_blocking(move || qoder_login::claim_campaign(&uid, &cid)).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(
+            format!("领取 Qoder 权益失败: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
     }

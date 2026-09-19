@@ -248,6 +248,7 @@ const ROUTES: Record<string, Route> = {
   zcode_refresh_account: { method: "POST", path: "/api/zcode/refresh-account" },
   qoder_refresh_account: { method: "POST", path: "/api/qoder/refresh-account" },
   qoder_campaigns: { method: "POST", path: "/api/qoder/campaigns" },
+  qoder_claim_campaign: { method: "POST", path: "/api/qoder/claim-campaign" },
   zcode_login_start: { method: "POST", path: "/api/zcode/login/start" },
   zcode_login_poll: { method: "POST", path: "/api/zcode/login/poll" },
 };
@@ -1483,6 +1484,40 @@ export interface QoderCampaignsResult {
  */
 export function qoderCampaigns(uid: string): Promise<QoderCampaignsResult> {
   return call<QoderCampaignsResult>("qoder_campaigns", { uid });
+}
+
+/** 领取结果。 */
+export interface QoderClaimResult {
+  status: string;
+  uid: string;
+  grantId: string;
+  campaignId: string;
+  campaignKey: string;
+  claimed: boolean;
+  /**
+   * 这次是**重放**（之前已领过），不是新领到。
+   *
+   * ⚠ 界面必须区分：说"领取成功"会让用户以为又领了一份。
+   */
+  replayed: boolean;
+  claimedAt: string;
+  grantedAt: string;
+}
+
+/**
+ * 领取一个权益活动。
+ *
+ * ## 只能由用户显式点击触发
+ *
+ * 领取本身是安全的（用用户自己的令牌打官方接口，与官方客户端点那个
+ * 「领取」按钮同构、**不需要人机验证**）。但**不做定时自动领取** ——
+ * 那与"用户点一下"不是一回事，且会让账号表现出非人类的活动模式。
+ */
+export function qoderClaimCampaign(
+  uid: string,
+  campaignId: string,
+): Promise<QoderClaimResult> {
+  return call<QoderClaimResult>("qoder_claim_campaign", { uid, campaignId });
 }
 
 // ---------------------------------------------------------------------------

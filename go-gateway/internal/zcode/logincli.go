@@ -318,8 +318,56 @@ func runQuota(args []string, defaultAuthDir string) int {
 			"total":     e.Total,
 			"used":      e.Used,
 			"unitType":  e.UnitType,
-			"expiresAt": e.ExpiresAt,
+			// ⚠ 这是**每日周期**的结束（实测当天 23:59:59），不是套餐到期。
+			// 套餐到期见下面的 planExpiresAt。
+			"expiresAt":   e.ExpiresAt,
+			"periodStart": e.PeriodStart,
+			"periodEnd":   e.PeriodEnd,
+			// 该桶来自哪个套餐 —— 界面据此说"这 300 万是体验套餐送的"
+			"planId":        e.PlanID,
+			"entitlementId": e.EntitlementID,
+			"grantUnits":    e.GrantUnits,
 		})
+	}
+
+	// 套餐（含**整体到期**）。
+	//
+	// 所有者的实测反馈：「这个体验套餐是 9月23号23:59 过期时间」——
+	// 那个时刻在 `plans[].ends_at` 里，而我们此前**完全没读 plans**。
+	plans := make([]map[string]any, 0, len(q.Plans))
+	for _, p := range q.Plans {
+		ents := make([]map[string]any, 0, len(p.Entitlements))
+		for _, e := range p.Entitlements {
+			ents = append(ents, map[string]any{
+				"entitlementId": e.EntitlementID,
+				"showName":      e.ShowName,
+				"grantUnits":    e.GrantUnits,
+				"period":        e.Period,
+				"unitType":      e.UnitType,
+				"effectiveAt":   e.EffectiveAt,
+			})
+		}
+		plans = append(plans, map[string]any{
+			"planId":      p.PlanID,
+			"name":        p.Name,
+			"description": p.Description,
+			"status":      p.Status,
+			"priority":    p.Priority,
+			"startsAt":    p.StartsAt,
+			"endsAt":      p.EndsAt,
+			"entitlements": ents,
+		})
+	}
+
+	// 套餐类型（体验 / 付费 / 按量）—— 由 plan.go 按上游静态配置判定。
+	//
+	// 判据不硬编码数字：拿 `startPlanPreview` 的赠送量与实际总量比对。
+	// 取不到配置时返回 unknown（**不猜**）。
+	var planKind string
+	if sp, serr := cli.FetchStartPlanPreview(context.Background()); serr == nil {
+		planKind = string(ClassifyPlan(q, sp))
+	} else {
+		planKind = string(PlanUnknown)
 	}
 
 	writeJSON(map[string]any{
@@ -331,6 +379,11 @@ func runQuota(args []string, defaultAuthDir string) int {
 		// 最早到期时刻 —— 界面用它显示"最快要过期的额度"
 		"expiresAt": q.SoonestExpiry(),
 		"entries":   entries,
+		// 套餐信息（含**套餐整体到期**）—— 与 entries 的每日周期到期不同
+		"plans": plans,
+		// 套餐整体到期（Unix 秒；0 = 无套餐/未知）
+		"planExpiresAt": q.PlanExpiry(),
+		"planKind":      planKind,
 		// 该凭证**自己的**上游账号标识。
 		//
 		// 为什么由这里返回：宿主需要它来判断"客户端登录态里的身份是否属于
