@@ -155,6 +155,24 @@ func main() {
 	if n := len(cfg.Pool.ModelPlatforms); n > 0 {
 		log.Printf("模型平台白名单已启用：%d 个模型被限定平台", n)
 	}
+	// ZCode 验证码求解器（见 config.Pool.ZcodeCaptchaDir 的说明）。
+	//
+	// ⚠ **默认关闭**：求解器在没有真人操作的情况下产出通过凭证，
+	// 性质上与"用户自己在官方客户端点一下"不同，故要用户明确开启。
+	if cfg.Pool.ZcodeCaptchaDir != "" {
+		cs := zcode.SharedCaptchaSolver()
+		cs.SetDir(cfg.Pool.ZcodeCaptchaDir)
+		if cfg.Pool.ZcodeCaptchaEnabled {
+			if reason := cs.UnavailableReason(); reason != "" {
+				// 开了但组件不全 → **如实报**，而不是静默失效
+				log.Printf("⚠ ZCode 验证码求解已启用，但组件不可用：%s", reason)
+			} else {
+				log.Printf("ZCode 验证码求解已启用：%s", cfg.Pool.ZcodeCaptchaDir)
+			}
+		} else {
+			log.Printf("ZCode 验证码求解已配置但**未启用**（pool.zcode_captcha_enabled=false）")
+		}
+	}
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
 

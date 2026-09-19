@@ -128,6 +128,18 @@ type Cred struct {
 
 	// FilePath 来源文件路径；保存时写回此处。
 	FilePath string
+
+	// CaptchaParam 本次请求要带的验证码通过凭证（`X-Aliyun-Captcha-Verify-Param`）。
+	//
+	// ⚠ **一次性**：用一个就作废，用第二次上游必回 3007（实测）。
+	// 故它不是"账号的属性"，而是"本次请求的瞬时值" —— 由调用方在发请求前
+	// 现取一个填进来，用完整理掉。放在 Cred 上只是因为它随请求一起流动，
+	// 而 Cred 已经是那个流动载体。
+	CaptchaParam string
+
+	// CaptchaRegion 验证码所属区域（`X-Aliyun-Captcha-Verify-Region`）。
+	// 与 CaptchaParam 成对；实测缺它就是 3007。
+	CaptchaRegion string
 }
 
 // AccountIDFromJWT 从 JWT 里解出上游的 `user_id`（**不验签**）。

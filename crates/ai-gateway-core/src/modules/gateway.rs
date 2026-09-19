@@ -1961,6 +1961,74 @@ fn product_models_for_gateway() -> Value {
     Value::Object(out)
 }
 
+/// ZCode 验证码求解器所在目录（含 solver.js + node_modules）。
+///
+/// # 解析顺序（与 `resolve_gateway_exe` 同一套约定）
+///
+///   1. 环境变量 `AI_GATEWAY_CAPTCHA_DIR`（显式指定，便于开发/调试）
+///   2. 与本程序同目录的 `zcode-captcha/`（打包后资源就在这里）
+///   3. 安装目录上一级的 `resources/zcode-captcha/`（Tauri 的资源布局）
+///   4. `~/.wb-switch/zcode-captcha/`（用户手动放置）
+///
+/// # 为什么返回空串而不是报错
+///
+/// 求解器是**可选能力**（验证码只在 ZCode 对话通道上需要，且默认不启用）。
+/// 找不到就让网关回落到"如实报 3007"，而不是让启动失败 ——
+/// 缺一个可选组件不该让整个软件不能用。
+fn captcha_solver_dir() -> String {
+    fn ok(p: PathBuf) -> Option<String> {
+        // 必须能找到 solver.js 才算数：只判断目录存在会把"空目录"
+        // 当成有效组件，于是求解时才发现缺文件（fail late）。
+        if p.join("solver.js").is_file() {
+            Some(p.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    }
+
+    if let Ok(p) = std::env::var("AI_GATEWAY_CAPTCHA_DIR") {
+        if let Some(d) = ok(PathBuf::from(&p)) {
+            return d;
+        }
+    }
+    if let Ok(self_exe) = std::env::current_exe() {
+        if let Some(dir) = self_exe.parent() {
+            for cand in [
+                dir.join("zcode-captcha"),
+                dir.join("resources").join("zcode-captcha"),
+                // Tauri 的 macOS 布局：Contents/MacOS/../Resources
+                dir.join("..").join("Resources").join("zcode-captcha"),
+            ] {
+                if let Some(d) = ok(cand) {
+                    return d;
+                }
+            }
+        }
+    }
+    if let Some(d) = ok(gateway_dir().join("zcode-captcha")) {
+        return d;
+    }
+    String::new()
+}
+
+/// 是否**启用**验证码求解（默认关闭）。
+///
+/// # 为什么默认关闭
+///
+/// 求解器在没有真人操作的情况下产出通过凭证 —— 性质上与"用户自己在官方
+/// 客户端点一下"不同。虽然求解本身是"在精简环境里跑官方 SDK"（不是逆向
+/// 破解算法），但要不要用它应当由**账号所有者**决定，而不是我们默认替他
+/// 打开。故这里默认 false，由用户在界面上明确开启。
+///
+/// 配置读自网关配置的 `zcode_captcha_enabled`。
+fn captcha_solver_enabled() -> bool {
+    load_gateway_config()
+        .get("zcode_captcha_enabled")
+        .and_then(Value::as_bool)
+        // 缺席 = 关闭（而不是"默认开"）—— 见上面的理由
+        .unwrap_or(false)
+}
+
 /// 把「模型 → 允许的平台」白名单交给网关（所有者的需求）。
 ///
 /// # 需求原文
@@ -2264,6 +2332,17 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
             //
             // 空对象 = 不限制，行为与加该功能之前逐字相同（回滚点）。
             "model_platforms": model_platforms_for_gateway(),
+            // ZCode 验证码求解器。
+            //
+            // 求解器（solver.js + happy-dom）由 Tauri 作为**资源**随包分发，
+            // 安装后在资源目录里；开发期在仓库的 assets/ 下。
+            // 网关无从推断这个路径，故由宿主告诉它。
+            //
+            // ⚠ `zcode_captcha_enabled` **默认 false**：求解器在没有人
+            // 操作的情况下产出通过凭证，性质上与"用户自己在官方客户端
+            // 点一下"不同，故要用户明确开启。
+            "zcode_captcha_dir": captcha_solver_dir(),
+            "zcode_captcha_enabled": captcha_solver_enabled(),
         },
         "session_sticky": { "enabled": true, "ttl": "30m", "gc_interval": "5m" },
         // ---- 账号记录回写（养号任务的执行痕迹）----

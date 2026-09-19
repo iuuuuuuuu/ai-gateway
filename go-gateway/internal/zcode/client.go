@@ -196,6 +196,29 @@ func (c *Client) applyHeaders(req *http.Request, cr *Cred, stream bool) {
 			req.Header.Set(k, v)
 		}
 	}
+	// 追踪头：start-plan（JWT）通道**只发这三个**。
+	//
+	// 参考实现（zcode2api 的 identity.py）明确记载：
+	//
+	//	「通道差异（关键，**误发会触发上游 3012 "unusual activity"**）：
+	//	  start-plan（JWT 通道）：只发 x-request-id / x-zcode-session-type /
+	//	  x-zcode-trace-id 三个头，**不发** x-query-id / x-session-id。」
+	//
+	// 故这里只补三个；`x-query-id` / `x-session-id` **刻意不发**。
+	for k, v := range c.Identity.TraceHeaders() {
+		if v != "" {
+			req.Header.Set(k, v)
+		}
+	}
+	// 验证码头（仅在启用且已求到 param 时）。
+	//
+	// ⚠ param 是**一次性**的：调用方每次请求都要现取一个（见 captcha.go）。
+	if cr.CaptchaParam != "" {
+		req.Header.Set("X-Aliyun-Captcha-Verify-Param", cr.CaptchaParam)
+		if cr.CaptchaRegion != "" {
+			req.Header.Set("X-Aliyun-Captcha-Verify-Region", cr.CaptchaRegion)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

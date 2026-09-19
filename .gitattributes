@@ -7,3 +7,15 @@
 # picking either side (task state lives in task.json, not index.md). See
 # .trellis/spec/cli/backend/directory-structure.md for details.
 .trellis/workspace/*/journal-*.md merge=union
+
+# 纳入版本管理的第三方运行时依赖（ZCode 验证码求解器的 happy-dom）
+# **不要**做换行符归一化。
+#
+# 原因：
+#   · 它会产生海量 "LF will be replaced by CRLF" 警告，淹没真正有用的输出
+#     （实测一次 git add 刷了 14000+ 字节的警告）
+#   · vendored 内容应当与上游 npm 包**逐字节一致** —— 让 git 改写行尾会让
+#     校验/哈希对不上，将来核对来源时无法信任
+#
+# 我们自己的源码仍走默认归一化，只有 vendored 目录退出。
+assets/zcode-captcha/node_modules/** -text

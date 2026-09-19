@@ -224,6 +224,30 @@ type Config struct {
 		// ⚠ 白名单内账号全不可用时**回退到全池**，不硬失败
 		//（见 pool.platformAllowedLocked 与 pickBestFrom）。
 		ModelPlatforms map[string][]string `json:"model_platforms"`
+
+		// ZcodeCaptchaDir ZCode 验证码求解器所在目录（含 solver.js + node_modules）。
+		//
+		// # 为什么需要它
+		//
+		// ZCode 对话端点要求 `X-Aliyun-Captcha-Verify-Param`（实测回
+		// `400 code=3007 captcha verify failed`，且与模型名、请求头都无关）。
+		// 求解器是一个 Node 脚本（用 happy-dom 模拟浏览器跑阿里云官方 SDK），
+		// 由宿主作为**发行资源**释放到磁盘并告诉网关路径。
+		//
+		// # 为什么不是网关自己找
+		//
+		// 发行包里的资源路径由 Tauri 决定（安装目录下的 resources），
+		// 网关无从推断；开发期又指向仓库里的 assets/。由宿主透传最可靠。
+		//
+		// 空 = 不启用（网关回落到如实报 3007）。
+		ZcodeCaptchaDir string `json:"zcode_captcha_dir"`
+
+		// ZcodeCaptchaEnabled 是否**主动求解**验证码。
+		//
+		// 默认 **false**（关闭）。理由：求解器在**没有真人操作**的情况下
+		// 产出通过凭证 —— 这在性质上与"用户自己在官方客户端点一下"不同。
+		// 由用户在界面上明确开启后才参与请求。
+		ZcodeCaptchaEnabled bool `json:"zcode_captcha_enabled"`
 	} `json:"pool"`
 
 	// Proxy 出站 HTTP 代理，形如 "http://127.0.0.1:7890"（缺省空 = 不用显式代理）。

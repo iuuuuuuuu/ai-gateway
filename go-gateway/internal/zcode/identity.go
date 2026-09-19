@@ -262,6 +262,42 @@ func osCategory(goos string) string {
 	}
 }
 
+// TraceHeaders 返回**追踪头**（对话通道用）。
+//
+// # 为什么单独成一组（而不是塞进 Headers）
+//
+// 参考实现（zcode2api 的 `identity.py::build_trace_headers`）明确记载了
+// 一个**会触发 3012** 的坑：
+//
+//	「通道差异（关键，误发会触发上游 3012 "unusual activity"）：
+//	  start-plan（JWT 通道，cred.jwt 存在）：**只发** x-request-id /
+//	  x-zcode-session-type / x-zcode-trace-id 三个头，**不发**
+//	  x-query-id / x-session-id —— 官方客户端 start-plan 请求不带这两个。
+//	  coding-plan（API Key 通道）：额外发 x-query-id / x-session-id。」
+//
+// 我们走的是 JWT（start-plan）通道，故这里**只发三个**。
+// 单独成组是为了让"哪些头属于哪条通道"这件事在代码里可见 ——
+// 混进 Headers 就会被"顺手补全"而踩坑。
+//
+// ⚠ 每次请求都要**重新生成**（不能被缓存复用）：它们标识单次请求。
+func (i Identity) TraceHeaders() map[string]string {
+	return map[string]string{
+		"x-request-id":        newTraceID(),
+		"x-zcode-session-type": "main",
+		"x-zcode-trace-id":     newTraceID(),
+	}
+}
+
+// newTraceID 生成一个 UUIDv4 形态的追踪 id。
+//
+// 复用 `NewDeviceMid`（它已经处理了 v4 的版本位与变体位）—— 追踪头与
+// 设备标识对**形态**的要求相同：上游会对"看着不像 UUID"的值直接拒绝
+//（参考实现用 `str(uuid.uuid4())`）。
+//
+// 单独包一层只是为了语义清晰：这里是"每次请求一个新 id"，
+// 而 NewDeviceMid 的调用点语义是"一个稳定的设备标识"。
+func newTraceID() string { return NewDeviceMid() }
+
 // Headers 返回要发的身份头。
 //
 // 取不到的值**直接省略**而不是填 "unknown" —— 理由见文件头注释
