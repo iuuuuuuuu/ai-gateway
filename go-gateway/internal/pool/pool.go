@@ -72,6 +72,25 @@ type Status struct {
 	// 两者在界面上若都写成「禁用」，用户就无法判断「这个号还在不在养」——
 	// 而「禁用了但仍在养号」正是本功能的语义。
 	NoRoute         bool      `json:"no_route,omitempty"`
+
+	// Product 该账号属于**哪个客户端产品**（`workbuddy` / `qoder` / `zcode`）。
+	//
+	// # 为什么必须下发（所有者 2026-09-20 要求）
+	//
+	// 原话：「在兼容网关哪里的账号池,也要标记上进入池子的账号属于那个客户端」。
+	//
+	// 三个产品的账号混在**同一个池**里（多产品路由开启时），而界面上
+	// 只有昵称/备注 —— 用户看到 `wish`、`aliyun-…` 这样的名字，
+	// **不知道它来自哪个客户端**。于是：
+	//
+	//	· 排查"为什么 zcode: 前缀选不出号"时，看不出池里到底有几个 ZCode 号
+	//	· 想给某个号单独停流量时，得先去别的页面确认它是哪家的
+	//
+	// ⚠ 值走 `ProductOf()`（**空串归一成 workbuddy**），不是裸 `e.a.Product`：
+	// 老账号的 Product 是空串，若原样下发，界面会显示空、或前端各自
+	// 拿空串去猜 —— 那正是"同一个号在不同页面显示不同产品"的成因。
+	Product string `json:"product,omitempty"`
+
 	SuccessCount    int64     `json:"success_count,omitempty"`
 	ErrTotal        int64     `json:"err_total,omitempty"`
 	LastSuccessTime time.Time `json:"last_success,omitempty"`
@@ -193,6 +212,20 @@ func (e *entry) expiryDayKey() string {
 		return ""
 	}
 	return time.Unix(e.expireAt, 0).In(time.Local).Format("2006-01-02")
+}
+
+// productOf 取账号所属产品，**nil 安全**且把空串归一成 workbuddy。
+//
+// 为什么要两层兜底而不是直接 `e.a.ProductOf()`：
+//   · `e.a` 可能是 nil（池里曾经有过 nil 账号的路径），直接调会 panic
+//   · 空串归一由 `auth.ProductOf()` 负责，这里只是复用它的口径 ——
+//     **不要**在这里另写一份判断，否则两条路径迟早分叉
+//      （界面显示 workbuddy、选号却按别的产品过滤，那是极难查的一类缺陷）
+func productOf(a *auth.Auth) string {
+	if a == nil {
+		return ""
+	}
+	return a.ProductOf()
 }
 
 // healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期、未被用户标记不接流量）。
@@ -2435,6 +2468,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Reason:          e.reason,
 		Disabled:        e.disabled,
 		NoRoute:         e.a != nil && e.a.NoRoute,
+		Product:         productOf(e.a),
 		SuccessCount:    e.successCount,
 		ErrTotal:        e.errTotal,
 		LastSuccessTime: e.lastSuccess,

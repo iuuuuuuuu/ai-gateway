@@ -40,8 +40,21 @@ func newThreeProductHandler(t *testing.T, auths ...*auth.Auth) (*Handler, *fakeQ
 	for _, a := range auths {
 		p.Add(a)
 	}
-	fq := &fakeQoder{stream: "data: [DONE]\n\n"}
-	fz := &fakeQoder{stream: "data: [DONE]\n\n"}
+	// ⚠ 假上游必须给**至少一帧真实数据**，不能只给 `data: [DONE]`。
+	//
+	// 这里原来写的是 `"data: [DONE]\n\n"` —— 而那是**空流**：
+	// `[DONE]` 只表示结束，不代表有内容（见 upstream.ValidSSEFrame 的注释）。
+	//
+	// 旧代码之所以没暴露，是因为 `ProbeFirstFrame` 当时只看 `data:` 前缀，
+	// 于是"只有 [DONE]"也能通过探测，直到 `Stream` 数出 0 帧才报空流。
+	// 修好探测口径（改用 ValidSSEFrame）后，这种假流**立刻被判成空流并换号**，
+	// 这些用例才红 —— 说明它们是**依赖缺陷行为**才通过的，不是真在测派发。
+	//
+	// 换成真实形状：一帧内容 + [DONE]。
+	const okStream = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+	fq := &fakeQoder{stream: okStream}
+	fz := &fakeQoder{stream: okStream}
 	h := NewHandler(Config{
 		Pool:      p,
 		APIKey:    "",

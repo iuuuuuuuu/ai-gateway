@@ -28,18 +28,42 @@ import (
 	"workbuddy2api/internal/upstream"
 )
 
-// sseProbeTimeout 流式请求预读首帧的超时。
+// sseProbeTimeout 流式请求预读首帧的**兜底**超时（未配置时用）。
 //
 // # 取值依据
 //
-// 首帧 = 上游开始产出（TTFB）。实测本机到 WorkBuddy 的 TTFB 约 1.1s，
-// 慢模型（带思考）会更久。取 30 秒：足够覆盖常见慢速首帧，
-// 又能在**上游真的挂住**时及时换号，而不是让用户干等。
+// 首帧 = 上游开始产出（TTFB）。实测本机到 WorkBuddy 的 TTFB 约 1.1s。
 //
-// ⚠ 超时**不等于**账号坏：网络抖动也会超时。故超时走的是
-// `applyErrorPolicy` 的分类路径（按 503 处理），由它决定冷却多久，
-// 而不是在这里硬编码一个"永久禁用"。
+// ⚠⚠ 但它对**推理模型的长思考**可能不够（2026-09-20 修正）：
+// 用户配置里 `upstream.header_timeout_seconds = 120`（"聊天 SSE 首字节前
+// 上限"），说明他期望上游可以有 2 分钟才吐第一个字节。
+// 而旧代码**硬编码 30 秒**，于是：
+//
+//	思考 40 秒才开始输出的模型 → probe 超时 → 判"上游返回空流" → 换号
+//	→ 换过去还是同一个模型、同样超时 → 整轮失败
+//
+// 用户看到的是 `empty upstream stream`，而**上游其实完全正常**，
+// 只是思考久了点。这是"用错误的判据把正常请求判成失败"。
+//
+// 故：**优先用配置的 header_timeout_seconds**（那是用户对"首字节等待"
+// 的显式表态），只在未配置时回落到这个常量。
 const sseProbeTimeout = 30 * time.Second
+
+// probeTimeoutFor 返回本次流式请求该用的首帧预读超时。
+//
+// 优先 `upstream.Client.HeaderTimeout`（由配置
+// `upstream.header_timeout_seconds` 而来，**用户对"等上游开口"的显式表态**），
+// 未配置（<=0）时回落 `sseProbeTimeout`。
+//
+// 为什么与 SSE 的 header timeout 复用同一个配置而不是新加一个键：
+// 它们**语义相同** —— 都是"等上游开口"的上限。多一个键会让用户
+// 面对两个含义几乎一样的数字，而不知道该调哪个。
+func (h *Handler) probeTimeoutFor() time.Duration {
+	if h != nil && h.cfg.Upstream != nil && h.cfg.Upstream.HeaderTimeout > 0 {
+		return h.cfg.Upstream.HeaderTimeout
+	}
+	return sseProbeTimeout
+}
 
 // ⚠ unsupportedEffortError 与 checkRequestedEffort 已移除（2026-09-18）。
 //
@@ -584,7 +608,7 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 		// 分类规则（哪些错误该冷却、多久、是否禁用）集中在那一个函数里，
 		// 另起一套会让同一个错误在不同路径下产生不同后果。
 		if stream && rc != nil && status < 400 {
-			probed, first, perr := upstream.ProbeFirstFrame(rc, sseProbeTimeout)
+			probed, first, perr := upstream.ProbeFirstFrame(rc, h.probeTimeoutFor())
 			rc = probed // 首帧已从 rc 消费，必须接回去（否则丢帧）
 			var probeMsg string
 			if perr != nil || first == "" {

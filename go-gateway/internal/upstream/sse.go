@@ -420,8 +420,23 @@ func ProbeFirstFrame(r io.ReadCloser, timeout time.Duration) (io.ReadCloser, str
 				consumed.WriteString(line)
 				mu.Unlock()
 				t := strings.TrimRight(line, "\r\n")
-				// 跳过注释/心跳/空行，找第一个真实 data: 帧
-				if strings.HasPrefix(t, "data:") {
+				// 跳过注释/心跳/空行，找第一个**有效**数据帧。
+				//
+				// ⚠⚠ 这里必须用 `ValidSSEFrame`，**不能**只用 `HasPrefix("data:")`。
+				//
+				// 这是真实缺陷（所有者 2026-09-20 现场：装新版后仍报
+				// `empty upstream stream`）。旧代码判据太宽：
+				//
+				//	probe 认 `data:` 前缀就算"有帧"
+				//	Stream 要求 JSON 能解析成对象才算 valid
+				//
+				// 于是 `data: [DONE]`（或任何非 JSON 的 data 行）会让
+				// **probe 放行、Stream 判空** —— 用户看到"探测通过了却报
+				// empty upstream stream"，而且 200 已经写出去、**再也无法换号**。
+				//
+				// `ValidSSEFrame` 与 `Stream` 的计数口径**逐字一致**
+				//（`[DONE]` 不算、非 JSON 不算），故两者不会再自相矛盾。
+				if ValidSSEFrame(t) {
 					ch <- outcome{line: line}
 					return
 				}

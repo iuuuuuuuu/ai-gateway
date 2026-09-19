@@ -65,6 +65,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { ModelRoutingList } from "@/components/model-routing-list";
+import { PRODUCT_LABELS, productAccentOf } from "@/lib/product-accent";
 import * as api from "@/lib/api";
 import { SENSITIVE_STRING_INPUT_PROPS } from "@/lib/sensitive-input";
 import { useAccountsStore } from "@/stores/accounts";
@@ -238,6 +239,35 @@ function normalizeAllowedModels(raw: string[] | string | null | undefined): stri
   }
   return out;
 }
+
+/**
+ * 账号池里产品徽标的**短标签**。
+ *
+ * # 为什么不用 `PRODUCT_LABELS` 的全名
+ *
+ * 账号列只有 `max-w-[168px]`，而它已经要放「名字 + uid 前 8 位」。
+ * 塞进 `WorkBuddy`（9 字符）会把名字挤到只剩下两三个字 —— 而**名字**
+ * 才是用户用来认账号的东西，产品只是**辅助判断**。
+ *
+ * 故用首字母缩写：`WB` / `QD` / `ZC`。
+ * 完整名放在 `title` 悬浮里（用户能随时看到，信息不丢）。
+ *
+ * ⚠ 未知产品**原样返回**而不是编一个缩写：环境里出现第四种产品时，
+ * 显示它本来的名字比显示一个我们猜的缩写更有用。
+ */
+function productShortLabelOf(product: string): string {
+  switch (product) {
+    case "workbuddy":
+      return "WB";
+    case "qoder":
+      return "QD";
+    case "zcode":
+      return "ZC";
+    default:
+      return product;
+  }
+}
+
 
 /**
  * 「放行模型」控件：**多选**，默认「全部」。
@@ -1539,10 +1569,37 @@ function PoolAccountRow({
           */}
           <div
             data-slot="pool-account-name"
-            className="truncate text-[12.5px] font-medium leading-4"
+            className="flex items-center gap-1 text-[12.5px] font-medium leading-4"
             title={poolAccountName(acc)}
           >
-            {poolAccountName(acc)}
+            {/* 产品徽标：这个账号来自哪个客户端。
+                所有者的需求：
+                  「在兼容网关哪里的账号池,也要标记上进入池子的账号属于那个客户端」
+
+                三个产品的账号混在同一个池里，而名字只有昵称/备注 ——
+                `wish`、`aliyun-…` 这样的名字**看不出是哪家的**。于是排查
+                「`zcode:` 前缀为什么选不出号」时看不出池里有几个 ZCode 号，
+                想单独给某个号停流量也得先去别的页面确认。
+
+                ⚠ 与「模型路由清单」的平台徽标**共用同一份配色**
+                （`productAccentOf`）—— 同一个产品在两个地方颜色不同，
+                用户会以为是两回事。 */}
+            {acc.product && (
+              <span
+                data-slot="pool-account-product"
+                data-product={acc.product}
+                title={`该账号属于 ${PRODUCT_LABELS[acc.product] || acc.product}`}
+                className={cn(
+                  "shrink-0 rounded border px-1 py-px text-[9.5px] font-medium leading-3",
+                  productAccentOf(acc.product).border,
+                  productAccentOf(acc.product).bg,
+                  productAccentOf(acc.product).text,
+                )}
+              >
+                {productShortLabelOf(acc.product)}
+              </span>
+            )}
+            <span className="truncate">{poolAccountName(acc)}</span>
           </div>
           {/* uid 在概览行给短前缀（完整值在二级行「积分」块里，信息不丢），
               因为 36 字符的 uuid 会把「账号」列撑到吃掉「消耗」列的宽度。 */}
@@ -3999,30 +4056,12 @@ export default function GatewayPage() {
           />
         </Row>
 
-        {/* 模型路由清单：把**三种写法**与每个模型来自哪些平台完整摆出来。
-            所有者的需求：
-              「相同的模型支持 平台:模型名 / 平台:国际版:模型名 / 模型名
-                这三种的方式路由流量」
-              「在兼容网关那里加一个模型列表跟智能体网关显示的一致」
-              「要把我说的支持的模型名称完整展示给用户，也要加上描述」
-              「加这个的原因是因为三个平台有重复的模型，这样子方便用户做选择」
-
-            放在「放行模型」**下方**是有意的：两者都关于"哪些模型可用"，
-            但前者是**写配置**（网关会 400 拒绝其它模型），本清单是**只读参考**
-            （告诉用户该怎么写模型名）。相邻便于对照，而各自说明都写清了
-            区别，不会混淆。
-
-            ⚠ 用**独立区块**而不是塞进上面的 Row：内容量差异很大（这里是
-            可滚动列表），塞进 Row 会把整段设置的栅格撑变形。 */}
-        <div className="mt-3 rounded-lg border border-border/60 px-3 py-3">
-          <div className="mb-2 flex flex-wrap items-baseline gap-2">
-            <span className="text-[13px] font-medium">模型路由清单</span>
-            <span className="text-[11px] text-muted-foreground">
-              同名模型可能由多个平台提供 —— 用带前缀的写法可指定走哪个平台
-            </span>
-          </div>
-          <ModelRoutingList models={modelItems} />
-        </div>
+        {/*
+          「模型路由清单」原先就在这个位置（「放行模型」下方、仍在「接口配置」
+          卡片**内部**）。所有者要求把它从「接口配置」里**拿出来单独成块**，
+          故整块已下移为本页的独立区块（标题 + Card），原位置的说明文字
+          一并搬了过去 —— 见下方 `<Section title="模型路由清单">`。
+        */}
 
         <Row className="flex-col items-stretch gap-2 sm:flex-row sm:items-center">
           <div className="min-w-0">
@@ -4198,6 +4237,71 @@ export default function GatewayPage() {
         </Row>
         </Section>
       </div>
+
+      {/*
+        模型路由清单：把**三种写法**与每个模型来自哪些平台完整摆出来。
+
+        所有者的需求：
+          「相同的模型支持 平台:模型名 / 平台:国际版:模型名 / 模型名
+            这三种的方式路由流量」
+          「在兼容网关那里加一个模型列表跟智能体网关显示的一致」
+          「要把我说的支持的模型名称完整展示给用户，也要加上描述」
+          「加这个的原因是因为三个平台有重复的模型，这样子方便用户做选择」
+
+        ── 为什么**从「接口配置」里拿出来**（本轮改动）
+
+          所有者原话：「兼容网关的 模型路由清单 单独拿出来,不要放在 接口配置
+          里面去」。此前它挂在「接口配置」卡片的「放行模型」行下方，
+          观感上是那条设置的一部分 —— 但它**不写任何配置**，是纯查询参考。
+          混在配置项里，用户会以为它也是"改了什么就生效"的开关之一。
+
+        ── 为什么放在「接口配置」之后、「账号池」之前
+
+          三条理由，按重要性排序：
+
+            1. **阅读顺序是「我配了什么 → 我该填什么 → 池子里现在怎么样」。**
+               用户刚在「接口配置」填完端口 / API Key，紧接着最自然的疑问
+               就是「那我客户端里模型名该写什么」—— 本区块正是回答它。
+               再往下「账号池」是运行态观测（谁在接流量、烧了多少），
+               属于"看结果"，放在参考之后合适。
+
+            2. **它是"查询参考"而不是"配置"，所以必须与配置区拉开一级。**
+               本区块用与「账号池」完全相同的 Section 规格（标题在外、
+               卡片在内），与「接口配置」是**同级**的兄弟区块，而不是它的
+               下级 —— 这样"它不是接口配置的一部分"在版面上就一眼可见。
+               若放在页面最底部，它会与「Token 用量」贴在一起，反而像是
+               用量统计的附属说明。
+
+            3. **与「放行模型」的对照关系仍然保留。** `放行模型`（写配置，
+               网关会 400 拒绝名单外的模型）在本区块上方，两者都关于
+               "哪些模型可用"，只隔一个卡片标题的距离，对照依旧方便。
+
+        ── 与「智能体管理」的关系
+
+          两页展示同一个模型时必须**看起来是一套**（同上同一下发的
+          `/v1/models`）。故卡片内的条目样式与「智能体管理」页的模型卡
+          逐项对齐：容器 `rounded-lg border px-2.5 py-2`、模型名 `font-mono`、
+          能力行复用同一个 `ModelCapabilityRow`、平台徽标改用同一套
+          `productAccentOf` 配色。
+
+          ⚠ 两页**语义不同**，不要为了"看起来一样"而删功能：
+            · 智能体管理：平台徽标是**开关**，点击写 `model_platforms`
+              配置、改服务端行为；
+            · 本区块：模型写法**可复制**，只读参考，告诉用户该怎么填。
+          两者各自保留交互，只统一视觉。
+      */}
+      <Section
+        title="模型路由清单"
+        description="同名模型可能由多个平台提供 —— 用带前缀的写法可指定走哪个平台"
+      >
+        {/*
+          卡片内留白跟「账号池」对齐（`p-3 sm:p-4`），而不是像设置行那样
+          贴边 —— 本区块内容是自成一体的列表，贴边会像被裁掉了一块。
+        */}
+        <div className="p-3 sm:p-4">
+          <ModelRoutingList models={modelItems} />
+        </div>
+      </Section>
 
       <Section title="账号池" description={pool ? `网关侧运行态（redis=${pool.redis_mode ?? "noop"}）` : "启动网关后可见"}>
         {poolAccounts.length > 0 ? (
