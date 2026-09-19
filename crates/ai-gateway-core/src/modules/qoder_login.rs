@@ -324,6 +324,249 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
 ///
 /// 活动是**限时**的（实测那条 `endAt` 只差 22 小时），且每天重置。
 /// 用户不知道就白白错过。所以界面上要能看到"有 N 个可领取"。
+/// **批量**查所有账号的权益活动（所有者的需求）。
+///
+/// # 为什么需要它（现有实现的缺陷）
+///
+/// 前端此前是这么查的：
+///
+///	```text
+///	const target = rows.find((r) => r.hasCredential) ?? rows[0];
+///	const r = await api.qoderCampaigns(target.uid);
+///	```
+///
+/// **只查一个账号**，然后把结果当成了全局状态。但活动是**每账号专属**的：
+///
+///	A 账号领了 100 Credits，B 账号还有 100 没领
+///	→ 界面只显示 A 的"已领取"
+///	→ B 的活动**永远发现不了**
+///
+/// 所有者原话：「qoder 那个任务跟 workbuddy 一样都属于每个账号的专属任务,
+/// **每个账号都能领取**」—— 就是这个意思。
+///
+/// # 返回形状
+///
+///	{
+///	  "accounts": [
+///	    { "uid": "...", "nickname": "...", "status": "ok",
+///	      "claimable": 1, "campaigns": [ ... ] },
+///	    { "uid": "...", "status": "error", "message": "..." }
+///	  ],
+///	  "claimableTotal": 2,          // 所有账号里可领的总数
+///	  "accountsWithClaimable": 1,   // 有几个账号有可领的
+///	}
+///
+/// # 为什么单个账号失败不让整体失败
+///
+/// 一个账号的凭证坏了/过期了，不该让用户看不到**其他账号**的活动。
+/// 故失败项如实记录 `status` + `message`，成功的照常返回 ——
+/// 界面能区分"这个账号查不到"与"所有账号都没活动"。
+pub fn fetch_campaigns_all() -> Result<Value, String> {
+    let uids = qoder_account::credential_uids();
+    if uids.is_empty() {
+        return Ok(json!({
+            "accounts": [],
+            "claimableTotal": 0,
+            "accountsWithClaimable": 0,
+        }));
+    }
+
+    let mut accounts = Vec::new();
+    let mut claimable_total: i64 = 0;
+    let mut with_claimable: i64 = 0;
+
+    for uid in &uids {
+        let nickname = qoder_account::load_accounts()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|a| a.uid == *uid)
+            .map(|a| a.nickname)
+            .unwrap_or_default();
+        match fetch_campaigns(uid) {
+            Ok(r) => {
+                let campaigns = r.get("campaigns").cloned().unwrap_or_else(|| json!([]));
+                // 可领 = 活动列表里 claimStatus 不是已领取的那些。
+                // ⚠ 用**活动自身**的状态判断，而不是顶层 `claimable` ——
+                // 顶层字段在部分账号上缺失（实测），只有逐条看才准。
+                let claimable = count_claimable(&campaigns);
+                claimable_total += claimable;
+                if claimable > 0 {
+                    with_claimable += 1;
+                }
+                accounts.push(json!({
+                    "uid": uid,
+                    "nickname": nickname,
+                    "status": "ok",
+                    "claimable": claimable,
+                    "campaigns": campaigns,
+                    "campaignUrl": r.get("campaignUrl").cloned().unwrap_or(Value::Null),
+                }));
+            }
+            Err(e) => accounts.push(json!({
+                "uid": uid,
+                "nickname": nickname,
+                "status": "error",
+                "claimable": 0,
+                "message": e,
+            })),
+        }
+    }
+
+    Ok(json!({
+        "accounts": accounts,
+        "claimableTotal": claimable_total,
+        "accountsWithClaimable": with_claimable,
+    }))
+}
+
+/// 数一个活动列表里有几条**可领取**的。
+///
+/// 判据用 `claimStatus`（上游的权威状态），不用 `claimable` —— 后者在
+/// 部分账号/部分活动上缺失，拿它判断会漏掉真实可领的活动。
+fn count_claimable(campaigns: &Value) -> i64 {
+    let Some(arr) = campaigns.as_array() else {
+        return 0;
+    };
+    arr.iter()
+        .filter(|c| {
+            let st = c.get("claimStatus").and_then(Value::as_str).unwrap_or("");
+            // 空串也算可领：上游没给状态时不预设为"已领取"，
+            // 否则用户明明能领却看不到按钮
+            !st.eq_ignore_ascii_case("CLAIMED") && !st.eq_ignore_ascii_case("EXPIRED")
+        })
+        .count() as i64
+}
+
+/// **批量领取**所有账号的可领取活动（所有者的需求：「一键领取（所有账号）」）。
+///
+/// # 语义
+///
+///	· 遍历每个账号，各自领各自的活动（活动是每账号专属的）
+///	· 单个账号/单个活动失败**不中断**其余 —— 用户要的是"能领的都领到"
+///	· 返回逐账号、逐活动的结果，界面据此如实展示
+///
+/// # ⚠ 这是**写操作**，只能由用户显式点击触发
+///
+/// 它用用户自己的令牌打官方接口（与官方客户端点那个「领取」按钮同构，
+/// **不需要人机验证**）。但**不做定时自动领取** —— 那与"用户点一下"
+/// 不是一回事，且会让账号表现出非人类的活动模式。
+/// 见 `campaign.go` 的说明。
+pub fn claim_all_campaigns() -> Result<Value, String> {
+    let uids = qoder_account::credential_uids();
+    if uids.is_empty() {
+        return Ok(json!({
+            "accounts": [], "claimedCount": 0, "failedCount": 0, "nothingCount": 0,
+        }));
+    }
+
+    let mut out = Vec::new();
+    let mut claimed = 0;
+    let mut failed = 0;
+    let mut nothing = 0;
+
+    for uid in &uids {
+        let nickname = qoder_account::load_accounts()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|a| a.uid == *uid)
+            .map(|a| a.nickname)
+            .unwrap_or_default();
+
+        // 先查该账号有哪些可领的（不重犯"只查一个账号"的错）
+        let campaigns = match fetch_campaigns(uid) {
+            Ok(r) => r.get("campaigns").cloned().unwrap_or_else(|| json!([])),
+            Err(e) => {
+                failed += 1;
+                out.push(json!({
+                    "uid": uid, "nickname": nickname,
+                    "status": "error", "message": e, "claimed": [],
+                }));
+                continue;
+            }
+        };
+
+        let targets: Vec<Value> = campaigns
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter(|c| {
+                        let st = c.get("claimStatus").and_then(Value::as_str).unwrap_or("");
+                        !st.eq_ignore_ascii_case("CLAIMED") && !st.eq_ignore_ascii_case("EXPIRED")
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if targets.is_empty() {
+            nothing += 1;
+            out.push(json!({
+                "uid": uid, "nickname": nickname,
+                "status": "nothing", "claimed": [],
+            }));
+            continue;
+        }
+
+        let mut done = Vec::new();
+        for c in &targets {
+            let cid = c.get("campaignId").and_then(Value::as_str).unwrap_or("");
+            if cid.is_empty() {
+                continue;
+            }
+            match claim_campaign(uid, cid) {
+                Ok(r) => {
+                    // `replayed` = 上游说"之前已领过"（不是错误）。
+                    // 如实区分，否则用户以为又领到一份。
+                    let replayed = r.get("replayed").and_then(Value::as_bool).unwrap_or(false);
+                    if !replayed {
+                        claimed += 1;
+                    }
+                    done.push(json!({
+                        "campaignId": cid,
+                        "ok": true,
+                        "replayed": replayed,
+                        "benefit": c.get("benefit").cloned().unwrap_or(Value::Null),
+                    }));
+                }
+                Err(e) => {
+                    failed += 1;
+                    // 失败也记一条 —— 与签到一致（`checkin.rs` 成功/失败都写）。
+                    //
+                    // 为什么重要：用户看到"失败 2 个"时，需要能在记录里
+                    // 查到**是哪两个、什么原因**，而不是只有一个数字。
+                    {
+                        use crate::modules::account_records;
+                        let (id, name) = qoder_record_identity(uid);
+                        account_records::add_task_record(
+                            &id,
+                            &name,
+                            "领取权益活动",
+                            "failed",
+                            &format!("{}：{e}", cid),
+                        );
+                    }
+                    done.push(json!({
+                        "campaignId": cid, "ok": false, "error": e,
+                        "benefit": c.get("benefit").cloned().unwrap_or(Value::Null),
+                    }));
+                }
+            }
+        }
+        out.push(json!({
+            "uid": uid, "nickname": nickname,
+            "status": "ok", "claimed": done,
+        }));
+    }
+
+    Ok(json!({
+        "accounts": out,
+        "claimedCount": claimed,
+        "failedCount": failed,
+        "nothingCount": nothing,
+    }))
+}
+
+/// 查该账号的权益活动（单个账号）。
 pub fn fetch_campaigns(uid: &str) -> Result<Value, String> {
     let uid = uid.trim();
     if uid.is_empty() {
@@ -390,7 +633,63 @@ pub fn claim_campaign(uid: &str, campaign_id: &str) -> Result<Value, String> {
             .unwrap_or("领取权益失败")
             .to_string());
     }
+
+    // 记一条「领取记录」—— 所有者的需求：
+    // 「qoder 也应该跟 workbuddy 一样要显示领取记录和消费记录」。
+    //
+    // 复用既有的记录管道（与签到同一条 `account_records.json`），于是记录
+    // 立刻出现在「账号记录」视图与积分统计页里，**前端零改动**。
+    //
+    // ⚠ `replayed` 必须区分成 `already`（与 Go 侧四值口径一致）：
+    //   上游对"之前已领过"回 `replayed:true` 而不是报错。
+    //   若都记成 success，用户在记录里会以为又领了一份。
+    {
+        use crate::modules::account_records;
+        let replayed = r.get("replayed").and_then(Value::as_bool).unwrap_or(false);
+        let (id, name) = qoder_record_identity(uid);
+        let detail = r
+            .get("campaignKey")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(campaign_id)
+            .to_string();
+        account_records::add_task_record(
+            &id,
+            &name,
+            "领取权益活动",
+            if replayed { "already" } else { "success" },
+            &detail,
+        );
+    }
+
     Ok(r)
+}
+
+/// 取一条记录该用的 (accountId, accountName)。
+///
+/// # 为什么不能直接用 Qoder 的 uid
+///
+/// `account_records.json` 的 `accountId` 约定是**宿主账号库的 uuid**
+///（`account-card.tsx` 内嵌记录视图时用 `fixedAccountId={account.id}` 过滤）。
+/// 而 Qoder 侧只有自己的 `uid`（形如 `qoder-019f1772-…`）—— 直接写进去，
+/// 记录会出现在「全部账号」视图里，但**点进那个账号的卡片看不到**。
+///
+/// 宿主账号库里没有 Qoder 账号（那里只有 WorkBuddy 账号），故这里退而
+/// 用 Qoder 自己的 uid 作 accountId：**记录不会丢**，且在全局视图可见。
+/// 昵称取账号库里的名字，让列表可读。
+///
+/// ⚠ 这是一个**已知的取舍**，不是疏漏：要真正归属到账号卡片，需要宿主
+/// 账号库也能列出 Qoder 账号（那是更大的改动）。这里先把"能记录、能看"
+/// 做出来，归属问题如实记在此处。
+fn qoder_record_identity(uid: &str) -> (String, String) {
+    let name = qoder_account::load_accounts()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|a| a.uid == uid)
+        .map(|a| a.nickname)
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| uid.to_string());
+    (uid.to_string(), name)
 }
 
 fn truncate(s: &str, n: usize) -> String {

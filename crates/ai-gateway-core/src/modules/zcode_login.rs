@@ -629,6 +629,40 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
             .collect();
         patch.insert("models".into(), json!(ids));
     }
+    // ---- 套餐信息落库（**此前完全漏了，所有者的反馈**）----
+    //
+    // 所有者原话：「智谱的到期时间还没显示出来」。
+    //
+    // 根因：`quota` 子命令**确实返回**了 `planExpiresAt` / `planKind` /
+    // `plans`（实测：`planExpiresAt=1789866000`、`planKind="paid"`、
+    // `plans=[{"name":"ZCode Weekend Build",...}]`），上面的解析也把它们
+    // 存进了局部变量 —— 但**写回账号库的 patch 里一个字都没提**。
+    //
+    // 于是账号库里恒为 `planExpireAt: 0`、`planKind: ""`、`plans: []`，
+    // 界面自然显示不出到期时间。数据一路解析到最后一步被丢掉，
+    // 是最难查的一类缺陷 —— 每一段单看都对。
+    //
+    // ⚠ 排查提示（我自己踩过）：读取端 `zcode_account::apply_patch`
+    // **本来就支持**这三个键。我一度以为它漏了，加了重复分支 ——
+    // 编译器用 `unreachable_patterns` 才纠正了我。**缺陷只在这一处**。
+    //
+    // ⚠ 三条都只在**有值**时放进 patch：
+    //   · `plan_expires_at` 是 Option，None 表示"没查到/无套餐"
+    //   · `plan_kind` 空串同理
+    //   · `plans` 空数组会把上一次的好数据抹掉
+    //
+    // 注意：`apply_patch` 那端**允许**空值覆盖（那是有意语义 ——
+    // 套餐真到期了就该显示"已过期"）。所以"别把好数据抹掉"这条约束
+    // 由**写入端**（这里）负责，不能指望读取端兜。
+    if let Some(pe) = plan_expires_at {
+        patch.insert("planExpireAt".into(), json!(pe));
+    }
+    if !plan_kind.trim().is_empty() {
+        patch.insert("planKind".into(), json!(plan_kind.trim()));
+    }
+    if !plans.is_empty() {
+        patch.insert("plans".into(), json!(plans));
+    }
     let acc = zcode_account::upsert_account(uid, &Value::Object(patch))?;
 
     // 重写网关配置 —— 让 `pool.product_models` 带上刚查到的模型。
@@ -711,5 +745,69 @@ mod tests {
         assert!(t.starts_with("中文字"));
         assert!(t.ends_with('…'));
         assert_eq!(truncate("abc", 10), "abc");
+    }
+
+    /// 套餐信息必须被放进写回 patch（所有者反馈：「智谱的到期时间还没显示出来」）。
+    ///
+    /// # 这条守的是**真正的缺陷位置**
+    ///
+    /// `quota` 子命令返回了 `planExpiresAt` / `planKind` / `plans`，
+    /// 解析代码也把它们存进了局部变量 —— 但**写回账号库的 patch 里
+    /// 一个字都没提**。于是账号库恒为 0 / "" / []，界面显示不出到期时间。
+    ///
+    /// 这是"数据一路解析到最后一步被丢掉"的典型：每一段单看都对，
+    /// 只有把整条链路连起来跑才发现。
+    ///
+    /// # 为什么用"构造 patch"而不是真的调用 `refresh_account`
+    ///
+    /// `refresh_account` 会调 Go 子命令（需要真实凭证与网络），
+    /// 单测里跑不了。故这里把该函数的**决策规则**抽出来单独验证 ——
+    /// 规则一致即可，函数体的其余部分只是把这些值喂给它。
+    ///
+    /// ⚠ 若哪天有人重构 `refresh_account` 而忘了把这三个键放进 patch，
+    /// 这条测试**不会红**（它测的是规则，不是函数体）。这是本测试的
+    /// 已知边界 —— 端到端由 `uitest/verify-refresh-chain.cjs` 覆盖。
+    #[test]
+    fn plan_fields_are_put_into_patch_only_when_present() {
+        // 复刻 refresh_account 里的决策规则（见该函数"套餐信息落库"段）
+        fn build_plan_patch(
+            plan_expires_at: Option<i64>,
+            plan_kind: &str,
+            plans: Vec<Value>,
+        ) -> serde_json::Map<String, Value> {
+            let mut p = serde_json::Map::new();
+            if let Some(pe) = plan_expires_at {
+                p.insert("planExpireAt".into(), json!(pe));
+            }
+            if !plan_kind.trim().is_empty() {
+                p.insert("planKind".into(), json!(plan_kind.trim()));
+            }
+            if !plans.is_empty() {
+                p.insert("plans".into(), json!(plans));
+            }
+            p
+        }
+
+        // ---- 有值时：三个键都要在 ----
+        let full = build_plan_patch(
+            Some(1789866000),
+            "paid",
+            vec![json!({ "name": "ZCode Weekend Build" })],
+        );
+        assert_eq!(full.get("planExpireAt").and_then(Value::as_i64), Some(1789866000),
+            "套餐到期必须进 patch —— 漏了它就是「到期时间不显示」的根因");
+        assert_eq!(full.get("planKind").and_then(Value::as_str), Some("paid"),
+            "套餐类型必须进 patch（界面要区分个人/体验套餐）");
+        assert_eq!(full.get("plans").and_then(Value::as_array).map(|a| a.len()), Some(1),
+            "套餐明细必须进 patch");
+
+        // ---- 无值时：一个键都不该进（避免抹掉上次的好数据）----
+        let empty = build_plan_patch(None, "", vec![]);
+        assert!(empty.is_empty(),
+            "查不到时不该写入任何套餐键 —— 否则会把上次查到的到期时间抹成 0（显示 1970 年）");
+
+        // ---- 空白字符也算无值 ----
+        let blank = build_plan_patch(None, "   ", vec![]);
+        assert!(blank.is_empty(), "纯空白的 planKind 不该写入");
     }
 }

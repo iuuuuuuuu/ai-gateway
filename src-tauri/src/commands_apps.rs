@@ -971,6 +971,28 @@ pub async fn qoder_campaigns(uid: String) -> Result<Value, String> {
         .map_err(|e| format!("查询 Qoder 权益活动失败: {e}"))?
 }
 
+/// 查询**所有账号**的 Qoder 权益活动。
+///
+/// 活动是每账号专属的（A 领了 B 还能领），故界面必须看到全部账号，
+/// 否则其他账号的活动永远发现不了。单个账号失败不影响其余。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_campaigns_all() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(qoder_login::fetch_campaigns_all)
+        .await
+        .map_err(|e| format!("批量查询 Qoder 权益活动失败: {e}"))?
+}
+
+/// **一键领取所有账号**的可领取权益活动。
+///
+/// ⚠ 写操作，只由用户显式点击触发（不做定时自动领取）。
+/// 单个账号/活动失败不中断其余。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_claim_all_campaigns() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(qoder_login::claim_all_campaigns)
+        .await
+        .map_err(|e| format!("批量领取 Qoder 权益活动失败: {e}"))?
+}
+
 /// 领取一个 Qoder 权益活动。
 ///
 /// **只由用户显式点击触发** —— 不做定时自动领取。

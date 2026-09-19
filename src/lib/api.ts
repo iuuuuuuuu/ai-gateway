@@ -256,6 +256,9 @@ const ROUTES: Record<string, Route> = {
   zcode_refresh_account: { method: "POST", path: "/api/zcode/refresh-account" },
   qoder_refresh_account: { method: "POST", path: "/api/qoder/refresh-account" },
   qoder_campaigns: { method: "POST", path: "/api/qoder/campaigns" },
+  // 批量：所有账号的活动 / 一键领取（活动是每账号专属的）
+  qoder_campaigns_all: { method: "POST", path: "/api/qoder/campaigns-all" },
+  qoder_claim_all_campaigns: { method: "POST", path: "/api/qoder/claim-all-campaigns" },
   qoder_claim_campaign: { method: "POST", path: "/api/qoder/claim-campaign" },
   zcode_login_start: { method: "POST", path: "/api/zcode/login/start" },
   zcode_login_poll: { method: "POST", path: "/api/zcode/login/poll" },
@@ -1519,13 +1522,100 @@ export interface QoderCampaignsResult {
 /**
  * 查询 Qoder 账号的权益活动。
  *
- * ## 只读，不代领
+ * ## ⚠ 活动是**每账号专属**的
  *
- * 领取要阿里云验证码（服务端的防滥用机制），故本应用**不提供**领取
- * 动作。界面只展示活动与倒计时，并把 `campaignUrl` 交给用户自己去打开。
+ * 这个接口只返回**一个账号**的活动。A 账号领了 100 Credits，B 账号可能
+ * 还有没领的 —— 把单个账号的结果当全局，会让其他账号的活动永远发现不了。
+ *
+ * 要看全部账号请用 `qoderCampaignsAll()`。
+ *
+ * ## 领取
+ *
+ * 领取**不需要**人机验证（用用户自己的令牌打官方接口，与官方客户端点
+ * 那个「领取」按钮同构）。单账号领取用 `qoderClaimCampaign`，
+ * 全部账号用 `qoderClaimAllCampaigns`。
  */
 export function qoderCampaigns(uid: string): Promise<QoderCampaignsResult> {
   return call<QoderCampaignsResult>("qoder_campaigns", { uid });
+}
+
+/** 一个账号的活动查询结果（批量接口的条目）。 */
+export interface QoderAccountCampaigns {
+  uid: string;
+  nickname: string;
+  /** "ok" 查到 / "error" 该账号查失败（原因在 message） */
+  status: string;
+  /** 该账号**可领取**的活动数（0 = 已领完或没有） */
+  claimable: number;
+  campaigns?: QoderCampaign[];
+  campaignUrl?: string | null;
+  /** status == "error" 时的原因 */
+  message?: string;
+}
+
+/** 所有账号的活动查询结果。 */
+export interface QoderCampaignsAllResult {
+  accounts: QoderAccountCampaigns[];
+  /** 所有账号里可领取的活动总数 */
+  claimableTotal: number;
+  /** 有几个账号有可领取的活动 */
+  accountsWithClaimable: number;
+}
+
+/**
+ * 查询**所有账号**的 Qoder 权益活动。
+ *
+ * ## 为什么需要它（所有者的反馈）
+ *
+ *	「qoder 那个任务跟 workbuddy 一样都属于每个账号的专属任务,
+ *	  每个账号都能领取」
+ *
+ * 活动是每账号专属的，只查一个账号会让其他账号的活动**永远发现不了**。
+ *
+ * 单个账号失败不影响其余 —— 结果里逐账号带 `status`。
+ */
+export function qoderCampaignsAll(): Promise<QoderCampaignsAllResult> {
+  return call<QoderCampaignsAllResult>("qoder_campaigns_all", {});
+}
+
+/** 一个账号的领取结果（批量一键领取的条目）。 */
+export interface QoderAccountClaimResult {
+  uid: string;
+  nickname: string;
+  /** "ok" 有处理 / "nothing" 无可领 / "error" 该账号失败 */
+  status: string;
+  message?: string;
+  claimed: Array<{
+    campaignId: string;
+    ok: boolean;
+    /** true = 上游说"之前已领过"（不是新领到） */
+    replayed?: boolean;
+    benefit?: { kind: string; amount: number } | null;
+    error?: string;
+  }>;
+}
+
+/** 一键领取（所有账号）的结果。 */
+export interface QoderClaimAllResult {
+  accounts: QoderAccountClaimResult[];
+  /** 本次**新领到**的数量（不含 replayed） */
+  claimedCount: number;
+  /** 失败数 */
+  failedCount: number;
+  /** 无可领活动的账号数 */
+  nothingCount: number;
+}
+
+/**
+ * **一键领取所有账号**的可领取权益活动。
+ *
+ * ⚠ 写操作，只由用户显式点击触发 —— 不做定时自动领取
+ *（那与"用户点一下"不是一回事，且会让账号表现出非人类的活动模式）。
+ *
+ * 单个账号/活动失败不中断其余：用户要的是"能领的都领到"。
+ */
+export function qoderClaimAllCampaigns(): Promise<QoderClaimAllResult> {
+  return call<QoderClaimAllResult>("qoder_claim_all_campaigns", {});
 }
 
 /** 领取结果。 */

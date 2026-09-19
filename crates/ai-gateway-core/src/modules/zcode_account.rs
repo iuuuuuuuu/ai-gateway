@@ -605,6 +605,64 @@ mod tests {
         assert_eq!(a.note, "ok");
     }
 
+    /// 套餐三件套必须能被 patch 写入。
+    ///
+    /// # 为什么要专门守它（所有者反馈：「智谱的到期时间还没显示出来」）
+    ///
+    /// 我排查时一度以为 `apply_patch` 漏了这三个键，**加了重复分支** ——
+    /// 编译器报 `unreachable_patterns` 才发现它本来就支持（见本函数上方
+    /// 的 `planExpireAt` / `planKind` / `plans` 三个分支）。
+    ///
+    /// 真正的缺陷只在**写入端**（`zcode_login::refresh_account` 的 patch
+    /// 没带这三个键）。这条测试的作用是把"读取端确实支持"这件事**钉住** ——
+    /// 若哪天有人误删了这三个分支，这条会红，而不是让界面静默失去到期时间。
+    #[test]
+    fn apply_patch_writes_plan_fields() {
+        let mut a = ZcodeAccount::default();
+        apply_patch(
+            &mut a,
+            &json!({
+                "planExpireAt": 1789866000i64,
+                "planKind": "paid",
+                "plans": [{ "name": "ZCode Weekend Build", "planId": "zcode-v3-start-plan-wk-0918" }],
+            }),
+        );
+        assert_eq!(a.plan_expire_at, 1789866000, "套餐到期必须能被写入（否则界面无到期时间）");
+        assert_eq!(a.plan_kind, "paid", "套餐类型必须能被写入（界面要区分个人/体验套餐）");
+        assert_eq!(a.plans.len(), 1, "套餐明细必须能被写入");
+    }
+
+    /// 套餐字段允许被空值覆盖 —— 这是**有意**的语义。
+    ///
+    /// # 为什么和 `models` 的取舍不同
+    ///
+    /// `models` 是「空数组不覆盖」（避免一次网络抖动抹掉好数据），
+    /// 而这三个字段**允许**空值覆盖，理由是它们表达的是**当下判断**：
+    ///
+    ///	· 套餐**已经到期**了 → 就该显示"已过期"，而不是留着上次的到期日
+    ///	· 这次判不出类型 → 空串比留着旧判断更诚实
+    ///
+    /// 代码里的注释写明了这个意图（"空串也接受……必须能覆盖上一次的
+    /// 判断结果"）。故这里**反向**钉住：不是"不该覆盖"，而是"必须能覆盖"。
+    /// 我第一版把这条写反了（断言不该覆盖），测试红了 —— 那是我的假设错，
+    /// 不是代码错。
+    ///
+    /// 真正要防的"抹掉好数据"由**写入端**负责：`refresh_account` 只在
+    /// 查到值时才把键放进 patch（见 zcode_login.rs 的 `enrich` 段注释）。
+    #[test]
+    fn apply_patch_allows_clearing_plan_fields() {
+        let mut a = ZcodeAccount {
+            plan_expire_at: 1789866000,
+            plan_kind: "paid".into(),
+            plans: vec![json!({ "name": "ZCode Weekend Build" })],
+            ..Default::default()
+        };
+        apply_patch(&mut a, &json!({ "planExpireAt": 0i64, "planKind": "", "plans": [] }));
+        assert_eq!(a.plan_expire_at, 0, "套餐到期应能被清空（已到期的场景）");
+        assert_eq!(a.plan_kind, "", "套餐类型应能被清空（判不出来的场景）");
+        assert!(a.plans.is_empty(), "套餐明细应能被清空");
+    }
+
     #[test]
     fn account_view_uses_expected_keys() {
         let a = ZcodeAccount {

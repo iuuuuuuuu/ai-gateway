@@ -163,8 +163,14 @@ pub fn router() -> Router {
         .route("/api/qoder/import-from-client", post(api_qoder_import_from_client))
         // 刷新额度 / 到期 / 支持模型（此前没有任何生产者调用 FetchQuota）
         .route("/api/qoder/refresh-account", post(api_qoder_refresh_account))
-        // 权益活动（「每天领 100 Credits」那类）。**只读**，不代领。
+        // 权益活动（「每天领 100 Credits」那类）。**只读**。
+        //
+        // ⚠ 活动是**每账号专属**的 —— 单账号接口只能看到那一个账号的状态。
         .route("/api/qoder/campaigns", post(api_qoder_campaigns))
+        // 批量：所有账号的活动 / 一键领取。所有者的需求：
+        // 「每个账号都能领取，可以跟 workbuddy 一样显示一个一键领取（所有账号）」
+        .route("/api/qoder/campaigns-all", post(api_qoder_campaigns_all))
+        .route("/api/qoder/claim-all-campaigns", post(api_qoder_claim_all_campaigns))
         // 领取权益活动。**用户显式触发**，不做自动化（见 campaign.go）。
         .route("/api/qoder/claim-campaign", post(api_qoder_claim_campaign))
         // ---- ZCode（Z.AI / 智谱）----
@@ -342,10 +348,11 @@ async fn api_qoder_login_poll(Json(body): Json<Value>) -> Response {
 
 /// POST /api/qoder/campaigns —— body: `{ "uid": "..." }`
 ///
-/// 查询该账号的权益活动（「每天领 100 Credits」那类）。**只读**。
+/// 查询**该账号**的权益活动（「每天领 100 Credits」那类）。**只读**。
 ///
-/// ⚠ 刻意**不提供领取接口**：领取要阿里云验证码，那是服务端的防滥用
-/// 机制。界面只展示活动与倒计时，并给出活动页地址让用户自己去领。
+/// ⚠ 活动是**每账号专属**的 —— 查一个账号只能得到那一个账号的状态。
+/// 要拿到全部账号的状态请用 `POST /api/qoder/campaigns-all`。
+/// （此前前端只查一个账号就把结果当全局，导致其他账号的活动发现不了。）
 async fn api_qoder_campaigns(Json(body): Json<Value>) -> Response {
     let uid = body.get("uid").and_then(Value::as_str).unwrap_or("").to_string();
     match tokio::task::spawn_blocking(move || qoder_login::fetch_campaigns(&uid)).await {
@@ -353,6 +360,48 @@ async fn api_qoder_campaigns(Json(body): Json<Value>) -> Response {
         Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
         Err(e) => json_err(
             format!("查询 Qoder 权益活动失败: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/qoder/campaigns-all —— 查询**所有账号**的权益活动。
+///
+/// # 为什么需要批量接口
+///
+/// 活动是每账号专属的：A 账号领了，B 账号还有没领的。只查一个账号
+/// 会把 B 的活动**永远藏起来**（所有者反馈的正是这个）。
+///
+/// 单个账号失败不影响其余 —— 结果里逐账号带 `status`。
+async fn api_qoder_campaigns_all() -> Response {
+    match tokio::task::spawn_blocking(qoder_login::fetch_campaigns_all).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(
+            format!("批量查询 Qoder 权益活动失败: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/qoder/claim-all-campaigns —— **一键领取所有账号**的权益活动。
+///
+/// # 语义
+///
+///	· 遍历每个账号，各自领各自的活动（活动是每账号专属的）
+///	· 单个账号/活动失败不中断其余 —— 用户要的是"能领的都领到"
+///	· 逐账号逐活动返回结果，界面据此如实展示
+///
+/// # ⚠ 写操作，只能由用户显式点击触发
+///
+/// 不做定时自动领取 —— 那与"用户点一下"不是一回事，
+/// 且会让账号表现出非人类的活动模式。
+async fn api_qoder_claim_all_campaigns() -> Response {
+    match tokio::task::spawn_blocking(qoder_login::claim_all_campaigns).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(
+            format!("批量领取 Qoder 权益活动失败: {e}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
     }

@@ -1961,7 +1961,7 @@ fn product_models_for_gateway() -> Value {
     Value::Object(out)
 }
 
-/// ZCode 验证码求解器所在目录（含 solver.js + node_modules）。
+/// ZCode 验证码求解器所在目录（含 `solver.bundle.cjs`）。
 ///
 /// # 解析顺序
 ///
@@ -1983,9 +1983,17 @@ fn product_models_for_gateway() -> Value {
 /// 故这里把两种布局都列上，且把 `assets/` 那条放在前面（那是实际布局）。
 fn captcha_solver_dir() -> String {
     fn ok(p: PathBuf) -> Option<String> {
-        // 必须能找到 solver.js 才算数：只判断目录存在会把"空目录"
+        // 必须能找到**入口文件**才算数：只判断目录存在会把"空目录"
         // 当成有效组件，于是求解时才发现缺文件（fail late）。
-        if p.join("solver.js").is_file() {
+        //
+        // ⚠ 两个候选都要认，且顺序与 Go 侧 `entryFile()` **保持一致**：
+        //
+        //	solver.bundle.cjs  esbuild 打成的单文件（优先，安装更快）
+        //	solver.js          源码（回退，便于就地诊断）
+        //
+        // 只认其中一个会出事：宿主找到目录、Go 侧却选另一个入口，
+        // 两边判断不一致时会出现"宿主说可用、实际跑不起来"。
+        if p.join("solver.bundle.cjs").is_file() || p.join("solver.js").is_file() {
             Some(p.to_string_lossy().to_string())
         } else {
             None

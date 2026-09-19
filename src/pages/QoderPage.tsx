@@ -139,10 +139,21 @@ export default function QoderPage() {
   const [clientImporting, setClientImporting] = useState(false);
 
   // 权益活动（「每天领 100 Credits」那类）
-  const [campaigns, setCampaigns] = useState<api.QoderCampaignsResult | null>(null);
+  //
+  // ⚠ 按**账号**存放，不是全局一份。
+  //
+  // 活动是每账号专属的：A 账号领了 100 Credits，B 账号还有 100 没领。
+  // 此前只查一个账号（`rows.find(r => r.hasCredential)`）就把结果当全局，
+  // 于是**其他账号的活动永远发现不了** —— 所有者的反馈正是这个：
+  //
+  //	「qoder 那个任务跟 workbuddy 一样都属于每个账号的专属任务,
+  //	  每个账号都能领取」
+  const [campaigns, setCampaigns] = useState<api.QoderCampaignsAllResult | null>(null);
   const [campaignsLoading, setCampaignsLoading] = useState(false);
   /** 正在领取的活动 id（用于置灰与转圈）。 */
   const [claimingId, setClaimingId] = useState<string | null>(null);
+  /** 一键领取进行中（所有账号）。 */
+  const [claimingAll, setClaimingAll] = useState(false);
   // 倒计时用的"now"：每秒更新一次，让剩余时间真的在走。
   const [now, setNow] = useState(() => Date.now());
 
@@ -354,22 +365,32 @@ export default function QoderPage() {
   );
 
   /**
-   * 查询权益活动（**只读**）。
+   * 查询**所有账号**的权益活动（**只读**）。
    *
-   * 取第一个有凭证的账号来查 —— 活动是**账号级**的，而页面上通常只有
-   * 一个账号。多账号时逐个查会把界面搞复杂，而这里的目的只是"提醒
-   * 用户有活动可领"。故挑第一个能查的即可。
+   * # 为什么改成批量（所有者的反馈）
+   *
+   * 原实现只查**一个**账号：
+   *
+   *	```text
+   *	const target = rows.find((r) => r.hasCredential) ?? rows[0];
+   *	const r = await api.qoderCampaigns(target.uid);
+   *	setCampaigns(r);
+   *	```
+   *
+   * 当时的理由是"多账号时逐个查会把界面搞复杂"—— 这个取舍**是错的**：
+   * 活动是**每账号专属**的，只查 A 会让 B 的活动**永远发现不了**。
+   *
+   * 所有者的话：「qoder 那个任务跟 workbuddy 一样都属于每个账号的
+   * 专属任务,**每个账号都能领取**」。
    */
   const openCampaigns = useCallback(async () => {
-    const target = rows.find((r) => r.hasCredential) ?? rows[0];
-    if (!target) return;
     setCampaignsLoading(true);
     try {
-      const r = await api.qoderCampaigns(target.uid);
+      const r = await api.qoderCampaignsAll();
       setCampaigns(r);
-      if (r.claimable) {
-        toast.success("有可领取的权益活动", {
-          description: "点「打开活动页」去官方页面领取（需人机验证）",
+      if (r.claimableTotal > 0) {
+        toast.success(`有 ${r.claimableTotal} 个可领取的权益活动`, {
+          description: `分布在 ${r.accountsWithClaimable} 个账号上，可一键领取`,
           duration: 8000,
         });
       }
@@ -382,7 +403,7 @@ export default function QoderPage() {
     } finally {
       setCampaignsLoading(false);
     }
-  }, [rows]);
+  }, []);
 
   /** 在系统默认浏览器里打开活动页（领取要用户自己点，含人机验证）。 */
   const openCampaignPage = useCallback(async (url: string) => {
@@ -394,7 +415,13 @@ export default function QoderPage() {
   }, []);
 
   /**
-   * 领取一个活动。
+   * 领取**某个账号**的某个活动。
+   *
+   * ## 必须显式传 uid（不能靠"找第一个有凭证的账号"）
+   *
+   * 活动是每账号专属的。原实现用 `rows.find(r => r.hasCredential)` 猜账号 ——
+   * 在活动卡片按账号分组展示后，那会把**当前账号**的活动当成**第一个账号**的去领，
+   * 领错对象（或直接被上游拒）。
    *
    * ## 只能由用户点击触发
    *
@@ -408,12 +435,10 @@ export default function QoderPage() {
    * 若一律说"领取成功"，用户会以为又领了一份 —— 必须如实说"已领过"。
    */
   const claimOne = useCallback(
-    async (c: api.QoderCampaign) => {
-      const target = rows.find((r) => r.hasCredential) ?? rows[0];
-      if (!target) return;
+    async (uid: string, c: api.QoderCampaign) => {
       setClaimingId(c.campaignId);
       try {
-        const r = await api.qoderClaimCampaign(target.uid, c.campaignId);
+        const r = await api.qoderClaimCampaign(uid, c.campaignId);
         if (r.replayed) {
           toast.message("这个活动之前已经领过了", {
             description: "上游确认是重复请求，没有重复发放（领取时间：" +
@@ -435,8 +460,70 @@ export default function QoderPage() {
         setClaimingId(null);
       }
     },
-    [rows, openCampaigns],
+    [openCampaigns],
   );
+
+  /**
+   * **一键领取所有账号**的可领权益活动。
+   *
+   * # 所有者的需求
+   *
+   *	「qoder 那个任务跟 workbuddy 一样都属于每个账号的专属任务,
+   *	  每个账号都能领取,可以跟 workbuddy 一样显示一个一键领取(所有账号),
+   *	  然后单个账号单独跑」
+   *
+   * # 为什么放后端而不是前端循环
+   *
+   * 后端 `claim_all_campaigns` 会**先查每个账号有哪些可领的、再逐个领**，
+   * 并把"该账号没活动"与"该活动领失败"区分开。前端循环做不到这个区分，
+   * 而且要把每个账号的令牌状态判断重复一遍 —— 那些规则只该有一处实现。
+   *
+   * # 结果如实汇报
+   *
+   * 三类**分开**报，不合并成一句"完成"：
+   *
+   *	新领到 N 个  —— 真的拿到了
+   *	失败 M 个    —— 有原因，用户可以针对性处理
+   *	无可领 K 个  —— 本来就领完了，不是失败
+   *
+   * 合并会让"部分失败"被掩盖成"成功"，那是最容易让人误判的报法。
+   */
+  const claimAll = useCallback(async () => {
+    setClaimingAll(true);
+    try {
+      const r = await api.qoderClaimAllCampaigns();
+      const parts: string[] = [];
+      if (r.claimedCount > 0) parts.push(`新领到 ${r.claimedCount} 个`);
+      if (r.failedCount > 0) parts.push(`失败 ${r.failedCount} 个`);
+      if (r.nothingCount > 0) parts.push(`${r.nothingCount} 个账号无可领`);
+
+      const failedDetail = (r.accounts || [])
+        .flatMap((a) => (a.claimed || []).filter((c) => !c.ok).map((c) => c.error || "未知原因"))
+        .slice(0, 3)
+        .join("；");
+
+      if (r.claimedCount > 0) {
+        toast.success(parts.join("，") || "已处理", {
+          description: failedDetail || undefined,
+          duration: 8000,
+        });
+      } else if (r.failedCount > 0) {
+        toast.error("没有领到", { description: failedDetail || "全部失败", duration: 8000 });
+      } else {
+        toast.message("没有可领取的活动", {
+          description: "所有账号的活动都已经领过了",
+        });
+      }
+      // 领取后状态会变，重新拉一次才算数
+      await openCampaigns();
+    } catch (e) {
+      toast.error("一键领取失败", {
+        description: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setClaimingAll(false);
+    }
+  }, [openCampaigns]);
 
   // 倒计时每秒走一格
   useEffect(() => {
@@ -593,11 +680,11 @@ export default function QoderPage() {
             可以直接在这里领取：领取接口**不需要人机验证**
             （所有者实测确认），用的是用户自己的令牌打官方接口，
             与官方客户端点那个「领取」按钮完全同构。 */}
-        {campaigns && (campaigns.count > 0 || campaigns.claimable) && (
+        {campaigns && campaigns.accounts && campaigns.accounts.length > 0 && (
           <Card
             data-slot="qoder-campaigns"
             className={cn(
-              campaigns.claimable && "border-emerald-500/40 bg-emerald-50/20 dark:bg-emerald-950/10",
+              campaigns.claimableTotal > 0 && "border-emerald-500/40 bg-emerald-50/20 dark:bg-emerald-950/10",
             )}
           >
             <CardHeader>
@@ -606,14 +693,16 @@ export default function QoderPage() {
                   <CardTitle className="flex items-center gap-2">
                     <Gift className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
                     权益活动
-                    {campaigns.claimable && (
+                    {campaigns.claimableTotal > 0 && (
                       <Badge className="border-emerald-500/30 bg-emerald-50 text-[10px] text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
-                        有可领取
+                        {campaigns.claimableTotal} 个可领取
                       </Badge>
                     )}
                   </CardTitle>
                   <CardDescription>
-                    活动由 Qoder 官方下发，可直接在此领取（领取后 30 天内有效）。
+                    {/* ⚠ 必须说清"每账号专属" —— 这是所有者反馈的核心 */}
+                    活动是**每个账号各自**的（A 领了，B 仍可领）。可一键领取所有账号，
+                    也可在下面单独领某一个账号的。
                   </CardDescription>
                 </div>
                 <div className="flex gap-2">
@@ -621,11 +710,29 @@ export default function QoderPage() {
                     <RefreshCw className={cn("mr-2 h-4 w-4", campaignsLoading && "animate-spin")} />
                     刷新活动
                   </Button>
-                  {campaigns.campaignUrl && (
+                  {/* 一键领取（所有账号）—— 所有者的需求。
+                      只在真有可领的时候才可点，避免用户点了却什么也没发生。 */}
+                  <Button
+                    size="sm"
+                    data-slot="qoder-claim-all"
+                    disabled={claimingAll || campaigns.claimableTotal === 0}
+                    onClick={() => void claimAll()}
+                    aria-label={`一键领取所有账号的 ${campaigns.claimableTotal} 个权益活动`}
+                  >
+                    {claimingAll ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <Gift className="mr-2 h-4 w-4" />
+                    )}
+                    一键领取（所有账号）
+                  </Button>
+                  {campaigns.accounts.find((a) => a.campaignUrl)?.campaignUrl && (
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={() => void openCampaignPage(campaigns.campaignUrl)}
+                      onClick={() =>
+                        void openCampaignPage(campaigns.accounts.find((a) => a.campaignUrl)!.campaignUrl!)
+                      }
                     >
                       <ExternalLink className="mr-2 h-4 w-4" />
                       打开活动页
@@ -634,63 +741,109 @@ export default function QoderPage() {
                 </div>
               </div>
             </CardHeader>
-            <CardContent className="space-y-2">
-              {campaigns.campaigns.map((c) => {
-                const claimable = c.claimStatus === "CLAIMABLE";
-                const left = c.endAt > 1e9 ? c.endAt * 1000 - now : 0;
-                return (
-                  <div
-                    key={c.campaignId || c.campaignKey}
-                    data-slot="qoder-campaign-item"
-                    data-claim-status={c.claimStatus}
-                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border/70 px-3 py-2"
-                  >
-                    <div className="min-w-0">
-                      <div className="text-sm font-medium">
-                        {c.benefit
-                          ? `每天领 ${c.benefit.amount} ${c.benefit.kind === "CREDITS" ? "Credits" : c.benefit.kind}`
-                          : c.actionType === "VIEW_DETAILS"
-                            ? "活动详情"
-                            : c.campaignKey}
-                      </div>
-                      <div className="text-xs text-muted-foreground">
-                        {c.benefit?.validity
-                          ? `领取后 ${c.benefit.validity.days} 天内有效`
-                          : "限时活动"}
-                      </div>
+            <CardContent className="space-y-4">
+              {/* 按**账号**分组渲染 —— 每个账号一段，各带自己的领取按钮。
+                  这样"A 已领、B 还能领"一眼可见，不会互相盖住。 */}
+              {campaigns.accounts.map((acc) => (
+                <div
+                  key={acc.uid}
+                  data-slot="qoder-campaign-account"
+                  data-uid={acc.uid}
+                  data-claimable={acc.claimable}
+                  className="space-y-2"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-xs font-medium">
+                      {acc.nickname || acc.uid.slice(0, 12)}
+                    </span>
+                    {acc.status === "error" ? (
+                      <Badge variant="destructive" className="text-[10px]">
+                        查询失败
+                      </Badge>
+                    ) : acc.claimable > 0 ? (
+                      <Badge className="border-emerald-500/30 bg-emerald-50 text-[10px] text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
+                        {acc.claimable} 个可领取
+                      </Badge>
+                    ) : (
+                      <Badge variant="secondary" className="text-[10px]">
+                        已领完
+                      </Badge>
+                    )}
+                  </div>
+
+                  {acc.status === "error" ? (
+                    // 单个账号查失败要说清原因 —— 否则用户会以为"这个账号没活动"
+                    // （事实上是查不到，两者完全不同）
+                    <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">
+                      {acc.message || "查询失败"}
                     </div>
-                    <div className="flex items-center gap-2">
-                      {claimable ? (
-                        <>
-                          <Badge variant="success" className="gap-1">
-                            <Clock3 className="h-3 w-3" />
-                            {formatCountdown(left)}
-                          </Badge>
-                          {/* 领取按钮 —— 只有 actionType=CLAIM_BENEFIT 才能领，
-                              VIEW_DETAILS 那种（"查看详情"类）没有可领的东西。 */}
-                          {c.actionType === "CLAIM_BENEFIT" && (
-                            <Button
-                              size="sm"
-                              disabled={claimingId === c.campaignId}
-                              onClick={() => void claimOne(c)}
-                              aria-label={`领取活动奖励：${c.campaignKey}`}
-                            >
-                              {claimingId === c.campaignId ? (
-                                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                              ) : null}
-                              领取
-                            </Button>
-                          )}
-                        </>
-                      ) : (
-                        <Badge variant="secondary">
-                          {c.claimStatus === "CLAIMED" ? "已领取" : "不可领取"}
-                        </Badge>
+                  ) : (
+                    <div className="space-y-2">
+                      {(acc.campaigns || []).map((c) => {
+                        const claimable = c.claimStatus !== "CLAIMED" && c.claimStatus !== "EXPIRED";
+                        const left = c.endAt > 1e9 ? c.endAt * 1000 - now : 0;
+                        return (
+                          <div
+                            key={c.campaignId || c.campaignKey}
+                            data-slot="qoder-campaign-item"
+                            data-claim-status={c.claimStatus}
+                            className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border/70 px-3 py-2"
+                          >
+                            <div className="min-w-0">
+                              <div className="text-sm font-medium">
+                                {c.benefit
+                                  ? `领 ${c.benefit.amount} ${c.benefit.kind === "CREDITS" ? "Credits" : c.benefit.kind}`
+                                  : c.actionType === "VIEW_DETAILS"
+                                    ? "活动详情"
+                                    : c.campaignKey}
+                              </div>
+                              <div className="text-xs text-muted-foreground">
+                                {c.benefit?.validity
+                                  ? `领取后 ${c.benefit.validity.days} 天内有效`
+                                  : "限时活动"}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              {claimable ? (
+                                <>
+                                  <Badge variant="success" className="gap-1">
+                                    <Clock3 className="h-3 w-3" />
+                                    {formatCountdown(left)}
+                                  </Badge>
+                                  {/* 只有 actionType=CLAIM_BENEFIT 才能领，
+                                      VIEW_DETAILS 那种没有可领的东西。 */}
+                                  {c.actionType === "CLAIM_BENEFIT" && (
+                                    <Button
+                                      size="sm"
+                                      disabled={claimingId === c.campaignId}
+                                      onClick={() => void claimOne(acc.uid, c)}
+                                      aria-label={`为账号 ${acc.nickname || acc.uid} 领取：${c.campaignKey}`}
+                                    >
+                                      {claimingId === c.campaignId ? (
+                                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                                      ) : null}
+                                      领取
+                                    </Button>
+                                  )}
+                                </>
+                              ) : (
+                                <Badge variant="secondary">
+                                  {c.claimStatus === "CLAIMED" ? "已领取" : "不可领取"}
+                                </Badge>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                      {(acc.campaigns || []).length === 0 && (
+                        <div className="rounded-lg border border-border/70 px-3 py-2 text-xs text-muted-foreground">
+                          该账号暂无活动
+                        </div>
                       )}
                     </div>
-                  </div>
-                );
-              })}
+                  )}
+                </div>
+              ))}
             </CardContent>
           </Card>
         )}

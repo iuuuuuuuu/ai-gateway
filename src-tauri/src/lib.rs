@@ -317,6 +317,8 @@ pub fn run() {
         commands_apps::qoder_import_from_client,
         commands_apps::qoder_refresh_account,
         commands_apps::qoder_campaigns,
+        commands_apps::qoder_campaigns_all,
+        commands_apps::qoder_claim_all_campaigns,
         commands_apps::qoder_claim_campaign,
             commands_apps::qoder_summary,
             // ---- ZCode（Z.AI / 智谱）：账号元信息 + 凭证导入 + 登录编排 ----

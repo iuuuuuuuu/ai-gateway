@@ -203,8 +203,15 @@ func RunLoginCLI(args []string, defaultAuthDir string) int {
 	case "campaigns":
 		// 查权益活动（「每天领 100 Credits」那类）。
 		//
-		// ⚠ 只查询。领取见 `claim-campaign`。
+		// ⚠ 只查**一个**账号（--uid 必填）。活动是**每账号专属**的 ——
+		// 只看一个账号会让其他账号的活动永远发现不了。
+		// 要看全部账号请用 `campaigns-all`。
 		return runCampaigns(args[1:], defaultAuthDir)
+	case "campaigns-all":
+		// 查**所有**账号的权益活动（每账号独立计数，不互相盖住）。
+		//
+		// 所有者的需求：「每个账号都能领取」。
+		return runCampaignsAll(args[1:], defaultAuthDir)
 	case "claim-campaign":
 		// 领取一个权益活动。
 		//
@@ -212,11 +219,20 @@ func RunLoginCLI(args []string, defaultAuthDir string) int {
 		// 不写定时任务替用户自动领 —— 那与"用户点一下"不是一回事，
 		// 且会让账号表现出非人类的活动模式。见 campaign.go 的说明。
 		return runClaimCampaign(args[1:], defaultAuthDir)
+	case "claim-all-campaigns":
+		// **一键领取所有账号**的可领活动（所有者的需求：
+		// 「可以跟 workbuddy 一样显示一个一键领取（所有账号）」）。
+		//
+		// 同样是写操作，同样只由用户显式点击触发。
+		return runClaimAllCampaigns(args[1:], defaultAuthDir)
 	case "job-token":
 		// 换取短期作业令牌（jt-）。用于诊断与验证。
 		return runJobToken(args[1:], defaultAuthDir)
 	default:
-		fmt.Fprintf(os.Stderr, "未知子命令 %q（应为 url / poll / import-client）\n", sub)
+		// ⚠ 帮助文案必须与**实际派发的子命令**一致（见 RunLoginCLI 顶部注释）。
+		fmt.Fprintf(os.Stderr,
+			"未知子命令 %q（应为 url / poll / import-client / quota / models / campaigns / campaigns-all / claim-campaign / claim-all-campaigns / job-token）\n",
+			sub)
 		return 2
 	}
 }
@@ -367,6 +383,190 @@ func runCampaigns(args []string, defaultAuthDir string) int {
 		"campaignUrl":  st.CampaignURL,
 		"campaigns":    st.Campaigns,
 		"count":        len(st.Campaigns),
+	})
+	return 0
+}
+
+// runCampaignsAll 查**所有**账号的权益活动并输出聚合 JSON。
+//
+// 用法：`qoder-login campaigns-all --auth-dir <dir>`
+//
+// # 为什么需要它（所有者的反馈）
+//
+//	「qoder 那个任务跟 workbuddy 一样都属于每个账号的专属任务,
+//	  每个账号都能领取」
+//
+// 活动是**每账号专属**的：A 领了 100 Credits，B 还有 100 没领。
+// 只查一个账号会让其他账号的活动**永远发现不了**。
+//
+// # 输出形状
+//
+//	{"status":"ok","accounts":[{uid,status,claimable,campaigns:[...]},...],
+//	 "claimableTotal":N,"accountsWithClaimable":M}
+//
+// 单个账号失败**不影响**其余 —— 逐账号带 status/message，
+// 界面能区分"这个账号查不到"与"所有账号都没活动"。
+func runCampaignsAll(args []string, defaultAuthDir string) int {
+	fs := flag.NewFlagSet("qoder-login campaigns-all", flag.ContinueOnError)
+	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	creds, failed, _ := LoadDir(*authDir)
+	accounts := make([]map[string]any, 0, len(creds))
+	cli := New()
+	var claimableTotal, withClaimable int
+
+	// 先列出加载失败的（有文件但解析不了）—— 如实报，不静默丢
+	for _, f := range failed {
+		accounts = append(accounts, map[string]any{
+			"status": "error", "message": f,
+		})
+	}
+
+	for _, c := range creds {
+		st, err := cli.FetchCampaigns(context.Background(), c)
+		if err != nil {
+			accounts = append(accounts, map[string]any{
+				"uid": c.UID, "status": "error",
+				"claimable": 0, "message": err.Error(),
+			})
+			continue
+		}
+		n := countClaimableCLI(st.Campaigns)
+		claimableTotal += n
+		if n > 0 {
+			withClaimable++
+		}
+		accounts = append(accounts, map[string]any{
+			"uid":          c.UID,
+			"status":       "ok",
+			"claimable":    n,
+			"campaigns":    st.Campaigns,
+			"campaignUrl":  st.CampaignURL,
+			"showCampaign": st.ShowCampaign,
+		})
+	}
+
+	writeJSON(map[string]any{
+		"status":                "ok",
+		"accounts":              accounts,
+		"claimableTotal":        claimableTotal,
+		"accountsWithClaimable": withClaimable,
+	})
+	return 0
+}
+
+// countClaimableCLI 数一个活动列表里有几条**可领取**的。
+//
+// 判据用 `claimStatus`（上游的权威状态），不用顶层 `claimable` ——
+// 后者在部分账号/活动上缺失，拿它判断会漏掉真实可领的活动。
+func countClaimableCLI(campaigns []Campaign) int {
+	n := 0
+	for _, c := range campaigns {
+		st := strings.ToUpper(strings.TrimSpace(c.ClaimStatus))
+		// 空状态也算可领：上游没给状态时不预设为"已领取"，
+		// 否则用户明明能领却看不到按钮
+		if st != "CLAIMED" && st != "EXPIRED" {
+			n++
+		}
+	}
+	return n
+}
+
+// runClaimAllCampaigns **一键领取所有账号**的可领取权益活动。
+//
+// 用法：`qoder-login claim-all-campaigns --auth-dir <dir>`
+//
+// # 语义
+//
+//	· 遍历每个账号，**先查有哪些可领的、再逐个领**
+//	· 单个账号/活动失败**不中断**其余 —— 用户要的是"能领的都领到"
+//	· 返回逐账号逐活动结果，界面据此如实展示
+//
+// # ⚠ 这是**写操作**
+//
+// 只由用户在界面上显式点击触发。**不做定时自动领取** ——
+// 那与"用户点一下"不是一回事，且会让账号表现出非人类的活动模式。
+// 见 campaign.go 的说明。
+func runClaimAllCampaigns(args []string, defaultAuthDir string) int {
+	fs := flag.NewFlagSet("qoder-login claim-all-campaigns", flag.ContinueOnError)
+	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	creds, _, _ := LoadDir(*authDir)
+	accounts := make([]map[string]any, 0, len(creds))
+	cli := New()
+	var claimedCount, failedCount, nothingCount int
+
+	for _, c := range creds {
+		// 先查该账号有哪些可领的（不重犯"只查一个账号"的错）
+		st, err := cli.FetchCampaigns(context.Background(), c)
+		if err != nil {
+			failedCount++
+			accounts = append(accounts, map[string]any{
+				"uid": c.UID, "status": "error",
+				"message": err.Error(), "claimed": []any{},
+			})
+			continue
+		}
+
+		var targets []Campaign
+		for _, camp := range st.Campaigns {
+			s := strings.ToUpper(strings.TrimSpace(camp.ClaimStatus))
+			if s != "CLAIMED" && s != "EXPIRED" && camp.ActionType == "CLAIM_BENEFIT" {
+				targets = append(targets, camp)
+			}
+		}
+
+		if len(targets) == 0 {
+			nothingCount++
+			accounts = append(accounts, map[string]any{
+				"uid": c.UID, "status": "nothing", "claimed": []any{},
+			})
+			continue
+		}
+
+		done := make([]map[string]any, 0, len(targets))
+		for _, camp := range targets {
+			r, cerr := cli.ClaimCampaign(context.Background(), c, camp.CampaignID)
+			if cerr != nil {
+				failedCount++
+				done = append(done, map[string]any{
+					"campaignId": camp.CampaignID,
+					"ok":         false,
+					"error":      cerr.Error(),
+					"benefit":    camp.Benefit,
+				})
+				continue
+			}
+			// `replayed` = 上游说"之前已领过"（不是错误）。
+			// 如实区分，否则用户以为又领到一份。
+			if !r.Replayed {
+				claimedCount++
+			}
+			done = append(done, map[string]any{
+				"campaignId": camp.CampaignID,
+				"ok":         true,
+				"replayed":   r.Replayed,
+				"claimedAt":  r.ClaimedAt,
+				"benefit":    camp.Benefit,
+			})
+		}
+		accounts = append(accounts, map[string]any{
+			"uid": c.UID, "status": "ok", "claimed": done,
+		})
+	}
+
+	writeJSON(map[string]any{
+		"status":       "ok",
+		"accounts":     accounts,
+		"claimedCount": claimedCount,
+		"failedCount":  failedCount,
+		"nothingCount": nothingCount,
 	})
 	return 0
 }

@@ -86,6 +86,30 @@ type CaptchaSolver struct {
 // 取 2 分钟留余量。
 const DefaultCaptchaCooldown = 2 * time.Minute
 
+// captchaEntryFile 求解器入口文件名。
+//
+// # 为什么优先用打包好的单文件
+//
+// 原始做法是把整个 `node_modules/` 塞进安装包 ——
+// **11.36MB / 3353 个文件**。而 Tauri 的 NSIS 模板对每个资源文件生成
+// 一条 `File /a "/oname=..."`，即**逐文件解压**；3353 个零散小文件的
+// 写入远慢于单个大文件（尤其被杀软逐个扫描时）。
+//
+// 实测：装了这种包的机器上，安装过程慢到用户专门反馈
+//（「安装的时候那个 node_modules 解压速度超级慢」）。
+//
+// 现在用 esbuild 打成**单个文件**（`solver.bundle.cjs`，928KB），
+// 安装时的文件写入从 3353 次降到 1 次。
+// 打包方法与坑见 `assets/zcode-captcha/README-打包说明.md`。
+//
+// ⚠ 保留 `solver.js` 作为**回退**：万一某台机器上 bundle 出问题
+//（如 node 版本过旧不支持某个语法），源码目录还在就能原地诊断。
+// 这也是"打包产物不可读"的补偿 —— 排查时有源码可看。
+const (
+	captchaEntryBundle = "solver.bundle.cjs"
+	captchaEntrySource = "solver.js"
+)
+
 // captchaConfig 上游下发的 captcha 默认值（取自 client/configs 实测）。
 const (
 	defaultCaptchaScene  = "11xygtvd"
@@ -186,14 +210,32 @@ func (s *CaptchaSolver) resolveNode() (string, error) {
 	return "", s.nodeErr
 }
 
+// entryFile 选出要执行的求解器入口（优先打包好的单文件）。
+//
+// 返回 (入口文件名, 错误)。两个都不在时报错 —— 空目录会被当成
+// "有效组件"，于是求解时才发现缺文件（fail late）。
+//
+// 调用方需持锁（读 s.dir 之外无共享状态，但保持一致）。
+func (s *CaptchaSolver) entryFile() (string, error) {
+	if s.dir == "" {
+		return "", fmt.Errorf("求解器组件未安装")
+	}
+	// 优先单文件 bundle：它就是为"安装快"而打出来的
+	if _, err := os.Stat(filepath.Join(s.dir, captchaEntryBundle)); err == nil {
+		return captchaEntryBundle, nil
+	}
+	if _, err := os.Stat(filepath.Join(s.dir, captchaEntrySource)); err == nil {
+		return captchaEntrySource, nil
+	}
+	return "", fmt.Errorf("求解器目录里既没有 %s 也没有 %s：%s",
+		captchaEntryBundle, captchaEntrySource, s.dir)
+}
+
 // Available 报告求解器当前是否可用（供界面判断要不要显示开关）。
 func (s *CaptchaSolver) Available() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.dir == "" {
-		return false
-	}
-	if _, err := os.Stat(filepath.Join(s.dir, "solver.js")); err != nil {
+	if _, err := s.entryFile(); err != nil {
 		return false
 	}
 	_, err := s.resolveNode()
@@ -207,8 +249,8 @@ func (s *CaptchaSolver) UnavailableReason() string {
 	if s.dir == "" {
 		return "求解器组件未安装（发行包应包含 assets/zcode-captcha）"
 	}
-	if _, err := os.Stat(filepath.Join(s.dir, "solver.js")); err != nil {
-		return "求解器组件缺失：" + err.Error()
+	if _, err := s.entryFile(); err != nil {
+		return err.Error()
 	}
 	if _, err := s.resolveNode(); err != nil {
 		return err.Error()
@@ -249,11 +291,20 @@ func (s *CaptchaSolver) Solve(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// 入口文件在锁内解析（它读 s.dir，与 SetDir 竞争）
+	entry, err := func() (string, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.entryFile()
+	}()
+	if err != nil {
+		return "", err
+	}
 
 	cctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(cctx, node, "solver.js", scene, region, prefix)
+	cmd := exec.CommandContext(cctx, node, entry, scene, region, prefix)
 	cmd.Dir = dir
 
 	stdout, err := cmd.StdoutPipe()

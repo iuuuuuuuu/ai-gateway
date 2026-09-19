@@ -46,26 +46,77 @@ func TestSolverWithoutDirIsUnavailable(t *testing.T) {
 	}
 }
 
-// TestSolverMissingSolverJSReportsComponent 目录在但 solver.js 不在 → 报组件缺失。
+// TestSolverMissingSolverJSReportsComponent 目录在但入口文件都不在 → 报组件缺失。
 func TestSolverMissingSolverJSReportsComponent(t *testing.T) {
 	dir := t.TempDir()
 	s := &CaptchaSolver{dir: dir}
 	if s.Available() {
-		t.Error("缺少 solver.js 时不该报告可用")
+		t.Error("缺少入口文件时不该报告可用")
 	}
-	if got := s.UnavailableReason(); !strings.Contains(got, "solver.js") {
-		t.Errorf("应点明 solver.js 缺失，实际：%s", got)
+	got := s.UnavailableReason()
+	// 报错要同时点明两个候选名 —— 只提一个是误导：
+	// 排查者会以为"补上 solver.js 就行"，而实际优先用的是 bundle
+	for _, want := range []string{captchaEntryBundle, captchaEntrySource} {
+		if !strings.Contains(got, want) {
+			t.Errorf("应点明 %s 缺失，实际：%s", want, got)
+		}
 	}
 }
 
-// TestSolverWithoutNodeReportsNode 有 solver.js 但没有 node → 报缺 Node。
+// TestSolverPrefersBundle 有 bundle 时优先用它（那是为安装提速打的）。
+//
+// # 为什么这条重要
+//
+// 打包成单文件是**为了把安装时的文件写入从 3353 次降到 1 次** ——
+// 所有者专门反馈过「安装的时候那个 node_modules 解压速度超级慢」。
+// 若代码仍去跑 solver.js（源码），而源码依赖 node_modules ——
+// 那 bundle 就白打了，安装慢的问题会原样回来。
+func TestSolverPrefersBundle(t *testing.T) {
+	dir := t.TempDir()
+	// 两个都放，验证优先选 bundle
+	if err := os.WriteFile(filepath.Join(dir, captchaEntrySource), []byte("// source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, captchaEntryBundle), []byte("// bundle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &CaptchaSolver{dir: dir}
+	got, err := s.entryFile()
+	if err != nil {
+		t.Fatalf("两个入口都在，不该报错：%v", err)
+	}
+	if got != captchaEntryBundle {
+		t.Errorf("应优先用 %s，实际 %s", captchaEntryBundle, got)
+	}
+}
+
+// TestSolverFallsBackToSource 没有 bundle 时回退到源码入口。
+//
+// 保留源码是"打包产物不可读"的补偿：某台机器上 bundle 出问题时，
+// 至少还能就地用源码诊断。
+func TestSolverFallsBackToSource(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, captchaEntrySource), []byte("// source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &CaptchaSolver{dir: dir}
+	got, err := s.entryFile()
+	if err != nil {
+		t.Fatalf("有源码入口时不该报错：%v", err)
+	}
+	if got != captchaEntrySource {
+		t.Errorf("无 bundle 时应回退到 %s，实际 %s", captchaEntrySource, got)
+	}
+}
+
+// TestSolverWithoutNodeReportsNode 有入口文件但没有 node → 报缺 Node。
 //
 // 这是**最可能出现的真实情形**：发行包带了组件，但用户机器没装 Node。
 // 报错必须点明"要装 Node"，否则用户会以为是账号问题。
 func TestSolverWithoutNodeReportsNode(t *testing.T) {
 	dir := t.TempDir()
-	// 放一个空的 solver.js 让它过第一步检查
-	if err := os.WriteFile(filepath.Join(dir, "solver.js"), []byte("// stub"), 0o644); err != nil {
+	// 放一个空的 bundle 让它过第一步检查
+	if err := os.WriteFile(filepath.Join(dir, captchaEntryBundle), []byte("// stub"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	// 把 PATH 清掉并指定一个不存在的 ZCODE_NODE_PATH，确保探测失败

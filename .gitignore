@@ -78,18 +78,14 @@ NAVIGATION.md
 __pycache__/
 *.pyc
 
-# ZCode 验证码求解器的**运行时依赖**（happy-dom）必须入库。
+# ⚠ 这里曾有 `!assets/zcode-captcha/node_modules/` 的例外 —— 已删除。
 #
-# 为什么破例（上面刚排除了全局 node_modules）：它不是"开发依赖"，而是
-# **发行包里要带的运行组件** —— `assets/zcode-captcha/` 会被 Tauri 打进
-# 安装包，用户机器上不会去 npm install。不入库的话：
-#   · CI 构建出的包会缺这个目录 → 验证码功能静默失效
-#   · 而"静默失效"正是最难发现的一类缺陷
+# 原因：那 3353 个 node_modules 文件被塞进安装包后，NSIS 逐文件解压
+# 导致**安装极慢**（所有者反馈「解压速度超级慢」）。现已改为用 esbuild
+# 打成的**单文件** `solver.bundle.cjs`（928KB），node_modules 不再入库、
+# 也不再进安装包。
 #
-# happy-dom 是 solver.js 的唯一非内置依赖（undici 是可选的代理支持）。
-# 体积约 8.6MB —— 相对它带来的确定性，这个代价可接受。
-!assets/zcode-captcha/node_modules/
-!assets/zcode-captcha/node_modules/**
+# 重建方法见 assets/zcode-captcha/README-打包说明.md。
 
 # 本地隔离测试实例的 Tauri 配置（独立 identifier + 数据目录，仅供开发调试）
 src-tauri/tauri.dev-sandbox.conf.json
