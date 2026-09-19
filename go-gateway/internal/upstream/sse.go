@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -320,6 +321,205 @@ func normalizeFrame(obj map[string]any) map[string]any {
 		out["error"] = e
 	}
 	return out
+}
+
+// probeReader 把"已预读的内容 + 原流"接回去，同时保留原流的 Close。
+//
+// # 为什么必须保留 Close
+//
+// 调用方拿到的是 `io.ReadCloser`（HTTP 响应体），**关掉它才会释放连接**。
+// 若探针返回一个纯 `io.Reader`，调用方就无法关闭 —— 连接泄漏，
+// 高并发下会把上游连接池耗光（表现为「用一会儿就连不上上游」）。
+//
+// 故这里组合而非替换：读走预读缓冲，关闭转交原流。
+type probeReader struct {
+	r     io.Reader
+	close func() error
+}
+
+func (p *probeReader) Read(b []byte) (int, error) { return p.r.Read(b) }
+func (p *probeReader) Close() error               { return p.close() }
+
+// ProbeFirstFrame 预读上游 SSE 的**第一帧**，判断这条流是否值得交给客户端。
+//
+// # 为什么需要它（真实缺陷，2026-09-19 现场）
+//
+// 流式请求此前在 `status < 400` 时**直接交给调用方转写**，从不检查流里
+// 有没有内容。而上游有一种失败形态是 **HTTP 200 + 空流**：
+//
+//	ZCode 对话通道对受限账号返回 200，但流里一帧有效数据都没有
+//	（实测 code=3012 "unusual activity" 就是这个表现）
+//
+// 于是 `Stream` 走到 `validFrames == 0` 分支，回给用户
+// `empty upstream stream` —— 而这条流**已经把状态码 200 写出去了**，
+// 上层**再也无法改状态码、也无法换账号重试**。
+//
+// 更糟的是调用方在拿到这条流**之前**已调用 `Pool.NoteSuccess`：
+// 坏账号被记成"成功"，**永远不会冷却**，于是每次请求都选中它。
+//
+// # 设计：把"是否可重试"的判断提前到写响应头之前
+//
+//	probe 成功 → 返回已读到的首帧 + 可继续读的流，调用方安全开始转写
+//	probe 失败 → 调用方**还没写任何响应头**，可以标记账号冷却并换号重试
+//
+// ⚠ 只预读**一帧**（不是整个流）：那足够区分"空流"与"正常流"，
+// 又不破坏流式体验（首帧延迟只增加一个上游 TTFB）。
+//
+// ⚠ 返回的 reader 必须被调用方**继续读完并关闭** —— 它已从 r 消费掉
+// 一部分，丢掉就会**丢首帧**（表现为回答少开头几个字）。
+func ProbeFirstFrame(r io.ReadCloser, timeout time.Duration) (io.ReadCloser, string, error) {
+	type outcome struct {
+		line string
+		err  error
+	}
+	ch := make(chan outcome, 1)
+	br := bufio.NewReaderSize(r, 64*1024)
+
+	// consumed 累积读走的所有内容（**逐字节**保留，见下面 wrap 的说明）。
+	//
+	// ⚠ 必须加锁：超时返回时读协程**可能仍在运行**并继续往这里写，
+	// 而主协程同时读它 —— 那是真实的数据竞争（`go test -race` 会报）。
+	// 第一版用裸 `strings.Builder` 就有这个问题。
+	var mu sync.Mutex
+	var consumed strings.Builder
+
+	snapshot := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return consumed.String()
+	}
+
+	go func() {
+		for {
+			line, rerr := br.ReadString('\n')
+			if line != "" {
+				mu.Lock()
+				consumed.WriteString(line)
+				mu.Unlock()
+				t := strings.TrimRight(line, "\r\n")
+				// 跳过注释/心跳/空行，找第一个真实 data: 帧
+				if strings.HasPrefix(t, "data:") {
+					ch <- outcome{line: line}
+					return
+				}
+			}
+			if rerr != nil {
+				ch <- outcome{err: rerr}
+				return
+			}
+		}
+	}()
+
+	// ⚠ 重建方式必须**逐字节等价**于原流。
+	//
+	// 我第一版用 `io.MultiReader(br, r)` —— 看起来对，实测却让下游
+	// 多出一个前导 `\n`：`br.ReadString('\n')` 会把**行尾的 \n 一起读走**，
+	// 于是拼接回来的流比原来**少一个 \n**；而 SSE 用空行分帧，
+	// 少一个换行会让 `Stream` 把相邻帧粘连（实测表现为「工具调用参数
+	// 不完整」「工具块数=0」这类看似无关的解析错误）。
+	//
+	// 修法：把读走的每一行**原样**（含行尾）拼回去，再接着读剩余缓冲。
+	wrap := func() io.ReadCloser {
+		return &probeReader{
+			r:     io.MultiReader(strings.NewReader(snapshot()), br, r),
+			close: r.Close,
+		}
+	}
+
+	select {
+	case o := <-ch:
+		if o.err != nil {
+			return wrap(), "", o.err
+		}
+		return wrap(), o.line, nil
+	case <-time.After(timeout):
+		// 首帧超时：把已缓冲的内容接回去，交由上层决定
+		return wrap(), "", fmt.Errorf("上游首帧超时")
+	}
+}
+
+// ValidSSEFrame 判断一个 SSE data 行是否是**有效数据帧**。
+//
+// 与 `Stream` 内部 `writeFrame` 的计数口径保持一致：JSON 能解析成对象
+// 即算有效（`[DONE]` 不算 —— 它只表示结束，不代表有内容）。
+//
+// 为什么口径必须一致：`ProbeFirstFrame` 用它判断"这条流要不要重试"，
+// 而 `Stream` 用它判断"要不要报空流"。两者不一致会出现
+// 「probe 说有效、Stream 说空」的自相矛盾，用户看到的现象就是
+// 明明探测通过却收到 empty upstream stream。
+func ValidSSEFrame(line string) bool {
+	t := strings.TrimSpace(line)
+	if !strings.HasPrefix(t, "data:") {
+		return false
+	}
+	d := strings.TrimSpace(t[len("data:"):])
+	if d == "" || d == "[DONE]" {
+		return false
+	}
+	var obj map[string]any
+	return json.Unmarshal([]byte(d), &obj) == nil
+}
+
+// IsUpstreamErrorFrame 判断一帧是否是上游的错误帧（可据此判"该账号坏了"）。
+//
+// # 为什么要区分「错误帧」与「正常帧」
+//
+// 上游常用 `HTTP 200 + {"error":{...}}` 表达失败（如 ZCode 的
+// code=3012/3007、WorkBuddy 的 11128 渠道未批准）。
+// 这类帧说明**这个账号当前不可用**，应当冷却换号；
+// 而正常的首帧（哪怕只有 role）说明账号是好的，必须原样透传。
+//
+// ⚠ 不能只看"有没有 error 字段"就判坏：某些上游在正常流里也会带
+// 非致命 error 字段。故额外要求它**不含任何 choices 内容** ——
+// 有内容就说明这轮对话是能用的。
+func IsUpstreamErrorFrame(line string) (bool, string) {
+	t := strings.TrimSpace(line)
+	if !strings.HasPrefix(t, "data:") {
+		return false, ""
+	}
+	d := strings.TrimSpace(t[len("data:"):])
+	if d == "" || d == "[DONE]" {
+		return false, ""
+	}
+	var obj map[string]any
+	if json.Unmarshal([]byte(d), &obj) != nil {
+		return false, ""
+	}
+	e, hasErr := obj["error"]
+	if !hasErr || e == nil {
+		return false, ""
+	}
+	// 有实际产出就不算失败
+	if chs, ok := obj["choices"].([]any); ok && len(chs) > 0 {
+		for _, c := range chs {
+			if cm, ok := c.(map[string]any); ok {
+				if delta, ok := cm["delta"].(map[string]any); ok {
+					if s, _ := delta["content"].(string); s != "" {
+						return false, ""
+					}
+				}
+				if fr, _ := cm["finish_reason"].(string); fr != "" {
+					return false, ""
+				}
+			}
+		}
+	}
+	// 提取可读原因（上游形状不一，尽量挖）
+	msg := ""
+	switch v := e.(type) {
+	case string:
+		msg = v
+	case map[string]any:
+		if s, ok := v["message"].(string); ok {
+			msg = s
+		}
+		if msg == "" {
+			if c, ok := v["code"]; ok {
+				msg = fmt.Sprintf("code=%v", c)
+			}
+		}
+	}
+	return true, msg
 }
 
 // Stream 透传上游 SSE 到 w（逐帧规范化后 flush），保证至少写一个 [DONE]。

@@ -112,7 +112,10 @@ func loadSession(authDir, flowID string) (*LoginSession, error) {
 // 输出一律是**单行 JSON**（宿主按行解析），错误写 stderr 并以非零码退出。
 func RunLoginCLI(args []string, defaultAuthDir string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "用法: zcode-login <start|poll|import> [选项]")
+		// ⚠ 帮助文案必须与**实际派发的子命令**一致（同 qoder 侧的教训）：
+		// 旧文案只列 start|poll|import，漏了 quota / models，
+		// 排查时会误判「子命令没注册」。
+		fmt.Fprintln(os.Stderr, "用法: zcode-login <start|poll|import|quota|models> [选项]")
 		return 2
 	}
 	switch args[0] {

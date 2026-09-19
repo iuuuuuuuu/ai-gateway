@@ -20,12 +20,26 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
+
+// sseProbeTimeout 流式请求预读首帧的超时。
+//
+// # 取值依据
+//
+// 首帧 = 上游开始产出（TTFB）。实测本机到 WorkBuddy 的 TTFB 约 1.1s，
+// 慢模型（带思考）会更久。取 30 秒：足够覆盖常见慢速首帧，
+// 又能在**上游真的挂住**时及时换号，而不是让用户干等。
+//
+// ⚠ 超时**不等于**账号坏：网络抖动也会超时。故超时走的是
+// `applyErrorPolicy` 的分类路径（按 503 处理），由它决定冷却多久，
+// 而不是在这里硬编码一个"永久禁用"。
+const sseProbeTimeout = 30 * time.Second
 
 // ⚠ unsupportedEffortError 与 checkRequestedEffort 已移除（2026-09-18）。
 //
@@ -392,6 +406,59 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 			h.applyErrorPolicy(acct.UID, model, kind, string(respBody))
 			fail(acct.UID)
 			continue
+		}
+
+		// ⚠ 流式请求必须在**写响应头之前**确认这条流真的有内容。
+		//
+		// # 为什么（真实缺陷，2026-09-19 现场：empty upstream stream）
+		//
+		// 旧实现在这里直接 `NoteSuccess` 然后 return，把 rc 交给调用方转写。
+		// 但上游有一种失败形态是 **HTTP 200 + 空流**：
+		//
+		//	ZCode 对话通道对受限账号返回 200，流里一帧有效数据都没有
+		//	（实测 code=3012 "unusual activity"）
+		//
+		// 后果有两个，都很严重：
+		//  1. 用户收到 `empty upstream stream`，而状态码 200 已经写出去了，
+		//     上层**再也无法换账号重试**；
+		//  2. `NoteSuccess` 已调用 → 坏账号被记成"成功"、**永不冷却**
+		//     → 每次请求都选中它 → 用户的对话**持续失败**。
+		//
+		// 修法：预读首帧再决定。此时还没写任何响应头，可以安全地
+		// 走**已有的失败策略**（applyErrorPolicy 分类 + 冷却）并换号重试。
+		//
+		// ⚠ 复用 applyErrorPolicy 而不是自己调 Cooldown：账号状态的
+		// 分类规则（哪些错误该冷却、多久、是否禁用）集中在那一个函数里，
+		// 另起一套会让同一个错误在不同路径下产生不同后果。
+		if stream && rc != nil && status < 400 {
+			probed, first, perr := upstream.ProbeFirstFrame(rc, sseProbeTimeout)
+			rc = probed // 首帧已从 rc 消费，必须接回去（否则丢帧）
+			var probeMsg string
+			if perr != nil || first == "" {
+				probeMsg = "上游返回空流（无有效数据帧）"
+			} else if bad, reason := upstream.IsUpstreamErrorFrame(first); bad {
+				probeMsg = "上游首帧即错误：" + reason
+			}
+			if probeMsg != "" {
+				log.Printf("chat uid=%s product=%s: %s — 冷却换号",
+					acct.UID, acct.ProductOf(), probeMsg)
+				// 用 503 让 applyErrorPolicy 走"服务端/上游故障"分类
+				//（它会据此选择冷却时长与是否停用），而不是"请求侧错误"。
+				kind := upstream.Classify(http.StatusServiceUnavailable, probeMsg)
+				lastStatus = http.StatusServiceUnavailable
+				lastKind = kind
+				lastBody = probeMsg
+				lastTransportErr = nil
+				lastErr = errors.New(probeMsg)
+				h.applyErrorPolicy(acct.UID, model, kind, probeMsg)
+				fail(acct.UID)
+				rc.Close()
+				if heldUID != "" {
+					h.cfg.Pool.Release(heldUID)
+					heldUID = ""
+				}
+				continue
+			}
 		}
 
 		h.cfg.Pool.NoteSuccess(acct.UID)

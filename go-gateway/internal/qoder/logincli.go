@@ -162,7 +162,14 @@ func loadSession(authDir, sessionID string) (*LoginSession, error) {
 // 返回值即进程退出码。
 func RunLoginCLI(args []string, defaultAuthDir string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "用法: qoder-login <url|poll|import-client> [选项]")
+		// ⚠ 帮助文案必须与**实际派发的子命令**一致。
+		//
+		// 旧文案只列了 url|poll|import-client，而 switch 里还有
+		// quota / models / campaigns / claim-campaign / job-token。
+		// 于是排查时看到这条 usage 会误判「新子命令没注册」——
+		// 我自己就被它误导过，白查了一轮二进制版本问题。
+		// 漏列的子命令补齐，别让帮助文案成为误导源。
+		fmt.Fprintln(os.Stderr, "用法: qoder-login <url|poll|import-client|quota|models|campaigns|claim-campaign|job-token> [选项]")
 		return 2
 	}
 	sub := args[0]
