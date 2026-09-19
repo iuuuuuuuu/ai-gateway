@@ -242,6 +242,19 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 	if r := realmToRegion(realm); r != auth.RegionAny {
 		preferRegion = r
 	}
+	// ⚠⚠ **必须把 preferRegion 写回 route** —— 选号与随后的错误分支用的都是
+	// `route.Region`，而不是 `preferRegion`。
+	//
+	// 我第一版只改了 `preferRegion` 这个局部变量，于是：
+	//	· `pickAccountFor(..., route, ...)` 读的是 **route.Region（仍是 RegionAny）**
+	//	· 前缀**没有任何效果**
+	// 实测确认（uitest/diag-429-isolate.cjs）：
+	//
+	//	`global:deepseek-v4.1-flash` → 选中 uid=4ea736d4（**国服**）
+	//
+	// 写了区域前缀却选中国服账号 —— 与"前缀被丢弃"是同一个症状，
+	// 只是这次是**我自己的疏忽**（算出了正确值却没用它）。
+	route.Region = preferRegion
 
 	// 「限制使用的模型」白名单：非空时只放行名单内的模型。
 	//
