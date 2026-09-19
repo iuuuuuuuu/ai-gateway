@@ -64,6 +64,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { ModelRoutingList } from "@/components/model-routing-list";
 import * as api from "@/lib/api";
 import { SENSITIVE_STRING_INPUT_PROPS } from "@/lib/sensitive-input";
 import { useAccountsStore } from "@/stores/accounts";
@@ -76,6 +77,7 @@ import type {
   CreditStatistics,
   GatewayConfig,
   GatewayMode,
+  GatewayModelItem,
   GatewayPoolAccount,
   GatewayPortCheck,
   GatewayPortHolder,
@@ -2017,6 +2019,14 @@ export default function GatewayPage() {
   const [allowedModels, setAllowedModels] = useState<string[]>([]);
   /** 网关支持的模型列表（用于模型下拉；取不到时退化为自由输入）。 */
   const [modelOptions, setModelOptions] = useState<string[]>([]);
+  /**
+   * 模型**完整对象**（含 `channels` 来源平台与能力字段）。
+   *
+   * 与 `modelOptions`（只有名字）分开存：前者供「放行模型」控件（按字符串
+   * 数组消费），后者供「模型路由清单」（需要平台与能力）。同一个
+   * `getGatewayModels()` 调用的结果，存两份形状，避免改既有控件签名。
+   */
+  const [modelItems, setModelItems] = useState<GatewayModelItem[]>([]);
   /** 模型列表是否正在加载（驱动刷新按钮的转圈）。 */
   const [modelsLoading, setModelsLoading] = useState(false);
 
@@ -2679,6 +2689,13 @@ export default function GatewayPage() {
     try {
       const list = await api.getGatewayModels();
       setModelOptions(list.map((m) => m.id).filter(Boolean).sort());
+      // 同时留下**完整对象**：模型路由清单需要 `channels`（来源平台）
+      // 与能力字段，而 `modelOptions` 只有名字。
+      //
+      // 为什么不合并成一个 state：`modelOptions` 已被「放行模型」控件
+      // 按"字符串数组"消费，改成对象要动那个控件的签名 —— 而本清单
+      // 是新增的只读展示，不该为一个新功能去改既有控件的接口。
+      setModelItems(list);
     } catch {
       // 取不到就保留原列表：勾选列表里仍有当前已选值兜底（标「不在当前列表」）
     } finally {
@@ -3981,6 +3998,31 @@ export default function GatewayPage() {
             refreshing={modelsLoading}
           />
         </Row>
+
+        {/* 模型路由清单：把**三种写法**与每个模型来自哪些平台完整摆出来。
+            所有者的需求：
+              「相同的模型支持 平台:模型名 / 平台:国际版:模型名 / 模型名
+                这三种的方式路由流量」
+              「在兼容网关那里加一个模型列表跟智能体网关显示的一致」
+              「要把我说的支持的模型名称完整展示给用户，也要加上描述」
+              「加这个的原因是因为三个平台有重复的模型，这样子方便用户做选择」
+
+            放在「放行模型」**下方**是有意的：两者都关于"哪些模型可用"，
+            但前者是**写配置**（网关会 400 拒绝其它模型），本清单是**只读参考**
+            （告诉用户该怎么写模型名）。相邻便于对照，而各自说明都写清了
+            区别，不会混淆。
+
+            ⚠ 用**独立区块**而不是塞进上面的 Row：内容量差异很大（这里是
+            可滚动列表），塞进 Row 会把整段设置的栅格撑变形。 */}
+        <div className="mt-3 rounded-lg border border-border/60 px-3 py-3">
+          <div className="mb-2 flex flex-wrap items-baseline gap-2">
+            <span className="text-[13px] font-medium">模型路由清单</span>
+            <span className="text-[11px] text-muted-foreground">
+              同名模型可能由多个平台提供 —— 用带前缀的写法可指定走哪个平台
+            </span>
+          </div>
+          <ModelRoutingList models={modelItems} />
+        </div>
 
         <Row className="flex-col items-stretch gap-2 sm:flex-row sm:items-center">
           <div className="min-w-0">

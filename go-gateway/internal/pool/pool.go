@@ -785,6 +785,79 @@ func (p *Pool) PickForModelRegionStrict(model string, tried map[string]bool, reg
 	return p.pickForModelInRegion(model, tried, region)
 }
 
+// PickForModelProductRegion 按**产品 + 区域**选号（所有者的需求：`平台:区域:模型名`）。
+//
+// # 为什么需要它
+//
+// 三个平台**有重名模型** —— `glm-5.3` 既在 ZCode 的套餐里、也在 WorkBuddy
+// 的清单里。裸名请求时账号池按「最早到期分层」选号，可能选中一个
+// **没有该模型资源包**的账号，那条通道回 `1113 无可用资源包`，
+// 用户看到的是"余额不足"（其实额度充足，只是走错了平台）。
+//
+// 客户端用 `qoder:glm-5.3` / `zcode:国际版:glm-5.3` 显式指定即可消除歧义。
+//
+// # 实现方式：复用「收窄 tried」这个既有惯用法
+//
+// 与 `pickForModelInRegion` 同一套路 —— 把不符合的账号**塞进排除集**，
+// 而不是给每个 pick 函数加参数。好处：
+//
+//	· 不必改十几处 pick 签名（改动面小 = 出错面小）
+//	· 区域与产品用同一机制，行为可预期
+//	· 排除集与实际池子在**同一次 RLock 内**构造，避免两次加锁之间
+//	  池子变化导致筛选条件悄悄失效
+//
+// # 产品约束是**强制**的，不走兜底
+//
+// 与区域偏好不同：区域可以"偏好不成再放开"，而产品**不行** ——
+// 用户写 `qoder:` 就是明确说"只走这个平台"（他可能知道别的平台没额度）。
+// 若兜底跨平台，他会看到"我明明指定了 qoder，却报了 ZCode 的 1113"。
+//
+// 故产品约束走 `Strict` 路径（无全冷却兜底），选不出就返回 nil，
+// 由上层给出**指名道姓**的错误。
+//
+// # `product == ""` 时退化为原行为
+//
+// 空串 = 不限制产品，直接转交原有的区域逻辑 —— 老客户端不带前缀，
+// 行为必须逐字不变。
+func (p *Pool) PickForModelProductRegion(
+	model string, tried map[string]bool, prefer auth.Region, product string,
+) *auth.Auth {
+	if product == "" {
+		return p.PickForModelRegion(model, tried, prefer)
+	}
+
+	p.mu.RLock()
+	rot := p.rotationOn
+	scoped := make(map[string]bool, len(tried)+len(p.byUID))
+	for uid := range tried {
+		scoped[uid] = true
+	}
+	// 排除两类账号：
+	//  1. 产品不符（用 ProductOf() —— 老账号的 Product 是空串，
+	//     语义上等价于 workbuddy；裸读会让它们全部被排除，
+	//     表现为"指定 workbuddy 却一个号都选不出"）
+	//  2. 区域不符（与 pickForModelInRegion 同一判据；prefer 为 Any 时跳过）
+	for uid, e := range p.byUID {
+		if e.a == nil {
+			scoped[uid] = true
+			continue
+		}
+		if e.a.ProductOf() != product {
+			scoped[uid] = true
+			continue
+		}
+		if prefer != auth.RegionAny && e.a.Region() != prefer {
+			scoped[uid] = true
+		}
+	}
+	p.mu.RUnlock()
+
+	if rot {
+		return p.pickRotationStrict(scoped, model)
+	}
+	return p.pickStrict(scoped, model)
+}
+
 // pickForModelAny 原有行为：不做区域过滤。
 func (p *Pool) pickForModelAny(model string, tried map[string]bool) *auth.Auth {
 	p.mu.RLock()
@@ -2195,6 +2268,46 @@ func (p *Pool) PickByUIDForModelRegion(uid, model string, prefer auth.Region) *a
 		}
 	}
 	return p.PickByUIDForModel(uid, model)
+}
+
+// PickByUIDForModelProductRegion 粘性会话版：额外校验**产品**是否匹配。
+//
+// # 为什么必须单独做（这是我实测发现的漏洞）
+//
+// `forward.go` 的选号顺序是「先试粘性会话绑定的账号，绑不上才走产品过滤」：
+//
+//	acct = PickByUIDForModelRegion(stickyUID, model, preferRegion)  ← 这一支没有产品校验
+//	if acct == nil { acct = pickAccountFor(..., product) }          ← 产品过滤在这里
+//
+// 于是**只要该会话此前绑过一个账号**，`zcode:glm-5.3` 会继续用那个
+// 绑定的账号 —— 哪怕它是 WorkBuddy 的。实测确认（
+// `uitest/verify-model-prefix-live.cjs`）：
+//
+//	`zcode:glm-5.3` → 选中 e2891116（**workbuddy**）→ 报"额度已耗尽"
+//
+// 用户看到的是"我明明指定了 zcode，却报了 WorkBuddy 账号的错"。
+//
+// 故粘性路径也必须校验产品：不匹配就返回 nil，让上层解绑并走
+// 带产品过滤的重新分配（那正是"绑定号不可用即失效"的既有约定）。
+//
+// # `product == ""` 时与 PickByUIDForModelRegion 完全一致
+func (p *Pool) PickByUIDForModelProductRegion(
+	uid, model string, prefer auth.Region, product string,
+) *auth.Auth {
+	if product != "" {
+		p.mu.RLock()
+		e, ok := p.byUID[uid]
+		var got string
+		if ok && e.a != nil {
+			// 用 ProductOf()：老账号的 Product 是空串，语义上等价 workbuddy
+			got = e.a.ProductOf()
+		}
+		p.mu.RUnlock()
+		if !ok || got != product {
+			return nil
+		}
+	}
+	return p.PickByUIDForModelRegion(uid, model, prefer)
 }
 
 // CountsDetailed 返回 total/healthy/cooling/disabled/inFlightFull 五类计数。

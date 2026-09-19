@@ -174,15 +174,26 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 	// 请求的目标模型：用于「模型级限流」的选号过滤与冷却记账。
 	// 取不到时为空串，各环节自动退化为原有行为（不做模型过滤）。
 	//
-	// 同时解析可选的区域前缀 `cn:` / `global:`：前缀只是给网关的**选号指令**，
+	// 同时解析可选的路由前缀 `[产品:][区域:]`：前缀只是给网关的**选号指令**，
 	// 上游不认识它，故必须把请求体里的 model 改写成裸名（见下方 rewriteModel）。
-	// 注意返回顺序是 (realm, bare) —— 写反会把区域当成模型名，
+	// 注意返回顺序是 (product, realm, bare) —— 写反会把前缀当成模型名，
 	// 表现为「单一模型锁定」报「收到的是 (未指定)」。
 	//
-	// realm 不再参与选号：上游已把区域约束升级为 route/preferRegion
-	//（含「按区域的模型能力真值」），比字符串 realm 更完整且能区分
-	// 「偏好」与「强制」。这里只取 bare 用于改写请求体。
-	_, model := resolveModel(modelOf(body))
+	// # 前缀**参与选号**（2026-09-20 修正）
+	//
+	// 此前这里写的是 `_, model := resolveModel(...)`，realm 被**丢弃**，
+	// 且注释声称"区域约束已升级为 route/preferRegion"。但 `preferRegion`
+	// 只来自 `imageRouteFor`，而那个函数**只对带图片的请求生效** ——
+	// 于是 `cn:` / `global:` 前缀实际只被剥离、**完全不约束选号**。
+	//
+	// 实测确认（uitest/diag-region-prefix2.cjs，8 轮）：
+	//
+	//	`cn:deepseek-v4.1-flash`  → 选中 e889fe8a（www.workbuddy.ai，**国际版**）
+	//	`global:...`              → 选中 6b0c77ab（国际版）
+	//
+	// 即带 `cn:` 前缀却选中了国际版账号 —— 前缀无效。所有者要的
+	// 「平台:国际版:模型名」正依赖这个机制，故必须修。
+	product, realm, model := resolveModel(modelOf(body))
 
 	// 前缀只是给网关的**选号指令**，上游不认识它 —— 必须把请求体里的
 	// model 改写成裸名，否则上游返回 400 code=11102 model [cn:xxx] not found
@@ -218,6 +229,19 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 	// 详见 imageRouteFor 的注释。
 	route := imageRouteFor(model, requestHasImage(body))
 	preferRegion := route.Region
+
+	// **显式前缀优先于自动推断**（2026-09-20 新增）。
+	//
+	// 用户写了 `cn:` / `global:`（或中文 `国际版:`）就是明确指令，
+	// 不该被 imageRouteFor 的自动推断覆盖 —— 那是"猜"，而用户是"说"。
+	// 二者冲突时以用户为准；推断只在用户没表态时兜底。
+	//
+	// ⚠ 注意 `imageRouteFor` 在"两区都支持"或"都没实测"时返回 RegionAny，
+	// 此时前缀就是唯一约束（这是绝大多数情况 —— 文本请求从不带图，
+	// 永远走 RegionAny 那条分支，也就解释了为什么此前前缀形同虚设）。
+	if r := realmToRegion(realm); r != auth.RegionAny {
+		preferRegion = r
+	}
 
 	// 「限制使用的模型」白名单：非空时只放行名单内的模型。
 	//
@@ -300,7 +324,10 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUIDForModelRegion(stickyUID, model, preferRegion)
+			// ⚠ 粘性路径**也必须**校验产品，否则 `zcode:glm-5.3` 会继续用
+			// 该会话此前绑定的 WorkBuddy 账号 —— 实测确认过这个漏洞
+			//（见 PickByUIDForModelProductRegion 的注释）。
+			acct = h.cfg.Pool.PickByUIDForModelProductRegion(stickyUID, model, preferRegion, product)
 			if acct == nil {
 				if h.cfg.Session != nil {
 					h.cfg.Session.Unbind(sessKey)
@@ -309,7 +336,7 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 			}
 		}
 		if acct == nil {
-			acct = h.pickAccount(model, tried, route)
+			acct = h.pickAccountFor(model, tried, route, product)
 		}
 		if acct == nil {
 			// 区域受限且选不出号：**不降级**，明确告诉用户缺哪个区域的账号。
@@ -706,6 +733,27 @@ func (e *forwardFailure) Error() string { return e.Message }
 //	Required=true  → 强制：只在该区域挑，挑不到返回 nil，由调用方报错。
 //	                 此时跨区降级**不是**「能用就行」—— 后端会静默丢弃图片，
 //	                 用户拿到的是「模型说它看不见图片」，无从排查。
+// pickAccountFor 按**产品 + 区域**选号（product 为空时与 pickAccount 等价）。
+//
+// # 为什么单独一个函数而不是给 pickAccount 加参数
+//
+// `pickAccount` 的语义是「按区域选号」，而产品约束是**另一层**：
+// 它来自客户端前缀（`qoder:glm-5.3`）且**强制**（不兜底跨平台）。
+// 两者混在一个函数里，将来改区域逻辑时容易顺手把产品约束也带上兜底 ——
+// 那会让"我明明指定了 qoder"变成"报的是 ZCode 的错"。
+//
+// 故显式分开，并在 `pool.PickForModelProductRegion` 的注释里写明
+// 为什么产品不兜底而区域可以。
+func (h *Handler) pickAccountFor(model string, tried map[string]bool, route imageRoute, product string) *auth.Auth {
+	if product == "" {
+		return h.pickAccount(model, tried, route)
+	}
+	// 产品约束走 Strict 路径（见 PickForModelProductRegion 的说明）：
+	// 无论 route.Required 与否，都不做全冷却兜底 —— 显式指令不降级。
+	return h.cfg.Pool.PickForModelProductRegion(model, tried, route.Region, product)
+}
+
+// pickAccount 按区域选号（无产品约束）。
 func (h *Handler) pickAccount(model string, tried map[string]bool, route imageRoute) *auth.Auth {
 	if route.Region == auth.RegionAny {
 		return h.cfg.Pool.PickForModelRegion(model, tried, auth.RegionAny)

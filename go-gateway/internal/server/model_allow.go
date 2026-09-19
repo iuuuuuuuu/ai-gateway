@@ -33,8 +33,12 @@ func normalizeAllowedModels(raw []string) []string {
 	out := make([]string, 0, len(raw))
 	for _, item := range raw {
 		// 与请求侧同样先剥前缀：用户既可能在界面上选到裸名，也可能手写带前缀的名。
-		// resolveModel 的返回顺序是 (realm, bare)，写反会把区域当成模型名。
-		_, bare := resolveModel(strings.TrimSpace(item))
+		// resolveModel 的返回顺序是 (product, realm, bare)，写反会把前缀当成模型名。
+		//
+		// ⚠ 这里必须能剥**产品前缀**（`qoder:glm-5.3`）—— 否则用户在界面上
+		// 复制一个带前缀的完整名填进白名单，那个模型就**永远匹配不上**，
+		// 表现为「我明明加了它，却报不在放行清单里」。
+		_, _, bare := resolveModel(strings.TrimSpace(item))
 		if bare = strings.TrimSpace(bare); bare != "" {
 			out = append(out, bare)
 		}
@@ -49,11 +53,16 @@ func normalizeAllowedModels(raw []string) []string {
 //
 // 调用方必须传剥过前缀的裸名（forward.go 里已是如此）—— 这里再兜一次
 // resolveModel，是为了让「有人直接从别处调这个函数」也不会因带前缀而误拒。
+//
+// ⚠ 这一次兜底同时覆盖**产品前缀与区域前缀**：`qoder:glm-5.3`、
+// `zcode:国际版:glm-5.3` 都必须与裸名 `glm-5.3` 视为同一个模型。
+// 否则用户在客户端用前缀指定平台时，会被白名单判成"不在放行清单" ——
+// 而他明明放行了那个模型（这是最难自查的一类误拒）。
 func modelAllowed(allowed []string, model string) bool {
 	if len(allowed) == 0 {
 		return true
 	}
-	_, bare := resolveModel(model)
+	_, _, bare := resolveModel(model)
 	for _, item := range allowed {
 		if strings.EqualFold(bare, item) {
 			return true

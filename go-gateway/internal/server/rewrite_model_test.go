@@ -112,7 +112,8 @@ func TestRewriteModelPreservesOtherFields(t *testing.T) {
 // TestRewriteModelRoundTripWithResolve 与 resolveModel 配合的完整链路。
 func TestRewriteModelRoundTripWithResolve(t *testing.T) {
 	in := []byte(`{"model":"cn:glm-5.2"}`)
-	realm, bare := resolveModel(modelOf(in))
+	// 返回顺序是 (product, realm, bare) —— 见 resolve_model_test.go 的顺序断言
+	_, realm, bare := resolveModel(modelOf(in))
 	if realm != "cn" || bare != "glm-5.2" {
 		t.Fatalf("resolveModel 解析错误: realm=%q bare=%q", realm, bare)
 	}
