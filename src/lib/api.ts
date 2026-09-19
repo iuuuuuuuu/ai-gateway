@@ -1377,6 +1377,16 @@ export interface QoderClientImportResult {
   clientDir: string;
   expiresAt: string | null;
   account: QoderAccount;
+  /**
+   * 导入后是否成功补全了额度/套餐/模型。
+   *
+   * 导入流程现在会顺手查一次上游（否则界面显示「未知」，
+   * 用户会以为导入失败）。查失败**不影响**导入成功 ——
+   * 凭证已落盘可用，只是这几个字段暂时是空的。
+   */
+  enriched?: boolean;
+  /** 补全失败的原因（为空表示成功）。 */
+  enrichError?: string | null;
 }
 
 export function qoderImportFromClient(clientDir = ""): Promise<QoderClientImportResult> {
@@ -1801,6 +1811,16 @@ export interface ZcodeImportScannedResult {
     provider: ZcodeProvider;
     origin: string;
     account: ZcodeAccount;
+    /**
+     * 导入后是否成功补全了额度/套餐/模型。
+     *
+     * 导入流程现在会顺手查一次上游（否则界面显示「未知」，
+     * 用户会以为导入失败）。查失败**不影响**导入成功 ——
+     * 凭证已落盘可用，只是这几个字段暂时是空的。
+     */
+    enriched?: boolean;
+    /** 补全失败的原因（为空表示成功）。 */
+    enrichError?: string | null;
   }>;
   failed: Array<{ index: number; origin?: string; error: string }>;
   importedCount: number;

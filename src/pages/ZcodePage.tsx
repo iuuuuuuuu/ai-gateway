@@ -331,7 +331,21 @@ export default function ZcodePage() {
       const r = await api.zcodeImportScanned(indices);
       setScanImported(r);
       if (r.importedCount > 0) {
-        toast.success(`已导入 ${r.importedCount} 个账号`);
+        // ⚠ 导入后额度/套餐/模型是**后端顺手查好**的（否则界面显示「未知」，
+        // 用户以为导入失败 —— 所有者的反馈）。
+        //
+        // 这里如实报告补全结果：查不到时说清原因，而不是让用户
+        // 面对一片「未知」去猜是导入没生效还是账号真没额度。
+        const enrichFailed = (r.imported || []).filter((x) => x.enriched === false);
+        if (enrichFailed.length > 0) {
+          const why = enrichFailed.find((x) => x.enrichError)?.enrichError || "上游未返回数据";
+          toast.success(`已导入 ${r.importedCount} 个账号`, {
+            description: `${enrichFailed.length} 个的额度/模型没查到：${why}`,
+            duration: 8000,
+          });
+        } else {
+          toast.success(`已导入 ${r.importedCount} 个账号（含额度与模型）`);
+        }
         // 重新扫一次：让"已导入"标记立刻反映出来，
         // 否则用户会以为没生效、再点一次 → 重复导入
         const again = await api.zcodeScanLocal();

@@ -144,10 +144,17 @@ pub fn login_poll(session_id: &str) -> Result<Value, String> {
                 &json!({ "region": region, "nickname": nickname }),
             )?;
 
+            // ⚠ 登录成功后立即补全额度/套餐/模型 —— 否则界面显示「未知」，
+            // 用户以为登录没生效（所有者的反馈：「导入后也不自动更新状态,
+            // 也不自动更新这些信息」）。失败不阻断登录，只透出原因。
+            let enrich = refresh_account(&uid);
+
             Ok(json!({
                 "status": "ok",
                 "uid": uid,
                 "account": acc.to_view(),
+                "enriched": enrich.is_ok(),
+                "enrichError": enrich.err(),
             }))
         }
         "error" => Err(r
@@ -459,6 +466,16 @@ pub fn import_from_client(client_dir: &str) -> Result<Value, String> {
         &json!({ "nickname": nickname, "region": region, "avatarUrl": avatar }),
     )?;
 
+    // ⚠ 导入客户端凭证后立即补全额度/套餐/模型。
+    //
+    // 所有者的原话：「qoder这里也是一样的问题,导入后也不自动更新状态,
+    // 也不自动更新这些信息」「明明是有套餐容量的」。
+    // 实测该账号确实有容量（planTierName=personal_standard、
+    // total=100、remaining=100），只是**导入时没去查**，界面就显示「未知」。
+    //
+    // 失败不阻断导入：凭证已落盘可用，只是界面暂时少几个字段。
+    let enrich = refresh_account(&uid);
+
     Ok(json!({
         "status": "ok",
         "uid": uid,
@@ -467,6 +484,8 @@ pub fn import_from_client(client_dir: &str) -> Result<Value, String> {
         "clientDir": client,
         "expiresAt": r.get("expiresAt").cloned().unwrap_or(Value::Null),
         "account": acc.to_view(),
+        "enriched": enrich.is_ok(),
+        "enrichError": enrich.err(),
     }))
 }
 

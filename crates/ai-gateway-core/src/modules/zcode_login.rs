@@ -112,7 +112,18 @@ pub fn login_poll(session_id: &str) -> Result<Value, String> {
             }
             let provider = r.get("provider").and_then(Value::as_str).unwrap_or("");
             let acc = zcode_account::upsert_account(&uid, &json!({ "provider": provider }))?;
-            Ok(json!({ "status": "ok", "uid": uid, "account": acc.to_view() }))
+            // ⚠ 登录成功后**立即**补全额度/套餐/模型。
+            //
+            // 所有者的原话：「智谱登录后显示未知,点击刷新后获取到名字,
+            // 但是模型 token 等信息都没刷新」—— "显示未知"就是这个缺口：
+            // 登录只落盘 + 登记账号库，不查上游；而界面读的是本地库。
+            //
+            // 失败不阻断（凭证已可用），只把原因透出去。
+            let enrich = enrich_account_after_import(&uid, &auth_dir_s);
+            Ok(json!({
+                "status": "ok", "uid": uid, "account": acc.to_view(),
+                "enriched": enrich.is_ok(), "enrichError": enrich.err(),
+            }))
         }
         other => Err(format!("登录子命令返回了未知状态 {other:?}（原始：{r}）")),
     }
@@ -164,11 +175,17 @@ pub fn import_credential(credential: &str, provider: &str, nickname: &str) -> Re
         &json!({ "provider": prov, "nickname": nickname.trim() }),
     )?;
 
+    // 导入后立即补全额度/套餐/模型 —— 否则界面显示「未知」，
+    // 用户以为导入失败。理由详见 `enrich_account_after_import`。
+    let enrich = enrich_account_after_import(&uid, &auth_dir_s);
+
     Ok(json!({
         "status": "ok",
         "uid": uid,
         "provider": prov,
         "account": acc.to_view(),
+        "enriched": enrich.is_ok(),
+        "enrichError": enrich.err(),
     }))
 }
 
@@ -209,10 +226,14 @@ pub fn import_from_dir(dir: &str) -> Result<Value, String> {
         match import_one(f, &dst_dir) {
             Ok((uid, provider)) => {
                 let _ = zcode_account::upsert_account(&uid, &json!({ "provider": provider }));
+                // 导入后立即补全额度/套餐/模型（理由见 enrich_account_after_import）
+                let enrich = enrich_account_after_import(&uid, &dst_dir.to_string_lossy());
                 imported.push(json!({
                     "file": f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
                     "uid": uid,
                     "provider": provider,
+                    "enriched": enrich.is_ok(),
+                    "enrichError": enrich.err(),
                 }));
             }
             Err(e) => failed.push(json!({
@@ -325,10 +346,33 @@ pub fn import_scanned(indices: &[usize]) -> Result<Value, String> {
                     &json!({ "provider": prov, "nickname": c.suggested_nickname }),
                 );
                 match acc {
-                    Ok(a) => imported.push(json!({
-                        "index": i, "uid": uid, "provider": prov,
-                        "origin": c.origin_name, "account": a.to_view(),
-                    })),
+                    Ok(a) => {
+                        // ⚠ 导入后**立即**把额度/套餐/模型拉回来并落库。
+                        //
+                        // # 为什么必须在这里做（所有者的反馈）
+                        //
+                        //	「智谱登录后显示未知,点击刷新后获取到名字,
+                        //	  但是模型 token 等信息都没刷新」
+                        //	「导入后也不自动更新状态,也不自动更新这些信息」
+                        //
+                        // 根因：导入只把凭证落盘 + 登记账号库，**不查上游**。
+                        // 而 `zcodeListAccounts`（界面刷新读的那个）只读**本地库** ——
+                        // 于是额度/套餐/模型全是空的，界面显示「未知」，
+                        // 必须用户**逐个账号手点刷新**才有数据。
+                        //
+                        // 用户的心智模型是"导入 = 账号可用了"，看到「未知」
+                        // 会以为导入失败或没额度。故导入成功后就该把它查全。
+                        //
+                        // ⚠ 失败**不能**让导入失败：凭证已经在盘上、网关已经能用，
+                        // 只是界面暂时少几个字段。故这里只记录原因，不中断。
+                        let enrich = enrich_account_after_import(&uid, &auth_dir_s);
+                        imported.push(json!({
+                            "index": i, "uid": uid, "provider": prov,
+                            "origin": c.origin_name, "account": a.to_view(),
+                            "enriched": enrich.is_ok(),
+                            "enrichError": enrich.err(),
+                        }));
+                    }
                     Err(e) => failed.push(json!({
                         "index": i, "origin": c.origin_name,
                         "error": format!("凭证已落盘，但账号库登记失败：{e}")
@@ -345,6 +389,37 @@ pub fn import_scanned(indices: &[usize]) -> Result<Value, String> {
         "importedCount": imported.len(),
         "failedCount": failed.len(),
     }))
+}
+
+/// 导入成功后**立即**补全该账号的额度 / 套餐 / 模型。
+///
+/// # 它解决什么（所有者的反馈）
+///
+///	「智谱登录后显示未知,点击刷新后获取到名字,但是模型 token 等信息都没刷新」
+///	「导入后也不自动更新状态,也不自动更新这些信息」
+///
+/// 现象：导入后界面上额度、套餐、模型都是「未知」，必须**逐个账号手点刷新**。
+///
+/// 根因：导入流程只做了"凭证落盘 + 账号库登记"两件事，**不查上游**。
+/// 而界面刷新读的 `zcodeListAccounts` 只读**本地库** —— 库里没这些字段，
+/// 界面自然显示「未知」。
+///
+/// 用户的心智模型是"导入成功 = 账号可用了"，看到「未知」会以为导入失败
+/// 或以为账号没额度。故导入成功后就该顺手查全。
+///
+/// # 为什么复用 `refresh_account` 而不是另写一份
+///
+/// 额度的解析规则（每日周期 vs 套餐整体到期、套餐分类、
+/// `cred_account_id` 身份判定）全都集中在 `refresh_account` 里，
+/// 另写一份必然产生漂移 —— 那时同一个账号会有两套说法。
+///
+/// # 失败语义
+///
+/// 返回 `Err(原因)`，但**调用方不得因此判定导入失败**：凭证已落盘、
+/// 网关已能用，只是界面暂时少几个字段。把原因透出去让用户知道
+/// "导入成功但额度没查到，原因是 X" 才是如实的。
+fn enrich_account_after_import(uid: &str, _auth_dir: &str) -> Result<Value, String> {
+    refresh_account(uid)
 }
 
 /// 刷新一个账号的**额度、到期时间、可用模型**。

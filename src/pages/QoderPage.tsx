@@ -286,7 +286,19 @@ export default function QoderPage() {
     setClientImporting(true);
     try {
       const r = await api.qoderImportFromClient();
-      toast.success(`已从客户端导入：${r.nickname || r.uid.slice(0, 12)}`);
+      // ⚠ 导入后额度/套餐/模型是**后端顺手查好**的（见 qoder_login.rs 的
+      // import_from_client）。这里如实报告结果：查不到时说清原因，
+      // 而不是让用户面对一片「未知」去猜是导入没生效还是账号真没额度
+      //（所有者的反馈：「导入后也不自动更新状态,也不自动更新这些信息」
+      //  「明明是有套餐容量的」）。
+      if (r.enriched === false) {
+        toast.success(`已从客户端导入：${r.nickname || r.uid.slice(0, 12)}`, {
+          description: `额度/模型没查到：${r.enrichError || "上游未返回数据"}`,
+          duration: 8000,
+        });
+      } else {
+        toast.success(`已从客户端导入：${r.nickname || r.uid.slice(0, 12)}（含额度与模型）`);
+      }
       void refresh();
     } catch (e) {
       // 错误信息由后端给出**具体原因**（找不到客户端/未登录/解密失败），
