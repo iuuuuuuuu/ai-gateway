@@ -141,6 +141,8 @@ export default function QoderPage() {
   // 权益活动（「每天领 100 Credits」那类）
   const [campaigns, setCampaigns] = useState<api.QoderCampaignsResult | null>(null);
   const [campaignsLoading, setCampaignsLoading] = useState(false);
+  /** 正在领取的活动 id（用于置灰与转圈）。 */
+  const [claimingId, setClaimingId] = useState<string | null>(null);
   // 倒计时用的"now"：每秒更新一次，让剩余时间真的在走。
   const [now, setNow] = useState(() => Date.now());
 
@@ -379,6 +381,51 @@ export default function QoderPage() {
     }
   }, []);
 
+  /**
+   * 领取一个活动。
+   *
+   * ## 只能由用户点击触发
+   *
+   * 领取本身是安全的（用用户自己的令牌打官方接口，与官方客户端点那个
+   * 「领取」按钮同构，**不需要人机验证**）。但**不做定时自动领取** ——
+   * 那与"用户点一下"不是一回事，且会让账号表现出非人类的活动模式。
+   *
+   * ## `replayed` 必须区分
+   *
+   * 上游对"之前已领过"会回 `replayed:true`（而不是报错）。
+   * 若一律说"领取成功"，用户会以为又领了一份 —— 必须如实说"已领过"。
+   */
+  const claimOne = useCallback(
+    async (c: api.QoderCampaign) => {
+      const target = rows.find((r) => r.hasCredential) ?? rows[0];
+      if (!target) return;
+      setClaimingId(c.campaignId);
+      try {
+        const r = await api.qoderClaimCampaign(target.uid, c.campaignId);
+        if (r.replayed) {
+          toast.message("这个活动之前已经领过了", {
+            description: "上游确认是重复请求，没有重复发放（领取时间：" +
+              (r.claimedAt ? new Date(r.claimedAt).toLocaleString() : "未知") + "）",
+          });
+        } else {
+          const amt = c.benefit ? `${c.benefit.amount} ${c.benefit.kind === "CREDITS" ? "Credits" : c.benefit.kind}` : "奖励";
+          toast.success(`已领取 ${amt}`, {
+            description: c.benefit?.validity ? `有效期 ${c.benefit.validity.days} 天` : undefined,
+          });
+        }
+        // 领取后状态会变（CLAIMABLE → CLAIMED），重新拉一次才算数
+        await openCampaigns();
+      } catch (e) {
+        toast.error("领取失败", {
+          description: e instanceof Error ? e.message : String(e),
+        });
+      } finally {
+        setClaimingId(null);
+      }
+    },
+    [rows, openCampaigns],
+  );
+
   // 倒计时每秒走一格
   useEffect(() => {
     const t = window.setInterval(() => setNow(Date.now()), 1000);
@@ -531,8 +578,9 @@ export default function QoderPage() {
             活动是**限时**的（实测那条只差 22 小时），且每天重置 ——
             用户不知道就白白错过。故用醒目的卡片 + 实时倒计时。
 
-            ⚠ 这里**只展示，不代领**：领取要阿里云验证码（服务端防滥用
-            机制）。故给的是「打开活动页」按钮，由用户自己去点领取。 */}
+            可以直接在这里领取：领取接口**不需要人机验证**
+            （所有者实测确认），用的是用户自己的令牌打官方接口，
+            与官方客户端点那个「领取」按钮完全同构。 */}
         {campaigns && (campaigns.count > 0 || campaigns.claimable) && (
           <Card
             data-slot="qoder-campaigns"
@@ -553,8 +601,7 @@ export default function QoderPage() {
                     )}
                   </CardTitle>
                   <CardDescription>
-                    活动由 Qoder 官方下发。本应用只做展示 ——
-                    领取需在官方页面完成（含人机验证，我们不代领）。
+                    活动由 Qoder 官方下发，可直接在此领取（领取后 30 天内有效）。
                   </CardDescription>
                 </div>
                 <div className="flex gap-2">
@@ -564,6 +611,7 @@ export default function QoderPage() {
                   </Button>
                   {campaigns.campaignUrl && (
                     <Button
+                      variant="outline"
                       size="sm"
                       onClick={() => void openCampaignPage(campaigns.campaignUrl)}
                     >
@@ -601,10 +649,27 @@ export default function QoderPage() {
                     </div>
                     <div className="flex items-center gap-2">
                       {claimable ? (
-                        <Badge variant="success" className="gap-1">
-                          <Clock3 className="h-3 w-3" />
-                          {formatCountdown(left)}
-                        </Badge>
+                        <>
+                          <Badge variant="success" className="gap-1">
+                            <Clock3 className="h-3 w-3" />
+                            {formatCountdown(left)}
+                          </Badge>
+                          {/* 领取按钮 —— 只有 actionType=CLAIM_BENEFIT 才能领，
+                              VIEW_DETAILS 那种（"查看详情"类）没有可领的东西。 */}
+                          {c.actionType === "CLAIM_BENEFIT" && (
+                            <Button
+                              size="sm"
+                              disabled={claimingId === c.campaignId}
+                              onClick={() => void claimOne(c)}
+                              aria-label={`领取活动奖励：${c.campaignKey}`}
+                            >
+                              {claimingId === c.campaignId ? (
+                                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                              ) : null}
+                              领取
+                            </Button>
+                          )}
+                        </>
                       ) : (
                         <Badge variant="secondary">
                           {c.claimStatus === "CLAIMED" ? "已领取" : "不可领取"}
