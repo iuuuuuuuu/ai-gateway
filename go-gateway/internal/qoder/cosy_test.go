@@ -234,8 +234,12 @@ func TestApplyHeadersSetsAllRequired(t *testing.T) {
 		t.Errorf("cosy-user 应为 %s，实际 %s", c.UID, got)
 	}
 	// 值也必须对（这几个是有固定要求的）
-	if got := req.Header.Get("cosy-data-policy"); got != "AGREE" {
-		t.Errorf("cosy-data-policy 应为 AGREE，实际 %s", got)
+	//
+	// ⚠ `cosy-data-policy` 官方值是**小写** `agree`。我们此前发的是大写
+	// `AGREE`，且这条测试把它**写死成断言** —— 于是"错误的值"被测试固化了。
+	// 上游 qoderwork2api 的 PR #3 明确注记了大小写差异。
+	if got := req.Header.Get("cosy-data-policy"); got != "agree" {
+		t.Errorf("cosy-data-policy 应为 agree（官方值是小写，大写会被当成不同值），实际 %s", got)
 	}
 	if got := req.Header.Get("accept"); got != "text/event-stream" {
 		t.Errorf("accept 应恒为 text/event-stream，实际 %s", got)

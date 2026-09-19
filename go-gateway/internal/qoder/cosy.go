@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -234,7 +235,7 @@ func (s *CosySession) ApplyHeaders(req *http.Request, body, rawURL, uid string, 
 		return err
 	}
 	h := req.Header
-	h.Set("cosy-data-policy", "AGREE")
+	h.Set("cosy-data-policy", "agree")
 	h.Set("content-type", "application/json")
 	h.Set("cosy-machinetype", s.MachineType)
 	h.Set("cosy-clienttype", "5")
@@ -253,10 +254,49 @@ func (s *CosySession) ApplyHeaders(req *http.Request, body, rawURL, uid string, 
 	h.Set("cosy-machineid", s.MachineID)
 	h.Set("cosy-machinetoken", s.MachineToken)
 	h.Set("login-version", "v2")
-	h.Set("user-agent", "Go-http-client/2.0")
+	h.Set("user-agent", userAgent())
+	// ---- 官方推理请求协议要求的业务头 ----
+	//
+	// 来自上游 qoderwork2api 的 PR #3（`internal/upstream/cosy.go`），其注释称
+	// 这三个头是「官方推理请求协议要求（非 work 模式默认值），**缺失会产生差异**」。
+	//
+	// ⚠ 这是对方的逆向结论，我们**未做 A/B 验证**。但它们零风险：
+	// 缺失时我们本来就是"不发的状态"，补上只会更接近官方客户端。
+	h.Set("cosy-business-product", "cli")
+	h.Set("cosy-business-type", "agent")
+	h.Set("cosy-scene", "assistant")
 	if modelKey != "" {
 		h.Set("x-model-key", modelKey)
 		h.Set("x-model-source", "system")
 	}
 	return nil
+}
+
+// userAgent 返回 Cosy 请求使用的 User-Agent。
+//
+// # 为什么做成可覆盖的（上游发现的坑，但我们尚未复现）
+//
+// 上游 qoderwork2api 的 PR #3 报告：Go 默认串 `Go-http-client/*` 会被
+// 反爬**针对 SSE 长连接先放行再 reset**（表现为 `unexpected EOF`），
+// 且拦截针对的是**该特定串**而非"工具 UA"大类 —— 故他们默认改成
+// 官方 Node 客户端的 `node`，并留环境变量热覆盖。
+//
+// # ⚠ 我们为什么不直接把默认值改掉
+//
+// 我们的 Qoder 对话**目前是正常的**（实测能拿到内容），并未复现该现象。
+// 在没复现、也没做过 A/B 的前提下改默认 UA，是拿**正在工作**的能力
+// 去赌一条逆向结论 —— 万一对方的环境与我们的上游路由不同，改完反而
+// 从"能用"变"不能用"。
+//
+// 故：**保持现有默认值不变**，但提供环境变量开关 —— 这样一旦真的
+// 遇到 SSE 被 reset，改一个环境变量即可验证，无需重新编译。
+//
+// 验证方法（若将来出现 unexpected EOF）：
+//
+//	$env:QODER_USER_AGENT = "node"; 重启网关 → 观察是否消失
+func userAgent() string {
+	if ua := strings.TrimSpace(os.Getenv("QODER_USER_AGENT")); ua != "" {
+		return ua
+	}
+	return "Go-http-client/2.0"
 }

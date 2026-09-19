@@ -15,6 +15,108 @@ import (
 	"testing"
 )
 
+// TestDeriveSessionID session_id 必须**确定性派生**（不是每轮新 UUID）。
+//
+// # 为什么这条重要（上游 qoderwork2api PR #3 的实证）
+//
+// 上游按 `session_id` 做**会话级 prompt cache**。我们此前每次请求
+// `session_id: NewUUID()` —— 同一对话的每一轮都是全新 session，
+// 于是缓存**在结构上就不可能命中**，每轮都把完整上下文当新前缀重新计费。
+// 对 agentic IDE（动辄几万 token 上下文）这是实打实的额度浪费。
+//
+// # 三条不变式
+//
+//  1. 同 (模型, 首条 user 文本) → **必须相同**（否则缓存永远不命中）
+//  2. 不同首条 user 文本 → 必须不同（否则跨对话串味）
+//  3. 不同模型 → 必须不同（模型是不同的命名空间）
+//
+// ⚠ 刻意**不**把 system 纳入哈希：agentic IDE 每轮向 system 注入动态内容
+//（时间 / git 快照 / linter），system 逐轮变 → session 逐轮变 → 命中恒 0。
+// 这是上游明确记录的坑。
+func TestDeriveSessionID(t *testing.T) {
+	a := deriveSessionID("qmodel_38max", "帮我写个快排")
+	b := deriveSessionID("qmodel_38max", "帮我写个快排")
+	if a != b {
+		t.Errorf("同样的输入必须得到同样的 session_id（否则上游缓存永远不命中）：\n  %s\n  %s", a, b)
+	}
+
+	if c := deriveSessionID("qmodel_38max", "帮我写个冒泡"); c == a {
+		t.Error("不同的首条 user 文本必须得到不同的 session_id（否则跨对话串味）")
+	}
+	if d := deriveSessionID("qmodel_38b", "帮我写个快排"); d == a {
+		t.Error("不同模型必须得到不同的 session_id")
+	}
+
+	// 形态：必须是 UUID（上游对非 UUID 形态会拒）
+	if len(a) != 36 || strings.Count(a, "-") != 4 {
+		t.Errorf("session_id 必须是 UUID 形态（上游会拒非 UUID），实际 %q", a)
+	}
+}
+
+// TestDeriveSessionIDHasNoCollisionSeparator 分隔符必须存在。
+//
+// 没有分隔符时 ("ab","c") 与 ("a","bc") 会拼成同一个字节序列 `abc`
+// → 两个毫不相关的对话共享 session → 上游缓存命中**别人的前缀**。
+func TestDeriveSessionIDHasNoCollisionSeparator(t *testing.T) {
+	x := deriveSessionID("ab", "c")
+	y := deriveSessionID("a", "bc")
+	if x == y {
+		t.Error("模型名与用户文本之间必须有分隔符，否则 (ab,c) 与 (a,bc) 会撞成同一个 session")
+	}
+}
+
+// TestModelConfigCarriesSource system 字段是 reasoning_content 的开关。
+//
+// 上游穷举矩阵（PR #3 `internal/upstream/body.go`）：
+//
+//	{key, source:"system"}                → 返回 reasoning  ✅
+//	{key, is_reasoning:true}              → 不返回          ❌
+//	全字段但缺 source                      → 不返回          ❌
+//	{key, is_reasoning, source:"custom"}  → 不返回          ❌
+//
+// 我们此前正是"缺 source"那一格，而 `stream.go` 又在解析回传
+// reasoning_content —— 两头都写对了、中间少一个字段，思考块恒为空。
+func TestModelConfigCarriesSource(t *testing.T) {
+	body, err := BuildAgentBody([]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`), "qmodel_38max")
+	if err != nil {
+		t.Fatalf("构造请求体失败: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("请求体不是合法 JSON: %v", err)
+	}
+
+	check := func(where string, mc any) {
+		m, ok := mc.(map[string]any)
+		if !ok {
+			t.Errorf("%s 不是对象：%#v", where, mc)
+			return
+		}
+		if got := m["source"]; got != "system" {
+			t.Errorf("%s.source 必须是 \"system\"（否则上游不回传 reasoning），实际 %#v", where, got)
+		}
+		if got := m["key"]; got != "qmodel_38max" {
+			t.Errorf("%s.key 应为模型 key，实际 %#v", where, got)
+		}
+	}
+
+	check("model_config", parsed["model_config"])
+	if cc, ok := parsed["chat_context"].(map[string]any); ok {
+		check("chat_context.extra.modelConfig", cc["extra"].(map[string]any)["modelConfig"])
+	} else {
+		t.Error("chat_context 缺失或是错误类型")
+	}
+
+	// session_id 必须来自派生（不是每次新 UUID）—— 同输入两次必须一致
+	body2, _ := BuildAgentBody([]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`), "qmodel_38max")
+	var parsed2 map[string]any
+	_ = json.Unmarshal(body2, &parsed2)
+	if parsed["session_id"] != parsed2["session_id"] {
+		t.Errorf("session_id 必须确定性派生，两次构造得到不同值：%v vs %v",
+			parsed["session_id"], parsed2["session_id"])
+	}
+}
+
 // TestBuildAgentBodyCarriesAllMessages 客户端消息必须全量转发。
 //
 // 参考实现实测：模板 system + 模板 tools 均非必需，纯透传后
