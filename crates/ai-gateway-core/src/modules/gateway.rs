@@ -1961,6 +1961,73 @@ fn product_models_for_gateway() -> Value {
     Value::Object(out)
 }
 
+/// 把「模型 → 允许的平台」白名单交给网关（所有者的需求）。
+///
+/// # 需求原文
+///
+/// 「我希望可以加上 **平台区分使用哪个平台的模型**」
+///
+/// # 为什么需要用户来指定
+///
+/// 同名模型可能同时在多个平台上（实测 `glm-5.2` 在 WorkBuddy 与 ZCode
+/// 上都有）。选号默认按权重随机，用户无法指定"这个模型走 ZCode"。
+///
+/// 而他**需要**这个能力，因为各平台额度性质完全不同：
+///
+/// ```text
+/// ZCode 体验套餐：每日重置，9/23 到期后归零 → 该优先烧掉
+/// WorkBuddy：长期额度
+/// ```
+///
+/// 不指定的话，体验额度可能到过期都没用上。
+///
+/// # 存放位置
+///
+/// 存在网关配置的 `pool.model_platforms`，由用户在「兼容网关」页勾选。
+/// 形状：`{"glm-5.2":["zcode"], "deepseek-v4.1-flash":["qoder","zcode"]}`
+///
+/// 空对象 = 不限制（保持既有行为）—— 这是回滚点。
+///
+/// # 为什么要过滤掉空值
+///
+/// 界面上"全不勾"与"没配置过"是两种意图，但**落到网关都该是不限制**
+///（否则用户取消所有勾选会让该模型完全不可用，那是陷阱）。
+/// 故空数组不进配置。
+fn model_platforms_for_gateway() -> Value {
+    let cfg = load_gateway_config();
+    let Some(raw) = cfg.get("model_platforms") else {
+        return json!({});
+    };
+    let Some(obj) = raw.as_object() else {
+        return json!({});
+    };
+
+    let mut out = serde_json::Map::new();
+    for (model, platforms) in obj {
+        let model = model.trim();
+        if model.is_empty() {
+            continue;
+        }
+        let list: Vec<String> = platforms
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| s.trim().to_string())
+                    // "workbuddy" 是界面上的默认平台名，网关侧产品常量也是它
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // 空数组 = 不限制 → **不写**该键（而不是写个空的，
+        // 那样网关会以为"配置了但没有允许的平台"）
+        if !list.is_empty() {
+            out.insert(model.to_string(), json!(list));
+        }
+    }
+    Value::Object(out)
+}
+
 /// 把多份模型清单并成一份去重、排序后的列表；全空时返回 None。
 ///
 /// 返回 None 而不是空数组：调用方据此**不写**该产品的键，
@@ -2192,6 +2259,11 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
             // 发外部请求会带来延迟与失败面；而"某产品账号能用哪些模型"
             // 只有宿主知道（它持有账号库、刷新账号时已查过）。
             "product_models": product_models_for_gateway(),
+            // 「模型 → 允许的平台」白名单（所有者的需求：
+            // 平台区分使用哪个平台的模型）。用户在「兼容网关」页勾选。
+            //
+            // 空对象 = 不限制，行为与加该功能之前逐字相同（回滚点）。
+            "model_platforms": model_platforms_for_gateway(),
         },
         "session_sticky": { "enabled": true, "ttl": "30m", "gc_interval": "5m" },
         // ---- 账号记录回写（养号任务的执行痕迹）----
@@ -2943,6 +3015,98 @@ pub async fn set_allowed_models(models: &[String]) -> Value {
         // 多值时取第一项（旧界面是单选，给一个能对上号的值比给空串少一次误导）。
         "allowedModel": list.first().cloned().unwrap_or_default(),
     })
+}
+
+/// 保存「模型 → 允许的平台」白名单并**立即生效**。
+///
+/// # 需求
+///
+/// 「我希望可以加上 **平台区分使用哪个平台的模型**」
+///
+/// 同名模型可能同时在多个平台上（实测 `glm-5.2` 在 WorkBuddy 与 ZCode
+/// 都有），而各平台额度性质不同 —— ZCode 体验套餐 9/23 到期作废，
+/// 该优先烧掉。用户需要能指定"这个模型走哪个平台"。
+///
+/// # 归一化
+///
+///   · 空字符串平台名、空数组 → **丢掉该模型**（= 不限制它）
+///   · 数组去重 + trim
+///
+/// 为什么空数组要等于"不限制"而不是"全禁用"：界面上"全部熄灭"是
+/// 用户想恢复默认，若解释成"该模型任何平台都不能用"，
+/// 他会莫名其妙地发现这个模型完全不可用了 —— 那是个陷阱。
+///
+/// # 为什么立即重启网关
+///
+/// 白名单在**网关启动时**读入（同 `allowed_model`）。光落盘不会改变
+/// 正在运行的进程，用户会看到"改了没反应"。故这里重启它。
+pub async fn set_model_platforms(platforms: &Value) -> Value {
+    let normalized = model_platforms_normalized(platforms);
+
+    // 与 allowed_model 同一存放位置（gateway_config.json）
+    let patch = json!({ "model_platforms": normalized.clone() });
+    let cfg = match save_gateway_config(&patch) {
+        Ok(v) => v,
+        Err(e) => return json!({ "ok": false, "error": e }),
+    };
+
+    let mut reloaded = false;
+    if is_running() {
+        stop_gateway();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        match start_gateway(&cfg).await {
+            Ok(_) => {
+                reloaded = true;
+                update_runtime_state("started", None);
+            }
+            Err(e) => {
+                update_runtime_state("failed", Some(e.clone()));
+                return json!({
+                    "ok": false,
+                    "error": format!("网关重启失败，新配置未生效：{e}"),
+                });
+            }
+        }
+    }
+
+    json!({
+        "ok": true,
+        "reloaded": reloaded,
+        "modelPlatforms": normalized,
+    })
+}
+
+/// 归一化「模型 → 允许的平台」白名单。
+///
+/// 抽成纯函数便于测试（真正的保存路径会写配置并重启网关）。
+pub fn model_platforms_normalized(raw: &Value) -> Value {
+    let Some(obj) = raw.as_object() else {
+        return json!({});
+    };
+    let mut out = serde_json::Map::new();
+    for (model, list) in obj {
+        let model = model.trim();
+        if model.is_empty() {
+            continue;
+        }
+        let Some(arr) = list.as_array() else { continue };
+        let mut seen: Vec<String> = Vec::new();
+        for v in arr {
+            let Some(s) = v.as_str() else { continue };
+            let s = s.trim();
+            if s.is_empty() {
+                continue;
+            }
+            if !seen.iter().any(|x| x == s) {
+                seen.push(s.to_string());
+            }
+        }
+        // 空数组 = 不限制 → 不写该键（见函数文档里的理由）
+        if !seen.is_empty() {
+            out.insert(model.to_string(), json!(seen));
+        }
+    }
+    Value::Object(out)
 }
 
 /// 保存**单个**模型限制（向后兼容入口，等价于 `set_allowed_models` 传单元素）。

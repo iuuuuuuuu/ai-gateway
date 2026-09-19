@@ -340,6 +340,12 @@ type Pool struct {
 	// 落盘反而会让「配置改成负载均衡后重启」被旧状态覆盖。
 	rotationOn bool
 
+	// modelPlatforms 「模型 → 允许的平台」白名单（见 SetModelPlatforms）。
+	//
+	// 空 map = 不限制（保持既有行为）。同样不持久化：它是**部署配置**，
+	// 由网关启动时从 native config 读入；落盘会让"改配置后重启"被旧值覆盖。
+	modelPlatforms map[string][]string
+
 	// rotationUID 轮转模式下当前正在烧的那个账号（空串 = 尚未选定）。
 	//
 	// 这是轮转模式的全部状态：只要它仍可用就继续用，不可用才换下一个。
@@ -831,6 +837,53 @@ func (p *Pool) pickRotationStrict(tried map[string]bool, model string) *auth.Aut
 	return p.pickRotationLocked(tried, model, false)
 }
 
+// pickBestFrom 从给定候选里挑一个（复用主路径的排序口径）。
+//
+// 用途：平台白名单让正常候选**全空**时的兜底（见 pickLocked 的
+// excludedByPlatform）。它不是"随便给一个" —— 仍按：
+//
+//	到期分层（先烧快过期的）→ 权重降序（credits / 成功率 / 闲置补偿）
+//
+// 复用同一套口径的理由：兜底也是真实请求，选号质量不该因为"走了兜底"
+// 就退化成随机。若这里另写一套，两个路径的行为会随时间漂移。
+func (p *Pool) pickBestFrom(cands []*entry, tried map[string]bool, now time.Time, model string) *entry {
+	// 在途占满的仍要排除（它们会立刻失败）
+	usable := make([]*entry, 0, len(cands))
+	for _, e := range cands {
+		if tried != nil && tried[e.a.UID] {
+			continue
+		}
+		if !e.healthy(now) || e.modelCooled(model, now) || p.inFlightFull(e) {
+			continue
+		}
+		usable = append(usable, e)
+	}
+	if len(usable) == 0 {
+		return nil
+	}
+
+	usable, tiered := p.earliestExpiryTierLocked(usable)
+
+	var maxCredits int64
+	for _, e := range usable {
+		if e.credits > maxCredits {
+			maxCredits = e.credits
+		}
+	}
+	var best *entry
+	var bestW float64
+	for _, e := range usable {
+		w := p.weightOf(e, maxCredits, now)
+		if tiered {
+			w = p.tierWeightOf(e, now)
+		}
+		if best == nil || w > bestW {
+			best, bestW = e, w
+		}
+	}
+	return best
+}
+
 // SetRotation 开关「单一模型 + 积分轮转」模式。
 //
 // 该模式与「负载均衡」的差别：负载均衡在最早到期的那一档**内部分摊**，
@@ -841,6 +894,77 @@ func (p *Pool) SetRotation(on bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.rotationOn = on
+}
+
+// SetModelPlatforms 设置「模型 → 允许的平台」映射（所有者的需求）。
+//
+// # 为什么需要
+//
+// 所有者的要求：「我希望可以加上 **平台区分使用哪个平台的模型**」。
+//
+// 背景：同名模型可能同时存在于多个平台（实测 `glm-5.2` 在 WorkBuddy 与
+// ZCode 上都有，`deepseek-v4.1-flash` 在三个平台上都有）。选号当前是
+// 按权重随机的 —— 用户无法指定"这个模型走 ZCode"。
+//
+// 而他**需要**这个能力，因为各平台的额度性质不同：
+//
+//	ZCode 体验套餐：每日重置，**9/23 到期后归零** → 该优先烧掉
+//	WorkBuddy：长期额度
+//
+// 不指定的话，体验额度可能到过期都没用上。
+//
+// # 语义：**允许**（白名单），不是"偏好"
+//
+//	m["glm-5.2"] = ["zcode"]         → 只允许 ZCode
+//	m["glm-5.2"] = ["zcode","qoder"] → 两个都可以（走默认加权）
+//	m 里没有这个模型 / 值为空          → 不限制（保持现状）
+//
+// 为什么用"允许"而不是"优先"：只勾一个平台就等于"只用它"，
+// 语义自然，且不必再引入"强制 vs 偏好"两套模式。
+//
+// ⚠ 但被允许的平台**全部不可用**时（冷却/禁用/在途满），选号会回退到全池
+// —— 宁可回退一个"平台不符但能用"的账号，也不要让本来能成功的请求 503。
+// 这与 PickForModelRegion 的取舍一致。
+func (p *Pool) SetModelPlatforms(m map[string][]string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.modelPlatforms = m
+}
+
+// ModelPlatforms 报告当前的模型→平台映射（供诊断与测试断言）。
+func (p *Pool) ModelPlatforms() map[string][]string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make(map[string][]string, len(p.modelPlatforms))
+	for k, v := range p.modelPlatforms {
+		out[k] = append([]string(nil), v...)
+	}
+	return out
+}
+
+// platformAllowedLocked 该模型是否允许在该平台上使用。
+//
+// 未配置 → 允许（保持现状，不改变既有行为）。
+func (p *Pool) platformAllowedLocked(model, product string) bool {
+	if len(p.modelPlatforms) == 0 || model == "" {
+		return true
+	}
+	allowed, ok := p.modelPlatforms[model]
+	if !ok || len(allowed) == 0 {
+		// 该模型没被配置 → 不限制
+		return true
+	}
+	// WorkBuddy 是默认产品，`Product` 字段可能是空串（老账号没这个字段）。
+	// 按 WorkBuddy 处理，否则老账号会被静默排除出所有请求。
+	if product == "" {
+		product = auth.ProductWorkBuddy
+	}
+	for _, a := range allowed {
+		if a == product {
+			return true
+		}
+	}
+	return false
 }
 
 // RotationOn 报告当前是否处于轮转模式。
@@ -1004,6 +1128,13 @@ func (p *Pool) pickLocked(tried map[string]bool, model string, allowFallback boo
 	now := time.Now()
 
 	var cands []*entry
+	// excludedByPlatform 记录"仅因为平台白名单被排除"的账号。
+	//
+	// 用途：白名单让候选**全空**时用它兜底。否则会出现这样的坏结果：
+	// 用户勾了"glm-5.2 只用 ZCode"，而 ZCode 账号恰好都在冷却 →
+	// 候选为空 → 兜底逻辑也只从被允许的平台里找 → 仍然空 → **503**。
+	// 而 WorkBuddy 明明可用。宁可给他一个"平台不符但能用"的账号。
+	var excludedByPlatform []*entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
@@ -1019,6 +1150,12 @@ func (p *Pool) pickLocked(tried map[string]bool, model string, allowFallback boo
 		if e.modelCooled(model, now) {
 			continue
 		}
+		// 平台白名单：用户明确指定了"这个模型只用某几个平台"时，
+		// 其余平台的账号不参与候选（见 SetModelPlatforms）。
+		if !p.platformAllowedLocked(model, e.a.Product) {
+			excludedByPlatform = append(excludedByPlatform, e)
+			continue
+		}
 		if p.inFlightFull(e) {
 			continue // 在途占满：跳过（max=0 不限时不触发）
 		}
@@ -1028,8 +1165,16 @@ func (p *Pool) pickLocked(tried map[string]bool, model string, allowFallback boo
 		if !allowFallback {
 			return nil
 		}
-		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
-		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
+		// 兜底 1：白名单内一个可用账号都没有，但**白名单外**有健康的 ——
+		// 用它。见 excludedByPlatform 的说明（不做的话就是 503）。
+		if len(excludedByPlatform) > 0 {
+			if picked := p.pickBestFrom(excludedByPlatform, tried, now, model); picked != nil {
+				p.markUsed(picked)
+				return picked.a
+			}
+		}
+		// 兜底 2：全冷却兜底 —— 无 healthy 候选时，从冷却账号里选 until
+		// 最早到期的一个（熔断/冷却共用 expiry 口径）。禁用的账号永不参与。
 		return p.pickEarliestExpiryLocked(tried, now, model)
 	}
 

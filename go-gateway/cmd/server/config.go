@@ -199,6 +199,31 @@ type Config struct {
 		// 某个 id 出现在多个产品的清单里时，它就有多个渠道 ——
 		// 这正是界面上要表达的"重叠"。
 		ProductModels map[string][]string `json:"product_models"`
+
+		// ModelPlatforms 「模型 → 允许的平台」白名单（由宿主透传）。
+		//
+		// # 为什么需要（所有者的需求）
+		//
+		//	「我希望可以加上 **平台区分使用哪个平台的模型**」
+		//
+		// 同名模型可能同时在多个平台上（实测 `glm-5.2` 在 WorkBuddy 与
+		// ZCode 上都有）。选号默认是按权重随机的，用户无法指定
+		// "这个模型走 ZCode"。
+		//
+		// 而他**需要**这个能力，因为各平台额度性质不同：
+		//
+		//	ZCode 体验套餐：每日重置，**9/23 到期后归零** → 该优先烧掉
+		//	WorkBuddy：长期额度
+		//
+		// # 形状与语义
+		//
+		//	{"glm-5.2":["zcode"]}           → glm-5.2 只走 ZCode
+		//	{"glm-5.2":["zcode","qoder"]}   → 两个都可以
+		//	缺这个键 / 值为空                 → 不限制（保持既有行为）
+		//
+		// ⚠ 白名单内账号全不可用时**回退到全池**，不硬失败
+		//（见 pool.platformAllowedLocked 与 pickBestFrom）。
+		ModelPlatforms map[string][]string `json:"model_platforms"`
 	} `json:"pool"`
 
 	// Proxy 出站 HTTP 代理，形如 "http://127.0.0.1:7890"（缺省空 = 不用显式代理）。

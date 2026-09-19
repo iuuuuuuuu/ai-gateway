@@ -201,6 +201,18 @@ export default function AgentsPage() {
   const [gatewayModels, setGatewayModels] = useState<GatewayModelItem[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
 
+  /**
+   * 「模型 → 允许的平台」白名单（所有者的需求：
+   * 「平台区分使用哪个平台的模型」）。
+   *
+   *   undefined  → 该模型**不限制**（默认，行为与加该功能之前一致）
+   *   ["zcode"]  → 只允许 ZCode
+   *   []         → 用户在界面上把全部平台都关掉了 = 想恢复默认
+   *                （故存盘时会被过滤掉，见 api.setModelPlatforms）
+   */
+  const [modelPlatforms, setModelPlatforms] = useState<Record<string, string[]>>({});
+  const [platformSaving, setPlatformSaving] = useState<string | null>(null);
+
   // 全局模型多选（从网关动态拉取）
   const [selectedGlobalModels, setSelectedGlobalModels] = useState<string[]>([]);
 
@@ -318,6 +330,80 @@ export default function AgentsPage() {
   };
 
   // 获取当前 target 分配的模型列表
+  /**
+   * 该模型是否允许走某个平台。
+   *
+   * 没配置过（`undefined`）= 允许 —— 这是"加功能不改变老行为"的关键。
+   */
+  const isPlatformOn = useCallback(
+    (modelId: string, product: string): boolean => {
+      const allowed = modelPlatforms[modelId];
+      if (!allowed) return true; // 未配置 = 不限制
+      return allowed.includes(product);
+    },
+    [modelPlatforms],
+  );
+
+  /**
+   * 切换某模型的平台开关。
+   *
+   * ## 语义：点亮 = 允许，全熄灭 = 恢复不限制
+   *
+   * 「全熄灭」**不是**"这个模型哪个平台都不能用" —— 那样用户取消全部
+   * 勾选会把模型彻底禁掉，是个陷阱。故全熄灭时把该键**删掉**，
+   * 回到"未配置 = 不限制"。后端也会过滤空数组（双保险）。
+   *
+   * ## 为什么要点一下存一次
+   *
+   * 不做"改完再点保存"：这个页面已经有多处即时生效的开关
+   *（模型勾选、客户端接入），再加一个"保存"按钮会让人不确定
+   * 到底哪些改动已生效。代价是每次点击会重启网关（白名单在网关启动时
+   * 读取）—— 故按钮在保存期间置灰，避免连点导致反复重启。
+   */
+  const togglePlatform = useCallback(
+    async (modelId: string, product: string) => {
+      const current = modelPlatforms[modelId];
+      // 当前该模型可见的平台全集（从网关下发的 channels 取）
+      const item = gatewayModels.find((m) => m.id === modelId);
+      const all = (item?.channels ?? []).map((c) => c.product);
+      if (all.length === 0) return;
+
+      // 未配置 → 以"全部允许"为起点
+      const on = current ? [...current] : [...all];
+      const next = on.includes(product) ? on.filter((p) => p !== product) : [...on, product];
+
+      // 构造新配置；全熄灭 / 与全集相同 → 删键（恢复不限制）
+      const nextAll: Record<string, string[]> = { ...modelPlatforms };
+      if (next.length === 0 || next.length === all.length) {
+        delete nextAll[modelId];
+      } else {
+        nextAll[modelId] = next;
+      }
+
+      const prev = modelPlatforms;
+      setModelPlatforms(nextAll); // 乐观更新，点击立刻有反馈
+      setPlatformSaving(modelId);
+      try {
+        await api.setModelPlatforms(nextAll);
+        toast.success(
+          nextAll[modelId]
+            ? `${modelId} 只走：${next.join(" / ")}`
+            : `${modelId} 已恢复为「不限制平台」`,
+          // 网关要重启才生效，说清楚以免用户以为没生效
+          { description: "网关正在按新配置重启，几秒后生效" },
+        );
+      } catch (err) {
+        setModelPlatforms(prev); // 失败回滚，别让界面显示一个没保存成功的状态
+        toast.error("保存平台限制失败", {
+          description: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        setPlatformSaving(null);
+      }
+    },
+    [modelPlatforms, gatewayModels],
+  );
+
   const getModelsForTarget = (targetId: string): string[] => {
     return customTargetModels[targetId] ?? selectedGlobalModels;
   };
@@ -704,16 +790,34 @@ export default function AgentsPage() {
                 const view = capabilityViews.get(m.id) ?? capabilityViewOf(m);
 
                 return (
-                  <button
+                  /* ⚠ 这里必须是 `<div role="button">` 而**不是** `<button>`。
+                     原因：卡片内部还有「平台开关」（`model-platform-toggle`），
+                     而 **HTML 不允许 button 嵌套 button** —— 浏览器会把内层
+                     button 提到外层之后，于是内层的点击**永远不触发自己的
+                     onClick**（实测：点平台开关毫无反应，也不报错，
+                     因为事件被外层的"选中模型"处理器吞掉了）。
+
+                     用 div + role="button" + 键盘处理保持可访问性。 */
+                  <div
                     key={m.id}
-                    type="button"
+                    role="button"
+                    tabIndex={0}
                     data-slot="agent-model-card"
                     data-model={m.id}
                     data-selected={selected ? "true" : "false"}
                     data-primary={isPrimary ? "true" : "false"}
                     onClick={() => toggleGlobalModel(m.id)}
+                    onKeyDown={(e) => {
+                      // 键盘可访问性：Enter/Space 等价于点击。
+                      // 但内层开关自己会处理键盘事件，故先判断来源。
+                      if (e.target !== e.currentTarget) return;
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        toggleGlobalModel(m.id);
+                      }
+                    }}
                     className={cn(
-                      "flex flex-col gap-1.5 rounded-lg border px-2.5 py-2 text-left text-xs transition-all",
+                      "flex cursor-pointer flex-col gap-1.5 rounded-lg border px-2.5 py-2 text-left text-xs transition-all",
                       selected
                         ? "border-primary/50 bg-primary/10 text-foreground shadow-2xs"
                         : "border-border/60 bg-muted/20 text-muted-foreground hover:bg-muted/40 hover:text-foreground",
@@ -760,33 +864,75 @@ export default function AgentsPage() {
                         需要时可随时恢复展示。 */}
                     <ModelCapabilityRow vision={view.vision} region={view.region} />
 
-                    {/* 渠道：这个模型来自哪个平台。
-                        所有者的需求：「可以加一个渠道，是来自于哪个平台，
-                        如果重叠，就显示多个平台」。
+                    {/* 渠道：这个模型来自哪个平台，**并且可以点击限定**。
+                        所有者的需求：
+                          「可以加一个渠道，是来自于哪个平台，如果重叠，
+                            就显示多个平台」
+                          「我希望可以加上 **平台区分使用哪个平台的模型**」
 
-                        只在下发时展示（旧网关没有这个字段 = 未声明）。
-                        重叠时每个平台一个 chip —— 那正是需求要的表达。 */}
+                        第二句是**控制**需求，不只是显示：同名模型可能同时在
+                        多个平台上（实测 glm-5.2 在 WorkBuddy 与 ZCode 都有），
+                        而各平台额度性质不同（ZCode 体验套餐 9/23 到期作废，
+                        该优先烧掉）。故 chip 做成**开关**：
+                          · 全部点亮 = 不限制（默认，行为不变）
+                          · 只点亮一个 = 该模型只走这个平台
+                          · 全部熄灭 = 恢复"不限制"（不是"全都不能用"，
+                            否则用户取消全部勾选会把模型彻底禁掉 —— 那是陷阱）
+
+                        只在下发时展示（旧网关没有这个字段 = 未声明）。 */}
                     {m.channels && m.channels.length > 0 && (
                       <div
                         className="flex flex-wrap items-center gap-1"
                         data-slot="agent-model-channels"
                       >
-                        {m.channels.map((ch) => (
-                          <span
-                            key={ch.product}
-                            className="rounded border border-border/60 bg-muted/50 px-1 py-px text-[9px] leading-4 text-muted-foreground"
-                            title={
-                              ch.regions && ch.regions.length > 0
-                                ? `${ch.label}（${ch.regions.join(" / ")}）`
-                                : ch.label
-                            }
-                          >
-                            {ch.label}
+                        {m.channels.length > 1 && (
+                          <span className="text-[9px] leading-4 text-muted-foreground">
+                            平台：
                           </span>
-                        ))}
+                        )}
+                        {m.channels.map((ch) => {
+                          const on = isPlatformOn(m.id, ch.product);
+                          const onlyThis =
+                            on &&
+                            m.channels!.filter((x) => isPlatformOn(m.id, x.product)).length === 1 &&
+                            m.channels!.length > 1;
+                          return (
+                            <button
+                              key={ch.product}
+                              type="button"
+                              data-slot="model-platform-toggle"
+                              data-product={ch.product}
+                              data-on={on ? "1" : "0"}
+                              aria-pressed={on}
+                              disabled={platformSaving === m.id}
+                              aria-label={`${m.id} 使用 ${ch.label} 平台（当前${on ? "允许" : "不允许"}）`}
+                              title={
+                                (ch.regions && ch.regions.length > 0
+                                  ? `${ch.label}（${ch.regions.join(" / ")}）`
+                                  : ch.label) +
+                                (onlyThis ? " · 当前只允许这个平台" : "")
+                              }
+                              onClick={(e) => {
+                                // ⚠ 必须阻止冒泡：外层模型卡片也有 onClick
+                                //（选中/取消该模型）。不阻止的话，点平台开关
+                                // 会连带把模型选中状态切掉。
+                                e.stopPropagation();
+                                void togglePlatform(m.id, ch.product);
+                              }}
+                              className={cn(
+                                "rounded border px-1 py-px text-[9px] leading-4 transition-colors",
+                                on
+                                  ? "border-primary/40 bg-primary/10 text-primary"
+                                  : "border-border/50 bg-muted/30 text-muted-foreground/60 line-through",
+                              )}
+                            >
+                              {ch.label}
+                            </button>
+                          );
+                        })}
                       </div>
                     )}
-                  </button>
+                  </div>
                 );
               })}
             </div>

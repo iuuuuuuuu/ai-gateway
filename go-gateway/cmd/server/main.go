@@ -148,6 +148,13 @@ func main() {
 	p := pool.New(cfg.StateFile)
 	defer p.Flush() // 进程退出前强制落盘（后台 flush 每 5s 一次，退出时补一次）
 	p.SetStore(store)
+	// 「模型 → 允许的平台」白名单（所有者的需求：平台区分使用哪个平台的模型）。
+	//
+	// 空 = 不限制，行为与加该功能之前逐字相同 —— 这是回滚点。
+	p.SetModelPlatforms(cfg.Pool.ModelPlatforms)
+	if n := len(cfg.Pool.ModelPlatforms); n > 0 {
+		log.Printf("模型平台白名单已启用：%d 个模型被限定平台", n)
+	}
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
 

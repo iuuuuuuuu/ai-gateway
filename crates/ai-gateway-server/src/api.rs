@@ -124,6 +124,9 @@ pub fn router() -> Router {
         .route("/api/gateway/config", get(api_gateway_config).post(api_save_gateway_config))
         .route("/api/gateway/mode", post(api_switch_gateway_mode))
         .route("/api/gateway/allowed-model", post(api_set_allowed_model))
+        // 「模型 → 允许的平台」白名单（所有者的需求：
+        // 「平台区分使用哪个平台的模型」）。
+        .route("/api/gateway/model-platforms", post(api_set_model_platforms))
         .route("/api/gateway/start", post(api_gateway_start))
         .route("/api/gateway/port-check", post(api_gateway_port_check))
         .route("/api/gateway/port-holder", post(api_gateway_port_holder))
@@ -1502,6 +1505,32 @@ async fn api_set_allowed_model(Json(body): Json<Value>) -> Response {
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("设置模型限制失败")
+            .to_string();
+        return json_err(msg, StatusCode::BAD_REQUEST);
+    }
+    json_ok(result)
+}
+
+/// POST /api/gateway/model-platforms —— 设置「模型 → 允许的平台」白名单。
+///
+/// body：`{ "platforms": { "glm-5.2": ["zcode"] } }`
+/// 空对象 = 恢复不限制。网关运行时自动重启以生效
+///（白名单由网关启动时读取，光落盘不会改变正在运行的进程）。
+///
+/// 需求原文（所有者）：「我希望可以加上 **平台区分使用哪个平台的模型**」。
+async fn api_set_model_platforms(Json(body): Json<Value>) -> Response {
+    // 兼容两种写法：`platforms` 与 `modelPlatforms`
+    let raw = body
+        .get("platforms")
+        .or_else(|| body.get("modelPlatforms"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let result = ai_gateway_core::modules::gateway::set_model_platforms(&raw).await;
+    if result.get("ok").and_then(Value::as_bool) == Some(false) {
+        let msg = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("设置模型平台限制失败")
             .to_string();
         return json_err(msg, StatusCode::BAD_REQUEST);
     }

@@ -252,6 +252,7 @@ pub fn run() {
             commands::switch_gateway_mode,
             // 多值「限制使用的模型」；单值入口保留给旧前端（向后兼容）。
             commands::set_allowed_models,
+        commands::set_model_platforms,
             commands::set_allowed_model,
             commands::start_gateway,
             commands::stop_gateway,

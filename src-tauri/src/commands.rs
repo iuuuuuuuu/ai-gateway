@@ -1058,6 +1058,26 @@ pub async fn set_allowed_model(model: String) -> Result<Value, String> {
     Ok(result)
 }
 
+/// 设置「模型 → 允许的平台」白名单（所有者的需求：
+/// 「平台区分使用哪个平台的模型」）。
+///
+/// 形状：`{"glm-5.2":["zcode"]}`；空对象 = 恢复不限制。
+/// 网关运行时后端会重启它以生效（白名单在网关启动时读取，
+/// 光落盘不会改变正在运行的进程）。
+#[tauri::command]
+pub async fn set_model_platforms(platforms: Value) -> Result<Value, String> {
+    let result = ai_gateway_core::modules::gateway::set_model_platforms(&platforms).await;
+    if result.get("ok").and_then(Value::as_bool) == Some(false) {
+        let msg = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("设置模型平台限制失败")
+            .to_string();
+        return Err(msg);
+    }
+    Ok(result)
+}
+
 /// 启动网关；传 port 时先保存再启动（前端「选端口 → 启动」一步完成）。
 #[tauri::command]
 pub async fn start_gateway(port: Option<u16>) -> Result<Value, String> {

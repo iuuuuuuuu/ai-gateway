@@ -159,6 +159,14 @@ const ROUTES: Record<string, Route> = {
   // 后端按 body 里的键名区分（models/allowedModels vs model/allowedModel）。
   set_allowed_models: { method: "POST", path: "/api/gateway/allowed-model" },
   set_allowed_model: { method: "POST", path: "/api/gateway/allowed-model" },
+  // 「模型 → 允许的平台」白名单（所有者的需求：
+  // 「平台区分使用哪个平台的模型」）。
+  //
+  // ⚠ 这条**必须**注册：webui 下 `call()` 靠这张表把命令名翻成 HTTP 路径。
+  // 漏注册时 `call` 会静默失败（实测：点平台开关毫无反应、不报错、
+  // 也没有请求发出 —— 排查了很久）。而 Tauri 桌面端走 IPC 不经此表，
+  // 所以只在 webui/测试里暴露。
+  set_model_platforms: { method: "POST", path: "/api/gateway/model-platforms" },
   start_gateway: { method: "POST", path: "/api/gateway/start" },
   check_gateway_port: { method: "POST", path: "/api/gateway/port-check" },
   kill_gateway_port_holder: { method: "POST", path: "/api/gateway/port-kill" },
@@ -995,6 +1003,30 @@ export function setAccountDisabled(
  */
 export function setAllowedModels(models: string[]): Promise<GatewayModeSwitchResult> {
   return call<GatewayModeSwitchResult>("set_allowed_models", { models });
+}
+
+/**
+ * 设置「模型 → 允许的平台」白名单（所有者的需求：
+ * 「平台区分使用哪个平台的模型」）。
+ *
+ * ## 语义
+ *
+ *	{"glm-5.2":["zcode"]}          → glm-5.2 只走 ZCode
+ *	{"glm-5.2":["zcode","qoder"]}  → 两个都可以
+ *	{}                             → 不限制（恢复默认）
+ *
+ * 某模型**不在**这个 map 里 = 不限制它。
+ *
+ * ## 为什么空数组要被过滤掉
+ *
+ * 界面上"全部熄灭"与"从没配置过"是两种操作，但落到网关都该是**不限制**
+ * —— 否则用户取消所有勾选会让该模型彻底不可用，那是个陷阱。
+ * 后端会过滤空数组（见 `model_platforms_for_gateway`）。
+ */
+export function setModelPlatforms(
+  platforms: Record<string, string[]>,
+): Promise<GatewayModeSwitchResult> {
+  return call<GatewayModeSwitchResult>("set_model_platforms", { platforms });
 }
 
 /**
