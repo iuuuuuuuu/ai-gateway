@@ -1,4 +1,4 @@
-# 在 app.asar 中按 ASCII needle 扫描并打印上下文（只读，不修改目标文件）。
+﻿# 在 app.asar 中按 ASCII needle 扫描并打印上下文（只读，不修改目标文件）。
 # 用法: pwsh -File asar-scan.ps1 -Path <asar> -Needle workbuddy-ai -Before 200 -After 400 -Max 30
 param(
   [Parameter(Mandatory = $true)][string]$Path,

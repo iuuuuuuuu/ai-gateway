@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     统一 bump 版本号（PowerShell 版，等价于 scripts/bump-version.sh 并修掉其两个缺陷）。
 

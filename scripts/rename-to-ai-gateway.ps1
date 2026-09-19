@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     把本仓库从 "WorkBuddy Switch Gateway / wb-switch" 彻底更名为 "AI Gateway"。
 

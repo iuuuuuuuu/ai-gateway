@@ -1,4 +1,4 @@
-# build-single.ps1 —— 构建单文件 AI Gateway（内含 OpenAI 兼容网关）
+﻿# build-single.ps1 —— 构建单文件 AI Gateway（内含 OpenAI 兼容网关）
 #
 # 产物：dist/ai-gateway.exe （一个文件，无需额外的 gateway.exe）
 #
