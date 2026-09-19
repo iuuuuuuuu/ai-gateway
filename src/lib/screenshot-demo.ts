@@ -5,6 +5,9 @@ import type {
   GithubConfig, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals,
   TravelConfig, TravelStatus,
 } from "./types";
+// Qoder / ZCode 的账号类型定义在 api.ts（不在 types.ts）——
+// 演示模式要给这两个页面造假数据，故从这里取真实类型。
+import type { QoderAccount, ZcodeAccount } from "./api";
 import { demoModeEnabled } from "./demo-mode";
 
 export const screenshotDemoEnabled = demoModeEnabled;
@@ -474,6 +477,99 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "check_update": return { ok: true, current: "0.1.24", latest: "0.1.25", latestTag: "v0.1.25", hasUpdate: true, releaseName: "更新提示演示", releaseUrl: "https://github.com/changexbc/workbuddy-switch/releases/tag/v0.1.25" };
     case "get_launch_at_login_enabled": return true;
     case "switch_progress": return { running: false, progress: null };
+
+    // ---- Qoder / ZCode 页面 ----
+    //
+    // 这两个页面的数据此前**完全没覆盖**，于是演示模式打开它们会走到
+    // 下面的 `default` 抛「演示模式缺少只读数据」—— 截图直接崩。
+    //
+    // 这里的假数据只求**形状正确**（字段齐全、类型对），数值本身无意义：
+    // 它的用途是截图与视觉走查，不是功能验证。
+    case "qoder_list_accounts":
+      return { accounts: [demoQoderAccount()] };
+    case "zcode_list_accounts":
+      return { accounts: [demoZcodeAccount()] };
+    case "qoder_summary":
+      return { total: 1, enabled: 1, healthy: 1, cooling: 0 };
+    case "zcode_summary":
+      return { total: 1, enabled: 1, healthy: 1, cooling: 0 };
+    case "qoder_campaigns":
+    case "qoder_campaigns_all":
+      // 演示模式给"有可领活动"的样子，方便走查那张卡片
+      return {
+        accounts: [{
+          uid: demoQoderAccount().uid,
+          nickname: demoQoderAccount().nickname,
+          ok: true,
+          campaigns: [{
+            id: "demo-campaign-1",
+            name: "每日签到奖励",
+            status: "claimable",
+            claimable: true,
+            campaignUrl: "https://qoder.com.cn/activities",
+          }],
+          claimable: 1,
+        }],
+        totalClaimable: 1,
+      };
+    case "qoder_claim_campaign":
+    case "qoder_claim_all_campaigns":
+      // 演示模式**绝不真领**（这是写操作）—— 只回一个成功形状供界面走查
+      return {
+        ok: true,
+        claimed: 1,
+        failed: 0,
+        skipped: 0,
+        results: [{ uid: demoQoderAccount().uid, ok: true, message: "演示模式：未真实领取" }],
+      };
+    case "zcode_scan_local":
+      return { candidates: [], scanned: 0 };
+    case "zcode_import_scanned":
+      return { imported: 0, failed: 0, enriched: 0, enrichError: "" };
+    case "qoder_import_from_client":
+      return { imported: 0, failed: 0, enriched: 0, enrichError: "" };
+
     default: throw new Error(`演示模式缺少只读数据: ${command}`);
   }
+}
+
+// demoQoderAccount / demoZcodeAccount 演示模式用的账号形状。
+//
+// ⚠ 字段名必须与 `src/lib/api.ts` 里的真实类型**逐字一致** ——
+// 我第一版凭印象写成 `remaining` / `total` / `planTierName`，
+// 而真实字段是 `credits` / `creditsTotal` / `expireAt`。
+// 形状错了界面会渲染出「undefined」或直接崩，**比没有演示数据更糟**。
+// 故这里用 `satisfies` 而不是 `as`：类型不匹配会在编译期报错，
+// 而不是静默地把坏数据喂给界面。
+//
+// 若将来类型变了，这两处会编译失败 —— 那正是我们想要的提醒。
+function demoQoderAccount(): QoderAccount {
+  return {
+    uid: "demo-qoder-0001",
+    nickname: "演示 Qoder 账号",
+    note: "演示用",
+    region: "cn",
+    disabled: false,
+    createdAt: new Date(Date.now() - 30 * 86400_000).toISOString(),
+    lastSeenAt: new Date().toISOString(),
+    credits: 860,
+    creditsTotal: 1000,
+    expireAt: Math.floor(Date.now() / 1000) + 30 * 86400,
+    models: ["qmodel_38max", "qmodel_38b"],
+  } satisfies QoderAccount;
+}
+
+function demoZcodeAccount(): ZcodeAccount {
+  return {
+    uid: "demo-zcode-0001",
+    nickname: "演示 ZCode 账号",
+    note: "演示用",
+    provider: "bigmodel",
+    disabled: false,
+    createdAt: new Date(Date.now() - 30 * 86400_000).toISOString(),
+    lastSeenAt: new Date().toISOString(),
+    credits: 299999978,
+    creditsTotal: 300000000,
+    expireAt: Math.floor(Date.now() / 1000) + 30 * 86400,
+  } satisfies ZcodeAccount;
 }
