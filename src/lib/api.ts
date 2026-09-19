@@ -242,6 +242,8 @@ const ROUTES: Record<string, Route> = {
   zcode_summary: { method: "GET", path: "/api/zcode/summary" },
   zcode_import_credential: { method: "POST", path: "/api/zcode/import-credential" },
   zcode_import_from_dir: { method: "POST", path: "/api/zcode/import-dir" },
+  zcode_scan_local: { method: "POST", path: "/api/zcode/scan-local" },
+  zcode_import_scanned: { method: "POST", path: "/api/zcode/import-scanned" },
   zcode_login_start: { method: "POST", path: "/api/zcode/login/start" },
   zcode_login_poll: { method: "POST", path: "/api/zcode/login/poll" },
 };
@@ -1413,6 +1415,109 @@ export interface ZcodeImportDirResult {
 
 export function zcodeImportFromDir(path: string): Promise<ZcodeImportDirResult> {
   return call<ZcodeImportDirResult>("zcode_import_from_dir", { path });
+}
+
+/**
+ * 扫描本机 ZCode 客户端的登录凭证。
+ *
+ * ZCode 官方客户端把 apiKey **明文**落在 `~/.zcode/v2/config.json`，
+ * 所以我们能直接读出来 —— 用户不必手工去控制台复制。
+ *
+ * ⚠ 返回的是**掩码**（`masked`），不含凭证本体：前端不需要它，
+ * 而它会进 DOM、可能被截图、被 devtools 复制。
+ */
+export interface ZcodeScannedItem {
+  /** 在本次扫描结果里的位置，导入时回传这个。 */
+  index: number;
+  /** 来源文件（让用户知道"从哪读的"）。 */
+  source: string;
+  provider: ZcodeProvider;
+  providerLabel: string;
+  /** 掩码后的凭证（如 `abc123…wxyz（49 字符）`）。 */
+  masked: string;
+  credentialLength: number;
+  suggestedNickname: string;
+  /** 客户端里的原始条目名（如 `builtin:bigmodel-coding-plan`）。 */
+  originName: string;
+  enabled: boolean;
+  /**
+   * 凭证形态：
+   *   `two-part` = `{apiKey}.{secret}`，可直接对话
+   *   `jwt`      = 只是**额度查询**用的令牌，不能当对话凭证
+   *   `single`   = 单段（智谱的 secret 可选，合法）
+   */
+  shape: "two-part" | "jwt" | "single";
+  /** 由凭证派生的 uid（与 Go 侧一致），用于判断是否已导入。 */
+  uid: string;
+  alreadyImported: boolean;
+  /**
+   * 是否配到了额度令牌（JWT）。
+   *
+   * 额度查询**只认 JWT**，不认对话凭证。ZCode 客户端把两者放在不同的
+   * provider 条目里（`*-coding-plan` 是凭证、`*-start-plan` 是 JWT），
+   * 扫描时会把同一服务商的 JWT 配对过来。
+   *
+   * 界面据此说明"导入后能读到额度" —— 没有它时讲清楚"额度会显示未知"。
+   */
+  hasQuotaToken: boolean;
+  /**
+   * 账号名（来自客户端登录态，如 `wish`）。
+   *
+   * ## 为什么它可以和 suggestedNickname 不同
+   *
+   * `suggestedNickname` 的兜底是客户端配置里的 `provider[*].name`，
+   * 那是**套餐名**（"BigModel - Coding Plan"），不是账号名。
+   * 真正的账号名在客户端登录态里（`credentials.json` 的 `user_info`，
+   * 经 `enc:v1:` 解密）—— 有它时两个字段相同，没有时只用兜底值。
+   */
+  accountName?: string;
+}
+
+/** 客户端登录态（读不到时为 null）。 */
+export interface ZcodeIdentity {
+  username: string;
+  displayName: string;
+  id: string;
+  avatarUrl: string;
+  activeProvider: string;
+}
+
+export interface ZcodeScanResult {
+  count: number;
+  items: ZcodeScannedItem[];
+  /** 扫描过程中的问题（如文件不是合法 JSON）。 */
+  problems: string[];
+  /** 扫过哪些路径 —— 用户能自己判断"是不是没找对地方"。 */
+  scannedPaths: string[];
+  existingAccountCount: number;
+  /** 已登录的账号（界面用来说明"已登录为 xxx"）。 */
+  identity: ZcodeIdentity | null;
+}
+
+export function zcodeScanLocal(): Promise<ZcodeScanResult> {
+  return call<ZcodeScanResult>("zcode_scan_local");
+}
+
+/**
+ * 导入扫描结果里选中的项。
+ *
+ * 只传**索引**，凭证本体从不离开进程 —— 详见后端 `import_scanned` 的注释。
+ */
+export interface ZcodeImportScannedResult {
+  imported: Array<{
+    index: number;
+    uid: string;
+    provider: ZcodeProvider;
+    origin: string;
+    account: ZcodeAccount;
+  }>;
+  failed: Array<{ index: number; origin?: string; error: string }>;
+  importedCount: number;
+  failedCount: number;
+}
+
+export function zcodeImportScanned(indices: number[]): Promise<ZcodeImportScannedResult> {
+  return call<ZcodeImportScannedResult>("zcode_import_scanned", { indices });
 }
 
 /** 发起 ZCode 登录（OAuth 设备流，备选路径）。 */

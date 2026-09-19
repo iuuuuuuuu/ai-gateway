@@ -1009,6 +1009,28 @@ pub async fn zcode_import_from_dir(path: String) -> Result<Value, String> {
         .map_err(|e| format!("批量导入 ZCode 凭证失败: {e}"))?
 }
 
+/// 扫描本机 ZCode 客户端的登录凭证 → 返回可导入项（掩码）。
+///
+/// 省掉手工粘贴：ZCode 官方客户端把 apiKey **明文**落在
+/// `~/.zcode/v2/config.json`，我们**只读**它。
+///
+/// ⚠ Qoder **没有**对应命令，这是刻意的 —— 它的凭证是自定义加密格式，
+/// 本机拿不到。详见 `zcode_scan` 的模块注释。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn zcode_scan_local() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(zcode_login::scan_local)
+        .await
+        .map_err(|e| format!("扫描本机 ZCode 凭证失败: {e}"))?
+}
+
+/// 导入扫描结果里选中的项（只传索引，凭证不经过前端）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn zcode_import_scanned(indices: Vec<usize>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || zcode_login::import_scanned(&indices))
+        .await
+        .map_err(|e| format!("导入扫描到的 ZCode 凭证失败: {e}"))?
+}
+
 /// 发起 ZCode 登录（OAuth 设备流，备选路径）。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn zcode_login_start(provider: String) -> Result<Value, String> {

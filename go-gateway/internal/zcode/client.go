@@ -230,17 +230,28 @@ type QuotaEntry struct {
 //
 // 单独成型是刻意的：界面据此显示"额度未知（需要 OAuth 登录）"，
 // 而不是显示 0 —— 0 会被用户误读成"额度耗尽"。
+//
+// ⚠ 只有**缺 JWT** 才该走到这里。曾经的实现还有第二个原因（缺 deviceMid）
+// 也会查不到，但那个是**我们自己能补的**，不该让用户看到"需要重新登录"。
 var ErrNoJWT = fmt.Errorf("该账号没有 JWT（仅导入了凭证），无法查询额度；请在账号页重新登录")
 
 // FetchQuota 查询额度。
 //
-// ## 为什么用 JWT 而不是 Credential
+// ## 两个必需条件（缺任一都查不到）
 //
-// 参考实现明确写了：billing 接口用 OAuth 换来的 **jwt**（start-plan 令牌），
-// 不是 `{apiKey}.{secret}`。故只导入了凭证的账号（方式 B）**查不到额度**。
+//  1. **JWT**（`zcodejwttoken`）—— billing 接口用它，不是 `{apiKey}.{secret}`。
+//     故只导入了 Credential 的账号查不到额度 → 返回 ErrNoJWT。
+//  2. **X-Device-Mid**（UUID 形态）—— 控制面硬要求，缺了回
+//     `400 {"code":3001,"msg":"parameter error"}`。
 //
-// 这种情况返回 ErrNoJWT（而不是空结果）—— 让调用方能区分
-// "没有 JWT" 与 "查到了但额度是 0"。
+// ⚠ 第 2 条是我最初漏掉的：我把那个 3001 误判成"只导入凭证所以查不到额度"，
+// 于是界面上做了「额度未知」这个状态、并在文档里写成"需要重新登录"。
+// **那个结论是错的** —— 补上这个头之后，只要有 JWT 就能查到完整额度
+//（实测：3 亿 token 的活动计划，见 `probe-zcode-quota-auth2.cjs`）。
+//
+// 两个条件的区别在于**用户能否自己解决**：
+//   · 缺 JWT    → 用户要在客户端里走一次 OAuth（我们无法代劳）
+//   · 缺 DeviceMid → **我们自己补**（随机 UUID 即可，实测上游只校验格式）
 func (c *Client) FetchQuota(ctx context.Context, cr *Cred) (*Quota, error) {
 	if cr == nil {
 		return nil, fmt.Errorf("账号为空")
@@ -256,13 +267,28 @@ func (c *Client) FetchQuota(ctx context.Context, cr *Cred) (*Quota, error) {
 	q := fmt.Sprintf("/api/v1/zcode-plan/billing/balance?app_version=%s&platform=%s",
 		c.Identity.AppVersion, c.Identity.PlatformArch())
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cr.Provider.BizHost()+q, nil)
+	// ⚠ 用 **QuotaHost**，不是 BizHost。
+	//
+	// 实测两个服务商的额度查询都走 zcode.z.ai；用各自 BizHost 会得到
+	// `HTTP 200 {"code":500,"msg":"404 NOT_FOUND"}` —— 那是 200，
+	// 会被误当成"查到了但没额度"。详见 provider.go 的 QuotaHost 注释。
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cr.Provider.QuotaHost()+q, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+cr.JWT)
 	req.Header.Set("Accept", "application/json")
-	for k, v := range c.Identity.Headers() {
+	// ⚠ 控制面**必须**带 X-Device-Mid（见 identity.go 的注释）。
+	//
+	// 漏发它上游回 `400 code=3001 parameter error` —— 那个错误看起来像
+	// "参数写错了"，实际原因是缺这个头，很容易被误判成"这个账号查不到额度"。
+	deviceMid := cr.DeviceMid
+	if !IsUUID(deviceMid) {
+		// 凭证文件里没有（或形态不对）时现场补一个，并写回让它稳定下来
+		deviceMid = NewDeviceMid()
+		cr.DeviceMid = deviceMid
+	}
+	for k, v := range c.Identity.ControlPlaneHeaders(deviceMid) {
 		if v != "" {
 			req.Header.Set(k, v)
 		}

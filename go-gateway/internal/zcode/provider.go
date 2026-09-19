@@ -73,8 +73,30 @@ type endpoints struct {
 	OpenAIBase string
 	// AnthropicBase Anthropic 端点基址（保留：将来若需要可切换）。
 	AnthropicBase string
-	// BizHost 业务 API host（凭证兑换、额度查询用）。
+	// BizHost 业务 API host（**凭证兑换**用，如 z/login、getCustomerInfo）。
 	BizHost string
+	// QuotaHost 额度/账单查询 host。
+	//
+	// ## ⚠ 为什么它必须与 BizHost 分开（实测踩到）
+	//
+	// 我最初让额度查询复用 `BizHost`，于是 bigmodel 账号发去了
+	// `open.bigmodel.cn/api/v1/zcode-plan/billing/balance` —— 上游回
+	//
+	//	HTTP 200 {"code":500,"msg":"404 NOT_FOUND"}
+	//
+	// 那个响应**是 200**，故不会被 `if resp.StatusCode >= 400` 拦下，
+	// 会被当成"拿到了数据但额度为空" —— 界面显示「额度 0」/「未知」，
+	// 而用户明明有 3 亿 token。这类"错误被包装成成功"的失败最难发现。
+	//
+	// 实测（uitest/diag-balance-endpoint.cjs）三个 host 对照：
+	//
+	//	zcode.z.ai          → code=0，完整额度 ✓
+	//	open.bigmodel.cn    → code=500 404 NOT_FOUND ✗
+	//	api.z.ai            → code=500 404 NOT_FOUND ✗
+	//
+	// 即**两个服务商的额度查询都走 zcode.z.ai** —— 那是统一的账单网关，
+	// 与凭证兑换（各服务商自己的 host）不是一回事。
+	QuotaHost string
 }
 
 // endpointsOf 返回服务商的端点表。
@@ -89,20 +111,29 @@ func (p Provider) endpointsOf() endpoints {
 			OpenAIBase:    "https://open.bigmodel.cn/api/coding/paas/v4",
 			AnthropicBase: "https://open.bigmodel.cn/api/anthropic",
 			BizHost:       "https://open.bigmodel.cn",
+			QuotaHost:     QuotaHost,
 		}
 	default:
 		return endpoints{
 			OpenAIBase:    "https://api.z.ai/api/coding/paas/v4",
 			AnthropicBase: "https://api.z.ai/api/anthropic",
 			BizHost:       "https://api.z.ai",
+			QuotaHost:     QuotaHost,
 		}
 	}
 }
 
-// OpenAIBase / AnthropicBase / BizHost 便捷访问器。
+// QuotaHost 额度/账单查询的统一 host。
+//
+// **两个服务商都用它** —— 实测 api.z.ai 与 open.bigmodel.cn 对
+// billing/balance 都回 404，只有 zcode.z.ai 给出数据。
+const QuotaHost = "https://zcode.z.ai"
+
+// OpenAIBase / AnthropicBase / BizHost / QuotaHost 便捷访问器。
 func (p Provider) OpenAIBase() string    { return p.endpointsOf().OpenAIBase }
 func (p Provider) AnthropicBase() string { return p.endpointsOf().AnthropicBase }
 func (p Provider) BizHost() string       { return p.endpointsOf().BizHost }
+func (p Provider) QuotaHost() string     { return p.endpointsOf().QuotaHost }
 
 // AllProviders 全部已知服务商（供界面渲染选项）。
 func AllProviders() []Provider { return []Provider{ProviderZAI, ProviderBigmodel} }

@@ -9,6 +9,7 @@ import {
   Loader2,
   Pencil,
   RefreshCw,
+  Search,
   Trash2,
   Upload,
 } from "lucide-react";
@@ -17,6 +18,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -106,6 +108,19 @@ export default function ZcodePage() {
   // 编辑备注
   const [editTarget, setEditTarget] = useState<ZcodeAccountRow | null>(null);
   const [editNote, setEditNote] = useState("");
+
+  // 扫描本机凭证
+  //
+  // ZCode 官方客户端把 apiKey 明文落在 ~/.zcode/v2/config.json，
+  // 我们能直接读 —— 用户不必手工去控制台复制粘贴。
+  const [scanOpen, setScanOpen] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [scanResult, setScanResult] = useState<api.ZcodeScanResult | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
+  /** 已勾选的项（按 index）。默认全选**可导入且未导入**的。 */
+  const [scanPicked, setScanPicked] = useState<Set<number>>(new Set());
+  const [scanImporting, setScanImporting] = useState(false);
+  const [scanImported, setScanImported] = useState<api.ZcodeImportScannedResult | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -211,6 +226,76 @@ export default function ZcodePage() {
       setBusy(null);
     }
   }, [dirPath, refresh]);
+
+  // ---- 扫描本机凭证 ----
+
+  /**
+   * 打开弹窗并立即扫描。
+   *
+   * 为什么打开就扫、不等用户再点一次：这个功能的**全部价值**就是省掉
+   * 手工操作 —— 再要求他点一下「开始扫描」就打了折扣。
+   */
+  const openScan = useCallback(async () => {
+    setScanOpen(true);
+    setScanImported(null);
+    setScanError(null);
+    setScanResult(null);
+    setScanning(true);
+    try {
+      const r = await api.zcodeScanLocal();
+      setScanResult(r);
+      // 默认勾选**可导入且未导入**的：
+      //   · jwt 形态是额度查询用的，当对话凭证用会失败 → 不默认选
+      //   · 已导入的再选一次会产生重复账号 → 不默认选
+      const preset = new Set<number>();
+      for (const it of r.items) {
+        if (it.shape !== "jwt" && !it.alreadyImported) preset.add(it.index);
+      }
+      setScanPicked(preset);
+    } catch (e) {
+      setScanError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setScanning(false);
+    }
+  }, []);
+
+  const toggleScanPick = useCallback((index: number) => {
+    setScanPicked((prev) => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+  }, []);
+
+  const doScanImport = useCallback(async () => {
+    const indices = [...scanPicked].sort((a, b) => a - b);
+    if (indices.length === 0) {
+      toast.error("请先勾选要导入的凭证");
+      return;
+    }
+    setScanImporting(true);
+    try {
+      const r = await api.zcodeImportScanned(indices);
+      setScanImported(r);
+      if (r.importedCount > 0) {
+        toast.success(`已导入 ${r.importedCount} 个账号`);
+        // 重新扫一次：让"已导入"标记立刻反映出来，
+        // 否则用户会以为没生效、再点一次 → 重复导入
+        const again = await api.zcodeScanLocal();
+        setScanResult(again);
+        setScanPicked(new Set());
+        void refresh();
+      }
+      if (r.failedCount > 0) {
+        toast.error(`${r.failedCount} 个导入失败，详见下方`);
+      }
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setScanImporting(false);
+    }
+  }, [scanPicked, refresh]);
 
   const startLogin = useCallback(async () => {
     if (!loginProvider) {
@@ -408,6 +493,17 @@ export default function ZcodePage() {
                 <Button variant="outline" size="sm" onClick={() => setDirOpen(true)}>
                   <Upload className="mr-2 h-4 w-4" />
                   从目录导入
+                </Button>
+                {/* 「扫描本机凭证」放在「粘贴凭证」旁边：两者都是"把已有凭证弄进来"，
+                    而扫描更省事（ZCode 客户端已经把凭证明文落在本机了）。 */}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void openScan()}
+                  disabled={scanning}
+                >
+                  <Search className={cn("mr-2 h-4 w-4", scanning && "animate-pulse")} />
+                  扫描本机凭证
                 </Button>
                 <Button variant="outline" size="sm" onClick={() => setLoginOpen(true)}>
                   <Globe className="mr-2 h-4 w-4" />
@@ -822,6 +918,231 @@ export default function ZcodePage() {
               <Button onClick={() => void doDirImport()} disabled={busy === "dir"}>
                 {busy === "dir" && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
                 开始导入
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        {/* 扫描本机凭证 */}
+        <Dialog open={scanOpen} onOpenChange={setScanOpen}>
+          <DialogContent className="sm:max-w-2xl">
+            <DialogHeader>
+              <DialogTitle>扫描本机凭证</DialogTitle>
+              <DialogDescription>
+                读取 ZCode 客户端已登录的凭证，不必手工粘贴。
+                <span className="text-muted-foreground">
+                  {" "}
+                  （只读扫描，不会改动客户端自己的配置文件）
+                </span>
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="max-h-[26rem] space-y-3 overflow-y-auto py-2">
+              {scanning && (
+                <div className="space-y-2">
+                  <Skeleton className="h-16 w-full" />
+                  <Skeleton className="h-16 w-full" />
+                </div>
+              )}
+
+              {scanError && (
+                <Alert variant="destructive">
+                  <AlertTitle>扫描失败</AlertTitle>
+                  <AlertDescription className="break-all">{scanError}</AlertDescription>
+                </Alert>
+              )}
+
+              {/* 扫不到时说清楚**扫过哪里** —— 否则用户对着"没找到"无从判断
+                  是"确实没有"还是"路径不对"。 */}
+              {!scanning && scanResult && scanResult.count === 0 && (
+                <div className="rounded-lg border border-dashed px-5 py-8 text-center">
+                  <Search className="mx-auto mb-3 h-6 w-6 opacity-50" />
+                  <p className="text-sm font-medium">没有扫描到可用的凭证</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    请先在 ZCode 客户端里登录，或改用「粘贴凭证」。
+                  </p>
+                  {scanResult.scannedPaths.length > 0 && (
+                    <details className="mt-3 text-left">
+                      <summary className="cursor-pointer text-xs text-muted-foreground">
+                        查看扫描过哪些位置
+                      </summary>
+                      <div className="mt-2 space-y-0.5">
+                        {scanResult.scannedPaths.map((p) => (
+                          <div key={p} className="break-all font-mono text-[11px] text-muted-foreground">
+                            {p}
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  )}
+                </div>
+              )}
+
+              {!scanning && scanResult && scanResult.count > 0 && (
+                <>
+                  {/* 已登录的账号 —— 这条信息解决一个真实的困惑：
+                      "我明明登录了 wish，为什么导入的账号叫别的名字"。
+                      名字取自客户端登录态，不是套餐名。 */}
+                  {scanResult.identity && (
+                    <div className="flex items-center gap-3 rounded-lg border bg-muted/40 px-4 py-3">
+                      {scanResult.identity.avatarUrl ? (
+                        <img
+                          src={scanResult.identity.avatarUrl}
+                          alt=""
+                          className="h-9 w-9 shrink-0 rounded-full"
+                          referrerPolicy="no-referrer"
+                        />
+                      ) : (
+                        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-sm font-medium">
+                          {(scanResult.identity.displayName || scanResult.identity.username || "?").slice(0, 1)}
+                        </div>
+                      )}
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium">
+                          已登录：{scanResult.identity.displayName || scanResult.identity.username}
+                        </div>
+                        <div className="truncate text-xs text-muted-foreground">
+                          {scanResult.identity.activeProvider
+                            ? `当前服务商：${scanResult.identity.activeProvider === "bigmodel" ? "智谱" : "Z.AI"}`
+                            : "账号名读自客户端登录态"}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  <p className="text-xs text-muted-foreground">
+                    找到 {scanResult.count} 条凭证。勾选后导入（凭证不会离开本机进程）。
+                  </p>
+                  <div className="space-y-2">
+                    {scanResult.items.map((it) => {
+                      const isJwt = it.shape === "jwt";
+                      // jwt 不能当对话凭证；已导入的再导会产生重复账号。
+                      // 两者都**可以**勾（用户可能有自己的理由），但要给出提示。
+                      return (
+                        <label
+                          key={it.index}
+                          className={cn(
+                            "flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors",
+                            scanPicked.has(it.index) && "border-primary/50 bg-accent/40",
+                          )}
+                        >
+                          <Checkbox
+                            checked={scanPicked.has(it.index)}
+                            onCheckedChange={() => toggleScanPick(it.index)}
+                            className="mt-0.5"
+                          />
+                          <div className="min-w-0 flex-1 space-y-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="truncate text-sm font-medium">
+                                {it.suggestedNickname || it.originName}
+                              </span>
+                              <Badge variant="outline" className="shrink-0 text-[11px]">
+                                {it.providerLabel}
+                              </Badge>
+                              {it.alreadyImported && (
+                                <Badge variant="secondary" className="shrink-0 text-[11px]">
+                                  已导入
+                                </Badge>
+                              )}
+                              {isJwt && (
+                                <Badge variant="outline" className="shrink-0 text-[11px] text-amber-600">
+                                  仅额度令牌
+                                </Badge>
+                              )}
+                              {!it.enabled && (
+                                <Badge variant="outline" className="shrink-0 text-[11px]">
+                                  客户端里已停用
+                                </Badge>
+                              )}
+                              {/* 额度令牌的配对情况要说清楚：额度查询只认 JWT，
+                                  没有它导入后额度会显示「未知」—— 用户会以为
+                                  是自己的账号没额度。 */}
+                              <Badge
+                                variant="outline"
+                                className={cn(
+                                  "shrink-0 text-[11px]",
+                                  it.hasQuotaToken ? "text-emerald-600" : "text-muted-foreground",
+                                )}
+                              >
+                                {it.hasQuotaToken ? "含额度令牌" : "无额度令牌"}
+                              </Badge>
+                            </div>
+                            <div className="font-mono text-xs text-muted-foreground">{it.masked}</div>
+                            {isJwt && (
+                              <p className="text-[11px] text-amber-600">
+                                这是额度查询令牌（JWT），不能用于对话。导入后额度可读，但发不出请求。
+                              </p>
+                            )}
+                            <div className="break-all text-[11px] text-muted-foreground">
+                              {it.source}
+                            </div>
+                          </div>
+                        </label>
+                      );
+                    })}
+                  </div>
+
+                  {scanResult.problems.length > 0 && (
+                    <Alert>
+                      <AlertTitle>有 {scanResult.problems.length} 个位置读取异常</AlertTitle>
+                      <AlertDescription>
+                        <div className="mt-1 space-y-0.5">
+                          {scanResult.problems.map((p) => (
+                            <div key={p} className="break-all text-xs">
+                              {p}
+                            </div>
+                          ))}
+                        </div>
+                      </AlertDescription>
+                    </Alert>
+                  )}
+                </>
+              )}
+
+              {scanImported && (
+                <>
+                  <Separator />
+                  {scanImported.importedCount > 0 && (
+                    <div className="space-y-1">
+                      <div className="text-sm font-medium text-emerald-600">
+                        成功导入 {scanImported.importedCount} 个
+                      </div>
+                      {scanImported.imported.map((x) => (
+                        <div key={x.uid} className="font-mono text-xs text-muted-foreground">
+                          {x.origin} → {x.uid.slice(0, 16)}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {scanImported.failedCount > 0 && (
+                    <div className="space-y-1">
+                      <div className="text-sm font-medium text-destructive">
+                        失败 {scanImported.failedCount} 个
+                      </div>
+                      {scanImported.failed.map((x) => (
+                        <div key={`${x.index}-${x.error}`} className="text-xs text-muted-foreground">
+                          <span className="font-mono">{x.origin ?? `#${x.index}`}</span>：{x.error}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setScanOpen(false)}>
+                关闭
+              </Button>
+              <Button onClick={() => void openScan()} disabled={scanning || scanImporting} variant="ghost">
+                <RefreshCw className={cn("mr-2 h-4 w-4", scanning && "animate-spin")} />
+                重新扫描
+              </Button>
+              <Button
+                onClick={() => void doScanImport()}
+                disabled={scanImporting || scanPicked.size === 0}
+              >
+                {scanImporting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                导入所选（{scanPicked.size}）
               </Button>
             </DialogFooter>
           </DialogContent>

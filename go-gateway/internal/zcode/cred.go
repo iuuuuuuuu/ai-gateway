@@ -58,7 +58,6 @@ type Cred struct {
 	Provider Provider
 
 	// NoRoute 用户手动禁用：**只不接流量**。
-	//
 	// 由宿主的账号页「停止接流量」开关写入凭证文件的 `account.no_route`。
 	//
 	// 为什么用凭证文件传递而不是宿主的账号库：网关的池是**扫描
@@ -76,6 +75,22 @@ type Cred struct {
 	// 若用户只导入了 Credential（方式 B），则 JWT 为空 → 额度查不到，
 	// 界面应显示"未知"而不是 0（0 会被误读成"额度耗尽"）。
 	JWT string
+
+	// DeviceMid 控制面请求（额度/账单）必需的设备标识（UUID 形态）。
+	//
+	// ## 为什么需要它（这是我最初漏掉的一环）
+	//
+	// 上游对控制面要求 `X-Device-Mid`，**缺了直接 400 code=3001
+	// "parameter error"**（实测，见 identity.go 的注释）。
+	// 我最初把这个 3001 误判成"需要 JWT"，于是界面上做了「额度未知」——
+	// 而实际上**只要补上这个头就能查到额度**。
+	//
+	// ## 为什么是随机生成的
+	//
+	// 实测上游**只校验格式**（UUID 形态），随机生成的也通过 ——
+	// 不需要是注册过的设备。持久化的意义是"同一账号始终表现为同一台设备"，
+	// 否则服务端会看到"一个账号被大量设备查询"。
+	DeviceMid string
 
 	// JWTIssuedAt JWT 的签发时刻（Unix 秒）；0 = 未知。
 	//
@@ -304,6 +319,13 @@ func parseBytes(raw []byte, path string) (*Cred, error) {
 	//（手写凭证文件时用户可能直接写在顶层，不接受它会让禁用静默失效）。
 	c.NoRoute = rawBool(doc, "no_route") || rawBoolAt(doc, "account", "no_route")
 
+	// 控制面设备标识。缺失时**补一个**而不是留空 ——
+	// 空值会让额度查询恒回 3001（实测），而那看起来像"这个账号没有额度"。
+	c.DeviceMid = rawStr(doc, "device_mid")
+	if !IsUUID(c.DeviceMid) {
+		c.DeviceMid = NewDeviceMid()
+	}
+
 	return c, nil
 }
 
@@ -357,6 +379,11 @@ func (c *Cred) SaveAtomic() error {
 	}
 	if c.JWTIssuedAt > 0 {
 		doc["jwt_issued_at"] = c.JWTIssuedAt
+	}
+	// 持久化 deviceMid：同一个账号必须始终表现为同一台设备
+	//（否则服务端会看到"一个账号被大量不同设备查询"）。
+	if IsUUID(c.DeviceMid) {
+		doc["device_mid"] = c.DeviceMid
 	}
 
 	// 保留禁用标记（见上面的说明）。

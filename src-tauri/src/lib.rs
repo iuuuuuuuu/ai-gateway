@@ -323,6 +323,8 @@ pub fn run() {
             commands_apps::zcode_summary,
             commands_apps::zcode_import_credential,
             commands_apps::zcode_import_from_dir,
+        commands_apps::zcode_scan_local,
+        commands_apps::zcode_import_scanned,
             commands_apps::zcode_login_start,
             commands_apps::zcode_login_poll,
             // ---- 本地 MITM 代理（设备身份隔离 + 凭证抓取） ----

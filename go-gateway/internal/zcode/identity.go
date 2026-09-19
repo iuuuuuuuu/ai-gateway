@@ -37,15 +37,86 @@ package zcode
 //	X-Os-Category         windows / macos / linux
 //	X-Os-Version          系统版本
 //
-// **不发** X-Device-Mid：参考实现注释说 3.12.3 起 LLM 请求路径不再发它
-//（`X-Device-Mid is NEVER sent`），只有控制面请求才发。
-// 多带一个真实客户端不发的头反而会成为**区分特征**。
+// **LLM 请求路径不发** X-Device-Mid：参考实现注释说 3.12.3 起该路径不再发它
+//（`X-Device-Mid is NEVER sent`）。多带一个真实客户端不发的头反而会成为**区分特征**。
+//
+// ## ⚠ 但**控制面**（额度/账单）**必须发** —— 我最初漏读了这半句
+//
+// 参考实现原话是「only control-plane requests send it」，我当时只看到
+// LLM 那半句，于是额度查询也漏发了它，结果是：
+//
+//	GET /api/v1/zcode-plan/billing/balance   →  400 {"code":3001,"msg":"parameter error"}
+//
+// 我把那个 3001 误判成"额度需要 JWT、只导入凭证的账号查不到"，
+// 甚至在界面上做了「额度未知」这个状态。**那个结论是错的。**
+//
+// 实测（uitest/probe-zcode-quota-auth2.cjs）：
+//
+//	不带头            → 400 code=3001
+//	UUID 格式的头     → **200 code=0，拿到完整额度**
+//	非 UUID 字符串     → 429
+//	空串              → 400 code=3001
+//
+// 且**任意 UUID 都行**（随机生成的也通过）—— 不需要是注册过的设备。
+// 故这里是"格式校验"而非"设备身份校验"。
+//
+// 结论：控制面请求必须带一个 UUID 形态的 X-Device-Mid。见 ControlPlaneHeaders。
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"os"
 	"runtime"
 	"strings"
 )
+
+// NewDeviceMid 生成一个 UUID v4 形态的 deviceMid。
+//
+// ## 为什么随机就够
+//
+// 实测（uitest/probe-zcode-quota-auth.cjs）：上游**只校验格式**，
+// 随机生成的 UUID 与客户端真实读到的一样能通过（都回 200）。
+// 故不需要假装是某个已注册设备 —— 那反而更可疑。
+//
+// ## 为什么要是 v4 形态（第 13 位 = 4）
+//
+// 上游会对"看着不像 UUID"的值直接 429/3001。规范的 v4 形态最安全。
+func NewDeviceMid() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// 随机源不可用时回退一个固定值 —— 额度查询失败好过整个功能不可用
+		return "00000000-0000-4000-8000-000000000000"
+	}
+	// 版本位（第 7 字节高 4 位 = 4）与变体位（第 9 字节高 2 位 = 10）
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	s := hex.EncodeToString(b[:])
+	return s[0:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:32]
+}
+
+// IsUUID 报告 s 是否是 UUID 形态（控制面请求的硬要求）。
+//
+// 宽松判据（只认形状，不校验版本位）：上游就是这么判的 ——
+// 实测非 UUID 字符串会被 429，而任意 UUID（含非 v4）都通过。
+func IsUUID(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 // DefaultAppVersion 默认上报的客户端版本。
 //
@@ -230,6 +301,28 @@ func (i Identity) Headers() map[string]string {
 	}
 	if v := strings.TrimSpace(i.OSVersion); v != "" {
 		h["X-Os-Version"] = v
+	}
+	return h
+}
+
+// ControlPlaneHeaders 在 `Headers()` 之上补上控制面（额度/账单）**必需**的头。
+//
+// ## 唯一差异是 X-Device-Mid
+//
+// 上游对控制面要求一个 **UUID 形态**的 `X-Device-Mid`：
+//
+//	不发 / 空串 / 非 UUID   → 400 {"code":3001,"msg":"parameter error"}
+//	任意 UUID              → 200（实测随机生成的也通过）
+//
+// 故这里不需要"注册设备" —— 生成一个稳定的 UUID 即可。
+// **稳定**很重要（不是每次请求随机）：同一个账号的额度查询应呈现为同一台设备，
+// 否则在服务端看来是"一个账号被大量不同设备查询"。
+//
+// deviceMid 为空时**不发**这个头（保持原行为），调用方据此可显式关闭它。
+func (i Identity) ControlPlaneHeaders(deviceMid string) map[string]string {
+	h := i.Headers()
+	if v := strings.TrimSpace(deviceMid); v != "" {
+		h["X-Device-Mid"] = v
 	}
 	return h
 }

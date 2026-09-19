@@ -164,6 +164,13 @@ pub fn router() -> Router {
         .route("/api/zcode/summary", get(api_zcode_summary))
         .route("/api/zcode/import-credential", post(api_zcode_import_credential))
         .route("/api/zcode/import-dir", post(api_zcode_import_dir))
+        // 扫描本机 ZCode 客户端凭证 → 一键导入（省掉手工粘贴）。
+        //
+        // ⚠ **没有对应的 Qoder 路由，这是刻意的**：Qoder 的凭证在自定义加密的
+        // `auth.v1.dat` 里，本机没有明文副本 —— 拿不到就不给按钮，
+        // 否则是个点了没反应的摆设。详见 zcode_scan.rs 的模块注释。
+        .route("/api/zcode/scan-local", post(api_zcode_scan_local))
+        .route("/api/zcode/import-scanned", post(api_zcode_import_scanned))
         .route("/api/zcode/login/start", post(api_zcode_login_start))
         .route("/api/zcode/login/poll", post(api_zcode_login_poll))
         .fallback(static_handler)
@@ -418,6 +425,38 @@ async fn api_zcode_import_dir(Json(body): Json<Value>) -> Response {
         Ok(Ok(v)) => json_ok(v),
         Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
         Err(e) => json_err(format!("批量导入 ZCode 凭证失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/zcode/scan-local —— 无 body。
+///
+/// 扫描本机 ZCode 客户端的登录凭证，返回**可导入项**（掩码，不含凭证本体）。
+async fn api_zcode_scan_local() -> Response {
+    match tokio::task::spawn_blocking(zcode_login::scan_local).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("扫描本机 ZCode 凭证失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/zcode/import-scanned —— body: `{ "indices": [0, 1] }`
+///
+/// 只传**索引**，不传凭证本体 —— 那样凭证就不必在浏览器里往返
+///（会进 DOM、可能被截图、被 devtools 复制）。
+async fn api_zcode_import_scanned(Json(body): Json<Value>) -> Response {
+    let indices: Vec<usize> = match body.get("indices").and_then(Value::as_array) {
+        Some(a) => a.iter().filter_map(Value::as_u64).map(|n| n as usize).collect(),
+        None => {
+            return json_err(
+                "缺少 indices（要导入哪些扫描结果）".to_string(),
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+    match tokio::task::spawn_blocking(move || zcode_login::import_scanned(&indices)).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("导入扫描到的凭证失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 

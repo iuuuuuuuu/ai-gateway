@@ -248,6 +248,105 @@ fn import_one(src: &PathBuf, dst_dir: &PathBuf) -> Result<(String, String), Stri
     Ok((uid, provider))
 }
 
+/// 扫描本机 ZCode 客户端的凭证，返回**可导入项**（不含凭证本体）。
+///
+/// 见 `zcode_scan` 的模块注释：读的是官方客户端明文落的
+/// `~/.zcode/v2/config.json`，**只读**，不改动它。
+pub fn scan_local() -> Result<Value, String> {
+    let found = crate::modules::zcode_scan::scan();
+    Ok(crate::modules::zcode_scan::scan_result_view(&found))
+}
+
+/// 导入扫描结果里**选中的**那几条（按 index）。
+///
+/// ## 为什么按 index 而不是把凭证回传给前端再传回来
+///
+/// 那样凭证要在浏览器里往返一趟：会进 DOM、可能被截图、被 devtools 复制。
+/// 索引方案下**凭证从不离开进程** —— 前端只看到掩码。
+///
+/// ## 为什么重新扫一遍而不是缓存
+///
+/// 缓存要与"用户在客户端里换了账号"保持一致，多一份状态就多一处不一致。
+/// 重扫的成本是读一个几 KB 的 JSON 文件，可以忽略。
+pub fn import_scanned(indices: &[usize]) -> Result<Value, String> {
+    if indices.is_empty() {
+        return Err("没有选择要导入的凭证".into());
+    }
+    let found = crate::modules::zcode_scan::scan();
+    if found.is_empty() {
+        return Err("本机没有扫描到可导入的 ZCode 凭证".into());
+    }
+
+    zcode_account::ensure_dirs()?;
+    let auth_dir = zcode_account::auth_dir();
+    let auth_dir_s = auth_dir.to_string_lossy().to_string();
+
+    let mut imported = Vec::new();
+    let mut failed = Vec::new();
+
+    for &i in indices {
+        let Some((c, _)) = found.get(i) else {
+            failed.push(json!({ "index": i, "error": "扫描结果里没有这一项（本机配置可能已变化）" }));
+            continue;
+        };
+
+        let mut args = vec![
+            "import",
+            "--credential",
+            c.credential.as_str(),
+            "--provider",
+            c.provider.as_str(),
+            "--nickname",
+            c.suggested_nickname.as_str(),
+            "--auth-dir",
+            auth_dir_s.as_str(),
+        ];
+        // 带上配对到的额度令牌 —— 否则导入后界面显示「额度未知」，
+        // 而用户明明有额度（额度查询只认 JWT，不认对话凭证）。
+        if let Some(j) = c.jwt.as_deref() {
+            if !j.trim().is_empty() {
+                args.push("--jwt");
+                args.push(j);
+            }
+        }
+
+        match run_login_cmd(&args) {
+            Ok(r) => {
+                let uid = r.get("uid").and_then(Value::as_str).unwrap_or("").to_string();
+                if uid.is_empty() {
+                    failed.push(json!({ "index": i, "origin": c.origin_name, "error": "导入没返回 uid" }));
+                    continue;
+                }
+                let prov = r.get("provider").and_then(Value::as_str).unwrap_or("");
+                // 登记到账号库；失败不阻断（凭证已在盘上，网关能用，
+                // 只是界面上少一条记录 —— 如实报出来而不是静默吞掉）
+                let acc = zcode_account::upsert_account(
+                    &uid,
+                    &json!({ "provider": prov, "nickname": c.suggested_nickname }),
+                );
+                match acc {
+                    Ok(a) => imported.push(json!({
+                        "index": i, "uid": uid, "provider": prov,
+                        "origin": c.origin_name, "account": a.to_view(),
+                    })),
+                    Err(e) => failed.push(json!({
+                        "index": i, "origin": c.origin_name,
+                        "error": format!("凭证已落盘，但账号库登记失败：{e}")
+                    })),
+                }
+            }
+            Err(e) => failed.push(json!({ "index": i, "origin": c.origin_name, "error": e })),
+        }
+    }
+
+    Ok(json!({
+        "imported": imported,
+        "failed": failed,
+        "importedCount": imported.len(),
+        "failedCount": failed.len(),
+    }))
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         return s.to_string();

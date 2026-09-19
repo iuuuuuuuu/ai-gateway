@@ -43,6 +43,18 @@ pub mod qoder_login;
 // 且凭证是用户可复制的字符串（故"导入"是主路径）。
 pub mod zcode_account;
 pub mod zcode_login;
+// 扫描本机 ZCode 客户端的登录凭证 → 一键导入，省掉手工粘贴。
+//
+// ⚠ **Qoder 没有对应的模块，这是刻意的**：它的凭证在自定义加密的
+// `auth.v1.dat` 里（实测熵 7.5、明文占比 7%、非标准 DPAPI），本机没有
+// 明文副本 —— 拿不到就**不做**那个按钮，否则是个点了没反应的摆设。
+pub mod zcode_scan;
+// 读客户端 `credentials.json` 里的**账号名**（`enc:v1:` 解密）。
+//
+// 与 zcode_scan 分开是因为关注点不同：那个负责"找出可导入的凭证"，
+// 这个负责"把账号叫什么弄对"。解密逻辑必须逐字照抄客户端源码，
+// 故独立成文件并把源码出处写在里面。
+pub mod zcode_credstore;
 pub mod refresh;
 pub mod rotate;
 // Windows 计划任务（Trae 签到 / 豆包保活 / 额度巡检）

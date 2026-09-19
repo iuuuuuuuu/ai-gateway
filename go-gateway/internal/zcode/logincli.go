@@ -19,11 +19,13 @@ package zcode
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -230,11 +232,53 @@ func runPoll(args []string, defaultAuthDir string) int {
 //
 // ZCode 与 Qoder 不同：凭证是用户能从控制台复制的字符串，
 // 故"粘贴导入"比 OAuth 更常用。
+// jwtIssuedAt 从 JWT 里读出 `iat`（签发时刻），**不验签**。
+//
+// 只用于展示 token 年龄（排障用）。参考实现明确说明：这个 JWT
+// **没有 exp 字段**、不因时间过期 —— 故**不能**据此判断"是否过期"，
+// 只有上游回 401/3012 才表示需要重新登录。
+//
+// 解不开或没有 iat 时返回 0（未知），不报错 —— 它只是个展示字段，
+// 为它中断导入是不值得的。
+func jwtIssuedAt(token string) int64 {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 3 {
+		return 0
+	}
+	// base64url → base64（Go 的 RawURLEncoding 直接吃 base64url，无需补 '='）
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		// 有些实现带 padding，兼容一下
+		raw, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return 0
+		}
+	}
+	var payload struct {
+		Iat int64 `json:"iat"`
+	}
+	if json.Unmarshal(raw, &payload) != nil {
+		return 0
+	}
+	return payload.Iat
+}
+
 func runImport(args []string, defaultAuthDir string) int {
 	fs := flag.NewFlagSet("zcode-login import", flag.ContinueOnError)
 	credential := fs.String("credential", "", "凭证（形如 apiKey.secret）")
 	provider := fs.String("provider", "", "服务商：zai 或 bigmodel（可选，默认 zai）")
 	nickname := fs.String("nickname", "", "昵称（可选）")
+	// --jwt：额度查询用的 OAuth 令牌（start-plan）。
+	//
+	// ## 为什么导入时就要带上它（闭环的关键）
+	//
+	// 额度查询**只认 JWT**，不认 `{apiKey}.{secret}`。而 ZCode 客户端把它们
+	// 分成两个 provider 条目落盘（coding-plan 是对话凭证、start-plan 是 JWT）。
+	//
+	// 若扫描导入只带对话凭证，用户会看到「额度未知」—— 而他明明有额度。
+	// 故扫描器把同一个客户端配置里的两条**配对**导入：凭证给这条，
+	// JWT 一并通过 `--jwt` 落进同一个凭证文件。
+	jwt := fs.String("jwt", "", "额度查询用的 JWT（可选；客户端 start-plan 那条）")
 	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -257,6 +301,10 @@ func runImport(args []string, defaultAuthDir string) int {
 		cred.Provider = ProviderZAI
 	}
 	cred.Nickname = *nickname
+	if strings.TrimSpace(*jwt) != "" {
+		cred.JWT = strings.TrimSpace(*jwt)
+		cred.JWTIssuedAt = jwtIssuedAt(cred.JWT)
+	}
 
 	if err := os.MkdirAll(*authDir, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "创建凭证目录失败: %v\n", err)
