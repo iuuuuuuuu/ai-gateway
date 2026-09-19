@@ -232,6 +232,36 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
         Err(e) => quota_error = Some(e),
     }
 
+    // ---- 消费快照 ----
+    //
+    // 记一次「本次读数」，供统计页用**差值法**算消费。
+    //
+    // ⚠ 只在**读到了有效额度**时记（`quota_error` 为空）。
+    // 拿失败时的默认值去记，会被差值法算成「一次巨额消费」——
+    // 那种幻影尖刺比"没有记录"更糟，因为它看起来像真实数据。
+    //
+    // ⚠ 另一半在 scheduler：差值法有 2 小时的间隔上限
+    //（`credit_usage::CREDIT_SNAPSHOT_MAX_GAP_MS`），只在用户手点刷新时
+    // 记快照的话，间隔动辄数天 → 差值永远被截断 → **算不出任何消费**。
+    // 故必须有定时巡检（见 `cmd/server` 的 qoder 巡检配置）。
+    if quota_error.is_none() {
+        if let (Some(total), Some(remaining)) = (credits_total, credits) {
+            let name = qoder_account::load_accounts()
+                .ok()
+                .and_then(|list| list.into_iter().find(|a| a.uid == uid).map(|a| a.nickname))
+                .unwrap_or_default();
+            let _ = crate::modules::product_credit_snapshot::product_credit_snapshot(
+                "qoder",
+                uid,
+                &name,
+                total as f64,
+                remaining as f64,
+                // Qoder 目前没有分包概念 —— 传空是**如实**，不是偷懒
+                std::collections::BTreeMap::new(),
+            );
+        }
+    }
+
     // ---- 模型 ----
     let mut models: Vec<Value> = Vec::new();
     let mut models_error: Option<String> = None;

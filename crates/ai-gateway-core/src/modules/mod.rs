@@ -13,6 +13,10 @@ pub mod codebuddy_cn_ide;
 pub mod config;
 pub mod credit_usage;
 pub mod credits;
+// 多产品（Qoder / ZCode）的消费快照。复用 credit_usage 的同一份存储与口径。
+pub mod product_credit_snapshot;
+// 多产品余额的**周期采样** —— 消费记录的差值法依赖它（间隔上限 2 小时）。
+pub mod multi_product_credit_patrol;
 // MITM 设备身份代理（hyper 协议栈自建，不依赖 Tauri）：CA 签发 / 抓包改写 /
 // 豆包与 Trae 凭证捕获 / 系统代理编排 / OAuth 直连豁免 / WS 桥接。
 pub mod device_proxy;

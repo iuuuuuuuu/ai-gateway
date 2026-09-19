@@ -8,6 +8,7 @@ import {
   FileUp,
   Gift,
   GraduationCap,
+  ListChecks,
   Loader2,
   MapPin,
   Moon,
@@ -49,6 +50,7 @@ import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
 import { ImportLocalDialog } from "@/components/import-local-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
+import { TaskQueuePanel } from "@/components/task-queue-panel";
 import * as api from "@/lib/api";
 import { useVisibilityInterval } from "@/lib/use-visibility-interval";
 import type { AccountMeta, AccountRunningTask, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, GatewayTaskName, GatewayTaskRuntime, TravelConfig, TravelStatus } from "@/lib/types";
@@ -163,6 +165,8 @@ export default function AccountsPage() {
   const [oauthOpen, setOauthOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  /** 跨账号任务队列面板（批量跑成长任务，带实时进度） */
+  const [taskQueueOpen, setTaskQueueOpen] = useState(false);
   /** 从本机导入（扫描当前登录态 + 历史快照 + 切换备份）弹框 */
   const [importLocalOpen, setImportLocalOpen] = useState(false);
   const [switchAccount, setSwitchAccount] = useState<AccountMeta | null>(null);
@@ -1134,6 +1138,35 @@ export default function AccountsPage() {
                 </TooltipTrigger>
                 <TooltipContent side="top">{api.isDemoMode() ? "演示模式下不可操作" : "签到并刷新全部账号积分"}</TooltipContent>
               </Tooltip>
+              {/* 跨账号任务队列：把「逐个账号点成长任务」变成一次批量执行。
+                  独立成按钮而不是塞进「一键操作」下拉 —— 多账号运维时
+                  「逐个点」是主要时间黑洞，埋在二级菜单里等于没做这个功能。
+                  与上面那个刷新按钮同构（Tooltip > span > DemoAction > Button），
+                  沿用既有写法，不引入新的 asChild 组合。 */}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span>
+                    <DemoAction>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-9 gap-1.5 rounded-lg px-2.5"
+                        disabled={accounts.length === 0}
+                        onClick={() => setTaskQueueOpen(true)}
+                        aria-label="跨账号任务队列：扫描并批量执行成长任务"
+                      >
+                        <ListChecks />
+                        扫描待办
+                      </Button>
+                    </DemoAction>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="top">
+                  {api.isDemoMode()
+                    ? "演示模式下不可操作"
+                    : "扫描各账号可自动完成的成长任务，按并发档位批量执行并实时查看进度"}
+                </TooltipContent>
+              </Tooltip>
               {/* 一键操作：签到与旅行合并成一个下拉，避免工具栏继续横向膨胀。
                   这里刻意**不**套 Tooltip —— 双层 asChild（TooltipTrigger + DropdownMenuTrigger）
                   会在 ref 与事件处理上互相覆盖，属于已知的脆弱组合；按钮本身已有
@@ -1299,6 +1332,17 @@ export default function AccountsPage() {
       </section>
 
       <OAuthLoginDialog open={oauthOpen} onOpenChange={setOauthOpen} />
+      {/* 跨账号任务队列面板。onFinished 里刷新账号列表与积分：
+          成长任务会写账号记录并可能带来领奖积分，不刷新的话卡片上还是旧值。 */}
+      <TaskQueuePanel
+        open={taskQueueOpen}
+        onOpenChange={setTaskQueueOpen}
+        accounts={accounts}
+        onFinished={() => {
+          void fetchAll();
+          void refreshCredits(accounts.map((account) => account.id));
+        }}
+      />
       <ExportAccountsDialog
         open={exportOpen}
         onOpenChange={setExportOpen}

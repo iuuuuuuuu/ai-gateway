@@ -19,6 +19,7 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { CreditPackageBreakdown } from "@/components/credit-package-breakdown";
 import { DemoAction } from "@/components/demo-action";
 import {
   Card,
@@ -1355,6 +1356,7 @@ export default function CreditStatsPage() {
     creditMap,
     creditLoadingMap,
     fetchAll,
+    ensureCredits,
     refreshCredits,
   } = useAccountsStore();
   const [stats, setStats] = useState<CreditStatistics | null>(cachedStatistics);
@@ -1401,6 +1403,24 @@ export default function CreditStatsPage() {
       Date.now() - lastStatisticsRefreshAt >= STATISTICS_AUTO_REFRESH_MS;
     void load(autoRefresh);
   }, [load]);
+
+  /**
+   * 直接打开本页（未经过账号页 / 网关页）时，`creditMap` 还是空的 ——
+   * 统计接口只返回**汇总**，逐账号的积分包必须单独查一次。
+   *
+   * 为什么必须在这里补：`load()` 只在 `refresh === true` 时才拉积分包，
+   * 而首次进入是 `refresh === false`。于是「积分明细」与「积分构成对比」
+   * 两个区块都会显示「尚未采集…」，用户必须手动点一次「刷新统计」才能看到
+   * 内容 —— 实测确认过这条路径（`/api/credits` 一次都没被调用）。
+   *
+   * `ensureCredits` 会跳过已缓存的账号，所以这里不会造成重复请求；
+   * 依赖里只放 `accounts` 与稳定 action，不会变成轮询。
+   * 与 `GatewayPage.tsx` 的同名补加载是同一套做法。
+   */
+  useEffect(() => {
+    if (accounts.length === 0) return;
+    void ensureCredits(accounts.map((account) => account.id));
+  }, [accounts, ensureCredits]);
 
   const officialUsage = stats?.officialUsage;
   const official = isOfficialUsageAvailable(officialUsage) ? officialUsage : undefined;
@@ -1530,6 +1550,20 @@ export default function CreditStatsPage() {
           <TrendChart
             stats={stats}
             officialUsage={officialUsage}
+          />
+
+          {/*
+            积分构成对比：回答「两个任务量相同的账号，余额为什么差上千」。
+            数据源与账号卡片完全一致（store 的 `creditMap`），不新增请求路径 ——
+            本页若自己算一遍积分，就会出现「同一个号在两页显示不同余额」的偏差。
+          */}
+          <CreditPackageBreakdown
+            accounts={accounts}
+            creditMap={creditMap}
+            creditLoadingMap={creditLoadingMap}
+            error={error}
+            onRefresh={() => void load(true)}
+            refreshing={loading}
           />
 
           {official && (

@@ -49,6 +49,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import {
+  PoolCoolCountdown,
+  PoolStatusBar,
+  poolReasonLine,
+} from "@/components/pool-status";
+import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
@@ -911,15 +916,50 @@ function queuedReasonText(acc: GatewayPoolAccount): string {
  * 括号那处则会变成「账号级冷却（）」。
  * 空串 + 调用处判空，两处都能退化成正常文案。
  *
- * 真实取值只有两个（Go 侧 `CoolKind.String()`）：`hard_credit`（余额不足，
- * 冷却到次日 04:00 等签到）与 `soft_rate`（429 短冷却）。
- * `breaker` 是宿主侧熔断的表述，一并保留以免回归。
+ * 真实取值只有四个（Go 侧 `CoolKind.String()` + `statusOf()` 的 `breaker` 覆盖）：
+ *   · `hard_credit` —— 余额（积分）不足，冷却到次日 04:00 等签到恢复；
+ *   · `soft_rate`   —— 429 限流，短冷却（默认 60s）；
+ *   · `breaker`     —— 连续失败触发的**指数退避熔断**（默认 30m 起，封顶 6h）。
+ *                     ⚠ 它是**后端真实下发**的值（pool.go:2357），不是宿主侧表述 ——
+ *                     此前这句注释写成「宿主侧熔断的表述」是错的，容易让人误以为
+ *                     永远不会收到，从而漏掉这条分支。
+ *   · `unknown`     —— `CoolKind` 零值；未冷却时该字段因 omitempty 整个不下发。
+ *
+ * ⚠ 需求里的四档分类中，**「连败降权」在后端并不存在**（已核实到源码级）：
+ * `CoolKind` 只有 `CoolHard` / `CoolSoft` 两个枚举值（pool.go:41-44），
+ * 「连续失败」这条路径走的是**熔断**（`breakerUntil`，退避 30m→6h），
+ * 并没有一个独立的「降权」状态。因此本函数刻意**不为它造一个分支** ——
+ * 编一个后端永远不会下发的 `cool_kind` 值，只会得到一段永不执行的死代码。
+ * 「连续失败」的语义已由「熔断」如实覆盖（`coolReasonText` 里那句
+ * 「连续失败触发熔断，按退避时间恢复」正是它）。真出现新类型时由
+ * `poolCoolKindText` 原样显示，不会静默丢失。
+ *
+ * 文案口径：`hard_credit` 用「积分冷却」而不是「余额欠费」—— 需求要求的分类里
+ * 这一档就叫「积分冷却」，且「欠费」在积分语境下比「余额不足」更刺眼。
+ * 这里保持短标签（状态列要能一眼扫完），完整解释仍由 `coolReasonText` 承担。
  */
 function poolCoolKindLabel(kind: string | undefined): string {
-  if (kind === "hard_credit") return "余额欠费";
+  if (kind === "hard_credit") return "积分冷却";
   if (kind === "breaker") return "熔断";
-  if (kind === "soft_rate") return "账号限速";
+  if (kind === "soft_rate") return "限流冷却";
   return "";
+}
+
+/**
+ * 状态列徽标用的冷却分类文案：已知值给中文短标签，**未知值原样显示**。
+ *
+ * 为什么与 `poolCoolKindLabel` 并存而不是改它：那个函数的契约是「未知返回空串」，
+ * 因为它的另外两处调用是**拼接**（`账号级冷却（X）`），空串才能退化成正常文案
+ *（见其上方注释）。而状态列徽标恰恰相反 —— 网关将来若新增一种冷却类型
+ *（`cool_kind` 在前端是宽松 `string`，后端也确实可能在版本升级后多一个取值），
+ * 徽标应该把它**照实显示出来**（如 `new_kind`），而不是退回泛称「冷却中」让用户
+ * 完全看不出是哪一种。两种诉求不同，因此拆成两个函数而不是让一个函数兼两职。
+ *
+ * `kind` 为空（未下发）时返回空串，调用方回退到 `state.label`。
+ */
+function poolCoolKindText(kind: string | undefined): string {
+  if (!kind) return "";
+  return poolCoolKindLabel(kind) || kind;
 }
 
 /**
@@ -1339,6 +1379,7 @@ function PoolAccountRow({
   usageRangeLabel,
   creditStatsLoaded,
   stickySessions,
+  now,
 }: {
   metrics: PoolRowMetrics;
   expanded: boolean;
@@ -1351,6 +1392,16 @@ function PoolAccountRow({
   creditStatsLoaded: boolean;
   /** 网关侧的**池级**粘性会话绑定数（后端没有逐账号口径）。 */
   stickySessions: number;
+  /**
+   * 当前时刻（毫秒），来自页面**已有的**每秒 tick。
+   *
+   * 为什么复用页面 tick 而不是让倒计时组件自建 `setInterval`：本页每秒本就
+   * 重渲染一次（驱动「上次更新 x 秒前」），整张表随之重渲染 —— 所以把 tick
+   * 传进来是**零额外开销**；而每行各建一个定时器则是十几个定时器白跑。
+   * 注意这与 `poolLastUsedAgo`「不把 tick 传进每一行」的取舍**不矛盾**：
+   * 那条说的是「不要为了相对时间而**新增**每秒重渲染」，而这里用的是已经存在的。
+   */
+  now: number;
 }) {
   const { acc, total, records, percent, rank, creditUsed, creditVerdict, creditToday, creditTodayVerdict, balance, expiryKey } = metrics;
   const modelCools = acc.model_cooling ?? [];
@@ -1415,6 +1466,8 @@ function PoolAccountRow({
   // 「#」是**消耗排名**（第 1 名 = 消耗最高），不是行号 —— 这样即使按别的列排序，
   // 也能立刻看出「这个号在消耗上排第几」。无消耗数据时不给排名（否则会显示一批并列第 1）。
   const rankLabel = rank > 0 ? String(rank) : "—";
+  /** 状态列下方的原因原文；不在「可用性异常」状态时为 null（口径见 `poolReasonLine`）。 */
+  const reasonLine = poolReasonLine(acc);
 
   return (
     <>
@@ -1440,7 +1493,16 @@ function PoolAccountRow({
           inUse && "pool-row-inuse",
         )}
       >
-        <td className="px-1.5 py-1">
+        <td className="relative px-1.5 py-1">
+          {/*
+            行首 3px 状态色条（绿 = 正常可用 / 琥珀 = 冷却中 / 红 = 已禁用·不可用）。
+            放在本单元格内**绝对定位**：不参与布局、不占列宽、也不会把行内容右移
+            —— 与 `.pool-row-inuse` 用 inset 阴影而不用 border-left 是同一理由。
+            为什么需要它：状态列里挤着「使用中 / 冷却中 / 模型冷却」一堆彩色标签，
+            徽标混在里面不显眼；色条占的是行的**空白边缘**，且窗口横向滚动时
+            行左边缘永远在视野内（状态列可能不在）。扫视靠色条、读细节靠徽标。
+          */}
+          <PoolStatusBar acc={acc} />
           <PoolExpandToggle open={expanded} controls={detailId} onClick={onToggle} />
         </td>
         <td className="w-8 px-1.5 py-1">
@@ -1514,16 +1576,20 @@ function PoolAccountRow({
               className={cn("shrink-0 whitespace-nowrap rounded-md px-1.5 py-0.5 text-[11px] font-medium", state.cls)}
               title={acc.queued && !acc.cooling && !acc.disabled ? queuedReasonText(acc) : coolReasonText(acc)}
             >
-              {state.label}
-              {/* 只有拿得到具体原因时才追加「 · 原因」——未知 kind 时
-                  `poolCoolKindLabel` 返回空串，这里若不判空就会拼出
-                  「冷却中 · 42 秒」这种多一个点的文案。 */}
-              {acc.cooling && poolCoolKindLabel(acc.cool_kind)
-                ? ` · ${poolCoolKindLabel(acc.cool_kind)}`
-                : ""}
-              {acc.cooling && typeof acc.cool_remaining_sec === "number" && acc.cool_remaining_sec > 0
-                ? ` ${formatRemaining(acc.cool_remaining_sec)}`
-                : ""}
+              {/*
+                冷却时用**分类短标签**（熔断 / 积分冷却 / 限流冷却）顶替泛称「冷却中」，
+                倒计时紧跟在同一个徽标里 → 读作「熔断 · 12 分钟」。
+
+                为什么必须 `acc.cooling &&`：`cool_kind` 是**持久化字段**，账号恢复后
+                仍可能残留上一次的值（`issue5_portrait_test.go` 记录的正是「until 已归零、
+                cool_kind 却还是 hard_credit」的现场）。不判 cooling 就会让一个健康的
+                账号显示成「积分冷却」。
+              */}
+              {(acc.cooling && poolCoolKindText(acc.cool_kind)) || state.label}
+              {/* 冷却倒计时 —— 用页面已有的每秒 tick 驱动，见 `now` prop 的说明。
+                  刻意**不**用后端快照 `cool_remaining_sec`：那是上次轮询那一刻的值，
+                  而本页 5 秒才轮询一次，直接渲染会让倒计时「卡住不动」。 */}
+              {acc.cooling ? <PoolCoolCountdown acc={acc} now={now} /> : null}
             </span>
             {/* 模型级冷却 —— 只有角标计数 + 悬浮明细（避免在概览行铺开一长串模型名）。 */}
             {coolingModelCount > 0 ? (
@@ -1580,6 +1646,33 @@ function PoolAccountRow({
               </span>
             ) : null}
           </span>
+          {/*
+            原因原文（灰字小行）：状态列上方的短标签是**分类**（熔断 / 积分冷却 /
+            限流冷却），这里补上后端写下的**原始依据** —— 两者回答的问题不同：
+            分类回答「属于哪种不可用」，原文回答「具体是因为什么」。
+
+            为什么放在上面那个 `flex-wrap` 容器**之外**（而不是当它的一个子项）：
+            容器内是 flex 项，而 flex 的换行判定用的是**被 max-width 夹过**的假想
+            主轴尺寸 —— 「w-full + max-w」的窄文本反而可能留在同一行，两层结构就
+            白写了。放在容器外面，它就是普通的块级元素，天然独占一行、不依赖 flex
+            的换行计算，也不改动既有徽标行的任何缩进。
+
+            拿不到原因时 `poolReasonLine` 返回 null，整行不渲染（不留空占位）。
+            ⚠ 它只在账号**确实处于该 reason 所解释的状态**时才返回文本：`reason`
+            在冷却自然到期后并不会被后端清空（见 `poolReasonLine` 的说明），
+            无脑显示会让健康账号下面挂着一条早已过期的「429 rate limit」。
+          */}
+          {reasonLine ? (
+            <div
+              data-slot="pool-state-reason"
+              // `max-w-[220px]` 给列宽**封顶**：`truncate` 是 `white-space: nowrap`，
+              // 没有上限时长原因文本会把状态列撑宽、挤掉右侧的用量列。
+              className="mt-0.5 max-w-[220px] truncate text-[10.5px] leading-3 text-muted-foreground"
+              title={reasonLine}
+            >
+              {reasonLine}
+            </div>
+          ) : null}
         </td>
         <td className="px-2.5 py-1 text-right">
           <div className="flex items-center justify-end gap-1.5">
@@ -4236,6 +4329,7 @@ export default function GatewayPage() {
                           usageRangeLabel={usageRangeLabel}
                           creditStatsLoaded={Boolean(creditStats)}
                           stickySessions={pool?.sticky_sessions ?? 0}
+                          now={nowTick}
                         />
                       ))}
                     </tbody>

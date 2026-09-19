@@ -37,6 +37,13 @@ import { cn } from "@/lib/utils";
 import { useVisibilityInterval } from "@/lib/use-visibility-interval";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { DemoAction } from "@/components/demo-action";
+import {
+  LogTail,
+  LogTailHeader,
+  LOG_LEVEL_CLASS,
+  LOG_TONE_CLASS,
+  logLevelOf,
+} from "@/components/log-tail";
 import { useAccountsStore } from "@/stores/accounts";
 
 interface SettingsGroupProps {
@@ -143,6 +150,13 @@ function AutoCheckinCard() {
   const [saving, setSaving] = useState(false);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  /**
+   * 日志「自动滚动」开关，缺省**开**（tail 场景下用户要的就是跟随最新）。
+   *
+   * 只是本卡片内的展示偏好，刻意**不**持久化：它不改变任何行为，
+   * 写进配置反而要为一个纯 UI 偏好增加后端字段与迁移成本。
+   */
+  const [autoScroll, setAutoScroll] = useState(true);
 
   useEffect(() => {
     void load();
@@ -285,15 +299,33 @@ function AutoCheckinCard() {
 
         <div className="px-4 py-3 sm:px-5">
           {/* 天数必须与「记录保留」设置一致：写死 30 天会在用户改成 60 天后骗人 */}
-          <p className="mb-2 text-[13px] font-medium">
-            签到日志{retentionDays ? `（最近 ${retentionDays} 天）` : ""}
-          </p>
+          <LogTailHeader
+            title={`签到日志${retentionDays ? `（最近 ${retentionDays} 天）` : ""}`}
+            autoScroll={autoScroll}
+            onAutoScrollChange={setAutoScroll}
+            switchId="checkin-log-autoscroll"
+          />
           {logs.length === 0 ? (
             <p className="py-3 text-center text-sm text-muted-foreground">暂无签到记录</p>
           ) : (
-            <div className="max-h-64 overflow-y-auto pr-1">
+            <LogTail
+              // 版本号取「条数 + 最新一条的时刻」：只看条数会漏掉「同一天内
+              // 最新一条被改写」的情形（后端按天去重后可能原地更新而不是新增）。
+              revision={`${logs.length}:${logs[logs.length - 1]?.ts ?? 0}`}
+              autoScroll={autoScroll}
+              // 后端按插入顺序返回（旧 → 新，见 `add_checkin_log` 的 push），
+              // 这里 reverse 成「新 → 旧」显示，**最新一条在最上面** ——
+              // 因此「跟随最新」= 停在顶部，用 `anchor="start"` 告知 LogTail。
+              // 保留倒序是因为「最新在顶」对扫读更友好，且改动前就是如此。
+              anchor="start"
+              label="签到日志"
+            >
               {[...logs].reverse().map((l, i) => {
                 const tone = logLabel(l.result);
+                // 级别着色：右侧状态文字用**结构化 tone**（它比正则准）；
+                // 括号里的失败原因用**内容判定** —— 原因文本里带「冷却 / 熔断」
+                // 时也该显琥珀，而不是一律涂红（红留给真正的「失败 / 错误」）。
+                const level = l.error ? logLevelOf(l.error) : "info";
                 return (
                   <div
                     key={i}
@@ -301,26 +333,18 @@ function AutoCheckinCard() {
                   >
                     <div className="min-w-0 flex-1 truncate">
                       <span className="font-medium">{l.email}</span>
-                      {l.error && <span className="text-destructive">（{l.error}）</span>}
+                      {l.error && (
+                        <span className={LOG_LEVEL_CLASS[level]}>（{l.error}）</span>
+                      )}
                     </div>
                     <div className="ml-2 flex shrink-0 items-center gap-2">
-                      <span
-                        className={
-                          tone.tone === "error"
-                            ? "text-destructive"
-                            : tone.tone === "warning"
-                              ? "text-amber-600"
-                              : "text-emerald-600"
-                        }
-                      >
-                        {tone.text}
-                      </span>
+                      <span className={LOG_TONE_CLASS[tone.tone]}>{tone.text}</span>
                       <span className="text-muted-foreground">{formatTime(l.ts)}</span>
                     </div>
                   </div>
                 );
               })}
-            </div>
+            </LogTail>
           )}
         </div>
       </CardContent>
@@ -1115,6 +1139,8 @@ function AutoRotateCard() {
   const [saving, setSaving] = useState(false);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  /** 轮换日志「自动滚动」开关，缺省开（与签到日志同一取舍：纯 UI 偏好，不持久化）。 */
+  const [autoScroll, setAutoScroll] = useState(true);
 
   useEffect(() => {
     void load();
@@ -1319,13 +1345,36 @@ function AutoRotateCard() {
         )}
 
         <div className="px-4 py-3 sm:px-5">
-          <p className="mb-2 text-[13px] font-medium">轮换日志（最近 200 条）</p>
+          <LogTailHeader
+            title="轮换日志（最近 200 条）"
+            autoScroll={autoScroll}
+            onAutoScrollChange={setAutoScroll}
+            switchId="rotate-log-autoscroll"
+          />
           {logs.length === 0 ? (
             <p className="py-3 text-center text-sm text-muted-foreground">暂无轮换记录</p>
           ) : (
-            <div className="max-h-64 overflow-y-auto pr-1">
+            <LogTail
+              // 版本号取「条数 + 最新一条的时刻」：只看条数会漏掉原地更新。
+              revision={`${logs.length}:${logs[0]?.ts ?? 0}`}
+              autoScroll={autoScroll}
+              // 后端 `rotate_logs()` 已反转成「新 → 旧」（见其注释「新→旧」），
+              // 前端直接渲染，**最新一条在最上面** → 跟随最新 = 停在顶部。
+              anchor="start"
+              label="轮换日志"
+            >
               {logs.map((l, i) => {
                 const tone = actionLabel(l.action);
+                // 文本里带「失败 / 错误」时按内容升级为红色；带「冷却 / 熔断」时为琥珀。
+                // 结构化 tone 与内容判定取**更严重**的那个，避免「action=skipped
+                // 但 reason 写着熔断」被统一涂成琥珀而看不出问题。
+                const level = logLevelOf(`${l.action} ${l.reason ?? ""}`);
+                const cls =
+                  tone.tone === "error" || level === "error"
+                    ? LOG_TONE_CLASS.error
+                    : level === "warn"
+                      ? LOG_TONE_CLASS.warning
+                      : LOG_TONE_CLASS[tone.tone];
                 return (
                   <div
                     key={i}
@@ -1340,23 +1389,13 @@ function AutoRotateCard() {
                       {l.reason && <span className="text-muted-foreground">（{l.reason}）</span>}
                     </div>
                     <div className="ml-2 flex shrink-0 items-center gap-2">
-                      <span
-                        className={
-                          tone.tone === "error"
-                            ? "text-destructive"
-                            : tone.tone === "success"
-                              ? "text-emerald-600"
-                              : "text-amber-600"
-                        }
-                      >
-                        {tone.text}
-                      </span>
+                      <span className={cls}>{tone.text}</span>
                       <span className="text-muted-foreground">{formatTime(l.ts)}</span>
                     </div>
                   </div>
                 );
               })}
-            </div>
+            </LogTail>
           )}
         </div>
       </CardContent>
@@ -2001,6 +2040,8 @@ function ProxyCard() {
   const [cert, setCert] = useState<Awaited<ReturnType<typeof api.proxyCertStatus>> | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
+  /** 代理日志「自动滚动」开关，缺省开（实时推送的 tail，最需要跟随最新）。 */
+  const [autoScroll, setAutoScroll] = useState(true);
 
   const load = useCallback(async () => {
     try {
@@ -2187,10 +2228,34 @@ function ProxyCard() {
 
         {logs.length > 0 && (
           <div className="px-4 pb-4 sm:px-5">
-            <div className="mb-1 text-xs font-medium">代理日志</div>
-            <pre className="max-h-40 overflow-auto rounded-lg border border-border/60 bg-muted/40 p-2 text-[11px] leading-5">
-              {logs.join("\n")}
-            </pre>
+            <LogTailHeader
+              title="代理日志"
+              autoScroll={autoScroll}
+              onAutoScrollChange={setAutoScroll}
+              switchId="proxy-log-autoscroll"
+            />
+            {/*
+              改成逐行渲染（原来是整块 `<pre>{logs.join("\n")}</pre>`）：
+              只有切开才能**按行着色** —— 整块文本没法给某几行上色。
+              用 `whitespace-pre-wrap break-all` 保留原来的空白排版：
+              代理日志常有缩进与对齐，用默认 `white-space: normal` 会把缩进吃掉。
+            */}
+            <LogTail
+              revision={`${logs.length}:${logs[logs.length - 1] ?? ""}`}
+              autoScroll={autoScroll}
+              // 代理日志是**追加**的（`[...prev, line]`），最新一行在最下面
+              // → 跟随即滚到底（与参考实现 `box.scrollTop = box.scrollHeight` 同向）。
+              anchor="end"
+              size="sm"
+              className="rounded-lg border border-border/60 bg-muted/40 p-2 font-mono text-[11px] leading-5"
+              label="代理日志"
+            >
+              {logs.map((line, i) => (
+                <div key={i} className={cn("whitespace-pre-wrap break-all", LOG_LEVEL_CLASS[logLevelOf(line)])}>
+                  {line}
+                </div>
+              ))}
+            </LogTail>
           </div>
         )}
       </CardContent>

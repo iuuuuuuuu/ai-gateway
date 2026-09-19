@@ -54,6 +54,31 @@ fn spawn_background_loops() {
         }
     });
 
+    // Qoder / ZCode 积分巡检：**为消费记录而存在**。
+    //
+    // # 为什么必须有这个循环（不是"顺手加的定时刷新"）
+    //
+    // 消费是**差值法**算出来的：记两次余额快照，两次之间的下降即消费。
+    // 而差值法有硬上限 —— `credit_usage::CREDIT_SNAPSHOT_MAX_GAP_MS`
+    // 是 **2 小时**：相隔更久的两条快照**不算差值**（避免把"隔了一整夜的
+    // 下降"当成"一次消费"）。
+    //
+    // 在此之前，Qoder / ZCode 的余额**只在用户手点「刷新额度」时才读**——
+    // 间隔动辄数天，差值永远被上限截断，于是**一条消费都算不出来**。
+    // 用户看到的是"消费记录永远是空的"，而根因是采样太稀。
+    //
+    // 故本循环的周期**必须显著小于 2 小时**：这里取 20 分钟，
+    // 留足余量（即使某轮失败/被推迟，下一轮仍在窗口内）。
+    tauri::async_runtime::spawn(async move {
+        // 启动后**稍等一会**再跑第一轮：避免与启动时的其它初始化
+        // （账号同步、签到核验）抢网络与磁盘。
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        loop {
+            let _ = modules::multi_product_credit_patrol::run_once().await;
+            tokio::time::sleep(modules::multi_product_credit_patrol::PATROL_INTERVAL).await;
+        }
+    });
+
     tauri::async_runtime::spawn(async move {
         let mut last_keepalive_day = String::new();
         let mut last_rotate_at: i64 = 0;
