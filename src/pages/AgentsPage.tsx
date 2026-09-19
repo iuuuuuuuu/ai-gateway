@@ -51,6 +51,7 @@ import { ModelCapabilityRow } from "@/components/model-capability-chip";
 import * as api from "@/lib/api";
 import { capabilityViewOf, summarizeCapabilities } from "@/lib/model-capability";
 import { accentOf } from "@/lib/client-accent";
+import { productAccentOf } from "@/lib/product-accent";
 import type {
   AgentBackupItem,
   AgentClientTarget,
@@ -886,12 +887,13 @@ export default function AgentsPage() {
                         data-slot="agent-model-channels"
                       >
                         {m.channels.length > 1 && (
-                          <span className="text-[9px] leading-4 text-muted-foreground">
+                          <span className="text-[10px] leading-4 text-muted-foreground">
                             平台：
                           </span>
                         )}
                         {m.channels.map((ch) => {
                           const on = isPlatformOn(m.id, ch.product);
+                          const accent = productAccentOf(ch.product);
                           const onlyThis =
                             on &&
                             m.channels!.filter((x) => isPlatformOn(m.id, x.product)).length === 1 &&
@@ -920,10 +922,15 @@ export default function AgentsPage() {
                                 void togglePlatform(m.id, ch.product);
                               }}
                               className={cn(
-                                "rounded border px-1 py-px text-[9px] leading-4 transition-colors",
+                                // 字号 9px → 11px、加大内边距：
+                                // 所有者反馈「都看不清」，9px 确实太小。
+                                "rounded border px-1.5 py-0.5 text-[11px] font-medium leading-4 transition-colors",
+                                // 每个平台一个色相（所有者的要求：
+                                // 「不同平台应该用不同的颜色表示」）。
+                                // 此前三个平台共用 primary 一套色 → 分不出来。
                                 on
-                                  ? "border-primary/40 bg-primary/10 text-primary"
-                                  : "border-border/50 bg-muted/30 text-muted-foreground/60 line-through",
+                                  ? cn(accent.border, accent.bg, accent.text)
+                                  : cn(accent.off, "line-through"),
                               )}
                             >
                               {ch.label}
