@@ -37,6 +37,21 @@ type Chunk struct {
 	FinishReason string
 	// Model 模型名（上游回显）。
 	Model string
+	// Usage 用量汇总（**通常只在最后一个分片里**）。
+	//
+	// # 为什么必须留住它（此前被静默丢弃）
+	//
+	// 原实现遇到"既不是 body 信封、也没有 choices"的分片就返回
+	// `&Chunk{Raw: payload}` —— 注释写着「可能是 usage 汇总等，不算解析失败」。
+	// 问题是**它被丢掉了**，于是：
+	//
+	//	· Qoder 路径对客户端**从不报 token 用量**
+	//	· 本地统计与成本台账拿不到 Qoder 的数
+	//
+	// 而严格遵循 OpenAI 规范的客户端只从 `choices` 为空的独立分片里读
+	// usage —— 上游恰好把 usage 塞在**带 choices 的 finish 分片**里，
+	// 两条规则正好错开。故下游要拆成两帧（见 stream.go 的 frame 处理）。
+	Usage map[string]any
 	// Raw 原始 data 行（供排障：解析不出内容时能看到上游到底发了什么）。
 	Raw string
 }
@@ -142,7 +157,19 @@ func parseChunk(payload string) (*Chunk, error) {
 		return parseOpenAIShaped([]byte(payload), payload)
 	}
 
-	// 其它：可能是 usage 汇总等 —— 不算解析失败，返回空分片。
+	// 形状三：**独立 usage 分片**（`choices` 为空数组或缺失，只有 usage）。
+	//
+	// 这是标准 OpenAI 的用法上报形状 —— 严格客户端只从这里读用量。
+	// 此前这段落到下面的 `&Chunk{Raw: payload}` 里被**丢掉**，于是
+	// Qoder 路径对客户端从不报 token 用量。
+	if u, ok := top["usage"]; ok && len(u) > 0 && string(u) != "null" {
+		var usage map[string]any
+		if err := json.Unmarshal(u, &usage); err == nil && len(usage) > 0 {
+			return &Chunk{Usage: usage, Raw: payload}, nil
+		}
+	}
+
+	// 其它：不认识的分片。不算解析失败（跳过继续读），但要保留原文供排障。
 	return &Chunk{Raw: payload}, nil
 }
 
@@ -209,6 +236,10 @@ func parseOpenAIShaped(data []byte, raw string) (*Chunk, error) {
 			Code string `json:"code"`
 			Msg  string `json:"msg"`
 		} `json:"error"`
+		// Usage 用量。**上游常把它塞在带 choices 的 finish 分片里**，
+		// 而严格 OpenAI 客户端只从 `choices` 为空的独立分片读它 ——
+		// 两条规则正好错开。故这里先收下，下游再拆成两帧（见 stream.go）。
+		Usage map[string]any `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &v); err != nil {
 		return nil, err
@@ -218,7 +249,7 @@ func parseOpenAIShaped(data []byte, raw string) (*Chunk, error) {
 		return nil, &inStreamError{Code: v.Error.Code, Msg: v.Error.Msg}
 	}
 
-	ch := &Chunk{Model: v.Model, Raw: raw}
+	ch := &Chunk{Model: v.Model, Raw: raw, Usage: v.Usage}
 	if len(v.Choices) > 0 {
 		c := v.Choices[0]
 		// delta 用于流式增量；message 用于非流式（有些实现两者都给）。

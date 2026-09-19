@@ -108,7 +108,18 @@ func (s *openAIStream) fill() error {
 		return nil
 	}
 
+	// ⚠ usage 的处理与内容**分开**（上游常把 usage 塞在带 choices 的
+	// finish 分片里，而严格 OpenAI 客户端只从 `choices` 为空的独立分片读它）。
+	//
+	// 顺序很重要：先发内容帧（含 finish_reason），再发独立的 usage 帧。
+	// 反过来的话，客户端可能在收到 finish_reason 时就结束读取，
+	// usage 帧就白发了。
 	if ch.Content == "" && ch.ReasoningContent == "" && ch.FinishReason == "" {
+		// 纯 usage 分片（choices 为空的那种）：直接产出 usage 帧
+		if len(ch.Usage) > 0 {
+			s.pending = []byte(usageFrame(s.created, s.modelOf(ch), ch.Usage))
+			return nil
+		}
 		return nil // 心跳/未知形状：继续读
 	}
 	if s.created == 0 {
@@ -132,12 +143,101 @@ func (s *openAIStream) fill() error {
 	if ch.FinishReason != "" {
 		choice["finish_reason"] = ch.FinishReason
 	}
-	model := ch.Model
-	if model == "" {
-		model = s.model
+	model := s.modelOf(ch)
+	contentFrame := frame("chat.completion.chunk", s.created, model, choice)
+
+	// 有 usage 时**拆成两帧**：内容帧（不含 usage）+ 独立 usage 帧。
+	//
+	// 为什么不能把 usage 留在内容帧里：严格遵循规范的客户端只从
+	// `choices` 为空的帧读 usage，塞在带 choices 的帧里它**读不到** ——
+	// 表现为"缓存/用量面板恒显示 0"。
+	if len(ch.Usage) > 0 {
+		s.pending = []byte(contentFrame + usageFrame(s.created, model, ch.Usage))
+	} else {
+		s.pending = []byte(contentFrame)
 	}
-	s.pending = []byte(frame("chat.completion.chunk", s.created, model, choice))
 	return nil
+}
+
+// modelOf 取本帧该用的模型名（优先上游回显，回退流开始时记下的）。
+func (s *openAIStream) modelOf(ch *Chunk) string {
+	if ch.Model != "" {
+		return ch.Model
+	}
+	return s.model
+}
+
+// usageFrame 产出一帧**独立的** usage 上报（`choices` 为空数组）。
+//
+// 这是标准 OpenAI 的形状，也是严格客户端唯一会读的用法。
+func usageFrame(created int64, model string, usage map[string]any) string {
+	// 补上 CodeBuddy 只认的顶层别名（原生字段优先，不覆盖）。
+	//
+	// 实测：客户端读 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` /
+	// `prompt_cache_write_tokens` 这三个顶层字段；而标准 OpenAI 把它们
+	// 放在 `prompt_tokens_details.cached_tokens` 里。两个都给，两边都认。
+	enrichCacheAliases(usage)
+
+	raw, _ := json.Marshal(map[string]any{
+		"id":      defaultChunkID,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []any{},
+		"usage":   usage,
+	})
+	return "data: " + string(raw) + "\n\n"
+}
+
+// enrichCacheAliases 把缓存用量补齐成**两种形状都给**。
+//
+// # 为什么
+//
+//	标准 OpenAI：usage.prompt_tokens_details.cached_tokens
+//	CodeBuddy  ：usage.prompt_cache_hit_tokens（顶层）
+//
+// 只给标准形状时，读顶层别名的客户端会把缓存命中显示成 0 ——
+// 用户以为缓存没生效（而实际上生效了），进而去查一个不存在的问题。
+//
+// ⚠ **原生字段优先**：若上游已经给了顶层别名，绝不覆盖。
+func enrichCacheAliases(usage map[string]any) {
+	if usage == nil {
+		return
+	}
+	details, _ := usage["prompt_tokens_details"].(map[string]any)
+	if details == nil {
+		return
+	}
+	cached, ok := numOfAny(details["cached_tokens"])
+	if !ok {
+		return
+	}
+	if _, exists := usage["prompt_cache_hit_tokens"]; !exists {
+		usage["prompt_cache_hit_tokens"] = cached
+	}
+	// miss = prompt - cached（取不到 prompt 就不猜）
+	if _, exists := usage["prompt_cache_miss_tokens"]; !exists {
+		if prompt, ok2 := numOfAny(usage["prompt_tokens"]); ok2 && prompt >= cached {
+			usage["prompt_cache_miss_tokens"] = prompt - cached
+		}
+	}
+}
+
+// numOfAny 把 JSON 数字统一成 int64（取不到返回 false）。
+//
+// JSON 数字经 interface{} 解出来是 float64，直接断言 int64 会失败 ——
+// 那会让上面那段"补别名"静默不生效。
+func numOfAny(v any) (int64, bool) {
+	switch t := v.(type) {
+	case float64:
+		return int64(t), true
+	case int64:
+		return t, true
+	case int:
+		return int64(t), true
+	default:
+		return 0, false
+	}
 }
 
 // finishFrame 收尾帧：上游没给 finish_reason 时补一个 stop。

@@ -129,6 +129,48 @@ func (p Provider) endpointsOf() endpoints {
 // billing/balance 都回 404，只有 zcode.z.ai 给出数据。
 const QuotaHost = "https://zcode.z.ai"
 
+// ⚠⚠ 已知的**架构级不一致**（2026-09-19 实测，尚未修，需产品决策）
+//
+// # 现象
+//
+// 额度挂在 **start-plan** 上，而我们的对话走 **coding/paas** —— 两条通道。
+//
+//	① 额度（`GET zcode.z.ai/api/v1/zcode-plan/billing/balance`）
+//	   planKind = "paid"
+//	   entries[0].planId    = "zcode-v3-start-plan-wk-0918"   ← **start-plan**
+//	                     showName = "GLM-5.3-Flash"
+//	                     remaining = 299999978 / 300000000    ← 2.99 亿 token
+//
+//	② 对话（`{OpenAIBase}/chat/completions`，即 coding/paas）
+//	   任意模型（glm-5.3 / glm-4.6 / glm-5.3-flash）一律：
+//	   429 {"code":1113,"msg":"余额不足或无可用资源包,请充值。"}
+//
+//	③ 同一账号的 `{OpenAIBase}/models` 却是 **HTTP 200**，能列出 11 个模型
+//	   → 该通道**对该账号是开放的**，只是"没有资源包"
+//
+// # 为什么这不是"账号没额度"
+//
+// `1113` 的语义是**「这条通道没有该账号的资源包」**，而不是「账号没额度」。
+// 账号确实有 2.99 亿 token —— 只是挂在 start-plan 上。
+//
+// 用户看到的现象是「明明有额度却报余额不足」，而我们的错误文案
+//（`ErrNoResourcePack` 的 FriendlyMessage）也没能说清这一点。
+//
+// # 为什么我没直接改（这是产品决策，不是 bug 修复）
+//
+// 切到 anthropic（start-plan）通道意味着：
+//
+//	· 协议从 OpenAI 换成 Anthropic（要重写请求/响应翻译层）
+//	· 该通道要求**验证码**（3007），而我们已实现求解器
+//	· 但该通道在解完验证码后回 **3012 unusual activity** ——
+//	  已做 A/B 实验证明**与请求形状无关**（补官方 system 块 + meta_user
+//	  后仍然 3012），是账号/风控层
+//
+// 即：切过去**也不一定能用**，却要付出一整套协议翻译的代价。
+// 故先把事实记录在这里，由所有者决定要不要投入。
+//
+// 验证脚本：`uitest/diag-zcode-channel.cjs`、`uitest/diag-system-block-ab.cjs`
+
 // OpenAIBase / AnthropicBase / BizHost / QuotaHost 便捷访问器。
 func (p Provider) OpenAIBase() string    { return p.endpointsOf().OpenAIBase }
 func (p Provider) AnthropicBase() string { return p.endpointsOf().AnthropicBase }
