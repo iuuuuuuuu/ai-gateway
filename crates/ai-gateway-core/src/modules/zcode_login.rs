@@ -379,33 +379,15 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
     let auth_dir = zcode_account::auth_dir();
     let auth_dir_s = auth_dir.to_string_lossy().to_string();
 
-    // ---- 身份（头像 / 显示名 / 上游账号标识）----
-    //
-    // 使用者的反馈：「已授权后,也不显示头像,也不显示名称」。
-    //
-    // 头像与显示名来自客户端登录态里的 `oauth:*:user_info`
-    //（已解密，见 zcode_credstore）。登录后刷新一次就能补上。
-    let identity = crate::modules::zcode_credstore::read_identity();
-    let mut identity_patch = serde_json::Map::new();
-    if let Some(id) = &identity {
-        let name = id.best_name();
-        if !name.is_empty() {
-            identity_patch.insert("nickname".into(), json!(name));
-        }
-        if !id.avatar_url.is_empty() {
-            identity_patch.insert("avatarUrl".into(), json!(id.avatar_url));
-        }
-        if !id.id.is_empty() {
-            identity_patch.insert("accountId".into(), json!(id.id));
-        }
-    }
-
-    // ---- 额度 ----
+    // ---- 额度（含该凭证自己的上游账号标识）----
     let mut credits: Option<i64> = None;
     let mut credits_total: Option<i64> = None;
     let mut expire_at: Option<i64> = None;
     let mut quota_error: Option<String> = None;
     let mut quota_entries: Vec<Value> = Vec::new();
+    // 该凭证**自己的**上游账号标识（Go 侧从 JWT 解出）。
+    // 用于判断客户端登录态里的身份是否属于这个账号 —— 见下面的身份段。
+    let mut cred_account_id = String::new();
 
     match run_login_cmd(&["quota", "--uid", uid, "--auth-dir", &auth_dir_s]) {
         Ok(r) => {
@@ -420,6 +402,10 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
                     }
                     if let Some(arr) = r.get("entries").and_then(Value::as_array) {
                         quota_entries = arr.clone();
+                    }
+                    // 凭证自己的账号标识（Go 侧权威来源）
+                    if let Some(aid) = r.get("accountId").and_then(Value::as_str) {
+                        cred_account_id = aid.trim().to_string();
                     }
                 }
                 "no_jwt" => {
@@ -466,6 +452,52 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
         Err(e) => models_error = Some(e),
     }
 
+    // ---- 身份（头像 / 显示名 / 上游账号标识）----
+    //
+    // 使用者的反馈：「已授权后,也不显示头像,也不显示名称」。
+    // 头像与显示名来自客户端登录态里的 `oauth:*:user_info`（已解密）。
+    //
+    // # ⚠ 必须**确认这份身份属于当前账号**才能用
+    //
+    // 客户端登录态只描述**一个**账号（客户端里当前登录的那个）。
+    // 无条件套到每个账号上会出大错 —— 所有者实测报的：
+    //
+    //	「我点击刷新只有列表中从本地导入的显示正确,其他都是显示错误」
+    //
+    // 我第一版就是无条件覆盖，于是 3 个**不同**账号全被贴上了同一个
+    // 昵称/头像/accountId（实测：三者 accountId 全变成
+    // `19331730795565300`，而它们真实身份分别是
+    // `7cb298d6-…` / `10d28204-…` / `19331730795565300`）。
+    //
+    // 判据是**上游账号标识**：凭证自己的 account_id（上面从额度接口拿到，
+    // 权威来源）与客户端身份里的 `id` 比对，一致才采用。
+    //
+    // ⚠ 这段必须放在取额度**之后** —— 它依赖 `cred_account_id`。
+    // 我第一版把它放在前面，编译期就报「找不到值」（好在是编译错，
+    // 不是运行时静默用错数据）。
+    let identity = crate::modules::zcode_credstore::read_identity();
+    let mut identity_patch = serde_json::Map::new();
+    if let Some(id) = &identity {
+        // 凭证侧未知时也允许套用：只导入凭证、没有 JWT 的账号解不出
+        // account_id，那时无法比对；用客户端身份总比什么都不填好。
+        // 但只要知道凭证属于别的账号，就绝不覆盖。
+        let belongs = cred_account_id.is_empty() || cred_account_id == id.id;
+        if belongs {
+            let name = id.best_name();
+            if !name.is_empty() {
+                identity_patch.insert("nickname".into(), json!(name));
+            }
+            if !id.avatar_url.is_empty() {
+                identity_patch.insert("avatarUrl".into(), json!(id.avatar_url));
+            }
+        }
+    }
+    // 凭证自己的账号标识**总是**写入 —— 那是这个账号的真实身份，
+    // 与"客户端此刻登录的是谁"无关。
+    if !cred_account_id.is_empty() {
+        identity_patch.insert("accountId".into(), json!(cred_account_id));
+    }
+
     // ---- 写回账号库 ----
     let mut patch = serde_json::Map::new();
     if let Some(c) = credits {
@@ -501,6 +533,22 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
         patch.insert("models".into(), json!(ids));
     }
     let acc = zcode_account::upsert_account(uid, &Value::Object(patch))?;
+
+    // 重写网关配置 —— 让 `pool.product_models` 带上刚查到的模型。
+    //
+    // ⚠ 这里**刻意只写文件、不重启网关**：刷新是高频操作，每次重启会
+    // 掐断正在进行的对话。而网关是启动时读配置的，故这份更新对**已在运行**
+    // 的网关要等下次重启才生效 —— 取舍是"渠道标签晚一点出现"，
+    // 而不是"每次刷新都断线"。
+    //
+    // 不这么做的话（所有者的实测反馈）：
+    // 「智能体管理里只看到 WorkBuddy 的模型，没看到 ZCode 和 Qoder 的」
+    // —— 因为启动时账号还没刷新，product_models 是空的。
+    if let Err(e) = crate::modules::gateway::resync_native_config() {
+        // 写配置失败**不该让刷新整体失败**：额度与模型已经落库了，
+        // 那才是用户点这个按钮的主要目的。但要留下痕迹便于排查。
+        eprintln!("刷新后重写网关配置失败（渠道标签可能不更新）: {e}");
+    }
 
     Ok(json!({
         "status": "ok",

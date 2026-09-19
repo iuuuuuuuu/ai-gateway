@@ -282,6 +282,12 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
     }
     let acc = qoder_account::upsert_account(uid, &Value::Object(patch))?;
 
+    // 重写网关配置（同 zcode_login::refresh_account 的理由）：
+    // 让 `pool.product_models` 带上刚查到的模型，渠道标签才有数据。
+    if let Err(e) = crate::modules::gateway::resync_native_config() {
+        eprintln!("刷新后重写网关配置失败（渠道标签可能不更新）: {e}");
+    }
+
     Ok(json!({
         "status": "ok",
         "account": acc.to_view(),

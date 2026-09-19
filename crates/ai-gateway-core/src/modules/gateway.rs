@@ -2010,6 +2010,45 @@ fn prompt_mode_of(cfg: &Value) -> &'static str {
 }
 
 /// 生成网关需要的 config.json（网关原生格式）。
+/// 重新生成网关的 native config（**不重启网关**）。
+///
+/// # 为什么需要
+///
+/// `write_native_config` 只在**启动网关时**调用一次，而它写进去的某些内容
+/// 是**会变的**：
+///
+///   · `pool.product_models` —— 各产品实际可用的模型清单，
+///     由「刷新账号」时查得。启动时账号还没刷新过，写进去就是空的。
+///
+/// 后果（所有者实测报的）：「智能体管理里只看到 WorkBuddy 的模型，
+/// 没看到 ZCode 和 Qoder 的」—— 因为 `product_models` 一直是空的。
+///
+/// # 为什么不能靠重启网关解决
+///
+/// 重启会**掐断正在进行的请求**（用户的对话会断）。而这个文件只是配置，
+/// 网关在**每次请求时**读模型清单 —— 改写它即可生效，无需重启。
+///
+/// ⚠ 但要说清楚：网关是**启动时**读这个文件并解析进内存的
+///（`Load(*cfgPath)` 在 main 开头）。所以改文件对**已在运行的**网关
+/// 不生效，需要重启才读得到。
+///
+/// 取舍：这里**只写文件**，由调用方决定要不要重启。刷新账号是高频操作，
+/// 每次重启网关代价太大；而"渠道标签"晚一点生效无关紧要。
+/// 用户重启应用（或切换配置）时自然生效。
+pub fn resync_native_config() -> Result<PathBuf, String> {
+    let cfg = load_gateway_config();
+    let port = cfg
+        .get("port")
+        .and_then(Value::as_u64)
+        .map(|p| p as u16)
+        .filter(|p| *p > 0)
+        .unwrap_or_else(|| port_of(cfg.get("listen").and_then(Value::as_str).unwrap_or(":7863")));
+    let mut cfg = cfg;
+    cfg["port"] = json!(port);
+    cfg["listen"] = json!(normalize_listen(port));
+    write_native_config(&cfg)
+}
+
 fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
     let dir = gateway_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;

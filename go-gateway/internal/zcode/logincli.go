@@ -331,8 +331,31 @@ func runQuota(args []string, defaultAuthDir string) int {
 		// 最早到期时刻 —— 界面用它显示"最快要过期的额度"
 		"expiresAt": q.SoonestExpiry(),
 		"entries":   entries,
+		// 该凭证**自己的**上游账号标识。
+		//
+		// 为什么由这里返回：宿主需要它来判断"客户端登录态里的身份是否属于
+		// 这个账号"。没有它，宿主只能猜 —— 而猜错的后果是所有账号被贴上
+		// 同一个身份（实测踩到：3 个不同账号的 accountId 全变成同一个）。
+		"accountId": accountIDOf(c),
 	})
 	return 0
+}
+
+// accountIDOf 取凭证对应的上游账号标识。
+//
+// 优先用文件里已存的 `account_id`；没有就从 JWT 现解 ——
+// 老版本导入的凭证文件里没有这个字段，现解能把它补上。
+func accountIDOf(c *Cred) string {
+	if c == nil {
+		return ""
+	}
+	if c.AccountID != "" {
+		return c.AccountID
+	}
+	if c.JWT != "" {
+		return AccountIDFromJWT(c.JWT)
+	}
+	return ""
 }
 
 // runModels 查一个账号实际可用的模型并输出 JSON。
