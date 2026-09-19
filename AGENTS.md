@@ -40,18 +40,39 @@ Token 统计与网关的接口契约可直接查阅实现本身：
 
 ## 构建与签名（Build & Signing）
 
-构建带 updater 签名的安装包时，**不要再去搜索私钥**，位置与用法如下（固定不变）：
+构建带 updater 签名的安装包时，**不要再去搜索私钥**，位置与用法如下（2026-09-19 实测校准）：
 
-- 一条命令：`pwsh scripts/build-signed.ps1`（仅校验密钥不构建：加 `-CheckOnly`）
-- 签名私钥：`%USERPROFILE%\.ai-gateway\ai-gateway-updater.key`（minisign 私钥）
-- 私钥口令：`%USERPROFILE%\.ai-gateway\ai-gateway-updater.password`
-- 两者都在**仓库外**，`.gitignore` 已排除 `*.key`；**本仓库是公开仓库，严禁把口令写入任何被 git 跟踪的文件。**
+- 一条命令（**必须显式带上 cargo 的 PATH，见下**）：
+  ```powershell
+  $env:Path = "C:\Users\iuuuuuuuu\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin;$env:Path"
+  & ".\scripts\build-signed.ps1" -KeyFile "D:\WishProject\WorkbuddySwitchAPi\keys\ai-gateway-updater.key" `
+                                -PasswordFile "D:\WishProject\WorkbuddySwitchAPi\keys\ai-gateway-updater.password"
+  ```
+  仅校验密钥不构建：加 `-CheckOnly`
+- 签名私钥：`D:\WishProject\WorkbuddySwitchAPi\keys\ai-gateway-updater.key`（minisign 私钥）
+- 私钥口令：`D:\WishProject\WorkbuddySwitchAPi\keys\ai-gateway-updater.password`
+- 两者在 **`wt-port` 之外、`WorkbuddySwitchAPi` 之内**，`.gitignore` 已排除 `*.key`；
+  **本仓库是公开仓库，严禁把口令写入任何被 git 跟踪的文件。**
+  （脚本默认找 `%USERPROFILE%\.wb-switch\` 与 `%USERPROFILE%\.ai-gateway\`，
+  本机两处都不存在，故**必须**用 `-KeyFile` / `-PasswordFile` 显式指定。）
+
+### ⚠ 三处曾经误导过我的过时信息（已按实测更正）
+
+1. **密钥路径**：原文写 `%USERPROFILE%\.ai-gateway\`，实际在
+   `WorkbuddySwitchAPi\keys\`。照原文找会"找不到密钥"。
+2. **keyid**：原文写 `217C0E2B4321D841`，**实测是 `7e7ce64b6fc3a36f`**
+   （`tauri.conf.json` 的 pubkey 与私钥实际配对的就是它）。
+   照原文比对会误判成"密钥不配对"。
+3. **`cargo` 不在新 shell 的 PATH 里**，也不在 `~/.cargo/bin`。
+   直接跑 `npm run tauri -- build` 会报
+   `failed to run 'cargo metadata' ... program not found`，
+   而那个报错**完全不提 PATH**，很容易被误判成"Rust 环境坏了"。
 
 背景（改动相关代码前务必了解，否则会重复踩坑）：
 
 - `src-tauri/tauri.conf.json` 的 `createUpdaterArtifacts` **一直为 `true`**，因此
   `tauri build` 必须拿到私钥；`tauri.conf.json` 里的 `plugins.updater.pubkey`
-  必须与私钥配对（keyid `217C0E2B4321D841`），否则客户端会拒绝更新包。
+  必须与私钥配对（keyid `7e7ce64b6fc3a36f`），否则客户端会拒绝更新包。
 - `TAURI_SIGNING_PRIVATE_KEY` 的值必须是密钥**内容**，不是路径。传路径会报
   `failed to decode base64 secret key: Invalid symbol 58`（路径里的冒号）。
   读取方式：`(Get-Content -LiteralPath $key -Raw).Trim()`。
