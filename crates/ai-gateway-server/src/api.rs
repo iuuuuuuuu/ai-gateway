@@ -156,6 +156,8 @@ pub fn router() -> Router {
         .route("/api/qoder/login/start", post(api_qoder_login_start))
         .route("/api/qoder/login/poll", post(api_qoder_login_poll))
         .route("/api/qoder/import", post(api_qoder_import))
+        // 从**客户端自己的登录态**一键导入（主路径，见 qoder_login 的注释）。
+        .route("/api/qoder/import-from-client", post(api_qoder_import_from_client))
         // ---- ZCode（Z.AI / 智谱）----
         // 与 Qoder 的差异：凭证是用户可复制的字符串，故导入是主路径。
         .route("/api/zcode/accounts", get(api_zcode_list_accounts))
@@ -334,6 +336,26 @@ async fn api_qoder_import(Json(body): Json<Value>) -> Response {
         Ok(Ok(v)) => json_ok(v),
         Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
         Err(e) => json_err(format!("导入 Qoder 凭证失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/qoder/import-from-client —— body: `{ "clientDir": "..." }`（可空）
+///
+/// 读 Qoder 客户端自己的登录态（**主路径**）。clientDir 为空时自动探测。
+async fn api_qoder_import_from_client(Json(body): Json<Value>) -> Response {
+    let dir = body
+        .get("clientDir")
+        .or_else(|| body.get("client_dir"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    match tokio::task::spawn_blocking(move || qoder_login::import_from_client(&dir)).await {
+        Ok(Ok(v)) => json_ok(v),
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(
+            format!("从 Qoder 客户端导入失败: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 

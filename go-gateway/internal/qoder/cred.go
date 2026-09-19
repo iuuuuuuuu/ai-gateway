@@ -134,6 +134,18 @@ func Parse(raw []byte, path string) (*Cred, error) {
 				// 用户手动禁用（宿主账号页的「停止接流量」开关）
 				NoRoute bool `json:"no_route"`
 			} `json:"account"`
+			// 机器指纹 —— **必须读回来**。
+			//
+			// 此前这里没读，于是 `SaveAtomic` 写出去的 machine 段在下次
+			// 加载时被丢掉，`EnsureFingerprint` 又生成一套新的。
+			// 指纹的语义是"同一账号 + 同一设备"，每次换就等于让上游看到
+			// 「同一账号从大量不同设备登录」—— 正是 Cred.MachineID 注释里
+			// 警告过的风险，却因为读写不对称而实际发生着。
+			Machine struct {
+				ID    string `json:"id"`
+				Token string `json:"token"`
+				Type  string `json:"type"`
+			} `json:"machine"`
 		}
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return nil, fmt.Errorf("嵌套形解析失败: %w", err)
@@ -144,6 +156,9 @@ func Parse(raw []byte, path string) (*Cred, error) {
 		c.UID = n.Account.UID
 		c.Nickname = n.Account.Nickname
 		c.NoRoute = n.Account.NoRoute
+		c.MachineID = n.Machine.ID
+		c.MachineToken = n.Machine.Token
+		c.MachineType = n.Machine.Type
 		c.Region = RegionFromDomain(n.Auth.Domain)
 	} else {
 		var f struct {
@@ -250,6 +265,36 @@ func (c *Cred) SaveAtomic() error {
 	account["uid"] = c.UID
 	account["nickname"] = c.Nickname
 	doc["account"] = account
+
+	// ⚠ 机器指纹**必须落盘**（这是我漏掉的一环）。
+	//
+	// `EnsureFingerprint` 会生成它们，但此前 `SaveAtomic` 不写 ——
+	// 于是每次重新加载都生成一套**新的**指纹。而指纹的语义是
+	// "同一账号 + 同一设备"，每次换就等于：
+	//
+	//	上游看到「同一账号从大量不同设备登录」→ 可能触发风控
+	//
+	// 我自己在 Cred.MachineID 的注释里写了这个风险，却没在保存时落实。
+	// 实测发现：`qoder-login import-client` 落盘的凭证里没有 machine 段，
+	// 重新加载后 MachineID 为空（回归测试 tmp_imported_cred_test.go 抓到）。
+	//
+	// 形状照参考实现（嵌套 `machine` 段）—— 与 LoadFile 的解析对应。
+	if c.MachineID != "" || c.MachineToken != "" || c.MachineType != "" {
+		machine, _ := doc["machine"].(map[string]any)
+		if machine == nil {
+			machine = map[string]any{}
+		}
+		if c.MachineID != "" {
+			machine["id"] = c.MachineID
+		}
+		if c.MachineToken != "" {
+			machine["token"] = c.MachineToken
+		}
+		if c.MachineType != "" {
+			machine["type"] = c.MachineType
+		}
+		doc["machine"] = machine
+	}
 
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {

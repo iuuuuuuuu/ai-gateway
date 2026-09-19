@@ -234,6 +234,7 @@ const ROUTES: Record<string, Route> = {
   qoder_login_start: { method: "POST", path: "/api/qoder/login/start" },
   qoder_login_poll: { method: "POST", path: "/api/qoder/login/poll" },
   qoder_import_credentials: { method: "POST", path: "/api/qoder/import" },
+  qoder_import_from_client: { method: "POST", path: "/api/qoder/import-from-client" },
   // ---- ZCode（Z.AI / 智谱）----
   // 与 Qoder 的差异：凭证是用户可复制的字符串，故导入是主路径。
   zcode_list_accounts: { method: "GET", path: "/api/zcode/accounts" },
@@ -1311,6 +1312,35 @@ export interface QoderImportResult {
 
 export function qoderImportCredentials(path: string): Promise<QoderImportResult> {
   return call<QoderImportResult>("qoder_import_credentials", { path });
+}
+
+/**
+ * 从 **Qoder 客户端自己的登录态**一键导入（**主路径**）。
+ *
+ * ## 为什么这才是主路径
+ *
+ * 网页授权在本机走不通：授权链接的 `redirect_uri` 是
+ * `qoder-work-cn://` —— 一个**自定义协议**，只有真正的 Qoder 客户端
+ * 才会注册它。我们不是它，浏览器授权完成后**无处回调**。
+ *
+ * 而客户端已经登录了，登录态就在它的数据目录里。读它即可 ——
+ * 用户什么都不用点。
+ *
+ * @param clientDir 客户端数据目录；留空则自动探测
+ */
+export interface QoderClientImportResult {
+  status: string;
+  uid: string;
+  nickname: string;
+  region: QoderRegion;
+  /** 实际读取的客户端目录（让用户知道"从哪读的"）。 */
+  clientDir: string;
+  expiresAt: string | null;
+  account: QoderAccount;
+}
+
+export function qoderImportFromClient(clientDir = ""): Promise<QoderClientImportResult> {
+  return call<QoderClientImportResult>("qoder_import_from_client", { clientDir });
 }
 
 // ---------------------------------------------------------------------------

@@ -73,7 +73,26 @@ fn run_login_cmd(args: &[&str]) -> Result<Value, String> {
 /// 不做网络请求、不写磁盘 —— 只是生成 PKCE 与机器指纹。
 pub fn login_start(region: &str) -> Result<Value, String> {
     let region = normalize_region(region)?;
-    let r = run_login_cmd(&["url", "--region", region])?;
+
+    // ⚠ **必须把 auth_dir 传下去** —— 我漏了这一处，造成两个真实故障：
+    //
+    //  1. **隔离失效**：不传时 Go 侧用它的默认目录
+    //     （`~/.wb-switch/qoder/auths`），于是独立实例的登录会话
+    //     写进了**使用者的真实数据目录**（实测确认：独立实例跑一次
+    //     start，真实目录里就多一个会话文件）。
+    //
+    //  2. **poll 永远失败**：start 把会话写进 A 目录，而 poll 带着
+    //     auth_dir 去 B 目录找 —— 找不到就报
+    //     「登录会话不存在或已过期，请重新点击「登录」」。
+    //     这正是使用者反馈的现象：「出来链接 就提我重新点击登录」。
+    //
+    // 对照：ZCode 侧的 `login_start` **有**传（见 zcode_login.rs）。
+    // 同一个仓库里两个产品写法不一致，漏的那个就出了这个问题。
+    let auth_dir = qoder_account::auth_dir();
+    qoder_account::ensure_dirs()?;
+    let auth_dir_s = auth_dir.to_string_lossy().to_string();
+
+    let r = run_login_cmd(&["url", "--region", region, "--auth-dir", &auth_dir_s])?;
 
     // 校验 Go 侧返回了必需字段：缺 authUrl 时界面会显示一个空链接，
     // 用户点不开却不知道原因 —— 提前报错更好。
@@ -158,6 +177,80 @@ fn truncate(s: &str, n: usize) -> String {
         return s.to_string();
     }
     s.chars().take(n).collect::<String>() + "…"
+}
+
+/// 从**Qoder 客户端自己的登录态**导入凭证（**一键导入，主路径**）。
+///
+/// # 为什么这才是主路径
+///
+/// 网页授权在本机**走不通**：授权链接的 `redirect_uri` 是
+/// `qoder-work-cn://` —— 一个**自定义协议**，只有真正的 Qoder 客户端
+/// 才会注册它。我们不是它，浏览器授权完成后**无处回调**。
+///
+/// ⚠ 但要说清楚：我们的**轮询**端点形状是对的。实测拿会话里的
+/// nonce/verifier 去打 `/api/v1/deviceToken/poll` 得到
+///
+/// ```text
+/// 401 {"errorCode":"Unauthorized","errorMessage":"User not authenticated"}
+/// ```
+///
+/// 那正是"**还没授权**"的预期响应。所以不是请求写错了，而是
+/// **授权这一步在本机根本没有完成的条件**。
+///
+/// 而客户端已经登录了 —— 它的登录态就在它的数据目录里
+///（Electron safeStorage 加密，由 DPAPI 绑定当前 Windows 用户）。
+/// 读它就够了：**用户什么都不用点**。
+///
+/// # 实现为什么在 Go 侧
+///
+/// DPAPI 与 Electron 的密钥解包（`os_crypt.encrypted_key` → AES-256-GCM）
+/// 已在 Go 侧实现并**用真实客户端数据实测通过**（`internal/qoderclient`）。
+/// 在 Rust 重写意味着两套实现要各自跟进客户端的格式变化。
+///
+/// 本函数只做**编排**：调 `gateway.exe qoder-login import-client`，
+/// 把结果登记进账号库。
+pub fn import_from_client(client_dir: &str) -> Result<Value, String> {
+    qoder_account::ensure_dirs()?;
+    let auth_dir = qoder_account::auth_dir();
+    let auth_dir_s = auth_dir.to_string_lossy().to_string();
+
+    let mut args = vec!["import-client", "--auth-dir", auth_dir_s.as_str()];
+    let dir = client_dir.trim();
+    if !dir.is_empty() {
+        args.push("--client-dir");
+        args.push(dir);
+    }
+
+    let r = run_login_cmd(&args)?;
+
+    let uid = r.get("uid").and_then(Value::as_str).unwrap_or("").to_string();
+    if uid.is_empty() {
+        return Err(format!("导入成功但没返回 uid（原始：{r}）"));
+    }
+    let nickname = r.get("nickname").and_then(Value::as_str).unwrap_or("").to_string();
+    let region = r.get("region").and_then(Value::as_str).unwrap_or("cn").to_string();
+    let client = r.get("clientDir").and_then(Value::as_str).unwrap_or("").to_string();
+
+    // 登记进账号库。
+    //
+    // ⚠ 只传 Qoder 存在的键（nickname / region）。Qoder 没有
+    // `provider` 概念（那是 ZCode 的：Z.AI vs 智谱）—— 传了会被
+    // apply_patch 静默忽略，但那是"看起来生效了其实没有"的隐患，
+    // 不如一开始就不传。
+    let acc = qoder_account::upsert_account(
+        &uid,
+        &json!({ "nickname": nickname, "region": region }),
+    )?;
+
+    Ok(json!({
+        "status": "ok",
+        "uid": uid,
+        "nickname": nickname,
+        "region": region,
+        "clientDir": client,
+        "expiresAt": r.get("expiresAt").cloned().unwrap_or(Value::Null),
+        "account": acc.to_view(),
+    }))
 }
 
 /// 导入已有凭证文件（方式 B）。

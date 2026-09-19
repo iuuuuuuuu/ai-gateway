@@ -20,13 +20,46 @@ package qoder
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+
+	"workbuddy2api/internal/qoderclient"
 )
+
+// parseRFC3339 解析客户端给的到期时刻（如 `2026-10-18T22:53:53Z`）。
+//
+// 解不开时返回 0（未知）—— 上层会把"未知"当"需要刷新"，
+// 那是安全的（宁可多刷一次，也不要用过期令牌去打上游）。
+func parseRFC3339(s string) int64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05Z", "2006-01-02T15:04:05.000Z"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.Unix()
+		}
+	}
+	return 0
+}
+
+// deterministicUUID 由字符串派生一个**稳定的** UUID 形态标识。
+//
+// 用途：客户端没落盘 machine-id 时给 COSY 签名一个稳定指纹。
+// **稳定**是关键 —— 每次随机的话，上游会看到"同一账号来自大量不同设备"。
+func deterministicUUID(seed string) string {
+	sum := sha256.Sum256([]byte("qoder-machine:" + seed))
+	h := hex.EncodeToString(sum[:16])
+	// 摆成 8-4-4-4-12，并把版本位设成 4
+	return h[0:8] + "-" + h[8:12] + "-4" + h[13:16] + "-" + h[16:20] + "-" + h[20:32]
+}
 
 // DefaultAuthDir 宿主未显式指定时的凭证目录。
 //
@@ -129,7 +162,7 @@ func loadSession(authDir, sessionID string) (*LoginSession, error) {
 // 返回值即进程退出码。
 func RunLoginCLI(args []string, defaultAuthDir string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "用法: qoder-login <url|poll> [选项]")
+		fmt.Fprintln(os.Stderr, "用法: qoder-login <url|poll|import-client> [选项]")
 		return 2
 	}
 	sub := args[0]
@@ -139,10 +172,101 @@ func RunLoginCLI(args []string, defaultAuthDir string) int {
 		return runLoginURL(args[1:], defaultAuthDir)
 	case "poll":
 		return runLoginPoll(args[1:], defaultAuthDir)
+	case "import-client":
+		// **主路径**：直接读 Qoder 客户端已登录的凭证。
+		//
+		// ## 为什么这才是主路径（而不是上面的浏览器授权）
+		//
+		// 授权链接的 `redirect_uri` 是 `qoder-work-cn://` —— 一个**自定义
+		// 协议**，只有真正的 Qoder 客户端才会注册它。我们不是它，浏览器
+		// 授权完成后**无处回调**，所以那条路在本机走不通。
+		//
+		// 而客户端已经登录了，登录态就在它的数据目录里（Electron
+		// safeStorage 加密）。见 internal/qoderclient 的包注释。
+		return runImportClient(args[1:], defaultAuthDir)
 	default:
-		fmt.Fprintf(os.Stderr, "未知子命令 %q（应为 url 或 poll）\n", sub)
+		fmt.Fprintf(os.Stderr, "未知子命令 %q（应为 url / poll / import-client）\n", sub)
 		return 2
 	}
+}
+
+// runImportClient 读客户端登录态并落成我们的凭证文件。
+//
+// 这是 Qoder 的**主路径**：用户只要在客户端里登录过，就不需要再做任何事。
+func runImportClient(args []string, defaultAuthDir string) int {
+	fs := flag.NewFlagSet("qoder-login import-client", flag.ContinueOnError)
+	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
+	// 客户端数据目录（默认自动探测；显式传入便于测试与多版本共存）
+	clientDir := fs.String("client-dir", "", "客户端数据目录（默认自动探测）")
+	nickname := fs.String("nickname", "", "昵称（默认用客户端里的账号名）")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	dir := strings.TrimSpace(*clientDir)
+	if dir == "" {
+		found, ok := qoderclient.FindClientAppDir()
+		if !ok {
+			fmt.Fprintln(os.Stderr,
+				"找不到 Qoder 客户端的登录数据。请先在 Qoder 客户端里登录一次"+
+					"（会自动探测 %APPDATA%\\com.qodercn.app.stable 等目录）。")
+			return 1
+		}
+		dir = found
+	}
+
+	auth, err := qoderclient.ReadClientAuthFrom(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "读取 Qoder 客户端凭证失败: %v\n", err)
+		return 1
+	}
+
+	r := Region(qoderclient.Region(dir))
+	if r == RegionUnknown {
+		r = RegionCN
+	}
+
+	c := &Cred{
+		UID:          auth.User.ID,
+		Nickname:     firstNonEmpty(strings.TrimSpace(*nickname), auth.User.Name),
+		DT:           auth.Token,
+		DRT:          auth.RefreshToken,
+		DTExpiresAt:  parseRFC3339(auth.ExpiresAt),
+		MachineID:    qoderclient.MachineID(dir),
+		MachineToken: "", // 客户端不落盘 machineToken，首次请求时上游会下发
+		MachineType:  "windows",
+		Region:       r,
+	}
+	if c.UID == "" {
+		fmt.Fprintln(os.Stderr, "客户端凭证里没有 user.id，无法确定账号标识")
+		return 1
+	}
+	if c.MachineID == "" {
+		// COSY 签名需要机器指纹。客户端没落盘时造一个稳定的
+		//（由 uid 派生，保证同一账号每次相同）。
+		c.MachineID = deterministicUUID(c.UID)
+	}
+
+	if err := os.MkdirAll(*authDir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "创建凭证目录失败: %v\n", err)
+		return 1
+	}
+	c.FilePath = filepath.Join(*authDir, "qoder-"+sanitizeUID(c.UID)+".json")
+	if err := c.SaveAtomic(); err != nil {
+		fmt.Fprintf(os.Stderr, "保存凭证失败: %v\n", err)
+		return 1
+	}
+
+	writeJSON(map[string]any{
+		"status":    "ok",
+		"uid":       c.UID,
+		"nickname":  c.Nickname,
+		"region":    string(c.Region),
+		"file":      filepath.Base(c.FilePath),
+		"clientDir": dir,
+		"expiresAt": auth.ExpiresAt,
+	})
+	return 0
 }
 
 func runLoginURL(args []string, defaultAuthDir string) int {

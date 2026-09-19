@@ -932,6 +932,23 @@ pub async fn qoder_import_credentials(path: String) -> Result<Value, String> {
         .map_err(|e| format!("导入 Qoder 凭证失败: {e}"))?
 }
 
+/// 从 **Qoder 客户端自己的登录态**一键导入（**主路径**）。
+///
+/// 网页授权在本机走不通：授权链接的 `redirect_uri` 是
+/// `qoder-work-cn://` —— 一个**自定义协议**，只有真正的 Qoder 客户端
+/// 才会注册。我们不是它，浏览器授权完成后无处回调。
+///
+/// 而客户端已经登录了，登录态就在它的数据目录里（Electron safeStorage
+/// 加密，DPAPI 绑定当前 Windows 用户）。读它即可 —— 用户什么都不用点。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_import_from_client(client_dir: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        qoder_login::import_from_client(&client_dir)
+    })
+    .await
+    .map_err(|e| format!("从 Qoder 客户端导入失败: {e}"))?
+}
+
 /// Qoder 账号库概览（供界面顶部展示）。
 #[tauri::command]
 pub async fn qoder_summary() -> Result<Value, String> {

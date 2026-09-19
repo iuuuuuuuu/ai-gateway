@@ -107,6 +107,15 @@ export default function QoderPage() {
   const [editTarget, setEditTarget] = useState<QoderAccountRow | null>(null);
   const [editNote, setEditNote] = useState("");
 
+  // 从客户端一键导入（**主路径**）
+  //
+  // 网页授权在本机走不通：授权链接的 redirect_uri 是 `qoder-work-cn://`，
+  // 一个只有真正的 Qoder 客户端才会注册的自定义协议 —— 我们不是它，
+  // 浏览器授权完成后无处回调。
+  //
+  // 而客户端已经登录了，登录态就在它的数据目录里。读它即可。
+  const [clientImporting, setClientImporting] = useState(false);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
@@ -226,6 +235,28 @@ export default function QoderPage() {
       setBusy(null);
     }
   }, [importPath, refresh]);
+
+  /**
+   * 从客户端一键导入。
+   *
+   * 这是**主路径**：网页授权在本机走不通（`redirect_uri` 是自定义协议
+   * `qoder-work-cn://`，只有真正的 Qoder 客户端才注册它），
+   * 而客户端已经登录了 —— 直接读它的登录态即可，用户什么都不用点。
+   */
+  const doClientImport = useCallback(async () => {
+    setClientImporting(true);
+    try {
+      const r = await api.qoderImportFromClient();
+      toast.success(`已从客户端导入：${r.nickname || r.uid.slice(0, 12)}`);
+      void refresh();
+    } catch (e) {
+      // 错误信息由后端给出**具体原因**（找不到客户端/未登录/解密失败），
+      // 不要在这里改写成笼统的"导入失败"—— 那会让用户无从下手。
+      toast.error(e instanceof Error ? e.message : String(e), { duration: 8000 });
+    } finally {
+      setClientImporting(false);
+    }
+  }, [refresh]);
 
   const toggleDisabled = useCallback(
     async (row: QoderAccountRow) => {
@@ -381,11 +412,22 @@ export default function QoderPage() {
                   <RefreshCw className={cn("mr-2 h-4 w-4", loading && "animate-spin")} />
                   刷新
                 </Button>
+                {/* 「从客户端导入」是**主按钮** —— 它读 Qoder 客户端已登录的
+                    登录态，用户不需要做任何事。
+
+                    而「浏览器登录」在本机**走不通**：授权链接的 redirect_uri
+                    是自定义协议 `qoder-work-cn://`，只有真正的 Qoder 客户端
+                    才注册它，浏览器授权完成后我们收不到回调。故它降级为
+                    次要入口，并在弹窗里说明原因。 */}
+                <Button size="sm" onClick={() => void doClientImport()} disabled={clientImporting}>
+                  <Download className={cn("mr-2 h-4 w-4", clientImporting && "animate-spin")} />
+                  从客户端导入
+                </Button>
                 <Button variant="outline" size="sm" onClick={() => setImportOpen(true)}>
                   <Upload className="mr-2 h-4 w-4" />
-                  导入凭证
+                  导入凭证文件
                 </Button>
-                <Button size="sm" onClick={() => setLoginOpen(true)}>
+                <Button variant="outline" size="sm" onClick={() => setLoginOpen(true)}>
                   <Download className="mr-2 h-4 w-4" />
                   登录新账号
                 </Button>
@@ -590,6 +632,31 @@ export default function QoderPage() {
             </DialogHeader>
 
             <div className="space-y-4 py-2">
+              {/* ⚠ 先说清楚这条路在**本机走不通**，并把用户引向能用的那条。
+                  这是实测结论，不是猜测：
+                    授权链接的 redirect_uri = `qoder-work-cn://`
+                    那是一个自定义协议，只有真正的 Qoder 客户端才注册它；
+                    我们不是它，浏览器授权完成后**收不到回调**。
+                  （我们的轮询端点是好的 —— GET 回 401「User not
+                   authenticated」正是"还没授权"的预期响应。） */}
+              <Alert>
+                <AlertTitle>推荐改用「从客户端导入」</AlertTitle>
+                <AlertDescription className="space-y-1">
+                  <p>
+                    这条浏览器授权在本机**无法完成**：它要求系统注册
+                    <code className="mx-1 rounded bg-muted px-1 font-mono text-[11px]">
+                      qoder-work-cn://
+                    </code>
+                    协议来回调结果，而那个协议只有 Qoder 客户端才会注册。
+                  </p>
+                  <p>
+                    若你已在 Qoder 客户端里登录过，直接用账号列表上的
+                    <span className="mx-1 font-medium">「从客户端导入」</span>
+                    即可 —— 一步到位，不需要任何浏览器操作。
+                  </p>
+                </AlertDescription>
+              </Alert>
+
               <div className="space-y-2">
                 <Label>区域</Label>
                 {/* 不给默认值：两区授权页与端点都不同，选错会登录到另一个区 */}
