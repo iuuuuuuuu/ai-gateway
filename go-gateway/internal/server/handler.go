@@ -179,6 +179,10 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	// /debug/* 同样走鉴权：它透出账号 UID 与域名，属敏感信息。
 	h.mux.HandleFunc("GET /debug/", h.withAuth(h.debugHandler))
+	// 复活端点与 /debug/* 同一族、同一鉴权：它改变选号结果（把自动禁用的号放回
+	// 流量池），比只读视图更敏感，故必须与它们一致地走 withAuth。
+	// 单独注册而非塞进 debugHandler：后者按 `area` 分段匹配，而本端点带路径参数。
+	h.mux.HandleFunc("POST /debug/accounts/{uid}/revive", h.withAuth(h.debugReviveAccount))
 	h.mux.HandleFunc("GET /usage", h.withAuth(h.usageReport))
 	// 养号任务手动触发：与 /status 同用 withAuth —— 它会向上游发真实请求，
 	// 未鉴权暴露等于给人一个刷账号活跃度的开关。
@@ -581,7 +585,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		sessKey = session.ExtractKey(body)
 	}
 
-	result, status, ferr := h.forwardChat(body, peek.Stream, sessKey)
+	// 传 r.Context()：客户端断开 / 请求超时后，换号退避会立即中止
+	//（见 backoff.go 的 sleepCtx），不替没人要的请求继续打上游。
+	result, status, ferr := h.forwardChatCtx(r.Context(), body, peek.Stream, sessKey)
 	if ferr != nil {
 		st.status = status
 		st.uid = result.UID
@@ -738,6 +744,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 //   - 模型不在白名单 → model_not_allowed（见 modelLockedError）
 //   - 上下文超长       → context_length_exceeded
 //   - 思考档位被上游拒 → reasoning_effort_rejected
+//
+// 另有一类**不是请求侧、但同样「重试无用」**的失败：
+//   - 出口 IP 疑似被 WAF 拦 → egress_ip_blocked（见 wafip.go）
+// 它与前三类的共同点是「换号/重试都解决不了」，区别是出路在网络出口而非请求。
 func openAIFailure(err error) (code, msg string) {
 	if f := failureOf(err); f != nil && f.Kind == FailureContextTooLong {
 		return "context_length_exceeded", f.Message
@@ -748,6 +758,11 @@ func openAIFailure(err error) (code, msg string) {
 		// 报 503 会把「你的参数上游不接受」说成「服务端暂时不可用」，
 		// 客户端会去重试而不是改参数。
 		return "reasoning_effort_rejected", f.Message
+	}
+	if f := failureOf(err); f != nil && f.Kind == FailureEgressIPBlocked {
+		// 独立错误码：no_healthy_account 会让客户端/用户以为「等账号恢复就好」
+		// 而不断重试 —— 而重试正是当前最不该做的事（会继续放大风控）。
+		return "egress_ip_blocked", f.Message
 	}
 	// 其余交给 errorCodeFor（当前只有 model_not_allowed 与 no_healthy_account），
 	// 即 chat/completions 一直以来的行为。
@@ -765,6 +780,12 @@ func anthropicFailure(err error) (code, msg string) {
 	}
 	if f := failureOf(err); f != nil && f.Kind == FailureEffortRejected {
 		return "invalid_request_error", f.Message
+	}
+	// 出口 IP 疑似被 WAF 拦：Anthropic 词汇表里最贴近的是 api_error
+	//（服务端/网络侧问题，非请求问题），不能报 invalid_request_error ——
+	// 那会让用户去改请求，而他要改的是网络出口。
+	if f := failureOf(err); f != nil && f.Kind == FailureEgressIPBlocked {
+		return "api_error", f.Message
 	}
 	if errorCodeFor(err) != "no_healthy_account" {
 		return "invalid_request_error", errText(err)
@@ -786,6 +807,12 @@ func responsesFailure(err error) (code, msg string) {
 	}
 	if f := failureOf(err); f != nil && f.Kind == FailureEffortRejected {
 		return "invalid_request_error", f.Message
+	}
+	// 出口 IP 疑似被 WAF 拦：归 upstream_error（服务端/上游侧问题），
+	// 与 responsesFailure 里 no_healthy_account 的默认归属一致 ——
+	// 它不是「你的请求写错了」，故不能走 invalid_request_error。
+	if f := failureOf(err); f != nil && f.Kind == FailureEgressIPBlocked {
+		return "upstream_error", f.Message
 	}
 	if errorCodeFor(err) != "no_healthy_account" {
 		return "invalid_request_error", errText(err)
@@ -865,6 +892,13 @@ func errorCodeFor(err error) string {
 	// 用户拿到它就知道该换档位，而不是去查账号池。
 	if f := failureOf(err); f != nil && f.Kind == FailureEffortRejected {
 		return "reasoning_effort_rejected"
+	}
+	// 出口 IP 疑似被 WAF 拦：单独成型，**不落进 no_healthy_account**。
+	// 后者对客户端意味着「账号池暂时不可用，稍后重试」，而这里的结论是
+	// 「重试（含换号）无用，问题在网络出口」—— 让客户端继续重试
+	// 恰好是当前最该避免的事（会继续放大风控）。
+	if f := failureOf(err); f != nil && f.Kind == FailureEgressIPBlocked {
+		return "egress_ip_blocked"
 	}
 	return "no_healthy_account"
 }

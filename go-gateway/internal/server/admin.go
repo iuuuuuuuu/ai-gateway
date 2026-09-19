@@ -123,6 +123,82 @@ func (h *Handler) debugHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// debugReviveAccount 复活一个被**系统自动禁用**的账号（POST /debug/accounts/{uid}/revive）。
+//
+// # 为什么这个端点必须存在（而不是「有更好」）
+//
+// disabled 会持久化进 state.json，而它此前**只有写入方没有任何清除入口**：
+// 账号一旦被自动判定为死号（session 死 / 额度冻结），在网关内就永远救不回来 ——
+// 重新导入凭证也无效（upsertLocked 对已存在账号只换凭证、不碰 disabled），
+// 用户唯一出路是手改 state.json。这与 /debug/* 的既有宗旨一致：
+// **不可诊断、不可恢复的状态本身就是缺陷**，而不是「运维自己想办法」。
+//
+// # 鉴权与形态刻意与既有 /debug/* 完全一致
+//
+// 同一个 mux + 同一个 withAuth（见 NewHandler 的路由注册）。本端点比只读视图更敏感
+// ——它会改变选号结果，未鉴权暴露等于给人一个「把死号放回流量池」的开关。
+//
+// # 语义边界（照 pool.ReviveDisabled）
+//
+//   - 只清**系统判定位** disabled/reason 与连续 12153 计数；
+//   - **不动**用户的手工轴 NoRoute（宿主写进凭证文件的「停止接流量」开关）；
+//   - **不动**熔断与账号级冷却（它们各有自己的到期路径，复活不假装账号健康）。
+//
+// 因此「复活成功但仍不接流量」有两种正常可能，响应里都如实透出：
+// 该账号仍被用户标了 no_route，或它正处于冷却/熔断期。不显式说明的话，
+// 用户会以为复活没生效。
+//
+// 幂等：账号本来就启用 → 200 + revived=false（不是错误，客户端可安全重试）。
+// uid 不在池中 → 404（打错 uid 时给出明确的「查无此号」，而不是静默成功）。
+func (h *Handler) debugReviveAccount(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if uid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "缺少账号 uid"})
+		return
+	}
+	before, ok := h.cfg.Pool.Status(uid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"error": "账号不在池中：" + uid,
+			"uid":   uid,
+			"hint": "账号池与凭证目录是对齐的（含运行期热加载）。若刚导入凭证，" +
+				"稍等一轮目录扫描（默认 5s）后重试；若凭证已被删除，它确实不会在池里。",
+		})
+		return
+	}
+	revived := h.cfg.Pool.ReviveDisabled(uid)
+
+	after, _ := h.cfg.Pool.Status(uid)
+	resp := map[string]any{
+		"uid":     uid,
+		"revived": revived,
+		"disabled": after.Disabled,
+		"no_route": after.NoRoute,
+		"reason":   after.Reason,
+		"cooling":  after.Cooling,
+		// 复活前的禁用原因：这是排查「它当初为什么被判死」的唯一线索，
+		// 复活后 reason 已被清空，故必须在这里留下。
+		"disabled_reason_before": before.Reason,
+	}
+	// 「复活了但依然不接流量」的两个真实原因，逐个如实说明（见函数注释）。
+	var notes []string
+	if !revived {
+		notes = append(notes, "该账号本来就未被系统禁用，未做任何改动（幂等）。")
+	}
+	if after.NoRoute {
+		notes = append(notes, "该账号仍被标为「不接流量」(no_route)：这是用户在界面上拨的开关，"+
+			"写在凭证文件里，复活只解系统禁用位、不动它。要恢复流量请在界面上关掉该开关。")
+	}
+	if after.Cooling {
+		notes = append(notes, "该账号当前处于冷却/熔断期，冷却到期或下一次成功请求后才会恢复接流量"+
+			"（复活不清冷却与熔断）。")
+	}
+	if len(notes) > 0 {
+		resp["notes"] = notes
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // debugCapability 返回能力真值的原始视图（含静态表与账号区域判定）。
 //
 // 刻意把静态表也列出来：本次修复中最难发现的一类问题是

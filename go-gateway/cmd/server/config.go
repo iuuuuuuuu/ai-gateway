@@ -248,6 +248,36 @@ type Config struct {
 		// 产出通过凭证 —— 这在性质上与"用户自己在官方客户端点一下"不同。
 		// 由用户在界面上明确开启后才参与请求。
 		ZcodeCaptchaEnabled bool `json:"zcode_captcha_enabled"`
+
+		// WatchAuthDir 是否监听凭证目录、运行期自动热加载（缺省 true）。
+		//
+		// # 为什么需要它
+		//
+		// 账号池此前只在**进程启动时**扫一次 auths 目录，于是「在界面上新增一个
+		// 账号」不会进池，必须手动重启网关才生效。这是用户实际报过的痛点
+		//（宿主侧把这条限制写进了注释，见 crates/ai-gateway-core 的 switch_mode）。
+		// 打开后目录内容一变就重新对齐账号池，无需重启。
+		//
+		// # 为什么缺省 true
+		//
+		// 这是**修缺陷**而不是加可选能力：不打开就等于保留原缺陷，用户仍然要
+		// 手动重启。它也不改变任何既有语义 —— 热加载复用 SyncToDir/upsertLocked，
+		// 对已存在账号只换凭证、保留 credits/冷却/熔断/统计（幂等，有单测钉住）。
+		// 老配置没有这个键 → 键缺席保留默认 true，行为只会变得更好。
+		//
+		// 需要关掉的场景：把凭证目录放在网络盘/同步盘上，轮询会带来无谓 IO；
+		// 或想完全锁死「运行期账号集合」以便复现问题。
+		WatchAuthDir bool `json:"watch_auth_dir"`
+
+		// WatchAuthDirInterval 目录轮询周期（duration 字符串，默认 "5s"）。
+		//
+		// 为什么是轮询而不是 fsnotify：见 internal/pool/watch.go 的包注释
+		//（零新依赖 + 容器/网络文件系统上不丢事件）。周期可配是因为它与
+		// 「目录所在介质的 IO 成本」强相关，而默认 5s 只对本地盘是最优。
+		//
+		// 空/非法一律回落默认（不报错）：与 credit_refresh_interval 同一口径，
+		// 避免一个调优键把网关拦停。
+		WatchAuthDirInterval string `json:"watch_auth_dir_interval"`
 	} `json:"pool"`
 
 	// Proxy 出站 HTTP 代理，形如 "http://127.0.0.1:7890"（缺省空 = 不用显式代理）。
@@ -321,6 +351,8 @@ type Config struct {
 	SessionGCInterval   time.Duration `json:"-"`
 	// CreditRefreshIntervalD 解析后的积分到期巡检周期。
 	CreditRefreshIntervalD time.Duration `json:"-"`
+	// WatchAuthDirIntervalD 解析后的凭证目录轮询周期（WatchAuthDir 开启时生效）。
+	WatchAuthDirIntervalD time.Duration `json:"-"`
 	// PromptText custom 模式下**解析后**的系统提示词文本（passthrough 下恒空）。
 	//
 	// 在 normalize 阶段一次性读盘并缓存，而不是每个请求现读文件：
@@ -432,6 +464,10 @@ func Default() *Config {
 	// 积分到期巡检「缺省 true」同签到开关：键缺席保留默认，显式 false 才关。
 	c.Pool.CreditRefreshEnabled = true
 	c.Pool.CreditRefreshInterval = "15m"
+	// 凭证目录热加载「缺省 true」：这是修缺陷（不打开 = 新增账号仍要手动重启），
+	// 且不改动任何既有语义（见 Pool.WatchAuthDir 的注释）。
+	c.Pool.WatchAuthDir = true
+	c.Pool.WatchAuthDirInterval = "5s"
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -542,6 +578,11 @@ func (c *Config) normalize() error {
 		c.CreditRefreshIntervalD <= 0 {
 		c.CreditRefreshIntervalD = 15 * time.Minute
 	}
+	// 凭证目录轮询周期：同上一口径（空/非法回落默认，不拦启动）。
+	if c.WatchAuthDirIntervalD, err = time.ParseDuration(c.Pool.WatchAuthDirInterval); err != nil ||
+		c.WatchAuthDirIntervalD <= 0 {
+		c.WatchAuthDirIntervalD = 5 * time.Second
+	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
 	}
@@ -607,10 +648,18 @@ func (c *Config) normalizePrompt() error {
 		c.Prompt.Mode = "passthrough"
 	case "custom":
 		c.Prompt.Mode = "custom"
+	case "append":
+		// 追加模式：客户端规则在前、网关提示词在后（见 config.go 的模式说明）
+		c.Prompt.Mode = "append"
 	default:
-		return fmt.Errorf("prompt.mode: %q 不是合法值（custom / passthrough）", c.Prompt.Mode)
+		return fmt.Errorf("prompt.mode: %q 不是合法值（passthrough / custom / append）", c.Prompt.Mode)
 	}
-	if c.Prompt.Mode != "custom" {
+	// ⚠ 只有 passthrough 不需要提示词文本。
+	//
+	// 这里原先是 `!= "custom"`，加 append 后必须改成「排除 passthrough」——
+	// 否则 append 模式下 PromptText 会被清空，配置看起来生效了、
+	// 实际什么都没追加（静默失效，最难查的一类）。
+	if c.Prompt.Mode == "passthrough" {
 		c.PromptText = ""
 		return nil
 	}

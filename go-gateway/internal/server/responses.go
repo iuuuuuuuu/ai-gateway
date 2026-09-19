@@ -493,7 +493,8 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	stat.model = req.Model
 	stat.mode = "responses"
 
-	result, status, ferr := h.forwardChat(chatBody, req.Stream, sessKey)
+	// 传 r.Context()：客户端断开后换号退避立即中止（见 backoff.go）。
+	result, status, ferr := h.forwardChatCtx(r.Context(), chatBody, req.Stream, sessKey)
 	if ferr != nil {
 		stat.status = status
 		stat.uid = result.UID

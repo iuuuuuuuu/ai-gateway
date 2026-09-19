@@ -103,7 +103,21 @@ func (r *chatResult) IsQoder() bool { return r != nil && r.Product == auth.Produ
 
 // forwardChat 执行「选号 → token 刷新 → 转发 → 失败换号」的完整轮转。
 //
+// ⚠ 本函数是 forwardChatCtx 的便捷包装（ctx = context.Background()），
+// **仅供既有调用点与单测**使用 —— 它们不关心取消。生产路径必须用
+// forwardChatCtx(ctx, ...) 传 r.Context()，否则换号退避无法被客户端断开取消
+//（见 backoff.go 的 sleepCtx）。
+func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatResult, int, error) {
+	return h.forwardChatCtx(context.Background(), body, stream, sessKey)
+}
+
+// forwardChatCtx 执行「选号 → token 刷新 → 转发 → 失败换号」的完整轮转。
+//
 // 参数：
+//   - ctx：本次请求的上下文。**只有换号退避**用它（客户端断开 / 请求超时即
+//     中止轮转，不替一个没人要的请求继续打上游）；上游调用本身仍沿用既有行为
+//     （WorkBuddy 走 upstream.Client 自身的超时，产品路径显式传
+//     context.Background()），本次改动不动那条路径。
 //   - body：已转换成 OpenAI Chat 形态的请求体（原始字节，发往上游前由
 //     upstream.Client 再做一次 PrepareBody：强制 stream、归一化 role/tool_choice）。
 //   - stream：调用方是否要求流式。上游恒为流式，非流式时本函数读完后 Aggregate。
@@ -116,7 +130,7 @@ func (r *chatResult) IsQoder() bool { return r != nil && r.Product == auth.Produ
 //
 // 失败语义与原有 chatCompletions 完全一致：传输层错误只换号不喂熔断，
 // 业务错误按 Classify 结果施加冷却/禁用/熔断。
-func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatResult, int, error) {
+func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, sessKey string) (*chatResult, int, error) {
 	tried := map[string]bool{}
 	var lastErr error
 	var lastUID string
@@ -182,10 +196,19 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 	// 的请求体都在这里汇合成 OpenAI Chat 形态，在此改写只需一处，
 	// 也不会漏掉任何一条出站路径。
 	//
-	// mode=passthrough（缺省）时**完全不调用** Rewrite：既有行为必须逐字不变
+	// mode=passthrough（缺省）时**完全不调用**任何改写函数：既有行为必须逐字不变
 	//（不重新序列化、不动 messages），因此这里是显式分支而非「传空串让它空转」。
-	if h.cfg.PromptMode == prompt.ModeCustom && h.cfg.PromptText != "" {
-		body = prompt.Rewrite(body, h.cfg.PromptText)
+	switch h.cfg.PromptMode {
+	case prompt.ModeCustom:
+		// 整体替换：会丢掉客户端的项目规范（见 config.go 的模式说明）
+		if h.cfg.PromptText != "" {
+			body = prompt.Rewrite(body, h.cfg.PromptText)
+		}
+	case prompt.ModeAppend:
+		// 追加：客户端规则在前、网关提示词在后，两者共存
+		if h.cfg.PromptText != "" {
+			body = prompt.Append(body, h.cfg.PromptText)
+		}
 	}
 
 	body = rewriteModel(body, model)
@@ -233,7 +256,48 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 	// 真不被上游接受的档（如 deepseek-v4.1-flash 的 off）由上游自己报 400，
 	// 错误信息原样返回给客户端 —— 那才是唯一权威的判据。
 
+	// rotateWait 本次请求「准备发起第 i 次尝试」前的退避等待，返回 false 表示
+	// 客户端已断开，调用方应中止轮转。
+	//
+	// # 为什么放在**上游调用之前**（而不是循环顶部）
+	//
+	// 退避的唯一目的是「不要把一串账号零延迟地打给上游」（见 backoff.go）。
+	// 因此它必须紧贴上游调用，并且只在**确实要打上游**时才等：
+	//
+	//   - 循环顶部还有选号 / 取租约 / 刷新 token 几步，其中「池里选不出号」
+	//     会直接 break 返回错误。若退避放在循环顶部，那条路径会先白等一次
+	//     再报「账号全部不可用」—— 用户平白多等半秒以上（MaxRotate 越大越久），
+	//     而他等到的还是一个失败。放在这里就完全不会白等。
+	//   - 它同时仍是所有**真正会打上游**的路径的必经点：选号成功 → 取到租约
+	//     → 刷新成功之后，无论前一次是因为什么失败的（传输层 / 4xx / 空流 /
+	//     刷新失败），两个连续的上游尝试之间都隔着一次抖动退避。
+	//
+	// 三条约束都在这里满足：
+	//
+	//  1. **第 0 次不退避**：i==0 时没有任何账号失败过，没什么可等的。
+	//     正常请求的第一发不该被拖慢 —— 这正是「退避写在失败之后、而不是
+	//     请求之前」的含义。
+	//  2. **最后一次失败后不白等**：i 走到 MaxRotate 就退出循环了，
+	//     退避只发生在「后面确实还有一次尝试」时（i 从 1 到 MaxRotate-1）。
+	//     最后一次失败后直接返回错误，不再空等。
+	//  3. **可取消**：客户端断开 / 请求超时后 sleepCtx 立即返回 false，
+	//     调用方中止轮转 —— 不替一个没人要的请求继续打上游。
+	rotateWait := func(i int) bool {
+		if i <= 0 {
+			return true // 第一次尝试：不退避
+		}
+		d := backoffAfter(i - 1)
+		if d <= 0 {
+			return true
+		}
+		// 只在真的要换号时才打日志：这条日志是排查「上游为何看到一串账号」
+		// 的第一手线索，但正常成功路径上不该出现它。
+		log.Printf("chat rotate: 第 %d 次换号前退避 %s", i, d)
+		return sleepCtx(ctx, d)
+	}
+
 	for i := 0; i < h.cfg.MaxRotate; i++ {
+
 		var acct *auth.Auth
 		if stickyUID != "" {
 			acct = h.cfg.Pool.PickByUIDForModelRegion(stickyUID, model, preferRegion)
@@ -322,6 +386,13 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 			}
 		}
 
+		// 换号退避：i>0 说明上一次尝试已经失败，接下来这一发打的是另一个账号。
+		// 放在这里（真正要打上游之前）而不是循环顶部，是为了不让「池里选不出号」
+		// 那条直接 break 的路径白等一次 —— 详见 rotateWait 的注释。
+		if !rotateWait(i) {
+			return &chatResult{UID: lastUID}, http.StatusServiceUnavailable, rotateCanceledErr(ctx)
+		}
+
 		var rc io.ReadCloser
 		var status int
 		var respBody []byte
@@ -353,6 +424,48 @@ func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatRe
 			lastBody = string(respBody)
 			lastTransportErr = nil
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+
+			// WAF 403：可能拦的是**出口 IP**，不是账号（见 wafip.go 的实测记录）。
+			//
+			// 与下面两类请求侧错误不同，这里的结论不是「请求有问题」而是
+			// 「我们共同的出口可能被拦了」—— 它由**多个不同账号**在窗口内
+			// 一起 403 推断出来，所以判定状态是进程级共享的。
+			//
+			// 为什么必须在**继续换号之前**判断：这正是本缺陷的放大机制 ——
+			// 所有号轮一遍全 403，而网关还在换号，把请求放大 MaxRotate 倍，
+			// 恰好是 WAF 最想惩罚的行为，封禁被越打越重。
+			//
+			// ⚠ 判定成立时**不动账号状态**（不 applyErrorPolicy）：
+			// 账号是好的，问题在网络出口。把好账号冷却掉只会让用户在
+			// 「IP 解封之后」发现号也被自己人停了。
+			if isWafForbidden(status, string(respBody)) {
+				blocked := wafIP.noteWaf(acct.UID)
+				uid := acct.UID
+				distinct := wafIP.distinct()
+				// 记录日志：这是「为什么请求突然全都失败」的第一手线索，
+				// 也是事后判断「到底是不是 IP 被拦」的唯一依据。
+				log.Printf("chat uid=%s: WAF 403（窗口内 %d 个不同账号 403，已判定 IP 被拦=%v）",
+					uid, distinct, blocked)
+				if blocked {
+					// 跨过阈值：立即终止轮转。再换号只会让 WAF 看到更多账号被打。
+					//
+					// ⚠ 这里只 releaseHeld，**不调 fail(uid)**：fail 会在该号正是
+					// 粘性绑定号时 Unbind 掉会话。但这个账号是好的（被拦的是出口 IP），
+					// 解绑只会让同一会话下次换到别的号 —— 而 IP 解封后它本可继续用。
+					releaseHeld()
+					return &chatResult{UID: uid}, http.StatusServiceUnavailable, &forwardFailure{
+						Kind:    FailureEgressIPBlocked,
+						Status:  http.StatusServiceUnavailable,
+						Message: egressIPBlockedMessage(distinct),
+					}
+				}
+				// 未跨阈值：本次只是一个账号 403，不足以断定 IP 问题。
+				// 沿用既有语义继续换号 —— 403 的 kind 是 ErrClient，
+				// applyErrorPolicy 的 default 分支本就只换号不罚账号。
+				h.applyErrorPolicy(uid, model, kind, string(respBody))
+				fail(uid)
+				continue
+			}
 
 			// 上下文超长是**请求侧**错误：换号无用（同一请求体发给任何账号都同样失败），
 			// 继续轮转只会把整个请求体对着每个账号重传一遍（实测 1.12M token × 3），
@@ -546,6 +659,14 @@ const (
 	//（实测 off 在 14/16 个模型被接受，却被两个 deepseek 模型拒绝），
 	// 所以文案必须带回上游说的话，而不是替用户猜一个「可用范围」。
 	FailureEffortRejected
+	// FailureEgressIPBlocked 多个不同账号在短时间内一起被 WAF 403，
+	// 判定为**出口 IP 被拦**（详见 wafip.go）。
+	//
+	// 为什么要单独成型：它与「账号池耗尽」的默认契约恰好相反 ——
+	// 默认契约说「稍后重试就好」（账号会恢复），而这里的结论是
+	// 「**换号无用**，问题在我们的网络出口」，用户要查的是代理 / VPN /
+	// 公网 IP。混进 no_healthy_account 会让他去查账号池，方向完全错。
+	FailureEgressIPBlocked
 )
 
 // imageRegionUnavailableMessage 生成「带图片请求缺少该区域账号」的说明。

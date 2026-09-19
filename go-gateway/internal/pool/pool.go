@@ -634,20 +634,42 @@ func (p *Pool) Add(a *auth.Auth) {
 
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
 // 剔除结果持久化回 state.json，避免已删账号在下次启动时被 load() 复活。
+//
+// ⚠ 本方法的剔除是**按 uid 全量比对**的：调用方交出的 auths 必须覆盖池里
+// 「归它管」的全部账号，否则没交出去的那些会被当成「凭证文件已删除」删掉。
+// 运行期的热加载不满足这个前提（它只扫 WorkBuddy 的 auths 目录，而池里还混着
+// Qoder / ZCode 账号），故走 syncToDirLocked 并显式声明保留范围，见 watch.go。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.syncToDirLocked(auths, nil)
+}
+
+// syncToDirLocked 是 SyncToDir 的实现；keep 非 nil 时决定「池中存在但本次扫描
+// 未见」的账号是否**保留**（返回 true = 保留，不剔除）。调用方必须已持有 p.mu。
+//
+// 为什么需要 keep 这个口子：本进程的池是**三个产品共用**的（见 cmd/server/main.go
+// 的多产品路由：Qoder / ZCode 凭证由 p.Add 直接塞进同一个池），而 SyncToDir 的
+// 剔除按 uid 全量比对。启动路径满足前提（多产品账号在 SyncToDir 之后才 Add），
+// 但**运行期的目录热加载不满足** —— 它只扫 WorkBuddy 的 auths 目录。
+// 若那里直接调 SyncToDir，一次热加载就会把全部 Qoder / ZCode 账号删出池子，
+// 症状是「往 WorkBuddy 加了个账号，另外两个平台的账号全不见了」，且要重启才回来。
+func (p *Pool) syncToDirLocked(auths []*auth.Auth, keep func(*entry) bool) {
 	seen := make(map[string]bool, len(auths))
 	for _, a := range auths {
 		seen[a.UID] = true
 		p.upsertLocked(a)
 	}
 	changed := false
-	for uid := range p.byUID {
-		if !seen[uid] {
-			delete(p.byUID, uid)
-			changed = true
+	for uid, e := range p.byUID {
+		if seen[uid] {
+			continue
 		}
+		if keep != nil && keep(e) {
+			continue
+		}
+		delete(p.byUID, uid)
+		changed = true
 	}
 	if changed {
 		p.saveLocked()
@@ -1844,7 +1866,12 @@ func nextDay4AM(now time.Time) time.Time {
 	return time.Date(now.Year(), now.Month(), now.Day()+1, 4, 0, 0, 0, now.Location())
 }
 
-// Disable 永久禁用（session 死亡），需人工重登后手工恢复或文件替换。
+// Disable 禁用（session 死亡），需人工重登后**显式复活**才回到选号池
+//（见 ReviveDisabled 与 /debug/accounts/{uid}/revive）。
+//
+// ⚠ 重新导入凭证**不会**解开禁用：upsertLocked 对已存在账号只换凭证、不动
+// disabled。这曾是一个真实缺陷（自动禁用的账号在网关内没有任何恢复路径），
+// 故复活必须是一个显式动作。
 func (p *Pool) Disable(uid, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1906,6 +1933,44 @@ func (p *Pool) ClearSessionDead(uid string) {
 	if e, ok := p.byUID[uid]; ok {
 		e.sessionDeadFails = 0
 	}
+}
+
+// ReviveDisabled 人工/端点复活入口：清除 disabled + reason + 连续 12153 计数，
+// 账号回到池子（若无其他冷却/熔断则立即可选）。
+//
+// # 为什么必须有这个出口
+//
+// disabled 会被写进 state.json（见 stateOverviewLocked），而它此前**只有写入方**
+// （Disable / NoteSessionDead 达阈值）没有任何清除入口 —— 唯一能清的是
+// ReenableIfCredits，但它显式要求 `!e.disabled`（见其实现）。于是账号一旦被
+// 自动判定为死号（session 死 / 额度冻结）就在网关内**永远救不回来**：
+// 重新导入凭证也没用，因为 upsertLocked 对已存在账号只换凭证、不碰 disabled。
+// 用户唯一的出路是手改 state.json，而那是普通用户做不到、也不该做的事。
+//
+// # 只解系统自动禁用，不动用户的手工轴
+//
+// 本方法只清 `disabled`（系统判定位）。**不碰** auth.Auth.NoRoute —— 那是用户在
+// 界面上拨的「停止接流量」开关，由宿主写进凭证文件，属用户意图而非池运行态。
+// 若这里顺手清了它，一次「复活」就会把用户明确摘除的号悄悄放回选号池。
+// 用户要恢复流量，应去界面上关掉那个开关（宿主会重写凭证文件，见 pool 的 upsert）。
+//
+// 同理不清熔断（fails/retryCount/breakerUntil）与账号级冷却（until/coolKind）：
+// 它们各有自己的到期/恢复路径，复活只负责「把死号重新放回候选」，不假装它健康。
+//
+// 返回 true 表示本次**确实改了状态**（幂等：账号本就启用、或 uid 不存在 → false）。
+// 落盘走 dirty 标志（与 Disable 一致：置位后由后台 flusher 或 Flush 写盘）。
+func (p *Pool) ReviveDisabled(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok || !e.disabled {
+		return false
+	}
+	e.disabled = false
+	e.reason = ""
+	e.sessionDeadFails = 0
+	p.dirty.Store(true)
+	return true
 }
 
 // SessionDeadFails 当前连续 12153 计数（供 scheduler 日志与测试断言）。

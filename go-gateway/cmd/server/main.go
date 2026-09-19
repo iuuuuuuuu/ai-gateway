@@ -176,6 +176,24 @@ func main() {
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
 
+	// 凭证目录热加载：运行中新增的凭证文件自动进池，免去「加完账号手动重启网关」。
+	//
+	// 位置**必须在 p.SyncToDir(auths) 之后**：监听建立的是**当前**目录指纹作基线，
+	// 若排在 SyncToDir 之前，两者之间发生的目录变化会被当成「基线之内」而漏掉。
+	//
+	// 也必须排在下面「多产品 p.Add」**之前**吗？—— 不必，且不应：热加载的剔除
+	// 已显式放过非 WorkBuddy 账号（见 pool.keepWorkBuddyOnly），
+	// 两个顺序都对。这里贴着 SyncToDir 放，是为了让「启动对齐 + 运行期对齐」
+	// 这对概念挨在一起读。
+	//
+	// 仅配置启用时启动（缺省 true；见 config.Pool.WatchAuthDir）。
+	if cfg.Pool.WatchAuthDir {
+		stopWatch := p.StartAuthDirWatchWithInterval(cfg.AuthDir, cfg.WatchAuthDirIntervalD)
+		defer stopWatch() // 优雅退出：停掉轮询 goroutine（stop 幂等）
+	} else {
+		log.Printf("凭证目录热加载已禁用（pool.watch_auth_dir=false）：新增账号后需手动重启网关")
+	}
+
 	// Token 用量统计：与 state.json 同目录的 usage.json（独立文件，避免与池状态互相迁移）。
 	usagePath := ""
 	if cfg.StateFile != "" {

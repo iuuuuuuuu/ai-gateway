@@ -43,6 +43,12 @@ const (
 	ModePassthrough = "passthrough"
 	// ModeCustom 用网关自有提示词替换客户端的 system/developer 消息。
 	ModeCustom = "custom"
+	// ModeAppend 在客户端**已有**的 system 消息之后**追加**网关提示词。
+	//
+	// 与 custom 的区别：custom 会丢掉客户端的项目规范（模型于是不遵守
+	// 那些约定，表现为"变笨了"）；append 让两者共存。
+	// 见 Append 的说明。
+	ModeAppend = "append"
 )
 
 // Default 返回内置默认提示词文本。
@@ -137,6 +143,78 @@ func Rewrite(body []byte, systemPrompt string) []byte {
 			continue // 旧 system/developer 整体丢弃
 		}
 		kept = append(kept, m)
+	}
+
+	encoded, err := json.Marshal(kept)
+	if err != nil {
+		return body
+	}
+	doc["messages"] = encoded
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// Append 在客户端**已有**的 system 消息**之后**追加网关提示词。
+//
+// # 为什么需要第三种模式（`custom` 的已知副作用）
+//
+// `Rewrite`（custom 模式）把客户端的 system **整体替换**掉。代价是：
+// 客户端的**项目规范**（代码风格、工具约定、"不要改 X 文件"这类约束）
+// 一并消失，模型开始不遵守那些约定 —— 用户看到的是"模型变笨了 /
+// 不听话了"，而原因在网关把它的规则删了。
+//
+// `append` 让两者共存：客户端规则在前、网关提示词在后。
+//
+// # 为什么插在**开头连续的** system 块之后，而不是末尾
+//
+// 放在末尾会破坏客户端的**前缀缓存**（Anthropic / OpenAI 都按前缀命中）：
+// 把网关提示词插在中间，后面所有内容的前缀都变了。
+// 插在开头那组 system 之后，客户端原有的稳定前缀**逐字保留**。
+//
+// ⚠ 只跳过**开头连续**的 system/developer：中间的 system 消息（有些
+// agentic 客户端会在对话中途注入）不参与，否则会把网关提示词插到
+// 对话中间，语义上等于"用户说到一半时改了系统规则"。
+func Append(body []byte, systemPrompt string) []byte {
+	if len(body) == 0 || strings.TrimSpace(systemPrompt) == "" {
+		return body
+	}
+
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return body
+	}
+	if doc == nil {
+		return body
+	}
+
+	sysMsg, err := json.Marshal(map[string]string{"role": "system", "content": systemPrompt})
+	if err != nil {
+		return body
+	}
+
+	rawMsgs, hasMsgs := doc["messages"]
+	var msgs []json.RawMessage
+	if hasMsgs {
+		_ = json.Unmarshal(rawMsgs, &msgs)
+	}
+
+	kept := make([]json.RawMessage, 0, len(msgs)+1)
+	inserted := false
+	for i, m := range msgs {
+		// 在**开头连续的** system 块之后插入（见上面的理由）
+		if !inserted && !isSystemLike(m) {
+			kept = append(kept, sysMsg)
+			inserted = true
+		}
+		kept = append(kept, m)
+		_ = i
+	}
+	// 全是 system 或没有 messages：追加到末尾
+	if !inserted {
+		kept = append(kept, sysMsg)
 	}
 
 	encoded, err := json.Marshal(kept)
