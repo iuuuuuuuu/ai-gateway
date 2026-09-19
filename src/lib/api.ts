@@ -1563,6 +1563,47 @@ export interface ZcodeAccount {
   accountId?: string;
   /** 该账号实际可用的模型 id（刷新账号时查得）。 */
   models?: string[];
+  /**
+   * **套餐整体**到期（Unix 秒）；0 = 无套餐或未知。
+   *
+   * ⚠ 与 `expireAt` 不是一回事（最容易搞混的一处）：
+   *
+   *     expireAt      各模型桶的**每日周期**结束（实测当天 23:59:59）→ 明天重置
+   *     planExpireAt  套餐**整体**到期（实测 9/23 23:59:59）→ 之后归零
+   *
+   * 只显示前者，你会以为"明天额度就没了"；只显示后者，你会以为
+   * "今天用不完就浪费了"。两个都要显示。
+   */
+  planExpireAt?: number;
+  /**
+   * 套餐类型：
+   *   · `trial`    体验套餐（新账号赠送，每日重置，**有到期日**）
+   *   · `paid`     付费套餐（Coding Plan）
+   *   · `api_key`  按量付费（没有预发额度）
+   *   · `unknown`  判不出来（拿不到上游配置）—— **不猜**
+   *
+   * 判据是拿上游静态配置（`startPlanPreview`）的赠送量与实际总量比对，
+   * 没有硬编码数字（那 300 万/500 万是运营参数，上游随时可改）。
+   */
+  planKind?: string;
+  /** 生效中的套餐（含名称、说明、各模型每日赠送量）。 */
+  plans?: Array<{
+    planId: string;
+    name: string;
+    description: string;
+    status: string;
+    startsAt: number;
+    /** **套餐整体**到期（Unix 秒）。 */
+    endsAt: number;
+    entitlements?: Array<{
+      showName: string;
+      /** 每日赠送量（token）。 */
+      grantUnits: number;
+      /** 重置周期，实测 `daily`。 */
+      period: string;
+      unitType: string;
+    }>;
+  }>;
 }
 
 /** 列表项：账号 + 凭证是否存在。 */

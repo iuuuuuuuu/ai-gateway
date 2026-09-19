@@ -78,10 +78,55 @@ function expiryText(expireAt: number): { text: string; urgent: boolean } {
   return { text: date, urgent: false };
 }
 
+/**
+ * 体验套餐的徽章文案。
+ *
+ * ⚠ 只在**判出来了**才显示。`planKind` 为 `unknown` 时返回空 ——
+ * 猜一个会给长期订阅的用户假的"体验套餐"标签。
+ *
+ * 判据（Go 侧 `plan.go`）：拿上游静态配置 `startPlanPreview` 的赠送量
+ * 与实际总量比对，**不硬编码数字**。
+ */
+function planBadgeOf(row: ZcodeAccountRow): string | undefined {
+  if (row.planKind === "trial") return "体验套餐";
+  // 付费套餐不额外标注：界面上"有额度"本身就说明是付费的，
+  // 多一个标签反而噪声。
+  return undefined;
+}
+
+/**
+ * **套餐整体**到期的说明。
+ *
+ * ⚠ 与 `expiryText`（各模型桶的**每日周期**结束）不是一回事：
+ *
+ *     expiryText            今天 23:59:59 → 明天重置，额度回来了
+ *     本函数                9/23 23:59:59 → 套餐结束，额度**归零**
+ *
+ * 只显示前者，用户会以为"明天额度就没了"；只显示后者，他会以为
+ * "今天用不完就浪费了"。所以两个都要显示，且文案要各自说清。
+ *
+ * 只在**体验套餐**上显示：付费套餐的 `endsAt` 是订阅周期，
+ * 显示出来会让人误以为"到期就没了"（实际会自动续费）。
+ */
+function planExpiryTextOf(row: ZcodeAccountRow, now: number): string | undefined {
+  if (row.planKind !== "trial") return undefined;
+  const at = row.planExpireAt ?? 0;
+  if (!at) return undefined;
+  const ms = at > 1e12 ? at : at * 1000;
+  const days = Math.ceil((ms - now) / 86400000);
+  const date = new Date(ms);
+  const stamp = `${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  if (ms <= now) return `体验套餐已于 ${stamp} 到期`;
+  return `体验额度 ${stamp} 到期（剩 ${days} 天），到期后未用完的会失效`;
+}
+
 export default function ZcodePage() {
   const [rows, setRows] = useState<ZcodeAccountRow[]>([]);
   const [orphans, setOrphans] = useState<string[]>([]);
   const [summary, setSummary] = useState<ZcodeSummary | null>(null);
+  // 用于体验套餐的剩余天数显示 —— 不每秒更新（那是"天"级信息，
+  // 每秒渲染纯属浪费）。每分钟一次足够。
+  const [now, setNow] = useState(() => Date.now());
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -149,6 +194,13 @@ export default function ZcodePage() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // 让"体验额度还剩 N 天"随时间推进。
+  // 每分钟一次足够（那是天级信息），不必每秒渲染。
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => window.clearInterval(t);
+  }, []);
 
   const stopPolling = useCallback(() => {
     if (pollTimer.current !== null) {
@@ -644,6 +696,14 @@ export default function ZcodePage() {
                         creditsText,
                         expiryText: exp.text,
                         expiryUrgent: exp.urgent,
+                        // 套餐类型与**套餐整体到期**。
+                        //
+                        // 所有者的原话：「这个体验套餐是 9月23号23:59 过期时间,
+                        // 这是我刚登录的新账号赠送的额度,要区分好」——
+                        // 这两个字段此前根本没从上游读出来（我们漏读了
+                        // billing/balance 的 plans）。
+                        planBadge: planBadgeOf(row),
+                        planExpiryText: planExpiryTextOf(row, now),
                         models: row.models,
                         hasCredential: row.hasCredential,
                         disabled: row.disabled,

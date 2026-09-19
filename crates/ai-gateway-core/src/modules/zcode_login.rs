@@ -388,6 +388,17 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
     // 该凭证**自己的**上游账号标识（Go 侧从 JWT 解出）。
     // 用于判断客户端登录态里的身份是否属于这个账号 —— 见下面的身份段。
     let mut cred_account_id = String::new();
+    // 套餐信息（含**套餐整体到期**）。
+    //
+    // ⚠ 与 `expire_at` 不是一回事：
+    //   expire_at          各模型桶的**每日周期**结束（实测当天 23:59:59）
+    //   plan_expires_at    套餐**整体**到期（实测 2026-09-23 23:59:59）
+    //
+    // 只显示前者，用户以为"明天额度就没了"；只显示后者，他以为
+    // "今天用不完就浪费了"。两个都要透出给界面。
+    let mut plan_expires_at: Option<i64> = None;
+    let mut plan_kind = String::new();
+    let mut plans: Vec<Value> = Vec::new();
 
     match run_login_cmd(&["quota", "--uid", uid, "--auth-dir", &auth_dir_s]) {
         Ok(r) => {
@@ -402,6 +413,17 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
                     }
                     if let Some(arr) = r.get("entries").and_then(Value::as_array) {
                         quota_entries = arr.clone();
+                    }
+                    // 套餐整体到期（0 = 无套餐/未知，此时**不**覆盖成 0）
+                    let pe = r.get("planExpiresAt").and_then(Value::as_i64).unwrap_or(0);
+                    if pe > 0 {
+                        plan_expires_at = Some(pe);
+                    }
+                    if let Some(k) = r.get("planKind").and_then(Value::as_str) {
+                        plan_kind = k.to_string();
+                    }
+                    if let Some(arr) = r.get("plans").and_then(Value::as_array) {
+                        plans = arr.clone();
                     }
                     // 凭证自己的账号标识（Go 侧权威来源）
                     if let Some(aid) = r.get("accountId").and_then(Value::as_str) {
@@ -563,9 +585,16 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
         "quota": {
             "remaining": credits,
             "total": credits_total,
+            // ⚠ 各模型桶的**每日周期**结束（实测当天 23:59:59）
             "expiresAt": expire_at,
             "entries": quota_entries,
             "error": quota_error,
+            // 套餐信息 —— 与上面的周期到期**不同**，见变量声明处的说明
+            "plans": plans,
+            // 套餐整体到期（实测体验套餐是 2026-09-23 23:59:59）
+            "planExpiresAt": plan_expires_at,
+            // "trial" / "paid" / "api_key" / "unknown"
+            "planKind": plan_kind,
         },
         "models": models,
         "modelsError": models_error,

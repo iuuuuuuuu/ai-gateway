@@ -87,6 +87,30 @@ pub struct ZcodeAccount {
     /// 空 = 没查过（与"查了但一个都没有"是两回事，但这里都表现为空 ——
     /// 界面上按"未刷新"提示，见 refresh_account 的返回值）。
     pub models: Vec<String>,
+    /// **套餐整体**到期（Unix 秒）；0 = 无套餐或未知。
+    ///
+    /// ⚠ 与 `expire_at` 不是一回事，**不能混用**：
+    ///
+    /// ```text
+    /// expire_at        各模型桶的每日周期结束（实测当天 23:59:59）
+    /// plan_expire_at   套餐整体到期（实测 2026-09-23 23:59:59）
+    /// ```
+    ///
+    /// 所有者的实测反馈：「这个体验套餐是 9月23号23:59 过期时间，
+    /// 这是我刚登录的新账号赠送的额度，要区分好」——
+    /// 那个时刻一直藏在 `billing/balance` 的 `plans[].ends_at` 里，
+    /// 而我们此前**完全没读 plans**，所以界面上只显示了每天的重置时间。
+    pub plan_expire_at: i64,
+    /// 套餐类型：`trial`（体验套餐）/ `paid`（付费）/ `api_key` / `unknown`。
+    ///
+    /// 判据由 Go 侧 `plan.go` 按上游静态配置（`startPlanPreview` 的赠送量）
+    /// 比对得出，**不硬编码数字**。取不到配置时为 `unknown`（不猜）。
+    ///
+    /// 为什么要区分：体验套餐**每日重置且到期后作废**，付费套餐随订阅续期。
+    /// 同样显示"还有 800 万"，两者的含义完全不同。
+    pub plan_kind: String,
+    /// 生效中的套餐明细（上游原样透传，供界面展示套餐名与说明）。
+    pub plans: Vec<Value>,
 }
 
 impl ZcodeAccount {
@@ -103,6 +127,9 @@ impl ZcodeAccount {
             "credits": self.credits,
             "creditsTotal": self.credits_total,
             "expireAt": self.expire_at,
+            "planExpireAt": self.plan_expire_at,
+            "planKind": self.plan_kind,
+            "plans": self.plans,
             "avatarUrl": self.avatar_url,
             "accountId": self.account_id,
             "models": self.models,
@@ -141,6 +168,14 @@ pub fn load_accounts() -> Result<Vec<ZcodeAccount>, String> {
                 credits: i64_of(v, "credits"),
                 credits_total: i64_of(v, "creditsTotal"),
                 expire_at: i64_of(v, "expireAt"),
+                // 套餐整体到期 —— 与 expire_at 分开存（语义不同）
+                plan_expire_at: i64_of(v, "planExpireAt"),
+                plan_kind: str_of(v, "planKind"),
+                plans: v
+                    .get("plans")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
                 avatar_url: str_of(v, "avatarUrl"),
                 account_id: str_of(v, "accountId"),
                 models: v
@@ -272,6 +307,24 @@ fn apply_patch(a: &mut ZcodeAccount, patch: &Value) {
             "expireAt" => {
                 if let Some(n) = v.as_i64() {
                     a.expire_at = n;
+                }
+            }
+            // 套餐整体到期 —— 与 expireAt 语义不同，**不要**互相覆盖。
+            "planExpireAt" => {
+                if let Some(n) = v.as_i64() {
+                    a.plan_expire_at = n;
+                }
+            }
+            // 套餐类型。空串也接受（那是"这次判不出来"的意思，
+            // 必须能覆盖上一次的判断结果）。
+            "planKind" => {
+                if let Some(s) = v.as_str() {
+                    a.plan_kind = s.trim().to_string();
+                }
+            }
+            "plans" => {
+                if let Some(arr) = v.as_array() {
+                    a.plans = arr.clone();
                 }
             }
             // 身份字段：由 `refresh_account` 从客户端登录态补上。

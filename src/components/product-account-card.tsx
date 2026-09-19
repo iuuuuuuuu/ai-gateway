@@ -64,6 +64,20 @@ export interface ProductAccountCardData {
   variantLabel?: string;
   /** 服务商/区域的 Badge 变体。 */
   variantKind?: "default" | "secondary" | "outline" | "destructive" | "success";
+  /**
+   * 套餐类型徽章（如「体验套餐」）。
+   *
+   * ZCode 用它区分"新账号赠送的体验额度"与"付费套餐" —— 两者的额度
+   * 数字可以长得一样，但**含义完全不同**（体验套餐每日重置且到期作废）。
+   */
+  planBadge?: string;
+  /**
+   * 套餐整体到期的说明（如「套餐 09-23 23:59 到期」）。
+   *
+   * ⚠ 与 `expiryText`（每日周期重置）**不是一回事**，故分开显示。
+   * 只显示后者，用户会以为"今天用不完就浪费了"。
+   */
+  planExpiryText?: string;
 }
 
 interface Props {
@@ -161,6 +175,25 @@ export function ProductAccountCard({
           <Badge variant={data.variantKind ?? "secondary"}>{data.variantLabel}</Badge>
         )}
 
+        {/* 套餐类型 —— 「体验套餐」必须显眼。
+            体验额度**每日重置且到期作废**，与付费套餐的"余额"含义不同；
+            不标出来的话，用户会把 800 万当成攒着的存款。
+
+            ⚠ 这里**不用 Tooltip 包裹**：TooltipTrigger 的 asChild 会把自己的
+            `data-slot="tooltip-trigger"` 覆盖到徽章上，令徽章失去
+            `data-slot="badge"` —— 测试与样式选择器都会因此找不到它
+           （实测踩到过）。详细说明见下面 planExpiryText 那一行。 */}
+        {data.planBadge && (
+          <Badge
+            variant="outline"
+            className="gap-1 border-amber-500/40 text-amber-700 dark:text-amber-400"
+            title="体验套餐：新账号赠送的额度，每日重置，且到期后未用完的部分会失效（不是被用完了）"
+          >
+            <Clock3 className="size-3" />
+            {data.planBadge}
+          </Badge>
+        )}
+
         {!data.hasCredential ? (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -224,6 +257,12 @@ export function ProductAccountCard({
             <span title="点「刷新」可查询该账号实际可用的模型">支持模型：未查询</span>
           )}
         </div>
+
+        {/* 套餐整体到期 —— 与上面那行的"每日周期重置"是**两件事**。
+            分两行写，并各自标清含义，避免用户把"明天重置"误读成"明天没了"。 */}
+        {data.planExpiryText && (
+          <div className="mt-1 text-xs text-amber-700 dark:text-amber-400">{data.planExpiryText}</div>
+        )}
       </section>
 
       {/* ── 底部操作栏（同 WorkBuddy 卡片：右对齐） ── */}
