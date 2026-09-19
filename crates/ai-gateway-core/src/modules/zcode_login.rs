@@ -486,8 +486,19 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
     // ⚠ 只在**成功取到**时写。取不到（models_error 有值）时不写 ——
     // 写成空数组会把上一次的好数据抹掉，让界面从"有 11 个模型"
     // 变成"没有模型"，而原因只是一次网络抖动。
+    //
+    // ⚠ **只存 id**（不是整个模型对象）。账号库的 `models` 是
+    // `Vec<String>`，而 Go 侧返回的是对象数组 —— 直接塞对象会被
+    // apply_patch 的元素类型检查静默滤空（实测踩到：刷新返回 11 个，
+    // 落库后却变成 0 个）。完整信息（上下文窗口等）由界面按需再查。
     if models_error.is_none() {
-        patch.insert("models".into(), json!(models));
+        let ids: Vec<String> = models
+            .iter()
+            .filter_map(|m| m.get("id").and_then(Value::as_str))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        patch.insert("models".into(), json!(ids));
     }
     let acc = zcode_account::upsert_account(uid, &Value::Object(patch))?;
 
