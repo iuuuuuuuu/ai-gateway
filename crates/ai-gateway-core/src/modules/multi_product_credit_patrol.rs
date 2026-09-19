@@ -119,6 +119,11 @@ pub async fn run_once() -> (usize, usize) {
 ///
 /// 取不到有效读数时返回 `false`，**不报错**。
 pub fn snapshot_from_refresh_result(product: &str, uid: &str, result: &Value) -> bool {
+    let (remaining, total) = match remaining_and_total_of_refresh(result) {
+        Some(v) => v,
+        None => return false,
+    };
+
     let name = match product {
         "qoder" => qoder_account::load_accounts()
             .unwrap_or_default()
@@ -134,17 +139,6 @@ pub fn snapshot_from_refresh_result(product: &str, uid: &str, result: &Value) ->
             .unwrap_or_default(),
     };
 
-    // refresh 的返回形状：额度在 `credits` / `creditsTotal` 下
-    //（与 Go 侧 quota 命令的 `remaining` / `total` 不同名 —— 这里要做映射）
-    let remaining = match result.get("credits").and_then(Value::as_f64) {
-        Some(v) => v,
-        None => return false,
-    };
-    let total = match result.get("creditsTotal").and_then(Value::as_f64) {
-        Some(v) => v,
-        None => return false,
-    };
-
     product_credit_snapshot::product_credit_snapshot(
         product,
         uid,
@@ -153,4 +147,22 @@ pub fn snapshot_from_refresh_result(product: &str, uid: &str, result: &Value) ->
         remaining,
         std::collections::BTreeMap::new(),
     )
+}
+
+/// remaining_and_total_of_refresh 从 refresh 的返回 JSON 里取 `(remaining, total)`。
+///
+/// # ⚠ 字段名与 `quota` 命令**不同**
+///
+///	quota 命令输出：  remaining  / total
+///	refresh 返回值：  credits    / creditsTotal
+///
+/// 搞错会退化成 0 —— 而 0 会被记成一条幻影快照（见 `passes_sanity_check`）。
+/// 故这里**取不到就返回 `None`**，绝不"默认 0"。
+///
+/// 抽成独立函数是为了可测：测试直接断言解析结果，
+/// 不必真的写一次盘（那会依赖共享的 `AI_GATEWAY_HOME`）。
+pub fn remaining_and_total_of_refresh(result: &Value) -> Option<(f64, f64)> {
+    let remaining = result.get("credits").and_then(Value::as_f64)?;
+    let total = result.get("creditsTotal").and_then(Value::as_f64)?;
+    Some((remaining, total))
 }

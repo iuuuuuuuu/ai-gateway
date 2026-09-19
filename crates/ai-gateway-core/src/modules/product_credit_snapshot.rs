@@ -35,6 +35,73 @@ use std::collections::BTreeMap;
 
 use crate::modules::credit_usage;
 
+/// passes_sanity_check 判断一次读数是否**值得记成快照**。
+///
+/// # 为什么单独抽成纯函数
+///
+/// 它原本内联在 `product_credit_snapshot` 里，于是测试只能通过
+/// "真的写一次盘"来验证它 —— 而写盘依赖**跨测试共享**的
+/// `AI_GATEWAY_HOME`（`config.rs` 的 `Isolated` 会 set_var 并在 drop 时
+/// `remove_dir_all`）。结果是：测试单独跑全过、全量跑随机挂。
+///
+/// 抽成纯函数后，测试直接断言判据本身 —— 稳定，且覆盖的是**真正的逻辑**。
+///
+/// # 三条判据
+///
+/// `total <= 0`：额度接口没拿到数据（常见于超时后的默认值）。
+///   记进去的话，下一次正常读数（比如 3 亿）会被算成
+///   「+3 亿发放」，再下一次回落又算成「-3 亿消费」——
+///   两个都是幻影，且会让统计页的曲线出现一根戳天的尖刺。
+///
+/// `remaining < 0`：上游不该返回负数；出现说明数据有问题。
+///
+/// `remaining > total`：包列表不完整时的典型表现（只读到部分包）。
+///   不算错，但差值会失真，故跳过本次。
+///
+/// ⚠ `remaining == 0` **是合法的**（真的用光了，不是坏数据）——
+/// 把它判成坏读数会让"最后一次消费"记不上。
+fn passes_sanity_check(total: f64, remaining: f64) -> bool {
+    if !total.is_finite() || total <= 0.0 {
+        return false;
+    }
+    if !remaining.is_finite() || remaining < 0.0 {
+        return false;
+    }
+    remaining <= total
+}
+
+/// remaining_and_total_of 从 quota JSON 里取 `(remaining, total)`。
+///
+/// 取不到（缺字段或类型不对）时返回 `None` —— 调用方据此跳过，
+/// **不要**退化成 0（那会写出一条幻影快照）。
+fn remaining_and_total_of(quota: &Value) -> Option<(f64, f64)> {
+    let remaining = quota.get("remaining").and_then(Value::as_f64)?;
+    let total = quota.get("total").and_then(Value::as_f64)?;
+    Some((remaining, total))
+}
+
+/// packages_of 从 quota JSON 里解析分包明细。
+///
+/// 键的回退顺序：`showName` → `planId` → `#index`。
+/// 两个产品目前都没有分包概念，故通常是空 map —— 但接口形状留好了。
+fn packages_of(quota: &Value) -> BTreeMap<String, f64> {
+    let mut packages: BTreeMap<String, f64> = BTreeMap::new();
+    if let Some(entries) = quota.get("entries").and_then(Value::as_array) {
+        for (index, e) in entries.iter().enumerate() {
+            let key = e
+                .get("showName")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| e.get("planId").and_then(Value::as_str).filter(|s| !s.trim().is_empty()))
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("#{index}"));
+            let rem = e.get("remaining").and_then(Value::as_f64).unwrap_or(0.0);
+            packages.insert(key, rem);
+        }
+    }
+    packages
+}
+
 /// product_credit_snapshot 记一次某产品的余额快照。
 ///
 /// # 参数
@@ -75,23 +142,7 @@ pub fn product_credit_snapshot(
     }
 
     // ---- 健全性检查（宁可少记一次，也不要记一条假的"巨额消费"）----
-    //
-    // `total <= 0`：额度接口没拿到数据（常见于超时后的默认值）。
-    //   记进去的话，下一次正常读数（比如 3 亿）会被算成
-    //   「+3 亿发放」，再下一次回落又算成「-3 亿消费」——
-    //   两个都是幻影，且会让统计页的曲线出现一根戳天的尖刺。
-    //
-    // `remaining < 0`：上游不该返回负数；出现说明数据有问题。
-    //
-    // `remaining > total`：包列表不完整时的典型表现（只读到部分包）。
-    //   不算错，但差值会失真，故跳过本次。
-    if !total.is_finite() || total <= 0.0 {
-        return false;
-    }
-    if !remaining.is_finite() || remaining < 0.0 {
-        return false;
-    }
-    if remaining > total {
+    if !passes_sanity_check(total, remaining) {
         return false;
     }
 
@@ -133,33 +184,18 @@ pub fn snapshot_from_quota_result(
     account_name: &str,
     quota: &Value,
 ) -> bool {
-    let remaining = match quota.get("remaining").and_then(Value::as_f64) {
+    let (remaining, total) = match remaining_and_total_of(quota) {
         Some(v) => v,
         None => return false,
     };
-    let total = match quota.get("total").and_then(Value::as_f64) {
-        Some(v) => v,
-        None => return false,
-    };
-
-    // 分包明细（两产品目前都没有，但接口形状留好了 ——
-    // 将来若上游加了分包，这里不用改）
-    let mut packages: BTreeMap<String, f64> = BTreeMap::new();
-    if let Some(entries) = quota.get("entries").and_then(Value::as_array) {
-        for (index, e) in entries.iter().enumerate() {
-            let key = e
-                .get("showName")
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| e.get("planId").and_then(Value::as_str).filter(|s| !s.trim().is_empty()))
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("#{index}"));
-            let rem = e.get("remaining").and_then(Value::as_f64).unwrap_or(0.0);
-            packages.insert(key, rem);
-        }
-    }
-
-    product_credit_snapshot(product, account_id, account_name, total, remaining, packages)
+    product_credit_snapshot(
+        product,
+        account_id,
+        account_name,
+        total,
+        remaining,
+        packages_of(quota),
+    )
 }
 
 #[cfg(test)]
@@ -227,21 +263,36 @@ mod tests {
         }
     }
 
-    /// 正常读数应当被记录。
+    /// 正常读数应当**通过健全性检查**。
     ///
     /// ⚠ 用唯一 id：固定 id 会因去重抑制而与别的测试互相干扰（见 `unique_uid`）。
+    ///
+    /// ⚠⚠ 更重要的：这里**不**断言 `snapshot_from_quota_result` 返回 true。
+    /// 那条路会真的写共享快照文件，而 `config.rs` 的 `Isolated` 会
+    /// `set_var("AI_GATEWAY_HOME")` 并在 drop 时 `remove_dir_all` ——
+    /// 并行跑时写入可能落在被删掉的目录里，于是返回 false。
+    ///
+    /// **那与"读数是否合法"无关**。故这里测**纯逻辑**
+    ///（`passes_sanity_check`），把"能不能写盘"交给集成层。
+    /// 这样测试既稳定，又真正覆盖了本模块新增的那道闸。
     #[test]
-    fn good_reading_is_recorded() {
-        let got = snapshot_from_quota_result(
-            "zcode",
-            &unique_uid("good"),
-            "正常账号",
-            &json!({ "remaining": 299999978, "total": 300000000 }),
+    fn good_reading_passes_sanity_check() {
+        let quota = json!({ "remaining": 299999978, "total": 300000000 });
+        assert!(
+            passes_sanity_check(
+                quota["total"].as_f64().unwrap(),
+                quota["remaining"].as_f64().unwrap()
+            ),
+            "正常读数必须通过健全性检查"
         );
-        assert!(got, "正常读数应被记录");
+        // 顺带确认解析路径本身没问题（不写盘，故用纯函数断言）
+        assert_eq!(remaining_and_total_of(&quota), Some((299999978.0, 300000000.0)));
     }
 
     /// 空账号 id 不记（与 record_snapshot 同口径）。
+    ///
+    /// 这条**可以**断言返回值 —— 空 id 在**写盘之前**就被拦下，
+    /// 不依赖文件系统状态。
     #[test]
     fn empty_account_id_is_rejected() {
         let got = snapshot_from_quota_result(
@@ -257,100 +308,78 @@ mod tests {
     ///
     /// ⚠ `remaining == 0` 特别重要：那是**真的用光了**，不是坏数据。
     /// 若把它当坏读数跳过，用户会看到"最后一次消费没记上"。
-    ///
-    /// 判据用"**不是被健全性检查拒掉**"而不是"一定记上"：
-    /// 后者会把测试绑在共享快照文件的状态上（见 `unique_uid` 的说明）。
-    /// 这里通过一个**明显非法的读数**做对照 —— 若边界读数与非法读数
-    /// 得到同样的结果，说明边界读数被误判了。
     #[test]
     fn boundary_readings_pass_sanity_check() {
-        // 非法读数：total 为 0 → 必然被健全性检查拒掉
-        let illegal = snapshot_from_quota_result(
-            "qoder",
-            &unique_uid("illegal"),
-            "n",
-            &json!({ "remaining": 0, "total": 0 }),
-        );
-        assert!(!illegal, "total 为 0 必须被拒（对照基准）");
-
-        // 边界读数：remaining == 0 但 total > 0 → **是真实状态**
-        // 它可能因去重/写盘失败返回 false，但绝不该因"健全性检查"被拒。
-        // 故这里只断言它**不等于**"非法读数被拒"的判据方式 ——
-        // 用一个全新的唯一 id 与全新读数，最大化"能记上"的概率。
-        let zero = snapshot_from_quota_result(
-            "zcode",
-            &unique_uid("zero"),
-            "n",
-            &json!({ "remaining": 0, "total": 200 }),
-        );
-        let full = snapshot_from_quota_result(
-            "qoder",
-            &unique_uid("full"),
-            "n",
-            &json!({ "remaining": 200, "total": 200 }),
+        assert!(
+            passes_sanity_check(200.0, 200.0),
+            "满额（remaining == total）是合法读数"
         );
         assert!(
-            zero || full,
-            "满额或用光这两种边界读数**至少有一种**应能通过健全性检查被记录 —— \
-             两种都被拒说明边界判错了（remaining == 0 是真的用光了，不是坏数据）"
+            passes_sanity_check(200.0, 0.0),
+            "用光（remaining == 0）是**真实状态**，不是坏数据 —— 跳过会让最后一次消费记不上"
         );
+        // 对照：total 为 0 必须被拒（这是坏读数，见 bad_readings 用例）
+        assert!(!passes_sanity_check(0.0, 0.0), "total 为 0 必须被拒（对照基准）");
     }
 
-    /// entries 为空时不影响记录（两产品目前都没有分包）。
+    /// entries 为空时不影响读数解析（两产品目前都没有分包）。
     #[test]
-    fn empty_entries_do_not_block_snapshot() {
-        let got = snapshot_from_quota_result(
-            "qoder",
-            &unique_uid("noentries"),
-            "n",
-            &json!({ "remaining": 10, "total": 20, "entries": [] }),
+    fn empty_entries_do_not_block_parsing() {
+        let quota = json!({ "remaining": 10, "total": 20, "entries": [] });
+        assert_eq!(
+            remaining_and_total_of(&quota),
+            Some((10.0, 20.0)),
+            "没有分包明细不该影响读数解析"
         );
-        assert!(got, "没有分包明细不该阻止快照（两产品本来就没有分包概念）");
     }
 
     /// 有 entries 时能正确解析出分包（为将来上游加分包留的形状）。
     #[test]
     fn entries_are_parsed_when_present() {
-        let got = snapshot_from_quota_result(
-            "qoder",
-            &unique_uid("entries"),
-            "n",
-            &json!({
-                "remaining": 30,
-                "total": 100,
-                "entries": [
-                    { "showName": "每日包", "remaining": 20 },
-                    { "planId": "plan-x", "remaining": 10 },
-                    { "remaining": 0 },  // 无名无 planId → 回退到 #index
-                ]
-            }),
-        );
-        assert!(got, "带 entries 的正常读数应被记录");
+        let quota = json!({
+            "remaining": 30,
+            "total": 100,
+            "entries": [
+                { "showName": "每日包", "remaining": 20 },
+                { "planId": "plan-x", "remaining": 10 },
+                { "remaining": 0 },  // 无名无 planId → 回退到 #index
+            ]
+        });
+        let pkgs = packages_of(&quota);
+        assert_eq!(pkgs.len(), 3, "三个 entry 应解析成三个包");
+        assert_eq!(pkgs.get("每日包"), Some(&20.0), "有 showName 时用它作键");
+        assert_eq!(pkgs.get("plan-x"), Some(&10.0), "无 showName 时回退到 planId");
+        assert_eq!(pkgs.get("#2"), Some(&0.0), "都没有时回退到 #index");
     }
 
     /// 从 refresh 结果记快照：字段名与 quota **不同**（credits / creditsTotal）。
     ///
     /// 这条防的是"字段名搞错 → 记成 0 → 幻影消费"。
     ///
-    /// ⚠ 该函数在 `multi_product_credit_patrol`（它是给调用方用的第二条路），
-    /// 故这里要跨模块引用。
+    /// ⚠ 该函数在 `multi_product_credit_patrol`（它是给调用方用的第二条路）。
+    ///
+    /// ⚠⚠ **不**断言"一定记上了" —— 那会依赖共享的 `AI_GATEWAY_HOME`
+    /// 与写盘成功（见 `passes_sanity_check` 的说明）。
+    /// 这里断言的是**解析结果**：字段名对上时能取到读数，
+    /// 对不上时必须返回 `None`（而不是退化成 0）。
     #[test]
     fn refresh_result_uses_different_field_names() {
-        use crate::modules::multi_product_credit_patrol::snapshot_from_refresh_result;
+        use crate::modules::multi_product_credit_patrol::remaining_and_total_of_refresh;
 
-        let got = snapshot_from_refresh_result(
-            "qoder",
-            "u-refresh",
-            &json!({ "credits": 500, "creditsTotal": 1000 }),
+        // 字段名正确 → 能取到读数
+        assert_eq!(
+            remaining_and_total_of_refresh(&json!({ "credits": 500, "creditsTotal": 1000 })),
+            Some((500.0, 1000.0)),
+            "refresh 结果的 credits/creditsTotal 应被正确映射"
         );
-        assert!(got, "refresh 结果的 credits/creditsTotal 应被正确映射");
 
-        let wrong = snapshot_from_refresh_result(
-            "qoder",
-            "u-refresh2",
-            &json!({ "remaining": 500, "total": 1000 }),
+        // 字段名不对（传了 quota 形状）→ **必须返回 None**，
+        // 不能退化成 (0,0) —— 那会写出一条 total=0 的幻影快照
+        assert_eq!(
+            remaining_and_total_of_refresh(&json!({ "remaining": 500, "total": 1000 })),
+            None,
+            "字段名不匹配时必须返回 None（退化成 0 会产生幻影消费）"
         );
-        assert!(!wrong, "字段名不匹配时不该记（记成 0 会产生幻影消费）");
     }
 
     /// 巡检周期**必须显著小于**差值法的间隔上限。
