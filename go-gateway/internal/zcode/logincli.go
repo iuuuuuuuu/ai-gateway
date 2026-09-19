@@ -115,7 +115,7 @@ func RunLoginCLI(args []string, defaultAuthDir string) int {
 		// ⚠ 帮助文案必须与**实际派发的子命令**一致（同 qoder 侧的教训）：
 		// 旧文案只列 start|poll|import，漏了 quota / models，
 		// 排查时会误判「子命令没注册」。
-		fmt.Fprintln(os.Stderr, "用法: zcode-login <start|poll|import|quota|models> [选项]")
+		fmt.Fprintln(os.Stderr, "用法: zcode-login <start|poll|import|quota|models|preview-plan|claim-plan> [选项]")
 		return 2
 	}
 	switch args[0] {
@@ -146,8 +146,20 @@ func RunLoginCLI(args []string, defaultAuthDir string) int {
 		// ⚠ 是**按账号**查（走该账号的凭证），不是查全局清单：
 		// 不同账号/服务商的可用模型不同，全局列表会误导。
 		return runModels(args[1:], defaultAuthDir)
+	case "preview-plan":
+		// 查**可领取**的套餐（限时活动）。
+		//
+		// 与 `quota` 是两个端点，别混：
+		//	quota        → billing/balance  **已生效**的套餐与余额
+		//	preview-plan → billing/preview  **可领取**的套餐
+		return runPreviewPlan(args[1:], defaultAuthDir)
+	case "claim-plan":
+		// 领取套餐（**写操作**）。
+		//
+		// ⚠ 只由用户显式触发（界面点击或本子命令），**不做定时自动抢**。
+		return runClaimPlan(args[1:], defaultAuthDir)
 	default:
-		fmt.Fprintf(os.Stderr, "未知子命令 %q（应为 start / poll / import）\n", args[0])
+		fmt.Fprintf(os.Stderr, "未知子命令 %q（应为 start / poll / import / quota / models / preview-plan / claim-plan）\n", args[0])
 		return 2
 	}
 }
@@ -272,6 +284,140 @@ func runPoll(args []string, defaultAuthDir string) int {
 // ⚠ `no_jwt` 是**正常状态**而不是错误：ZCode 的额度查询只认 JWT，
 // 而只导入对话凭证的账号本来就没有。宿主据此显示「额度未知」
 // 而不是 0（0 会被用户误读成"额度耗尽"）。
+// loadCredForPlan 按 uid 载入凭证，并**强制要求 JWT**。
+//
+// preview-plan / claim-plan 两个端点都只认 JWT（`Authorization: Bearer <jwt>`），
+// 不认 `{apiKey}.{secret}` 对话凭证。缺 JWT 时**如实说明**，
+// 而不是发一个必然 401 的请求上去（那会让用户以为"账号没资格"，
+// 实际只是"导入时没带 JWT"）。
+func loadCredForPlan(authDir, uid string) (*Cred, int) {
+	if strings.TrimSpace(uid) == "" {
+		fmt.Fprintln(os.Stderr, "缺少 --uid 参数")
+		return nil, 2
+	}
+	c, err := loadCredByUID(authDir, uid)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		return nil, 1
+	}
+	if strings.TrimSpace(c.JWT) == "" {
+		writeJSON(map[string]any{
+			"status":  "no_jwt",
+			"uid":     c.UID,
+			"message": "该账号只导入了对话凭证，没有套餐查询/领取用的 JWT",
+		})
+		return nil, 0
+	}
+	return c, 0
+}
+
+// runPreviewPlan 查**可领取**的套餐（billing/preview）。
+//
+// 与 `quota` 的区别（两个端点，别混）：
+//
+//	quota        → billing/balance  **已生效**的套餐与余额
+//	preview-plan → billing/preview  **可领取**的套餐（限时活动）
+//
+// ⚠ 该端点**必须带 UUID 形态的 `X-Device-Mid`**，缺它上游回
+// `400 {"code":3001,"msg":"parameter error"}` —— 实测确认
+//（见 `uitest/diag-zcode-claim.cjs`）。头由 `ControlPlaneHeaders` 提供。
+func runPreviewPlan(args []string, defaultAuthDir string) int {
+	fs := flag.NewFlagSet("zcode-login preview-plan", flag.ContinueOnError)
+	uid := fs.String("uid", "", "账号 uid")
+	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	c, code := loadCredForPlan(*authDir, *uid)
+	if c == nil {
+		return code
+	}
+
+	pv, err := New().FetchPlanPreview(context.Background(), c)
+	if err != nil {
+		// 与 quota 同一口径：错误回传给宿主显示，但**退出码 0** ——
+		// 否则宿主会把"上游返回业务错误"当成"网关命令执行失败"，
+		// 用户看到的是笼统的"命令失败"而不是上游那句具体原因。
+		writeJSON(map[string]any{"status": "error", "uid": c.UID, "message": err.Error()})
+		return 0
+	}
+
+	offers := make([]map[string]any, 0, len(pv.Offers))
+	for _, o := range pv.Offers {
+		offers = append(offers, map[string]any{
+			"planId": o.PlanID,
+			"name":   o.Name,
+			"status": o.Status,
+			"endsAt": o.EndsAt,
+		})
+	}
+	writeJSON(map[string]any{
+		"status":     "ok",
+		"uid":        c.UID,
+		"serverTime": pv.ServerTime,
+		"offers":     offers,
+		// 显式给出"有没有可领的"，让宿主不必自己判空数组
+		"claimable": len(offers),
+	})
+	return 0
+}
+
+// runClaimPlan 领取一个套餐（billing/claim）。
+//
+// # ⚠ 这是**写操作**
+//
+// 只由用户显式触发（界面点击或本子命令），**不做定时自动抢** ——
+// 定时抢会让账号表现出非人类的活动模式（与 Qoder campaign 同一取舍）。
+//
+// # 验证码
+//
+// 该端点可能要求 `X-Aliyun-Captcha-Verify-Param`。本命令**不主动求解**：
+// 求解器是可选组件（需用户显式启用），且求解会被限流。缺验证码时上游回
+// `3007`，我们如实透传 —— 由调用方决定要不要先求解一个。
+func runClaimPlan(args []string, defaultAuthDir string) int {
+	fs := flag.NewFlagSet("zcode-login claim-plan", flag.ContinueOnError)
+	uid := fs.String("uid", "", "账号 uid")
+	planID := fs.String("plan-id", "", "要领取的套餐 ID（从 preview-plan 拿）")
+	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if strings.TrimSpace(*planID) == "" {
+		// 本地拦下：不拦的话会发一个 `{"plan_id":""}` 上去，
+		// 上游回 3001「parameter error」—— 那个文案完全看不出是
+		// "我们没传 ID"，排查方向会被引向"是不是缺 X-Device-Mid"。
+		fmt.Fprintln(os.Stderr, "缺少 --plan-id 参数（先用 preview-plan 查看可领的套餐）")
+		return 2
+	}
+
+	c, code := loadCredForPlan(*authDir, *uid)
+	if c == nil {
+		return code
+	}
+
+	res, err := New().ClaimPlan(context.Background(), c, *planID)
+	if err != nil {
+		writeJSON(map[string]any{"status": "error", "uid": c.UID, "planId": *planID, "message": err.Error()})
+		return 0
+	}
+	writeJSON(map[string]any{
+		"status":         "ok",
+		"uid":            c.UID,
+		"planId":         *planID,
+		"alreadyClaimed": res.AlreadyClaimed,
+		"claimedAt":      res.ClaimedAt,
+		// 已领过也算达成目标 —— 明确说出来，否则用户重复点会以为每次都失败
+		"message": func() string {
+			if res.AlreadyClaimed {
+				return "该套餐此前已领取过（不是错误）"
+			}
+			return "领取成功"
+		}(),
+	})
+	return 0
+}
+
 func runQuota(args []string, defaultAuthDir string) int {
 	fs := flag.NewFlagSet("zcode-login quota", flag.ContinueOnError)
 	uid := fs.String("uid", "", "账号 uid")
