@@ -1963,18 +1963,24 @@ fn product_models_for_gateway() -> Value {
 
 /// ZCode 验证码求解器所在目录（含 solver.js + node_modules）。
 ///
-/// # 解析顺序（与 `resolve_gateway_exe` 同一套约定）
+/// # 解析顺序
 ///
 ///   1. 环境变量 `AI_GATEWAY_CAPTCHA_DIR`（显式指定，便于开发/调试）
-///   2. 与本程序同目录的 `zcode-captcha/`（打包后资源就在这里）
-///   3. 安装目录上一级的 `resources/zcode-captcha/`（Tauri 的资源布局）
-///   4. `~/.wb-switch/zcode-captcha/`（用户手动放置）
+///   2. 与本程序同目录的若干候选（打包后的实际布局，见下）
+///   3. `~/.wb-switch/zcode-captcha/`（用户手动放置）
 ///
-/// # 为什么返回空串而不是报错
+/// # ⚠ 候选路径是**实测解包**得出的，不是猜的
 ///
-/// 求解器是**可选能力**（验证码只在 ZCode 对话通道上需要，且默认不启用）。
-/// 找不到就让网关回落到"如实报 3007"，而不是让启动失败 ——
-/// 缺一个可选组件不该让整个软件不能用。
+/// Tauri 的 `bundle.resources` **保留相对路径**：配置里写
+/// `"../assets/zcode-captcha"`，安装后就落在
+///
+///	$INSTDIR\assets\zcode-captcha
+///
+/// 而不是 `$INSTDIR\zcode-captcha`。我第一版只按后者找 ——
+/// **打包后功能会静默失效**。这是通过解包安装包（AGENTS.md 要求的做法，
+/// 不能真装）才发现的：解包目录里看到的是 `_up_\assets\zcode-captcha`。
+///
+/// 故这里把两种布局都列上，且把 `assets/` 那条放在前面（那是实际布局）。
 fn captcha_solver_dir() -> String {
     fn ok(p: PathBuf) -> Option<String> {
         // 必须能找到 solver.js 才算数：只判断目录存在会把"空目录"
@@ -1994,9 +2000,15 @@ fn captcha_solver_dir() -> String {
     if let Ok(self_exe) = std::env::current_exe() {
         if let Some(dir) = self_exe.parent() {
             for cand in [
+                // ⚠ 打包后的**实际**布局（Tauri 保留 `assets/` 这一层）
+                dir.join("assets").join("zcode-captcha"),
+                // 直接把目录内容拷到旁边的布局（手工部署/绿色版）
                 dir.join("zcode-captcha"),
+                // Tauri 在某些配置下会包一层 resources/
+                dir.join("resources").join("assets").join("zcode-captcha"),
                 dir.join("resources").join("zcode-captcha"),
-                // Tauri 的 macOS 布局：Contents/MacOS/../Resources
+                // macOS：Contents/MacOS/../Resources
+                dir.join("..").join("Resources").join("assets").join("zcode-captcha"),
                 dir.join("..").join("Resources").join("zcode-captcha"),
             ] {
                 if let Some(d) = ok(cand) {

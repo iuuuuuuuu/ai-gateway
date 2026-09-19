@@ -1,0 +1,11 @@
+{
+  "name": "zcode-captcha-solver",
+  "version": "2.0.0",
+  "private": true,
+  "description": "ZCode 验证码求解器：用 happy-dom 在 Node 里模拟浏览器环境，运行阿里云官方无痕验证 SDK 取得 verifyParam。来源：https://github.com/dengyie/zcode2api 的 captcha_node/（所有者确认可引入）。",
+  "type": "commonjs",
+  "main": "solver.js",
+  "dependencies": {
+    "happy-dom": "^20.14.0"
+  }
+}
