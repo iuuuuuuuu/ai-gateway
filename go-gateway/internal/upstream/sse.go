@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -145,7 +146,29 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		for _, idx := range toolOrder {
 			calls = append(calls, toolCalls[idx])
 		}
-		message["tool_calls"] = calls
+		// ⚠ 丢弃**参数残缺**的工具调用（流被中途截断时 arguments 只剩半截 JSON）。
+		//
+		// 不丢的话，客户端 `JSON.parse` 会抛异常，表现为**整个会话卡死**：
+		// 工具调用既没成功也没失败，agent 循环停在原地等一个永远不来的结果。
+		//
+		// 也不补成 `{}` 假装合法 —— 那会把"参数丢了"伪装成"无参调用"，
+		// 写文件变成写空内容、删除变成删默认路径，**可能造成数据损坏**
+		// 且客户端不报错。丢弃是显式失败，客户端会自行重试。
+		kept, dropped := dropTruncatedToolCalls(calls)
+		if dropped > 0 {
+			// 必须留日志：否则用户只看到"工具调用少了"却不知为什么，
+			// 而"少了一个工具调用"和"工具调用失败"是完全不同的排查方向。
+			log.Printf("[upstream] 丢弃 %d 个参数残缺的 tool_call"+
+				"（流被截断导致 arguments 不是合法 JSON；不补 {} 以免伪造无参调用）", dropped)
+		}
+		if len(kept) > 0 {
+			message["tool_calls"] = kept
+		} else if finishReason == "" || finishReason == "tool_calls" {
+			// 所有调用都被丢弃 → 不能再说 finish_reason=tool_calls：
+			// 那会让客户端去读一个不存在的 tool_calls 字段，可能再次卡住。
+			// 改成 stop，如实表达"这轮没有工具调用"。
+			finishReason = "stop"
+		}
 	}
 	resp := map[string]any{
 		"id":      id,
