@@ -58,6 +58,35 @@ const (
 	ErrModelNotFound ErrKind = "model_not_found"
 	// ErrProviderDown 上游不可用（5xx）。
 	ErrProviderDown ErrKind = "provider_down"
+
+	// ErrPlanRequired 该账号**没有 coding plan 资格**（上游 3101）。
+	//
+	// 实测（2026-09-19，uitest/probe-zcode-all-chat.cjs）：把客户端那套
+	// 请求头补全后，套餐通道从 401 变成
+	//
+	//	HTTP 403 {"code":3101,"msg":"coding plan is required"}
+	//
+	// 403（而非 401）说明**鉴权已经通过** —— 是账号侧没有这个套餐的资格。
+	// 换句话说这不是凭证错、也不是我们请求写错。
+	//
+	// 为什么单独成类：它的处置与"额度耗尽"完全不同 ——
+	// 额度耗尽要充值，而这个要**换一个有套餐的账号**或去官方领套餐。
+	// 混在一起报会让用户白充钱。
+	ErrPlanRequired ErrKind = "plan_required"
+
+	// ErrCaptchaRequired 该操作需要**人机验证码**（上游 3007）。
+	//
+	// 实测：`/api/v1/zcode-plan/...` 对话通道回
+	//
+	//	HTTP 400 {"code":3007,"msg":"captcha verify failed"}
+	//
+	// 而客户端源码里，这类请求要带
+	// `X-Aliyun-Captcha-Verify-Param`（见 billing/claim 的实现）。
+	//
+	// ⚠ **刻意不实现绕过**：验证码是服务端的防滥用机制。
+	// 如实告诉用户"需要在官方客户端里完成一次验证"，
+	// 而不是想办法自动过硬。
+	ErrCaptchaRequired ErrKind = "captcha_required"
 )
 
 // 上游业务码（实测确认，见 Classify 的注释）。
@@ -73,6 +102,14 @@ const (
 	CodeQuotaExhausted = "1113"
 	// CodeModelNotFound 模型不存在（**大小写敏感**）。
 	CodeModelNotFound = "11102"
+	// CodePlanRequired 没有 coding plan 资格（403）。
+	//
+	// 实测：补全客户端请求头后，套餐通道由 401 变 403 并带此码。
+	CodePlanRequired = "3101"
+	// CodeCaptchaRequired 需要人机验证码（400）。
+	//
+	// ⚠ 不实现绕过（防滥用机制）。见 ErrCaptchaRequired 的说明。
+	CodeCaptchaRequired = "3007"
 )
 
 // Error 上游错误（带分类与原始响应）。
@@ -130,6 +167,17 @@ func (e *Error) FriendlyMessage() string {
 			"注意模型名**区分大小写**（如 glm-5.3 与 GLM-5.3 在上游是两个不同的名字）"
 	case ErrProviderDown:
 		return "ZCode 上游暂时不可用（" + e.Msg + "）。稍后会自动重试。"
+	case ErrPlanRequired:
+		// 与"额度耗尽"要**分开说**：那个要充值，这个充值也没用
+		return "该 ZCode 账号**没有 Coding Plan 资格**，因此套餐通道不可用" +
+			"（上游：" + e.Msg + "）。请注意这不是凭证问题（凭证是有效的），" +
+			"充值也解决不了 —— 需要换一个有套餐的账号，" +
+			"或先在 ZCode 官方客户端里开通/领取套餐。"
+	case ErrCaptchaRequired:
+		// 如实说明，并明确我们**不绕过**验证码
+		return "该 ZCode 操作需要**人机验证**（上游：" + e.Msg + "）。" +
+			"出于对服务端防滥用机制的尊重，本网关**不会绕过验证码** —— " +
+			"请在 ZCode 官方客户端里完成一次验证后重试。"
 	default:
 		if e.Msg != "" {
 			return "ZCode 上游返回错误：" + e.Msg
@@ -180,6 +228,16 @@ func Classify(status int, body string) ErrKind {
 	case CodeModelNotFound:
 		// 「模型不存在」—— 多半是模型名不对（上游大小写敏感）
 		return ErrModelNotFound
+	case CodePlanRequired:
+		// 「coding plan is required」—— 账号没有套餐资格
+		//（403 而非 401 = 鉴权已过，是账号侧的事）
+		return ErrPlanRequired
+	case CodeCaptchaRequired:
+		// 「captcha verify failed」—— 需要人机验证。
+		// ⚠ 业务码判断必须在状态码之前：这里的 3007 配的是 HTTP 400，
+		// 若不特判会掉进 default（无分类），界面上就是一句空洞的
+		// "上游返回 HTTP 400"，用户完全不知道该怎么办。
+		return ErrCaptchaRequired
 	}
 
 	// 3. 文案里的**额度信号**要先于状态码判 —— 见下面 429 的注释。
