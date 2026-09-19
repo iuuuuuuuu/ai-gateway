@@ -33,21 +33,49 @@ try {
         Write-Host "    直接使用: $GatewaySource"
     } elseif ($SkipGateway -and (Test-Path (Join-Path $embedded "gateway.exe"))) {
         Write-Host "    跳过（-SkipGateway，沿用现有 embedded/gateway.exe）"
-    } elseif (Test-Path (Join-Path $embedded "gateway.exe")) {
-        $age = (Get-Date) - (Get-Item (Join-Path $embedded "gateway.exe")).LastWriteTime
-        Write-Host ("    已有 embedded/gateway.exe（{0:N0} 小时前构建），如需重建请加 -GatewaySource" -f $age.TotalHours)
     } else {
+        # ⚠ 这里**不再**「已有就沿用」。
+        #
+        # 原逻辑是：embedded/gateway.exe 存在就打印一行提示然后**跳过重建**。
+        # 那个默认行为已经害过我们两次 —— 打完包才发现里面装的是旧网关
+        # （症状是"新功能在开发机上好好的，装完却没有"，
+        # 而日志里只有一行容易被忽略的"已有 ... 如需重建请加 -GatewaySource"）。
+        #
+        # 现在改成：**源码比产物新就自动重建**；只有显式 `-SkipGateway`
+        # 才跳过。判断依据是 go-gateway 下所有 .go 文件与 go.mod 的
+        # 最新修改时间 vs 产物时间。
+        #
+        # 为什么用 mtime 而不是内容哈希：构建脚本要快，且哈希也挡不住
+        # "改了文件但 mtime 没变"这种极罕见情况（那需要手动 touch）。
+        # mtime 的假阳性（touch 过但内容没变）代价只是一次多余的重建。
+        $gwExe = Join-Path $embedded "gateway.exe"
         $gwDir = Join-Path $root "go-gateway"
-        if (-not (Test-Path $gwDir)) {
-            throw "未找到网关源码目录 $gwDir；可用 -GatewaySource 指定已有的 gateway.exe"
+        $needRebuild = $true
+        if (Test-Path $gwExe) {
+            $exeTime = (Get-Item $gwExe).LastWriteTimeUtc
+            $srcTime = Get-ChildItem -Path $gwDir -Recurse -File -Include *.go, go.mod, go.sum -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+            if ($srcTime -and $srcTime.LastWriteTimeUtc -le $exeTime) {
+                $needRebuild = $false
+                $age = (Get-Date).ToUniversalTime() - $exeTime
+                Write-Host ("    网关产物比源码新（{0:N0} 小时前构建），无需重建" -f $age.TotalHours)
+            } else {
+                $newer = if ($srcTime) { $srcTime.Name } else { "（未知）" }
+                Write-Host "    源码比产物新（$newer），自动重建网关" -ForegroundColor Yellow
+            }
         }
-        $env:GOFLAGS = "-mod=mod"
-        Push-Location $gwDir
-        go build -trimpath -ldflags "-s -w" -o (Join-Path $embedded "gateway.exe") ./cmd/server
-        $code = $LASTEXITCODE
-        Pop-Location
-        if ($code -ne 0) { throw "网关构建失败" }
-        Write-Host "    已从源码构建网关"
+        if ($needRebuild) {
+            if (-not (Test-Path $gwDir)) {
+                throw "未找到网关源码目录 $gwDir；可用 -GatewaySource 指定已有的 gateway.exe"
+            }
+            $env:GOFLAGS = "-mod=mod"
+            Push-Location $gwDir
+            go build -trimpath -ldflags "-s -w" -o $gwExe ./cmd/server
+            $code = $LASTEXITCODE
+            Pop-Location
+            if ($code -ne 0) { throw "网关构建失败" }
+            Write-Host "    已从源码构建网关"
+        }
     }
 
     # ---- 2) 前端 ----
