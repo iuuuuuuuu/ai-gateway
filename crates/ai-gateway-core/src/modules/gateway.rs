@@ -1095,6 +1095,31 @@ impl GatewayJob {
         let process = HANDLE(child.as_raw_handle());
         unsafe { AssignProcessToJobObject(self.0, process).is_ok() }
     }
+
+    /// **终止 Job 内的所有进程**（比 taskkill 可靠得多）。
+    ///
+    /// # 为什么必须用它替代 taskkill（上游 `7966c578` 修的正是这个）
+    ///
+    /// 关机 / 注销时，会话的控制台子系统已在拆除。此时 spawn 出来的
+    /// `taskkill` 会以 `0xc0000142`（STATUS_DLL_INIT_FAILED）**启动失败**，
+    /// 而 Windows 会为此弹出**系统错误框** —— 用户必须在关机界面手动点掉它，
+    /// 否则关不掉机。上游实测「装后 4 次关机 4 次复现」。
+    ///
+    /// `TerminateJobObject` 是内核调用，不依赖控制台子系统，也不需要
+    /// spawn 新进程，故在关机路径上同样可靠。
+    ///
+    /// ⚠ 返回值**不能**用来判断"有没有真的终止"：对**空的** Job 它也返回
+    /// 成功。真正的判据是 `GATEWAY_IN_JOB`（见该常量的说明）。
+    fn terminate(&self) -> bool {
+        #[cfg(windows)]
+        unsafe {
+            windows::Win32::System::JobObjects::TerminateJobObject(self.0, 0).is_ok()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1115,6 +1140,40 @@ fn gateway_job() -> Option<&'static GatewayJob> {
     JOB.get_or_init(GatewayJob::create).as_ref()
 }
 
+/// 网关子进程**是否真的进了 Job**（决定能否用 `TerminateJobObject` 收尾）。
+///
+/// # 为什么需要这个标志（上游 `7966c578` 的关键洞察）
+///
+/// `TerminateJobObject` 对**空的** Job 也返回 `Ok` —— 光看返回值无法区分
+/// 「真的终止了那个子进程」与「Job 里根本没有进程，白调一次」。
+///
+/// 这很重要，因为 `stop_gateway` 要用它决定**是否回退到 taskkill**：
+///
+///	· 标志为 true  → 子进程在 Job 里 → `TerminateJobObject` 能收干净，
+///	                  且不会弹那个关机错误框
+///	· 标志为 false → 子进程没进 Job（创建/assign 失败）→ 只能用 taskkill，
+///	                  宁可承担弹出错误框的风险，也不能让网关**停不掉**
+///	                  （那会占着端口，用户以为程序坏了）
+///
+/// 故这里记录的是"**登记结果**"而不是"调用结果"。
+static GATEWAY_IN_JOB: AtomicBool = AtomicBool::new(false);
+
+/// 尝试用 Job 终止网关；返回 false 表示"Job 里没有我们的进程"，
+/// 调用方应回退到 taskkill。
+fn terminate_gateway_job() -> bool {
+    #[cfg(windows)]
+    {
+        if !GATEWAY_IN_JOB.load(Ordering::SeqCst) {
+            return false;
+        }
+        gateway_job().map(GatewayJob::terminate).unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// 把新启动的网关子进程纳入 Job：应用进程结束时由系统连带回收。
 ///
 /// 加入失败不阻断启动（显式 stop_gateway 仍可正常停止），只打日志提示兜底失效。
@@ -1122,13 +1181,22 @@ fn attach_child_to_job(child: &Child) {
     #[cfg(windows)]
     {
         match gateway_job() {
-            None => eprintln!("[gateway] Job Object 创建失败：应用异常退出时可能残留网关进程"),
+            None => {
+                GATEWAY_IN_JOB.store(false, Ordering::SeqCst);
+                eprintln!("[gateway] Job Object 创建失败：应用异常退出时可能残留网关进程");
+            }
             Some(job) if !job.assign(child) => {
+                GATEWAY_IN_JOB.store(false, Ordering::SeqCst);
                 eprintln!(
                     "[gateway] 网关子进程加入 Job Object 失败：应用异常退出时可能残留网关进程"
                 )
             }
-            Some(_) => {}
+            Some(_) => {
+                // ⚠ 这一句是"停止网关"能否走 TerminateJobObject 的**唯一依据**。
+                // 漏了它，stop_gateway 会永远回退到 taskkill —— 那正是关机时
+                // 弹系统错误框的根源（见 GATEWAY_IN_JOB 的说明）。
+                GATEWAY_IN_JOB.store(true, Ordering::SeqCst);
+            }
         }
     }
     #[cfg(not(windows))]
@@ -2662,18 +2730,43 @@ pub fn stop_gateway() -> Value {
     let stopped = match slot.as_mut() {
         Some(child) => {
             let pid = child.id();
-            // Windows 需连同子进程树一起结束；走 cmd_builder 加 CREATE_NO_WINDOW，
-            // 避免退出/停止时闪出 taskkill 控制台窗口。
-            let _ = crate::modules::process::cmd_builder("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            // **优先用 Job Object 终止**（上游 `7966c578` 的修复）。
+            //
+            // # 为什么不能用 taskkill 作为首选
+            //
+            // 关机 / 注销时控制台子系统已在拆除，spawn 的 `taskkill` 会以
+            // `0xc0000142`（STATUS_DLL_INIT_FAILED）启动失败 ——
+            // 而 Windows 会为此弹出**系统错误框**，用户必须在关机界面手动
+            // 点掉它。上游实测「装后 4 次关机 4 次复现」（issue #21）。
+            //
+            // `TerminateJobObject` 是内核调用：不 spawn 新进程、不依赖
+            // 控制台子系统，故在关机路径上同样可靠。
+            //
+            // # 为什么要保留 taskkill 作为回退
+            //
+            // 子进程**没进 Job** 时（Job 创建或 assign 失败，见
+            // `GATEWAY_IN_JOB`），`TerminateJobObject` 会"成功"地终止一个
+            // 空 Job，而真正的网关仍在跑 —— 它会占着端口，
+            // 用户看到的是"程序说停了但服务还在"。
+            // 那种情况下宁可承担弹出错误框的风险，也不能停不掉。
+            if !terminate_gateway_job() {
+                // 回退路径。加 CREATE_NO_WINDOW 避免闪出 taskkill 控制台窗口。
+                let _ = crate::modules::process::cmd_builder("taskkill")
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = child.wait();
+            }
+            // Job 路径下也要 wait：等句柄真正可回收，避免立刻重启时
+            // 新进程抢不到端口（TerminateJobObject 是异步生效的）。
             let _ = child.wait();
             true
         }
         None => false,
     };
+    // 进程已终止，标志复位：下一次启动若 assign 失败，仍能正确回退。
+    GATEWAY_IN_JOB.store(false, Ordering::SeqCst);
     *slot = None;
     GATEWAY_RUNNING.store(false, Ordering::SeqCst);
     json!({ "stopped": stopped })
@@ -6264,5 +6357,50 @@ p42\ncjava\nf9\nn*:8080\n";
             json!({ "allowed_model": [] }),
             "空输入 = 清除限制，写成空数组而不是 null（形状统一，便于前端回显）"
         );
+    }
+
+    /// 停止网关必须**优先走 Job Object**（上游 `7966c578` 的修复）。
+    ///
+    /// # 这条守的是什么
+    ///
+    /// 关机 / 注销时控制台子系统已在拆除，spawn 出来的 `taskkill` 会以
+    /// `0xc0000142`（STATUS_DLL_INIT_FAILED）启动失败，Windows 为此弹**系统
+    /// 错误框**，用户必须在关机界面手动点掉（上游实测 4/4 复现）。
+    ///
+    /// `TerminateJobObject` 是内核调用，不 spawn 进程、不依赖控制台子系统，
+    /// 故关机时同样可靠。
+    ///
+    /// # 为什么断言「标志」而不是「行为」
+    ///
+    /// 真去终止一个进程需要起真实子进程（单测里代价大且不稳）。
+    /// 而这段逻辑的**关键不变式**恰好是那个标志：
+    ///
+    ///	· `GATEWAY_IN_JOB == false` → 必须**不走** Job 路径（回退 taskkill）
+    ///	· `GATEWAY_IN_JOB == true`  → 走 Job 路径
+    ///
+    /// 因为 `TerminateJobObject` 对**空 Job 也返回成功**，光看返回值无法区分
+    /// 「真终止了」与「Job 里根本没进程」。若哪天有人把判据从标志改成返回值，
+    /// 就会出现「程序说停了、网关还在跑并占着端口」—— 这条会红。
+    #[test]
+    fn terminate_gateway_job_requires_registration_flag() {
+        use std::sync::atomic::Ordering;
+
+        // 复位到"没进 Job"
+        super::GATEWAY_IN_JOB.store(false, Ordering::SeqCst);
+        assert!(
+            !super::terminate_gateway_job(),
+            "没登记进 Job 时必须返回 false，让调用方回退到 taskkill —— \
+             否则会「静默地什么都没停」"
+        );
+
+        super::GATEWAY_IN_JOB.store(true, Ordering::SeqCst);
+        #[cfg(not(windows))]
+        assert!(
+            !super::terminate_gateway_job(),
+            "非 Windows 没有 Job 机制，必须返回 false 让调用方走 Child::kill"
+        );
+
+        // 收尾复位，避免影响同进程内的其它测试
+        super::GATEWAY_IN_JOB.store(false, Ordering::SeqCst);
     }
 }
