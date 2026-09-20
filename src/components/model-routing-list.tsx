@@ -96,10 +96,36 @@
  *	  点击写 `model_platforms` 配置、改服务端行为）；
  *	  本组件的徽标是**只读**（`<span>`），因为它不改任何配置。
  *	  只统一视觉，不统一交互。
- *	· AgentsPage 的模型列表是 `sm:grid-cols-2 lg:grid-cols-3` 网格；
- *	  本组件保持单列。原因：本组件每条多出**三行可复制写法**（那是它存在
- *	  的理由），塞进 1/3 宽的网格列会被挤成多行折行，反而比 AgentsPage 难读。
- *	  两个页面的**条目内部排版**已经一致，差异只在列的排布。
+ *
+ * ────────────────────────────────────────────────────────────────────────
+ * # 布局：从「一行一个」改成**自适应多列网格**（所有者 2026-09-20 要求）
+ *
+ * 所有者原话：
+ *
+ *	「兼容网关这里 模型路由清单 不应该一行一个，优化下布局 改成动态的」
+ *	「兼容网关和智能体路由 的 路由模型清单 样式也没统一，我说了兼容网关
+ *	  这里的 路由模型清单做的不错，让你两个统一一下你忘了吧」
+ *
+ * 这两条其实指向**同一个动作**：把单列改成像 AgentsPage 那样的响应式网格，
+ * 于是「不一行一个」与「两页统一」同时达成。
+ *
+ * ## 为什么用 `auto-fill` 而不是 AgentsPage 的 `sm:grid-cols-2 lg:grid-cols-3`
+ *
+ * 固定的断点列数在**宽屏**下会浪费：本清单所在区块宽度随侧栏折叠/窗口变化，
+ * 而 `lg:grid-cols-3` 到了 2560 宽还是 3 列，卡片被拉得很宽、右侧大片空白 ——
+ * 那正是所有者说的"动态"要解决的问题。`auto-fill` + `minmax`
+ * 让列数**随可用宽度自动增减**，且不需要为每个断点写一条类名。
+ *
+ * ⚠ 这个写法在本仓库**已有先例**（`GatewayPage.tsx:1841`、
+ * `AccountsPage.tsx:1273` 都在用 `grid-cols-[repeat(auto-fill,minmax(...))]`），
+ * 故不是我引入的新风格。
+ *
+ * ## 卡片最小宽度取 260px 的依据
+ *
+ * 卡片内容最宽的一行是「可复制写法」（如 `qoder:国际版:qwen3.8-flash`，
+ * 约 30 个等宽字符 ≈ 220px）+ 复制图标 + 内边距 ≈ 250px。
+ * 取 260px 让它**刚好一行放得下**；小于此值会折行，那种"两行才装得下"
+ * 的卡片正是单列时代的问题（纵向过高、扫视效率低）。
  */
 import { useMemo, useState } from "react";
 import { Check, Copy, Info, Search } from "lucide-react";
@@ -122,6 +148,20 @@ const REGION_LABEL: Record<string, string> = {
 /**
  * 生成某个模型的**全部可用写法**。
  *
+ * # 优先用网关下发的 `aliases`（2026-09-20 起）
+ *
+ * 网关的 `/v1/models` 现在会为每个模型直接下发 `aliases`
+ * （`平台:模型名` / `平台:区域:模型名`，见 capability.go 的 aliasesOf）。
+ * **优先用它**，理由是它才是权威：
+ *
+ *	· 网关知道**该产品确实有账号的区域**，前端只能从 `channels[].regions` 猜
+ *	· 两处各算一遍必然出现分歧（而分歧的表现是"界面给的写法抄进去解析失败"）
+ *	· 网关加新写法时前端自动跟上，不需要同步改两处
+ *
+ * 只有旧网关不带 `aliases` 时才退回本地计算 —— 那是**向后兼容**，
+ * 不是主路径。保留它是因为"前端连着一个稍旧的网关"是真实情况
+ *（宿主与网关是两个可分别更新的组件）。
+ *
  * 规则（与网关 `resolveModel` 的解析口径**必须一致**，否则展示的写法
  * 用户抄进去会解析失败）：
  *
@@ -135,18 +175,34 @@ const REGION_LABEL: Record<string, string> = {
  */
 export function routeFormsOf(model: GatewayModelItem): string[] {
   const id = model.id;
-  const forms: string[] = [id];
+  // 汇总而不是直接返回：裸名始终排第一（它是"最省事的写法"），
+  // 后面的组合名按网关给的顺序。
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const push = (s: string) => {
+    if (s && !seen.has(s)) {
+      seen.add(s);
+      out.push(s);
+    }
+  };
+
+  push(id);
+  // ① 网关下发的权威写法
+  for (const a of model.aliases || []) push(a);
+  if (out.length > 1) return out;
+
+  // ② 旧网关：本地按 channels 推导（向后兼容路径）
   const channels = model.channels || [];
   for (const ch of channels) {
     const product = (ch.product || "").trim();
     if (!product) continue;
-    forms.push(`${product}:${id}`);
+    push(`${product}:${id}`);
     for (const region of ch.regions || []) {
       const label = REGION_LABEL[region];
-      if (label) forms.push(`${product}:${label}:${id}`);
+      if (label) push(`${product}:${label}:${id}`);
     }
   }
-  return forms;
+  return out;
 }
 
 /**
@@ -331,10 +387,14 @@ export function ModelRoutingList({ models, className }: ModelRoutingListProps) {
         </div>
       ) : (
         /*
-          列表高度本组件独有（AgentsPage 是 max-h-96 的网格）：
-          每条多出三行可复制写法，需要更多纵向空间才装得下几行。
+          列表：**自适应多列网格**（见文件头「布局」一节）。
+
+          ⚠ 高度上限从 520 降到 460：改成多列后同样高度能装下约 2 倍的模型，
+          不必再给那么高的滚动区（过高会让页面下方的内容被推得太远）。
+          而 `auto-rows-fr` 让同一行的卡片等高 —— 否则长短不一的写法行
+          会让网格看起来参差不齐。
         */
-        <div className="flex max-h-[520px] flex-col gap-2 overflow-y-auto pr-1">
+        <div className="grid max-h-[460px] auto-rows-fr grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-2 overflow-y-auto p-0.5 pr-1">
           {filtered.map((m) => {
             const channels = m.channels || [];
             const forms = routeFormsOf(m);
@@ -347,7 +407,7 @@ export function ModelRoutingList({ models, className }: ModelRoutingListProps) {
                 data-slot="model-routing-item"
                 data-model={m.id}
                 // 与 AgentsPage 的 `agent-model-card` 容器同款类名（见文件头 ①）
-                className="flex flex-col gap-1.5 rounded-lg border border-border/60 px-2.5 py-2 text-xs"
+                className="flex min-w-0 flex-col gap-1.5 rounded-lg border border-border/60 px-2.5 py-2 text-xs"
               >
                 {/* 行 1：模型名 + 重名徽标（徽标几何与 AgentsPage 的
                     「默认主模型」一致：Badge h-4 w-fit px-1 text-[9px]） */}

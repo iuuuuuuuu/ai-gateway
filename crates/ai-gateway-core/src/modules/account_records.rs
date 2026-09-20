@@ -127,6 +127,121 @@ pub fn add_task_record(account_id: &str, account_name: &str, title: &str, result
     });
 }
 
+/// 任务结果的规范取值（写记录时用，也被前端用于配色与筛选）。
+///
+/// ⚠ 这些是**跨语言契约**，改字面量要三处同步：
+///
+///	宿主（本文件）  RESULT_*
+///	网关 go-gateway/internal/records/records.go  的 ResultSuccess / ResultFailed / ResultAlready
+///	前端 src/components/account-records-view.tsx  按 `result === "…"` 匹配
+///	  （success → 绿勾、already → 黄勾、failed/error → 红）
+///
+/// 前三个与 Go 侧**逐字一致**（已核对）；`skipped` 是本模块新增的，
+/// 前端目前没有专门配色，会落到"非失败"分支 —— 那是可接受的默认
+///（跳过不是故障，不该标红）。
+pub const RESULT_SUCCESS: &str = "success";
+/// 已经做过（幂等命中）——**不是失败**。
+///
+/// 单独一个值而不是复用 success：用户在记录里要能区分
+/// 「这次真的领到了」与「今天已经领过了」。两者都算"任务正常完成"，
+/// 但前者会带来积分变化，后者不会 —— 混在一起会让人以为漏发了。
+pub const RESULT_ALREADY: &str = "already";
+pub const RESULT_FAILED: &str = "failed";
+/// 条件不满足而跳过（非故障，如"不在夜猫时段""该任务国服专属"）。
+pub const RESULT_SKIPPED: &str = "skipped";
+
+/// 一次任务执行的留痕包装。
+///
+/// # 为什么要有它（所有者明确要求：2026-09-20）
+///
+/// 所有者原话：「最最重要，任务一定要留痕，执行记录必须要有」。
+///
+/// 而当时的实情是：**任务散在多个产品的多个模块里，各自决定要不要写记录**。
+/// 结果就是覆盖面参差不齐 —— WorkBuddy 的几个任务都写了，
+/// 而 Qoder 的活动领取只写了部分路径，**ZCode 则一条都不写**。
+/// 用户点了按钮、看到"已触发"，事后却查不到跑没跑、结果如何。
+///
+/// 靠"每个新任务记得写记录"是**约定**，约定会被漏掉（ZCode 就是证据）。
+/// 故这里提供**一个统一的包装**：把任务体塞进闭包，无论成功、幂等命中、
+/// 跳过还是失败，出口处**必定**写一条记录。
+///
+/// # 用法
+///
+/// ```ignore
+/// let r = audit_task(&uid, &name, "ZCode 签到", || do_checkin(&uid));
+/// ```
+///
+/// 返回值原样透传，**不改变任何业务行为** —— 留痕是旁路，不该影响结果。
+///
+/// ⚠ 包装**不吞 panic**：任务体 panic 时整个进程/线程的行为与不包装时一致。
+/// 有意如此 —— 用 `catch_unwind` 掩盖 panic 会让真正的缺陷变成一条
+/// "failed" 记录，反而更难查。
+pub fn audit_task<F, T>(account_id: &str, account_name: &str, title: &str, body: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    let out = body();
+    // 任务体已返回，此处写记录。
+    //
+    // ⚠ 写记录失败**不影响返回值**：`push` 内部已做容错（见其实现），
+    // 但即便将来它变成可失败的，也不该因为"日志写不进去"而让任务失败 ——
+    // 那是本末倒置。
+    add_task_record(account_id, account_name, title, RESULT_SUCCESS, "");
+    out
+}
+
+/// 记录一次「任务失败」，返回给调用方原样继续。
+///
+/// 与 [`audit_task`] 分开是因为很多任务体内部就有多次可失败的步骤，
+/// 调用方在 `Err` 分支上调用它比把整个任务包成 `Result` 更贴合现状。
+/// 两者可以混用：外层 `audit_task` 记成功，内层 `audit_failure` 记具体失败原因。
+pub fn audit_failure(account_id: &str, account_name: &str, title: &str, reason: &str) {
+    add_task_record(
+        account_id,
+        account_name,
+        title,
+        RESULT_FAILED,
+        &truncate_detail(reason),
+    );
+}
+
+/// 记录一次「已做过（幂等命中）」。
+pub fn audit_already(account_id: &str, account_name: &str, title: &str, detail: &str) {
+    add_task_record(
+        account_id,
+        account_name,
+        title,
+        RESULT_ALREADY,
+        &truncate_detail(detail),
+    );
+}
+
+/// 记录一次「跳过」（条件不满足，非故障）。
+pub fn audit_skipped(account_id: &str, account_name: &str, title: &str, reason: &str) {
+    add_task_record(
+        account_id,
+        account_name,
+        title,
+        RESULT_SKIPPED,
+        &truncate_detail(reason),
+    );
+}
+
+/// 截断过长的 detail，避免一条记录把文件撑爆。
+///
+/// 上游错误体常带整段 JSON 甚至 HTML（网关 401 时返回 openresty 错误页），
+/// 原样存下来会让 `account_records.json` 迅速膨胀，而前面 200 字
+/// 通常已经够定位问题。超长时**明确标注被截断**，不假装完整。
+fn truncate_detail(s: &str) -> String {
+    const MAX: usize = 600;
+    let t = s.trim();
+    if t.chars().count() <= MAX {
+        return t.to_string();
+    }
+    let head: String = t.chars().take(MAX).collect();
+    format!("{head}…（已截断，原文 {} 字符）", t.chars().count())
+}
+
 /// 追加一条积分变化记录（amount 正为增长、负为消耗）。
 ///
 /// `source` 是这个账号**为什么**变分（见 [`CREDIT_SOURCE_GRANT`] 等）。
