@@ -33,6 +33,21 @@ func main() {
 	stream := flag.Bool("stream", true, "是否流式")
 	prompt := flag.String("prompt", "只回答两个字：收到", "用户消息")
 	noCaptcha := flag.Bool("no-captcha", false, "跳过验证码求解（只看 3007）")
+	// deviceMid 覆盖 —— 用于验证"设备指纹是否影响风控"。
+	//
+	// # 为什么需要它
+	//
+	// 我们的凭证里**没有 `device_mid`** 字段（`cred.go` 见缺失就随机补一个），
+	// 于是每次启动都是一个**新的设备指纹**。而官方客户端的 deviceMid 是
+	// **固定**的（持久化在 `~/.zcode/v2/telemetry-state.json`）。
+	//
+	// 参考实现明确警告过这条：
+	//   「device fingerprint 稳定：X-Device-Mid 生成一次、永久复用、落盘、
+	//     **绝不每请求随机**」
+	//
+	// 这个开关让探针能**指定**一个 deviceMid（如官方那个），
+	// 从而做 A/B —— 而它**不改任何文件**，纯运行时覆盖。
+	deviceMid := flag.String("device-mid", "", "覆盖 X-Device-Mid（空 = 用凭证里的随机值）")
 	flag.Parse()
 
 	if *uid == "" {
@@ -67,9 +82,15 @@ func main() {
 	fmt.Println(strings.Repeat("=", 88))
 	fmt.Println("  ZCode 真机探针（走生产代码路径 zcode.Client.StreamChat）")
 	fmt.Println(strings.Repeat("=", 88))
+	// deviceMid 覆盖（见 -device-mid 的说明）。纯内存，不写文件。
+	if *deviceMid != "" {
+		cred.DeviceMid = *deviceMid
+	}
 	fmt.Printf("\n  凭证目录 : %s\n", dir)
 	fmt.Printf("  账号     : %s  provider=%s\n", cred.UID, cred.Provider)
 	fmt.Printf("  jwt      : %d 字符  iat=%d\n", len(cred.JWT), cred.JWTIssuedAt)
+	fmt.Printf("  deviceMid: %s%s\n", cred.DeviceMid,
+		map[bool]string{true: "  （-device-mid 覆盖）", false: "  （凭证缺 device_mid ⇒ 随机）"}[*deviceMid != ""])
 	fmt.Printf("  模型     : %s   流式=%v\n", *model, *stream)
 
 	// ---- 验证码求解器（与网关同一份） ----
