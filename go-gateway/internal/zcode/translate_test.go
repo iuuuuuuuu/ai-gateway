@@ -64,12 +64,33 @@ func TestBuildAnthropicSystemGoesToTopLevel(t *testing.T) {
 	}`)
 
 	sys, ok := out["system"].([]any)
-	if !ok || len(sys) != 2 {
-		t.Fatalf("system 应提到顶层且有 2 块（system + developer），实际 %v", out["system"])
+	if !ok {
+		t.Fatalf("system 应提到顶层，实际 %v", out["system"])
 	}
-	first := sys[0].(map[string]any)
-	if first["type"] != "text" || first["text"] != "你是助手" {
-		t.Errorf("system 首块错误: %v", first)
+	// ⚠ 块数不再是 2：官方 3 块会**排在客户端内容前面**注入
+	//（JWT 账号缺官方 system 会被上游回 405 = 3012 的载体）。
+	// 故这里改为断言「官方块在前 + 客户端两块都在」，而不是写死总数。
+	//
+	// 原先写死 `len(sys) != 2` 是**旧契约**（当时不注入官方块）；
+	// 注入接上后它必然失败 —— 那是断言过时，不是注入错了。
+	if len(sys) < 2 {
+		t.Fatalf("至少要有客户端那 2 块，实际 %v", out["system"])
+	}
+	// 客户端两块必须都还在，且**相对顺序不变**
+	var clientTexts []string
+	for _, b := range sys {
+		bm, _ := b.(map[string]any)
+		if txt, _ := bm["text"].(string); txt == "你是助手" || txt == "补充规则" {
+			clientTexts = append(clientTexts, txt)
+		}
+	}
+	if len(clientTexts) != 2 || clientTexts[0] != "你是助手" || clientTexts[1] != "补充规则" {
+		t.Errorf("客户端两块 system 必须保留且顺序不变，实际 %v", clientTexts)
+	}
+	// 官方块必须在前
+	firstBlock := sys[0].(map[string]any)
+	if txt, _ := firstBlock["text"].(string); !containsStr(txt, "You are ZCode") {
+		t.Errorf("首块应是官方 cliPrefix（官方块排在客户端前面），实际 %v", firstBlock)
 	}
 	// messages 里**不应**再有 system 角色
 	msgs := out["messages"].([]any)

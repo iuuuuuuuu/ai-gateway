@@ -148,27 +148,44 @@ func TestContextPrefixMessageShape(t *testing.T) {
 	}
 }
 
-// TestSystemBlockDisabledByDefault **默认关闭**。
+// TestSystemBlockEnabledByDefault **默认开启**（2026-09-20 反转的契约）。
 //
-// 这条守的是"不要把已证伪的假设默认打开"：它在 3012 上的 A/B 是失败的
-//（两组都 3012）。默认开启会让所有人白多传 8KB system 文本，
-// 且可能引入新的指纹差异。
-func TestSystemBlockDisabledByDefault(t *testing.T) {
+// # 为什么这条测试从"默认关闭"反转成"默认开启"
+//
+// 它原先守的是「不要把已证伪的假设默认打开」，依据是一次 A/B：
+// 开/关两组都 3012。
+//
+// **但那次 A/B 是在风控期做的** —— 当时该账号连官方客户端都一律吃 3012。
+// 在"所有请求都失败"的窗口里比较两个方案，结论必然无差别。
+// 那是**实验设计的错误**，不是方案无效。
+//
+// 对照参考实现（`gakiyukr/zcode2api-plus`，Go，持续更新，能跑通）确认：
+//
+//	// JWT 账号请求必须注入到顶层 system，否则上游返回 405。
+//
+// 而 405 正是 3012 的载体。故默认改为注入。
+//
+// ⚠ 保留 `=0` 作为逃生开关：万一注入在某个环境反而出问题，
+// 用户能不改代码就关掉。
+func TestSystemBlockEnabledByDefault(t *testing.T) {
+	// 未设置 = 默认开启
 	t.Setenv("AI_GATEWAY_ZCODE_SYSTEM_BLOCK", "")
-	if SystemBlockEnabled() {
-		t.Error("默认必须关闭 —— 该假设已在 3012 上被 A/B 证伪")
-	}
-	t.Setenv("AI_GATEWAY_ZCODE_SYSTEM_BLOCK", "1")
 	if !SystemBlockEnabled() {
-		t.Error("设为 1 时应启用（便于重跑 A/B）")
+		t.Error("默认必须**开启** —— 参考实现证明 JWT 账号缺官方 system 会被回 405(=3012)")
 	}
-	t.Setenv("AI_GATEWAY_ZCODE_SYSTEM_BLOCK", "true")
-	if !SystemBlockEnabled() {
-		t.Error("true 也应接受")
+	// 显式 1/true 仍表示开启
+	for _, v := range []string{"1", "true", "TRUE"} {
+		t.Setenv("AI_GATEWAY_ZCODE_SYSTEM_BLOCK", v)
+		if !SystemBlockEnabled() {
+			t.Errorf("%q 应视为开启", v)
+		}
 	}
-	t.Setenv("AI_GATEWAY_ZCODE_SYSTEM_BLOCK", "0")
-	if SystemBlockEnabled() {
-		t.Error("0 应视为关闭")
+	// 显式 0/false 才关（逃生开关）
+	for _, v := range []string{"0", "false", "FALSE"} {
+		t.Setenv("AI_GATEWAY_ZCODE_SYSTEM_BLOCK", v)
+		if SystemBlockEnabled() {
+			t.Errorf("%q 应视为关闭（逃生开关）", v)
+		}
 	}
 }
 

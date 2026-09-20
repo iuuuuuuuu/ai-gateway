@@ -330,13 +330,30 @@ func BuildContextPrefixMessage(now string) (map[string]any, error) {
 
 // SystemBlockEnabled 报告是否启用官方 system 块注入。
 //
-// **默认关闭**：这是一条**未经验证**的假设（见文件头说明）。
-// 开启方式：环境变量 `AI_GATEWAY_ZCODE_SYSTEM_BLOCK=1`。
+// # ⚠ 现在**恒为 true**，这个函数只保留给测试与诊断（2026-09-20 改）
 //
-// 为什么做成环境变量而不是配置项：它的用途是**在同一账号上做 A/B 对照**
-//（开/关各打一次看 3012 是否消失），那种实验不需要重启整套配置、
-// 更不该成为持久化设置里一个用户看不懂的开关。
+// 原先它读 `AI_GATEWAY_ZCODE_SYSTEM_BLOCK`，默认 **false**（不注入）。
+// 那个默认值的依据是一次 A/B：「开/关两组都 3012」。
+//
+// **但那次 A/B 是在风控期做的** —— 当时该账号连官方客户端都一律吃 3012。
+// 在"所有请求都失败"的窗口里比较两个方案，结论必然无差别；
+// **那是实验设计的错误，不是方案无效。**
+//
+// 对照参考实现（`gakiyukr/zcode2api-plus`，Go，持续更新，能跑通）后确认：
+//
+//	// JWT 账号请求必须注入到顶层 system，否则上游返回 405。
+//
+// 而 405 正是 3012 的载体。故 `BuildAnthropicBodyWithMeta` 现在
+// **无条件注入**（见那里的长注释）。
+//
+// ⚠ 保留 `AI_GATEWAY_ZCODE_SYSTEM_BLOCK=0` 作为**逃生开关**：
+// 万一注入在某个环境反而出问题，用户能不改代码就关掉。
+// 但那不是默认路径 —— 默认是注入。
 func SystemBlockEnabled() bool {
 	v := strings.TrimSpace(os.Getenv("AI_GATEWAY_ZCODE_SYSTEM_BLOCK"))
-	return v == "1" || strings.EqualFold(v, "true")
+	// 只有**显式**写 0/false 才关；未设置（空）时按开启处理。
+	if v == "" {
+		return true
+	}
+	return !(v == "0" || strings.EqualFold(v, "false"))
 }

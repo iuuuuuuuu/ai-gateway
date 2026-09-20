@@ -96,6 +96,18 @@ type AnthropicMeta struct {
 	SessionID string
 }
 
+// existingSystemOf 把已抽出的 system 块还原成 `BuildOfficialSystem` 要的入参。
+//
+// `BuildOfficialSystem(existing any, …)` 的 `existing` 可以是 string / []any / nil，
+// 这里统一给 `[]any`（我们抽出来的本来就是块数组）。
+// 空则给 nil，让 `BuildOfficialSystem` 走"只有官方块"那一支。
+func existingSystemOf(blocks []any) any {
+	if len(blocks) == 0 {
+		return nil
+	}
+	return blocks
+}
+
 // BuildAnthropicBodyWithMeta 同 BuildAnthropicBody，但可注入会话元数据。
 func BuildAnthropicBodyWithMeta(openAIBody []byte, model string, meta AnthropicMeta) ([]byte, error) {
 	var in map[string]any
@@ -202,6 +214,58 @@ func BuildAnthropicBodyWithMeta(openAIBody []byte, model string, meta AnthropicM
 
 	if len(systemBlocks) > 0 {
 		out["system"] = systemBlocks
+	}
+
+	// ---- 官方 system 块注入（JWT 账号**必需**）----
+	//
+	// # 为什么必须注入（2026-09-20 对照参考实现后确认）
+	//
+	// 参考实现 `gakiyukz/zcode2api-plus`（Go，持续更新，能跑通）在
+	// `upstream/request.go` 里写得很直接：
+	//
+	//	// JWT 账号请求必须注入到顶层 system，否则上游返回 405。
+	//
+	// 而 **405 正是 3012 的载体** —— 我们的 `captcha.go` 里记着：
+	//
+	//	HTTP 405 {"code":3012,"msg":"request has been blocked due to unusual activity."}
+	//
+	// 我们此前**只从客户端 messages 里抽 system**（见上面的循环）：
+	// 普通 API 客户端（Cline / DSH / curl）根本不发 system 消息 ⇒
+	// `systemBlocks` 为空 ⇒ **官方块从未被注入**。
+	//
+	// 而 `BuildOfficialSystem` 早就写好了、形状也验证过，
+	// 却在生产代码里**一个调用点都没有** —— 它只被测试调用。
+	//
+	// # 为什么之前"默认关闭"的判断是错的
+	//
+	// `systemblock.go` 的文件头记着一次 A/B：「开/关两组都 3012」，
+	// 据此判定"该假设已证伪"。
+	//
+	// **但那次 A/B 是在风控期做的** —— 当时该账号（连官方客户端）
+	// 一律吃 3012。在"所有请求都失败"的窗口里比较两个方案，
+	// 结论必然是无差别。**那是实验设计的错误，不是方案无效。**
+	//
+	// 现在风控已解除（所有者确认能对话），且参考实现在正常期
+	// **无条件注入**并能跑通 —— 故改为默认注入。
+	//
+	// # 顺序与合并
+	//
+	// 官方块**排在调用方内容前面**（与参考实现一致）：
+	// 替换会丢掉客户端的项目规范与工具约定。
+	//
+	// ⚠ 注入失败**不阻断请求**：拿不到官方块只说明少了这层指纹，
+	// 不该让用户的对话直接失败（降级优于报错）。
+	//
+	// ⚠ `SystemBlockEnabled()` 是**逃生开关**（默认开，显式写 0 才关）：
+	// 万一注入在某个环境反而出问题，用户能不改代码就关掉。
+	if SystemBlockEnabled() {
+		if blk, err := BuildOfficialSystem(existingSystemOf(systemBlocks), model, envInfo{}); err == nil {
+			merged := make([]any, 0, len(blk))
+			for _, b := range blk {
+				merged = append(merged, b)
+			}
+			out["system"] = merged
+		}
 	}
 
 	// ---- metadata：官方的会话元数据（抓包实测必发）----

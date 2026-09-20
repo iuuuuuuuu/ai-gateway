@@ -150,9 +150,22 @@ func TestStreamChatOnceHitsAnthropicEndpointAndTranslates(t *testing.T) {
 	if _, bad := gotBody["messages"].([]any); !bad {
 		t.Fatal("请求体缺 messages")
 	}
+	// ⚠ 块数不再是 1：官方 3 块会排在客户端内容**前面**注入
+	//（JWT 账号缺官方 system 会被上游回 405 = 3012 的载体）。
+	// 断言改为「顶层存在 + 客户端那块还在」，而不是写死总数。
 	sys, ok := gotBody["system"].([]any)
-	if !ok || len(sys) != 1 {
+	if !ok || len(sys) == 0 {
 		t.Errorf("system 应提到顶层，实际 %v", gotBody["system"])
+	}
+	clientKept := false
+	for _, b := range sys {
+		bm, _ := b.(map[string]any)
+		if txt, _ := bm["text"].(string); containsStr(txt, "你是助手") {
+			clientKept = true
+		}
+	}
+	if !clientKept {
+		t.Errorf("客户端自己的 system 必须保留，实际 %v", sys)
 	}
 	if v, _ := gotBody["max_tokens"].(float64); v != 64 {
 		t.Errorf("max_tokens 应保留，实际 %v", gotBody["max_tokens"])
