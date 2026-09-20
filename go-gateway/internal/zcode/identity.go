@@ -264,27 +264,40 @@ func osCategory(goos string) string {
 
 // TraceHeaders 返回**追踪头**（对话通道用）。
 //
-// # 为什么单独成一组（而不是塞进 Headers）
+// # ⚠ 2026-09-20 更正：此前"只发三个"的结论被实测推翻
 //
-// 参考实现（zcode2api 的 `identity.py::build_trace_headers`）明确记载了
-// 一个**会触发 3012** 的坑：
+// 旧注释（引自某参考实现的 `identity.py::build_trace_headers`）声称：
 //
-//	「通道差异（关键，误发会触发上游 3012 "unusual activity"）：
-//	  start-plan（JWT 通道，cred.jwt 存在）：**只发** x-request-id /
-//	  x-zcode-session-type / x-zcode-trace-id 三个头，**不发**
-//	  x-query-id / x-session-id —— 官方客户端 start-plan 请求不带这两个。
-//	  coding-plan（API Key 通道）：额外发 x-query-id / x-session-id。」
+//	「start-plan（JWT 通道）**只发** x-request-id / x-zcode-session-type /
+//	  x-zcode-trace-id 三个头，**不发** x-query-id / x-session-id。
+//	  误发会触发上游 3012 "unusual activity"。」
 //
-// 我们走的是 JWT（start-plan）通道，故这里**只发三个**。
-// 单独成组是为了让"哪些头属于哪条通道"这件事在代码里可见 ——
-// 混进 Headers 就会被"顺手补全"而踩坑。
+// **但抓包实测（Reqable，官方客户端 3.14.0 的成功对话请求）显示官方在发：**
+//
+//	x-query-id:    01a0bc8b-d86e-7e99-9808-73c0d0a52642
+//	x-session-id:  8fc6b5b0-fb13-4801-b1de-988f41d14eed
+//
+// 即：**那条注释与实测矛盾**。它可能针对的是另一个版本/另一条通道，
+// 也可能本身就不对。在拿到更多证据前，**不再把它当作约束** ——
+// 照官方实测发全。
+//
+// ⚠ 教训（值得记）：注释里的"参考实现说…"是**二手结论**，
+// 会随上游版本失效；而抓包是**一手事实**。二者冲突时以抓包为准，
+// 并把这个冲突写进注释 —— 否则下一个人还会照着旧注释改回去。
 //
 // ⚠ 每次请求都要**重新生成**（不能被缓存复用）：它们标识单次请求。
 func (i Identity) TraceHeaders() map[string]string {
 	return map[string]string{
-		"x-request-id":        newTraceID(),
+		"x-request-id":         newTraceID(),
 		"x-zcode-session-type": "main",
 		"x-zcode-trace-id":     newTraceID(),
+		// 官方实测**在发**这两个（见上）。旧实现刻意不发，已更正。
+		"x-query-id": newTraceID(),
+		"x-session-id": func() string {
+			// 官方是裸 uuid（无 `sess_` 前缀）——抓包值
+			// `8fc6b5b0-fb13-4801-b1de-988f41d14eed` 证实。
+			return newTraceID()
+		}(),
 	}
 }
 
@@ -314,11 +327,12 @@ func (i Identity) Headers() map[string]string {
 	// User-Agent 与 App-Version 成对出现
 	ver := strings.TrimSpace(i.AppVersion)
 	if ver != "" {
-		h["User-Agent"] = "ZCode/" + ver
+		// ⚠ 必须带 runtime 后缀（官方实测值），见 userAgentRuntimeSuffix 的注释。
+		h["User-Agent"] = "ZCode/" + ver + userAgentRuntimeSuffix
 		h["X-ZCode-App-Version"] = ver
 	} else {
 		// 版本取不到时官方会回退成 "ZCode/unknown"（参考实现的 fio 行为）
-		h["User-Agent"] = "ZCode/unknown"
+		h["User-Agent"] = "ZCode/unknown" + userAgentRuntimeSuffix
 	}
 
 	h["X-Title"] = "Z Code@" + firstNonEmpty(i.SourceTitle, "zcode")

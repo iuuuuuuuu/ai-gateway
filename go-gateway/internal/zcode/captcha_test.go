@@ -193,34 +193,49 @@ func TestSetCaptchaConfigFromUpstream(t *testing.T) {
 	}
 }
 
-// TestTraceHeadersAreStartPlanChannel 追踪头**只发三个**。
+// TestTraceHeadersMatchCapturedClient 追踪头必须与**抓包实测的官方客户端**一致。
 //
-// 参考实现（zcode2api 的 identity.py）明确记载：
+// # 2026-09-20 更正：此前这条测试编码的是一个**被推翻的结论**
 //
-//	「误发会触发上游 3012 "unusual activity"：
-//	  start-plan（JWT 通道）只发 x-request-id / x-zcode-session-type /
-//	  x-zcode-trace-id 三个头，**不发** x-query-id / x-session-id。」
+// 旧版本断言"只发 3 个、x-query-id / x-session-id 必须不发"，依据是
+// 某参考实现的注释。但 Reqable 抓到的**官方客户端成功请求**显示：
 //
-// 我们走 JWT 通道，故多一个都可能是错的。
-func TestTraceHeadersAreStartPlanChannel(t *testing.T) {
+//	x-query-id:    01a0bc8b-d86e-7e99-9808-73c0d0a52642
+//	x-session-id:  8fc6b5b0-fb13-4801-b1de-988f41d14eed
+//
+// 即官方**在发**这两个头。旧注释与实测矛盾，故：
+//   · 断言改为"必须**发**这 5 个"（照实测）
+//   · 并把"为什么改"写进测试 —— 否则后人照旧注释又改回去
+//
+// ⚠ 这条测试的价值不在于"锁住 3 或 5"，而在于**锁住"与抓包一致"**：
+// 上游协议会变，唯一可靠的判据是抓包，不是任何二手注释。
+func TestTraceHeadersMatchCapturedClient(t *testing.T) {
 	h := Identity{}.TraceHeaders()
 
-	if len(h) != 3 {
-		t.Errorf("start-plan 通道应只发 3 个追踪头，实际 %d 个：%v", len(h), keysOf(h))
+	// 官方实测发的 5 个追踪头，一个都不能少
+	want := []string{
+		"x-request-id",
+		"x-zcode-session-type",
+		"x-zcode-trace-id",
+		"x-query-id",  // ← 旧实现刻意不发，实测官方在发
+		"x-session-id", // ← 同上
 	}
-	for _, want := range []string{"x-request-id", "x-zcode-session-type", "x-zcode-trace-id"} {
-		if h[want] == "" {
-			t.Errorf("缺少必需追踪头 %q", want)
+	for _, k := range want {
+		if h[k] == "" {
+			t.Errorf("缺少官方实测会发的追踪头 %q（当前只有 %v）", k, keysOf(h))
 		}
 	}
-	// 这两个**必须不发**（发了会触发 3012）
-	for _, forbidden := range []string{"x-query-id", "x-session-id"} {
-		if _, ok := h[forbidden]; ok {
-			t.Errorf("%q 属于 coding-plan 通道，JWT 通道发了会触发 3012", forbidden)
-		}
+	if len(h) != len(want) {
+		t.Errorf("追踪头应恰好 %d 个（与抓包一致），实际 %d 个：%v",
+			len(want), len(h), keysOf(h))
 	}
 	if h["x-zcode-session-type"] != "main" {
-		t.Errorf("x-zcode-session-type 应为 main，实际 %q", h["x-zcode-session-type"])
+		t.Errorf("x-zcode-session-type 应为 main（抓包值），实际 %q", h["x-zcode-session-type"])
+	}
+	// x-session-id 是**裸 uuid**，不带 `sess_` 前缀（抓包值证实）
+	if s := h["x-session-id"]; strings.HasPrefix(s, "sess_") {
+		t.Errorf("x-session-id 应为裸 uuid（官方抓包值形如 8fc6b5b0-…），"+
+			"实际带 sess_ 前缀：%q", s)
 	}
 }
 

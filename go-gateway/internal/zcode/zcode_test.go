@@ -511,7 +511,6 @@ func TestIdentityHeadersShape(t *testing.T) {
 
 	must := map[string]string{
 		"HTTP-Referer":        "https://zcode.z.ai",
-		"User-Agent":          "ZCode/3.12.3",
 		"X-ZCode-App-Version": "3.12.3",
 		"X-Title":             "Z Code@zcode",
 		"X-Release-Channel":   "production",
@@ -528,6 +527,23 @@ func TestIdentityHeadersShape(t *testing.T) {
 		if h[k] != want {
 			t.Errorf("%s 应为 %q，实际 %q", k, want, h[k])
 		}
+	}
+
+	// User-Agent：**必须带 runtime 声明**（2026-09-20 抓包实测的官方值）。
+	//
+	// 官方完整值：
+	//	ZCode/3.14.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24
+	// 我们此前只发 `ZCode/3.12.3` —— 少了"我是 AI SDK 的 Node runtime"
+	// 这个声明，风控可能据此区分官方客户端与裸脚本。
+	//
+	// ⚠ 断言用"前缀 + 含 runtime"而不是全等：版本号会随客户端升级变化，
+	// **形态才是约束**，全等会让每次上游升级都误报。
+	if ua := h["User-Agent"]; !strings.HasPrefix(ua, "ZCode/3.12.3") {
+		t.Errorf("User-Agent 应以 ZCode/<版本> 开头，实际 %q", ua)
+	} else if !strings.Contains(ua, "runtime/node.js/") {
+		t.Errorf("User-Agent 必须带 runtime 声明（官方实测形如 "+
+			"`ZCode/3.14.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24`）—— "+
+			"少了它可能被风控识别为非官方客户端，实际 %q", ua)
 	}
 
 	// **不发** X-Device-Mid：参考实现注释说 LLM 请求路径不再发它，

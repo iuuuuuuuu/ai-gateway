@@ -142,6 +142,38 @@ type Cred struct {
 	CaptchaRegion string
 }
 
+// isStartPlan 该凭证是否属于 **start-plan** 通道。
+//
+// # 为什么要区分通道（这是端点选择与凭证选择的前提）
+//
+// 上游有**两条**通道，端点、凭证形态、计费来源都不同：
+//
+//	通道          端点                                       凭证
+//	────────────  ─────────────────────────────────────────  ──────────────────────
+//	start-plan    zcode.z.ai/api/v1/zcode-plan/anthropic      **jwt**
+//	coding-plan   {provider}/api/anthropic 或 …/coding/paas   `{apiKey}.{secret}`
+//
+// 抓包实测（`cdn-zcode.z.ai/zcode/config/zcode-builtin-23.json` 的 providerRules）：
+//
+//	account:zai-start-plan                  → zcode.z.ai/api/v1/zcode-plan/anthropic
+//	account:bigmodel-start-plan             → 同上
+//	account:zai-individual-coding-plan      → api.z.ai/api/anthropic
+//	account:bigmodel-individual-coding-plan → open.bigmodel.cn/api/anthropic
+//	account:*-offpeak-idle-plan             → zcode.z.ai/api/v1/off-peak/anthropic
+//
+// # 判据为什么是"有没有 jwt"
+//
+// 本地凭证文件里**没有**存套餐类型（只有 provider / credential / jwt /
+// account_id）。而 JWT **只有 start-plan 通道会签发** —— 走 OAuth 登录时才
+// 由上游一并返回。故"有 jwt"等价于"这个账号走过 start-plan 的 OAuth"。
+//
+// ⚠ 这个判据**不完美**：一个账号若同时有套餐与 API Key，我们会优先用
+// 套餐通道（有 jwt）。那是**有意的** —— 套餐是包月额度，用它更省。
+// 要纠正也很简单：删掉凭证里的 jwt 即可回落 API Key 通道。
+func (c *Cred) isStartPlan() bool {
+	return c != nil && strings.TrimSpace(c.JWT) != ""
+}
+
 // AccountIDFromJWT 从 JWT 里解出上游的 `user_id`（**不验签**）。
 //
 // # 用途

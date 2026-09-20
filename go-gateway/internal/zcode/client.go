@@ -34,7 +34,23 @@ type Client struct {
 	Timeout time.Duration
 	// Identity 身份头（伪装成官方客户端）。见 identity.go。
 	Identity Identity
+
+	// anthropicBaseOverride 仅测试用：覆盖 Anthropic 端点基址。
+	//
+	// # 为什么必须留这个口子
+	//
+	// start-plan 通道的端点是**硬编码的** zcode.z.ai（那是上游权威定义，
+	// 不该可配）。但测试**绝不能打真实上游** —— 既会消耗用户额度，
+	// 也会实打实地触发风控（本项目已经因为高频测试吃过 3012）。
+	//
+	// 故留一个只在测试里调用的覆盖点，让集成测试能打到 httptest 服务器。
+	anthropicBaseOverride string
 }
+
+// SetAnthropicBaseForTest 覆盖 Anthropic 端点基址（**仅测试用**）。
+//
+// 名字里带 ForTest 是刻意的：生产代码调用它就是 bug。
+func (c *Client) SetAnthropicBaseForTest(base string) { c.anthropicBaseOverride = base }
 
 // New 生产默认客户端。
 //
@@ -131,6 +147,35 @@ func (c *Client) streamHTTP() *http.Client {
 // ChatPath 对话端点路径（拼在 OpenAIBase 后）。
 const ChatPath = "/chat/completions"
 
+// Anthropic Messages 协议的声明头（官方客户端实测值）。
+//
+//	anthropic-version: 2023-06-01
+//	anthropic-beta:    mid-conversation-system-2026-04-07
+//
+// ⚠ 这两个**不是可选的**：Anthropic 协议要求 version，而 beta 声明
+// "本客户端支持 mid-conversation system turn"。不发 beta 可能被上游
+// 当成**旧版客户端**而走不同的兼容路径。
+const (
+	anthropicVersion = "2023-06-01"
+	anthropicBeta    = "mid-conversation-system-2026-04-07"
+)
+
+// userAgentRuntimeSuffix User-Agent 的 runtime 声明段（官方实测）。
+//
+// 官方完整值：
+//
+//	ZCode/3.14.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24
+//
+// 而我们此前只发 `ZCode/3.14.0`。差别在于官方**声明了它是 AI SDK 的
+// Node runtime** —— 风控据此区分"官方客户端发的"与"裸脚本发的"是
+// 完全可能的。成本为零，照发。
+//
+// ⚠ 版本号（4.0.27 / node.js/24）是抓包时那一刻的值，会随客户端升级变化。
+// 这里硬编码是**有意的取舍**：与其编造一个"看起来合理"的动态值，
+// 不如用一个**真实且曾被上游接受过**的值。它过期后最多是回到
+// "官方认为我们是稍旧的客户端"，而不会更糟。
+const userAgentRuntimeSuffix = " ai-sdk/provider-utils/4.0.27 runtime/node.js/24"
+
 // StreamChat 发起流式对话，返回上游原始流。
 //
 // openAIBody 是客户端发来的 OpenAI 请求体 —— **原样透传**（见文件头注释：
@@ -200,9 +245,43 @@ func (c *Client) StreamChat(ctx context.Context, cr *Cred, openAIBody []byte) (i
 }
 
 // streamChatOnce 发一次请求（不涉及验证码求解）。
+//
+// # 2026-09-20：改走 **Anthropic Messages** 端点
+//
+// 此前打的是 `{OpenAIBase}/chat/completions`（按量计费通道），
+// 实测**恒回** `429 {"code":1113,"msg":"余额不足或无可用资源包"}` ——
+// 而账号明明有 300 万 + 500 万 token/日。
+//
+// 原因是**通道错**：额度挂在 start-plan 上，而按量计费通道没有该账号的
+// 资源包。抓包实测官方客户端打的是：
+//
+//	POST https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages
+//
+// 且官方 provider 清单里**所有** provider 的 schema 都是 `anthropic`
+//（含 coding-plan），`openai:chat` 只存在于 templateRules（自定义模板）。
+//
+// 故这里：OpenAI 请求体 → **翻译** → Anthropic 请求体；
+// 上游返回的 Anthropic SSE → **翻译** → OpenAI SSE。
 func (c *Client) streamChatOnce(ctx context.Context, cr *Cred, openAIBody []byte) (io.ReadCloser, int, []byte, error) {
-	rawURL := cr.Provider.OpenAIBase() + ChatPath
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(openAIBody))
+	// 解析出模型名（翻译需要它），并把请求体翻成 Anthropic 形状。
+	model := modelNameOf(openAIBody)
+	anthBody, err := BuildAnthropicBody(openAIBody, model)
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("翻译请求体失败: %w", err)
+	}
+	// ⚠ **强制流式**，即使客户端要的是非流式。
+	//
+	// 为什么：上游的流式与非流式响应形状**不同**（SSE 事件 vs 单个 message
+	// 对象），若两条路都自己翻译，就有两套要同步维护的代码 + 两套测试。
+	// 而网关的非流式路径本来就是"读完流再聚合"（见 forward.go 的
+	// `productUp.Aggregate(rc, …)`）—— 即**它本来就期望拿到流**。
+	//
+	// 故这里统一按流式请求上游，非流式的聚合交给已有的 AggregateOpenAI
+	//（它解析的正是我们翻译产物那种 OpenAI SSE）。一条路径，一处真相。
+	anthBody = forceStream(anthBody)
+
+	rawURL := c.anthropicMessagesURLFor(cr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(anthBody))
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -215,9 +294,154 @@ func (c *Client) streamChatOnce(ctx context.Context, cr *Cred, openAIBody []byte
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return nil, resp.StatusCode, raw, nil
+		// ⚠ 错误体也可能是 Anthropic 形状 —— 翻成 OpenAI 形状再返回，
+		// 否则调用方（server 层）解析不出错误信息，用户只看到"上游错误"。
+		return nil, resp.StatusCode, NormalizeErrorBody(raw, resp.StatusCode), nil
 	}
-	return resp.Body, resp.StatusCode, nil, nil
+	// 上游是 Anthropic SSE → 翻成 OpenAI SSE。
+	//
+	// ⚠ 翻译是**流式**的（io.Pipe），不缓冲整个响应 ——
+	// 缓冲会让"首字节延迟"变成"整段生成延迟"，用户看到长时间空白。
+	return TranslateStream(resp.Body, model), resp.StatusCode, nil, nil
+}
+
+// forceStream 把请求体里的 `stream` 强制设为 true。
+//
+// 见 streamChatOnce 里"为什么强制流式"的说明。解析失败时原样返回
+//（不该因为一个可选字段解析不动就让整个请求失败）。
+func forceStream(body []byte) []byte {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	if v, ok := m["stream"].(bool); ok && v {
+		return body
+	}
+	m["stream"] = true
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// anthropicMessagesURL 拼 Anthropic Messages 端点。
+//
+// # 端点来源（**不硬编码**）
+//
+// 官方把"套餐 → 端点"的映射放在两个地方，优先级如下：
+//
+//	① `cdn-zcode.z.ai/zcode/config/zcode-builtin-23.json` 的 providerRules
+//	   （账号级，最权威）：`account:*start-plan*` → zcode.z.ai/api/v1/zcode-plan/anthropic
+//	② 默认回落 `StartPlanBase`
+//
+// 抓包实测的映射（providerRules）：
+//
+//	account:zai-start-plan              → https://zcode.z.ai/api/v1/zcode-plan/anthropic
+//	account:bigmodel-start-plan         → 同上
+//	account:zai-individual-coding-plan  → https://api.z.ai/api/anthropic
+//	account:bigmodel-individual-coding-plan → https://open.bigmodel.cn/api/anthropic
+//	account:*-offpeak-idle-plan         → https://zcode.z.ai/api/v1/off-peak/anthropic
+//
+// ⚠ 当前实现只用"start-plan 与否"做二分（够用且可验证），
+// 完整映射表见 `uitest/ZCODE-对话请求权威规格.md`。
+func anthropicMessagesURL(cr *Cred) string {
+	base := StartPlanBase
+	if cr != nil && !cr.isStartPlan() {
+		// coding-plan（按量）通道：走服务商自己的 anthropic 端点。
+		if b := cr.Provider.AnthropicBase(); b != "" {
+			base = b
+		}
+	}
+	return base + AnthropicMessagesPath
+}
+
+// anthropicMessagesURLFor 在 anthropicMessagesURL 之上叠加测试覆盖。
+//
+// 生产路径等于 anthropicMessagesURL；测试时被 SetAnthropicBaseForTest
+// 指向 httptest —— 这样测试**不打真实上游**（不耗额度、不触风控）。
+func (c *Client) anthropicMessagesURLFor(cr *Cred) string {
+	if c != nil && c.anthropicBaseOverride != "" {
+		return strings.TrimRight(c.anthropicBaseOverride, "/") + AnthropicMessagesPath
+	}
+	return anthropicMessagesURL(cr)
+}
+
+// NormalizeErrorBody 把上游的错误体统一成 OpenAI 的 error 形状。
+//
+// # 为什么必须做
+//
+// server 层的错误处理按 **OpenAI 形状**解析（`error.message`）。
+// 上游返回的是 Anthropic 形状：
+//
+//	{"type":"error","error":{"type":"invalid_request_error","message":"..."}}
+//	或 {"code":3007,"msg":"captcha verify failed"}
+//
+// 不转的话用户看到的是**空错误**或"未知错误"，而真正的原因
+//（验证码/额度/参数）就藏在原文里 —— 那是最难排查的状态。
+func NormalizeErrorBody(body []byte, status int) []byte {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		// 不是 JSON（HTML 错误页等）：包一层，至少让用户看到原文片段
+		msg := strings.TrimSpace(string(body))
+		if len(msg) > 500 {
+			msg = msg[:500] + "…"
+		}
+		b, _ := json.Marshal(map[string]any{
+			"error": map[string]any{
+				"message": msg,
+				"type":    "upstream_error",
+				"code":    status,
+			},
+		})
+		return b
+	}
+	// 已是 OpenAI 形状 → 原样
+	if _, ok := m["error"].(map[string]any); ok {
+		return body
+	}
+	msg := ""
+	typ := "upstream_error"
+	// Anthropic 形状：{"type":"error","error":{"type":"…","message":"…"}}
+	if e, ok := m["error"].(map[string]any); ok {
+		msg = strOr(e["message"], "")
+		if t := strOr(e["type"], ""); t != "" {
+			typ = t
+		}
+	}
+	// ZCode 业务码形状：{"code":3007,"msg":"captcha verify failed"}
+	if msg == "" {
+		msg = strOr(m["msg"], "")
+	}
+	// 有些是 {"error":{"code":…,"msg":…}} 或 {"message":"…"}
+	if msg == "" {
+		msg = strOr(m["message"], "")
+	}
+	if msg == "" {
+		msg = strings.TrimSpace(string(body))
+	}
+	out := map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    typ,
+			"code":    firstNonNil(m["code"], status),
+		},
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return body
+	}
+	return b
+}
+
+// firstNonNil 返回第一个非 nil 的值（用于错误码回落）。
+func firstNonNil(vs ...any) any {
+	for _, v := range vs {
+		if v != nil {
+			return v
+		}
+	}
+	return nil
 }
 
 // IsCaptchaRequiredBody 报告响应体是否是"需要验证码"（3007）。
@@ -233,18 +457,57 @@ func IsCaptchaRequiredBody(body []byte) bool {
 		strings.Contains(s, "验证码")
 }
 
-// appendCaptchaNote 在原始响应体里补一句可读说明（保留原 body 不动其结构）。
+// appendCaptchaNote 在**错误响应体**里补一句可读说明。
 //
-// 为什么是"拼接"而不是重新构造 JSON：上游 body 的形状随版本变，
-// 我们**没有把握**解析它再序列化回等价的 JSON；而这段文字只是给人看的，
-// 拼在后面既能被用户看到，又不会破坏调用方对原始 body 的判断。
+// # ⚠ 2026-09-20 修正：此前是"往 JSON 后面拼文本"，那会**破坏 JSON**
+//
+// 旧实现直接 `append(body, note...)`，产物形如：
+//
+//	{"error":{...}}
+//	[网关说明] 求解未成功…
+//
+// 那是**非法 JSON** —— server 层的错误处理会解析失败，
+// 于是用户看到的是"未知错误"，而我们精心写的说明反而**谁也看不到**。
+// 这个缺陷是被 `TestStreamChatTranslatesErrorBody` 抓出来的：
+// 它断言错误体必须是合法 JSON。
+//
+// 现在改成：**把说明放进 error.message**（结构不变，说明也能透出）。
 func appendCaptchaNote(body []byte, reason string) []byte {
 	note := fmt.Sprintf(
-		"\n\n[网关说明] 上游要求人机验证，但**求解未成功**，因此没有重试。原因：%s\n"+
-			"[网关说明] 若求解器组件缺失，请确认安装包内含 assets/zcode-captcha；"+
-			"若是冷却/限流，稍后会自动恢复（求解器自身有冷却保护）。",
-		reason)
-	return append(append([]byte{}, body...), note...)
+		"（网关附注：上游要求人机验证，但求解未成功，故未重试。原因：%s"+
+			"；若为组件缺失请确认安装包含 assets/zcode-captcha，"+
+			"若为冷却/限流则稍后会自动恢复）", reason)
+
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err == nil {
+		if e, ok := m["error"].(map[string]any); ok {
+			if msg, ok := e["message"].(string); ok && msg != "" {
+				e["message"] = msg + " " + note
+				if out, err := json.Marshal(m); err == nil {
+					return out
+				}
+			}
+		}
+		// 没有 error.message 就补一个（保持结构合法）
+		m["error"] = map[string]any{
+			"message": note,
+			"type":    "captcha_solve_failed",
+		}
+		if out, err := json.Marshal(m); err == nil {
+			return out
+		}
+	}
+	// 原 body 不是 JSON（HTML 错误页等）：包成 JSON 再附注
+	b, err := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": note + " 上游原始响应：" + strings.TrimSpace(string(body)),
+			"type":    "captcha_solve_failed",
+		},
+	})
+	if err != nil {
+		return body
+	}
+	return b
 }
 
 // solveCaptcha 用共享求解器求一个 verifyParam。
@@ -278,45 +541,73 @@ func (c *Client) captchaRegion() string {
 
 // applyHeaders 写上游请求头。
 //
-// ## 认证头的两种形状（按端点区分）
+// # 本函数已按**抓包实测的权威规格**对齐（2026-09-20）
+//
+// 此前这里的头是**推断**出来的，而且有一条推断被实测推翻。现在有官方客户端
+// 成功请求的逐字抓包（Reqable，HTTP 200 + 流式内容），照它对齐。
+//
+// ## 与旧实现的四处差异（都是实测驱动，不是猜）
+//
+//	① **补 x-api-key**：官方同时发 authorization 与 x-api-key，**同值**（都是 JWT）。
+//	   Anthropic 协议里 x-api-key 才是标准认证位置；只发 Authorization
+//	   等于少了协议要求的头。
+//
+//	② **补 anthropic-version / anthropic-beta**：官方发
+//	   `2023-06-01` 与 `mid-conversation-system-2026-04-07`。
+//	   第二个是协议扩展声明 —— 不发可能被上游当成**旧版客户端**。
+//
+//	③ **User-Agent 要带 runtime 段**：官方是
+//	   `ZCode/3.14.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24`
+//	   而我们只发 `ZCode/3.14.0`。差别在于官方**声明了它是 AI SDK /
+//	   Node runtime** —— 风控可能据此区分"官方客户端"与"裸脚本"。
+//
+//	④ **补 x-query-id / x-session-id**（见 TraceHeaders 的注释更正）。
+//
+// ## 认证头的形状
 //
 //	OpenAI 端点     Authorization: Bearer {credential}
-//	Anthropic 端点  x-api-key: {credential}  +  Authorization: Bearer {credential}
+//	Anthropic 端点  x-api-key: {jwt}  +  Authorization: Bearer {jwt}
 //	                +  anthropic-version: 2023-06-01
 //
-// 本包**只走 OpenAI 端点**，故只发 Authorization。Anthropic 那套保留在
-// 注释里，便于将来切换时不用重新逆向。
-//
-// ## 身份头是可选的
-//
-// 实测（见 signing.go 的对照实验）：不带身份头也能通过认证。
-// 照发的理由是"让代理在指纹层与官方客户端不可区分"（参考实现的注释口径），
-// 成本为零而"被风控识别为第三方代理"的代价可能很高。
-//
-// 但**不因缺头而失败** —— 头缺失只是少一层伪装。
+// ⚠ 注意 Anthropic 端点用的是 **jwt**，不是 `{apiKey}.{secret}` 形态的
+// `credential` —— 后者是按量计费通道（`open.bigmodel.cn/api/coding/paas/v4`）
+// 用的。两者不能混（混了就是 `1113 余额不足或无可用资源包`）。
 func (c *Client) applyHeaders(req *http.Request, cr *Cred, stream bool) {
-	req.Header.Set("Authorization", "Bearer "+cr.Credential)
+	// ---- 认证：authorization 与 x-api-key 都发（官方实测同值）----
+	//
+	// ⚠ 用 **jwt**（start-plan 通道的凭证）。`cr.Credential` 是
+	// `{apiKey}.{secret}` 形态，属于**另一条通道**；两者混用会回 1113。
+	// 若该账号没有 jwt（只导入了 credential），则回落 credential ——
+	// 那样至少能走按量通道，而不是一个头都不发。
+	token := strings.TrimSpace(cr.JWT)
+	if token == "" {
+		token = strings.TrimSpace(cr.Credential)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-Api-Key", token)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
+	// ---- Anthropic 协议声明（官方必发）----
+	req.Header.Set("Anthropic-Version", anthropicVersion)
+	if !stream {
+		// ⚠ beta 头只声明"我们支持 mid-conversation system"这个扩展。
+		// 流式与非流式都发 —— 官方是流式抓的，非流式同协议同要求。
+	}
+	req.Header.Set("Anthropic-Beta", anthropicBeta)
+
 	// 身份头（伪装成官方客户端）
 	for k, v := range c.Identity.Headers() {
 		if v != "" {
 			req.Header.Set(k, v)
 		}
 	}
-	// 追踪头：start-plan（JWT）通道**只发这三个**。
-	//
-	// 参考实现（zcode2api 的 identity.py）明确记载：
-	//
-	//	「通道差异（关键，**误发会触发上游 3012 "unusual activity"**）：
-	//	  start-plan（JWT 通道）：只发 x-request-id / x-zcode-session-type /
-	//	  x-zcode-trace-id 三个头，**不发** x-query-id / x-session-id。」
-	//
-	// 故这里只补三个；`x-query-id` / `x-session-id` **刻意不发**。
+	// 追踪头（含 x-query-id / x-session-id，见 TraceHeaders 的注释更正）
 	for k, v := range c.Identity.TraceHeaders() {
 		if v != "" {
 			req.Header.Set(k, v)

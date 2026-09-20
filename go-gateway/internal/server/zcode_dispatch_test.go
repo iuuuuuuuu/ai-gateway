@@ -279,10 +279,21 @@ func TestThreeProductsCoexistInPool(t *testing.T) {
 	}
 }
 
-// TestZcodeStreamPassedThroughUnchanged ZCode 的流**原样透传**（不翻译）。
+// TestZcodeStreamPassedThroughUnchanged **server 层**不擅自加工产品上游给的流。
 //
-// 这是选 OpenAI 端点的收益：上游给的就是标准 OpenAI SSE，
-// 与 WorkBuddy 路径的读法完全一致。
+// # ⚠ 2026-09-20 更正：这条测试的范围与名字
+//
+// 它此前叫"ZCode 的流原样透传（不翻译）"，理由是"选了 OpenAI 端点所以零翻译"。
+// **那个前提已经不成立了** —— 抓包实测 ZCode 上游是 Anthropic 协议，
+// 现在 `zcode.Client` 会做双向翻译（见 `internal/zcode/translate.go`）。
+//
+// 但这条测试**本身仍然有效**，只是它测的是**另一层**：
+// 这里注入的 `fakeQoder` 直接实现了 ProductUpstream 接口，
+// 故它验证的是「**server 的派发层**不会擅自改写产品上游给的字节」——
+// 与"上游是什么协议"无关。翻译的正确性由 `internal/zcode/translate_test.go`
+// 的 21 条测试负责。
+//
+// 保留它的价值：**server 层若某天加了"顺手格式化一下"的逻辑，这里会红。**
 func TestZcodeStreamPassedThroughUnchanged(t *testing.T) {
 	h, _, fz := newThreeProductHandler(t, zcodeAuth("zc-1"))
 	// 标准 OpenAI SSE（非嵌套）
