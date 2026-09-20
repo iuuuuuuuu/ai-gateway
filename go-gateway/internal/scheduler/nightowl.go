@@ -61,6 +61,12 @@ func (s *Scheduler) RunNightOwlNow() {
 // 或机器休眠后迟到唤醒 —— 窗口外执行毫无意义（上游不计入），
 // 因此这里再判一次，避免做无用请求。
 func (s *Scheduler) runNightOwl(ctx context.Context) {
+	// 手动触发时被限定的账号 uid（空串 = 自动排程）。
+	//
+	// ⚠ 用 uid 而不是 bool 更直接：手动触发**必然**有具体账号，
+	// 而写账号记录正需要这个 uid。若只留 bool 还得再把 uid 取一遍
+	//（我第一版就是那样，结果把 bool 当 uid 传给了 Task）。
+	manualUID := accountScopeUID(ctx)
 	if !withinNightWindow() {
 		log.Printf("nightowl: skipped (outside 23:00-08:00 CST window)")
 		// 窗口外跳过是「明确且原因重要」的：用户点了「立即执行」却什么都没发生，
@@ -68,6 +74,18 @@ func (s *Scheduler) runNightOwl(ctx context.Context) {
 		// 用 TaskAllDaily：这是整轮条件、与具体账号无关，逐账号各写一条等于刷屏。
 		s.cfg.Records.TaskAllDaily("夜猫子任务", records.ResultInfo,
 			"当前不在夜猫时段（23:00–08:00 北京时间），上游不计入本次上报")
+		// ⚠ 但**手动触发**时还要给该账号补一条 —— 上面那条是整轮汇总，
+		// **不带 accountId**，用户在账号卡片的记录里按账号筛选时看不到它。
+		//
+		// 所有者原话（2026-09-20）：「workbuddy的夜猫子任务也不知道到底
+		// 执行了没，任务记录里面也没有」。他正是在卡片上点的。
+		//
+		// 不担心刷屏：手动触发是用户主动行为，一次点击一条记录是合理的；
+		// 自动排程走不到这里（其在窗口外根本不会被排入，见 runCareTask）。
+		if manualUID != "" {
+			s.cfg.Records.Task(manualUID, "夜猫子任务", records.ResultInfo,
+				"当前不在夜猫时段（23:00–08:00 北京时间），上游不计入本次上报")
+		}
 		return
 	}
 

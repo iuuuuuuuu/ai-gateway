@@ -228,10 +228,31 @@ func (s *Scheduler) RunTaskFor(name, accountUID string) (TaskRunResult, error) {
 	// 夜猫子只在夜猫窗口内计入：窗口外触发会被 runNightOwl 直接跳过，
 	// 与其让用户白等一轮然后什么都没发生，不如提前回报原因。
 	if name == TaskNameNightOwl && !withinNightWindow() {
+		// ⚠ 这里**必须补一条记录**，因为下面会 `return` —— 根本不进
+		// runNightOwl，故写在那里的留痕是**死代码**。
+		//
+		// 我第一版就写错了位置（加在 runNightOwl 的窗口外分支里），
+		// 测试直接把它揪出来：`手动触发夜猫子…实际 0 条`。
+		// 这正是"先写失败测试再改"的价值：位置错了一眼可见。
+		//
+		// 所有者原话（2026-09-20）：「workbuddy的夜猫子任务也不知道到底
+		// 执行了没，任务记录里面也没有」。他正是在账号卡片上点的按钮 ——
+		// 那个动作走的就是本函数。
+		//
+		// 为什么这里可以放心写：手动触发是**用户主动行为**，一次点击一条
+		// 记录是合理的；而自动排程在窗口外根本不会被排入（见 runCareTask），
+		// 故不必担心刷屏。
+		const nightOwlSkipMsg = "当前不在夜猫子时段（23:00–08:00 北京时间），上游不计入本次上报"
+		s.cfg.Records.TaskAllDaily(name, records.ResultInfo, nightOwlSkipMsg)
+		if accountUID != "" {
+			// 账号级记录：整轮汇总**不带 accountId**，用户在账号卡片的
+			// 记录里按账号筛选时看不到它，于是"点了却什么都没发生"。
+			s.cfg.Records.Task(accountUID, "夜猫子任务", records.ResultInfo, nightOwlSkipMsg)
+		}
 		return TaskRunResult{
 			Task:    name,
 			Skip:    "outside_window",
-			Message: "当前不在夜猫子时段（23:00–08:00 北京时间），上游不计入本次上报",
+			Message: nightOwlSkipMsg,
 		}, nil
 	}
 
@@ -299,6 +320,24 @@ func withAccountScope(ctx context.Context, uid string) context.Context {
 func inAccountScope(ctx context.Context, uid string) bool {
 	scoped, _ := ctx.Value(accountScopeKey{}).(string)
 	return scoped == "" || scoped == uid
+}
+
+// accountScopeUID 返回被限定的账号 uid；空串 = 未限定。
+//
+// # 用途：区分「手动触发某个账号」与「自动排程」
+//
+// 两者的记录策略必须不同（所有者 2026-09-20 反馈「我手动执行了但是查看
+// 记录却没有」）：
+//
+//	手动（非空）—— 用户盯着结果 ⇒ 无论成败都要留**账号级**记录
+//	自动（空）  —— 没人看 ⇒ 只在"有新变化"时写，避免把记录刷成噪音
+//
+// 判据就是"有没有人在看"，而这里正是那个信息的唯一来源。
+// 抽成具名函数而不是让各任务直接读 ctx：语义在调用点一眼可见，
+// 也避免每个任务各自 `_, ok := ctx.Value(...)` 写错键。
+func accountScopeUID(ctx context.Context) string {
+	scoped, _ := ctx.Value(accountScopeKey{}).(string)
+	return scoped
 }
 
 

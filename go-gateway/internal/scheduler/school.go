@@ -39,6 +39,21 @@ func (s *Scheduler) RunSchoolNow() {
 // 单账号失败只记日志、不影响其余账号 —— 活动任务是尽力而为的日常任务。
 func (s *Scheduler) runSchool(ctx context.Context) {
 	first := true
+	// manualUID = 用户在某个账号的菜单里手动触发时的账号 uid；空串 = 自动排程。
+	//
+	// # 为什么这个区分是必要的（所有者 2026-09-20 反馈）
+	//
+	// 原话：「开学季任务也是，我手动执行了但是查看记录却没有」。
+	//
+	// 根因：成功的路径里，「活动不在期」与「在期但无已达标任务」**都不写
+	// 账号级记录**。原作者的顾虑是"逐账号写会把记录刷成噪音" ——
+	// 那条顾虑**对自动排程成立**（每天一次、没人看），
+	// 但对**手动触发**不成立：用户主动点了按钮，就必须有反馈。
+	//
+	// 判据不是主观偏好，而是**有没有人在看**。而代码里已经有这个信息：
+	// `RunTaskFor(name, accountUID)` 的 accountUID 非空即手动触发
+	//（见其注释：「用户在某个账号的菜单里点…期望影响那张卡片」）。
+	manualUID := accountScopeUID(ctx)
 	// anyInPeriod 与 anyAnswered 必须分开记，否则两种情况会被混为一谈：
 	//   - 「问了上游，回答是不在期」→ 结论成立，值得写一条汇总记录；
 	//   - 「一个账号都没问到」（全被禁用/区域不符/拉清单全失败）→ 我们对活动
@@ -82,6 +97,19 @@ func (s *Scheduler) runSchool(ctx context.Context) {
 		if !inPeriod {
 			// 活动已下线：正常状态，不是错误。后续账号也不用再试。
 			log.Printf("school %s: activity not in period, skip", uid8(a.UID))
+			// 手动触发时必须给**该账号**留痕（所有者 2026-09-20 反馈：
+			// 「开学季任务也是，我手动执行了但是查看记录却没有」）。
+			//
+			// 为什么汇总记录不够：末尾那条 `TaskAllDaily` 是**整轮**结论，
+			// **不带 accountId** —— 用户在账号卡片的记录里按该账号筛选时
+			// 看不到它，于是"点了却什么都没发生"。
+			//
+			// ⚠ 只对手动触发补写。自动排程每天跑一次，为"活动不在期"逐账号
+			// 写记录会把记录刷成噪音 —— 原作者那条顾虑**对自动路径成立**。
+			if manualUID != "" {
+				s.cfg.Records.Task(a.UID, "开学季活动", records.ResultInfo,
+					"活动不在期（已下线或尚未开始），本次未做任何领取")
+			}
 			continue
 		}
 		anyInPeriod = true
@@ -93,6 +121,17 @@ func (s *Scheduler) runSchool(ctx context.Context) {
 			// 每天为「活动在期但无奖励可领」写一条只会把记录刷成噪音。
 			s.cfg.Records.Task(a.UID, "开学季活动", records.ResultSuccess,
 				fmt.Sprintf("领取 %d 个已达标任务奖励", claimed))
+		} else if manualUID != "" && len(claimErrs) == 0 {
+			// 在期、但**没有已达标任务** ⇒ 此前完全不写记录。
+			//
+			// 那在自动排程下是对的（没人看，写下来是噪音），但在**手动触发**
+			// 下是缺陷：用户主动点了按钮，什么都没写等于"点了没反应"
+			//（所有者原话：「我手动执行了但是查看记录却没有」）。
+			//
+			// ⚠ 这里排除了 `len(claimErrs) > 0` 的情况 —— 那些失败会在
+			// 下面逐条写 failed 记录，再加一条 info 只会让同一件事出现两次。
+			s.cfg.Records.Task(a.UID, "开学季活动", records.ResultAlready,
+				"活动在期，但当前没有可领取的已达标任务（无需操作）")
 		}
 		// 领取失败必须留痕（按天去重）：这是用户排查「奖励为什么没到账」的线索。
 		for _, e := range claimErrs {
