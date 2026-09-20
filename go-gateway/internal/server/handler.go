@@ -556,11 +556,46 @@ const (
 // 列表是**两区并集**：/v1/models 没有账号上下文，无法知道用户会选哪个账号，
 // 因此必须让客户端看到全部可用的名称，同时用能力字段诚实地表达
 // 「这个名称只在某一个区域存在」。见 mergedModelList 与 capabilityFieldsFor。
+//
+// # ⚠ `?refresh=1`：清掉失败负缓存（2026-09-20 实测缺陷）
+//
+// 所有者反馈：「我明明国内外账号都有,居然还有这个提示 这是个bug」。
+//
+// 查证：他两侧账号都齐（实测带代理后 intl 21 个模型、cn 16 个模型都能拉到），
+// 但**某一轮**国际版拉取失败（网络抖动）⇒ `knownRegion[intl]=false` ⇒
+// 近半数模型被打上「国服未检测到可用真值」。
+//
+// 而那段文案结尾写着「稍后点「刷新」重试即可确认」—— **但它做不到**：
+//
+//	`resetModelsCache()` 只被测试调用，**生产代码里没有任何地方调它**（实测）。
+//	`fetchModelsForRegion` 在失败后进入 `modelsFetchFailCooldown`（5 分钟），
+//	期间**直接 return nil**，连试都不试。
+//
+// 于是用户点「刷新」→ 走同一个 `/v1/models` → 仍吃负缓存 → 界面毫无变化。
+// **文案让他做的事，代码不支持** —— 与"补账号"那个错误建议同一性质。
+//
+// 故加 `?refresh=1`：清掉负缓存后重拉。界面上的「刷新模型列表」改用它，
+// 让文案里的"稍后刷新"真正可执行（用户不必等满 5 分钟）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	if wantsModelRefresh(r) {
+		resetModelsCache()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
 		"data":   h.mergedModelList(),
 	})
+}
+
+// wantsModelRefresh 判断本次 /v1/models 请求是否要求**强制重拉**。
+//
+// 接受 `refresh=1` / `refresh=true`（大小写不敏感）——
+// 宽容输入，客户端不必纠结用哪种写法。
+func wantsModelRefresh(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	v := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("refresh")))
+	return v == "1" || v == "true" || v == "yes"
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {

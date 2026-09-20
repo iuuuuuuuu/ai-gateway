@@ -1161,11 +1161,26 @@ pub fn detect_agent_clients() -> Result<Value, String> {
 }
 
 /// 获取网关模型列表（优先从运行中的网关拉取，失败回退预置列表）。
+///
+/// `refresh` = true 时**强制重拉**：网关侧清掉按区域的失败负缓存
+///（`/v1/models?refresh=1`）。
+///
+/// # 为什么需要这个参数（2026-09-20 实测缺陷）
+///
+/// 网关按区域缓存模型清单，拉取失败后有 5 分钟负缓存（期间连试都不试）。
+/// 而界面上那段「国服未检测到可用真值…稍后点刷新重试即可确认」里的
+/// **"刷新"此前走的就是带缓存的路径** ⇒ 点了没有任何变化。
+///
+/// 用户被文案指引去做一件事，而代码不支持 —— 与"补账号"那个错误建议
+/// 同一性质（所有者：「我明明国内外账号都有,居然还有这个提示 这是个bug」）。
 #[tauri::command]
-pub async fn get_gateway_models() -> Result<Value, String> {
-    Ok(json!({
-        "models": ai_gateway_core::modules::gateway::fetch_models().await,
-    }))
+pub async fn get_gateway_models(refresh: Option<bool>) -> Result<Value, String> {
+    let models = if refresh.unwrap_or(false) {
+        ai_gateway_core::modules::gateway::fetch_models_refreshed().await
+    } else {
+        ai_gateway_core::modules::gateway::fetch_models().await
+    };
+    Ok(json!({ "models": models }))
 }
 
 /// 获取网关累计 Token 用量统计（days 省略 = 全部历史）。

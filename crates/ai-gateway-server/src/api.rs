@@ -1740,11 +1740,30 @@ fn gateway_root_and_key() -> (String, String) {
     (format!("http://127.0.0.1:{port}"), api_key)
 }
 
-/// GET /api/gateway/models —— 返回网关支持的模型列表（优先动态查询）。
-async fn api_gateway_models() -> Response {
-    json_ok(json!({
-        "models": ai_gateway_core::modules::gateway::fetch_models().await,
-    }))
+/// GET /api/gateway/models?refresh=1 —— 返回网关支持的模型列表（优先动态查询）。
+///
+/// `refresh=1/true` 时**强制重拉**：让网关清掉按区域的失败负缓存。
+/// 界面上的「刷新模型列表」用它 —— 那段「国服未检测到可用真值…稍后点刷新
+/// 重试即可确认」的文案承诺了刷新能重新确认，而带缓存的路径在失败后
+/// 5 分钟内连试都不试 ⇒ 点了没变化（2026-09-20 实测缺陷）。
+///
+/// ⚠ 必须与 Tauri 命令 `get_gateway_models(refresh)` 行为一致：
+/// 同一个界面按钮在桌面版与 webui 版下要走同一条路径，否则"刷新无效"
+/// 只会在其中一种形态下复现 —— 那种不一致极难查。
+async fn api_gateway_models(Query(params): Query<HashMap<String, String>>) -> Response {
+    let force = params
+        .get("refresh")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false);
+    let models = if force {
+        ai_gateway_core::modules::gateway::fetch_models_refreshed().await
+    } else {
+        ai_gateway_core::modules::gateway::fetch_models().await
+    };
+    json_ok(json!({ "models": models }))
 }
 
 /// GET /api/gateway/usage?days=7 —— 网关累计 Token 用量（days 省略 = 全部历史）。

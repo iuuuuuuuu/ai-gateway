@@ -3482,6 +3482,27 @@ pub async fn switch_mode(mode: GatewayMode, uids: Vec<String>) -> Value {
 
 /// 从运行中的网关动态拉取上游模型列表。仅从网关实时获取，不使用内置静态模型。
 pub async fn fetch_models() -> Vec<Value> {
+    fetch_models_impl(false).await
+}
+
+/// 强制重拉网关的模型清单（清掉网关侧的失败负缓存）。
+///
+/// # 为什么需要它（2026-09-20 实测缺陷）
+///
+/// 网关的按区域模型清单有**失败负缓存**（5 分钟）：某一轮拉取失败后，
+/// 期间连试都不试。而界面那段「国服未检测到可用真值…稍后点刷新重试即可」
+/// 里的"刷新"此前走的就是带缓存的路径 ⇒ **点了没有任何变化**。
+///
+/// 用户被文案指引去做一件事，而代码不支持 —— 与"补账号"那个错误建议
+/// 同一性质（所有者：「我明明国内外账号都有,居然还有这个提示 这是个bug」）。
+///
+/// 故「刷新模型列表」按钮走这条路径：网关侧 `?refresh=1` 会清掉负缓存，
+/// 于是"稍后刷新"真正可执行，用户不必干等 5 分钟。
+pub async fn fetch_models_refreshed() -> Vec<Value> {
+    fetch_models_impl(true).await
+}
+
+async fn fetch_models_impl(forceRefresh: bool) -> Vec<Value> {
     let cfg = load_gateway_config();
     let port = cfg.get("port").and_then(Value::as_u64).unwrap_or(7863) as u16;
     let api_key = cfg
@@ -3490,7 +3511,12 @@ pub async fn fetch_models() -> Vec<Value> {
         .unwrap_or("")
         .to_string();
 
-    let url = format!("http://127.0.0.1:{port}/v1/models");
+    // `?refresh=1` 让网关清掉按区域的失败负缓存后重拉。
+    let url = if forceRefresh {
+        format!("http://127.0.0.1:{port}/v1/models?refresh=1")
+    } else {
+        format!("http://127.0.0.1:{port}/v1/models")
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(2000))
         .build();

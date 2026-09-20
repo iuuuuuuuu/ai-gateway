@@ -2740,11 +2740,18 @@ export default function GatewayPage() {
     }
   }
 
-  /** 拉取网关支持的模型列表（供「放行模型」勾选列表使用）。 */
-  const loadModels = useCallback(async () => {
+  /**
+   * 拉取网关支持的模型列表（供「放行模型」勾选列表使用）。
+   *
+   * `force` = true 时**强制重拉**（网关侧清掉按区域的失败负缓存）。
+   * 界面上的「刷新模型列表」按钮传 true —— 那段「国服未检测到可用真值…
+   * 稍后点刷新重试即可确认」的文案承诺了刷新能重新确认，而带缓存的路径
+   * 在失败后 5 分钟内连试都不试 ⇒ 点了没变化（2026-09-20 实测缺陷）。
+   */
+  const loadModels = useCallback(async (force = false) => {
     setModelsLoading(true);
     try {
-      const list = await api.getGatewayModels();
+      const list = await api.getGatewayModels(force);
       /*
         「放行模型」候选 = 裸名 + **全部组合写法**。
 
@@ -4085,7 +4092,7 @@ export default function GatewayPage() {
             options={modelOptions}
             selected={allowedModels}
             onChange={(next) => void changeAllowedModels(next)}
-            onRefresh={() => void loadModels()}
+            onRefresh={() => void loadModels(true)}
             refreshing={modelsLoading}
           />
         </Row>

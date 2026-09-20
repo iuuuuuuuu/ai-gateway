@@ -1046,9 +1046,20 @@ export function setAllowedModel(model: string): Promise<GatewayModeSwitchResult>
 // 一键导入：接入本机 AI 客户端
 // ---------------------------------------------------------------------------
 
-/** 获取网关可用模型列表（优先动态查询网关，网关未就绪时回退静态并集）。 */
-export async function getGatewayModels(): Promise<GatewayModelItem[]> {
-  const res = await call<{ models?: GatewayModelItem[] }>("get_gateway_models");
+/**
+ * 获取网关可用模型列表（优先动态查询网关，网关未就绪时回退静态并集）。
+ *
+ * `refresh` = true 时**强制重拉**：让网关清掉按区域的失败负缓存。
+ *
+ * ⚠ 界面上的「刷新模型列表」必须传 true —— 那段「国服未检测到可用真值…
+ * 稍后点刷新重试即可确认」的文案承诺了"刷新能重新确认"，而带缓存的路径
+ * 在失败后 5 分钟内**连试都不试**，点了不会有任何变化（2026-09-20 实测）。
+ */
+export async function getGatewayModels(refresh = false): Promise<GatewayModelItem[]> {
+  const res = await call<{ models?: GatewayModelItem[] }>(
+    "get_gateway_models",
+    refresh ? { refresh: true } : undefined,
+  );
   return res.models ?? [];
 }
 

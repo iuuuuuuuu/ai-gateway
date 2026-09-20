@@ -255,12 +255,12 @@ type capabilityIndex struct {
 	// knownRegion 该区域的清单是否来自**真实拉取**（而非静态兜底）。
 	// 静态兜底表是手抄的、可能过期，用它做「不存在」判断会误伤。
 	knownRegion map[auth.Region]bool
-	// gapReason 该区域**没有真值**的原因（面向用户的中文短语，可拼进提示文案）。
+	// gapReason 该区域**没有真值**的原因（种类 + 面向用户的中文短语）。
 	//
 	// 只在 knownRegion[region]==false 时设置。分开记是因为「为什么没有真值」
 	// 直接决定用户该做什么：没有账号要去启用/同步账号，账号都在冷却要等，
 	// 拉取失败要稍后重试。三者若都说成「未知」，用户只能干瞪眼。
-	gapReason map[auth.Region]string
+	gapReason map[auth.Region]regionGapInfo
 }
 
 // regionExplain 一个模型名在**区域维度**上的已知与未知。
@@ -340,7 +340,7 @@ func (h *Handler) buildCapabilityIndex() *capabilityIndex {
 	idx := &capabilityIndex{
 		byRegion:    map[auth.Region]map[string]regionCapability{},
 		knownRegion: map[auth.Region]bool{},
-		gapReason:   map[auth.Region]string{},
+		gapReason:   map[auth.Region]regionGapInfo{},
 	}
 	add := func(region auth.Region, infos []upstream.ModelInfo, dynamic bool) {
 		m := idx.byRegion[region]
@@ -404,14 +404,60 @@ func (h *Handler) buildCapabilityIndex() *capabilityIndex {
 // 没有账号要去启用/同步账号（这是所有者实际遇到的那种），有账号但拉取失败
 // 只需稍后重试，账号都在冷却则要等冷却到期。混成一句「未知」，
 // 用户既不知道该做什么，也不知道这是不是自己造成的。
-func (h *Handler) regionGapReason(region auth.Region) string {
+// regionGap 描述「某区域为什么没有拿到真实模型清单」。
+//
+// # ⚠ 为什么要区分种类，而不是只给一句文案（2026-09-20 实测缺陷）
+//
+// 所有者的现场：界面提示「国服账号清单本次未拉到…**补齐国服账号后刷新即可确认**」，
+// 而他**明明有 12 个国服账号**。他的反应是「我明明国内外账号都有,居然还有
+// 这个提示 这是个bug」—— **他判断对了**。
+//
+// 根因是文案：`unverifiedNote` 无条件结尾写「补齐X账号」，而真实成因有两种，
+// 行动建议**完全不同**：
+//
+//	KindMissingAccounts —— 该区一个可用账号都没有 ⇒ 补账号**是对的**
+//	KindFetchFailed     —— 有账号但这次没拉到（上游不可达/网络波动）
+//	                       ⇒ 补账号**毫无用处**，该"稍后点刷新重试"
+//
+// 把「补账号」的建议给到一个已经有账号的人，就是在误导他去做无用功。
+//
+// 故这里返回**种类 + 文案**，由 `unverifiedNote` 按种类给对应的行动建议。
+// ⚠ 不要靠解析 reason 字符串里的关键词来判断种类 —— 文案改一个字就失效。
+type regionGapCause int
+
+const (
+	// KindMissingAccounts 该区域没有任何可用账号（用户自己能修）。
+	KindMissingAccounts regionGapCause = iota
+	// KindFetchFailed 有账号，但本次没拉到清单（上游暂时不可达）。
+	KindFetchFailed
+)
+
+// regionGapInfo 一并给出"成因"与"给人看的说明"。
+type regionGapInfo struct {
+	Cause  regionGapCause
+	Reason string
+}
+
+// regionGapReason 判断「该区域为什么没有真值」。
+//
+// 为什么要分两种而不是统一说「未知」：它们对应的**用户动作完全不同** ——
+// 没有账号要去启用/同步账号（这是所有者实际遇到过的另一种情形），
+// 有账号但拉取失败只需稍后重试。混成一句「未知」，
+// 用户既不知道该做什么，也不知道这是不是自己造成的。
+func (h *Handler) regionGapReason(region auth.Region) regionGapInfo {
 	if h.pickProbeAccountInRegion(region) == nil {
 		// 该区域一个可用账号都没有。**必须与「拉取失败」区分开** ——
-		// 这是唯一一种「用户自己能修好」的成因，也是所有者本次遇到的。
-		return "账号池里没有" + regionLabel(region.String()) + "的可用账号"
+		// 这是唯一一种「用户自己能修好」的成因。
+		return regionGapInfo{
+			Cause:  KindMissingAccounts,
+			Reason: "账号池里没有" + regionLabel(region.String()) + "的可用账号",
+		}
 	}
-	// 有账号，但这次没拉到清单：负缓存期内或上游失败。
-	return regionLabel(region.String()) + "账号清单本次未拉到"
+	// 有账号，但这次没拉到清单：上游暂时不可达（网络波动），或负缓存期内。
+	return regionGapInfo{
+		Cause:  KindFetchFailed,
+		Reason: regionLabel(region.String()) + "账号清单本次未拉到（上游暂时不可达，稍后刷新即可）",
+	}
 }
 
 // infosFromStatic 把静态表条目转成 ModelInfo（仅用于国服兜底路径）。
@@ -928,14 +974,20 @@ func (idx *capabilityIndex) regionFields(id string) map[string]any {
 	otherRegion := regionByCode(other)
 	if !idx.knownRegion[otherRegion] {
 		// C 情形：另一侧没有真值 —— 结论只能是「没检查过」，不是「不存在」。
-		why := idx.gapReason[otherRegion]
-		if why == "" {
-			why = regionLabel(other) + "的模型清单本次未拉到"
+		gap, ok := idx.gapReason[otherRegion]
+		if !ok || gap.Reason == "" {
+			// 兜底：理论上不该走到（gapReason 在 index 构建时已填）。
+			// 按「拉取失败」处理而不是「没账号」—— 后者会给出"补账号"的
+			// 错误建议（那正是 2026-09-20 那个缺陷的形态）。
+			gap = regionGapInfo{
+				Cause:  KindFetchFailed,
+				Reason: regionLabel(other) + "的模型清单本次未拉到",
+			}
 		}
 		return map[string]any{
 			"supported_regions": []string{supported[0]},
 			"unverified_regions": []string{other},
-			"region_note":       unverifiedNote(supported[0], other, why),
+			"region_note":       unverifiedNote(supported[0], other, gap),
 		}
 	}
 	// B 情形：另一侧有真值且清单里确实没有它 —— 可以断言。
@@ -955,17 +1007,43 @@ func regionNote(region string) string {
 		other + "账号调用它会返回 11102 model service info not found。"
 }
 
-// unverifiedNote 生成「另一区未检测到账号 / 未拉到清单，故无法确认」的说明。
+// unverifiedNote 生成「另一区没有真值，故无法确认」的说明。
 //
-// 为什么必须与 regionNote 分开：那句「仅在X上游存在」是**断言**，
-// 在没有另一区真值时它是编造结论，会把用户引向「换模型」；
-// 而真实可行动作是「去启用/补一个该区账号」。所有者反馈的正是这个偏差。
-func unverifiedNote(region, other, why string) string {
-	return "已确认" + regionLabel(region) + "上游有此模型；但" +
-		regionLabel(other) + "未检测到可用真值（" + why + "），" +
+// # ⚠ 行动建议必须**按成因**给（2026-09-20 实测缺陷）
+//
+// 所有者的原话：
+//
+//	「还有这个,我明明国内外账号都有,居然还有这个提示 这是个bug」
+//
+// 他判断对了。旧实现**无条件**结尾写「补齐X账号后刷新即可确认」，
+// 而他的现场是 `KindFetchFailed`（有 12 个国服账号，只是那一轮上游没拉到）——
+// 于是提示让他去"补账号"，而他账号早就够了。**建议指向了不存在的问题**。
+//
+// 两种成因给的建议完全不同，故必须分开：
+//
+//	KindMissingAccounts → 补账号（这是唯一"用户自己能修好"的情形）
+//	KindFetchFailed     → 稍后刷新重试（补账号毫无用处）
+//
+// ⚠ 判据用**枚举**而不是解析 reason 字符串：文案改一个字就失效。
+func unverifiedNote(region, other string, gap regionGapInfo) string {
+	head := "已确认" + regionLabel(region) + "上游有此模型；但" +
+		regionLabel(other) + "未检测到可用真值（" + gap.Reason + "），" +
 		"因此**无法确认**" + regionLabel(other) + "是否也有它 —— " +
-		"这不等于该模型" + regionLabel(other) + "没有。" +
-		"补齐" + regionLabel(other) + "账号后刷新即可确认。"
+		"这不等于该模型" + regionLabel(other) + "没有。"
+
+	switch gap.Cause {
+	case KindMissingAccounts:
+		// 真的没有该区账号 —— 补账号是有效的，如实说。
+		return head + "补齐" + regionLabel(other) + "账号后刷新即可确认。"
+	default:
+		// 有账号、只是这轮没拉到。**不要说"补账号"** ——
+		// 那会让已有账号的用户去做无用功（本次缺陷）。
+		//
+		// 也不说"无法确认"就结束：用户需要知道**该做什么**（等一会儿重试），
+		// 以及**这不是他的问题**（账号是够的）。
+		return head + "你的" + regionLabel(other) +
+			"账号是够的，这是上游暂时不可达；稍后点「刷新」重试即可确认。"
+	}
 }
 
 // otherRegionCode 返回另一个区域的码。

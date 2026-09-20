@@ -441,7 +441,7 @@ func TestRegionNoteHelpersSeparateAssertionFromUnverified(t *testing.T) {
 		t.Errorf("regionNote 不该出现「无法确认」（它是确认后的措辞），实际: %s", confirmed)
 	}
 
-	unverified := unverifiedNote(regionCodeCN, regionCodeIntl, "账号池里没有国际版的可用账号")
+	unverified := unverifiedNote(regionCodeCN, regionCodeIntl, regionGapInfo{Cause: KindMissingAccounts, Reason: "账号池里没有国际版的可用账号"})
 	if strings.Contains(unverified, "仅在国服上游存在") {
 		t.Errorf("unverifiedNote 不得复用断言语，实际: %s", unverified)
 	}
@@ -452,8 +452,86 @@ func TestRegionNoteHelpersSeparateAssertionFromUnverified(t *testing.T) {
 		t.Errorf("unverifiedNote 应把原因带上（否则用户不知道该做什么），实际: %s", unverified)
 	}
 	// 方向必须跟着区域走（别把国服/国际版写反）。
-	rev := unverifiedNote(regionCodeIntl, regionCodeCN, "账号池里没有国服的可用账号")
+	rev := unverifiedNote(regionCodeIntl, regionCodeCN, regionGapInfo{Cause: KindMissingAccounts, Reason: "账号池里没有国服的可用账号"})
 	if !strings.Contains(rev, "已确认国际版") || !strings.Contains(rev, "国服未检测到") {
 		t.Errorf("反方向措辞错误，实际: %s", rev)
+	}
+}
+
+// TestUnverifiedNoteDoesNotTellExistingAccountsToAddAccounts 有账号却被告知「补账号」。
+//
+// # 所有者 2026-09-20 的现场（这条是回归）
+//
+//	「还有这个,我明明国内外账号都有,居然还有这个提示 这是个bug」
+//
+// 他判断对了。旧 `unverifiedNote` **无条件**结尾写「补齐X账号后刷新即可确认」，
+// 而他的现场是 `KindFetchFailed`（有 12 个国服账号，只是那一轮上游没拉到）——
+// 于是提示让他去"补账号"，而他账号早就够了。**建议指向了不存在的问题**。
+//
+// 契约：`KindFetchFailed` 时**绝不能**出现"补账号"类措辞，
+// 且必须说清"账号够了、是上游暂时不可达、稍后重试"。
+func TestUnverifiedNoteDoesNotTellExistingAccountsToAddAccounts(t *testing.T) {
+	got := unverifiedNote(regionCodeIntl, regionCodeCN, regionGapInfo{
+		Cause:  KindFetchFailed,
+		Reason: "国服账号清单本次未拉到（上游暂时不可达，稍后刷新即可）",
+	})
+
+	// ① 绝不能建议补账号 —— 那正是本次缺陷
+	for _, bad := range []string{"补齐", "补一个", "添加账号", "没有账号", "启用账号"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("有账号（拉取失败）时不该出现 %q —— "+
+				"会让用户去做无用功；实际：%s", bad, got)
+		}
+	}
+	// ② 必须明确说"账号是够的"，让用户不必去查账号
+	if !strings.Contains(got, "账号是够的") {
+		t.Errorf("应明确告诉用户账号够用（否则他会去查账号池），实际：%s", got)
+	}
+	// ③ 必须给出**可执行**的下一步
+	if !strings.Contains(got, "刷新") {
+		t.Errorf("应给出可执行建议（稍后刷新重试），实际：%s", got)
+	}
+	// ④ 原有信息不能丢：仍要说清"无法确认"，且"不等于没有"
+	if !strings.Contains(got, "无法确认") || !strings.Contains(got, "不等于") {
+		t.Errorf("仍应说清「无法确认」且「不等于没有」，实际：%s", got)
+	}
+}
+
+// TestUnverifiedNoteKeepsAddAdviceWhenAccountsReallyMissing 真的没账号时，仍要建议补账号。
+//
+// 反面：别为了修上面那条，把"真缺账号"这个正例也一起改坏 ——
+// 那是唯一一种**用户自己能修好**的成因，建议必须保留。
+func TestUnverifiedNoteKeepsAddAdviceWhenAccountsReallyMissing(t *testing.T) {
+	got := unverifiedNote(regionCodeIntl, regionCodeCN, regionGapInfo{
+		Cause:  KindMissingAccounts,
+		Reason: "账号池里没有国服的可用账号",
+	})
+	if !strings.Contains(got, "补齐") {
+		t.Errorf("真的没有该区账号时，应建议补账号，实际：%s", got)
+	}
+	if strings.Contains(got, "账号是够的") {
+		t.Errorf("没有账号时不该说「账号是够的」（自相矛盾），实际：%s", got)
+	}
+}
+
+// TestRegionGapReasonDistinguishesCauses 成因判定的两种情形要区分开。
+//
+// 判据是**枚举**而不是文案（文案改一个字，靠 strings.Contains 的判断就失效）。
+func TestRegionGapReasonDistinguishesCauses(t *testing.T) {
+	// 只有国服账号 → 问国际版的成因，应是「没有该区账号」
+	h := handlerWithAccounts(t, poolAuths{cn: true}, []string{"m"}, []string{"m"})
+	gapIntl := h.regionGapReason(auth.RegionIntl)
+	if gapIntl.Cause != KindMissingAccounts {
+		t.Errorf("池里没有国际版账号时，国际版成因应为 KindMissingAccounts，实际 %v（%s）",
+			gapIntl.Cause, gapIntl.Reason)
+	}
+	// 国服有账号 → 若国服也没拉到（上游一直失败），成因是 KindFetchFailed。
+	//
+	// 用 `handlerWithAccounts` 的默认上游（它会正常返回）时国服是能拉到的，
+	// 故这里只断言"有账号时不会是 KindMissingAccounts"——
+	// 那正是本次缺陷的判据（有账号却被说成没账号）。
+	gapCN := h.regionGapReason(auth.RegionCN)
+	if gapCN.Cause == KindMissingAccounts {
+		t.Errorf("池里有国服账号，成因不该是 KindMissingAccounts，实际：%s", gapCN.Reason)
 	}
 }
