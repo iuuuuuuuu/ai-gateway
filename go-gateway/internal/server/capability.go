@@ -28,6 +28,7 @@ package server
 
 import (
 	"sort"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +42,16 @@ type regionModels struct {
 	infos   []upstream.ModelInfo
 	fetched time.Time
 	lastErr time.Time // 最近一次失败（负缓存用）
+	// lastErrMsg 最近一次失败的**原因**（给人和给排查用）。
+	//
+	// ⚠ 为什么必须存消息而不只存时间（2026-09-20 实测缺陷）
+	//
+	// 所有者现场：界面报「国服未检测到可用真值」，而 /v1/models/regions 的
+	// last_error 只给了一个时间戳 —— **看不出国服为什么失败**。
+	// 当时我的独立探针用**同一个 exe、同一份配置**能拉到 16 个国服模型，
+	// 而网关拉不到；此时"错误消息 + 用的是哪个账号"是唯一线索。
+	// 没有它，排查只能靠猜 —— 这正是本次补上它的原因。
+	lastErrMsg string
 	// fails 连续失败次数，驱动**指数退避**（见 modelsRetryAfter）。
 	//
 	// 所有者 2026-09-20：「这应该是自动的,而不是需要人手动同步」。
@@ -48,6 +59,24 @@ type regionModels struct {
 	// 一次瞬时抖动就让用户看到 5 分钟的"信息不完整"，而系统本可以自己好。
 	fails int
 }
+
+// shortUID 取 uid 前 8 位，用于日志/错误消息里指认账号。
+//
+// 完整 uid 有 36 字符，塞进错误消息会把真正的原因挤到看不见；
+// 8 位在同一账号池里足以唯一（实测 19 个账号无冲突）。
+func shortUID(uid string) string {
+	if len(uid) <= 8 {
+		return uid
+	}
+	return uid[:8]
+}
+
+// maxProbeAccounts 探测某区域模型清单时**最多试几个账号**。
+//
+// 为什么不是"全试"：账号多的用户可能有几十个，一次探测全试完会打很多
+// 上游请求（虽然只读，但没必要）。3 个足以覆盖"个别账号凭证失效/
+// 混进了别的产品"这类局部问题 —— 那正是重试要解决的问题。
+const maxProbeAccounts = 3
 
 // modelsRetryAfter 失败后**多久再试**（指数退避，有上下限）。
 //
@@ -157,15 +186,19 @@ func (h *Handler) fetchModelsForRegion(region auth.Region) []upstream.ModelInfo 
 	}
 	regionModelCache.Unlock()
 
-	acct := h.pickProbeAccountInRegion(region)
-	if acct == nil {
-		return nil
-	}
-	infos, err := h.cfg.Upstream.FetchModels(acct)
-	if err != nil || len(infos) == 0 {
-		// **不喂熔断器**：/v3/config 是能力探测接口，它的失败不代表该账号不能聊天。
-		// 历史上曾在此调 NoteError，导致国际版账号（恰好占据最早到期档位、
-		// 且旧端点在国际版恒 500）被反复记失败直到熔断。
+	// ⚠ 逐个账号重试，而不是只试一个。
+	//
+	// 所有者现场（2026-09-20）：池里混进了一个 Qoder 账号（见 probeAccountsInRegion
+	// 的注释），它恰好被排在最前 ⇒ 空清单 ⇒ 整个国服被判成"没拉到"，
+	// 而他**有 14 个正常国服账号**。
+	//
+	// 「一个坏账号不该让整个区域变未知」—— 这也是对凭证目录里存在
+	// 异常账号（用户手动放的、旧版本残留的）的**防御**：
+	// 筛选能挡掉已知的混入，重试能兜住未知的坏账号。
+	accts := h.probeAccountsInRegion(region)
+	if len(accts) == 0 {
+		// 记下原因：这一支**没有**走下面的 err 分支，若不记，
+		// /v1/models/regions 会显示「失败但没原因」，排查时是盲区。
 		regionModelCache.Lock()
 		rm := regionModelCache.byRegion[region]
 		if rm == nil {
@@ -173,6 +206,52 @@ func (h *Handler) fetchModelsForRegion(region auth.Region) []upstream.ModelInfo 
 			regionModelCache.byRegion[region] = rm
 		}
 		rm.lastErr = time.Now()
+		rm.lastErrMsg = "该区域没有可用账号（池里没有本产品的账号，或全在冷却/禁用）"
+		rm.fails++
+		regionModelCache.Unlock()
+		return nil
+	}
+
+	// 试到第一个成功为止（上限 maxProbeAccounts 个，避免账号很多时打太多上游）。
+	var infos []upstream.ModelInfo
+	var lastFailure string
+	tried := 0
+	for _, acct := range accts {
+		if tried >= maxProbeAccounts {
+			break
+		}
+		tried++
+		got, err := h.cfg.Upstream.FetchModels(acct)
+		if err == nil && len(got) > 0 {
+			infos = got
+			lastFailure = ""
+			break
+		}
+		if err != nil {
+			lastFailure = fmt.Sprintf("账号 %s → %v", shortUID(acct.UID), err)
+		} else {
+			lastFailure = fmt.Sprintf("账号 %s → 上游返回 0 个模型（响应有效但清单为空）", shortUID(acct.UID))
+		}
+	}
+
+	if len(infos) == 0 {
+		// 全部试过都失败：记下**为什么** + 试了几个（只记一个会误导成
+		// "这个区域只有一个账号"，而实际可能是"试了 3 个都不行"）。
+		//
+		// **不喂熔断器**：/v3/config 是能力探测接口，它的失败不代表该账号不能聊天。
+		// 历史上曾在此调 NoteError，导致国际版账号（恰好占据最早到期档位、
+		// 且旧端点在国际版恒 500）被反复记失败直到熔断。
+		if tried > 1 {
+			lastFailure = fmt.Sprintf("连续试了 %d 个账号都不行；最后一个：%s", tried, lastFailure)
+		}
+		regionModelCache.Lock()
+		rm := regionModelCache.byRegion[region]
+		if rm == nil {
+			rm = &regionModels{}
+			regionModelCache.byRegion[region] = rm
+		}
+		rm.lastErr = time.Now()
+		rm.lastErrMsg = lastFailure
 		// 累加连续失败次数，驱动指数退避（上限 5 分钟）。
 		rm.fails++
 		regionModelCache.Unlock()
@@ -188,17 +267,36 @@ func (h *Handler) fetchModelsForRegion(region auth.Region) []upstream.ModelInfo 
 	return infos
 }
 
-// pickProbeAccountInRegion 在指定区域里挑一个用于探测模型清单的账号。
+// probeAccountsInRegion 在指定区域里挑出**可用于探测**的账号（按优先级）。
 //
-// region=RegionAny 时「优先国服、其次国际版」：探测只读能力发现，不需要遵循
-// 分层/轮转选号策略，那些策略是给流量用的。优先国服是因为历史上国际版的
-// 旧探测端点恒 500（现端点 /v3/config 两区都可用，这里只为兼容）。
+// # 为什么返回**列表**而不是单个（2026-09-20 实测缺陷）
 //
-// region=具体区域时**只在那个区域里找**，找不到返回 nil —— 不退回其它区域。
-// 拿国际版账号去拉清单再标注成「国服真值」，正是本次修复要消除的错误；
-// 返回 nil 让调用方明确知道「该区域这次没有真值」，进而退回保守行为。
-func (h *Handler) pickProbeAccountInRegion(region auth.Region) *auth.Auth {
-	var anyIntl *auth.Auth
+// 所有者现场：界面报「国服账号清单本次未拉到」，而他**有 14 个正常国服账号**。
+//
+// 根因链（每步可核）：
+//
+//	① 网关把 Qoder 凭证也加载进同一个池（`qoder_auth_dir`，见 config.go）；
+//	② 那个 Qoder 账号（domain=qoder.com.cn）没有 `product` 字段，
+//	   `ProductOf()` 把空串归一成 workbuddy ⇒ 被当成 WorkBuddy 账号；
+//	③ `qoder.com.cn` 不以 `.ai` 结尾 ⇒ `Region()` 判成 **cn**；
+//	④ `ProbeUIDs()` 按 **uid 字典序**排序 ⇒ `019f1772…` 排在
+//	   `11b8eb03…` / `1f3c55e5…` 之前 ⇒ **它被选中国服探测**；
+//	⑤ 拿 Qoder 的 token 去打 WorkBuddy 的 `/v3/config` ⇒ **空清单**；
+//	⑥ `len(infos)==0` ⇒ 判定国服"没拉到" ⇒ 所有 cn 侧模型都带
+//	   `unverified_regions=[cn]` ⇒ 界面说「国服未检测到真值」。
+//
+// **两个错误叠加才造成这个结果**，故两处都要修：
+//
+//	筛选：只挑**本产品**的账号（Qoder/ZCode 的凭证不该去探测 WorkBuddy）
+//	重试：一个账号失败就**试下一个** —— 一个坏账号不该让整个区域变未知
+//
+// 第 2 点尤其重要：即使筛选修好了，凭证目录里仍可能有异常账号
+//（用户手动放的、旧版本残留的）。让"一个坏账号拖垮整个区域"不可能发生，
+// 才是真正的健壮性。
+func (h *Handler) probeAccountsInRegion(region auth.Region) []*auth.Auth {
+	var anyIntl []*auth.Auth
+	var inRegion []*auth.Auth
+
 	// **用 ProbeUIDs 而不是 AvailableUIDs**：拉 /v3/config 是只读探测，
 	// 不产生流量也不消耗积分，因此被用户标记「不接流量」的账号同样可用 ——
 	// 而且它们往往是唯一能提供某个区域真值的账号。
@@ -210,29 +308,47 @@ func (h *Handler) pickProbeAccountInRegion(region auth.Region) *auth.Auth {
 		if a == nil {
 			continue
 		}
+		// ⚠ 只挑**本产品**的账号。
+		//
+		// 混进别的产品会拿到空清单（它们的 token 对 WorkBuddy 端点无效），
+		// 于是整个区域被误判成"没有真值" —— 那正是所有者遇到的。
+		if a.ProductOf() != auth.ProductWorkBuddy {
+			continue
+		}
 		intl := a.Region() == auth.RegionIntl
-		if region == auth.RegionAny {
-			if intl {
-				if anyIntl == nil {
-					anyIntl = a
-				}
-				continue
-			}
-			return a
-		}
-		if a.Region() == region {
-			return a
-		}
 		if intl {
-			anyIntl = a
+			anyIntl = append(anyIntl, a)
+			continue
 		}
+		inRegion = append(inRegion, a)
 	}
-	if region != auth.RegionAny {
-		// 该区域没有账号：不给跨区域账号，避免把另一个区域的真值标成这个区域的。
-		return nil
+
+	if region == auth.RegionAny {
+		// 优先国服、其次国际版（探测只读，不需要遵循分层/轮转策略）。
+		if len(inRegion) > 0 {
+			return inRegion
+		}
+		return anyIntl
 	}
-	// RegionAny 且池里只有国际版：仍返回一个，让探测能自愈（上游修好端点时）。
-	return anyIntl
+	if region == auth.RegionIntl {
+		return anyIntl
+	}
+	// 国服：只给国服账号 —— 不跨区域回退。
+	//
+	// 拿国际版账号去拉清单再标注成「国服真值」，正是要消除的错误；
+	// 返回空让调用方明确知道「该区域这次没有真值」，进而退回保守行为。
+	return inRegion
+}
+
+// probeAccountInRegion 挑**一个**探测账号（兼容既有调用方）。
+//
+// 只用于「判断该区域有没有可用账号」这类二值场景；
+// 真正去拉清单的地方应当用 probeAccountsInRegion 逐个重试。
+func (h *Handler) probeAccountInRegion(region auth.Region) *auth.Auth {
+	if list := h.probeAccountsInRegion(region); len(list) > 0 {
+		return list[0]
+	}
+	return nil
 }
 
 // regionCapability 一个区域里某个模型的能力事实。
@@ -497,7 +613,7 @@ type regionGapInfo struct {
 // 有账号但拉取失败只需稍后重试。混成一句「未知」，
 // 用户既不知道该做什么，也不知道这是不是自己造成的。
 func (h *Handler) regionGapReason(region auth.Region) regionGapInfo {
-	if h.pickProbeAccountInRegion(region) == nil {
+	if h.probeAccountInRegion(region) == nil {
 		// 该区域一个可用账号都没有。**必须与「拉取失败」区分开** ——
 		// 这是唯一一种「用户自己能修好」的成因。
 		return regionGapInfo{

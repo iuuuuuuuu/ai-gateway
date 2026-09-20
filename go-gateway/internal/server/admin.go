@@ -27,13 +27,22 @@ func (h *Handler) modelsRegions(w http.ResponseWriter, r *http.Request) {
 		infos := h.fetchModelsForRegion(region)
 		regionModelCache.Lock()
 		rm := regionModelCache.byRegion[region]
-		var fetched, failed any
+		var fetched, failed, failMsg any
 		if rm != nil {
 			if !rm.fetched.IsZero() {
 				fetched = rm.fetched.Format("2006-01-02T15:04:05Z07:00")
 			}
 			if !rm.lastErr.IsZero() {
 				failed = rm.lastErr.Format("2006-01-02T15:04:05Z07:00")
+			}
+			// ⚠ 错误**原因**必须一并给出，不能只给时间戳。
+			//
+			// 2026-09-20 实测：界面报「国服未检测到可用真值」，而这里只有
+			// `last_error: 2026-09-20T20:44:43+08:00` —— 看不出失败原因。
+			// 当时我的独立探针用**同一个 exe、同一份配置**能拉到 16 个国服模型，
+			// 而网关拉不到，正是这个字段的缺失让排查只能靠猜。
+			if rm.lastErrMsg != "" {
+				failMsg = rm.lastErrMsg
 			}
 		}
 		regionModelCache.Unlock()
@@ -75,8 +84,12 @@ func (h *Handler) modelsRegions(w http.ResponseWriter, r *http.Request) {
 			"truth_source": truthSourceFor(region, len(infos) > 0),
 			"fetched_at":   fetched,
 			"last_error":   failed,
-			"model_count":  len(models),
-			"models":       models,
+			// 失败**原因**（上游状态码 + 响应片段，或网络错误原文）。
+			// 与 last_error（时间戳）拆成两个字段：一个回答"什么时候"，
+			// 一个回答"为什么" —— 排查时缺的总是后者。
+			"last_error_message": failMsg,
+			"model_count":        len(models),
+			"models":             models,
 		}
 	}
 

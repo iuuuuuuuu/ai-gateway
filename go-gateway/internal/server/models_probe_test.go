@@ -113,7 +113,7 @@ func TestModelsProbeRegionCNSelectsCNAccount(t *testing.T) {
 	)
 	h := NewHandler(Config{Pool: p, Upstream: modelsFailUpstream(t), MaxRotate: 1})
 
-	got := h.pickProbeAccountInRegion(auth.RegionCN)
+	got := h.probeAccountInRegion(auth.RegionCN)
 	if got == nil {
 		t.Fatal("应选出账号")
 	}
@@ -122,7 +122,7 @@ func TestModelsProbeRegionCNSelectsCNAccount(t *testing.T) {
 	}
 
 	// 同一池子按国际版探测，必须选国际版的那个。
-	gotIntl := h.pickProbeAccountInRegion(auth.RegionIntl)
+	gotIntl := h.probeAccountInRegion(auth.RegionIntl)
 	if gotIntl == nil || gotIntl.UID != "intl-1" {
 		t.Fatalf("指定国际版时应选国际版账号，实际 %v", gotIntl)
 	}
@@ -142,11 +142,11 @@ func TestModelsProbeRegionCNReturnsNilWhenNoCNAccount(t *testing.T) {
 	})
 	h := NewHandler(Config{Pool: p, Upstream: modelsFailUpstream(t), MaxRotate: 1})
 
-	if got := h.pickProbeAccountInRegion(auth.RegionCN); got != nil {
+	if got := h.probeAccountInRegion(auth.RegionCN); got != nil {
 		t.Fatalf("池里没有国服账号时不该用国际版账号冒充，实际返回 %q", got.UID)
 	}
 	// 但 RegionAny（兼容路径）仍应退回国际版账号，让探测能自愈。
-	got := h.pickProbeAccountInRegion(auth.RegionAny)
+	got := h.probeAccountInRegion(auth.RegionAny)
 	if got == nil || got.UID != "intl-1" {
 		t.Fatalf("RegionAny 应回退到唯一的国际版账号，实际 %v", got)
 	}
@@ -165,11 +165,11 @@ func TestModelsProbeSkipsUnavailableAccounts(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: modelsFailUpstream(t), MaxRotate: 1})
 
 	// 被禁用的国服账号不可用 → 该区域探测返回 nil，而不是选它。
-	if got := h.pickProbeAccountInRegion(auth.RegionCN); got != nil {
+	if got := h.probeAccountInRegion(auth.RegionCN); got != nil {
 		t.Fatalf("不应选被禁用的账号，实际 %q", got.UID)
 	}
 	// 国际版那个仍可用。
-	got := h.pickProbeAccountInRegion(auth.RegionIntl)
+	got := h.probeAccountInRegion(auth.RegionIntl)
 	if got == nil || got.UID != "intl-cooling" {
 		t.Fatalf("应选可用的国际版账号，实际 %v", got)
 	}
