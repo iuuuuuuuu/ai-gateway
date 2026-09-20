@@ -31,11 +31,19 @@
  *
  * 这样两个产品页与 WorkBuddy 账号页放在一起时，用户不必重新学一遍。
  */
-import { Loader2, RefreshCw, Trash2, Pencil, AlertTriangle, CheckCircle2, Clock3 } from "lucide-react";
+import { Loader2, RefreshCw, Trash2, Pencil, AlertTriangle, CheckCircle2, Clock3, ListChecks, PlayCircle } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
@@ -78,6 +86,85 @@ export interface ProductAccountCardData {
    * 只显示后者，用户会以为"今天用不完就浪费了"。
    */
   planExpiryText?: string;
+  /**
+   * 额度**剩余**比例（0~1）；undefined = 没有可用的总量信息（**不显示进度条**）。
+   *
+   * # 为什么需要（所有者 2026-09-20）
+   *
+   * 原话：「你设计的 qoder 和 zcode 卡片都很难看，不如 workbuddy 的好看，
+   * 完全可以借鉴 workbuddy 账号页面的逻辑，**积分进度条** 任务执行菜单」。
+   *
+   * WorkBuddy 卡片有进度条，而本组件只有一行数字 —— 用户看不出"还剩多少 /
+   * 用掉多少"。数字本身不传达紧迫感，进度条传达。
+   *
+   * # ⚠ 语义是「剩余」不是「已用」—— 我第一版搞反了
+   *
+   * WorkBuddy 卡的算法（`account-card.tsx:1153`）是：
+   *
+   *	ratio = remaining / total      ← **剩余**占比
+   *	宽度 = ratio%                  ← 用掉越多，条越短
+   *
+   * 我第一版按"已用占比"实现（用掉越多条越长），并把颜色按用量阈值
+   * （>70% 琥珀 / >90% 红）—— **两处都与 WorkBuddy 相反**。
+   * 而所有者要的就是"借鉴 workbuddy"，方向搞反反而更糟：
+   * 用户看到条快满了会以为额度快用完，实际那是才用了一点。
+   *
+   * 故现在与 WorkBuddy **逐字一致**：
+   *	· 宽度 = 剩余占比
+   *	· 颜色由**是否临近过期**决定（`usageWarn`），而不是由用量决定
+   *
+   * ⚠ undefined 与 0 必须区分：`undefined` = 上游没给总量（无从计算比例），
+   * 此时**不画进度条**；`0` = 确实一点没剩，画一条空的。
+   * 把前者画成 0% 会让用户以为"额度耗尽"，那是反向误导。
+   */
+  usageRatio?: number;
+  /** 进度条旁边的文字（如「剩余 1.2M / 3M」）；配合 usageRatio 使用。 */
+  usageText?: string;
+  /**
+   * 额度是否**临近过期/已过期**（决定进度条颜色）。
+   *
+   * 与 WorkBuddy 同款：它用 `resource.expiringSoon || resource.expired`
+   * 决定转橙，而**不是**用"用了多少"。额度的问题几乎总是"马上过期用不完"，
+   * 而不是"用太多" —— 后者是好事，不该标红。
+   */
+  usageWarn?: boolean;
+  /**
+   * 本账号可执行的任务（渲染成右上角「任务」菜单）。
+   *
+   * # 为什么任务要挂在**账号卡片**上（所有者 2026-09-20）
+   *
+   * 原话：「qoder这个活动卡片和账号卡片应该合到一起，应该是 这个账号还有
+   * 多少任务没运行，而且也没有跟 workbuddy 有个菜单按钮，点击后进行执行
+   * qoder 还支持的任务（因为 qoder 活动是动态的，所以这里支持的任务也是动态的），
+   * 而且任务也应该自动执行」。
+   *
+   * 即：任务不是"页面级的批量操作"，而是**每个账号各自的状态与动作** ——
+   * 这个号还有哪些没跑、单独跑一个。故挂在卡片上，与 WorkBuddy 一致。
+   *
+   * 空数组 = 该账号当前没有可执行任务（不渲染菜单按钮，而不是渲染一个空菜单）。
+   */
+  tasks?: ProductAccountTask[];
+}
+
+/** 账号卡片上的一个可执行任务。 */
+export interface ProductAccountTask {
+  /** 稳定标识（提交给后端用）。 */
+  id: string;
+  /** 显示名（如「领取体验套餐」）。 */
+  label: string;
+  /**
+   * 当前状态：决定菜单里显示什么。
+   *
+   *	done    —— 今天已完成（幂等命中），菜单项置灰并标注"已完成"
+   *	ready   —— 可以执行
+   *	blocked —— 当前不满足条件（如不在活动期），附 reason
+   *
+   * ⚠ `done` 的项**仍要显示**（置灰）而不是隐藏：用户需要知道
+   * "这个任务存在且今天已经做过了"。隐藏会让他以为功能没了。
+   */
+  state: "done" | "ready" | "blocked";
+  /** state=blocked 时的原因（悬浮可见）。 */
+  reason?: string;
 }
 
 interface Props {
@@ -91,6 +178,8 @@ interface Props {
   onEditNote?: () => void;
   onToggleDisabled?: () => void;
   onDelete?: () => void;
+  /** 执行某个任务（来自卡片上的任务菜单）。 */
+  onRunTask?: (taskId: string) => void;
   /** 紧凑模式（窄列）。 */
   compact?: boolean;
 }
@@ -103,12 +192,16 @@ export function ProductAccountCard({
   onEditNote,
   onToggleDisabled,
   onDelete,
+  onRunTask,
   compact = false,
 }: Props) {
   const name = data.nickname || "（未命名）";
   const refreshing = busyKey === "refresh";
   const toggling = busyKey === "toggle";
   const deleting = busyKey === "delete";
+  const tasks = data.tasks || [];
+  /** 还有几个任务可跑（用于菜单按钮上的计数徽标）。 */
+  const runnable = tasks.filter((t) => t.state === "ready").length;
 
   return (
     <article
@@ -263,10 +356,119 @@ export function ProductAccountCard({
         {data.planExpiryText && (
           <div className="mt-1 text-xs text-amber-700 dark:text-amber-400">{data.planExpiryText}</div>
         )}
+
+        {/*
+          额度进度条 —— 借鉴 WorkBuddy 账号卡（所有者要求「积分进度条」）。
+
+          ⚠ 只在 usageRatio 有值时才渲染：undefined 表示"上游没给总量"，
+          此时画成 0% 会让用户以为额度耗尽（反向误导）。
+
+          ⚠ 语义是**剩余**占比（与 WorkBuddy 逐字一致）：用掉越多，条越短。
+          颜色由"是否临近过期"决定，不是由用量 —— 额度的问题是
+          "马上过期用不完"，而不是"用太多"。
+        */}
+        {typeof data.usageRatio === "number" && (
+          <div className="mt-2 space-y-1" data-slot="product-usage-bar">
+            <div className="h-1 overflow-hidden rounded-full bg-muted">
+              <div
+                data-slot="product-usage-fill"
+                // 宽度 = 剩余比例（钳到 0~100%：上游偶尔给 >1 的比例，
+                // 容量刚变更时会出现，不钳会让进度条溢出容器）。
+                style={{ width: `${Math.min(100, Math.max(0, data.usageRatio * 100))}%` }}
+                className={cn(
+                  "h-full rounded-full transition-all",
+                  // 与 WorkBuddy 同款：临近过期/已过期转橙，否则主色。
+                  data.usageWarn ? "bg-orange-500" : "bg-primary",
+                )}
+              />
+            </div>
+            {data.usageText && (
+              <div className="text-[11px] leading-4 text-muted-foreground">{data.usageText}</div>
+            )}
+          </div>
+        )}
       </section>
 
       {/* ── 底部操作栏（同 WorkBuddy 卡片：右对齐） ── */}
       <footer className="flex items-center justify-end gap-1 border-t border-border/60 px-3 py-2">
+        {/*
+          任务菜单 —— 与 WorkBuddy 账号卡同款交互（所有者要求
+          「也没有跟 workbuddy 有个菜单按钮，点击后进行执行 qoder 还支持的任务」）。
+
+          ⚠ 只在确实有任务时渲染：`tasks` 为空说明该账号当前没有可执行任务，
+          渲染一个空的"任务"按钮会让用户以为点了没反应。
+        */}
+        {tasks.length > 0 && onRunTask && (
+          <DropdownMenu>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    data-slot="product-task-menu"
+                    aria-label={`任务：${name}`}
+                    className="h-7 gap-1 px-2 text-[11px]"
+                  >
+                    <ListChecks className="h-3.5 w-3.5" />
+                    任务
+                    {/* 还有几个可跑 —— 一眼看出"这个号还有事没做" */}
+                    {runnable > 0 && (
+                      <Badge
+                        variant="secondary"
+                        className="h-4 min-w-4 justify-center px-1 text-[9.5px] font-normal"
+                      >
+                        {runnable}
+                      </Badge>
+                    )}
+                  </Button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent>
+                {runnable > 0
+                  ? `还有 ${runnable} 个任务可执行`
+                  : "本账号今日任务都已完成"}
+              </TooltipContent>
+            </Tooltip>
+            <DropdownMenuContent align="end" className="w-56">
+              <DropdownMenuLabel className="text-xs">
+                {data.nickname || "本账号"}的任务
+              </DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              {tasks.map((t) => (
+                <DropdownMenuItem
+                  key={t.id}
+                  data-slot="product-task-item"
+                  data-task={t.id}
+                  data-state={t.state}
+                  // 已完成 / 不可用都置灰但**仍然显示**：用户需要知道
+                  // "这个任务存在且今天已经做过了"。隐藏会让他以为功能没了。
+                  disabled={t.state !== "ready"}
+                  onSelect={() => {
+                    if (t.state === "ready") onRunTask(t.id);
+                  }}
+                  title={t.reason}
+                  className="gap-2 text-xs"
+                >
+                  {t.state === "done" ? (
+                    <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-600" />
+                  ) : t.state === "blocked" ? (
+                    <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  ) : (
+                    <PlayCircle className="h-3.5 w-3.5 shrink-0" />
+                  )}
+                  <span className="min-w-0 flex-1 truncate">{t.label}</span>
+                  {t.state === "done" && (
+                    <span className="shrink-0 text-[10px] text-muted-foreground">已完成</span>
+                  )}
+                  {t.state === "blocked" && (
+                    <span className="shrink-0 text-[10px] text-muted-foreground">不可用</span>
+                  )}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
         {onRefresh && (
           <Tooltip>
             <TooltipTrigger asChild>

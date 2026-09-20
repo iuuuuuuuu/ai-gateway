@@ -718,6 +718,25 @@ export default function ZcodePage() {
                         // billing/balance 的 plans）。
                         planBadge: planBadgeOf(row),
                         planExpiryText: planExpiryTextOf(row, now),
+                        // ── 额度进度条（所有者要求「积分进度条」）──
+                        //
+                        // ⚠ 传的是**剩余**占比（不是已用）—— 与 WorkBuddy 卡
+                        // 的 `remaining / total` 逐字同款。方向反了会让用户
+                        // 看到条快满了就以为额度快用完，实际那是才用了一点。
+                        //
+                        // 只在**确实有总量**时给比例：`creditsTotal` 为 0
+                        // 表示上游没给容量（如按次计费的套餐），此时传 undefined
+                        // ⇒ 卡片不画进度条（不能当成 0%：那会误导成"已耗尽"）。
+                        usageRatio:
+                          row.creditsTotal > 0
+                            ? Math.min(1, Math.max(0, row.credits / row.creditsTotal))
+                            : undefined,
+                        usageText:
+                          row.creditsTotal > 0
+                            ? `剩余 ${row.credits.toLocaleString()} / ${row.creditsTotal.toLocaleString()}`
+                            : undefined,
+                        // 临近到期转橙（同 WorkBuddy：额度的问题是"快过期用不完"）
+                        usageWarn: exp.urgent,
                         models: row.models,
                         hasCredential: row.hasCredential,
                         disabled: row.disabled,

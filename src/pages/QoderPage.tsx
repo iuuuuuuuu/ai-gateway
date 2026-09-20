@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { QoderMark } from "@/components/product-marks";
 import { ProductAccountCard, ProductAccountGrid } from "@/components/product-account-card";
+import type { ProductAccountTask } from "@/components/product-account-card";
 import { openInDefaultBrowser } from "@/lib/open-browser";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -285,6 +286,49 @@ function campaignEntriesFor(acc: api.QoderAccountCampaigns): api.QoderCampaign[]
     out.push(c);
   }
   return out.sort((a, b) => Number(isClaimedCampaign(a)) - Number(isClaimedCampaign(b)));
+}
+
+/**
+ * 把一个账号的权益活动转成**账号卡片上的任务清单**。
+ *
+ * # 为什么是"推导"而不是"写死一张表"（所有者明确要求）
+ *
+ * 原话：「qoder 还支持的任务（**因为 qoder 活动是动态的，所以这里支持的
+ * 任务也是动态的**）」。
+ *
+ * 上游的活动是按账号下发、随时上新的（实测 `campaignKey` 形如
+ * `act-20260918-628`）。写死一张任务表意味着：上游换个活动，菜单里就少了
+ * 那项，而**用户只会看到"任务不见了"** —— 他不会知道是我们要改代码。
+ *
+ * 故这里直接用活动清单做任务清单：**活动有多少，任务就有多少**。
+ *
+ * # 三个状态的判定
+ *
+ *	done    —— 上游明确说已领（`isClaimedCampaign`）
+ *	blocked —— 已过期或不是"查看类"动作（`!isClaimableCampaign` 且未领）
+ *	ready   —— 其余（可领）
+ *
+ * ⚠ `blocked` 与 `done` 都置灰但**都显示**：用户需要知道"这个任务存在"。
+ * 隐藏会让他以为功能没了（见 ProductAccountTask 的注释）。
+ */
+function qoderTaskStateOf(c: api.QoderCampaign): "done" | "ready" | "blocked" {
+  if (isClaimedCampaign(c)) return "done";
+  if (!isClaimableCampaign(c)) return "blocked";
+  return "ready";
+}
+
+/** 该账号当前有哪些任务、各自什么状态。 */
+function qoderTasksOf(
+  acc: api.QoderAccountCampaigns | undefined,
+): ProductAccountTask[] {
+  if (!acc) return [];
+  return campaignEntriesFor(acc).map((c) => ({
+    // id 用 campaignId：领取接口要的就是它（campaignKey 只是好看的名字）
+    id: c.campaignId || c.campaignKey || "",
+    label: campaignTitleOf(c),
+    state: qoderTaskStateOf(c),
+    reason: qoderTaskStateOf(c) === "blocked" ? campaignSubtitleOf(c) || "当前不可领取" : undefined,
+  })).filter((t) => t.id !== "");
 }
 
 /**
@@ -945,8 +989,19 @@ export default function QoderPage() {
    * 若一律说"领取成功"，用户会以为又领了一份 —— 必须如实说"已领过"。
    */
   const claimOneAccount = useCallback(
-    async (acc: api.QoderAccountCampaigns) => {
-      const targets = campaignEntriesFor(acc).filter(isClaimableCampaign);
+    async (acc: api.QoderAccountCampaigns, onlyCampaignId?: string) => {
+      // `onlyCampaignId` 非空 = 从账号卡的任务菜单**只跑选中那一项**；
+      // 为空 = 卡片上的「领取全部」按钮，跑该账号所有可领活动。
+      //
+      // 为什么需要"只跑一项"：所有者要求任务要能**单独执行**
+      //（「点击后进行执行 qoder 还支持的任务」）—— 他点的是某个任务，
+      // 期望影响的就是那一个，而不是顺带把别的也领了。
+      let targets = campaignEntriesFor(acc).filter(isClaimableCampaign);
+      if (onlyCampaignId) {
+        targets = targets.filter(
+          (c) => (c.campaignId || c.campaignKey) === onlyCampaignId,
+        );
+      }
       if (targets.length === 0) return;
 
       setClaimingUid(acc.uid);
@@ -1581,11 +1636,56 @@ export default function QoderPage() {
                         disabled: row.disabled,
                         variantLabel: regionLabel(row.region),
                         variantKind: regionVariant(row.region),
+                        // ── 额度进度条（所有者要求「积分进度条」）──
+                        //
+                        // ⚠ 传的是**剩余**占比（不是已用）—— 与 WorkBuddy 卡
+                        // 的 `remaining / total` 逐字同款。我第一版按"已用占比"
+                        // 算，方向反了：用户看到条快满了会以为额度快用完，
+                        // 实际那是才用了一点。
+                        //
+                        // 只在**确实有总量**时给比例：`creditsTotal` 为 0
+                        // 表示上游没给容量（如按次计费），此时传 undefined
+                        // ⇒ 卡片不画进度条。
+                        //
+                        // ⚠ 不能把"没有总量"当成 0% —— 那会让用户以为额度
+                        // 耗尽（反向误导）。
+                        usageRatio:
+                          row.creditsTotal > 0
+                            ? Math.min(1, Math.max(0, row.credits / row.creditsTotal))
+                            : undefined,
+                        usageText:
+                          row.creditsTotal > 0
+                            ? `剩余 ${row.credits.toLocaleString()} / ${row.creditsTotal.toLocaleString()}`
+                            : undefined,
+                        // 临近到期转橙（同 WorkBuddy：额度的问题是"快过期用不完"）
+                        usageWarn: exp.urgent,
+                        // ── 任务清单（所有者 2026-09-20：活动并进账号卡）──
+                        //
+                        // 原话：「qoder这个活动卡片和账号卡片应该合到一起，
+                        // 应该是 这个账号还有多少任务没运行…而且也没有跟
+                        // workbuddy 有个菜单按钮，点击后进行执行 qoder 还支持的任务
+                        //（因为 qoder 活动是动态的，所以这里支持的任务也是动态的）」
+                        //
+                        // 故任务清单**从活动数据实时推导**（不是写死的列表）：
+                        // 上游下发哪些活动，菜单里就有哪些任务。
+                        //
+                        // ⚠ 放在 `data` 里而不是顶层 prop：`tasks` 是**这个账号的
+                        // 数据**（它有几个任务、各什么状态），与 uid/nickname 同类。
+                        // 我第一版放成顶层 prop，被 tsc 挡住 —— 类型检查帮了忙。
+                        tasks: qoderTasksOf(
+                          (campaigns?.accounts || []).find((a) => a.uid === row.uid),
+                        ),
                       }}
                       onRefresh={() => void refreshAccount(row)}
                       onEditNote={() => {
                         setEditTarget(row);
                         setEditNote(row.note);
+                      }}
+                      onRunTask={(taskId) => {
+                        // 目前 qoder 的可执行任务就是"领取某个权益活动"，
+                        // 故任务 id 即活动 id。
+                        const acc = (campaigns?.accounts || []).find((a) => a.uid === row.uid);
+                        if (acc) void claimOneAccount(acc, taskId);
                       }}
                       onToggleDisabled={() => void toggleDisabled(row)}
                       onDelete={() => void remove(row)}
