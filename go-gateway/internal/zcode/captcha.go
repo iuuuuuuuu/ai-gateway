@@ -177,6 +177,22 @@ func (s *CaptchaSolver) Dir() string {
 	return s.dir
 }
 
+// Region 返回验证码所属区域（`X-Aliyun-Captcha-Verify-Region` 的值）。
+//
+// # 为什么需要这个访问器
+//
+// 它与 param **成对**：实测缺 region 就是 3007（见 cred.go 的注释）。
+// 而 region 是求解器的运营参数（可能被上游配置覆盖，见 SetCaptchaConfig），
+// 故**不能**在调用方硬编码 —— 那样一旦上游换区域，我们会带着
+// 旧 region 去配新 param，结果是"求解成功但仍 3007"，极难查。
+//
+// 空串表示未配置，调用方应回落默认值。
+func (s *CaptchaSolver) Region() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.region
+}
+
 // resolveNode 找到可用的 node 可执行文件。
 //
 // 顺序：环境变量 ZCODE_NODE_PATH → PATH 里的 node。

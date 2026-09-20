@@ -2086,9 +2086,56 @@ fn captcha_solver_dir() -> String {
                 // macOS：Contents/MacOS/../Resources
                 dir.join("..").join("Resources").join("assets").join("zcode-captcha"),
                 dir.join("..").join("Resources").join("zcode-captcha"),
+                // ⚠⚠ NSIS 安装后的**真实**布局（2026-09-20 实测，此前漏了）
+                //
+                // 实测：主程序在 `D:\APP\AI Gateway\ai-gateway.exe`，
+                // 而求解器落在 `D:\APP\AI Gateway\_up_\assets\zcode-captcha`。
+                //
+                // 那个 `_up_` 是 Tauri NSIS 的**更新暂存目录**（`_up_` =
+                // update staging）：安装器先把文件解到 `_up_`，再搬运；
+                // 而 `bundle.resources` 的 `../assets/...` 相对路径在暂存期
+                // 就已经把 `assets/` 建在了 `_up_` 下面，搬运后**没有**再上提一层。
+                //
+                // 后果：上面 6 个候选**全部落空** ⇒ `captcha_solver_dir()`
+                // 返回空串 ⇒ 网关配置里 `zcode_captcha_dir` 为空 ⇒
+                // `main.go` 连求解器都不创建 ⇒ 用户即使把开关打开也会看到
+                // 「组件未安装」，而他明明能在安装目录里看到那个文件夹。
+                //
+                // 这是**只能通过解包安装目录才能发现**的一类缺陷：
+                // 开发时（`target/release` 旁边直接放 assets）一切正常。
+                dir.join("_up_").join("assets").join("zcode-captcha"),
+                dir.join("_up_").join("zcode-captcha"),
             ] {
                 if let Some(d) = ok(cand) {
                     return d;
+                }
+            }
+
+            // 兜底：在安装目录**一层深**里找 `assets/zcode-captcha`。
+            //
+            // 为什么需要它：Tauri 的 NSIS 布局随版本变过（`_up_` 只是当前
+            // 版本的名字）。硬编码候选列表**每次布局变化都会静默失效**，
+            // 而症状是"求解器找不到"——与"组件没打包"完全一样，
+            // 排查时极易误判。
+            //
+            // 只扫一层深：再深就可能命中 node_modules 里的同名目录，
+            // 而那个不是我们的组件（它没有 solver.bundle.cjs，`ok()` 会拒掉，
+            // 但多扫几层会让启动变慢）。
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    for sub in ["assets", ""] {
+                        let cand = if sub.is_empty() {
+                            e.path().join("zcode-captcha")
+                        } else {
+                            e.path().join(sub).join("zcode-captcha")
+                        };
+                        if let Some(d) = ok(cand) {
+                            return d;
+                        }
+                    }
                 }
             }
         }
@@ -3759,6 +3806,119 @@ pub async fn growth_task(action: &str, account_id: &str, task_code: &str) -> Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 求解器目录必须在 **NSIS 安装后的真实布局** 里能找到。
+    ///
+    /// # 这条测试守的是什么
+    ///
+    /// 实测（2026-09-20）：主程序在 `D:\APP\AI Gateway\ai-gateway.exe`，
+    /// 而求解器落在 `D:\APP\AI Gateway\_up_\assets\zcode-captcha`
+    /// —— `_up_` 是 Tauri NSIS 的更新暂存目录，搬运后**没有**上提一层。
+    ///
+    /// 原候选列表里**没有 `_up_`**，于是：
+    ///
+    ///	6 个候选全部落空 → `captcha_solver_dir()` 返回空串
+    ///	→ 网关配置 `zcode_captcha_dir=""` → `main.go` 不创建求解器
+    ///	→ 用户即使把开关打开也看到「组件未安装」
+    ///
+    /// **而他在安装目录里明明能看到那个文件夹。** 这类缺陷开发期测不出来
+    ///（`target/release` 旁边直接放 assets 就正常），只能靠解包安装目录发现。
+    ///
+    /// 故用**临时目录搭出真实布局**来钉住它 —— 不依赖本机装没装。
+    #[test]
+    fn captcha_dir_is_found_in_nsis_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "wb2a-captcha-layout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // 搭出 `{root}/_up_/assets/zcode-captcha/solver.bundle.cjs`
+        let solver_dir = root.join("_up_").join("assets").join("zcode-captcha");
+        std::fs::create_dir_all(&solver_dir).expect("建测试目录");
+        std::fs::write(solver_dir.join("solver.bundle.cjs"), b"// stub").expect("写占位入口");
+
+        // 复刻 `captcha_solver_dir()` 的候选逻辑（它读 current_exe，
+        // 测试进程的 exe 不在这个 root 下，故这里把逻辑抽出来单独验）。
+        //
+        // ⚠ 不直接调 `captcha_solver_dir()`：那会依赖**测试二进制**的位置，
+        // 与本用例要验的布局无关。抽出来是为了让断言只针对"候选列表 +
+        // 兜底扫描"这段纯逻辑。
+        fn find_under(dir: &std::path::Path) -> Option<String> {
+            fn ok(p: std::path::PathBuf) -> Option<String> {
+                if p.join("solver.bundle.cjs").is_file() || p.join("solver.js").is_file() {
+                    Some(p.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            }
+            for cand in [
+                dir.join("assets").join("zcode-captcha"),
+                dir.join("zcode-captcha"),
+                dir.join("resources").join("assets").join("zcode-captcha"),
+                dir.join("resources").join("zcode-captcha"),
+                dir.join("_up_").join("assets").join("zcode-captcha"),
+                dir.join("_up_").join("zcode-captcha"),
+            ] {
+                if let Some(d) = ok(cand) {
+                    return Some(d);
+                }
+            }
+            // 兜底一层深扫描
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    for sub in ["assets", ""] {
+                        let cand = if sub.is_empty() {
+                            e.path().join("zcode-captcha")
+                        } else {
+                            e.path().join(sub).join("zcode-captcha")
+                        };
+                        if let Some(d) = ok(cand) {
+                            return Some(d);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        let found = find_under(&root);
+        assert!(
+            found.is_some(),
+            "求解器在 `_up_/assets/zcode-captcha` 布局下**必须**能被找到 —— \
+             找不到会让 captcha 求解永远不可用，而用户在安装目录里能看到它"
+        );
+        assert!(
+            found.as_deref().unwrap_or("").contains("_up_"),
+            "应命中 `_up_` 那条候选，实际 {:?}",
+            found
+        );
+
+        // 反向：目录存在但**没有入口文件**时不该认（否则 fail late）
+        let empty = root.join("assets").join("zcode-captcha");
+        std::fs::create_dir_all(&empty).expect("建空目录");
+        let bare_root = std::env::temp_dir().join(format!(
+            "wb2a-captcha-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(bare_root.join("assets").join("zcode-captcha")).expect("建空布局");
+        assert!(
+            find_under(&bare_root).is_none(),
+            "只有空目录、没有 solver.bundle.cjs / solver.js 时**不该**认作可用组件"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&bare_root);
+    }
 
     // 「指定账号」下拉的条目必须把备注一并下发给界面。
     //

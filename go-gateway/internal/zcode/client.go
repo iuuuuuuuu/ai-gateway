@@ -140,11 +140,67 @@ const ChatPath = "/chat/completions"
 //
 //	rc != nil              → 成功，调用方负责 Close
 //	rc == nil, status >= 400 → 上游拒绝，respBody 是原始响应体
+//
+// # 验证码（captcha）—— 2026-09-20 补上的接线
+//
+// start-plan 通道对不带 `X-Aliyun-Captcha-Verify-Param` 的请求一律回
+//
+//	HTTP 400 {"code":3007,"msg":"captcha verify failed"}
+//
+// 求解器（`captcha.go` 的 `Solve()`）**早已实现且有 277 行测试**，
+// 但**从来没有生产代码调用它** —— 全仓 `CaptchaParam` 的赋值次数为 0，
+// 于是 `applyHeaders` 里那个 `if cr.CaptchaParam != ""` **永远为假**，
+// 我们**从不发**这个头 ⇒ 必然 3007。
+//
+// 那是一个典型的「写了但没接线」缺陷：每一段单看都对，合起来是死的。
+// 本函数现在负责接线。
+//
+// ⚠ 求解是**有成本**的（起一个 Node 进程、约 3 秒，且**会上游限流**：
+// 连续求解若干次后求解器报 `[pe-stall]` 且需等待恢复）。
+// 故只在**确实需要时**解（见下），不做"每次都解"。
 func (c *Client) StreamChat(ctx context.Context, cr *Cred, openAIBody []byte) (io.ReadCloser, int, []byte, error) {
 	if cr == nil || cr.Credential == "" {
 		return nil, 0, nil, fmt.Errorf("账号没有凭证")
 	}
 
+	// 先试**不带**验证码：多数情况下不需要它，能省一次求解（以及一次限流风险）。
+	rc, status, body, err := c.streamChatOnce(ctx, cr, openAIBody)
+	if err != nil || status != http.StatusBadRequest {
+		return rc, status, body, err
+	}
+	// 只有明确是「验证码缺失/失败」才去解 —— 其他 400（参数错、模型无权限）
+	// 解了也没用，白白消耗一次求解配额。
+	if !IsCaptchaRequiredBody(body) {
+		return rc, status, body, err
+	}
+
+	param, serr := c.solveCaptcha(ctx)
+	if serr != nil || param == "" {
+		// 求解失败**如实返回原始 3007**，并把原因拼进响应体。
+		//
+		// ⚠ 不能静默返回原来的 body：用户会看到"captcha verify failed"
+		// 而不知道**我们连求解都没成功**（组件没装 / 正在冷却 / 求解器受限流），
+		// 那两种情况的处置完全不同（装组件 vs 等一会儿）。
+		if serr != nil {
+			return nil, status, appendCaptchaNote(body, serr.Error()), nil
+		}
+		return rc, status, body, err
+	}
+
+	// 用**一次性** param 重试。
+	//
+	// ⚠ 必须复制 Cred 再改：`cr` 是池里共享的账号对象，
+	// 直接写它的 CaptchaParam 会让这个一次性值**残留**在账号上，
+	// 下一次请求带着它必回 3007（一次性语义），表现为"偶发失败"。
+	// 复制一份既干净又不会污染池状态。
+	retry := *cr
+	retry.CaptchaParam = param
+	retry.CaptchaRegion = c.captchaRegion()
+	return c.streamChatOnce(ctx, &retry, openAIBody)
+}
+
+// streamChatOnce 发一次请求（不涉及验证码求解）。
+func (c *Client) streamChatOnce(ctx context.Context, cr *Cred, openAIBody []byte) (io.ReadCloser, int, []byte, error) {
 	rawURL := cr.Provider.OpenAIBase() + ChatPath
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(openAIBody))
 	if err != nil {
@@ -162,6 +218,62 @@ func (c *Client) StreamChat(ctx context.Context, cr *Cred, openAIBody []byte) (i
 		return nil, resp.StatusCode, raw, nil
 	}
 	return resp.Body, resp.StatusCode, nil, nil
+}
+
+// IsCaptchaRequiredBody 报告响应体是否是"需要验证码"（3007）。
+func IsCaptchaRequiredBody(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	s := string(body)
+	// 上游两种形状都见过：`code:3007` 与中文/英文文案。
+	// 用 code 为主判据（文案可能变），文案为辅。
+	return strings.Contains(s, "3007") ||
+		strings.Contains(s, "captcha verify failed") ||
+		strings.Contains(s, "验证码")
+}
+
+// appendCaptchaNote 在原始响应体里补一句可读说明（保留原 body 不动其结构）。
+//
+// 为什么是"拼接"而不是重新构造 JSON：上游 body 的形状随版本变，
+// 我们**没有把握**解析它再序列化回等价的 JSON；而这段文字只是给人看的，
+// 拼在后面既能被用户看到，又不会破坏调用方对原始 body 的判断。
+func appendCaptchaNote(body []byte, reason string) []byte {
+	note := fmt.Sprintf(
+		"\n\n[网关说明] 上游要求人机验证，但**求解未成功**，因此没有重试。原因：%s\n"+
+			"[网关说明] 若求解器组件缺失，请确认安装包内含 assets/zcode-captcha；"+
+			"若是冷却/限流，稍后会自动恢复（求解器自身有冷却保护）。",
+		reason)
+	return append(append([]byte{}, body...), note...)
+}
+
+// solveCaptcha 用共享求解器求一个 verifyParam。
+//
+// 求解器是**进程级共享**的（`SharedCaptchaSolver`），因为它自带冷却状态 ——
+// 每个 Client 各持一个会让冷却形同虚设（上游限流是按我们的出口算的，
+// 不是按实例算的）。
+func (c *Client) solveCaptcha(ctx context.Context) (string, error) {
+	s := SharedCaptchaSolver()
+	if s == nil {
+		return "", fmt.Errorf("求解器未初始化")
+	}
+	if reason := s.UnavailableReason(); reason != "" {
+		return "", fmt.Errorf("求解器不可用：%s", reason)
+	}
+	return s.Solve(ctx)
+}
+
+// captchaRegion 验证码所属区域。
+//
+// 与 param 成对；实测缺它就是 3007（见 cred.go 的 CaptchaRegion 注释）。
+// 取不到时回落 "cn"（本项目所有实测样本都是 cn）。
+func (c *Client) captchaRegion() string {
+	if s := SharedCaptchaSolver(); s != nil {
+		if r := s.Region(); r != "" {
+			return r
+		}
+	}
+	return "cn"
 }
 
 // applyHeaders 写上游请求头。

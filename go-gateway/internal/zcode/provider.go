@@ -129,6 +129,35 @@ func (p Provider) endpointsOf() endpoints {
 // billing/balance 都回 404，只有 zcode.z.ai 给出数据。
 const QuotaHost = "https://zcode.z.ai"
 
+// StartPlanBase start-plan（**JWT 通道**）的 Anthropic 端点基址。
+//
+// # 这是官方客户端实际用的那个端点（实测 2026-09-20）
+//
+// 从官方客户端自己的配置读到（`~/.zcode/v2/config.json`）：
+//
+//	builtin:bigmodel-start-plan:
+//	  kind    = "anthropic"
+//	  apiKey  = eyJ…（就是凭证文件里那个 jwt）
+//	  baseURL = https://zcode.z.ai/api/v1/zcode-plan/anthropic
+//
+// 而**表里原来那两个**（`open.bigmodel.cn/api/anthropic`、
+// `api.z.ai/api/anthropic`）是 **API Key 通道**的端点，不是 start-plan 的。
+// 两者不能混用：
+//
+//	· start-plan 通道 → 凭证是 **jwt**，额度挂在 start-plan 上
+//	· coding/paas 通道 → 凭证是 `{apiKey}.{secret}`，**没有该账号的资源包**
+//	  （实测恒回 429 code=1113「余额不足或无可用资源包」）
+//
+// 用户看到的现象是「明明有 2.99 亿额度却报余额不足」，根因就是
+// **拿到了 start-plan 的额度，却把对话发到了 coding/paas 通道**。
+//
+// ⚠ 完整路径要在 base 后再拼 `/v1/messages`（Anthropic 协议固定后缀）。
+//   实测直接打 base 是 404，打 `{base}/v1/messages` 才进得去。
+const StartPlanBase = "https://zcode.z.ai/api/v1/zcode-plan/anthropic"
+
+// AnthropicMessagesPath Anthropic Messages 协议的固定后缀。
+const AnthropicMessagesPath = "/v1/messages"
+
 // ⚠⚠ 已知的**架构级不一致**（2026-09-19 实测，尚未修，需产品决策）
 //
 // # 现象
@@ -156,20 +185,23 @@ const QuotaHost = "https://zcode.z.ai"
 // 用户看到的现象是「明明有额度却报余额不足」，而我们的错误文案
 //（`ErrNoResourcePack` 的 FriendlyMessage）也没能说清这一点。
 //
-// # 为什么我没直接改（这是产品决策，不是 bug 修复）
+// # 2026-09-20 补充：端点已找到，但 3012 仍在
 //
-// 切到 anthropic（start-plan）通道意味着：
+// 本轮从官方客户端配置定位到了 **start-plan 的真实端点**
+//（见 `StartPlanBase`）——此前表里那两个是 API Key 通道的，用错了。
 //
-//	· 协议从 OpenAI 换成 Anthropic（要重写请求/响应翻译层）
-//	· 该通道要求**验证码**（3007），而我们已实现求解器
-//	· 但该通道在解完验证码后回 **3012 unusual activity** ——
-//	  已做 A/B 实验证明**与请求形状无关**（补官方 system 块 + meta_user
-//	  后仍然 3012），是账号/风控层
+// 但该通道在**解完验证码后仍可能回 3012 unusual activity**：
 //
-// 即：切过去**也不一定能用**，却要付出一整套协议翻译的代价。
-// 故先把事实记录在这里，由所有者决定要不要投入。
+//	· **官方客户端自己也吃 3012**（实测：日志 `turn.failed`，
+//	  providerId=account:bigmodel-start-plan，405 code=3012）
+//	· 同一账号 07:01 是 3012、07:02 就成功 ⇒ 是**请求级/瞬时**风控，
+//	  不是账号被封
 //
-// 验证脚本：`uitest/diag-zcode-channel.cjs`、`uitest/diag-system-block-ab.cjs`
+// 故 3012 的判据**仍未确证**（可能是时间/频率/IP/内容维度），
+// 而它连官方客户端都拦 —— 切过去**也不保证能用**。
+//
+// 验证脚本：`uitest/diag-zcode-channel.cjs`、`uitest/diag-system-block-ab.cjs`、
+// `uitest/report-zcode-3012-evidence.cjs`（本轮证据汇总，只读本机数据）
 
 // OpenAIBase / AnthropicBase / BizHost / QuotaHost 便捷访问器。
 func (p Provider) OpenAIBase() string    { return p.endpointsOf().OpenAIBase }
