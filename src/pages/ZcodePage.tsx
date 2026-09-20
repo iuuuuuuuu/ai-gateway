@@ -67,15 +67,41 @@ function providerVariant(provider: ZcodeProvider): "default" | "secondary" | "ou
   return "outline";
 }
 
-/** 到期时间展示。 */
+/**
+ * 额度周期展示。
+ *
+ * # ⚠ 必须说清是**哪种**到期（所有者 2026-09-20 反馈）
+ *
+ * 原话：「zcode这里显示 0天后 是什么东西?看不懂,是token到期时间吗?修正一下」
+ *
+ * 原因：ZCode 有**两个**完全不同的到期时间，而卡片上只写了一串
+ * 「0 天后（2026/9/20）」，用户无从判断它指什么：
+ *
+ *	expireAt（本函数处理）  各模型桶的**每日周期**结束
+ *	                        实测 = 当天 23:59:59 → 明天**自动重置**
+ *	planExpireAt            套餐**整体**到期（实测 9/23 23:59:59）
+ *	                        → 之后**归零**，不会再有
+ *
+ * 「0 天后」正是前者在**当天**的表现（离今天 23:59 不足 1 天，
+ * `Math.floor` 得 0）—— 而它其实意味着"今晚重置、明天还有"，
+ * 与"快没了"的直觉**完全相反**。不说清就会让用户误判额度要失效。
+ *
+ * 故措辞改成「今日 … 重置」/「N 天后重置」，与 `planExpiryText`
+ *（套餐整体到期）在视觉上明确区分开。
+ */
 function expiryText(expireAt: number): { text: string; urgent: boolean } {
-  if (!expireAt) return { text: "未知", urgent: false };
+  if (!expireAt) return { text: "额度周期未知", urgent: false };
   const ms = expireAt > 1e12 ? expireAt : expireAt * 1000;
   const days = Math.floor((ms - Date.now()) / 86400000);
-  const date = new Date(ms).toLocaleDateString();
-  if (days < 0) return { text: `已过期（${date}）`, urgent: true };
-  if (days <= 7) return { text: `${days} 天后（${date}）`, urgent: true };
-  return { text: date, urgent: false };
+  // 只显示月/日与时分：额度周期都在当天或次日，显示年份是噪音。
+  const d = new Date(ms);
+  const stamp = `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  if (days < 0) return { text: `额度周期已过（${stamp}）`, urgent: true };
+  // 不足 1 天 = 今天就是这个周期的最后一天。**不是**"快没了"，
+  // 而是"今晚重置"—— 故用中性措辞，不用红色警示。
+  if (days === 0) return { text: `今日 ${stamp} 重置`, urgent: false };
+  if (days <= 7) return { text: `${days} 天后重置（${stamp}）`, urgent: days <= 1 };
+  return { text: `${stamp} 重置`, urgent: false };
 }
 
 /**
@@ -708,6 +734,8 @@ export default function ZcodePage() {
                         note: row.note,
                         avatarUrl: row.avatarUrl,
                         creditsText,
+                        // 单位说明：ZCode 的额度单位是 **token**（不是积分/次数）。
+                        creditsLabel: "剩余 token",
                         expiryText: exp.text,
                         expiryUrgent: exp.urgent,
                         // 套餐类型与**套餐整体到期**。

@@ -56,6 +56,13 @@ export interface ProductAccountCardData {
   avatarUrl?: string;
   /** 额度的显示文本（已格式化）；空 = 未知。 */
   creditsText?: string;
+  /**
+   * 大数字的单位说明（默认「额度」）。
+   *
+   * 所有者反馈过「看不懂」—— 一个光秃秃的数字不说明它是积分、token
+   * 还是次数。各产品传自己的口径（如 ZCode 是 token，Qoder 是 Credits）。
+   */
+  creditsLabel?: string;
   /** 到期显示文本。 */
   expiryText?: string;
   /** 到是否紧急（7 天内），用于着色。 */
@@ -318,7 +325,12 @@ export function ProductAccountCard({
           与 WorkBuddy 卡片同构：主指标用大号字、副信息用 muted 小字。 */}
       <section className="flex min-w-0 flex-1 flex-col px-4 py-3">
         <div className="flex items-baseline gap-x-3 gap-y-1">
-          <span className="flex items-center gap-1.5">
+          <span className="flex items-baseline gap-1.5">
+            {/* 给大数字一个**单位说明** —— 否则用户不知道这个数是积分、
+                token 还是次数（所有者反馈过「看不懂」）。 */}
+            <span className="text-[11px] leading-4 text-muted-foreground">
+              {data.creditsLabel ?? "额度"}
+            </span>
             <strong
               className={cn("font-semibold leading-none tabular-nums tracking-[-0.025em]", compact ? "text-[20px]" : "text-[22px]")}
               style={{ fontFamily: '"Bricolage Grotesque Variable", "SF Pro Display", ui-sans-serif, sans-serif' }}
@@ -326,10 +338,31 @@ export function ProductAccountCard({
               {data.creditsText ?? "未知"}
             </strong>
           </span>
-          <div className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
-            <Clock3 className="size-3.5 shrink-0" />
-            <span className={cn(data.expiryUrgent && "text-amber-600")}>{data.expiryText ?? "到期未知"}</span>
-          </div>
+          {/*
+            「额度周期」—— 措辞必须说清它**不是**套餐到期。
+
+            ZCode 有两个完全不同的时间：额度桶的每日重置点，与套餐整体到期。
+            此前这里只写「0 天后（日期）」，所有者反馈「看不懂，是 token
+            到期时间吗」—— 因为「0 天后」听起来像"快没了"，而实际含义是
+            "今晚重置、明天还有"，**方向完全相反**。
+          */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <div className="ml-auto flex cursor-help items-center gap-1.5 text-xs text-muted-foreground">
+                <Clock3 className="size-3.5 shrink-0" />
+                <span className={cn(data.expiryUrgent && "text-amber-600")}>
+                  {data.expiryText ?? "额度周期未知"}
+                </span>
+              </div>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-xs">
+              <div className="font-medium">额度周期</div>
+              <div className="mt-1 text-xs">
+                每日额度会在该时刻**重置**，不是"额度到期作废"。
+                套餐整体到期另有标注（见下方橙色文字）。
+              </div>
+            </TooltipContent>
+          </Tooltip>
         </div>
 
         {/* 支持模型：没查过（undefined）与"查过但 0 个"是两回事，措辞要分开 */}

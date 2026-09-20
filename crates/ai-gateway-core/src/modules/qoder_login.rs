@@ -449,22 +449,61 @@ pub fn fetch_campaigns_all() -> Result<Value, String> {
     }))
 }
 
+/// 该活动**是不是一件能领的事**（"可领的任务"的唯一定义）。
+///
+/// # ⚠ 为什么必须存在，以及为什么单独抽出来
+///
+/// 所有者 2026-09-20 反馈：「qoder只有一个活动能领取,第二个只是优惠说明」。
+///
+/// 上游会把**纯宣传文案**也放进 `campaigns` 下发：它带 `actionType`、
+/// 带 `placements`，甚至带 `claimStatus`，但**没有 `benefit`** ——
+/// 领不到任何东西。实测那条是：
+///
+///	"专业版 4,000 Qwen Credits，高级版 12,000。续费、升级加赠 1,000。"
+///
+/// 旧判据只看 `claimStatus`，于是把它算成"可领"，界面上就出现
+/// **"2 个可领取"但只有一个真能领** —— 数量对不上，用户会以为界面在骗他。
+///
+/// # 判据
+///
+///	有 `benefit`                    → 能领（真活动）
+///	无 `benefit` 且 `actionType` 不是 CLAIM_BENEFIT → **不是任务**
+///	`CLAIMED` / `EXPIRED`           → 不是（已领/已结束）
+///	状态为空                        → **算可领**（上游没给状态时不预设为已领，
+///	                                   否则用户明明能领却看不到按钮）
+///
+/// ⚠ 抽成**一个**函数而不是在三处各写一遍：这条规则此前在
+/// `count_claimable` 与"一键领取"的目标筛选里**各写了一份**，
+/// 而两份都没排除宣传文案。复制粘贴的判据必然分叉 ——
+/// 那种缺陷表现为"计数说 2、实际领 1"，极难查。
+fn is_claimable_campaign(c: &Value) -> bool {
+    let st = c.get("claimStatus").and_then(Value::as_str).unwrap_or("");
+    if st.eq_ignore_ascii_case("CLAIMED") || st.eq_ignore_ascii_case("EXPIRED") {
+        return false;
+    }
+    // 有 benefit = 确实能领到东西，这就是"真活动"的判据。
+    if c.get("benefit").map(|b| !b.is_null()).unwrap_or(false) {
+        return true;
+    }
+    // 没有 benefit：只有明确声明是"领取类"动作时才算。
+    //
+    // `VIEW_DETAILS` 之类（"查看详情"）本来就领不到东西，
+    // 前端 `isClaimableCampaign` 也是这么判的 —— 两边必须一致。
+    c.get("actionType")
+        .and_then(Value::as_str)
+        .map(|a| a.eq_ignore_ascii_case("CLAIM_BENEFIT"))
+        .unwrap_or(false)
+}
+
 /// 数一个活动列表里有几条**可领取**的。
 ///
-/// 判据用 `claimStatus`（上游的权威状态），不用 `claimable` —— 后者在
-/// 部分账号/部分活动上缺失，拿它判断会漏掉真实可领的活动。
+/// 判据用 [`is_claimable_campaign`] —— 与"一键领取"的目标筛选、
+/// 以及前端的任务清单**共用同一条规则**（见该函数的说明）。
 fn count_claimable(campaigns: &Value) -> i64 {
     let Some(arr) = campaigns.as_array() else {
         return 0;
     };
-    arr.iter()
-        .filter(|c| {
-            let st = c.get("claimStatus").and_then(Value::as_str).unwrap_or("");
-            // 空串也算可领：上游没给状态时不预设为"已领取"，
-            // 否则用户明明能领却看不到按钮
-            !st.eq_ignore_ascii_case("CLAIMED") && !st.eq_ignore_ascii_case("EXPIRED")
-        })
-        .count() as i64
+    arr.iter().filter(|c| is_claimable_campaign(c)).count() as i64
 }
 
 /// **批量领取**所有账号的可领取活动（所有者的需求：「一键领取（所有账号）」）。
@@ -515,14 +554,14 @@ pub fn claim_all_campaigns() -> Result<Value, String> {
             }
         };
 
+        // ⚠ 用 `is_claimable_campaign`，**不要**再手写一遍 claimStatus 判据 ——
+        // 那样会与 `count_claimable` 分叉（此前正是如此，导致把宣传文案
+        // 也算成可领，界面上"2 个可领"实际只领到 1 个）。
         let targets: Vec<Value> = campaigns
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .filter(|c| {
-                        let st = c.get("claimStatus").and_then(Value::as_str).unwrap_or("");
-                        !st.eq_ignore_ascii_case("CLAIMED") && !st.eq_ignore_ascii_case("EXPIRED")
-                    })
+                    .filter(|c| is_claimable_campaign(c))
                     .cloned()
                     .collect()
             })
@@ -1002,5 +1041,71 @@ mod tests {
         assert!(t.ends_with('…'));
         // 不超长时原样返回
         assert_eq!(truncate("abc", 10), "abc");
+    }
+    #[test]
+    fn claimable_excludes_promo_entries() {
+        // 所有者 2026-09-20：「qoder只有一个活动能领取,第二个只是优惠说明」。
+        //
+        // 上游会把**纯宣传文案**也放进 campaigns：带 claimStatus、带 placements，
+        // 但**没有 benefit** —— 领不到任何东西。旧判据只看 claimStatus，
+        // 于是界面上"2 个可领取"而实际只领到 1 个。
+        let campaigns = json!([
+            {
+                "campaignId": "real-1",
+                "actionType": "CLAIM_BENEFIT",
+                "claimStatus": "CLAIMABLE",
+                "benefit": { "kind": "CREDITS", "amount": 100 },
+            },
+            {
+                // 实测那条宣传文案的原文
+                "campaignId": "promo-1",
+                "actionType": "VIEW_DETAILS",
+                "claimStatus": "CLAIMABLE",
+                // 注意：**没有 benefit**
+            },
+        ]);
+        assert_eq!(
+            count_claimable(&campaigns),
+            1,
+            "宣传文案（无 benefit、非 CLAIM_BENEFIT）不该算可领 —— \
+             算了就会出现「说 2 个可领、实际领 1 个」"
+        );
+    }
+
+    #[test]
+    fn claimable_status_rules_unchanged() {
+        // 原有取向不能被我这次改动弄坏：
+        //  · 状态为空仍算可领（否则用户明明能领却看不到按钮）
+        //  · CLAIMED / EXPIRED 不算
+        let campaigns = json!([
+            { "campaignId": "a", "actionType": "CLAIM_BENEFIT", "benefit": {"amount": 1} },
+            { "campaignId": "b", "actionType": "CLAIM_BENEFIT", "claimStatus": "CLAIMED", "benefit": {"amount": 1} },
+            { "campaignId": "c", "actionType": "CLAIM_BENEFIT", "claimStatus": "EXPIRED", "benefit": {"amount": 1} },
+            { "campaignId": "d", "actionType": "CLAIM_BENEFIT", "claimStatus": "", "benefit": {"amount": 1} },
+        ]);
+        assert_eq!(count_claimable(&campaigns), 2, "空状态 + 无非状态字段的都算可领");
+    }
+
+    #[test]
+    fn claimable_benefit_wins_over_action_type() {
+        // 有 benefit 就是真活动 —— 即使 actionType 不是 CLAIM_BENEFIT。
+        //
+        // 为什么这样取向：`benefit` 是**能领到多少**的结构化证据，
+        // 比 actionType 这个名义字段更可靠（实测上游字段名会变，
+        // 而 benefit 一直在）。
+        let campaigns = json!([
+            { "campaignId": "x", "actionType": "SOMETHING_ELSE", "benefit": { "amount": 5 } },
+        ]);
+        assert_eq!(count_claimable(&campaigns), 1);
+    }
+
+    #[test]
+    fn claimable_null_benefit_is_not_claimable() {
+        // 显式 null 与"字段缺失"必须同判 —— JSON 里两者都表示"没有"。
+        // 若把 null 当成有值，宣传文案（有时下发 benefit:null）又会混进来。
+        let campaigns = json!([
+            { "campaignId": "n", "actionType": "VIEW_DETAILS", "benefit": null },
+        ]);
+        assert_eq!(count_claimable(&campaigns), 0);
     }
 }

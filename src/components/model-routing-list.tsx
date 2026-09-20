@@ -389,12 +389,27 @@ export function ModelRoutingList({ models, className }: ModelRoutingListProps) {
         /*
           列表：**自适应多列网格**（见文件头「布局」一节）。
 
-          ⚠ 高度上限从 520 降到 460：改成多列后同样高度能装下约 2 倍的模型，
-          不必再给那么高的滚动区（过高会让页面下方的内容被推得太远）。
-          而 `auto-rows-fr` 让同一行的卡片等高 —— 否则长短不一的写法行
-          会让网格看起来参差不齐。
+          ⚠⚠ **绝不能加 `auto-rows-fr`**（我加过，是一个真实缺陷）
+
+          `auto-rows-fr` = `grid-auto-rows: minmax(0, 1fr)` —— 它要求
+          **所有行都等于容器高度的一份**。而本容器有 `max-h-[460px]`，
+          于是每一行被压成 `460px ÷ 行数`：
+
+            45 个模型 / 8 列 ≈ 6 行 ⇒ 每行只有 ~76px
+            而卡片内容（模型名+能力行+平台徽标+写法行+说明）需要 150px+
+
+          ⇒ 卡片互相重叠、文字溢出到相邻卡片上（所有者 2026-09-20 截图反馈
+             「这里 模型路由清单 显示异常」，画面上正是这种重叠）。
+
+          而且 `auto-rows-fr` 在本处**根本不需要**：
+          网格默认 `align-items: stretch`，**同一行**的卡片本来就会等高
+          （行高取该行最高者）。`auto-rows-fr` 额外要求"跨行也等高"，
+          那对内容长度差异很大的清单是错的。
+
+          故这里用默认的 `grid-auto-rows: auto`（不写就是 auto）——
+          每行按内容取高，同行仍然等高。
         */
-        <div className="grid max-h-[460px] auto-rows-fr grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-2 overflow-y-auto p-0.5 pr-1">
+        <div className="grid max-h-[460px] grid-cols-[repeat(auto-fill,minmax(260px,1fr))] content-start gap-2 overflow-y-auto p-0.5 pr-1">
           {filtered.map((m) => {
             const channels = m.channels || [];
             const forms = routeFormsOf(m);
