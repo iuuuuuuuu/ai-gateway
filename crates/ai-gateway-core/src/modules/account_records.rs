@@ -131,10 +131,19 @@ pub fn add_task_record(account_id: &str, account_name: &str, title: &str, result
 ///
 /// ⚠ 这些是**跨语言契约**，改字面量要三处同步：
 ///
-///	宿主（本文件）  RESULT_*
-///	网关 go-gateway/internal/records/records.go  的 ResultSuccess / ResultFailed / ResultAlready
-///	前端 src/components/account-records-view.tsx  按 `result === "…"` 匹配
-///	  （success → 绿勾、already → 黄勾、failed/error → 红）
+/// ```text
+/// 宿主（本文件）  RESULT_*
+/// 网关 go-gateway/internal/records/records.go  的 ResultSuccess / ResultFailed / ResultAlready
+/// 前端 src/components/account-records-view.tsx  按 `result === "…"` 匹配
+///   （success → 绿勾、already → 黄勾、failed/error → 红）
+/// ```
+///
+/// ⚠ 上面那个 `text` 围栏**必须保留**：
+/// 这几行是缩进写的，而 rustdoc 会把**缩进块当成 Rust 代码**去编译 ——
+/// 于是「（success → 绿勾…）」会被当成表达式，doc-test 直接失败：
+/// `error: expected one of '.', '?', ';', or an operator, found '→'`。
+/// 我第一版就是那样（没加围栏），`cargo test --workspace` 报
+/// `0 passed; 1 failed`。加上 `text` 围栏后 rustdoc 只当纯文本渲染。
 ///
 /// 前三个与 Go 侧**逐字一致**（已核对）；`skipped` 是本模块新增的，
 /// 前端目前没有专门配色，会落到"非失败"分支 —— 那是可接受的默认
