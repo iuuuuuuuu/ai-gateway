@@ -186,35 +186,202 @@ type inStreamError struct {
 	Msg  string
 }
 
+// Error 把上游错误渲染成**给人看**的文案。
+//
+// # 为什么要"渲染"而不是直接拼原文（2026-09-20 补）
+//
+// 上游的排队错误是**三层嵌套 + 两层 JSON 存在字符串里**，原文长这样：
+//
+//	code=403 msg={"code":"10605","message":"{\"isQueued\":true,\"queueCount\":7309,…}"}
+//
+// 直接拼出来用户完全看不懂，得自己一层层解转义才知道"是在排队"。
+// 故这里识别出**已知的业务码**并渲染成一句话。
+//
+// ⚠ 渲染失败时**必须退回原文** —— 宁可难看，也不能吞掉信息。
 func (e *inStreamError) Error() string {
+	if msg, ok := e.humanMessage(); ok {
+		return msg
+	}
 	if e.Code == "" {
 		return "上游在流内报错：" + e.Msg
 	}
 	return fmt.Sprintf("上游在流内报错 code=%s msg=%s", e.Code, e.Msg)
 }
 
-// errorFromEnvelope 从响应信封里提取错误（顶层 error 字段）。
+// humanMessage 识别已知业务码并渲染成可读文案。
 //
-// 上游两种报错位置都要查：
+// 返回 ok=false 表示"不认识这个码" —— 调用方退回原文。
+func (e *inStreamError) humanMessage() (string, bool) {
+	// 把可能的多层嵌套剥开，取出最内层的业务对象。
+	inner := e.peelNested()
+	if inner == nil {
+		return "", false
+	}
+	// ---- 排队（10605）：免费档拥挤时的正常保护，不是故障 ----
+	if queued, ok := inner["isQueued"].(bool); ok && queued {
+		var b strings.Builder
+		b.WriteString("免费模型正在排队（上游主动限流，非故障）")
+		if n, ok := numField(inner, "queueCount"); ok {
+			fmt.Fprintf(&b, "：前面约 %d 个请求", n)
+		}
+		if w, ok := numField(inner, "waitTime"); ok {
+			fmt.Fprintf(&b, "，预计等待约 %d 秒", w)
+		}
+		if m, ok := inner["modelKey"].(string); ok && m != "" {
+			fmt.Fprintf(&b, "（模型 %s）", m)
+		}
+		if r, ok := numField(inner, "retryAfterSeconds"); ok {
+			fmt.Fprintf(&b, "。建议 %d 秒后重试", r)
+		}
+		// 明确告知"服务正常"——避免用户以为账号或服务出了问题
+		if av, ok := inner["serviceAvailable"].(bool); ok && av {
+			b.WriteString("；上游服务状态正常")
+		}
+		return b.String(), true
+	}
+	return "", false
+}
+
+// peelNested 剥开"JSON 存在字符串里"的多层嵌套，返回最内层对象。
 //
-//	{"error":{"code":"500","msg":"..."}}                        顶层（本函数）
-//	{"body":"{\"error\":{\"code\":\"500\",\"msg\":\"...\"}}" }  嵌在 body 里（parseOpenAIShaped）
+// 上游的形状（实测）：
+//
+//	第1层 {"code":"403","message":"<JSON>"}
+//	第2层 {"code":"10605","message":"<JSON>"}
+//	第3层 {"isQueued":true,…}        ← 要的就是它
+//
+// 最多剥 4 层（够用且防死循环 —— 恶意/异常的自引用串会让无界循环挂住）。
+func (e *inStreamError) peelNested() map[string]any {
+	cur := e.Msg
+	for i := 0; i < 4; i++ {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(cur), &m); err != nil {
+			return nil
+		}
+		// 已经到"业务对象"（有 isQueued 之类的字段）就返回
+		if _, ok := m["isQueued"]; ok {
+			return m
+		}
+		// 否则继续往 message 里剥
+		next, ok := m["message"].(string)
+		if !ok || strings.TrimSpace(next) == "" {
+			return m
+		}
+		cur = next
+	}
+	return nil
+}
+
+// numField 取一个数字字段（JSON 解出来是 float64）。
+func numField(m map[string]any, key string) (int64, bool) {
+	switch v := m[key].(type) {
+	case float64:
+		return int64(v), true
+	case int64:
+		return v, true
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// errorFromEnvelope 从响应信封里提取错误。
+//
+// # 上游报错的**两种**形状都要查（这是 2026-09-20 补的第二种）
+//
+//	① 有 error 包装：{"error":{"code":"500","msg":"..."}}
+//	② **无** error 包装，错误信息直接在顶层：{"code":"403","message":"..."}
+//
+// ## 为什么第二种必须识别（它此前被静默跳过）
+//
+// 实测（官方 Qoder CN 客户端日志，免费模型排队时）：
+//
+//	POST gateway.qoder.com.cn/.../agent_chat_generation  → HTTP **200**
+//	SSE 第 1 帧：
+//	  {"code":"403","message":"{\"code\":\"10605\",\"message\":
+//	    \"{\\\"isQueued\\\":true,\\\"queueCount\\\":7309,...}\"}"}
+//
+// 这个帧**四个分支全不匹配**：没有 `error`、没有 `body`、没有 `choices`、
+// 没有 `usage` —— 于是落到 `parseChunk` 最后的"不认识的分片"，**被静默跳过**。
+// 流随即结束、一个内容帧都没有 ⇒ 走 stream.go 的"上游无内容"分支
+// ⇒ **用户看到的是一句空回答**，而真正原因是上游在排队。
+//
+// 用户会去怀疑模型、网络、提示词 —— 全都不对。这正是最难查的那类缺陷：
+// **错误信息一路都在，只是我们没接住。**
+//
+// ## 为什么不担心误判正常帧
+//
+// 只在**这一帧本来就不会被当成内容**时才把它当错误（见下面的判据）。
+// 正常帧的形状是 `{"body":…}` / `{"choices":…}` / `{"usage":…}` —— 都带
+// 其中之一，故**一个都不受影响**（有测试锁定这一点）。
 func errorFromEnvelope(top map[string]json.RawMessage) error {
-	raw, ok := top["error"]
-	if !ok || len(raw) == 0 || string(raw) == "null" {
+	// ---- 形状①：标准 error 包装 ----
+	if raw, ok := top["error"]; ok && len(raw) > 0 && string(raw) != "null" {
+		var e struct {
+			Code string `json:"code"`
+			Msg  string `json:"msg"`
+			// 有些实现用 message 而不是 msg
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(raw, &e); err != nil {
+			// error 字段存在但不是对象：当作有错，原文带出
+			return &inStreamError{Msg: string(raw)}
+		}
+		return &inStreamError{Code: e.Code, Msg: firstNonEmpty(e.Msg, e.Message)}
+	}
+
+	// ---- 形状②：错误直接在顶层（无 error 包装）----
+	//
+	// 判据（**三重否定**，缺一不可）：这一帧既不是内容、也不是用量、也不是心跳。
+	//
+	//	· 没有 body    → 不是嵌套内容帧
+	//	· 没有 choices → 不是直接 OpenAI 内容帧
+	//	· 没有 usage   → 不是用量帧
+	//
+	// 三者都没有时，这一帧**原本就会被丢掉**（parseChunk 的最后一行）。
+	// 故把它识别成错误，只可能比"静默丢弃"更好 —— **不存在把正常帧判成错误的风险**。
+	_, hasBody := top["body"]
+	_, hasChoices := top["choices"]
+	_, hasUsage := top["usage"]
+	if hasBody || hasChoices || hasUsage {
 		return nil
 	}
-	var e struct {
-		Code string `json:"code"`
-		Msg  string `json:"msg"`
-		// 有些实现用 message 而不是 msg
-		Message string `json:"message"`
+	rawCode, hasCode := top["code"]
+	if !hasCode || len(rawCode) == 0 || string(rawCode) == "null" {
+		return nil
 	}
-	if err := json.Unmarshal(raw, &e); err != nil {
-		// error 字段存在但不是对象：当作有错，原文带出
-		return &inStreamError{Msg: string(raw)}
+	// 取 code 的字面值（上游有的发字符串 "403"，有的发数字 403）
+	code := strings.Trim(strings.TrimSpace(string(rawCode)), `"`)
+	// 取 message / msg（两种都见过）
+	msg := rawStringField(top, "message")
+	if msg == "" {
+		msg = rawStringField(top, "msg")
 	}
-	return &inStreamError{Code: e.Code, Msg: firstNonEmpty(e.Msg, e.Message)}
+	if msg == "" {
+		// 有 code 没文案：仍当错误（原文带出便于排查）
+		return &inStreamError{Code: code, Msg: strings.TrimSpace(string(rawCode))}
+	}
+	// 明确表示"成功"的 code 不算错误（防上游给正常帧加个 code:"0"）
+	if code == "0" || code == "200" || code == "" {
+		return nil
+	}
+	return &inStreamError{Code: code, Msg: msg}
+}
+
+// rawStringField 从顶层取一个字符串字段（容忍"值是字符串"与"值是对象"两种）。
+func rawStringField(top map[string]json.RawMessage, key string) string {
+	raw, ok := top[key]
+	if !ok || len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	// 不是字符串（少见）：返回原文
+	return strings.TrimSpace(string(raw))
 }
 
 // parseOpenAIShaped 解析标准 OpenAI chunk 形状。
