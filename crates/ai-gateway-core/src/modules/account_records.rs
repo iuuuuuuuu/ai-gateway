@@ -350,6 +350,63 @@ pub fn normalize_records(records: &[Value], at_ms: i64, keep_days: i64) -> Vec<V
     kept
 }
 
+/// account_id_matches 判断记录里的 accountId 是否属于要查的那个账号。
+///
+/// 等价规则：**剥掉已知产品前缀后相等**。
+///
+///	record="zcode:zcode-abc"  want="zcode-abc"  → true
+///	record="zcode-abc"        want="zcode-abc"  → true
+///	record="zcode:zcode-abc"  want="zcode:zcode-abc" → true（原样也认）
+///	record="qoder:xyz"        want="zcode-abc"  → false
+///
+/// ⚠ 只剥**已知产品**前缀（白名单），不做"首个冒号前就是产品"的宽松判定：
+/// 用户手填的 id 未必守规矩，宽松判定会把 `a:b` 与 `b` 误判成同一个账号，
+/// 那比"查不到"更糟 —— 它会把**别人的记录混进来**。
+fn account_id_matches(record_id: &str, want: &str) -> bool {
+    if record_id == want {
+        return true;
+    }
+    // ⚠ 空 want 只能靠上面的精确相等命中。
+    //
+    // `want=""` 在 query_records 里是「全部账号」的语义，那是**调用方**在
+    // 过滤前就分支掉的；若让本函数也认它，`"zcode:"` 这种残串会被剥成空串
+    // 而命中**所有**查询 —— 一个异常记录就能污染每个账号的记录视图。
+    //（这个边界是我写测试时被自己的断言抓出来的。）
+    if want.is_empty() {
+        return false;
+    }
+    // 归一：把**双方**的已知产品前缀都剥掉，再比较。
+    //
+    // 必须双向。只剥 record 一侧的话，"用带前缀的 id 查询"就找不到
+    // 裸记录 —— 而网关侧历史上确实用过带前缀的 id（见
+    // credit_usage::record_account_id 的注释）。
+    //（这个不对称是我写测试时抓出来的：query_matches_bare_record_when_asked_with_prefix。）
+    let a = strip_product_prefix(record_id);
+    let b = strip_product_prefix(want);
+    !a.is_empty() && a == b
+}
+
+/// strip_product_prefix 剥掉**已知产品**前缀（`zcode:` / `qoder:` / `workbuddy:`）。
+///
+/// 白名单而非"首个冒号前就是产品"：用户手填的 id 未必守规矩，
+/// 宽松剥离会把 `a:b` 与 `b` 误判成同一账号 —— 那比"查不到"更糟，
+/// 它会把**别人的记录混进来**。
+///
+/// 只剥一次：`zcode:zcode:x` 这种异常输入剥成 `zcode:x`，不继续剥。
+fn strip_product_prefix(id: &str) -> &str {
+    const PRODUCTS: [&str; 3] = ["zcode", "qoder", "workbuddy"];
+    for p in PRODUCTS {
+        if let Some(rest) = id.strip_prefix(p) {
+            if let Some(rest) = rest.strip_prefix(':') {
+                if !rest.is_empty() {
+                    return rest;
+                }
+            }
+        }
+    }
+    id
+}
+
 /// 查询账号记录。
 ///
 /// 参数：
@@ -358,6 +415,24 @@ pub fn normalize_records(records: &[Value], at_ms: i64, keep_days: i64) -> Vec<V
 ///   - `kinds`：为空表示全部类型
 ///
 /// 返回按时间**倒序**（最新在前），并附各类型计数，便于前端展示概览。
+///
+/// # ⚠ 账号匹配是「裸 id 等价」而不是精确相等（2026-09-20 实测缺陷）
+///
+/// 历史上有**两种** accountId 写法落到同一个账号上：
+///
+/// ```text
+/// zcode:zcode-1b2941c020ef   ← product_credit_snapshot 的 scoped_id 泄漏
+/// zcode-1b2941c020ef         ← 额度刷新直接写 uid
+/// ```
+///
+/// 界面按**裸 uid** 过滤，精确比较会让带前缀的那一半**静默消失**
+///（所有者：「zcode和qoder都无法查看任务执行记录,和积分消耗明细」）。
+///
+/// 写入侧已修（见 `credit_usage::record_account_id`），但**已写下的历史记录
+/// 改不回来** —— 故查询侧必须同时认两种写法，否则那些账号的历史永远缺一块。
+///
+/// 判据是 `account_id_matches`，只剥**已知产品前缀**（白名单），
+/// 避免把用户自己 id 里的冒号误当产品分隔符。
 pub fn query_records(
     account_id: &str,
     from_ms: i64,
@@ -380,7 +455,10 @@ pub fn query_records(
                 return false;
             }
             if !account_id.is_empty()
-                && r.get("accountId").and_then(Value::as_str).unwrap_or("") != account_id
+                && !account_id_matches(
+                    r.get("accountId").and_then(Value::as_str).unwrap_or(""),
+                    account_id,
+                )
             {
                 return false;
             }
@@ -879,5 +957,108 @@ mod tests {
 
         let v = query_records("", 0, 0, &[], 100);
         assert_eq!(v.get("total").and_then(Value::as_u64), Some(1), "不应有重复");
+    }
+
+    // -----------------------------------------------------------------------
+    // 带产品前缀的 accountId 必须仍能按裸 id 查到（2026-09-20 实测缺陷）
+    //
+    // 所有者：「zcode和qoder都无法查看任务执行记录,和积分消耗明细」。
+    //
+    // 实测同一账号在记录里出现两种写法：
+    //
+    //	zcode:zcode-1b2941c020ef   ← product_credit_snapshot 的 scoped_id 泄漏
+    //	zcode-1b2941c020ef         ← 额度刷新直接写 uid
+    //
+    // 界面按**裸 uid** 过滤，精确比较让带前缀的那一半**静默消失**。
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn query_matches_record_with_product_prefix() {
+        let _iso = Isolated::new("records-prefix");
+        let now = now_ms();
+        // 两种写法落在同一个账号上 —— 复现所有者现场的混合状态
+        push_at(now - 1000, "zcode:zcode-abc", KIND_CREDIT, "调用扣减", -5);
+        push_at(now, "zcode-abc", KIND_CREDIT, "额度刷新", 100);
+
+        // 界面传的是裸 uid ⇒ 两条都要能看到
+        let v = query_records("zcode-abc", 0, 0, &[], 100);
+        assert_eq!(
+            v.get("records").and_then(Value::as_array).map(Vec::len),
+            Some(2),
+            "按裸 uid 查询应同时命中带前缀与不带前缀的记录 —— \
+             只命中一条就是所有者遇到的『记录少了一半』"
+        );
+        assert_eq!(
+            v.get("total").and_then(Value::as_u64),
+            Some(2),
+            "总数也要算全（否则界面显示『共 1 条』而列表有 2 条）"
+        );
+    }
+
+    #[test]
+    fn query_matches_bare_record_when_asked_with_prefix() {
+        let _iso = Isolated::new("records-prefix-rev");
+        let now = now_ms();
+        push_at(now, "zcode-abc", KIND_CREDIT, "额度刷新", 100);
+
+        // 反方向：若调用方传了带前缀的 id，也应命中裸记录。
+        // （网关侧历史上确实用过带前缀的 id，双向兼容才不会漏。）
+        let v = query_records("zcode:zcode-abc", 0, 0, &[], 100);
+        assert_eq!(
+            v.get("records").and_then(Value::as_array).map(Vec::len),
+            Some(1),
+            "带前缀的查询也应命中裸记录"
+        );
+    }
+
+    #[test]
+    fn query_does_not_mix_different_products() {
+        let _iso = Isolated::new("records-no-mix");
+        let now = now_ms();
+        push_at(now, "zcode:zcode-abc", KIND_CREDIT, "z", -1);
+        push_at(now, "qoder:qoder-xyz", KIND_CREDIT, "q", -1);
+
+        // 只剥自己的前缀，不能把别的产品的记录混进来
+        let v = query_records("zcode-abc", 0, 0, &[], 100);
+        assert_eq!(
+            v.get("records").and_then(Value::as_array).map(Vec::len),
+            Some(1),
+            "查 zcode 的账号不该看到 qoder 的记录"
+        );
+    }
+
+    #[test]
+    fn query_does_not_strip_unknown_colon_prefix() {
+        let _iso = Isolated::new("records-unknown-prefix");
+        let now = now_ms();
+        push_at(now, "team:a", KIND_CREDIT, "x", -1);
+        push_at(now, "a", KIND_CREDIT, "y", -1);
+
+        // 白名单外的冒号前缀**不剥**：用户手填的 id 未必守规矩，
+        // 宽松剥离会把别人的记录混进来（比"查不到"更糟）。
+        let v = query_records("a", 0, 0, &[], 100);
+        assert_eq!(
+            v.get("records").and_then(Value::as_array).map(Vec::len),
+            Some(1),
+            "`team:a` 不该被当成 `a` —— 那会把别的账号的记录混进来"
+        );
+    }
+
+    #[test]
+    fn account_id_matches_rules() {
+        // 等价规则本身（纯函数，不碰磁盘）
+        assert!(account_id_matches("zcode-abc", "zcode-abc"));
+        assert!(account_id_matches("zcode:zcode-abc", "zcode-abc"));
+        assert!(account_id_matches("zcode:zcode-abc", "zcode:zcode-abc"));
+        assert!(account_id_matches("qoder:q-1", "q-1"));
+        assert!(account_id_matches("workbuddy:w-1", "w-1"));
+        // 反例
+        assert!(!account_id_matches("qoder:q-1", "zcode-abc"));
+        assert!(!account_id_matches("team:a", "a"));
+        assert!(!account_id_matches("", "a"));
+        assert!(!account_id_matches("a", "b"));
+        // 前缀后为空：不能剥成空串（空 id 在 query_records 里是"全部账号"，
+        // 那会让一个异常 id 意外匹配到所有记录）
+        assert!(!account_id_matches("zcode:", ""));
     }
 }

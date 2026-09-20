@@ -458,8 +458,39 @@ fn reading_trust(
     ReadingTrust::Ok
 }
 
-/// 写入一个成功的资源观察值。
+/// record_account_id 把**快照用的** id 归一成**记录用的**裸 id。
 ///
+/// # 为什么需要这一步（2026-09-20 实测缺陷）
+///
+/// 两个产品（Qoder / ZCode）的 uid 命名空间可能与 WorkBuddy 撞，
+/// 故 `product_credit_snapshot` 给快照 id 加产品前缀（`zcode:xxx`）——
+/// 那对**快照**是正确的隔离。
+///
+/// 但同一个 id 也被写进了**用户可见的记录**，而界面按**裸 uid** 过滤
+///（`ZcodePage` → `fixedAccountId={row.uid}`），且 `query_records`
+/// 是精确比较 ⇒ 点开账号只能看到一半记录，**另一半静默消失**。
+///
+/// 故记录侧统一剥掉前缀。只剥**已知产品**的前缀：
+/// 用「首个冒号前是产品名」判定太宽松 —— WorkBuddy 的 uid 本身是
+/// UUID（含 `-` 不含 `:`），而用户手填的 id 未必守规矩，
+/// 白名单能保证"只有我们自己的前缀会被剥掉"。
+fn record_account_id(snapshot_id: &str) -> &str {
+    const PRODUCTS: [&str; 3] = ["zcode", "qoder", "workbuddy"];
+    for p in PRODUCTS {
+        // 前缀后必须还有内容，否则 `"zcode:"` 会被剥成空串
+        //（空 id 在 query_records 里是"全部账号"的语义，那会串账号）。
+        if let Some(rest) = snapshot_id.strip_prefix(p) {
+            if let Some(rest) = rest.strip_prefix(':') {
+                if !rest.is_empty() {
+                    return rest;
+                }
+            }
+        }
+    }
+    snapshot_id
+}
+
+/// 写入一个成功的资源观察值。
 /// 同一账号同一资源值在短时间内只保留一条；资源值发生变化时立即保留，
 /// 这样余额下降可以归因到新快照。返回值表示本次是否实际写入。
 ///
@@ -521,7 +552,28 @@ pub fn record_snapshot(
                     let source = classify_credit_source(delta.amount, delta.capacity);
                     let (title, detail) = credit_record_text(source, &delta);
                     crate::modules::account_records::add_credit_record(
-                        account_id,
+                        // ⚠ 记录用**裸 id**，不能带产品前缀。
+                        //
+                        // # 为什么（2026-09-20 实测缺陷）
+                        //
+                        // `product_credit_snapshot` 为了隔离两个产品的 uid 命名空间，
+                        // 把 id 拼成 `zcode:zcode-1b2941c020ef` 再传给本函数
+                        //（那对**快照**是对的）。但本函数会把这个 id **写进用户可见
+                        // 的记录**，而界面按账号的**裸 uid** 过滤
+                        //（`ZcodePage` → `fixedAccountId={row.uid}`）。
+                        //
+                        // 于是同一个 ZCode 账号出现两种 accountId：
+                        //
+                        //	zcode:zcode-1b2941c020ef   ← 走本函数（带前缀）
+                        //	zcode-1b2941c020ef         ← 走 zcode_login 的额度刷新
+                        //
+                        // 而 `query_records` 是**精确字符串比较** ⇒ 点开账号只能
+                        // 看到不带前缀的那一半，**另一半静默消失**。
+                        // 所有者报的「zcode和qoder都无法查看任务执行记录,和积分消耗明细」
+                        // 有一部分正是这个。
+                        //
+                        // 故：**快照**用带前缀的 id（隔离有效），**记录**用裸 id。
+                        record_account_id(account_id),
                         account_name.trim(),
                         title,
                         delta.amount,
