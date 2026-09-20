@@ -48,6 +48,12 @@ import {
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { ModelCapabilityRow } from "@/components/model-capability-chip";
+// 「分发模型」卡片的**可复制写法**行与兼容网关的模型路由清单共用同一组实现。
+//
+// ⚠ 必须复用而不是各写一份：那个字符串是用户要贴进客户端的，
+// 两处实现分叉会出现"这边能复制、那边不能"，或复制出来的字符串不同 ——
+// 而写法错一个字符，网关就解析失败。
+import { CopyableForm, routeFormsOf } from "@/components/model-routing-list";
 import * as api from "@/lib/api";
 import { capabilityViewOf, summarizeCapabilities } from "@/lib/model-capability";
 import { accentOf } from "@/lib/client-accent";
@@ -939,6 +945,29 @@ export default function AgentsPage() {
                         })}
                       </div>
                     )}
+
+                    {/* 行 4：**可复制写法** —— 与「兼容网关」的模型路由清单同一个组件。
+
+                        所有者 2026-09-20：「智能网关的 分发模型样式 和 那个模型逻辑
+                        要跟兼容网关显示的一样」。
+
+                        这一页的用户**最需要**它：他在这里勾完模型，接着就去客户端里
+                        填模型名。有这组可复制写法就能直接抄，不必回兼容网关页找。
+
+                        ⚠ 复用 `CopyableForm` / `routeFormsOf`，**不自己拼字符串** ——
+                        写法必须与网关 `resolveModel` 的解析口径逐字一致，
+                        错一个字符用户抄进去就解析失败。 */}
+                    {(() => {
+                      const forms = routeFormsOf(m);
+                      if (forms.length === 0) return null;
+                      return (
+                        <div className="mt-0.5 flex flex-wrap gap-1" data-slot="agent-model-route-forms">
+                          {forms.map((f) => (
+                            <CopyableForm key={f} form={f} />
+                          ))}
+                        </div>
+                      );
+                    })()}
                   </div>
                 );
               })}
@@ -1022,8 +1051,36 @@ export default function AgentsPage() {
           </div>
         </div>
 
-        {/* 客户端卡片网格 */}
-        <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 lg:grid-cols-3">
+        {/*
+          客户端卡片网格 —— **自适应流式**（所有者 2026-09-20：
+          「智能体管理布局也要改成流式的」）。
+
+          原来是固定断点 `sm:grid-cols-2 lg:grid-cols-3`：宽屏下永远只有
+          3 列，右侧留一大片空白。
+
+          改成 `auto-fill` + `minmax(260px,1fr)`：列数随容器宽度**自动**决定。
+
+          ⚠ 下界取 **260px** 而不是 320 —— 这是**实测**定的，不是估的：
+
+              容器的实际宽度只有 **1104px**（视口 1800，但侧边栏 + 内边距
+              吃掉约 700px），gap 14px：
+
+                  minmax(320px) → 3 列（每列 359px）   ← 我第一版，等于没改
+                  minmax(300px) → 3 列
+                  minmax(280px) → 3 列
+                  minmax(260px) → **4 列**（每列 266px）← 正确
+
+              算法：n 列需要 `n*min + (n-1)*gap ≤ 1104`，故 4 列要求 min ≤ 261。
+              我第一版凭"卡片内容需要 320px"的感觉定，结果**一列都没多** ——
+              是验证脚本量出 `gridWidth: 1104` 才发现的。
+
+          取 260 还与「兼容网关」的模型路由清单**同一个下界**（那边也是 260），
+          两处同类布局保持一致。
+
+          ⚠ 不加 `auto-rows-fr`：那会让所有行等于容器高度的一份，
+          短卡片被撑出大片空白（我在模型清单上刚犯过这个错）。
+        */}
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] items-start gap-3.5">
           {filteredTargets.map((target) => {
             const meta = CLIENT_METAS[target.id] ?? {
               protocol: "通用兼容",

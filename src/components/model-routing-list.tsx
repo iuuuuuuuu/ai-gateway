@@ -214,7 +214,19 @@ export function routeFormsOf(model: GatewayModelItem): string[] {
  * 比 AgentsPage 展开区里 10px 的模型 token 略大一档，是刻意的：
  * 这几行是**要读准再抄走**的内容，抄错一个字符就是一次失败请求。
  */
-function CopyableForm({ form }: { form: string }) {
+/**
+ * 一个可复制的小块。
+ *
+ * # 为什么导出
+ *
+ * 「智能体管理」页的分发模型卡片也要显示这组写法（所有者 2026-09-20：
+ * 「智能体网关的 分发模型样式 和 那个模型逻辑 要跟兼容网关显示的一样」）。
+ *
+ * **必须复用同一个组件**而不是各写一份：两处的"可复制写法"若实现不同，
+ * 会出现一处能复制、一处点了没反应，或复制出来的字符串不一样 ——
+ * 而那个字符串是要用户贴进客户端的，错一个字符就解析失败。
+ */
+export function CopyableForm({ form }: { form: string }) {
   const [copied, setCopied] = useState(false);
   return (
     <button
