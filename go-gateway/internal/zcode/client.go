@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -122,6 +123,52 @@ func New() *Client {
 		Timeout:  30 * time.Second,
 		Identity: DefaultIdentity(),
 	}
+}
+
+// SetProxy 让 ZCode 的请求走指定代理（空串 = 直连）。
+//
+// # 为什么必须有它（2026-09-20 实测缺陷）
+//
+// 网关启动时给 `upstream.Client` 装了代理（`up.SetProxy(cfg.Proxy)`），
+// 但 ZCode 走的是**另一套 client** —— `zcode.NewDispatch(zcode.New())`，
+// 而它**从没被装过代理**。
+//
+// 后果（真实对话实测）：
+//
+//	我的独立探针（zcode.New()，默认直连）→ **HTTP 200** ✓
+//	走网关的对话（同一个 zcode 包）      → 503「无法连接上游（网络超时）」
+//
+// 同一个包、同一份凭证、同一个模型，**只差代理** —— 那就是根因。
+//
+// # 为什么 zcode.z.ai 需要代理
+//
+// `proxy_scope` 按**域名后缀**分流（`.ai` 结尾走代理）。`zcode.z.ai`
+// 恰好以 `.ai` 结尾，会被判成国际版走代理 —— 那是**对的**（它确实需要）。
+// 但 ZCode 的 client 压根没读这份配置，于是它永远直连。
+//
+// ⚠ 传空串 = 显式直连（与 upstream 的 SetProxy("") 同一语义）。
+func (c *Client) SetProxy(raw string) error {
+	raw = strings.TrimSpace(raw)
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConns = 100
+	tr.MaxIdleConnsPerHost = 20
+	tr.IdleConnTimeout = 90 * time.Second
+	if raw != "" {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("解析代理地址失败: %w", err)
+		}
+		tr.Proxy = http.ProxyURL(u)
+	} else {
+		// 空 = 真直连：**不要**回落 ProxyFromEnvironment。
+		//
+		// 与 upstream 的 newDirectTransport 同一口径：用户明确关掉代理时，
+		// 环境变量里的 HTTP_PROXY 也不该偷偷生效 —— 否则"关"不彻底，
+		// 表现为"设置了直连但流量仍走代理"。
+		tr.Proxy = nil
+	}
+	c.HTTP = &http.Client{Transport: tr, Timeout: 60 * time.Second}
+	return nil
 }
 
 func (c *Client) http() *http.Client {

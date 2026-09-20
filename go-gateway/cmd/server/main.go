@@ -157,21 +157,35 @@ func main() {
 	}
 	// ZCode 验证码求解器（见 config.Pool.ZcodeCaptchaDir 的说明）。
 	//
-	// ⚠ **默认关闭**：求解器在没有真人操作的情况下产出通过凭证，
-	// 性质上与"用户自己在官方客户端点一下"不同，故要用户明确开启。
+	// # 2026-09-20：改为**始终启用**（所有者决定，不再读开关）
+	//
+	// 原先这里判 `cfg.Pool.ZcodeCaptchaEnabled`，默认 false。两个问题：
+	//
+	//	① 那个"界面开关"**从来不存在**（前端与宿主搜 captcha 均 0 命中）
+	//	② 实测 ZCode 对话通道对不带验证码的请求一律回
+	//	   `HTTP 400 {"code":3007,"msg":"captcha verify failed"}`
+	//
+	// ⇒ "默认关闭"等于 **ZCode 对话从未成功过**。
+	//
+	// 所有者原话：「肯定要默认打开并且不能关闭啊，这是开源软件有什么在乎的？」
+	//
+	// ⚠ **刻意不读 `ZcodeCaptchaEnabled`**：老配置里可能留着 false，
+	// 若据此关闭，升级后老用户仍然"功能永远关着" —— 那正是本次要修的状态。
+	// 该字段现在只作为向后兼容的占位（网关侧仍会写 true）。
 	if cfg.Pool.ZcodeCaptchaDir != "" {
 		cs := zcode.SharedCaptchaSolver()
 		cs.SetDir(cfg.Pool.ZcodeCaptchaDir)
-		if cfg.Pool.ZcodeCaptchaEnabled {
-			if reason := cs.UnavailableReason(); reason != "" {
-				// 开了但组件不全 → **如实报**，而不是静默失效
-				log.Printf("⚠ ZCode 验证码求解已启用，但组件不可用：%s", reason)
-			} else {
-				log.Printf("ZCode 验证码求解已启用：%s", cfg.Pool.ZcodeCaptchaDir)
-			}
+		if reason := cs.UnavailableReason(); reason != "" {
+			// 组件不全 → **如实报**，而不是静默失效
+			//（那会让用户看到 3007 却不知道为什么）
+			log.Printf("⚠ ZCode 验证码求解已启用，但组件不可用：%s", reason)
 		} else {
-			log.Printf("ZCode 验证码求解已配置但**未启用**（pool.zcode_captcha_enabled=false）")
+			log.Printf("ZCode 验证码求解已启用：%s", cfg.Pool.ZcodeCaptchaDir)
 		}
+	} else {
+		// 目录为空 = 求解器没释放出来。这是**发行包缺陷**，必须显眼。
+		log.Printf("⚠ ZCode 验证码求解器未配置（zcode_captcha_dir 为空）：" +
+			"ZCode 对话会因 3007 人机验证而失败；发行包应包含 assets/zcode-captcha")
 	}
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
@@ -442,7 +456,37 @@ func main() {
 		// （具体类型）—— 直接调会被编译器拒绝（接口没有那个方法）。
 		// 我第一版就是那样，报 `SetAuthDir undefined` 与
 		// `cannot use … as *zcode.Dispatch`。
-		zd := zcode.NewDispatch(zcode.New())
+		//
+		// ⚠⚠ **必须把代理装到 ZCode 的 client 上**（2026-09-20 实测缺陷）。
+		//
+		// ZCode 走的是**另一套 client**（`zcode.New()`），而上面那个
+		// `up.SetProxy(cfg.Proxy)` 只作用于 `upstream.Client` —— 两者互不相干。
+		// 于是 ZCode 的请求**永远直连**，即使配置里明明写了代理。
+		//
+		// 真实对话实测（同一份凭证、同一个模型）：
+		//
+		//	独立探针（zcode.New()，直连）        → **HTTP 200** ✓
+		//	走网关（同一个 zcode 包）            → 503「无法连接上游（网络超时）」
+		//
+		// 只差代理。而 `zcode.z.ai` 以 `.ai` 结尾，本就会按 `proxy_scope`
+		// 判成国际版走代理 —— 那份判断对，只是 ZCode 的 client 从没读它。
+		//
+		// ⚠ 顺序与 upstream 一致：先 SetProxy 再 SetProxyScope 的等价物。
+		// 这里 `zcode.Client` 只有一个开关（不分区域），故按国际版的口径
+		// 决定是否挂代理：`proxy_scope.intl` 为真且地址非空才挂。
+		zc := zcode.New()
+		if proxyAddr := strings.TrimSpace(cfg.Proxy); proxyAddr != "" && cfg.ProxyScope.Intl {
+			if err := zc.SetProxy(proxyAddr); err != nil {
+				log.Printf("⚠ ZCode 代理设置失败（将直连）：%v", err)
+			} else {
+				log.Printf("ZCode 走代理：%s", proxyAddr)
+			}
+		} else {
+			// 显式直连 —— 与 upstream 的 newDirectTransport 同一口径
+			//（空地址时也不回落环境变量，避免"关了还走代理"）。
+			_ = zc.SetProxy("")
+		}
+		zd := zcode.NewDispatch(zc)
 		// 告诉它凭证目录 —— 供自动领取遍历（见 SetAuthDir 的说明）。
 		zd.SetAuthDir(zcodeDir)
 		zcodeDispatch = zd
