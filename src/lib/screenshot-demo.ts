@@ -1,7 +1,8 @@
 import type {
-  AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
+  AccountMeta, AgentBackupItem, AgentClientTarget, AgentDetectionResult, AppStatus, AutoRotateConfig,
+  CheckinConfig, CheckinLog,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
-  GatewayUsageGroup, GatewayUsageResult,
+  GatewayModelItem, GatewayStatus, GatewayUsageGroup, GatewayUsageResult,
   GithubConfig, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals,
   TravelConfig, TravelStatus,
 } from "./types";
@@ -403,6 +404,86 @@ function demoTokenStatistics(days?: number): TokenStatistics {
   return { generatedAt: Date.now(), rangeDays: days ?? null, sources: [demoTokenSource("workbuddy", 1), demoTokenSource("codebuddy-cli", 0.58), demoTokenSource("codebuddy-ide", 0.36)] };
 }
 
+// ---------------------------------------------------------------------------
+// 智能体管理演示数据
+// ---------------------------------------------------------------------------
+
+/** 演示用客户端探测结果：12 类智能体的安装/接入状态。 */
+function demoAgentTargets(): AgentClientTarget[] {
+  return [
+    { id: "claude-code", label: "Claude Code", installed: true, configured: true, configPath: "C:\\Users\\demo\\.claude\\settings.json", note: "检测到 CLI 与配置文件", version: "2.1.4" },
+    { id: "claude-desktop", label: "Claude Desktop", installed: true, configured: true, configPath: "C:\\Users\\demo\\AppData\\Roaming\\Claude\\claude_desktop_config.json", note: "第三方网关模式", version: "1.13.0" },
+    { id: "codex", label: "Codex", installed: true, configured: true, configPath: "C:\\Users\\demo\\.codex\\config.toml", note: "Responses API 已启用", version: "0.146.2" },
+    { id: "dsh", label: "DeepSeek Harness", installed: true, configured: false, configPath: "C:\\Users\\demo\\.dsh\\config.json", note: "已安装，尚未接入", version: "0.9.8" },
+    { id: "opencode", label: "OpenCode", installed: true, configured: false, configPath: "C:\\Users\\demo\\.config\\opencode\\opencode.json", note: "已安装，尚未接入", version: "0.7.12" },
+    { id: "pi", label: "Pi", installed: false, configured: false, configPath: "C:\\Users\\demo\\.pi\\providers.json", note: "未检测到安装", version: null },
+    { id: "grok-build", label: "Grok Build", installed: true, configured: false, configPath: "C:\\Users\\demo\\.grok\\config.toml", note: "已安装，尚未接入", version: "1.2.0" },
+    { id: "zcode", label: "ZCode", installed: false, configured: false, configPath: "C:\\Users\\demo\\.zcode\\config.json", note: "未检测到安装", version: null },
+    { id: "kimi-code", label: "Kimi Code", installed: true, configured: false, configPath: "C:\\Users\\demo\\.kimi\\config.toml", note: "已安装，尚未接入", version: "0.5.3" },
+    { id: "openclaw", label: "OpenClaw", installed: true, configured: false, configPath: "C:\\Users\\demo\\.openclaw\\config.json", note: "已安装，尚未接入", version: "0.3.11" },
+    { id: "hermes", label: "Hermes", installed: false, configured: false, configPath: "C:\\Users\\demo\\.hermes\\config.json", note: "未检测到安装", version: null },
+    { id: "minimax-code", label: "MiniMax Code", installed: true, configured: false, configPath: "C:\\Users\\demo\\AppData\\Roaming\\MiniMax\\config.json", note: "已安装，尚未接入", version: "0.4.6" },
+  ];
+}
+
+/** 演示用网关综合状态（已启动、已配置 API Key）。 */
+function demoGatewayStatus(): GatewayStatus {
+  return {
+    running: true,
+    reachable: true,
+    base: "http://127.0.0.1:7863",
+    openaiBase: "http://127.0.0.1:7863/v1",
+    port: 7863,
+    exePath: "/demo/ai-gateway-server",
+    exeFound: true,
+    exeSource: "embedded",
+    portAvailable: false,
+    mode: "balance",
+    pinnedUid: null,
+    accounts: [{ uid: "demo-user-001", nickname: "测试 A", expiresAt: 0, needsRelogin: false }],
+    excludedAccounts: [],
+    authDir: "/demo/gateway/auth",
+    accountsInLibrary: 3,
+    config: {
+      enabled: true,
+      mode: "balance",
+      pinned_uid: null,
+      allowed_model: null,
+      port: 7863,
+      listen: ":7863",
+      api_key: "sk-demo-workbuddy-key",
+      auto_start: true,
+      last_status: "ok",
+      last_error: null,
+    },
+    health: { reachable: true, healthy: true, detail: null },
+    pool: { accounts: [], total: 3, healthy: 3, cooling: 0, disabled: 0, in_flight_full: 0, sticky_sessions: 0, redis_mode: "off" },
+  };
+}
+
+/** 演示用上游模型池。 */
+function demoGatewayModels(): GatewayModelItem[] {
+  return [
+    { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", owned_by: "anthropic" },
+    { id: "claude-opus-4-2", name: "Claude Opus 4.2", owned_by: "anthropic" },
+    { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", owned_by: "deepseek" },
+    { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", owned_by: "deepseek" },
+    { id: "kimi-k3-1", name: "Kimi K3.1", owned_by: "moonshot" },
+    { id: "glm-5.2", name: "GLM 5.2", owned_by: "zhipu" },
+    { id: "hy3", name: "混元 3", owned_by: "tencent" },
+    { id: "gpt-5.4-codex", name: "GPT-5.4 Codex", owned_by: "openai" },
+  ];
+}
+
+/** 演示用客户端配置备份记录（倒序，最新在前）。 */
+function demoAgentBackups(target: string): AgentBackupItem[] {
+  const now = Date.now();
+  return [0, 1, 2, 3].map((offset) => ({
+    id: `${target}-202609${String(21 - offset).padStart(2, "0")}-0${9 + offset}0000`,
+    createdAt: Math.floor((now - offset * 26 * 60 * 60 * 1000) / 1000),
+    path: `/demo/backups/${target}/20260921-0${9 + offset}0000/config.json`,
+  }));
+}
 /** 演示用网关 Token 用量：与网关 /usage 响应同构。 */
 function demoGatewayUsage(days?: number): GatewayUsageResult {
   const rangeDays = days && days > 0 ? days : null;
@@ -474,6 +555,14 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "check_update": return { ok: true, current: "0.1.24", latest: "0.1.25", latestTag: "v0.1.25", hasUpdate: true, releaseName: "更新提示演示", releaseUrl: "https://github.com/changexbc/workbuddy-switch/releases/tag/v0.1.25" };
     case "get_launch_at_login_enabled": return true;
     case "switch_progress": return { running: false, progress: null };
+    case "get_gateway_status": return demoGatewayStatus();
+    case "get_gateway_models": return { models: demoGatewayModels() };
+    case "detect_agent_clients": return {
+      base: "http://127.0.0.1:7863",
+      hasApiKey: true,
+      targets: demoAgentTargets(),
+    } satisfies AgentDetectionResult;
+    case "list_agent_backups": return { backups: demoAgentBackups(String(args?.target ?? "claude-code")) };
     default: throw new Error(`演示模式缺少只读数据: ${command}`);
   }
 }

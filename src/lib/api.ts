@@ -65,6 +65,7 @@ const DEMO_READ_COMMANDS = new Set([
   "get_github_config", "check_update", "get_launch_at_login_enabled", "switch_progress",
   "get_travel_status", "get_auto_travel_config",
   "get_gateway_usage",
+  "get_gateway_status", "get_gateway_models", "detect_agent_clients", "list_agent_backups",
 ]);
 
 export function isDemoMode(): boolean {
