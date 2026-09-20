@@ -240,8 +240,25 @@ try {
 
     $env:TAURI_SIGNING_PRIVATE_KEY = $keyContent
     $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $password
-    npm run tauri -- build --bundles $Bundles
-    if ($LASTEXITCODE -ne 0) { throw "tauri build 失败" }
+    # ⚠ npm 会把**普通的进度信息**写到 stderr（如 "Info Looking up installed
+    # tauri packages…"）。而 PowerShell 5.1 在 `$ErrorActionPreference = 'Stop'`
+    # 下会把原生命令的 stderr 当成**致命错误**并**中止整个脚本** ——
+    # 于是后面的"复制到 dist"根本不执行，但产物其实**已经构建成功**。
+    #
+    # 症状：脚本报 exit 1，而 `target/release/bundle/nsis/` 里躺着完好的安装包。
+    # 我据此误判过两次"打包失败"。
+    #
+    # 修法：这一段临时把 stderr 当普通输出流（`2>&1`），并**只**用
+    # `$LASTEXITCODE` 判断成败 —— 那才是原生命令真实的结果。
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        npm run tauri -- build --bundles $Bundles 2>&1 |
+            ForEach-Object { Write-Host "    $_" }
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+    if ($LASTEXITCODE -ne 0) { throw "tauri build 失败（exit $LASTEXITCODE）" }
 }
 finally {
     Pop-Location
@@ -266,8 +283,73 @@ if ($sigs.Count -eq 0) {
     }
 }
 
+# ── 5) 把产物复制到**固定的** dist/ ────────────────────────────────────
+#
+# # 为什么必须有这一步（2026-09-20 补，所有者明确要求）
+#
+# 此前脚本只把产物留在 `target/release/bundle/nsis/`（那是构建的中间位置，
+# 混在成千上万个 .rlib/.pdb 里，且会被 `cargo clean` 清掉）。
+# 于是每次交付都要**手动**去找包、手动决定放哪 —— 结果就是我每次
+# 随手新建一个目录（`dist-1.0.7`、`release-v0.7.1` …）。
+#
+# 所有者原话：
+#
+#	「你为什么每次打包都换一个新的目录？产物应该保持统一的位置，
+#	  而不是每次都改变」
+#
+# **根因是脚本没有固定出口**，而不是我"记性不好" —— 故修在脚本里：
+# 构建一结束就自动落到 `dist/`，这样"放哪"不再是每次要做的决定。
+#
+# ⚠ `dist/` 里还有历史草稿（HTML 草稿、诊断 md），故**只复制不清理**。
+#
+# ⚠ **不能写成 `Join-Path $root ".." "dist"`** —— PowerShell 5.1 的
+# `Join-Path` 只接受**两个**位置参数（第三个会报
+# "找不到接受实际参数 dist 的位置形式参数"）。先拼一层再拼一层。
+$distDir = Join-Path (Split-Path $root -Parent) "dist"
+$distDir = [System.IO.Path]::GetFullPath($distDir)
+if (-not (Test-Path -LiteralPath $distDir)) {
+    New-Item -ItemType Directory -Path $distDir -Force | Out-Null
+}
+Write-Host ""
+Write-Host "==> 复制产物到 dist/" -ForegroundColor Cyan
+$delivered = @()
+# 只搬"安装包 + 它的 .sig"，不搬整个 bundle 树（那里面有大量中间产物）
+foreach ($s in $sigs) {
+    $installer = $s.FullName -replace '\.sig$', ''
+    if (-not (Test-Path -LiteralPath $installer)) { continue }
+    foreach ($f in @($installer, $s.FullName)) {
+        $target = Join-Path $distDir (Split-Path $f -Leaf)
+        Copy-Item -LiteralPath $f -Destination $target -Force
+        $delivered += $target
+    }
+}
+if ($delivered.Count -eq 0) {
+    Write-Warning "没有可交付的产物（未找到与 .sig 配对的安装包）"
+} else {
+    foreach ($f in $delivered) {
+        $len = [math]::Round((Get-Item -LiteralPath $f).Length / 1MB, 2)
+        Write-Host ("    {0}  ({1} MB)" -f $f, $len)
+    }
+    # 复制后校验：哈希不一致说明写盘出错，宁可报出来也不要交付坏包
+    foreach ($s in $sigs) {
+        $installer = $s.FullName -replace '\.sig$', ''
+        if (-not (Test-Path -LiteralPath $installer)) { continue }
+        $copied = Join-Path $distDir (Split-Path $installer -Leaf)
+        if (-not (Test-Path -LiteralPath $copied)) { continue }
+        $h1 = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+        $h2 = (Get-FileHash -LiteralPath $copied -Algorithm SHA256).Hash
+        if ($h1 -eq $h2) {
+            Write-Host ("    [OK] SHA256 一致  {0}" -f (Split-Path $copied -Leaf)) -ForegroundColor Green
+        } else {
+            Write-Warning ("SHA256 不一致，副本可能损坏：{0}" -f $copied)
+        }
+    }
+}
+
 Write-Host ""
 Write-Host "==> 完成" -ForegroundColor Green
-Write-Host "    产物目录：$bundleRoot"
+Write-Host "    产物目录：$bundleRoot（构建原生产物）"
+Write-Host "    交付目录：$distDir（固定位置，安装包 + .sig 已就位）"
 Write-Host "    发布：把 *_setup.exe 与其 .sig、latest.json 一并上传到 GitHub Release"
 Write-Host "          （现有 scripts/publish-release.sh 覆盖此流程，但它依赖 bash/python3/gh）"
+
