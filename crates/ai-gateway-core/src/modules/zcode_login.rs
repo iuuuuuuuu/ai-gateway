@@ -445,6 +445,58 @@ fn enrich_account_after_import(uid: &str, _auth_dir: &str) -> Result<Value, Stri
 /// 单项失败**不返回 Err**，而是记进返回值的 `quotaError` / `modelsError`：
 /// 调用方（界面）要能显示"额度查不到，原因是 X"，而不是一个笼统的失败。
 /// 只有账号本身不存在才返回 Err。
+/// 从套餐 `plans` 里提取**该账号实际被授权的模型名**。
+///
+/// # 为什么要它（不是"照抄 /models"）
+///
+/// `/api/coding/paas/v4/models` 返回的是**平台目录** —— 上游把该 provider
+/// 支持的**全部**模型都列出来，**与账号套餐无关**。
+/// 而 `plans[].entitlements[].showName` 才是**这个账号真能用的**。
+///
+/// 实测（2026-09-20，wish 账号 `zcode-75b9a1dc64af`）：
+///
+///	/models 目录           → 11 个（glm-4.5, glm-4.5-air, …, glm-5.3-flashx）
+///	plans[0].entitlements  → 1 个（showName = "GLM-5.3-Flash"）
+///
+/// 差 10 个。界面照目录显示，用户会去选 `glm-5.3`，请求被上游按
+/// "无该模型授权"拒掉 —— 而他看到的界面明明说支持。**显示错的清单
+/// 比不显示更糟**，因为它会引导用户做出必然失败的请求。
+///
+/// # 为什么返回空集表示"用目录兜底"而不是"没有模型"
+///
+/// 有些账号/套餐拿不到 `entitlements`（字段缺失、或套餐是无限量的）。
+/// 那时**不能**据此断言"没有可用模型"，故返回空 `Vec` 让调用方回落到目录。
+/// 这与"套餐确实一个模型都没授权"无法区分 —— 但后者在真实数据里
+/// 未出现过，而前者（拿不到）很常见，故取"宁可多显示"的取舍。
+///
+/// # 形状容错
+///
+/// `plans` 是 `Vec<Value>`（原样存了上游 JSON），形状随上游变化：
+/// 故逐层 `and_then` 取，任一层缺失都只是"这项没有"，不 panic。
+fn entitled_model_names(plans: &[Value]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in plans {
+        let Some(ents) = p.get("entitlements").and_then(Value::as_array) else {
+            continue;
+        };
+        for e in ents {
+            // `showName` 是上游给的展示名（实测 "GLM-5.3-Flash"）。
+            // 也接受 `modelId` / `model` 之类的别名，避免上游改字段名就整个失效。
+            let name = ["showName", "modelId", "model", "name"]
+                .iter()
+                .find_map(|k| e.get(*k).and_then(Value::as_str))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let Some(n) = name else { continue };
+            // 去重（同一模型可能在多个 plan / 多条 entitlement 里重复出现）
+            if !out.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
 pub fn refresh_account(uid: &str) -> Result<Value, String> {
     let uid = uid.trim();
     if uid.is_empty() {
@@ -650,14 +702,43 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
     // `Vec<String>`，而 Go 侧返回的是对象数组 —— 直接塞对象会被
     // apply_patch 的元素类型检查静默滤空（实测踩到：刷新返回 11 个，
     // 落库后却变成 0 个）。完整信息（上下文窗口等）由界面按需再查。
-    if models_error.is_none() {
-        let ids: Vec<String> = models
-            .iter()
-            .filter_map(|m| m.get("id").and_then(Value::as_str))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        patch.insert("models".into(), json!(ids));
+    //
+    // ---- ⚠⚠ 「套餐实际能用哪些模型」≠ `/models` 目录（所有者 2026-09-20 纠正）----
+    //
+    // 所有者原话：
+    //   「wish 这个套餐,他被局限于 只能用 glm-5.3-flash,
+    //     所以你支持的模型并不准确,而且抓包数据我都给你了,
+    //     你居然还犯了错,如图 SmartPlan 到期时间和余量和支持模型都显示出来」
+    //
+    // 根因：`/api/coding/paas/v4/models`（`FetchModels`）返回的是**平台目录**
+    // —— 上游把该 provider 支持的**全部**模型都列出来，**与当前账号的套餐无关**。
+    // 实测 wish 账号：目录 11 个（glm-4.5 … glm-5.3-flashx），
+    // 而它的套餐 `ZCode Weekend Build` **只授权一个**：
+    //
+    //	plans[0].entitlements[0].showName = "GLM-5.3-Flash"
+    //	plans[0].entitlements[0].grantUnits = 300000000
+    //
+    // 故把目录当成"支持模型"是错的 —— 用户照着界面选了 `glm-5.3`，
+    // 请求会被上游按"无该模型授权"拒掉，而他看到的界面明明说支持。
+    //
+    // 修法：**套餐授权（entitlements.showName）优先**，目录只在拿不到授权时兜底。
+    // 这样：
+    //   · wish 这种"套餐只给一个模型"→ 界面如实显示 1 个
+    //   · 拿不到 plans 的账号 → 仍回落到目录（宁可多显示，也不显示空）
+    let entitled = entitled_model_names(&plans);
+    if entitled.is_empty() {
+        if models_error.is_none() {
+            let ids: Vec<String> = models
+                .iter()
+                .filter_map(|m| m.get("id").and_then(Value::as_str))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            patch.insert("models".into(), json!(ids));
+        }
+    } else {
+        // 套餐授权存在 → 以它为准（无论目录取到与否）
+        patch.insert("models".into(), json!(entitled));
     }
     // ---- 套餐信息落库（**此前完全漏了，所有者的反馈**）----
     //
@@ -839,5 +920,77 @@ mod tests {
         // ---- 空白字符也算无值 ----
         let blank = build_plan_patch(None, "   ", vec![]);
         assert!(blank.is_empty(), "纯空白的 planKind 不该写入");
+    }
+
+    /// **套餐授权优先于 `/models` 目录**（所有者 2026-09-20 纠正）。
+    ///
+    /// 原话：「wish 这个套餐,他被局限于 只能用 glm-5.3-flash,
+    ///   所以你支持的模型并不准确,而且抓包数据我都给你了,你居然还犯了错」
+    ///
+    /// 下面两组数据都是**真实抓包**（`~/.wb-switch/zcode/accounts.json` 与
+    /// `open.bigmodel.cn` 的 `/models` 返回）。
+    #[test]
+    fn entitled_model_names_wins_over_catalog() {
+        // 真实 plans（wish 账号，逐字取自账号库）
+        let plans: Vec<Value> = serde_json::from_str(
+            r#"[{"description":"ZCode 周末活动","endsAt":1789866000,
+                 "name":"ZCode Weekend Build","planId":"zcode-v3-start-plan-wk-0918",
+                 "entitlements":[{"effectiveAt":1789743600,
+                   "entitlementId":"ent-zcode-v3-start-plan-wk-0918-1",
+                   "grantUnits":300000000,"period":"one_time",
+                   "showName":"GLM-5.3-Flash","unitType":"token"}]}]"#,
+        )
+        .expect("真实 plans 必须能解析");
+
+        let got = entitled_model_names(&plans);
+        assert_eq!(
+            got,
+            vec!["GLM-5.3-Flash".to_string()],
+            "套餐只授权一个模型时，必须**只**返回它 —— \
+             否则界面会显示 11 个模型（目录），用户选了 glm-5.3 必被上游拒绝"
+        );
+    }
+
+    /// 拿不到 `entitlements` 时返回**空集**（表示"回落目录"，不是"没有模型"）。
+    #[test]
+    fn entitled_model_names_empty_when_no_entitlements() {
+        for plans in [
+            vec![],
+            vec![json!({ "name": "无 entitlement 字段的套餐" })],
+            vec![json!({ "entitlements": [] })],
+            // 形状异常也要安全：不 panic、不返回垃圾
+            vec![json!({ "entitlements": "不是数组" })],
+        ] {
+            assert!(
+                entitled_model_names(&plans).is_empty(),
+                "拿不到授权时必须返回空集让调用方回落目录，实际 plans={plans:?}"
+            );
+        }
+    }
+
+    /// 多套餐 / 多授权 / 重复项的处理。
+    #[test]
+    fn entitled_model_names_merges_and_dedupes() {
+        let plans = vec![
+            json!({ "entitlements": [
+                { "showName": "GLM-5.3-Flash" },
+                { "showName": "glm-5.3-flash" },   // 仅大小写不同 → 去重
+            ]}),
+            json!({ "entitlements": [
+                { "showName": "GLM-5.2" },
+                { "showName": "  " },              // 空白 → 丢弃
+                { "modelId": "GLM-5-Turbo" },      // 别名键也认
+            ]}),
+        ];
+        let got = entitled_model_names(&plans);
+        assert_eq!(
+            got,
+            vec![
+                "GLM-5.3-Flash".to_string(),
+                "GLM-5.2".to_string(),
+                "GLM-5-Turbo".to_string()
+            ],
+            "应合并多个套餐、按大小写去重、丢弃空白项，并接受 modelId 别名"
+        );
     }
 }
