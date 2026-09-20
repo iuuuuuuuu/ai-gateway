@@ -487,9 +487,16 @@ func TestUnverifiedNoteDoesNotTellExistingAccountsToAddAccounts(t *testing.T) {
 	if !strings.Contains(got, "账号是够的") {
 		t.Errorf("应明确告诉用户账号够用（否则他会去查账号池），实际：%s", got)
 	}
-	// ③ 必须给出**可执行**的下一步
+	// ③ 必须给出**可执行**的下一步，而且要写清按钮**在哪**。
+	//
+	// 所有者 2026-09-20：「我点哪里的刷新啊?兼容网关这里还是有这个描述」——
+	// 只说"点刷新"而页面上有好几个刷新按钮（且当时这个按钮只存在于
+	// 「放行模型」下拉里），那句话等于没说。
 	if !strings.Contains(got, "刷新") {
-		t.Errorf("应给出可执行建议（稍后刷新重试），实际：%s", got)
+		t.Errorf("应给出可执行建议（点刷新重试），实际：%s", got)
+	}
+	if !strings.Contains(got, "右上角") {
+		t.Errorf("必须写清刷新按钮**在哪**（否则用户找不到，本次反馈的正是这点），实际：%s", got)
 	}
 	// ④ 原有信息不能丢：仍要说清"无法确认"，且"不等于没有"
 	if !strings.Contains(got, "无法确认") || !strings.Contains(got, "不等于") {

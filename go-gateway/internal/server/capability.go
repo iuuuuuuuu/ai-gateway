@@ -456,7 +456,7 @@ func (h *Handler) regionGapReason(region auth.Region) regionGapInfo {
 	// 有账号，但这次没拉到清单：上游暂时不可达（网络波动），或负缓存期内。
 	return regionGapInfo{
 		Cause:  KindFetchFailed,
-		Reason: regionLabel(region.String()) + "账号清单本次未拉到（上游暂时不可达，稍后刷新即可）",
+		Reason: regionLabel(region.String()) + "账号清单本次未拉到（上游暂时不可达，点「刷新」可重试）",
 	}
 }
 
@@ -1034,15 +1034,20 @@ func unverifiedNote(region, other string, gap regionGapInfo) string {
 	switch gap.Cause {
 	case KindMissingAccounts:
 		// 真的没有该区账号 —— 补账号是有效的，如实说。
-		return head + "补齐" + regionLabel(other) + "账号后刷新即可确认。"
+		return head + "补齐" + regionLabel(other) + "账号后，点本清单右上角的「刷新」即可确认。"
 	default:
 		// 有账号、只是这轮没拉到。**不要说"补账号"** ——
 		// 那会让已有账号的用户去做无用功（本次缺陷）。
 		//
 		// 也不说"无法确认"就结束：用户需要知道**该做什么**（等一会儿重试），
 		// 以及**这不是他的问题**（账号是够的）。
+		//
+		// ⚠ 必须写清按钮**在哪**（所有者 2026-09-20：
+		// 「我点哪里的刷新啊?兼容网关这里还是有这个描述」）。
+		// 只说"点刷新"，而页面上有好几个刷新按钮、且当时这个按钮
+		// 只存在于「放行模型」下拉里 —— 那句话等于没说。
 		return head + "你的" + regionLabel(other) +
-			"账号是够的，这是上游暂时不可达；稍后点「刷新」重试即可确认。"
+			"账号是够的，这是上游暂时不可达；点本清单右上角的「刷新」即可重试。"
 	}
 }
 

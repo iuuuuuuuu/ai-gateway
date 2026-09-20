@@ -4340,7 +4340,18 @@ export default function GatewayPage() {
           贴边 —— 本区块内容是自成一体的列表，贴边会像被裁掉了一块。
         */}
         <div className="p-3 sm:p-4">
-          <ModelRoutingList models={modelItems} />
+            {/*
+              ⚠ 必须传 `onRefresh` 且走**强制重拉**（loadModels(true)）。
+
+              所有者 2026-09-20：「我点哪里的刷新啊?兼容网关这里还是有这个描述」——
+              提示就渲染在这个清单的卡片里，而"刷新"此前只存在于「放行模型」
+              下拉的最底部，隔了好几屏。按钮放在这里，用户才找得到。
+            */}
+            <ModelRoutingList
+              models={modelItems}
+              onRefresh={() => void loadModels(true)}
+              refreshing={modelsLoading}
+            />
         </div>
       </Section>
 

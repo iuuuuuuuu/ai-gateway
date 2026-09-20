@@ -128,9 +128,10 @@
  * 的卡片正是单列时代的问题（纵向过高、扫视效率低）。
  */
 import { useMemo, useState } from "react";
-import { Check, Copy, Info, Search } from "lucide-react";
+import { Check, Copy, Info, RefreshCw, Search } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ModelCapabilityRow } from "@/components/model-capability-chip";
 import { capabilityViewOf } from "@/lib/model-capability";
@@ -297,6 +298,22 @@ function ProductBadge({ product, regions }: { product: string; regions?: string[
 export interface ModelRoutingListProps {
   models: GatewayModelItem[];
   className?: string;
+  /**
+   * 「刷新模型列表」—— **必须传**（所有者 2026-09-20 反馈）。
+   *
+   * # 为什么这个按钮必须在这里
+   *
+   * 他原话：「我点哪里的刷新啊?兼容网关这里还是有这个描述」。
+   *
+   * 那段「国服未检测到可用真值…稍后点刷新重试即可确认」的提示就渲染在
+   * **本清单的卡片里**，而"刷新"此前只存在于「放行模型」下拉菜单的
+   * 最底部 —— 两个控件隔了好几屏，用户**根本找不到**。
+   *
+   * 这与前几个 bug 是**同一类问题**：让用户去做一件他做不到（或找不到）的事。
+   * 修法就是把按钮放在提示**旁边**。
+   */
+  onRefresh?: () => void;
+  refreshing?: boolean;
 }
 
 /**
@@ -306,7 +323,12 @@ export interface ModelRoutingListProps {
  * 与 `capabilityViewOf`、同一套平台配色），差别只是这里额外突出
  * **可复制写法** —— 因为本清单的用途是"让用户在客户端里填对模型名"。
  */
-export function ModelRoutingList({ models, className }: ModelRoutingListProps) {
+export function ModelRoutingList({
+  models,
+  className,
+  onRefresh,
+  refreshing = false,
+}: ModelRoutingListProps) {
   const [query, setQuery] = useState("");
 
   const filtered = useMemo(() => {
@@ -355,6 +377,31 @@ export function ModelRoutingList({ models, className }: ModelRoutingListProps) {
             </>
           )}
         </span>
+        {/*
+          「刷新」—— 放在**本清单自己的标题行**，紧挨着搜索框。
+
+          所有者 2026-09-20：「我点哪里的刷新啊?兼容网关这里还是有这个描述」。
+          那段提示就在下面的卡片里，而"刷新"原先只存在于「放行模型」下拉的
+          最底部 —— 隔了好几屏，用户找不到。
+
+          ⚠ 它必须调**强制重拉**（清掉网关侧的失败负缓存）：
+          否则点了也没变化 —— 那正是上一轮修的那个缺陷。
+        */}
+        {onRefresh && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            data-slot="model-routing-refresh"
+            disabled={refreshing}
+            onClick={onRefresh}
+            className="h-8 gap-1.5 px-2.5 text-xs"
+            title="重新向网关拉取模型清单（会清掉失败缓存，用于区域真值缺失时重试）"
+          >
+            <RefreshCw className={cn("size-3.5", refreshing && "animate-spin")} />
+            刷新
+          </Button>
+        )}
       </div>
 
       {/*
