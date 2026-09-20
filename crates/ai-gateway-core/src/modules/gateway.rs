@@ -3502,7 +3502,7 @@ pub async fn fetch_models_refreshed() -> Vec<Value> {
     fetch_models_impl(true).await
 }
 
-async fn fetch_models_impl(forceRefresh: bool) -> Vec<Value> {
+async fn fetch_models_impl(force_refresh: bool) -> Vec<Value> {
     let cfg = load_gateway_config();
     let port = cfg.get("port").and_then(Value::as_u64).unwrap_or(7863) as u16;
     let api_key = cfg
@@ -3512,7 +3512,7 @@ async fn fetch_models_impl(forceRefresh: bool) -> Vec<Value> {
         .to_string();
 
     // `?refresh=1` 让网关清掉按区域的失败负缓存后重拉。
-    let url = if forceRefresh {
+    let url = if force_refresh {
         format!("http://127.0.0.1:{port}/v1/models?refresh=1")
     } else {
         format!("http://127.0.0.1:{port}/v1/models")
