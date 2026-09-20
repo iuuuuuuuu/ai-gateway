@@ -1368,6 +1368,20 @@ export interface GatewayModelItem {
    * 这个字段只用来解释 `11102 model service info not found`。
    */
   supported_regions?: string[];
+  /**
+   * 该模型**未验证**的区域 —— 那些区域这一轮**没拿到真值**
+   *（无可用账号 / 上游暂时不可达），故无法确认该区是否也有此模型。
+   *
+   * # ⚠ 与 `supported_regions` 的区别（两者含义相反）
+   *
+   *	supported_regions   「**确认**该区有这个模型」
+   *	unverified_regions  「**不知道**该区有没有」——既不是有，也不是没有
+   *
+   * 前端用它做一件事：**判断信息是否完整**。只要还有 unverified，
+   * 界面就该自动重试到补齐为止 —— 所有者 2026-09-20：
+   * 「这应该是自动的,而不是需要人手动同步」。
+   */
+  unverified_regions?: string[];
   /** 面向人的区域说明（网关生成，客户端不读时至少人能看见）。 */
   region_note?: string;
   /**

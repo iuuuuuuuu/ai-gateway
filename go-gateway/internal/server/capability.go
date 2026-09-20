@@ -41,6 +41,48 @@ type regionModels struct {
 	infos   []upstream.ModelInfo
 	fetched time.Time
 	lastErr time.Time // 最近一次失败（负缓存用）
+	// fails 连续失败次数，驱动**指数退避**（见 modelsRetryAfter）。
+	//
+	// 所有者 2026-09-20：「这应该是自动的,而不是需要人手动同步」。
+	// 此前失败后是**固定** 5 分钟负缓存，期间连试都不试 ——
+	// 一次瞬时抖动就让用户看到 5 分钟的"信息不完整"，而系统本可以自己好。
+	fails int
+}
+
+// modelsRetryAfter 失败后**多久再试**（指数退避，有上下限）。
+//
+// # 为什么必须退避而不是固定值（2026-09-20 实测缺陷）
+//
+// 固定 5 分钟有两个方向的错：
+//
+//	太迟钝：一次瞬时抖动（代理偶发抽风）会让信息不完整持续 5 分钟，
+//	        而系统本可以在 15 秒后自愈 —— 用户看到的是"要手动同步"。
+//	太激进（若改成 0）：上游真挂了时，每个请求都会去重试，
+//	        那是打上游，且会拖慢每个 /v1/models 响应。
+//
+// 退避曲线：15s → 30s → 60s → 120s → 300s（上限）。
+//
+//	· 第一次失败只等 15 秒 ⇒ **瞬时抖动几乎无感**（那是最常见的情形）
+//	· 连续失败则逐步退到 5 分钟 ⇒ 上游真挂时不打它
+//
+// ⚠ 上限必须**保留**（不能无限增长）：上游挂了一天之后恢复，
+// 若退避已经涨到几小时，用户还要再等几小时 —— 那又把"自动"变成了"手动"。
+func modelsRetryAfter(fails int) time.Duration {
+	const (
+		first = 15 * time.Second
+		cap   = 5 * time.Minute
+	)
+	d := first
+	for i := 1; i < fails; i++ {
+		d *= 2
+		if d >= cap {
+			return cap
+		}
+	}
+	if d > cap {
+		return cap
+	}
+	return d
 }
 
 // regionModelCache 按区域缓存模型清单。
@@ -104,7 +146,11 @@ func (h *Handler) fetchModelsForRegion(region auth.Region) []upstream.ModelInfo 
 			regionModelCache.Unlock()
 			return out
 		}
-		if !rm.lastErr.IsZero() && time.Since(rm.lastErr) < modelsFetchFailCooldown {
+		// 失败后的**指数退避**：第一次只等 15 秒，连续失败才逐步退到 5 分钟。
+		//
+		// 此前是固定 5 分钟，于是瞬时抖动会让"信息不完整"持续 5 分钟 ——
+		// 所有者的感受就是"这得手动同步才行"。系统应当自己好。
+		if !rm.lastErr.IsZero() && time.Since(rm.lastErr) < modelsRetryAfter(rm.fails) {
 			regionModelCache.Unlock()
 			return nil
 		}
@@ -127,10 +173,16 @@ func (h *Handler) fetchModelsForRegion(region auth.Region) []upstream.ModelInfo 
 			regionModelCache.byRegion[region] = rm
 		}
 		rm.lastErr = time.Now()
+		// 累加连续失败次数，驱动指数退避（上限 5 分钟）。
+		rm.fails++
 		regionModelCache.Unlock()
 		return nil
 	}
 	regionModelCache.Lock()
+	// 成功即**清零退避**：下次失败重新从 15 秒开始。
+	//
+	// 不清零的后果：偶发抖动累积起来会把退避顶到上限，
+	// 于是"偶尔失败一次"的账号也要等 5 分钟 —— 又回到"要手动同步"。
 	regionModelCache.byRegion[region] = &regionModels{infos: infos, fetched: time.Now()}
 	regionModelCache.Unlock()
 	return infos
@@ -456,7 +508,7 @@ func (h *Handler) regionGapReason(region auth.Region) regionGapInfo {
 	// 有账号，但这次没拉到清单：上游暂时不可达（网络波动），或负缓存期内。
 	return regionGapInfo{
 		Cause:  KindFetchFailed,
-		Reason: regionLabel(region.String()) + "账号清单本次未拉到（上游暂时不可达，点「刷新」可重试）",
+		Reason: regionLabel(region.String()) + "账号清单本次未拉到（上游暂时不可达，会自动重试）",
 	}
 }
 
@@ -1034,20 +1086,23 @@ func unverifiedNote(region, other string, gap regionGapInfo) string {
 	switch gap.Cause {
 	case KindMissingAccounts:
 		// 真的没有该区账号 —— 补账号是有效的，如实说。
-		return head + "补齐" + regionLabel(other) + "账号后，点本清单右上角的「刷新」即可确认。"
+		return head + "补齐" + regionLabel(other) + "账号后即可确认。"
 	default:
 		// 有账号、只是这轮没拉到。**不要说"补账号"** ——
 		// 那会让已有账号的用户去做无用功（本次缺陷）。
 		//
-		// 也不说"无法确认"就结束：用户需要知道**该做什么**（等一会儿重试），
-		// 以及**这不是他的问题**（账号是够的）。
+		// ⚠ 措辞必须是「**正在自动重试**」而不是「请点刷新」。
 		//
-		// ⚠ 必须写清按钮**在哪**（所有者 2026-09-20：
-		// 「我点哪里的刷新啊?兼容网关这里还是有这个描述」）。
-		// 只说"点刷新"，而页面上有好几个刷新按钮、且当时这个按钮
-		// 只存在于「放行模型」下拉里 —— 那句话等于没说。
+		// 所有者 2026-09-20：「这应该是自动的,而不是需要人手动同步,你懂吗?」
+		//
+		// 前一版我写「点本清单右上角的「刷新」即可重试」—— 那是**治标**：
+		// 把"用户得手动同步"当成了既定前提。真正的修法是前端自动重试
+		//（见 GatewayPage 的 modelsIncomplete），于是这里的文案只需告诉
+		// 用户"**不用管，它自己会好**"，而不是教他去点什么。
+		//
+		// 「上游暂时不可达」也要保留：让用户知道这不是他的账号有问题。
 		return head + "你的" + regionLabel(other) +
-			"账号是够的，这是上游暂时不可达；点本清单右上角的「刷新」即可重试。"
+			"账号是够的，这是上游暂时不可达；**正在自动重试**，无需手动刷新。"
 	}
 }
 

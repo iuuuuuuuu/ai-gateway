@@ -24,6 +24,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/upstream"
@@ -206,5 +207,123 @@ func TestModelsRefreshRecoversRegionTruth(t *testing.T) {
 	if after >= before {
 		t.Errorf("`?refresh=1` 后未验证数应减少（前 %d → 后 %d）—— "+
 			"若没减少，用户点了刷新也拿不回真值，只能干等满 5 分钟", before, after)
+	}
+}
+// TestModelsRetryBackoff 失败重试间隔是**指数退避**且有上下限。
+//
+// # 所有者 2026-09-20
+//
+//	「这应该是自动的,而不是需要人手动同步,你懂吗?」
+//
+// 此前失败后是**固定** 5 分钟负缓存，期间连试都不试 ——
+// 一次瞬时抖动（代理偶发抽风）就让"信息不完整"持续 5 分钟，
+// 用户感受到的就是"这得手动同步"。而系统本可在 15 秒后自愈。
+//
+// 契约：
+//   · 第一次失败只等 **15 秒**（瞬时抖动几乎无感 —— 那是最常见情形）
+//   · 逐次翻倍，但**上限 5 分钟**（上游真挂时不打它）
+//   · 上限必须存在：若无限增长，上游挂一天后恢复，用户还要再等几小时
+//     —— 那又把"自动"变成了"手动"
+func TestModelsRetryBackoff(t *testing.T) {
+	first := modelsRetryAfter(1)
+	if first != 15*time.Second {
+		t.Errorf("第一次失败应只等 15 秒（瞬时抖动无感），实际 %v", first)
+	}
+
+	// 单调不减（退避必须越来越长，否则就是重试风暴）
+	prev := time.Duration(0)
+	for i := 1; i <= 12; i++ {
+		d := modelsRetryAfter(i)
+		if d < prev {
+			t.Errorf("退避应单调不减：fails=%d 得 %v，而上一次是 %v", i, d, prev)
+		}
+		prev = d
+	}
+
+	// 上限
+	if got := modelsRetryAfter(50); got != 5*time.Minute {
+		t.Errorf("退避上限应为 5 分钟，实际 %v（无上限会让恢复后还要等很久）", got)
+	}
+	if got := modelsRetryAfter(0); got != 15*time.Second {
+		t.Errorf("fails=0 应按首次处理（15 秒），实际 %v", got)
+	}
+	if got := modelsRetryAfter(-3); got != 15*time.Second {
+		t.Errorf("负数应安全按首次处理，实际 %v", got)
+	}
+}
+
+// TestModelsFetchRecoversAutomaticallyWithoutManualRefresh 无需任何手动操作即可自愈。
+//
+// 这是所有者诉求的**直接编码**：
+//
+//	「这应该是自动的,而不是需要人手动同步」
+//
+// 场景：某区第一次失败（瞬时抖动），退避窗口过后**下一次自动拉取**就该成功。
+// 判据不涉及任何 `?refresh=1` —— 那是"手动"路径。
+func TestModelsFetchRecoversAutomaticallyWithoutManualRefresh(t *testing.T) {
+	resetModelsCache()
+
+	// ⚠ 成功时**必须返回真实的 /v3/config 结构**（用 v3WithModels 造），
+	// 不能回空 body —— 空 body 解析出 0 个模型，等价于"没拉到"，
+	// 于是两区都没有真值，测试里根本不会出现 unverified（我第一版就是回空，
+	// 结果被 skip）。夹具必须让"成功"这个分支真的有清单。
+	intlFails := 0
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if strings.Contains(authz, "tok-intl") {
+			if intlFails < 1 {
+				intlFails++
+				return http.StatusInternalServerError, `{"code":500,"msg":"boom"}`, false
+			}
+			return http.StatusOK, v3WithModels("intl-only-model", "shared"), false
+		}
+		return http.StatusOK, v3WithModels("cn-only-model", "shared"), false
+	})
+	up.BaseIntl = "https://intl.fake.example"
+	h := NewHandler(Config{
+		Pool: testPoolWith(
+			&auth.Auth{UID: authCN, AccessToken: "tok-cn", Domain: "copilot.tencent.com", SoonestExpireAt: 1 << 40},
+			&auth.Auth{UID: authIntl, AccessToken: "tok-intl", Domain: "www.workbuddy.ai", SoonestExpireAt: 1 << 40},
+		),
+		Upstream:  up,
+		MaxRotate: 1,
+	})
+
+	// 第一轮：国际版失败 ⇒ 应该有不完整（unverified）的模型
+	first := listModels(t, h)
+	incomplete := 0
+	for _, e := range first {
+		if len(strList(e["unverified_regions"])) > 0 {
+			incomplete++
+		}
+	}
+
+	// 把上次失败时刻**人为拨回**到退避窗口之外（模拟"过了 15 秒"）。
+	//
+	// ⚠ 不 sleep：那会让测试慢且不稳；退避的时长本身由
+	// TestModelsRetryBackoff 单独锁定。这里只验证"过了窗口就会重试"。
+	regionModelCache.Lock()
+	for _, rm := range regionModelCache.byRegion {
+		if rm != nil && !rm.lastErr.IsZero() {
+			rm.lastErr = time.Now().Add(-modelsRetryAfter(rm.fails) - time.Second)
+		}
+	}
+	regionModelCache.Unlock()
+
+	// **不带任何 refresh 参数**再读一次 —— 模拟前端 30 秒后的自动重试
+	second := listModels(t, h)
+	after := 0
+	for _, e := range second {
+		if len(strList(e["unverified_regions"])) > 0 {
+			after++
+		}
+	}
+
+	if incomplete == 0 {
+		t.Skip("夹具第一轮没产生 unverified，跳过自愈验证")
+	}
+	if after != 0 {
+		t.Errorf("过了退避窗口后，**无需手动刷新**就该自动补齐（前 %d 条不完整 → 后 %d 条）—— "+
+			"若仍是 %d，说明自愈没接上，用户只能自己点（那正是所有者反对的）",
+			incomplete, after, after)
 	}
 }

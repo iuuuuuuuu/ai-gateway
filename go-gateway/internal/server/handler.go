@@ -542,14 +542,16 @@ var staticModelsAll = func() []map[string]any {
 	return out
 }()
 
-// dynamicModelsTTL 动态模型清单的缓存时长；modelsFetchFailCooldown 是拉取失败后的负缓存时长。
+// dynamicModelsTTL 动态模型清单的**成功**缓存时长。
 //
-// 缓存本身按区域分桶，在 capability.go 的 regionModelCache 里；
-// 这两个常量被那里复用，故留在包内共享。
-const (
-	dynamicModelsTTL        = time.Hour
-	modelsFetchFailCooldown = 5 * time.Minute
-)
+// 缓存本身按区域分桶，在 capability.go 的 regionModelCache 里。
+//
+// ⚠ 失败后的重试间隔**不在这里** —— 它是**指数退避**（15s→30s→…→5min），
+// 见 capability.go 的 `modelsRetryAfter`。此前这里是固定值
+// `modelsFetchFailCooldown = 5 * time.Minute`，那是 2026-09-20 那个
+// 「要人手动同步」缺陷的根源：一次瞬时抖动就让信息不完整持续 5 分钟。
+// 退避需要"连续失败次数"这个状态，故实现放在有状态的那一侧。
+const dynamicModelsTTL = time.Hour
 
 // models 返回模型列表：优先动态（按区域，缓存 1h），失败回退静态表。
 //

@@ -487,16 +487,28 @@ func TestUnverifiedNoteDoesNotTellExistingAccountsToAddAccounts(t *testing.T) {
 	if !strings.Contains(got, "账号是够的") {
 		t.Errorf("应明确告诉用户账号够用（否则他会去查账号池），实际：%s", got)
 	}
-	// ③ 必须给出**可执行**的下一步，而且要写清按钮**在哪**。
+	// ③ 必须说明**它会自己好** —— 而不是教用户去点什么。
 	//
-	// 所有者 2026-09-20：「我点哪里的刷新啊?兼容网关这里还是有这个描述」——
-	// 只说"点刷新"而页面上有好几个刷新按钮（且当时这个按钮只存在于
-	// 「放行模型」下拉里），那句话等于没说。
-	if !strings.Contains(got, "刷新") {
-		t.Errorf("应给出可执行建议（点刷新重试），实际：%s", got)
+	// 所有者 2026-09-20（两次反馈，后一次纠正了我的方向）：
+	//
+	//	「我点哪里的刷新啊?兼容网关这里还是有这个描述」
+	//	「这应该是自动的,而不是需要人手动同步,你懂吗?」
+	//
+	// 我第一次只把"刷新在哪"写清楚 —— 那是**治标**：把"用户得手动同步"
+	// 当成了既定前提。真正的修法是前端在信息不完整时自动重试
+	//（见 GatewayPage 的 modelsIncomplete），文案只需告诉用户
+	// "不用管，它自己会好"。
+	if !strings.Contains(got, "自动重试") {
+		t.Errorf("必须说明**正在自动重试**（这是所有者明确要求的：不该需要人手动同步），实际：%s", got)
 	}
-	if !strings.Contains(got, "右上角") {
-		t.Errorf("必须写清刷新按钮**在哪**（否则用户找不到，本次反馈的正是这点），实际：%s", got)
+	if !strings.Contains(got, "无需手动刷新") {
+		t.Errorf("必须明确告诉用户**不用手动刷新**，实际：%s", got)
+	}
+	// 反面：不该再教用户去点某个按钮（那是把手动同步当成前提）
+	for _, bad := range []string{"点本清单", "点「刷新」", "请点刷新"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("不该让用户去点 %q —— 自愈是系统的事（所有者明确要求自动），实际：%s", bad, got)
+		}
 	}
 	// ④ 原有信息不能丢：仍要说清"无法确认"，且"不等于没有"
 	if !strings.Contains(got, "无法确认") || !strings.Contains(got, "不等于") {
