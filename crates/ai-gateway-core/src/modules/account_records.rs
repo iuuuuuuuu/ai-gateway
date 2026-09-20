@@ -508,6 +508,67 @@ pub fn query_records(
     })
 }
 
+/// remove_bogus_grant_records 清掉**我们自己写错**的「额度刷新」记录。
+///
+/// # 背景（2026-09-20 所有者发现）
+///
+/// `zcode_login` 里我曾加过一段「每次刷新额度都写一条记录」的代码，
+/// 而它有两个错：
+///
+///	① `amount` 传的是**余额**（如 7434906）而不是变化量 ⇒
+///	   界面把每次刷新当成"+7,434,906 增长"累加 ⇒
+///	   「积分净变化 +58,753,966」这种荒谬值
+///	② 无条件写 ⇒ 每 15 分钟巡检一条，记录被刷屏
+///
+/// 而同一处**本来就有**正确的 `product_credit_snapshot`（算真实增量）。
+/// 写入侧已删掉那段，但**已写下的记录改不回来** —— 用户看到的历史里
+/// 仍然留着那些荒谬数字，故需要一次清理。
+///
+/// # 判据（必须精确，否则会误删真实记录）
+///
+/// 只删同时满足的：
+///
+///	· `title == "额度刷新"` —— 这是我那段代码**独有**的标题
+///	  （正确路径的标题是「积分增长 · 额度发放」/「积分消耗 · 调用扣减」等，
+///	   它们都由 `credit_record_text` 生成，**不会**是裸的「额度刷新」）
+///	· `kind == credit`
+///	· `source == "grant"`
+///
+/// ⚠ 刻意**不**按 amount 大小判定：那会依赖具体数值，换个账号就失效。
+/// 按标题判定更稳 —— 标题是"哪段代码写的"的直接指纹。
+///
+/// ⚠ 不删 `task` 类的「额度刷新」：那是**查询失败**的留痕（合法且有价值）。
+///
+/// 返回删除条数。幂等：删过之后再调返回 0。
+pub fn remove_bogus_grant_records() -> usize {
+    let _guard = RECORD_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let records = load_raw();
+    let before = records.len();
+
+    let kept: Vec<Value> = records
+        .into_iter()
+        .filter(|r| !is_bogus_grant_record(r))
+        .collect();
+
+    let removed = before - kept.len();
+    if removed == 0 {
+        return 0;
+    }
+    let content = serde_json::to_string_pretty(&kept).unwrap_or_default();
+    if atomic_write(&account_records_file(), &content).is_err() {
+        // 清理是尽力而为：写失败不该让启动失败，也不该谎报删了几条。
+        return 0;
+    }
+    removed
+}
+
+/// is_bogus_grant_record 判定某条记录是否是那段错误代码写的。
+fn is_bogus_grant_record(r: &Value) -> bool {
+    r.get("kind").and_then(Value::as_str) == Some(KIND_CREDIT)
+        && r.get("title").and_then(Value::as_str) == Some("额度刷新")
+        && r.get("source").and_then(Value::as_str) == Some(crate::modules::account_records::CREDIT_SOURCE_GRANT)
+}
+
 /// 把历史签到日志回填成账号记录（一次性迁移）。
 ///
 /// 为什么要回填：用户此前已积累了大量签到日志，若新视图只显示迁移后的数据，
@@ -1060,5 +1121,87 @@ mod tests {
         // 前缀后为空：不能剥成空串（空 id 在 query_records 里是"全部账号"，
         // 那会让一个异常 id 意外匹配到所有记录）
         assert!(!account_id_matches("zcode:", ""));
+    }
+    // -----------------------------------------------------------------------
+    // 清理写错的「额度刷新」记录（2026-09-20 所有者发现）
+    //
+    // 那段代码把**余额**当变化量写进 amount，界面累加成「+58,753,966」。
+    // 清理必须**只**删那一种形状，不能误伤真实记录。
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn removes_bogus_grant_records_only() {
+        let _iso = Isolated::new("records-bogus-grant");
+        let now = now_ms();
+        let f = account_records_file();
+
+        // 写错的那些（余额当增量 + 写死 grant）
+        // 写错的那些（余额当增量 + 写死 grant）
+        //
+        // ⚠ 必须用**真实的** `add_credit_record` 而不是 `push_at` 造夹具：
+        // `push_at` 不写 `source` 字段，而清理的判据包含 `source == grant` ——
+        // 用它造的"写错记录"根本不会被删，测试会假绿。
+        //（我第一版就是这样，结果断言 left=0 立刻暴露了。）
+        for _ in 0..3 {
+            add_credit_record(
+                "zcode-abc",
+                "zcode-abc",
+                "额度刷新",
+                7434906,
+                "剩余 7434906 / 8000000",
+                Some(crate::modules::account_records::CREDIT_SOURCE_GRANT),
+            );
+        }
+        // 正确的记录：标题来自 credit_record_text，**不是**裸的「额度刷新」
+        push_at(now + 10, "zcode-abc", KIND_CREDIT, "积分增长 · 额度发放", 7381510);
+        push_at(now + 11, "zcode-abc", KIND_CREDIT, "积分消耗 · 调用扣减", -53396);
+        // task 类的「额度刷新」（查询失败留痕）必须保留
+        push_at(now + 12, "zcode-abc", KIND_TASK, "额度刷新", 0);
+
+        let removed = remove_bogus_grant_records();
+        assert_eq!(removed, 3, "只该删那 3 条写错的 credit 记录");
+
+        // 复查文件
+        let left = load_raw();
+        assert_eq!(left.len(), 3, "应剩 3 条（2 条正确 credit + 1 条 task）");
+        for r in &left {
+            let title = r.get("title").and_then(Value::as_str).unwrap_or("");
+            let kind = r.get("kind").and_then(Value::as_str).unwrap_or("");
+            assert!(
+                !(kind == KIND_CREDIT && title == "额度刷新"),
+                "写错的 credit「额度刷新」应被删干净"
+            );
+        }
+        // 幂等
+        assert_eq!(remove_bogus_grant_records(), 0, "再跑一次应删 0 条");
+        let _ = f;
+    }
+
+    #[test]
+    fn keeps_task_records_with_same_title() {
+        let _iso = Isolated::new("records-keep-task");
+        let now = now_ms();
+        // 只有 task 类的同名记录 ⇒ 一条都不该删
+        push_at(now, "zcode-abc", KIND_TASK, "额度刷新", 0);
+        assert_eq!(
+            remove_bogus_grant_records(),
+            0,
+            "task 类的「额度刷新」是查询失败留痕，必须保留"
+        );
+        assert_eq!(load_raw().len(), 1);
+    }
+
+    #[test]
+    fn keeps_credit_records_without_grant_source() {
+        let _iso = Isolated::new("records-keep-nosource");
+        let now = now_ms();
+        // 同样是 credit + 「额度刷新」，但没有 source=grant ⇒ 不是那段代码写的
+        //（用 push_at 写的记录 source 为空）
+        push_at(now, "zcode-abc", KIND_CREDIT, "额度刷新", 100);
+        assert_eq!(
+            remove_bogus_grant_records(),
+            0,
+            "判据必须包含 source=grant —— 只按标题会误删"
+        );
     }
 }

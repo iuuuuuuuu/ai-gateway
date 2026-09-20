@@ -192,6 +192,23 @@ pub fn run() {
                 }
             }
 
+            // 清理我们自己写错的「额度刷新」记录（幂等，只删那一种形状）。
+            //
+            // 背景：`zcode_login` 曾有一段「每次刷新额度都写一条记录」的代码，
+            // 而 `amount` 传的是**余额**而不是变化量 ⇒ 界面把每次刷新当成
+            // "+7,434,906 增长"累加 ⇒ 「积分净变化 +58,753,966」这种荒谬值。
+            // 写入侧已删掉那段，但**已写下的记录改不回来**，故在这里清一次。
+            //
+            // 判据精确到 `title == "额度刷新" && kind == credit && source == grant`：
+            // 正确路径的标题由 `credit_record_text` 生成，不会是裸的「额度刷新」；
+            // `task` 类的「额度刷新」（查询失败留痕）也不受影响。
+            {
+                let removed = modules::account_records::remove_bogus_grant_records();
+                if removed > 0 {
+                    eprintln!("[records] 清理了 {removed} 条数值错误的「额度刷新」记录");
+                }
+            }
+
             // README 截图模式只渲染前端虚构数据，禁止读取账号后执行签到、轮换或保活。
             if !is_screenshot_demo() {
                 spawn_background_loops();

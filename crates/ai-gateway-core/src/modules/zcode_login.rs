@@ -776,37 +776,39 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
     }
     let acc = zcode_account::upsert_account(uid, &Value::Object(patch))?;
 
-    // ── 写**任务/额度记录** ──
+    // ── 查询失败留痕 ──
     //
-    // 所有者 2026-09-20：「zcode和qoder都无法查看任务执行记录,和积分消耗明细」。
+    // ⚠ 这里**只**记失败。成功的额度变化由上面那处
+    // `product_credit_snapshot` 负责（它会与上一快照比对、算出**真实增量**、
+    // 分类来源、再落记录）。
     //
-    // ZCode 侧此前**一条记录都没写**（整个模块组 0 处调用），于是那一页的
-    // 记录永远是空的。这里在每次刷新额度时落一条额度快照。
+    // # 我曾经在这里多写了一段，那是个错误（2026-09-20 所有者发现）
     //
-    // ⚠ `add_credit_record` 内部会**与上一次快照比对**，只有额度真的变化
-    // 才写入（见其实现）。故这里放心每次刷新都调 —— 不会刷出重复记录。
-    // 我原先打算自己加一层"变了才写"的判断，读了实现才发现是重复的。
-    let rec_name = zcode_account::load_accounts()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|a| a.uid == uid)
-        .map(|a| a.nickname)
-        .filter(|n| !n.trim().is_empty())
-        .unwrap_or_else(|| uid.to_string());
-    if let (Some(remain), Some(total)) = (credits, credits_total) {
-        let detail = format!("剩余 {remain} / {total}");
-        crate::modules::account_records::add_credit_record(
-            uid,
-            rec_name.trim(),
-            "额度刷新",
-            remain,
-            &detail,
-            Some("grant"),
-        );
-    }
-    // 查询失败也要留痕 —— 否则用户只看到「额度未知」，
-    // 无从判断是"没登录"还是"上游挂了"。
+    // 我加过一段「每次刷新都写一条『额度刷新』」的代码，注释还写着
+    // 「`add_credit_record` 内部会与上一次快照比对，只有变化才写」——
+    // **那句话是错的**：`add_credit_record` 就是无条件 `push`，
+    // 比对逻辑在 `credit_usage::record_snapshot` 里。我读了实现却看错了函数。
+    //
+    // 两个后果（所有者截图里都能看到）：
+    //
+    //	① `amount` 传的是**余额**（7434906）而不是变化量 ⇒
+    //	   界面把每次刷新当成"+7,434,906 增长"累加 ⇒
+    //	   「积分净变化 +58,753,966」这种荒谬值
+    //	② 无条件写 ⇒ 每 15 分钟巡检一条，记录被"额度刷新"刷屏
+    //
+    // 而 L601 那处 `product_credit_snapshot` **本来就在正确地做这件事**
+    //（它算出的 +7,381,510 才是真实增量）—— 所以那段是**纯粹的重复+错误**。
+    //
+    // 教训：写记录前先确认「这个变化是不是已经有人记了」。同一个额度变化
+    // 被两处记录，第二处还写错了单位，用户看到的就是双份且数值错乱的历史。
     if let Some(err) = &quota_error {
+        let rec_name = zcode_account::load_accounts()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|a| a.uid == uid)
+            .map(|a| a.nickname)
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| uid.to_string());
         crate::modules::account_records::add_task_record(
             uid,
             &rec_name,
