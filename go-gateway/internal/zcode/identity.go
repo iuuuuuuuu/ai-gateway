@@ -122,12 +122,20 @@ func IsUUID(s string) bool {
 
 // DefaultAppVersion 默认上报的客户端版本。
 //
-// 参考实现对着 ZCode 3.12.3 的桌面包逆向，故用同一个版本号 ——
-// 报一个不存在或过旧的版本可能触发风控。
+// # 版本号必须跟着官方客户端走（2026-09-20 更新）
 //
-// ⚠ 上游升级后这个值会过时。参考实现的做法是让它可配置
+// 参考实现（TriDefender/zcode-api）在最新提交 `8dca421 "Improved compliance"`
+// 把默认值从 `3.12.3` 升到 **`3.14.0`**，并新增了 3.14.0 对应的 host builder。
+// 作者原话（译）：*"每次客户端发版都要跟上，否则 User-Agent 与
+// X-ZCode-App-Version 会变成可区分的特征。"*
+//
+// 即：**报一个过旧的版本本身就是指纹**。我们此前停在 3.12.3，
+// 而官方客户端已经是 3.14.0 —— 那会让我们的请求与真机不一致。
+//
+// ⚠ 上游升级后这个值还会过时。参考实现的做法是让它可配置
 //（`identity.appVersion`），本包同样保留 Identity.AppVersion 字段可覆盖。
-const DefaultAppVersion = "3.12.3"
+// 排查"为什么被风控"时，**先核对这个版本号是否还是最新的**。
+const DefaultAppVersion = "3.14.0"
 
 // Identity 身份头的取值来源。
 type Identity struct {
@@ -463,6 +471,71 @@ func (i Identity) Headers() map[string]string {
 func (i Identity) ControlPlaneHeaders(deviceMid string) map[string]string {
 	h := i.Headers()
 	if v := strings.TrimSpace(deviceMid); v != "" {
+		h["X-Device-Mid"] = v
+	}
+	return h
+}
+
+// ClaimHeaders 是 **claim（领取限量套餐）** 端点的请求头。
+//
+// # 为什么不能用 ControlPlaneHeaders（2026-09-20 按参考实现对齐）
+//
+// 参考实现（TriDefender/zcode-api `src/claim/client.ts`）的 claim 请求
+// **只发 6~7 个头**，且与身份头 bundle 是两套：
+//
+//	Authorization: Bearer {jwt}
+//	Content-Type: application/json
+//	X-Aliyun-Captcha-Verify-Param: {verifyParam}
+//	[X-Aliyun-Captcha-Verify-Region: {region}]
+//	X-ZCode-App-Version: {appVersion}      ← 我们此前**缺这个**
+//	X-Platform: {platform}                 ← 我们此前**缺这个**
+//	[X-Device-Mid: {uuid}]                 ← 活动期硬要求
+//
+// 而我们此前给 claim 发的是 `ControlPlaneHeaders` **整套身份头**
+//（User-Agent / X-Title / HTTP-Referer / X-Os-* / X-ZCode-Agent …）。
+//
+// # 为什么"多送头"是风险而不是保险
+//
+// 直觉上多发头像是"更完整"，但上游的风控判据是**与真机一致**：
+// 官方客户端在这条路径上只发那几个头，我们多发一堆反而是**可区分的特征**。
+// 参考实现特意记载过这个反复：早期版本发全套身份头
+// （2026-08-28 活动期"经验上被接受"），3.12.3 起**改回逐字镜像客户端**。
+//
+// 故这里刻意**不**调用 `i.Headers()`，而是按参考实现逐字构造。
+//
+// ⚠ `X-Device-Mid` 仍然必需（活动期网关硬要求）——
+// 参考实现 commit `6b7327e "修复自动claim"` 专门修的就是这个：
+// 缺它必回 `biz 3001 parameter error`。我们此前已实现，此处保留。
+func (i Identity) ClaimHeaders(deviceMid string) map[string]string {
+	h := map[string]string{
+		"X-ZCode-App-Version": i.AppVersion,
+		"X-Platform":          i.PlatformArch(),
+	}
+	if v := strings.TrimSpace(deviceMid); v != "" {
+		h["X-Device-Mid"] = v
+	}
+	return h
+}
+
+// PreviewHeaders 是 **preview（查询可领套餐）** 端点的请求头。
+//
+// # 比 ClaimHeaders 更简（参考实现实测）
+//
+// 参考实现的 preview 是**极简头**：有 JWT 时只发
+// `Authorization`（+ 活动期的 `X-Device-Mid`），**连 Content-Type /
+// Accept / 身份头都不发**；匿名时**一个头都不发**。
+//
+// ⚠ 那为什么不干脆复用 ClaimHeaders？
+// 因为 preview 与 claim 在参考实现里就是**两个不同的头集**，
+// 而风控按路径比对。既然已知真机行为，就照它来。
+//
+// 返回的头由调用方再补 `Authorization` —— 那取决于凭证是否存在，
+// 而本函数不该依赖凭证（它只是身份信息的投影）。
+func (i Identity) PreviewHeaders(deviceMid string) map[string]string {
+	h := map[string]string{}
+	if v := strings.TrimSpace(deviceMid); v != "" {
+		// 活动期网关对 preview 也要求 UUID 形态的 X-Device-Mid
+		//（与 claim 同一个实测结论：缺它 3001）。
 		h["X-Device-Mid"] = v
 	}
 	return h

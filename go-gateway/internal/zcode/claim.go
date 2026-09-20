@@ -121,12 +121,21 @@ func (c *Client) FetchPlanPreview(ctx context.Context, cr *Cred) (*PlanPreview, 
 	if err != nil {
 		return nil, err
 	}
-	// ⚠ **控制面头**（含 X-Device-Mid）—— 缺它必然 3001。
-	// 复用既有实现，不在这里自己拼头。
-	for k, v := range c.Identity.ControlPlaneHeaders(cr.DeviceMid) {
+	// ⚠ **极简头**（见 Identity.PreviewHeaders 的说明）：参考实现的 preview
+	// 只发 `Authorization`（+ 活动期的 `X-Device-Mid`），**不发**身份头 bundle。
+	//
+	// 我此前给 preview 发的是 `ControlPlaneHeaders` 整套（含 User-Agent /
+	// X-Title / HTTP-Referer / X-Os-* / X-ZCode-Agent）—— 而上游风控按
+	// "是否与真机一致"判断，多发反而是可区分特征。
+	for k, v := range c.Identity.PreviewHeaders(cr.DeviceMid) {
 		if v != "" {
 			req.Header.Set(k, v)
 		}
+	}
+	// Authorization：有 JWT 才发。缺 JWT 时**一个头都不发** ——
+	// 匿名 preview 在参考实现里是合法的（会拿到空清单而不是 401）。
+	if jwt := strings.TrimSpace(cr.JWT); jwt != "" {
+		req.Header.Set("Authorization", "Bearer "+jwt)
 	}
 
 	resp, err := c.http().Do(req)
@@ -222,12 +231,19 @@ func (c *Client) ClaimPlan(ctx context.Context, cr *Cred, planID string) (*Claim
 	if err != nil {
 		return nil, err
 	}
-	for k, v := range c.Identity.ControlPlaneHeaders(cr.DeviceMid) {
+	for k, v := range c.Identity.ClaimHeaders(cr.DeviceMid) {
 		if v != "" {
 			req.Header.Set(k, v)
 		}
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Authorization：有 JWT 才发（与参考实现一致）。
+	//
+	// ⚠ 这条路径用 **JWT**，不是 `x-api-key` —— 参考实现的 claim 客户端
+	// 不发 `x-api-key`（那是对话面的双头做法，两条路径不同）。
+	if jwt := strings.TrimSpace(cr.JWT); jwt != "" {
+		req.Header.Set("Authorization", "Bearer "+jwt)
+	}
 	// 验证码头（仅在已求到时）—— 与对话路径同一取舍：没有就不发，
 	// 让上游如实回 3007，而不是我们猜。
 	if cr.CaptchaParam != "" {
