@@ -70,6 +70,34 @@ const DefaultMaxTokens = 128000
 // model 是**已规范化的上游模型名**（如 `GLM-5.3-Flash`，注意官方用
 // 展示名的大小写，不是目录里的 `glm-5.3-flash`）。
 func BuildAnthropicBody(openAIBody []byte, model string) ([]byte, error) {
+	return BuildAnthropicBodyWithMeta(openAIBody, model, AnthropicMeta{})
+}
+
+// AnthropicMeta 官方请求体里的**会话元数据**（抓包实测必发）。
+//
+// # 为什么必须发（这不是可有可无的装饰）
+//
+// 官方客户端每次对话都在请求体里带：
+//
+//	"metadata": {"user_id": "{\"device_id\":\"…\",\"account_uuid\":\"\",\"session_id\":\"…\"}"}
+//
+// 注意 `user_id` 的值本身是一个**序列化后的 JSON 字符串**（双重编码）——
+// 这是官方 SDK 的写法，照抄。
+//
+// 它给上游提供了"这是哪台设备、哪个会话"的维度。缺失时上游少了一个
+// 用于关联请求与判定行为模式的信号 —— 而风控恰恰靠这类信号区分
+// "真实客户端"与"脚本"。故即便它不影响认证，也应当发。
+type AnthropicMeta struct {
+	// DeviceID 设备标识（官方用 x-device-mid 那个值）。
+	DeviceID string
+	// AccountUUID 账号 uuid（官方抓包里是空串）。
+	AccountUUID string
+	// SessionID 会话标识。
+	SessionID string
+}
+
+// BuildAnthropicBodyWithMeta 同 BuildAnthropicBody，但可注入会话元数据。
+func BuildAnthropicBodyWithMeta(openAIBody []byte, model string, meta AnthropicMeta) ([]byte, error) {
 	var in map[string]any
 	if err := json.Unmarshal(openAIBody, &in); err != nil {
 		return nil, fmt.Errorf("解析 OpenAI 请求体失败: %w", err)
@@ -174,6 +202,20 @@ func BuildAnthropicBody(openAIBody []byte, model string) ([]byte, error) {
 
 	if len(systemBlocks) > 0 {
 		out["system"] = systemBlocks
+	}
+
+	// ---- metadata：官方的会话元数据（抓包实测必发）----
+	//
+	// ⚠ `user_id` 的值本身是一个**序列化后的 JSON 字符串**（双重编码）——
+	// 它是官方 SDK 的写法，照抄。上游据此把请求关联到"设备 / 会话"，
+	// 而风控正是靠这类维度区分真实客户端与脚本。
+	if meta.DeviceID != "" || meta.SessionID != "" {
+		inner, _ := json.Marshal(map[string]any{
+			"device_id":    meta.DeviceID,
+			"account_uuid": meta.AccountUUID,
+			"session_id":   meta.SessionID,
+		})
+		out["metadata"] = map[string]any{"user_id": string(inner)}
 	}
 
 	// ---- max_tokens：**必填** ----

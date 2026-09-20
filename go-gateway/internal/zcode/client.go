@@ -265,7 +265,16 @@ func (c *Client) StreamChat(ctx context.Context, cr *Cred, openAIBody []byte) (i
 func (c *Client) streamChatOnce(ctx context.Context, cr *Cred, openAIBody []byte) (io.ReadCloser, int, []byte, error) {
 	// 解析出模型名（翻译需要它），并把请求体翻成 Anthropic 形状。
 	model := modelNameOf(openAIBody)
-	anthBody, err := BuildAnthropicBody(openAIBody, model)
+	// 会话元数据：官方每次对话都发（见 AnthropicMeta 的注释）。
+	//
+	// device_id 用凭证上的 DeviceMid（与 x-device-mid 同源，保持一致）；
+	// session_id 用与追踪头同一个**稳定**会话标识 —— 两者必须一致，
+	// 否则上游会看到"头部说会话 A、体里说会话 B"的不一致。
+	sessID := stableUUID("zcode-session:" + firstNonEmptyStr(cr.AccountID, cr.UID))
+	anthBody, err := BuildAnthropicBodyWithMeta(openAIBody, model, AnthropicMeta{
+		DeviceID:  cr.DeviceMid,
+		SessionID: sessID,
+	})
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("翻译请求体失败: %w", err)
 	}
@@ -607,8 +616,16 @@ func (c *Client) applyHeaders(req *http.Request, cr *Cred, stream bool) {
 			req.Header.Set(k, v)
 		}
 	}
-	// 追踪头（含 x-query-id / x-session-id，见 TraceHeaders 的注释更正）
-	for k, v := range c.Identity.TraceHeaders() {
+	// 追踪头（含 x-query-id / x-session-id）。
+	//
+	// ⚠ 这里要**带上账号标识**：`x-session-id` 与 `x-zcode-trace-id` 必须是
+	// 会话级稳定的（抓包实测：官方相隔 58 分钟的两次请求，这两个值完全相同），
+	// 而旧实现每请求随机 —— 那在高频请求下与脚本无异，很可能就是 3012 的真因。
+	// Identity 是从配置构造的**共享值**，故这里做一次副本再填入账号信息，
+	// 不改动 c.Identity 本身（那会让并发的不同账号互相覆盖）。
+	id := c.Identity
+	id.AccountID = firstNonEmptyStr(cr.AccountID, cr.UID)
+	for k, v := range id.TraceHeaders() {
 		if v != "" {
 			req.Header.Set(k, v)
 		}

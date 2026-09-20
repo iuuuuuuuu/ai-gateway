@@ -64,7 +64,9 @@ package zcode
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"runtime"
 	"strings"
@@ -145,6 +147,23 @@ type Identity struct {
 	Platform  string
 	Arch      string
 	OSVersion string
+
+	// AccountID 当前请求所属的**账号**标识。
+	//
+	// # 为什么身份里需要它
+	//
+	// `x-session-id` 与 `x-zcode-trace-id` 必须是**会话级稳定**的
+	//（抓包实测：官方相隔 58 分钟的两次请求，这两个值完全相同），
+	// 而网关无状态、没有真实会话概念 —— 故用账号标识派生稳定 id。
+	//
+	// 见 TraceHeaders 的长注释（含抓包对照表与"为什么这很可能是 3012 真因"）。
+	AccountID string
+
+	// SessionID 调用方已知的真实会话 id（可选，优先于 AccountID）。
+	//
+	// 若是 UUID 形态就**直接用作** `x-session-id`（最贴近官方行为）；
+	// 否则作为派生的种子。
+	SessionID string
 }
 
 // DefaultIdentity 按当前运行环境构造身份。
@@ -264,41 +283,113 @@ func osCategory(goos string) string {
 
 // TraceHeaders 返回**追踪头**（对话通道用）。
 //
-// # ⚠ 2026-09-20 更正：此前"只发三个"的结论被实测推翻
+// # ⚠⚠ 2026-09-20 重大更正：这些 id 的**生命周期**此前搞错了
 //
-// 旧注释（引自某参考实现的 `identity.py::build_trace_headers`）声称：
+// 抓包对比官方客户端**相隔 58 分钟**的两次成功请求：
 //
-//	「start-plan（JWT 通道）**只发** x-request-id / x-zcode-session-type /
-//	  x-zcode-trace-id 三个头，**不发** x-query-id / x-session-id。
-//	  误发会触发上游 3012 "unusual activity"。」
+//	头                 10:01:26              10:59:12              行为
+//	─────────────────────────────────────────────────────────────────────
+//	x-query-id        01a0bc8b-dd41-…       01a0bcc0-dd41-…       每条消息**不同**
+//	x-request-id      04f0cee5-ab55-…       f816eb32-8fa5-…       每请求**不同**
+//	x-session-id      8fc6b5b0-fb13-…       8fc6b5b0-fb13-…       **完全相同**
+//	x-zcode-trace-id  65638a21-a6ea-…       65638a21-a6ea-…       **完全相同**
 //
-// **但抓包实测（Reqable，官方客户端 3.14.0 的成功对话请求）显示官方在发：**
+// 而旧实现**四个全都每请求重新随机生成**（见 git 历史）。
 //
-//	x-query-id:    01a0bc8b-d86e-7e99-9808-73c0d0a52642
-//	x-session-id:  8fc6b5b0-fb13-4801-b1de-988f41d14eed
+// 为什么这很可能是 3012 的真因：风控看的是**行为模式**。
+// 一个"每发一条消息就换一次 trace-id / session-id"的客户端，
+// 在服务端看来与脚本无异 —— 真实客户端的会话标识在整个会话期内是**稳定的**。
 //
-// 即：**那条注释与实测矛盾**。它可能针对的是另一个版本/另一条通道，
-// 也可能本身就不对。在拿到更多证据前，**不再把它当作约束** ——
-// 照官方实测发全。
+// 故现在按生命周期分三类：
 //
-// ⚠ 教训（值得记）：注释里的"参考实现说…"是**二手结论**，
-// 会随上游版本失效；而抓包是**一手事实**。二者冲突时以抓包为准，
-// 并把这个冲突写进注释 —— 否则下一个人还会照着旧注释改回去。
+//	每请求新   x-request-id        （官方每请求都换）
+//	每条消息新 x-query-id          （官方每条消息都换）
+//	每会话稳定 x-session-id        （官方会话期内不变）
+//	每会话稳定 x-zcode-trace-id    （官方会话期内不变）
 //
-// ⚠ 每次请求都要**重新生成**（不能被缓存复用）：它们标识单次请求。
+// ## "每会话"的粒度
+//
+// 我们没有真实会话概念（网关是无状态的），故粒度取"**每账号稳定**"：
+//   · `sessionID` 非空时用它（调用方若能给出真实会话 id 更好）
+//   · 否则用**账号标识**派生（同一账号恒定 → 上游看到的是一个稳定会话）
+//
+// 这比"每请求随机"接近官方行为得多。真正的会话级复用需要网关层
+// 透传客户端的 session id，那是更大的改动（见 TraceHeaders 的用法）。
+//
+// ⚠ 每次调用仍要**重新生成** x-request-id / x-query-id（它们本来就该变）。
 func (i Identity) TraceHeaders() map[string]string {
-	return map[string]string{
-		"x-request-id":         newTraceID(),
-		"x-zcode-session-type": "main",
-		"x-zcode-trace-id":     newTraceID(),
-		// 官方实测**在发**这两个（见上）。旧实现刻意不发，已更正。
-		"x-query-id": newTraceID(),
-		"x-session-id": func() string {
-			// 官方是裸 uuid（无 `sess_` 前缀）——抓包值
-			// `8fc6b5b0-fb13-4801-b1de-988f41d14eed` 证实。
-			return newTraceID()
-		}(),
+	// 会话级稳定值：优先用调用方给的会话 id，否则按账号派生。
+	//
+	// ⚠ 没有账号标识时**退回随机**（而不是退回固定串）：固定串会让
+	// 所有账号共用一个 session-id，那比随机更糟（上游会看到"一个会话
+	// 在给所有账号发请求"）。
+	sessionID := strings.TrimSpace(i.SessionID)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(i.AccountID)
 	}
+	if sessionID == "" {
+		// 无账号信息：退回每请求随机，至少不比原来差。
+		return map[string]string{
+			"x-request-id":         newTraceID(),
+			"x-zcode-session-type": "main",
+			"x-zcode-trace-id":     newTraceID(),
+			"x-query-id":           newTraceID(),
+			"x-session-id":         newTraceID(),
+		}
+	}
+	// 用账号标识**派生**两个稳定 id（同一账号恒定，不同账号不同）。
+	//
+	// 为什么不直接用 AccountID 本身：官方这两个值是 **UUID 形态**
+	//（上游会对"看着不像 UUID"的值回 429/3001，见 NewDeviceMid 的注释）。
+	// 而账号标识可能是 `zcode-1b2941c020ef` 或长数字 —— 直接发会被拒。
+	traceID := stableUUID("zcode-trace:" + sessionID)
+	stableSession := stableUUID("zcode-session:" + sessionID)
+	// 若调用方给的就是 UUID 形态的会话 id，直接用它作为 session-id
+	//（更贴近官方：官方就是用会话 uuid）。
+	if looksLikeUUID(sessionID) {
+		stableSession = sessionID
+	}
+	return map[string]string{
+		"x-request-id":         newTraceID(), // 每请求新（官方如此）
+		"x-zcode-session-type": "main",
+		"x-zcode-trace-id":     traceID,      // 每会话稳定
+		"x-query-id":           newTraceID(), // 每条消息新（官方如此）
+		"x-session-id":         stableSession, // 每会话稳定
+	}
+}
+
+// looksLikeUUID 判断是否 UUID 形态（8-4-4-4-12 的十六进制）。
+func looksLikeUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for idx, r := range s {
+		switch idx {
+		case 8, 13, 18, 23:
+			if r != '-' {
+				return false
+			}
+		default:
+			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// stableUUID 从一个任意字符串**确定性地**派生一个 UUIDv4 形态的 id。
+//
+// 用途：需要"同一输入恒定、不同输入不同、且形态必须是 UUID"的标识。
+// 用 SHA-256 截断 —— 确定性来自哈希，不需要额外状态（网关重启后依旧一样，
+// 这点很重要：重启即换 session-id 会再次暴露"非真实会话"）。
+func stableUUID(seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	b := sum[:16]
+	// 设版本位（v4）与变体位 —— 与 NewDeviceMid 一致，否则形态不像 UUID
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // newTraceID 生成一个 UUIDv4 形态的追踪 id。
