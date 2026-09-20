@@ -108,7 +108,11 @@ func TestClassifyDoesNotOverreach(t *testing.T) {
 		{"429 账号级限流", http.StatusTooManyRequests, `{"code":1001,"msg":"too many requests"}`, ErrSoftRate},
 		{"402 余额不足", http.StatusPaymentRequired, `{"code":1,"msg":"余额不足"}`, ErrHardCredit},
 		{"401 session 失效", http.StatusUnauthorized, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
-		{"400 模型不存在", http.StatusBadRequest, `{"code":11102,"msg":"model service info not found"}`, ErrClient},
+		// ⚠ 这条的**样本**原先用 11102，2026-09-20 起 11102 有了独立归类
+		//（ErrModelNotInRegion —— 它是请求侧错误，不该被轮转）。
+		// 本用例的意图是"分类器不要过度归类**通用** 4xx"，故换一个真正通用的样本；
+		// 11102 的新归属由 upstream 包的 TestClassifyModelNotInRegion 锁定。
+		{"400 渠道未批准", http.StatusBadRequest, `{"code":11128,"msg":"channel not approved"}`, ErrClient},
 		{"400 渠道未批准", http.StatusBadRequest, `{"code":11128,"msg":"channel not approved"}`, ErrClient},
 		{"500 上游故障", http.StatusInternalServerError, `{"code":500}`, ErrServer},
 		{"404 偶发", http.StatusNotFound, `{"code":404}`, ErrNotFound},

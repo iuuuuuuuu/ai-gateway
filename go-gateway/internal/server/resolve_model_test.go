@@ -223,3 +223,73 @@ func TestProductPrefixConstantsMatchAuth(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveModelAcceptsOurOwnGeneratedAliases 我们**下发**的组合名必须能被自己解析。
+//
+// # 为什么这条必须有（2026-09-20 实测缺陷）
+//
+// `/v1/models` 的 `aliases` 里下发的国服写法是「国服」
+//（`realmLabelOf(RegionCN)` 的返回值）。而 `isRealmPrefix` 此前只认 `cn` ——
+// 于是用户从界面复制 `workbuddy:国服:xxx` 填进配置后：
+//
+//	区域段不被识别 ⇒ 整段被当成**裸模型名** ⇒ 上游 11102「模型不存在」
+//
+// 自相矛盾：**我们给的写法自己读不回来**。所有者反馈的
+// 「接口返回的还是没有 平台:国内:模型名」正指向这条链路。
+//
+// 这条测试用「解析出来的 bare 必须等于真模型名」当判据 ——
+// 若区域段没被剥掉，bare 会变成 `国服:glm-5.3`（含前缀），断言即失败。
+func TestResolveModelAcceptsOurOwnGeneratedAliases(t *testing.T) {
+	cases := []struct {
+		in       string
+		product  string
+		realm    string
+		wantBare string
+	}{
+		// 我们下发的三种组合（见 capability.go 的 mergedModelList）
+		{"workbuddy:国服:glm-5.3", productWorkBuddy, realmCN, "glm-5.3"},
+		{"workbuddy:国际版:glm-5.3", productWorkBuddy, realmGlobal, "glm-5.3"},
+		// 所有者的说法「国内」—— 宽容输入，一并接受
+		{"workbuddy:国内:glm-5.3", productWorkBuddy, realmCN, "glm-5.3"},
+		{"qoder:国服:Qwen3.8-Flash", productQoder, realmCN, "Qwen3.8-Flash"},
+		// 纯区域前缀（不带产品）
+		{"国服:glm-5.3", "", realmCN, "glm-5.3"},
+		{"国内:glm-5.3", "", realmCN, "glm-5.3"},
+		// 英文仍照旧
+		{"cn:glm-5.3", "", realmCN, "glm-5.3"},
+	}
+	for _, c := range cases {
+		p, r, bare := resolveModel(c.in)
+		if p != c.product || r != c.realm || bare != c.wantBare {
+			t.Errorf("resolveModel(%q)=(%q,%q,%q) 期望 (%q,%q,%q) —— "+
+				"解析不出就会把整串当模型名，上游回 11102",
+				c.in, p, r, bare, c.product, c.realm, c.wantBare)
+		}
+	}
+}
+
+// TestNormalizeRealmMapsChineseAliases 中文别名要归一到内部枚举值。
+//
+// 不归一的话 `realmToRegion` 会走 default 分支返回 RegionAny ——
+// 用户的"只要国服"会**静默变成"不限区域"**，比报错更难发现。
+func TestNormalizeRealmMapsChineseAliases(t *testing.T) {
+	cases := map[string]string{
+		realmCNAlt:  realmCN,
+		realmCNAlt2: realmCN,
+		realmIntlCN: realmGlobal,
+		realmCN:     realmCN,
+		realmGlobal: realmGlobal,
+	}
+	for in, want := range cases {
+		if got := normalizeRealm(in); got != want {
+			t.Errorf("normalizeRealm(%q)=%q 期望 %q", in, got, want)
+		}
+	}
+	// 归一后必须真的映射到对应区域（不是 RegionAny）
+	if got := realmToRegion(normalizeRealm(realmCNAlt)); got != auth.RegionCN {
+		t.Errorf("「国服」应映射到 RegionCN，实际 %v", got)
+	}
+	if got := realmToRegion(normalizeRealm(realmCNAlt2)); got != auth.RegionCN {
+		t.Errorf("「国内」应映射到 RegionCN，实际 %v", got)
+	}
+}

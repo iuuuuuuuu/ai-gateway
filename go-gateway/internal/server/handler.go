@@ -764,6 +764,12 @@ func openAIFailure(err error) (code, msg string) {
 		// 而不断重试 —— 而重试正是当前最不该做的事（会继续放大风控）。
 		return "egress_ip_blocked", f.Message
 	}
+	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInRegion {
+		// 模型在这条通道上不存在（上游 11102）：请求侧错误，重试无用。
+		// 状态码由调用方原样透出（forwardChat 返回的 400），**不走 503** ——
+		// 503 会让客户端去重试，而这里等多久都不会出现（要换模型/加区域前缀）。
+		return "model_not_in_region", f.Message
+	}
 	// 其余交给 errorCodeFor（当前只有 model_not_allowed 与 no_healthy_account），
 	// 即 chat/completions 一直以来的行为。
 	return errorCodeFor(err), errText(err)
@@ -786,6 +792,11 @@ func anthropicFailure(err error) (code, msg string) {
 	// 那会让用户去改请求，而他要改的是网络出口。
 	if f := failureOf(err); f != nil && f.Kind == FailureEgressIPBlocked {
 		return "api_error", f.Message
+	}
+	// 模型在该通道不存在：请求侧问题（要改模型名或加区域前缀），
+	// 与上面两类「重试无用」的错误同一取向 —— 报 api_error 会让客户端重试。
+	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInRegion {
+		return "invalid_request_error", f.Message
 	}
 	if errorCodeFor(err) != "no_healthy_account" {
 		return "invalid_request_error", errText(err)
@@ -813,6 +824,12 @@ func responsesFailure(err error) (code, msg string) {
 	// 它不是「你的请求写错了」，故不能走 invalid_request_error。
 	if f := failureOf(err); f != nil && f.Kind == FailureEgressIPBlocked {
 		return "upstream_error", f.Message
+	}
+	// 模型在该通道不存在：Responses 词汇表里最贴近的是 invalid_request_error
+	//（用户的请求需要改：换模型或加区域前缀），不是 upstream_error ——
+	// 后者会让客户端以为"上游暂时坏了，重试即可"。
+	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInRegion {
+		return "invalid_request_error", f.Message
 	}
 	if errorCodeFor(err) != "no_healthy_account" {
 		return "invalid_request_error", errText(err)
@@ -899,6 +916,17 @@ func errorCodeFor(err error) string {
 	// 恰好是当前最该避免的事（会继续放大风控）。
 	if f := failureOf(err); f != nil && f.Kind == FailureEgressIPBlocked {
 		return "egress_ip_blocked"
+	}
+	// 模型在当前通道/区域上不存在（上游 11102）：也是**请求侧**错误。
+	//
+	// 所有者 2026-09-20 的现场表现很重要：它此前落进 no_healthy_account，
+	// 界面显示「all accounts unavailable (cooling/disabled)」，
+	// 于是他的判断是"这个模型不能用/要排队"。而真实原因是**区域没指定** ——
+	// 等多久都不会变，只能换模型或加区域前缀。
+	//
+	// 故给独立错误码，让客户端与用户都能看出"这是请求的问题，不是账号的问题"。
+	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInRegion {
+		return "model_not_in_region"
 	}
 	return "no_healthy_account"
 }

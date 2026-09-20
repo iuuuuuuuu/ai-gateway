@@ -92,18 +92,40 @@ func normalizeProduct(s string) string {
 //
 // 接受英文与中文别名：
 //
-//	cn / CN           → 国服
-//	global / 国际版    → 国际版
+//	cn / CN / 国服 / 国内   → 国服
+//	global / 国际版          → 国际版
+//
+// # ⚠ 「国服」「国内」是必须接受的（2026-09-20 实测缺陷）
+//
+// `/v1/models` 的 `aliases` 里，我们**自己下发**的组合名用的就是「国服」
+//（`realmLabelOf(RegionCN)` 返回它）。而本函数此前只认 `cn` ——
+// 于是用户从界面复制 `workbuddy:国服:xxx` 填进配置后**解析失败**：
+// 区域段不被识别 ⇒ 整段被当成裸模型名 ⇒ 上游回 11102「模型不存在」。
+//
+// 这是**自相矛盾**：我们给的写法自己读不回来。所有者 2026-09-20 反馈的
+//　「接口返回的还是没有 平台:国内:模型名」正指向这条链路。
+//
+// 「国内」一并接受：所有者的原话就是「国内」，口头与书面都有用；
+// 宽容输入（接受多种等价写法）在这里是对的 —— 用户抄哪个都能用。
 func isRealmPrefix(s string) bool {
-	return s == realmCN || s == realmGlobal || s == realmIntlCN
+	switch s {
+	case realmCN, realmGlobal, realmIntlCN, realmCNAlt, realmCNAlt2:
+		return true
+	default:
+		return false
+	}
 }
 
 // normalizeRealm 归一化区域前缀为内部枚举值（`cn` / `global`）。
 func normalizeRealm(s string) string {
-	if s == realmIntlCN {
+	switch s {
+	case realmIntlCN:
 		return realmGlobal
+	case realmCNAlt, realmCNAlt2:
+		return realmCN
+	default:
+		return s
 	}
-	return s
 }
 
 // product / realm 枚举。
@@ -121,6 +143,16 @@ const (
 	realmGlobal = "global"
 	// realmIntlCN 是 `global` 的**中文别名**（所有者习惯写「国际版」）。
 	realmIntlCN = "国际版"
+	// realmCNAlt / realmCNAlt2 是 `cn` 的中文别名。
+	//
+	// ⚠ 这两个不是可有可无的"锦上添花"：`/v1/models` 的 aliases 里
+	// **我们下发的组合名用的就是「国服」**（见 realmLabelOf）。不接受它，
+	// 用户从界面抄下来的写法会被当成裸模型名 ⇒ 上游 11102。
+	//
+	// 「国内」是所有者本人的说法（2026-09-20 原话「平台:国内:模型名」），
+	// 一并接受，让他抄哪个都能用。
+	realmCNAlt  = "国服"
+	realmCNAlt2 = "国内"
 )
 
 // realmToRegion 把区域前缀映射成 `auth.Region`。

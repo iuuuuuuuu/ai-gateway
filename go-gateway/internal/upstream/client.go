@@ -59,6 +59,30 @@ const (
 	//（hy3 声明 [low,high] 却接受 medium/max/off），预校验会误拒合法请求。
 	// 这条路径是「上游已经拒绝了」之后的如实转达，不是我们替它判断。
 	ErrEffortRejected
+	// ErrModelNotInRegion 该模型在**这条通道/区域**上不存在（HTTP 400 code=11102）。
+	//
+	// 实测原文（所有者 2026-09-20 的对话报错）：
+	//
+	//	upstream client (http 400): {"code":11102,
+	//	  "msg":"model [Qwen3.8-Flash] service info not found"}
+	//
+	// # 为什么必须独立成型（所有者原话）
+	//
+	//	「这个模型,如果是排队,就应该直接报错出来要排队多久,
+	//	  而不是说这个模型不能用」
+	//
+	// 他说对了一半：**消息确实在误导**，但 11102 不是排队（排队是 10605，
+	// 那条已有可读文案「免费模型正在排队…预计等待 N 秒」）。
+	//
+	// 11102 的真实含义是**区域不匹配**：同名模型可能只在某一侧上游存在
+	//（代码注释里早有记录：「跨区域调用返回 code=11102」）。
+	// 而它此前被归进通用 ErrClient ⇒ 逐账号轮转 ⇒ 最后包装成
+	// `503 no_healthy_account` + 「all accounts unavailable (cooling/disabled)」
+	// ⇒ **用户以为要等账号恢复，实际是模型名选错了**。
+	//
+	// 故与 ErrContextTooLong / ErrEffortRejected 同样处理：请求侧错误，
+	// 不轮转、不冷却账号、原样透出并给出可操作的提示。
+	ErrModelNotInRegion
 )
 
 func (k ErrKind) String() string {
@@ -81,6 +105,8 @@ func (k ErrKind) String() string {
 		return "context_too_long"
 	case ErrEffortRejected:
 		return "effort_rejected"
+	case ErrModelNotInRegion:
+		return "model_not_in_region"
 	default:
 		return "none"
 	}
@@ -376,6 +402,16 @@ var effortRejectedMarkers = []string{
 	"unsupported reasoning effort",
 }
 
+// modelNotInRegionMarkers 「模型在这条通道上不存在」的文案特征。
+//
+// 只放**足够特异**的片段 —— 通用词（如 "model not found"）会误伤正常报错。
+// 主判据仍是业务码 11102（见 IsModelNotInRegion）。
+var modelNotInRegionMarkers = []string{
+	"service info not found",   // 实测原文：model [X] service info not found
+	"model service not found",
+	"model info not found",
+}
+
 // IsEffortRejected 上游是否在拒绝本次请求的思考档位。
 func IsEffortRejected(body string) bool {
 	lower := strings.ToLower(body)
@@ -385,6 +421,86 @@ func IsEffortRejected(body string) bool {
 		}
 	}
 	return false
+}
+
+// IsModelNotInRegion 判断响应体是不是「该模型在这条通道上不存在」（11102）。
+//
+// # 为什么按**业务码 + 文案**双判
+//
+// 只认业务码 11102 会漏：部分上游把这句放在 `error.message` 里而不回 code；
+// 只认文案会误伤：正常的「模型不存在」也可能出现在别处。
+// 两者取"或" —— 与 `IsContextTooLong` / `IsEffortRejected` 同一取向。
+//
+// 实测原文（所有者 2026-09-20）：
+//
+//	{"code":11102,"msg":"model [Qwen3.8-Flash] service info not found"}
+//
+// ⚠ 与 10605（排队）**完全不同**：那个是上游主动限流、稍后可用；
+// 这个是"这条通道压根没有这个模型"，**等多久都没用**，必须换模型或换区域。
+// 所有者把两者都称作"排队"，措辞上要区分清楚（见 ModelNotInRegionMessage）。
+func IsModelNotInRegion(body string) bool {
+	if strings.Contains(body, "11102") {
+		return true
+	}
+	lower := strings.ToLower(body)
+	for _, m := range modelNotInRegionMarkers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// ModelNotInRegionMessage 把 11102 渲染成**可操作**的中文提示。
+//
+// # 为什么必须重写而不是透传原文
+//
+// 上游原文 `model [Qwen3.8-Flash] service info not found` 有两个问题：
+//
+//	· 英文，且 "service info not found" 让人以为是服务故障（要等）；
+//	· 完全没说**该怎么办** —— 用户只会反复重试同一个模型。
+//
+// 真实成因是**区域不匹配**：同名模型可能只在某一侧上游存在
+//（见 `capability.go` 的 regionNote）。故提示里给出两条出路：
+// 换一个模型，或用 `平台:区域:模型名` 的写法明确指定。
+//
+// 保留了原始模型名与上游文案 —— 排查时仍需要它们。
+func ModelNotInRegionMessage(model, body string) string {
+	var b strings.Builder
+	b.WriteString("这个模型在当前通道上不存在（不是排队，等多久都不会出现）")
+	if m := strings.TrimSpace(model); m != "" {
+		fmt.Fprintf(&b, "：模型 %s", m)
+	}
+	b.WriteString("。请换一个模型，或用「平台:区域:模型名」的写法明确指定区域")
+	b.WriteString("（例如 qoder:国服:模型名 / workbuddy:国际版:模型名）。")
+	if detail := upstreamMsgOf(body); detail != "" {
+		fmt.Fprintf(&b, " 上游原文：%s", detail)
+	}
+	return b.String()
+}
+
+// upstreamMsgOf 从响应体里取一句可读的上游说明（取不到返回空）。
+func upstreamMsgOf(body string) string {
+	var env struct {
+		Msg      string `json:"msg"`
+		Message  string `json:"message"`
+		Error    struct {
+			Message string `json:"message"`
+			Msg     string `json:"msg"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		return ""
+	}
+	for _, s := range []string{env.Msg, env.Message, env.Error.Message, env.Error.Msg} {
+		if t := strings.TrimSpace(s); t != "" {
+			if len(t) > 200 {
+				t = t[:200] + "…"
+			}
+			return t
+		}
+	}
+	return ""
 }
 
 // EffortRejectedDetail 从上游响应体里取出可读的原始说明。
@@ -458,6 +574,14 @@ func Classify(status int, body string) ErrKind {
 	// 而且要保留上游原文让用户知道该换哪个档（见 ErrEffortRejected 的注释）。
 	if IsEffortRejected(body) {
 		return ErrEffortRejected
+	}
+	// 模型在该区域不存在（11102）同样必须是**请求侧**错误。
+	//
+	// 换号毫无意义 —— 同一个模型名发给任何账号都会被同一侧上游拒；
+	// 而落进通用 ErrClient 会被轮转，最后包装成「账号全部不可用」，
+	// 把用户引向排查账号（实测就是这么误导所有者的）。
+	if IsModelNotInRegion(body) {
+		return ErrModelNotInRegion
 	}
 	if status == http.StatusNotFound {
 		return ErrNotFound

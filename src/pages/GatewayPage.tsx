@@ -2745,7 +2745,41 @@ export default function GatewayPage() {
     setModelsLoading(true);
     try {
       const list = await api.getGatewayModels();
-      setModelOptions(list.map((m) => m.id).filter(Boolean).sort());
+      /*
+        「放行模型」候选 = 裸名 + **全部组合写法**。
+
+        # ⚠ 为什么必须带上 aliases（所有者 2026-09-20 反馈）
+
+        「兼容网关 接口配置 放行模型 这里的模型也是一样的问题」——
+        他说的是：这里也只有裸名，没有 `平台:国服:模型名` 这类组合写法。
+
+        根因就在这一行：原来只 `list.map((m) => m.id)`，**把网关下发的
+        `aliases` 全丢了**。而网关其实一直在发（实测 45 个模型里 44 个带
+        aliases，含「国服」121 次、「国际版」84 次）。
+
+        为什么放行清单**特别需要**组合写法：放行是**逐字符串精确匹配**的
+        （网关按模型名比对）。用户若想让某模型只走国服，就必须把
+        `workbuddy:国服:xxx` 这一项加进放行清单 —— 没有它，用户只能放行
+        裸名（= 不限平台），做不到"只放行国服那个"。
+
+        ⚠ 顺序：裸名在前（那是"不限"的写法，最常用），组合名随后，
+        ⚠ 去重：不同平台的同名模型可能产生重复的裸名（同一 id 只出现一次，
+        因为这是"候选字符串"清单，不是"模型"清单）。
+      */
+      const names: string[] = [];
+      const seen = new Set<string>();
+      const push = (s: string) => {
+        const v = (s || "").trim();
+        if (v && !seen.has(v)) {
+          seen.add(v);
+          names.push(v);
+        }
+      };
+      for (const m of list) {
+        push(m.id);
+        for (const a of m.aliases || []) push(a);
+      }
+      setModelOptions(names.sort());
       // 同时留下**完整对象**：模型路由清单需要 `channels`（来源平台）
       // 与能力字段，而 `modelOptions` 只有名字。
       //

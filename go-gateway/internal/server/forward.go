@@ -580,6 +580,29 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 				}
 			}
 
+			// 模型在这条通道上不存在（11102）：**同样是请求侧错误**，
+			// 但必须说清"等也没用"，而不是让用户以为要等账号恢复。
+			//
+			// 为什么不轮转：同名模型可能只在某一侧上游存在（见 capability.go
+			// 的 regionNote）。同一个模型名发给任何账号都会被同一侧拒 ——
+			// 轮转只是把同一个请求对着每个账号重传一遍，最后还是失败，
+			// 且账号会被无谓地记上错误（实测旧行为正是如此）。
+			//
+			// 所有者 2026-09-20 的现场：他用裸名 `Qwen3.8-Flash`（放行清单里
+			// 就是裸名），网关挑到了没有该模型的区域，回 11102，最终展示成
+			// 「all accounts unavailable (cooling/disabled)」——
+			// 他的反应是「这个模型不能用」，而真实原因是**区域没指定**。
+			if kind == upstream.ErrModelNotInRegion {
+				uid := acct.UID
+				releaseHeld()
+				return &chatResult{UID: uid}, status, &forwardFailure{
+					Kind:   FailureModelNotInRegion,
+					Status: status,
+					Message: upstream.ModelNotInRegionMessage(
+						modelOf(body), string(respBody)),
+				}
+			}
+
 			h.applyErrorPolicy(acct.UID, model, kind, string(respBody))
 			fail(acct.UID)
 			continue
@@ -778,6 +801,21 @@ const (
 	// 「**换号无用**，问题在我们的网络出口」，用户要查的是代理 / VPN /
 	// 公网 IP。混进 no_healthy_account 会让他去查账号池，方向完全错。
 	FailureEgressIPBlocked
+	// FailureModelNotInRegion 该模型在当前通道/区域上不存在（上游 11102）。
+	//
+	// 所有者 2026-09-20 原话：
+	//
+	//	「这个模型,如果是排队,就应该直接报错出来要排队多久,
+	//	  而不是说这个模型不能用」
+	//
+	// 它把这类错误看成"排队"，而实际是**区域不匹配**（排队是 10605，
+	// 已有可读文案）。但用户的诉求成立：**消息在误导** ——
+	// 此前它被轮转后包成 `503 no_healthy_account` +
+	// 「all accounts unavailable (cooling/disabled)」，让人以为要等账号恢复。
+	//
+	// 故单独成型：不轮转、不冷却账号，直接说"这个模型在这条通道上不存在，
+	// 等多久都不会出现"，并给出可操作的出路（换模型 / 用区域前缀）。
+	FailureModelNotInRegion
 )
 
 // imageRegionUnavailableMessage 生成「带图片请求缺少该区域账号」的说明。

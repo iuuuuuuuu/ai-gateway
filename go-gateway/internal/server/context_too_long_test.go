@@ -205,9 +205,22 @@ func TestGenuineNoAccountStillReportsNoHealthyAccount(t *testing.T) {
 // TestGenericClientErrorKeepsLegacyContract 其余 4xx 行为不变（不惩罚账号、仍报 503）。
 //
 // 明确锁定：本次修复只给「上下文超长」开特例，不改变其他错误路径的对外契约。
+//
+// ⚠ 样本在 2026-09-20 从 11102 换成 11128（渠道未批准）。
+//
+// 原因：11102 那天**被有意提升为独立类别** `FailureModelNotInRegion` ——
+// 它是请求侧错误（模型在该通道不存在），不该被轮转、
+// 也不该落进 no_healthy_account 的 503 契约（那会让用户以为要等账号恢复）。
+//
+// 本用例的意图是"给**除已知特例之外**的 4xx 锁定旧契约"，
+// 故必须换一个真正属于"其余"的样本 —— 11128 就是这样的通用 4xx。
+// 断言强度**一字未动**（仍要求 503 + 不惩罚账号），只是换了取样对象。
+//
+// 11102 的新契约由 `model_not_in_region_test.go` 的 4 条测试锁定
+//（不轮转 / 状态码 400 / 独立错误码 / 消息可操作），覆盖没有减少。
 func TestGenericClientErrorKeepsLegacyContract(t *testing.T) {
 	up := newFakeUpstream(t, func(string) (int, string, bool) {
-		return 400, `{"code":11102,"msg":"model service info not found"}`, false
+		return 400, `{"code":11128,"msg":"channel not approved"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
