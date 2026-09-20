@@ -610,7 +610,22 @@ export default function AgentsPage() {
   );
 
   return (
-    <div className="mx-auto max-w-6xl space-y-5 p-4 sm:p-6">
+    <div className="space-y-5 p-4 sm:p-6">
+      {/*
+        ⚠ 这里原本是 `mx-auto max-w-6xl`，已按所有者 2026-09-20 的要求去掉：
+        「智能体管理两边留白太多了,优化一下」。
+
+        `max-w-6xl` = 1152px 封顶 + `mx-auto` 居中 ⇒ 宽屏下两侧各空一大块。
+        而**同级的「兼容网关」页没有任何 max-w 约束**（占满可用宽度），
+        两页切换时一个满宽、一个居中窄栏，观感差异很明显。
+
+        实测：这个上限让下方网格容器只有 1104px，直接导致「流式布局」
+        最多只能排 3 列（见网格处的算式）。故去掉它同时也是
+        让流式布局真正生效的前提。
+
+        保留 `p-4 sm:p-6`（内容与窗口边缘的呼吸），只去掉**宽度封顶** ——
+        两者是不同的事，一起删会让内容贴边。
+      */}
       {/* 顶部主横幅与一键更新操作栏 */}
       <div className="flex flex-col gap-3 rounded-2xl border border-border/70 bg-gradient-to-br from-card via-card to-muted/20 p-5 shadow-xs sm:flex-row sm:items-center sm:justify-between">
         <div className="space-y-1">

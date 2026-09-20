@@ -13,6 +13,9 @@ import {
 } from "lucide-react";
 import { QoderMark } from "@/components/product-marks";
 import { ProductAccountCard, ProductAccountGrid } from "@/components/product-account-card";
+// 记录视图：任务执行记录 + 额度消耗明细（所有者 2026-09-20 要求）。
+// 与 WorkBuddy 账号卡共用同一个组件 —— 三处的筛选与措辞必须一致。
+import { AccountRecordsView } from "@/components/account-records-view";
 import type { ProductAccountTask } from "@/components/product-account-card";
 import { openInDefaultBrowser } from "@/lib/open-browser";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -219,24 +222,45 @@ function isClaimedCampaign(c: api.QoderCampaign): boolean {
 }
 
 /**
+ * 该活动**是不是"能领东西"的真活动**（而不是广告位）。
+ *
+ * # 为什么单独一个函数
+ *
+ * 这条判据要在**三处**用同一份：任务清单、可领计数、单账号领取的目标筛选。
+ * 各写一遍必然分叉 —— 那正是我第一版的错误来源（后端与前端各写了一份
+ * `claimStatus` 判据，两份都漏了 `actionType`）。
+ *
+ * 判据：`actionType === "CLAIM_BENEFIT"` 或有 `benefit`。
+ *
+ *	两者取"或"而不是"与"：实测真活动**两者都有**
+ *	（`CLAIM_BENEFIT` + `benefit{100 CREDITS}`），但上游字段名历史上变过，
+ *	任一条成立就足以说明"这条能领到东西"。
+ *
+ * `VIEW_DETAILS` 是**广告位**：它也带 placements、也回 CLAIMED，
+ * 但它上面那个「已领取」是**整个活动页**的状态，不是"你领到了这个"。
+ * 故它既不该进任务清单，也不该显示为"已完成"。
+ */
+function isBenefitCampaign(c: api.QoderCampaign): boolean {
+  if (Boolean(c.benefit)) return true;
+  return (c.actionType || "").toUpperCase() === "CLAIM_BENEFIT";
+}
+
+/**
  * 该活动**能不能领**。
  *
  *	· 已领（CLAIMED）/ 已过期（EXPIRED）→ 不能领
- *	· **没有 `benefit`** 且不是 `CLAIM_BENEFIT` → 不能领
- *	  （上游会把纯宣传文案也下发，见 `qoderTasksOf` 的说明）
+ *	· **不是领取类**（`VIEW_DETAILS` 等广告位）→ 不能领
+ *	  （见 `isBenefitCampaign`：那类条目根本没有 benefit）
  *	· 状态为空 → **仍按可领处理**，与后端 `count_claimable` 同一取向
  *	  （"上游没给状态时不预设为已领取，否则用户明明能领却看不到按钮"）
  *
- * ⚠ 判据必须与后端 [`is_claimable_campaign`]（`qoder_login.rs`）**逐条一致**。
+ * ⚠ 判据必须与后端 `is_claimable_campaign`（`qoder_login.rs`）**逐条一致**。
  * 两边分叉的后果很具体：界面说"2 个可领取"而实际只领到 1 个 ——
- * 用户会认为这个按钮在骗他。此前两边**都**漏了"无 benefit"这一条。
+ * 用户会认为这个按钮在骗他。此前两边**都**漏了 actionType 这一条。
  */
 function isClaimableCampaign(c: api.QoderCampaign): boolean {
   if (isClaimedCampaign(c) || c.claimStatus === "EXPIRED") return false;
-  // 有 benefit = 确实能领到东西，这就是"真活动"的判据。
-  if (c.benefit) return true;
-  // 没有 benefit：只有明确声明是"领取类"动作时才算。
-  return c.actionType === "CLAIM_BENEFIT";
+  return isBenefitCampaign(c);
 }
 
 /**
@@ -298,27 +322,38 @@ function qoderTaskStateOf(c: api.QoderCampaign): "done" | "ready" | "blocked" {
 
 /** 该账号当前有哪些任务、各自什么状态。
  *
- * # ⚠ 只把**真的能领**的当成任务（所有者 2026-09-20 反馈）
+ * # ⚠ 只把**真活动**当成任务（所有者 2026-09-20 两次反馈）
  *
- * 原话：「qoder只有一个活动能领取,第二个只是优惠说明」。
+ * 原话：「qoder只有一个活动能领取,第二个只是优惠说明」
+ * 第二次：「qoder不是说只有一个能领取吗?你这里应该能做出区分吧,
+ *           他应该也有字段能区分是否能领取才对」
  *
- * 上游会把**纯宣传文案**也放进 campaigns 里下发 —— 它带 `actionType`、
- * 带 `placements`，但**没有 `benefit`**，领不到任何东西。实测那条是：
+ * **他说对了 —— 有字段，而且我第一版用错了。**
  *
- *	"专业版 4,000 Qwen Credits，高级版 12,000。续费、升级加赠 1,000。"
+ * 抓真实数据（`gateway.exe qoder-login campaigns`，2026-09-20）：
  *
- * 旧的独立活动卡把它渲染成一个可领条目（还配了「已领取」按钮），
- * 于是看上去有"两个活动"，其实只有一个能领 —— 这正是所有者看到的现象。
+ *	[0] act-20260920-044  actionType=CLAIM_BENEFIT  claimStatus=CLAIMED  benefit=有(100 CREDITS)
+ *	[1] act-20260901-922  actionType=VIEW_DETAILS   claimStatus=CLAIMED  benefit=**无**
  *
- * 判据用 `benefit` 存在与否，**不是**标题文案（文案会变，结构化字段不会）：
+ * 区分字段就是 **`actionType`**：
  *
- *	有 benefit            → 真活动（能领到具体东西）
- *	无 benefit 但已 CLAIMED → 仍然显示为 done（用户需要看到"领过了"）
- *	无 benefit 且未领     → **不是任务**，不放进菜单
+ *	CLAIM_BENEFIT → 能领真东西（每日 100 Credits）
+ *	VIEW_DETAILS  → **只是"查看详情"**，配的是优惠说明文案
+ *	                （实测那条：「专业版 4,000 Qwen Credits，高级版 12,000…」）
  *
- * ⚠ 第三条把"无 benefit 的可领项"也排除了。看起来激进，但那正是
- * `actionType !== "CLAIM_BENEFIT"` 的语义（如 VIEW_DETAILS）——
- * 它本来就领不到东西，`isClaimableCampaign` 也已经这么判了。
+ * # 我第一版错在哪（值得记下来）
+ *
+ * 我写的过滤是 `Boolean(c.benefit) || isClaimedCampaign(c)` ——
+ * 那个 `|| isClaimedCampaign(c)` 是致命的：**两条都是 CLAIMED**，
+ * 于是宣传那条照样被放行，界面上仍然是"两个任务"。
+ *
+ * 我当时加那个或条件，理由是"用户需要看到自己领过什么"。但那是**错位**的
+ * 关心：`VIEW_DETAILS` 本来就不是"领过的活动"，它是**广告位** ——
+ * 它上面显示的那个「已领取」是上游给整个活动页的状态，不是"你领到了这个"。
+ * 所以它既不该显示为任务，也不该显示为已完成。
+ *
+ * 判据只看 `actionType === "CLAIM_BENEFIT"`（与后端
+ * `is_claimable_campaign` 的取向一致：benefit 或 actionType 二者之一）。
  */
 function qoderTasksOf(
   acc: api.QoderAccountCampaigns | undefined,
@@ -326,9 +361,9 @@ function qoderTasksOf(
 ): ProductAccountTask[] {
   if (!acc) return [];
   return campaignEntriesFor(acc)
-    // 不是"能领的活动"的条目：只保留已领的（让用户看到"领过了"），
-    // 其余（纯宣传文案）整条隐藏 —— 显示一个永远灰着的"任务"是噪音。
-    .filter((c) => Boolean(c.benefit) || isClaimedCampaign(c))
+    // 只保留"领取类"动作。`VIEW_DETAILS` 是广告位 —— 显示成任务会让用户
+    // 以为还有第二个活动可领（那正是他反馈的问题）。
+    .filter(isBenefitCampaign)
     .map((c) => {
       const state = qoderTaskStateOf(c);
       // 失败原因只在**可领**（ready）的任务上提示 —— 那才是用户刚点过的那条。
@@ -388,6 +423,9 @@ export default function QoderPage() {
   // 编辑备注
   const [editTarget, setEditTarget] = useState<QoderAccountRow | null>(null);
   const [editNote, setEditNote] = useState("");
+
+/** 正在查看记录的账号（null = 关闭）。 */
+const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
 
   // 从客户端一键导入（**主路径**）
   //
@@ -1260,6 +1298,7 @@ export default function QoderPage() {
                         ),
                       }}
                       onRefresh={() => void refreshAccount(row)}
+                      onViewRecords={() => setRecordsFor(row)}
                       onEditNote={() => {
                         setEditTarget(row);
                         setEditNote(row.note);
@@ -1515,6 +1554,34 @@ export default function QoderPage() {
             </DialogFooter>
           </DialogContent>
         </Dialog>
+
+
+      {/* 记录弹窗：任务执行记录 + 额度消耗明细（所有者 2026-09-20 要求）。
+
+          账号标识用**本页的 uid**（`row.uid`），与后端写记录时的
+          accountId 口径一致（见 qoder_record_identity 的说明：
+          Qoder 账号不在宿主账号库里，故用 Qoder 自己的 uid 作 accountId）。
+
+          日期范围由组件自己管（默认今天，可切近 7/30 天）—— 与 WorkBuddy
+          的记录入口完全同一份交互，不在这里另造一套。 */}
+      <Dialog open={!!recordsFor} onOpenChange={(o) => !o && setRecordsFor(null)}>
+        <DialogContent className="sm:max-w-4xl">
+          <DialogHeader>
+            <DialogTitle>账号记录</DialogTitle>
+            <DialogDescription>
+              {recordsFor ? recordsFor.note || recordsFor.nickname || recordsFor.uid : ""}
+              的任务执行、额度消耗与领取记录；可按日期区间筛选。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 max-h-[70vh] overflow-y-auto pr-1">
+            <AccountRecordsView
+              accounts={[]}
+              fixedAccountId={recordsFor?.uid}
+              compact
+            />
+          </div>
+        </DialogContent>
+      </Dialog>
       </div>
     </TooltipProvider>
   );

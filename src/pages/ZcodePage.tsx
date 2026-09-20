@@ -13,6 +13,8 @@ import {
 } from "lucide-react";
 import { ZcodeMark } from "@/components/product-marks";
 import { ProductAccountCard, ProductAccountGrid } from "@/components/product-account-card";
+// 记录视图：任务执行记录 + 额度消耗明细（所有者 2026-09-20 要求）。
+import { AccountRecordsView } from "@/components/account-records-view";
 import { openInDefaultBrowser } from "@/lib/open-browser";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -179,6 +181,9 @@ export default function ZcodePage() {
   // 编辑备注
   const [editTarget, setEditTarget] = useState<ZcodeAccountRow | null>(null);
   const [editNote, setEditNote] = useState("");
+
+/** 正在查看记录的账号（null = 关闭）。 */
+const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
 
   // 扫描本机凭证
   //
@@ -772,6 +777,7 @@ export default function ZcodePage() {
                         variantKind: providerVariant(row.provider),
                       }}
                       onRefresh={() => void refreshAccount(row)}
+                      onViewRecords={() => setRecordsFor(row)}
                       onEditNote={() => {
                         setEditTarget(row);
                         setEditNote(row.note);
@@ -1271,6 +1277,30 @@ export default function ZcodePage() {
             </DialogFooter>
           </DialogContent>
         </Dialog>
+
+
+      {/* 记录弹窗：任务执行记录 + 额度消耗明细（所有者 2026-09-20 要求）。
+
+          账号标识用本页 uid（`row.uid`）—— 与后端写记录时的 accountId
+          口径一致（ZCode 账号同样不在宿主账号库里）。 */}
+      <Dialog open={!!recordsFor} onOpenChange={(o) => !o && setRecordsFor(null)}>
+        <DialogContent className="sm:max-w-4xl">
+          <DialogHeader>
+            <DialogTitle>账号记录</DialogTitle>
+            <DialogDescription>
+              {recordsFor ? recordsFor.note || recordsFor.nickname || recordsFor.uid : ""}
+              的套餐领取、额度周期与任务记录；可按日期区间筛选。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 max-h-[70vh] overflow-y-auto pr-1">
+            <AccountRecordsView
+              accounts={[]}
+              fixedAccountId={recordsFor?.uid}
+              compact
+            />
+          </div>
+        </DialogContent>
+      </Dialog>
       </div>
     </TooltipProvider>
   );

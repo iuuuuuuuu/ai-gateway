@@ -31,7 +31,7 @@
  *
  * 这样两个产品页与 WorkBuddy 账号页放在一起时，用户不必重新学一遍。
  */
-import { Loader2, RefreshCw, Trash2, Pencil, AlertTriangle, CheckCircle2, Clock3, ListChecks, PlayCircle } from "lucide-react";
+import { Loader2, RefreshCw, Trash2, Pencil, AlertTriangle, CheckCircle2, Clock3, ListChecks, PlayCircle, ScrollText } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -187,6 +187,16 @@ interface Props {
   onDelete?: () => void;
   /** 执行某个任务（来自卡片上的任务菜单）。 */
   onRunTask?: (taskId: string) => void;
+  /**
+   * 「记录」按钮：打开任务执行记录 + 额度消耗明细。
+   *
+   * 所有者 2026-09-20：「zcode和qoder都无法查看任务执行记录,和积分消耗明细」。
+   *
+   * ⚠ 做成**可选回调**而不是内置开关：卡片不该知道记录数据从哪来
+   *（那是各页面的职责），且三个产品（WorkBuddy/Qoder/ZCode）的凭证
+   * 与账号库都不同。传了这个 prop 才渲染按钮。
+   */
+  onViewRecords?: () => void;
   /** 紧凑模式（窄列）。 */
   compact?: boolean;
 }
@@ -200,6 +210,7 @@ export function ProductAccountCard({
   onToggleDisabled,
   onDelete,
   onRunTask,
+  onViewRecords,
   compact = false,
 }: Props) {
   const name = data.nickname || "（未命名）";
@@ -518,6 +529,37 @@ export function ProductAccountCard({
               </Button>
             </TooltipTrigger>
             <TooltipContent>刷新额度、到期与支持模型</TooltipContent>
+          </Tooltip>
+        )}
+        {/*
+          「记录」入口 —— 任务执行记录 + 积分/额度消耗明细。
+
+          所有者 2026-09-20：「zcode和qoder都无法查看任务执行记录,和积分消耗明细,
+          都一起修复了」。
+
+          # 为什么放在这张共用卡片上
+
+          这个组件被 WorkBuddy / Qoder / ZCode 三个页面共用，而三个产品都需要
+          记录入口。做成卡片的可选按钮 ⇒ 一处实现三处受益，也保证三者的
+          交互完全一致（弹窗形态、筛选、措辞都同一份代码）。
+
+          ⚠ 用 `onViewRecords` 可选 prop 而不是内置一个固定开关：
+          卡片本身不该知道"记录数据从哪来"（那是各页面的职责）。
+        */}
+        {onViewRecords && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                data-slot="product-records-open"
+                aria-label={`查看记录与消耗明细：${name}`}
+                onClick={onViewRecords}
+              >
+                <ScrollText className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>任务执行记录 · 额度消耗明细</TooltipContent>
           </Tooltip>
         )}
         {onEditNote && (

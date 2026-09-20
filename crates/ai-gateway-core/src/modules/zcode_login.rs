@@ -776,6 +776,46 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
     }
     let acc = zcode_account::upsert_account(uid, &Value::Object(patch))?;
 
+    // ── 写**任务/额度记录** ──
+    //
+    // 所有者 2026-09-20：「zcode和qoder都无法查看任务执行记录,和积分消耗明细」。
+    //
+    // ZCode 侧此前**一条记录都没写**（整个模块组 0 处调用），于是那一页的
+    // 记录永远是空的。这里在每次刷新额度时落一条额度快照。
+    //
+    // ⚠ `add_credit_record` 内部会**与上一次快照比对**，只有额度真的变化
+    // 才写入（见其实现）。故这里放心每次刷新都调 —— 不会刷出重复记录。
+    // 我原先打算自己加一层"变了才写"的判断，读了实现才发现是重复的。
+    let rec_name = zcode_account::load_accounts()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|a| a.uid == uid)
+        .map(|a| a.nickname)
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| uid.to_string());
+    if let (Some(remain), Some(total)) = (credits, credits_total) {
+        let detail = format!("剩余 {remain} / {total}");
+        crate::modules::account_records::add_credit_record(
+            uid,
+            rec_name.trim(),
+            "额度刷新",
+            remain,
+            &detail,
+            Some("grant"),
+        );
+    }
+    // 查询失败也要留痕 —— 否则用户只看到「额度未知」，
+    // 无从判断是"没登录"还是"上游挂了"。
+    if let Some(err) = &quota_error {
+        crate::modules::account_records::add_task_record(
+            uid,
+            &rec_name,
+            "额度刷新",
+            "failed",
+            err,
+        );
+    }
+
     // 重写网关配置 —— 让 `pool.product_models` 带上刚查到的模型。
     //
     // ⚠ 这里**刻意只写文件、不重启网关**：刷新是高频操作，每次重启会
