@@ -437,6 +437,19 @@ func main() {
 
 		// 成本维度：让各产品按"单位额度消耗率"参与加权（见 design.md §2.3）。
 		p.SetMultiProduct(true, 0.3)
+
+		// 把"各产品实际提供哪些模型"注入池 —— 用于**无前缀模型名**时
+		// 排除"不提供该模型的产品"的账号。
+		//
+		// # 为什么必须有（2026-09-20 实测缺陷）
+		//
+		// 用户用 `deepseek-v4.1-flash`（WorkBuddy 的模型）发请求，却被路由到
+		// **Qoder 账号**并失败两次 —— 因为无前缀时只按"账号当前可用"挑，
+		// 不问"这个产品有没有这个模型"。
+		//
+		// ⚠ 传空值时 SetProductModels 会清成"不约束"（回到既有行为），
+		// 不会误排除所有账号。
+		p.SetProductModels(cfg.Pool.ProductModels)
 	} else {
 		log.Printf("多产品路由已关闭（pool.multi_product=false）：只使用 WorkBuddy 账号")
 	}

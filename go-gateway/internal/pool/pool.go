@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -400,6 +401,24 @@ type Pool struct {
 	// 开关关闭时：不读成本字段、不做产品区分，所有既有路径**逐字不变**。
 	multiProductOn bool
 
+	// productModelSet 各产品**实际提供**的模型（小写归一），由宿主透传。
+	//
+	// # 为什么必须有它（2026-09-20 实测缺陷）
+	//
+	// 用户用 `deepseek-v4.1-flash`（一个 **WorkBuddy** 的模型）发了请求，
+	// 却被路由到 **Qoder 账号**上，失败两次 —— 因为无前缀模型名时
+	// `PickForModelRegion` 只按"账号当前可用"挑，**不问"这个产品有没有这个模型"**。
+	// Qoder 账号当时恰好可用就被选中，而它根本没有这个模型。
+	//
+	// 症状对用户极难理解：模型名是 WorkBuddy 的，报错却来自 Qoder。
+	//
+	// 故维护"产品 → 模型集合"，在**无前缀**时用它排除
+	// "不提供该模型的产品"的账号。有前缀时本来就有产品约束，不受影响。
+	//
+	// ⚠ 空 map / 某产品不在 map 里 = **不约束该产品**（保持既有行为）：
+	// 宿主没透传时不能因为"不知道"就把账号排掉 —— 那会让所有人不可用。
+	productModelSet map[string]map[string]bool
+
 	// costWeight 成本乘子的强度（0 = 成本不参与，1 = 满强度）。
 	//
 	// 设计意图（见 design.md §2.3）：成本是**小幅微调**，不是主导项。
@@ -507,11 +526,123 @@ func (p *Pool) SetMultiProduct(on bool, costWeight float64) {
 	}
 }
 
+// ProductRegions 报告某产品的账号覆及哪些区域（去重、顺序稳定）。
+//
+// # 用途
+//
+// `/v1/models` 要生成 `平台:区域:模型名` 形式的组合名，而**只能给该产品
+// 确实有账号的区域**生成 —— 无脑给所有区域会造出 "qoder:国服:xxx" 这类
+// 没有账号可用的名字，用户选中后得到"账号不可用"，比不显示更糟。
+//
+// 为什么不复用 `List()`：它返回的 Status **不含 Region**，而为了这一个用途
+// 去拓宽 Status 会让它对所有调用方都多一个字段。单独一个窄方法更清楚。
+//
+// `RegionAny` 不返回（它表示"不限区域"，不是一个可写进前缀的区域名）。
+func (p *Pool) ProductRegions(product string) []auth.Region {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	seen := map[auth.Region]bool{}
+	var out []auth.Region
+	for _, e := range p.byUID {
+		if e == nil || e.a == nil {
+			continue
+		}
+		if e.a.ProductOf() != product {
+			continue
+		}
+		r := e.a.Region()
+		if r == auth.RegionAny || seen[r] {
+			continue
+		}
+		seen[r] = true
+		out = append(out, r)
+	}
+	// 稳定顺序（map 遍历无序会让每次返回的组合名顺序不同，
+	// 客户端菜单跟着跳；也让测试无法断言）
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
 // MultiProductOn 报告多产品路由是否开启（供诊断与测试断言）。
 func (p *Pool) MultiProductOn() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.multiProductOn
+}
+
+// SetProductModels 注入"各产品实际提供哪些模型"（宿主透传）。
+//
+// 为什么需要它：无前缀的模型名（如 `deepseek-v4.1-flash`）此前会被路由到
+// **任何**当前可用的账号上 —— 包括根本没有这个模型的产品（实测被路由到
+// Qoder 并失败两次）。见 productModelSet 字段的注释。
+//
+// 入参形状：`{"workbuddy": ["deepseek-v4.1-flash", …], "qoder": ["qwen3.8-flash", …]}`。
+// 模型名**大小写不敏感**（上游写法不一，比较时统一小写）。
+//
+// 传空 map 等于"不约束"（回到既有行为）。
+func (p *Pool) SetProductModels(byProduct map[string][]string) {
+	set := make(map[string]map[string]bool, len(byProduct))
+	for prod, models := range byProduct {
+		if prod == "" {
+			continue
+		}
+		m := make(map[string]bool, len(models))
+		for _, id := range models {
+			if id = strings.ToLower(strings.TrimSpace(id)); id != "" {
+				m[id] = true
+			}
+		}
+		// ⚠ 只有**非空**集合才登记：某产品清单为空时登记成空集合会让
+		// "它不提供任何模型"成立 ⇒ 它的账号全被排除。而那多半是
+		// "宿主还没拿到清单"，不是"它真的没有模型"。
+		if len(m) > 0 {
+			set[prod] = m
+		}
+	}
+	p.mu.Lock()
+	p.productModelSet = set
+	p.mu.Unlock()
+}
+
+// ProductOffersModel 报告某产品是否提供该模型。
+//
+// 返回 (是否提供, 是否有该产品的清单)。第二个返回值让调用方能区分
+// "确定不提供"与"不知道" —— 后者**不该**排除账号。
+func (p *Pool) ProductOffersModel(product, model string) (bool, bool) {
+	p.mu.RLock()
+	set, ok := p.productModelSet[product]
+	p.mu.RUnlock()
+	if !ok || len(set) == 0 {
+		return false, false // 不知道
+	}
+	return set[strings.ToLower(strings.TrimSpace(model))], true
+}
+
+// productMayServe 判断某账号是否**可能**服务该模型（无前缀时的额外过滤）。
+//
+// 规则：
+//	· 模型名为空        → 放行（让上游自己报错，比我们猜好）
+//	· 该产品没有清单    → 放行（"不知道"不等于"不提供"）
+//	· 该产品清单里有它  → 放行
+//	· 该产品清单里没它  → **排除**（这就是本次修的缺陷）
+//
+// ⚠ 只对**多产品开启**时生效：单产品模式下不该有任何新约束，
+// 那是"既有行为逐字不变"的承诺。
+func (p *Pool) productMayServe(product, model string) bool {
+	if model == "" {
+		return true
+	}
+	p.mu.RLock()
+	on := p.multiProductOn
+	p.mu.RUnlock()
+	if !on {
+		return true
+	}
+	offers, known := p.ProductOffersModel(product, model)
+	if !known {
+		return true
+	}
+	return offers
 }
 
 // SetCostRate 设置某账号对**当前模型**的单位额度消耗率（0 = 未声明）。
@@ -892,14 +1023,68 @@ func (p *Pool) PickForModelProductRegion(
 }
 
 // pickForModelAny 原有行为：不做区域过滤。
+//
+// # ⚠ 2026-09-20：加了"该产品是否提供该模型"的过滤（修实测缺陷）
+//
+// 用户用 `deepseek-v4.1-flash`（WorkBuddy 的模型）发请求，却被路由到
+// **Qoder 账号**上并失败两次 —— 因为这里只按"账号当前可用"挑，
+// **不问"这个产品有没有这个模型"**。Qoder 账号当时恰好可用就被选中。
+//
+// 故这里排除"不提供该模型的产品"的账号（见 productMayServe）。
+// ⚠ 只在多产品开启 + 宿主透传了清单时生效；两者任一不满足即保持既有行为，
+// 否则会因"不知道清单"而把所有账号排掉。
+// pickForModelAny 原有行为：不做区域过滤。
+//
+// # ⚠ 2026-09-20：加了"该产品是否提供该模型"的过滤（修实测缺陷）
+//
+// 用户用 `deepseek-v4.1-flash`（WorkBuddy 的模型）发请求，却被路由到
+// **Qoder 账号**上并失败两次 —— 因为这里只按"账号当前可用"挑，
+// **不问"这个产品有没有这个模型"**。Qoder 账号当时恰好可用就被选中。
+//
+// 故这里排除"不提供该模型的产品"的账号（见 productMayServeLocked）。
+// ⚠ 只在多产品开启 + 宿主透传了清单时生效；两者任一不满足即保持既有行为 ——
+// 否则会因"不知道清单"而把所有账号排掉，那比原缺陷更糟。
 func (p *Pool) pickForModelAny(model string, tried map[string]bool) *auth.Auth {
 	p.mu.RLock()
 	rot := p.rotationOn
+	// 在同一把读锁内构造排除集：分两次加锁会让池子在两次之间变化，
+	// 使筛选条件与实际池子不一致。
+	//
+	// ⚠ 必须**复制** tried 而不是就地改：它是调用方传进来的 map，
+	// 就地写会把"已排除集"污染到调用方的重试循环里 —— 表现为
+	// "第一次挑不到号之后，后续永远挑不到"。
+	scoped := make(map[string]bool, len(tried)+4)
+	for uid := range tried {
+		scoped[uid] = true
+	}
+	for uid, e := range p.byUID {
+		if e.a == nil {
+			continue
+		}
+		if !p.productMayServeLocked(e.a.ProductOf(), model) {
+			scoped[uid] = true
+		}
+	}
 	p.mu.RUnlock()
 	if rot {
-		return p.pickRotation(tried, model)
+		return p.pickRotation(scoped, model)
 	}
-	return p.pick(tried, model)
+	return p.pick(scoped, model)
+}
+
+// productMayServeLocked 是 productMayServe 的**持锁**版本。
+//
+// 单独一个是因为 pickForModelAny 必须在**同一次** RLock 内完成
+// "读多产品开关 + 读清单 + 构造排除集"，否则三次读之间池子会变。
+func (p *Pool) productMayServeLocked(product, model string) bool {
+	if model == "" || !p.multiProductOn {
+		return true
+	}
+	set, ok := p.productModelSet[product]
+	if !ok || len(set) == 0 {
+		return true // 不知道这个产品提供什么 → 不排除
+	}
+	return set[strings.ToLower(strings.TrimSpace(model))]
 }
 
 // pickForModelInRegion 只在指定区域的账号里挑。

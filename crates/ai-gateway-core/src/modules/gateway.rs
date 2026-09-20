@@ -2015,6 +2015,26 @@ fn gateway_account_identities() -> Value {
 fn product_models_for_gateway() -> Value {
     let mut out = serde_json::Map::new();
 
+    // ⚠⚠ `workbuddy` **必须也在里面**（2026-09-20 补，这是一个真实缺陷的修正）
+    //
+    // 网关用这份清单做「无前缀模型名」的产品过滤：某产品有清单、
+    // 而清单里没有该模型 ⇒ 排除该产品的账号。见 Go 侧
+    // `pool.productMayServe` 的注释（用户用 WorkBuddy 的模型却被路由到
+    // Qoder 账号并失败两次）。
+    //
+    // 而此前这里**只 insert zcode / qoder** ⇒ `workbuddy` 没有清单 ⇒
+    // 网关认为"不知道 WorkBuddy 提供什么" ⇒ 不排除 ⇒ **缺陷依旧**。
+    // 即：光改 Go 侧不够，清单必须包含 workbuddy 才生效。
+    //
+    // 来源：用户配置的「限制使用的模型」白名单（`pool.allowed_model`）。
+    // ⚠ 它为空时**不插入**（表示"不限制"，网关侧也据此不约束）——
+    // 空数组插进去会被 Go 侧当成"它不提供任何模型"的风险，
+    // 虽然 Go 侧已对空集合做了保护，但两边都不做更稳妥。
+    let wb = allowed_models();
+    if !wb.is_empty() {
+        out.insert("workbuddy".into(), json!(wb));
+    }
+
     if let Ok(accounts) = crate::modules::zcode_account::load_accounts() {
         if let Some(ids) = union_models(accounts.iter().map(|a| a.models.as_slice())) {
             out.insert("zcode".into(), json!(ids));

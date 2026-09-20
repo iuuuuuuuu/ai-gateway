@@ -694,7 +694,54 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 		}
 	}
 	// 失败时也带上最后尝试过的账号，请求日志据此仍能显示 uid（与原实现一致）。
-	return &chatResult{UID: lastUID}, lastStatus, errors.New(msg)
+	return &chatResult{UID: lastUID}, clientFacingStatus(lastStatus), errors.New(msg)
+}
+
+// clientFacingStatus 把内部状态码归一成**不会误导客户端**的状态码。
+//
+// # 为什么需要它（2026-09-20 实测缺陷，所有者报告）
+//
+// 所有者原话：
+//
+//	「密钥明明是正确的，不知道怎么对话过程中就提示『本轮运行失败 API 密钥无效』，
+//	  而且我还是可以通过我配置的密钥获取到模型的名称」
+//
+// 查证结论：**密钥从头到尾都是对的**，是状态码被客户端误读了。
+//
+// DSH Desktop 客户端的映射（`dsh-llm-deepseek/lib/index.js:1527`）：
+//
+//	if (status === 401 || status === 403) return "AUTH";
+//
+// 而 `AUTH` 在界面上被渲染成 **「API 密钥无效」**
+//（`dsh-client-ui-chat/lib/client.js:2696` 的 `message.failure.auth`）。
+//
+// 于是完整因果是：
+//
+//	上游返回 403（排队 / 额度 / 风控 / WAF）
+//	→ 我们**原样透传 403**
+//	→ 客户端把 403 归类为 AUTH
+//	→ 界面显示「API 密钥无效」  ← 与事实完全不符
+//
+// 用户据此会去**反复改密钥**，而真正原因是上游拒绝了这次请求 ——
+// 这是最坏的一类误导：它把用户引向一个不可能修好的方向。
+//
+// # 为什么改成 502 而不是保留 403
+//
+// 语义上 403 是「服务器理解请求但拒绝执行」，属于**上游**的决定；
+// 而 401 才是「你没带对凭据」。403 被客户端当成凭据问题纯属误读。
+// 502 Bad Gateway 准确表达「上游拒绝了/不可用」，且客户端不会把它
+// 归类成 AUTH，而是走 `SERVER` 分支 —— 那才是可重试的正确语义。
+//
+// ⚠ **我们自己从不回 403**（鉴权中间件只用 401，见 handler.go:208），
+// 故这里把 403 改掉不会与"我们自己的拒绝"混淆。
+//
+// 401 不在这里处理：那是我们自己的鉴权结果，**必须**保持 401 让客户端
+// 提示"密钥无效" —— 那种情况下提示是对的。
+func clientFacingStatus(status int) int {
+	if status == http.StatusForbidden {
+		return http.StatusBadGateway
+	}
+	return status
 }
 
 // FailureKind 失败类别：决定回给客户端的错误码。

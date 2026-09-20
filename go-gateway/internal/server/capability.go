@@ -565,6 +565,68 @@ func (h *Handler) mergedModelList() []map[string]any {
 		addID(pm.ID)
 	}
 
+	// ---- 带前缀的**组合名**（所有者要求，2026-09-20）----
+	//
+	// 所有者原话：「我通过 models 接口 并没有返回 平台:国际:模型名、
+	// 平台:模型名，这两个组合的模型名，只有单独的 模型名」。
+	//
+	// 为什么必须有：前缀是**用户指定平台/区域的唯一手段**。只给裸模型名时，
+	// 用户想在 Qoder 上跑某个模型（或想在国服跑）就没法表达 ——
+	// 而裸名字的解析规则是"哪个账号可用就用哪个"，会误路由
+	//（实测：`deepseek-v4.1-flash` 被路由到 Qoder 账号并失败两次）。
+	//
+	// 故为**每个**模型补两种组合名：
+	//
+	//	平台:模型名            如 `qoder:qwen3.8-flash`
+	//	平台:区域:模型名       如 `qoder:国际:qwen3.8-flash`
+	//
+	// ⚠ 只补**该平台确实提供**的组合（按 productModels 与区域能力判断），
+	// 不无脑笛卡尔积 —— 否则菜单里会塞满用不了的名字，
+	// 用户选中后得到"模型不存在"，比不显示更糟。
+	//
+	// ⚠ 组合名**不单独进 order**（那会让菜单长度翻三倍、淹没裸名字），
+	// 而是作为 `aliases` 挂在裸名字那条目上 —— 客户端既能搜到，
+	// 列表又不会膨胀。见下面组装处的 `aliases`。
+	aliasesOf := map[string][]string{}
+	addAlias := func(bare, alias string) {
+		for _, have := range aliasesOf[bare] {
+			if have == alias {
+				return
+			}
+		}
+		aliasesOf[bare] = append(aliasesOf[bare], alias)
+	}
+	// ① 非 WorkBuddy 产品：按 productModels 补「平台:模型名」与「平台:区域:模型名」
+	for _, pm := range productModels {
+		if pm.Product == "" {
+			continue
+		}
+		bare := pm.ID
+		addAlias(bare, pm.Product+":"+bare)
+		// 区域维度：该产品账号覆及的每个区域各补一条。
+		//
+		// ⚠ 用**归一的显示名**（`国际版` / `国服`）而不是内部标识
+		//（`intl` / `cn`）：用户在前缀里写的是前者，写后者解析不出。
+		for _, r := range h.productRegions(pm.Product) {
+			if label := realmLabelOf(r); label != "" {
+				addAlias(bare, pm.Product+":"+label+":"+bare)
+			}
+		}
+	}
+	// ② WorkBuddy 的模型：补「workbuddy:模型名」与区域组合，
+	//    以及**纯区域**前缀（`国际版:模型名`）—— 那是老客户端就在用的写法。
+	for _, entries := range [][]map[string]any{staticModels, staticModelsIntl} {
+		for _, m := range entries {
+			id, _ := m["id"].(string)
+			if id == "" {
+				continue
+			}
+			addAlias(id, productWorkBuddy+":"+id)
+			addAlias(id, productWorkBuddy+":"+realmIntlCN+":"+id)
+			addAlias(id, realmIntlCN+":"+id)
+		}
+	}
+
 	// 动态元数据（context_length/max_output_tokens）比静态表准，优先用。
 	dynMeta := map[string]upstream.ModelInfo{}
 	for _, infos := range [][]upstream.ModelInfo{cnInfos, intlInfos} {
@@ -636,13 +698,20 @@ func (h *Handler) mergedModelList() []map[string]any {
 		if ch := channels[id]; len(ch) > 0 {
 			e["channels"] = channelsToJSON(ch)
 		}
+		// 带前缀的组合名（所有者要求的 `平台:模型名` / `平台:区域:模型名`）。
+		//
+		// 为什么挂在 aliases 而不是各自作为独立条目：
+		// 独立条目会让菜单长度翻两三倍、把裸名字淹没；而客户端真正需要的是
+		// **能搜到/能选用**这些名字。挂在裸名字上两者兼得。
+		if al := aliasesOf[id]; len(al) > 0 {
+			e["aliases"] = al
+		}
 		out = append(out, e)
 	}
 	return out
 }
 
 // appendChannel 加一个渠道，去重（同平台只留一条，区域合并）。
-//
 // 去重键是 **Product**：同一平台的多个区域算一条渠道、区域合并显示。
 // 若不去重，WorkBuddy 的国服+国际版会让每个模型都出现两条 "WorkBuddy"，
 // 界面上看起来像重复而不是"两个平台"。
@@ -687,6 +756,38 @@ func channelsToJSON(chs []productChannel) []map[string]any {
 type productModel struct {
 	ID      string
 	Product string
+}
+
+// realmLabelOf 把 `auth.Region` 映射成**用户在前缀里会写**的区域名。
+//
+// 为什么要这一步：内部标识是 `cn` / `intl`，而所有者习惯写「国服」/「国际版」
+//（`resolve_model.go` 里 `realmIntlCN = "国际版"` 就是为此加的别名）。
+// 模型清单里给出的组合名必须与用户会输入的写法一致，否则"给了名字但用不了"。
+//
+// RegionAny 返回空串：它表示"不限区域"，不是一个可写进前缀的区域名。
+func realmLabelOf(r auth.Region) string {
+	switch r {
+	case auth.RegionCN:
+		return "国服"
+	case auth.RegionIntl:
+		return realmIntlCN
+	default:
+		return ""
+	}
+}
+
+// productRegions 报告某产品的账号覆及哪些区域（用于生成区域组合名）。
+//
+// 为什么按**产品账号实际所在区域**而不是"所有区域"：
+// 无脑给所有区域会造出"qoder:国服:xxx"这类**并没有账号可用**的名字，
+// 用户选中后得到"账号不可用"，比不显示更糟。
+//
+// 实现委托给 `pool.ProductRegions` —— 那里能同时拿到账号与其 Region。
+func (h *Handler) productRegions(product string) []auth.Region {
+	if h == nil || h.cfg.Pool == nil {
+		return nil
+	}
+	return h.cfg.Pool.ProductRegions(product)
 }
 
 // productModels 从配置里读出 Qoder / ZCode 提供的模型。
