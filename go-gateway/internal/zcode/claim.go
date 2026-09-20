@@ -117,7 +117,7 @@ func (c *Client) FetchPlanPreview(ctx context.Context, cr *Cred) (*PlanPreview, 
 		previewPath, url.QueryEscape(c.Identity.AppVersion), url.QueryEscape(c.Identity.PlatformArch()))
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		cr.Provider.QuotaHost()+q, nil)
+		c.claimHost(cr)+q, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +227,7 @@ func (c *Client) ClaimPlan(ctx context.Context, cr *Cred, planID string) (*Claim
 		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		cr.Provider.QuotaHost()+claimPath, strings.NewReader(string(payload)))
+		c.claimHost(cr)+claimPath, strings.NewReader(string(payload)))
 	if err != nil {
 		return nil, err
 	}

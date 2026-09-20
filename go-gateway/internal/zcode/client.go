@@ -45,12 +45,32 @@ type Client struct {
 	//
 	// 故留一个只在测试里调用的覆盖点，让集成测试能打到 httptest 服务器。
 	anthropicBaseOverride string
+
+	// claimBaseOverride 覆盖**领取端点**的基址（仅测试用）。
+	//
+	// 与 anthropicBaseOverride 同一个理由：领取是真打上游的写操作，
+	// 集成测试不该真的去领一遍（会消费账号的领取机会，也可能触发风控）。
+	claimBaseOverride string
 }
 
 // SetAnthropicBaseForTest 覆盖 Anthropic 端点基址（**仅测试用**）。
 //
 // 名字里带 ForTest 是刻意的：生产代码调用它就是 bug。
 func (c *Client) SetAnthropicBaseForTest(base string) { c.anthropicBaseOverride = base }
+
+// SetClaimBaseForTest 覆盖**领取端点**基址（**仅测试用**）。
+//
+// 领取（`billing/preview` + `billing/claim`）是真打上游的写操作，
+// 测试绝不能指向生产 —— 那会消费账号的领取机会。故留这个覆盖点。
+func (c *Client) SetClaimBaseForTest(base string) { c.claimBaseOverride = base }
+
+// claimHost 领取端点用的 host（测试覆盖优先）。
+func (c *Client) claimHost(cr *Cred) string {
+	if c.claimBaseOverride != "" {
+		return c.claimBaseOverride
+	}
+	return cr.Provider.QuotaHost()
+}
 
 // New 生产默认客户端。
 //

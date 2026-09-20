@@ -60,7 +60,6 @@ type Config struct {
 	//
 	// 两个端点都幂等：Qoder 已领回 `replayed:true`、ZCode 回 `1003`。
 	// 故"重复执行"的最坏情况只是"今天已经领过了"。
-	ProductTasksHours []int `json:"product_tasks_hours"`
 		// CheckinEnabled/KeepaliveEnabled/ActivityEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -470,7 +469,6 @@ func Default() *Config {
 	c.Schedule.NightOwlHours = []int{1}
 	c.Schedule.SchoolHours = []int{12}
 	c.Schedule.TrialHours = []int{9, 21}
-	c.Schedule.ProductTasksHours = []int{10}
 	c.Schedule.ProductTasksEnabled = true
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
@@ -654,9 +652,6 @@ func (c *Config) normalize() error {
 	}
 	if len(c.Schedule.TrialHours) == 0 {
 		c.Schedule.TrialHours = []int{9, 21}
-	if len(c.Schedule.ProductTasksHours) == 0 {
-		c.Schedule.ProductTasksHours = []int{10}
-	}
 	}
 	if c.Schedule.ActivityReportCount <= 0 {
 		c.Schedule.ActivityReportCount = 3
@@ -746,9 +741,6 @@ func (c *Config) validateScheduleHours() error {
 		return err
 	}
 	if err := checkHourRange("schedule.school_hours", "school_enabled", c.Schedule.SchoolHours); err != nil {
-		return err
-	}
-	if err := checkHourRange("schedule.product_tasks_hours", "product_tasks_enabled", c.Schedule.ProductTasksHours); err != nil {
 		return err
 	}
 	return checkHourRange("schedule.trial_hours", "trial_enabled", c.Schedule.TrialHours)

@@ -62,30 +62,6 @@ type Config struct {
 	// TrialDisabled 显式关闭 trial 领取排程（schedule.trial_enabled=false）。
 	TrialDisabled bool
 
-	// ProductTasksDisabled 关闭 Qoder/ZCode 日常任务的自动执行。
-	//
-	// 零值 = **启用**（与其它任务"用禁用命名"的约定一致）。
-	//
-	// ⚠ 为什么默认启用而不是默认关闭：所有者明确要求了两次
-	//（「任务也应该自动执行」「自动领取…我们也要接进来」）。
-	// 默认关等于没做。而两个端点都幂等（Qoder `replayed` / ZCode `1003`），
-	// 最坏情况是"今天已经领过了"，代价可控。
-	//
-	// 关掉它用 `schedule.product_tasks_enabled=false`。
-	ProductTasksDisabled bool
-
-	// ProductTasksHours 产品日常任务的时点，默认 [10]。
-	//
-	// # 为什么是"每天一次"而不是参考实现的"每 5 分钟"
-	//
-	// 参考实现（TriDefender/zcode-api）每 5 分钟探测一次，因为它要**抢**
-	// 限量套餐（先到先得，慢了就没了）。而我们的诉求是"别让我每天手点"——
-	// 那不需要抢：幂等任务每天做一次就够，高频只会扩大风控面。
-	//
-	// 取 10 点是为了与既有时点错开：签到在 9/21、活跃上报在 10 点、
-	// 夜猫子在 1 点、开学季在 12 点。放在 10 点与活跃上报同轮，
-	// 但两者串行（见 runProductTasks 的单飞约束）。
-	ProductTasksHours []int
 
 	// RunProductTasks 产品日常任务的**执行体**，由网关自己实现（见 main.go）。
 	//
@@ -497,12 +473,6 @@ const (
 	taskNightOwl
 	taskSchool
 	taskTrial
-	// taskProductTasks Qoder/ZCode 的日常任务（幂等、每天一轮）。
-	//
-	// 单独一个 kind 而不是并入 taskActivity：两者的执行体与失败语义都不同
-	//（活跃上报是 WorkBuddy 的 growth 接口，本任务是宿主侧的产品接口），
-	// 混在一个 kind 里会让"某产品失败"也把活跃上报标记成失败。
-	taskProductTasks
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -531,10 +501,6 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	if !s.cfg.TrialDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.TrialHours), taskTrial})
-	}
-	// 产品日常任务：仅当宿主注入了执行体时才排（nil = 该构建不支持）。
-	if !s.cfg.ProductTasksDisabled && s.cfg.RunProductTasks != nil {
-		slots = append(slots, slot{nextFire(now, s.cfg.ProductTasksHours), taskProductTasks})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -587,8 +553,6 @@ func (s *Scheduler) Run(ctx context.Context) {
 					s.runCareTask(TaskNameSchool, func() { s.runSchool(ctx) })
 				case taskTrial:
 					s.runCareTask(TaskNameTrial, func() { s.runTrial(ctx) })
-				case taskProductTasks:
-					s.runCareTask(TaskNameProductTasks, func() { s.runProductTasks(ctx) })
 				}
 			}
 		}

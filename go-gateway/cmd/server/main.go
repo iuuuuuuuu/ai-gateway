@@ -320,21 +320,12 @@ func main() {
 		NightOwlHours:       cfg.Schedule.NightOwlHours,
 		SchoolHours:         cfg.Schedule.SchoolHours,
 		TrialHours:          cfg.Schedule.TrialHours,
-		ProductTasksHours:   cfg.Schedule.ProductTasksHours,
 		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
 		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
 		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
 		NightOwlDisabled:    !cfg.Schedule.NightOwlEnabled,
 		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
 		TrialDisabled:       !cfg.Schedule.TrialEnabled,
-		// 产品日常任务（Qoder/ZCode）：执行体由**网关自己**实现。
-		//
-		// ⚠ 我第一版设计成"宿主注入执行体"（依赖倒置），那是错的：
-		// 架构方向是 宿主 ──HTTP──▶ 网关，网关**从不回调宿主**（两个进程），
-		// 故那个注入点永远为 nil，是死代码。
-		// 而网关本来就有这些产品的能力（internal/zcode / internal/qoder），
-		// 凭证目录也由宿主透传（pool.zcode_auth_dir）。
-		ProductTasksDisabled: !cfg.Schedule.ProductTasksEnabled,
 		ActivityReportCount:  cfg.Schedule.ActivityReportCount,
 		CheckinScope:         cfg.Schedule.CheckinScope,
 		Records:              recorder,
@@ -384,6 +375,8 @@ func main() {
 	// 关闭时两者都不做 —— 行为与单产品时代逐字相同（回滚点）。
 	var qoderDispatch server.ProductUpstream
 	var zcodeDispatch server.ProductUpstream
+	// claimSched ZCode 套餐自动领取调度器（见下方 newClaimScheduler 处）。
+	var claimSched *zcode.ClaimScheduler
 	if cfg.Pool.MultiProduct {
 		// ---- Qoder ----
 		qoderDir := cfg.Pool.QoderAuthDir
@@ -450,16 +443,33 @@ func main() {
 		// 我第一版就是那样，报 `SetAuthDir undefined` 与
 		// `cannot use … as *zcode.Dispatch`。
 		zd := zcode.NewDispatch(zcode.New())
-		// 告诉它凭证目录 —— 供排程的自动领取遍历（见 SetAuthDir 的说明）。
+		// 告诉它凭证目录 —— 供自动领取遍历（见 SetAuthDir 的说明）。
 		zd.SetAuthDir(zcodeDir)
 		zcodeDispatch = zd
-		// 把执行体交给排程器。
+
+		// 自动领取调度器 —— **按参考实现的实际逻辑**（所有者明确要求：
+		// 「zcode要按照实际逻辑去做啊，他那个仓库怎么做我们就怎么做」）。
 		//
-		// ⚠ 必须在**赋值之后**调，因为 `scheduler.New`（上方）先于这里执行。
-		// 用 setter 而不是把它塞进 `scheduler.Config`：后者会让调用点引用
-		// 一个还没声明的变量（编译期 `undefined: zcodeDispatch`）。
-		// 也不挪动 `scheduler.New`：那会牵动一大片初始化顺序。
-		sch.SetProductTasksRunner(newProductTasksRunner(zd))
+		// 语义在 internal/zcode/claim_scheduler.go 里逐条照搬：
+		// 启动即跑 + 5 分钟轮询 + hold 硬闸 + 失败 cooldown +
+		// 成功/已领后 hold 到套餐截止 + login_required 永久停止。
+		//
+		// ⚠ 它是**独立循环**，不走网关那套"按小时时点"的排程：
+		// 参考实现要抢限量名额，节奏是分钟级；按小时排会变成"捡剩的"。
+		claimSched = zcode.NewClaimScheduler(
+			zcode.New(),
+			zd.LoadCreds,
+			// enabled 读配置（支持运行时改，不必重启）。
+			//
+			// ⚠ 配置字段是 `ProductTasksEnabled`（**启用**语义），
+			// 直接取反即可。我第一版手滑写成 `ProductTasksDisabled` ——
+			// 那个字段根本不存在（config.Schedule 里没有它）。
+			func() bool { return cfg.Schedule.ProductTasksEnabled },
+		)
+		// 手动「立即领取」与自动路径**共用同一套领取逻辑**（见 ClaimOnce）。
+		sch.SetProductTasksRunner(newProductTasksRunner(zd, claimSched))
+		log.Printf("ZCode 自动领取：启动即跑，之后每 %v 轮询（失败冷却 %v）",
+			zcode.ClaimPollInterval, zcode.ClaimCooldown)
 
 		// 成本维度：让各产品按"单位额度消耗率"参与加权（见 design.md §2.3）。
 		p.SetMultiProduct(true, 0.3)
@@ -532,6 +542,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	// ZCode 套餐自动领取：**独立循环**（启动即跑 + 5 分钟轮询 + 动态退避）。
+	//
+	// 与上面的 `sch.Run` 并列而不是并进去：两者的节奏完全不同
+	//（网关排程按小时时点，本调度器按分钟级轮询抢限量名额）。
+	startProductTasks(ctx, claimSched)
 	// 积分到期巡检：独立于签到的高频刷新，驱动账号池「先烧快过期额度」的分层选号。
 	if cfg.Pool.CreditRefreshEnabled {
 		go sch.RunCreditRefreshLoop(ctx, cfg.CreditRefreshIntervalD)
