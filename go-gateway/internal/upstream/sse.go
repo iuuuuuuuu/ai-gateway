@@ -525,7 +525,24 @@ func IsUpstreamErrorFrame(line string) (bool, string) {
 	}
 	e, hasErr := obj["error"]
 	if !hasErr || e == nil {
-		return false, ""
+		// ---- 形状②：错误在**顶层**，没有 error 包装 ----
+		//
+		// 实测（2026-09-20，官方 Qoder CN 客户端日志 + 本包单测）：
+		// 免费模型排队时，上游在 HTTP **200** 的流**首帧**下发：
+		//
+		//	{"code":"403","message":"{\"code\":\"10605\",\"message\":
+		//	  \"{\\\"isQueued\\\":true,\\\"queueCount\\\":7309,\\\"waitTime\\\":206}\"}"}
+		//
+		// 它**没有 error 字段** ⇒ 旧实现返回 false ⇒ 探测认为"首帧正常"
+		// ⇒ **照常写 200 把流交给客户端** ⇒ 客户端进入对话流程后才发现是错误。
+		//
+		// 所有者原话：「如果需要排队,直接就报错出来,不要等待对话」——
+		// 故必须在这里拦住它，让 forward.go 走"冷却换号 → 最终 503"，
+		// 即**在写响应头之前**就报错。
+		//
+		// ⚠ 判据要严（见 topLevelErrorFrame）：只有在**这一帧本来就不是内容**
+		// 时才判坏。否则好账号会被误判冷却 —— 那比漏判更糟。
+		return topLevelErrorFrame(obj)
 	}
 	// 有实际产出就不算失败
 	if chs, ok := obj["choices"].([]any); ok && len(chs) > 0 {
@@ -558,6 +575,128 @@ func IsUpstreamErrorFrame(line string) (bool, string) {
 		}
 	}
 	return true, msg
+}
+
+// topLevelErrorFrame 识别"错误直接在顶层"的帧（无 error 包装）。
+//
+// # 判据（三重否定，缺一不可）
+//
+// 这一帧必须**既不是内容、也不是用量**：
+//
+//	· 没有 body    → 不是嵌套内容帧
+//	· 没有 choices → 不是直接 OpenAI 内容帧
+//	· 没有 usage   → 不是用量帧
+//
+// 三者都没有时，这一帧在 `Stream` 里**本来就会被忽略**（不计入有效帧计数）。
+// 故把它判成错误，只可能比"当作未知帧跳过"更好 —— **不存在误伤正常帧的风险**。
+// 这条推断由单测锁定（`TestNormalFramesNotJudgedAsError` 等 4 条）。
+//
+// 另外排除 `code` 为 `0`/`200` 的"成功"语义（防上游给正常帧加个 code:"0"）。
+//
+// 返回 (true, 可读原因)。原因优先取 message/msg；取不到时给一句按形状的说明
+// （**不吞掉信息** —— 看不到原因比看到"code=403"更糟）。
+func topLevelErrorFrame(obj map[string]any) (bool, string) {
+	if _, ok := obj["body"]; ok {
+		return false, ""
+	}
+	if _, ok := obj["choices"]; ok {
+		return false, ""
+	}
+	if _, ok := obj["usage"]; ok {
+		return false, ""
+	}
+	raw, ok := obj["code"]
+	if !ok || raw == nil {
+		return false, ""
+	}
+	code := strings.Trim(strings.TrimSpace(fmt.Sprintf("%v", raw)), `"`)
+	if code == "" || code == "0" || code == "200" {
+		return false, ""
+	}
+	msg := ""
+	if s, ok := obj["message"].(string); ok {
+		msg = s
+	}
+	if msg == "" {
+		if s, ok := obj["msg"].(string); ok {
+			msg = s
+		}
+	}
+	if msg == "" {
+		return true, "code=" + code
+	}
+	// 把可能的多层嵌套渲染成**人能看懂**的一句话。
+	//
+	// 为什么必须渲染：上游的排队错误是三层嵌套 + 两层 JSON 存在字符串里，
+	// 原文长这样（用户完全看不懂，得自己一层层解转义）：
+	//
+	//	{"code":"10605","message":"{\"isQueued\":true,\"queueCount\":7309,…}"}
+	//
+	// ⚠ 渲染不出来就**退回原文** —— 宁可难看，也不能吞掉信息。
+	if human, ok := humanizeUpstreamMessage(msg); ok {
+		return true, human
+	}
+	return true, msg
+}
+
+// humanizeUpstreamMessage 把已知的业务错误**渲染成给人看的文案**。
+//
+// 目前只处理 Qoder 的排队（10605）—— 那是实测遇到的唯一一种。
+// 返回 ok=false 表示"不认识"，调用方应退回原文。
+//
+// 与 `internal/qoder` 里同名逻辑的关系：那份作用在**流翻译层**（客户端已经在
+// 对话里了），这份作用在**首帧探测层**（还没写响应头，可以直接报错）。
+// 两层都要，因为两层各自可能先拿到这个帧。
+func humanizeUpstreamMessage(msg string) (string, bool) {
+	cur := msg
+	// 最多剥 4 层（够用且防异常自引用串挂住）
+	for i := 0; i < 4; i++ {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(cur), &m); err != nil {
+			return "", false
+		}
+		if q, ok := m["isQueued"].(bool); ok && q {
+			var b strings.Builder
+			b.WriteString("免费模型正在排队（上游主动限流，非故障）")
+			if n, ok := intFieldOf(m, "queueCount"); ok {
+				fmt.Fprintf(&b, "：前面约 %d 个请求", n)
+			}
+			if w, ok := intFieldOf(m, "waitTime"); ok {
+				fmt.Fprintf(&b, "，预计等待约 %d 秒", w)
+			}
+			if k, ok := m["modelKey"].(string); ok && k != "" {
+				fmt.Fprintf(&b, "（模型 %s）", k)
+			}
+			if r, ok := intFieldOf(m, "retryAfterSeconds"); ok {
+				fmt.Fprintf(&b, "。建议 %d 秒后重试", r)
+			}
+			if av, ok := m["serviceAvailable"].(bool); ok && av {
+				b.WriteString("；上游服务状态正常")
+			}
+			return b.String(), true
+		}
+		next, ok := m["message"].(string)
+		if !ok || strings.TrimSpace(next) == "" {
+			return "", false
+		}
+		cur = next
+	}
+	return "", false
+}
+
+// intFieldOf 取一个数字字段（JSON 解出来是 float64）。
+func intFieldOf(m map[string]any, key string) (int64, bool) {
+	switch v := m[key].(type) {
+	case float64:
+		return int64(v), true
+	case int64:
+		return v, true
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 // Stream 透传上游 SSE 到 w（逐帧规范化后 flush），保证至少写一个 [DONE]。
