@@ -320,15 +320,24 @@ func main() {
 		NightOwlHours:       cfg.Schedule.NightOwlHours,
 		SchoolHours:         cfg.Schedule.SchoolHours,
 		TrialHours:          cfg.Schedule.TrialHours,
+		ProductTasksHours:   cfg.Schedule.ProductTasksHours,
 		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
 		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
 		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
 		NightOwlDisabled:    !cfg.Schedule.NightOwlEnabled,
 		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
 		TrialDisabled:       !cfg.Schedule.TrialEnabled,
-		ActivityReportCount: cfg.Schedule.ActivityReportCount,
-		CheckinScope:        cfg.Schedule.CheckinScope,
-		Records:             recorder,
+		// 产品日常任务（Qoder/ZCode）：执行体由**网关自己**实现。
+		//
+		// ⚠ 我第一版设计成"宿主注入执行体"（依赖倒置），那是错的：
+		// 架构方向是 宿主 ──HTTP──▶ 网关，网关**从不回调宿主**（两个进程），
+		// 故那个注入点永远为 nil，是死代码。
+		// 而网关本来就有这些产品的能力（internal/zcode / internal/qoder），
+		// 凭证目录也由宿主透传（pool.zcode_auth_dir）。
+		ProductTasksDisabled: !cfg.Schedule.ProductTasksEnabled,
+		ActivityReportCount:  cfg.Schedule.ActivityReportCount,
+		CheckinScope:         cfg.Schedule.CheckinScope,
+		Records:              recorder,
 	})
 	if normalizeCheckinScope(cfg.Schedule.CheckinScope) == "all" {
 		log.Printf("签到与猫猫旅行范围：国服 + 国际版（schedule.checkin_scope=all）")
@@ -433,7 +442,24 @@ func main() {
 		}
 		log.Printf("多产品路由已开启：ZCode 凭证目录 %s，载入 %d 个账号（解析失败 %d 个）",
 			zcodeDir, zadded, len(zfailed))
-		zcodeDispatch = zcode.NewDispatch(zcode.New())
+		// ⚠ 用**具体类型**局部变量再赋给接口变量。
+		//
+		// `zcodeDispatch` 声明为 `server.ProductUpstream`（接口），而
+		// `SetAuthDir` / `newProductTasksRunner` 需要 `*zcode.Dispatch`
+		// （具体类型）—— 直接调会被编译器拒绝（接口没有那个方法）。
+		// 我第一版就是那样，报 `SetAuthDir undefined` 与
+		// `cannot use … as *zcode.Dispatch`。
+		zd := zcode.NewDispatch(zcode.New())
+		// 告诉它凭证目录 —— 供排程的自动领取遍历（见 SetAuthDir 的说明）。
+		zd.SetAuthDir(zcodeDir)
+		zcodeDispatch = zd
+		// 把执行体交给排程器。
+		//
+		// ⚠ 必须在**赋值之后**调，因为 `scheduler.New`（上方）先于这里执行。
+		// 用 setter 而不是把它塞进 `scheduler.Config`：后者会让调用点引用
+		// 一个还没声明的变量（编译期 `undefined: zcodeDispatch`）。
+		// 也不挪动 `scheduler.New`：那会牵动一大片初始化顺序。
+		sch.SetProductTasksRunner(newProductTasksRunner(zd))
 
 		// 成本维度：让各产品按"单位额度消耗率"参与加权（见 design.md §2.3）。
 		p.SetMultiProduct(true, 0.3)

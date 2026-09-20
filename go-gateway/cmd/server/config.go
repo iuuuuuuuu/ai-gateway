@@ -49,6 +49,18 @@ type Config struct {
 		// TrialHours 国际版 trial 加油包领取时点，默认 [9, 21]（与签到同步）。
 		// 国际版没有签到/任务中心，trial 是其唯一积分增益动作；幂等可每天重试。
 		TrialHours []int `json:"trial_hours"`
+	// ProductTasksHours Qoder/ZCode 日常任务的自动执行时点，默认 [10]。
+	//
+	// # 为什么是"每天一次"而不是参考实现的"每 5 分钟"
+	//
+	// 参考实现（TriDefender/zcode-api）每 5 分钟探测一次，因为它要**抢**
+	// 限量套餐（先到先得）。而所有者的诉求是「任务也应该自动执行」
+	//（别让我每天手点）—— 那不需要抢：幂等任务每天做一次就够，
+	// 高频只会扩大风控面。
+	//
+	// 两个端点都幂等：Qoder 已领回 `replayed:true`、ZCode 回 `1003`。
+	// 故"重复执行"的最坏情况只是"今天已经领过了"。
+	ProductTasksHours []int `json:"product_tasks_hours"`
 		// CheckinEnabled/KeepaliveEnabled/ActivityEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -63,6 +75,27 @@ type Config struct {
 		NightOwlEnabled  bool `json:"nightowl_enabled"`  // 缺省 true；false = 关夜猫子任务
 		SchoolEnabled    bool `json:"school_enabled"`    // 缺省 true；false = 关开学季活动
 		TrialEnabled     bool `json:"trial_enabled"`     // 缺省 true；false = 关 trial 领取
+		// ProductTasksEnabled Qoder/ZCode 日常任务的**自动执行**（缺省 true）。
+		//
+		// # 默认开的理由（所有者 2026-09-20 要求）
+		//
+		// 原话：「qoder这个活动卡片…而且任务也应该自动执行」、
+		//       「他那个仓库还有个自动领取那个积分包的功能，我们也要接进来」。
+		//
+		// 即"别让我每天手点"。默认关等于没做。
+		//
+		// # 与"不做自动抢"的关系
+		//
+		// `internal/zcode/claim.go` 里写着「不做定时自动抢 —— 会让账号表现出
+		// 非人类的活动模式」，那条结论**仍然成立**：它反对的是**抢**
+		//（高频探测 + 争限量名额）。而本项是**做**：
+		//
+		//	抢：每 5 分钟探测、失败重试   ← 非人类画像
+		//	做：每天一次、零重试、端点幂等 ← 人类也会每天点一下
+		//
+		// 两个端点都幂等（Qoder `replayed:true` / ZCode `1003 already_claimed`），
+		// 故最坏情况只是"今天已经领过了"。
+		ProductTasksEnabled bool `json:"product_tasks_enabled"`
 		// ActivityReportCount 每号每日上报条数，默认 3。
 		//
 		// 取 3 而非 1：单条上报偶发被服务端丢弃（缺 userId 时 200 但静默丢弃），
@@ -437,6 +470,8 @@ func Default() *Config {
 	c.Schedule.NightOwlHours = []int{1}
 	c.Schedule.SchoolHours = []int{12}
 	c.Schedule.TrialHours = []int{9, 21}
+	c.Schedule.ProductTasksHours = []int{10}
+	c.Schedule.ProductTasksEnabled = true
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 	c.Schedule.CheckinEnabled = true
@@ -619,6 +654,9 @@ func (c *Config) normalize() error {
 	}
 	if len(c.Schedule.TrialHours) == 0 {
 		c.Schedule.TrialHours = []int{9, 21}
+	if len(c.Schedule.ProductTasksHours) == 0 {
+		c.Schedule.ProductTasksHours = []int{10}
+	}
 	}
 	if c.Schedule.ActivityReportCount <= 0 {
 		c.Schedule.ActivityReportCount = 3
@@ -708,6 +746,9 @@ func (c *Config) validateScheduleHours() error {
 		return err
 	}
 	if err := checkHourRange("schedule.school_hours", "school_enabled", c.Schedule.SchoolHours); err != nil {
+		return err
+	}
+	if err := checkHourRange("schedule.product_tasks_hours", "product_tasks_enabled", c.Schedule.ProductTasksHours); err != nil {
 		return err
 	}
 	return checkHourRange("schedule.trial_hours", "trial_enabled", c.Schedule.TrialHours)

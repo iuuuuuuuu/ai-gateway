@@ -30,6 +30,11 @@ import (
 type Dispatch struct {
 	client *Client
 
+	// authDir 凭证目录（由 main.go 通过 SetAuthDir 告知）。
+	//
+	// 供排程的自动领取遍历凭证用。空串 = 用 DefaultAuthDir()。
+	authDir string
+
 	// 模型清单缓存（按服务商分别缓存）。
 	//
 	// 为什么缓存：模型清单来自免认证的 config 端点，但每次请求都拉
@@ -53,6 +58,47 @@ func NewDispatch(c *Client) *Dispatch {
 		c = New()
 	}
 	return &Dispatch{client: c, modelMap: map[Provider]modelCache{}}
+}
+
+// SetAuthDir 记录凭证目录（供产品日常任务读凭证）。
+//
+// # 为什么需要它（所有者 2026-09-20 要求"自动领取"）
+//
+// 排程的自动领取要遍历凭证并调 claim —— 而凭证目录是**部署期配置**
+//（`pool.zcode_auth_dir`，见 cmd/server/main.go 的加载逻辑）。
+//
+// 不在 Dispatch 里硬编码默认值（那会让"配置指向别处"的部署读错目录，
+// 而且错得静默），而是由 main.go 在接线时显式告知。
+func (d *Dispatch) SetAuthDir(dir string) {
+	if d == nil {
+		return
+	}
+	d.authDir = dir
+}
+
+// LoadCreds 读取全部 ZCode 凭证（供产品日常任务用）。
+//
+// 目录为空时返回 `("", nil)` 的默认目录 —— 与 main.go 的加载口径一致
+//（那里的 `if zcodeDir == "" { zcodeDir = zcode.DefaultAuthDir() }`）。
+func (d *Dispatch) LoadCreds() (creds []*Cred, failed []string, err error) {
+	if d == nil {
+		return nil, nil, fmt.Errorf("zcode dispatch 未初始化")
+	}
+	dir := d.authDir
+	if dir == "" {
+		dir = DefaultAuthDir()
+	}
+	return LoadDir(dir)
+}
+
+// FetchPlanPreview 查该账号当前可领的套餐（转发到 Client）。
+func (d *Dispatch) FetchPlanPreview(ctx context.Context, cr *Cred) (*PlanPreview, error) {
+	return d.client.FetchPlanPreview(ctx, cr)
+}
+
+// ClaimPlan 领取指定套餐（转发到 Client）。
+func (d *Dispatch) ClaimPlan(ctx context.Context, cr *Cred, planID string) (*ClaimResult, error) {
+	return d.client.ClaimPlan(ctx, cr, planID)
 }
 
 // ChatStream 实现 server.ProductUpstream。

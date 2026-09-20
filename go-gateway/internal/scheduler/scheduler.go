@@ -62,6 +62,53 @@ type Config struct {
 	// TrialDisabled 显式关闭 trial 领取排程（schedule.trial_enabled=false）。
 	TrialDisabled bool
 
+	// ProductTasksDisabled 关闭 Qoder/ZCode 日常任务的自动执行。
+	//
+	// 零值 = **启用**（与其它任务"用禁用命名"的约定一致）。
+	//
+	// ⚠ 为什么默认启用而不是默认关闭：所有者明确要求了两次
+	//（「任务也应该自动执行」「自动领取…我们也要接进来」）。
+	// 默认关等于没做。而两个端点都幂等（Qoder `replayed` / ZCode `1003`），
+	// 最坏情况是"今天已经领过了"，代价可控。
+	//
+	// 关掉它用 `schedule.product_tasks_enabled=false`。
+	ProductTasksDisabled bool
+
+	// ProductTasksHours 产品日常任务的时点，默认 [10]。
+	//
+	// # 为什么是"每天一次"而不是参考实现的"每 5 分钟"
+	//
+	// 参考实现（TriDefender/zcode-api）每 5 分钟探测一次，因为它要**抢**
+	// 限量套餐（先到先得，慢了就没了）。而我们的诉求是"别让我每天手点"——
+	// 那不需要抢：幂等任务每天做一次就够，高频只会扩大风控面。
+	//
+	// 取 10 点是为了与既有时点错开：签到在 9/21、活跃上报在 10 点、
+	// 夜猫子在 1 点、开学季在 12 点。放在 10 点与活跃上报同轮，
+	// 但两者串行（见 runProductTasks 的单飞约束）。
+	ProductTasksHours []int
+
+	// RunProductTasks 产品日常任务的**执行体**，由网关自己实现（见 main.go）。
+	//
+	// # ⚠ 为什么不是"宿主注入"（我第一版设计错了，此处记录以免再犯）
+	//
+	// 我最初按 `RunTaskFor` 的模式设计成"宿主注入执行体"（依赖倒置）。
+	// 但读了架构后发现**方向是反的**：
+	//
+	//	Rust 宿主  ──HTTP POST /tasks/run──▶  Go 网关
+	//
+	// 即宿主调网关，网关**从不回调宿主**（两个独立进程）。
+	// 故"宿主注入"根本无人可注入 —— 那会变成一段永远为 nil 的死代码。
+	//
+	// 而实际上**网关自己就能做**：`internal/zcode` 有完整的客户端与
+	// 凭证读取（`zcode.NewDispatch(zcode.New())` 已在 main.go 接线），
+	// 凭证目录由宿主通过配置透传（`pool.zcode_auth_dir`）。
+	//
+	// 故本字段改由 main.go 用自己的实现填充，不再是"等宿主注入"。
+	//
+	// 返回一句可读的结果描述（写进任务记录）。
+	// nil = 该构建未接线（排程直接跳过，不报错）。
+	RunProductTasks func() (detail string, err error)
+
 	// ActivityReportCount 每个账号每日上报条数，默认 3（与官方客户端行为接近）。
 	// 多条共用同一 conversationId，requestId 各自独立。
 	ActivityReportCount int
@@ -103,6 +150,39 @@ const (
 	// 但仍注册为可手动触发的任务名：日排程每个账号一天只跑一轮，
 	// 用户想立刻确认「我的补签卡/抽奖次数有没有被处理」时需要一个入口。
 	TaskNameGrowthMap = "growthmap"
+
+	// TaskNameProductTasks 其它产品（Qoder / ZCode）的**日常任务**。
+	//
+	// # 所有者要求（2026-09-20）
+	//
+	//	「qoder这个活动卡片…而且任务也应该自动执行」
+	//	「他那个仓库还有个自动领取那个积分包的功能，我们也要接进来」
+	//
+	// 这两条都是"别让我每天手点" —— 日常任务自动做掉。
+	//
+	// # ⚠ 与我自己此前写下的风控结论的关系
+	//
+	// `internal/zcode/claim.go` 的文件头写着「**不做定时自动抢** ——
+	// 那会让账号表现出非人类的活动模式」。那条结论**仍然成立**，
+	// 它反对的是「自动**抢**」= 高频探测 + 抢限量名额
+	//（参考实现默认 5 分钟一轮，因为限量套餐先到先得）。
+	//
+	// 而所有者要的是**自动做掉每天的幂等任务**，两者不是一回事：
+	//
+	//	抢：  高频（5 分钟）、有竞争、失败要重试   ← 那才是非人类画像
+	//	做：  每天一次、幂等（已领会返回"已领过"）、失败不重试
+	//
+	// 故本实现刻意**与参考实现的 5 分钟轮询不同**：
+	//
+	//	· 每天固定时点跑一次（与签到/活跃上报同一套排程机制）
+	//	· **串行**：同一时刻只跑一个产品，避免并发指纹
+	//	· **零重试**：失败就等下一个时点，不做退避重试
+	//	· 两个端点都是幂等的（Qoder `replayed:true` / ZCode `1003`），
+	//	  故"重复执行"本身不产生副作用
+	//
+	// 执行体由**宿主**提供（依赖倒置）：Qoder/ZCode 的凭证与接口都在宿主侧，
+	// 网关不持有它们，与 `RunTaskFor` 的既有做法一致。
+	TaskNameProductTasks = "product_tasks"
 )
 
 // ErrTaskRunning 该任务已有一轮手动触发在执行中。
@@ -197,6 +277,12 @@ func (s *Scheduler) RunTaskByName(name string) (TaskRunResult, error) {
 func (s *Scheduler) RunTaskFor(name, accountUID string) (TaskRunResult, error) {
 	switch name {
 	case TaskNameActivity, TaskNameNightOwl, TaskNameSchool, TaskNameTrial, TaskNameGrowthMap:
+	case TaskNameProductTasks:
+		// 产品日常任务（Qoder/ZCode）：账号作用域**不适用** ——
+		// 它按产品遍历，且凭证在宿主侧（网关不知道哪些 uid 属于哪个产品）。
+		// 故这里不给它做 accountScopeSkip 预检，直接交给宿主执行体；
+		// 宿主自己知道该跑哪些账号。
+		return s.runProductTasksFor(name)
 	default:
 		return TaskRunResult{}, fmt.Errorf("unknown task %q", name)
 	}
@@ -411,6 +497,12 @@ const (
 	taskNightOwl
 	taskSchool
 	taskTrial
+	// taskProductTasks Qoder/ZCode 的日常任务（幂等、每天一轮）。
+	//
+	// 单独一个 kind 而不是并入 taskActivity：两者的执行体与失败语义都不同
+	//（活跃上报是 WorkBuddy 的 growth 接口，本任务是宿主侧的产品接口），
+	// 混在一个 kind 里会让"某产品失败"也把活跃上报标记成失败。
+	taskProductTasks
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -439,6 +531,10 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	if !s.cfg.TrialDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.TrialHours), taskTrial})
+	}
+	// 产品日常任务：仅当宿主注入了执行体时才排（nil = 该构建不支持）。
+	if !s.cfg.ProductTasksDisabled && s.cfg.RunProductTasks != nil {
+		slots = append(slots, slot{nextFire(now, s.cfg.ProductTasksHours), taskProductTasks})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -491,6 +587,8 @@ func (s *Scheduler) Run(ctx context.Context) {
 					s.runCareTask(TaskNameSchool, func() { s.runSchool(ctx) })
 				case taskTrial:
 					s.runCareTask(TaskNameTrial, func() { s.runTrial(ctx) })
+				case taskProductTasks:
+					s.runCareTask(TaskNameProductTasks, func() { s.runProductTasks(ctx) })
 				}
 			}
 		}
@@ -666,4 +764,90 @@ func (s *Scheduler) RunKeepaliveNow() {
 			log.Printf("keepalive %s save: %v", uid8(st.UID), err)
 		}
 	}
+}
+
+
+// ---------------------------------------------------------------------------
+// 产品日常任务（Qoder 活动 / ZCode claim）
+// ---------------------------------------------------------------------------
+
+// runProductTasksFor 手动触发入口（供 `POST /tasks/run?task=product_tasks`）。
+//
+// 与排程路径共用同一个执行体，只多把结果包成 TaskRunResult 回给界面。
+func (s *Scheduler) runProductTasksFor(name string) (TaskRunResult, error) {
+	if s.cfg.RunProductTasks == nil {
+		return TaskRunResult{
+			Task: name, Skip: "unsupported",
+			Message: "该构建未接入产品任务执行体",
+		}, nil
+	}
+	if !s.claimTask(name) {
+		return TaskRunResult{
+			Task: name, Skip: "already_running",
+			Message: "该任务正在执行中，请稍后再试",
+		}, ErrTaskRunning
+	}
+	defer s.releaseTask(name)
+
+	detail, err := s.cfg.RunProductTasks()
+	if err != nil {
+		// 失败也要留痕（所有者要求「任务一定要留痕」）。
+		//
+		// ⚠ 用 TaskAllDaily（整轮汇总、不带 accountId）而不是逐账号：
+		// 执行体内部按产品/账号遍历，它才知道每条结果属于谁；
+		// 网关在这里只知道"整轮的结果"。逐账号的细节由宿主执行体自己写
+		//（它有 account_records 的完整能力）。
+		s.cfg.Records.TaskAllDaily("产品日常任务", records.ResultFailed, err.Error())
+		return TaskRunResult{Task: name, Message: err.Error()}, err
+	}
+	s.cfg.Records.TaskAllDaily("产品日常任务", records.ResultSuccess, detail)
+	return TaskRunResult{Task: name, Ran: true, Message: detail}, nil
+}
+
+// runProductTasks 排程路径：到点自动执行一轮产品日常任务。
+//
+// # 与参考实现的差异（刻意，见 TaskNameProductTasks 的说明）
+//
+//	参考实现：每 5 分钟轮询、抢限量名额、失败退避重试
+//	本实现：  每天一次、**零重试**、失败就等下一个时点
+//
+// 理由是"抢"与"做"是两件事：所有者要的是"别让我每天手点"（做），
+// 而高频探测+重试才是非人类画像（抢）。两个端点都幂等，
+// 故"今天已经领过了"是最坏情况，不需要重试去争。
+func (s *Scheduler) runProductTasks(_ context.Context) {
+	if s.cfg.RunProductTasks == nil {
+		return
+	}
+	detail, err := s.cfg.RunProductTasks()
+	if err != nil {
+		// ⚠ **不重试**：失败就等明天那个时点。这是与参考实现最重要的差异，
+		// 也是本功能不扩大风控面的关键 —— 重试风暴正是把账号打进风控的
+		// 典型特征（我们在 ZCode 上亲身经历过）。
+		log.Printf("product_tasks: %v", err)
+		s.cfg.Records.TaskAllDaily("产品日常任务", records.ResultFailed, err.Error())
+		return
+	}
+	if detail != "" {
+		log.Printf("product_tasks: %s", detail)
+	}
+	s.cfg.Records.TaskAllDaily("产品日常任务", records.ResultSuccess, detail)
+}
+
+
+// SetProductTasksRunner 注入产品日常任务的执行体。
+//
+// # 为什么用 setter 而不是配置字段（2026-09-20）
+//
+// 执行体需要 `zcode.Dispatch`，而那个变量在 `main.go` 里的赋值位置
+// **晚于** `scheduler.New`（初始化顺序所致）。若走 `scheduler.Config`，
+// 调用点会引用一个还没声明的变量（编译期就报 `undefined`）。
+//
+// 用 setter 让"先建调度器、后接线执行体"成为合法顺序，
+// 而不必为了一个字段去挪动一大片初始化代码。
+//
+// ⚠ 必须在 `Run(ctx)` **之前**调用：排程循环启动时读一次该字段来算唤醒时点；
+// 之后注入不会让本轮的唤醒计划生效（要等下一个整点重算）。
+// main.go 的调用位置满足这一点（在 `go sch.Run(ctx)` 之前）。
+func (s *Scheduler) SetProductTasksRunner(fn func() (string, error)) {
+	s.cfg.RunProductTasks = fn
 }
