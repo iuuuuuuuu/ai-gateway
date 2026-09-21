@@ -777,10 +777,18 @@ mod tests {
             package_expiry_unix(&json!({"ExpiredTime": "1735689600"})),
             1735689600
         );
-        // 仅日期 → 当日 23:59:59
+        // 仅日期 → 当日 23:59:59（**本地时区**，见 parse_expiry_unix 的实现）
         let at = package_expiry_unix(&json!({"ExpiredTime": "2026-09-15"}));
         assert!(at > 0, "日期字符串应解析成功");
-        assert_eq!(at % 86400, 86399 - 8 * 3600 + 86400 % 86400, "应为本地 23:59:59");
+        // 必须按本机时区算出期望值，不能写死偏移。
+        // 曾写死 `- 8 * 3600`（北京时间），于是该用例只在 UTC+8 的机器上通过、
+        // 在 CI（UTC）上必挂 —— 断言的是作者的时区，不是被测行为。
+        let expected = chrono::Local
+            .with_ymd_and_hms(2026, 9, 15, 23, 59, 59)
+            .single()
+            .expect("本地时间应唯一")
+            .timestamp();
+        assert_eq!(at, expected, "应为本地 23:59:59");
     }
 
     #[test]
