@@ -797,6 +797,18 @@ export interface GatewayModelItem {
   owned_by?: string;
 }
 
+/**
+ * 网关模型清单响应。
+ *
+ * `error` 非空时 `models` 必为空数组。这份清单**只来自上游实时拉取** ——
+ * 网关侧与宿主侧都没有内置静态表，因此「空列表 + error」是唯一诚实的表达，
+ * UI 必须把 `error` 显示出来，不能只渲染一个空下拉。
+ */
+export interface GatewayModelsResult {
+  models: GatewayModelItem[];
+  error: string | null;
+}
+
 /** POST /api/gateway/agents/import 接入响应。 */
 export interface AgentImportResult {
   ok: boolean;

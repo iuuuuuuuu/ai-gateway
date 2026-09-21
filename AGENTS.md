@@ -38,6 +38,34 @@ Token 统计与网关的接口契约可直接查阅实现本身：
 - Write a custom component only when shadcn components and their composition APIs cannot satisfy the requirement. Record the reason before doing so.
 - Custom UI must still reuse the project's Rhea theme tokens, spacing, radii, states, and accessibility conventions. Do not substitute native interactive shortcuts such as `details/summary` when an appropriate shadcn component exists.
 
+## 模型列表（Model List Policy，强制）
+
+**严禁在任何位置内置静态模型表 / 静态模型清单**（Rust 常量、`static` / `const` 数组、
+前端 `MODEL_*` 常量、JSON 内嵌兜底表、TS 里的 `DEFAULT_MODELS` 等一律禁止）。
+
+- 模型的唯一来源是**运行中的网关**：`GET /v1/models`。网关自己再向上游现拉
+  （见 `crates/ai-gateway-router/src/upstream/client.rs` 的 `fetch_models`，
+  数据取自 `data.agents[name=="cli"].models`），要求**实时**获取。
+- 拉取入口统一走已有的实现，不要另写一份：
+  - Rust：`crates/ai-gateway-core/src/modules/gateway.rs` 的 `pub async fn fetch_models()`
+  - HTTP 路由：`crates/ai-gateway-server/src/api.rs`
+  - Tauri 包装：`src-tauri/src/commands.rs`
+  - 前端：`src/lib/api.ts` 的 `getGatewayModels()`，视图见
+    `src/components/agents/models-view.tsx`、`src/pages/AgentsPage.tsx`
+- **拉不到就明说拉不到**：返回空列表 + 具体错误原因（例如
+  `网关未运行：模型清单来自上游，需先启动网关再刷新`），由 UI 明确呈现给用户。
+  严禁用静态表兜底、严禁伪造一份清单、严禁「拉取失败但界面照常有模型可选」。
+- 唯一允许的"兜底"是空：`Vec::new()` / `[]` + 错误提示。任何形式的
+  `if 拉取失败 { 用内置常量 }` 都属于违规。
+- 新增客户端接入 / 模型分发相关代码时同样遵守：模型候选只能来自这次实时拉取的结果，
+  不得在配置文件模板、默认值、示例里写死具体模型 ID 作为可用清单。
+
+原因：静态表会与上游真实清单形成两份各自失真的副本，模型下线或改名后界面仍显示旧条目，
+用户按界面选了不可用的模型，问题被静默掩盖。
+
+若确有必要引入任何形式的模型兜底数据，必须先在 `AGENTS.md` 记录原因与范围，
+不得直接写进代码。
+
 ## 构建与签名（Build & Signing）
 
 构建带 updater 签名的安装包时，**不要再去搜索私钥**，位置与用法如下（固定不变）：

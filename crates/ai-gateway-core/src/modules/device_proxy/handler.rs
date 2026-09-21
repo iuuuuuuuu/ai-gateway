@@ -645,24 +645,50 @@ pub fn parse_cookie_header(cookie: &str) -> Vec<(String, String)> {
 /// 字节系账号的会话。**必须用 sessionid 去比中对应那一项**，否则会把 A 账号的
 /// sessionid 记到 B 账号名下（跨账号凭证污染）。
 pub fn doubao_uid_from_multi_sids(cookie: &str, session_id: &str) -> String {
+    parse_multi_sids_map(cookie)
+        .into_iter()
+        .find(|(_, sid)| sid == session_id)
+        .map(|(uid, _)| uid)
+        .unwrap_or_default()
+}
+
+/// 从 `multi_sids` cookie 解析出**全部** `(uid, sessionid)` 项。
+///
+/// 与 [`doubao_uid_from_multi_sids`] 的关系：那个函数是「本次会话是谁」（必须 sid 匹配），
+/// 这个是「这台机器上还挂着谁」。两者共用同一套解码与合法性校验，区别只在调用方
+/// 是否按 sessionid 过滤 —— 因此这里刻意**不做** sid 匹配，过滤留给调用方。
+///
+/// 存在的意义：一个豆包客户端可同时挂多个账号（`uidA:sidA|uidB:sidB`），
+/// 而一次请求只会带当前那一个 sessionid。只看当前项会让其余账号的 sessionid
+/// 白丢 —— 而它们本来就在同一个 cookie 里，属于「已经读得到却没填进去」。
+///
+/// 合法性：uid 必须非空且纯数字，sid 必须非空。畸形项直接跳过。
+pub fn parse_multi_sids_map(cookie: &str) -> Vec<(String, String)> {
     // OnceLock 单次编译（审查修复：原每次调用重编译正则）
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| regex::Regex::new(r"multi_sids=([^;\s]+)").expect("multi_sids regex"));
     let Some(m) = re.captures(cookie) else {
-        return String::new();
+        return Vec::new();
     };
     let raw = urlencoding::decode(m.get(1).map(|g| g.as_str()).unwrap_or(""))
         .unwrap_or_default()
         .to_string();
+    let mut out: Vec<(String, String)> = Vec::new();
     for pair in raw.split(['|', ';']) {
-        if let Some((uid, sid)) = pair.split_once(':') {
-            let uid = uid.trim();
-            if uid.chars().all(|c| c.is_ascii_digit()) && !uid.is_empty() && sid.trim() == session_id {
-                return uid.to_string();
-            }
+        let Some((uid, sid)) = pair.split_once(':') else {
+            continue;
+        };
+        let (uid, sid) = (uid.trim(), sid.trim());
+        if uid.is_empty() || sid.is_empty() || !uid.chars().all(|c| c.is_ascii_digit()) {
+            continue;
         }
+        // 同一 uid 重复出现时保留先到者：cookie 里的先后顺序即服务端给出的优先级
+        if out.iter().any(|(u, _)| u == uid) {
+            continue;
+        }
+        out.push((uid.to_string(), sid.to_string()));
     }
-    String::new()
+    out
 }
 
 /// `doubao.com` 域请求 Cookie 中提取会话凭证，变化时经
@@ -720,11 +746,19 @@ pub fn try_capture_doubao_credentials(
     let sid_guard = get("sid_guard");
     let ttwid = get("ttwid");
     let uid = doubao_uid_from_multi_sids(&cookie, &session_id);
+    // 全量 `multi_sids` 映射：uid → sessionid。**本次会话的那一项也在内**，
+    // 它是「已知正确」的锚点，回写时据此把同机其余账号的 sid 也补上
+    // （见 `doubao_account::auto_apply_captured`）。
+    let sids: serde_json::Map<String, serde_json::Value> = parse_multi_sids_map(&cookie)
+        .into_iter()
+        .map(|(u, s)| (u, serde_json::Value::String(s)))
+        .collect();
     let captured = serde_json::json!({
         "session_id": session_id,
         "sid_guard": sid_guard,
         "ttwid": ttwid,
         "uid": uid,
+        "sids": sids,
         "host": host_l,
         "captured_at": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
     });
@@ -736,6 +770,9 @@ pub fn try_capture_doubao_credentials(
                 && c.get("sid_guard") == captured.get("sid_guard")
                 && c.get("ttwid") == captured.get("ttwid")
                 && c.get("uid") == captured.get("uid")
+                // sids 映射必须参与比对：同机其它账号登录/登出会只改映射不改
+                // sessionid，漏比对会让新账号的 sid 一直不落盘
+                && c.get("sids") == captured.get("sids")
         })
         .unwrap_or(false);
     if unchanged {
@@ -1167,6 +1204,66 @@ mod tests {
         assert_eq!(doubao_uid_from_multi_sids("sessionid=sidB", "sidB"), "");
         // 未编码形态（分号分隔）同样支持
         assert_eq!(doubao_uid_from_multi_sids("multi_sids=111:sidA|222:sidB", "sidB"), "222");
+    }
+
+    /// 全量 multi_sids 解析：一个客户端挂多个账号时，**所有**项都要能读出来。
+    ///
+    /// 为什么需要它：`multi_sids` 里本来就有同机其余账号的 sessionid，
+    /// 只看当前项会让它们白丢（「读得到却没填进去」）。
+    #[test]
+    fn multi_sids_解析全部项() {
+        let cookie = "multi_sids=111%3AsidA%7C222%3AsidB%7C333%3AsidC; sessionid=sidB";
+        assert_eq!(
+            parse_multi_sids_map(cookie),
+            vec![
+                ("111".to_string(), "sidA".to_string()),
+                ("222".to_string(), "sidB".to_string()),
+                ("333".to_string(), "sidC".to_string()),
+            ],
+            "三项都要解析出来，不能只留当前会话那一项"
+        );
+
+        // 未编码形态（`|` / `:` 原样）
+        assert_eq!(
+            parse_multi_sids_map("multi_sids=111:sidA|222:sidB"),
+            vec![
+                ("111".to_string(), "sidA".to_string()),
+                ("222".to_string(), "sidB".to_string()),
+            ]
+        );
+    }
+
+    /// 全量解析的合法性过滤：畸形项跳过，但**不影响**同一 cookie 里的合法项。
+    #[test]
+    fn multi_sids_全量解析跳过畸形项() {
+        // uid 非数字 / uid 空 / sid 空 都被跳过，222 保留
+        let cookie = "multi_sids=abc%3AsidA%7C%3AsidB%7C222%3A%7C333%3AsidC";
+        assert_eq!(
+            parse_multi_sids_map(cookie),
+            vec![("333".to_string(), "sidC".to_string())],
+            "只剩合法项 333"
+        );
+
+        // 无 multi_sids → 空
+        assert!(parse_multi_sids_map("sessionid=sidB").is_empty());
+        assert!(parse_multi_sids_map("").is_empty());
+        // 同一 uid 重复出现：保留先到者
+        assert_eq!(
+            parse_multi_sids_map("multi_sids=111:sidOld|111:sidNew"),
+            vec![("111".to_string(), "sidOld".to_string())]
+        );
+    }
+
+    /// 全量解析与「取当前项」必须**同源**：当前会话那一项一定在全量映射里。
+    #[test]
+    fn multi_sids_当前项包含在全量映射中() {
+        let cookie = "multi_sids=111%3AsidA%7C222%3AsidB%7C333%3AsidC; sessionid=sidC";
+        let current = doubao_uid_from_multi_sids(cookie, "sidC");
+        assert_eq!(current, "333");
+        assert!(
+            parse_multi_sids_map(cookie).iter().any(|(u, _)| u == &current),
+            "当前登录账号必须出现在全量映射里"
+        );
     }
 
     #[test]

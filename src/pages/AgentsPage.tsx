@@ -82,6 +82,8 @@ export default function AgentsPage() {
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus | null>(null);
   const [gatewayModels, setGatewayModels] = useState<GatewayModelItem[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
+  // 上游清单拉取失败的原因；非空时 gatewayModels 必为空。
+  const [modelsError, setModelsError] = useState<string | null>(null);
 
   // 二级视图 + 一级客户端选择 + 三级详情目标
   const [view, setView] = useState<AgentView>(readStoredView);
@@ -130,25 +132,28 @@ export default function AgentsPage() {
     }
   }, []);
 
-  // 从网关动态拉取模型列表（无静态预设，纯上游拉取 + 权威去重）
+  // 从上游实时拉取模型清单（无静态预设：拉不到就报错，不伪装成一份清单）
   const fetchModels = useCallback(async () => {
     setLoadingModels(true);
     try {
-      const list = await api.getGatewayModels();
-      if (list && list.length > 0) {
+      const res = await api.getGatewayModels();
+      if (res.models.length > 0) {
         // 全局按 ID 去重，消除重复项，统一呈现
-        const uniqueList = Array.from(new Map(list.map((m) => [m.id, m])).values());
+        const uniqueList = Array.from(new Map(res.models.map((m) => [m.id, m])).values());
         setGatewayModels(uniqueList);
+        setModelsError(res.error);
         setSelectedGlobalModels((prev) => {
           const valid = prev.filter((id) => uniqueList.some((m) => m.id === id));
           return valid.length > 0 ? valid : [uniqueList[0].id];
         });
       } else {
         setGatewayModels([]);
+        setModelsError(res.error ?? "上游未返回任何模型");
       }
     } catch (err) {
-      console.warn("拉取网关模型失败:", err);
+      console.warn("拉取上游模型失败:", err);
       setGatewayModels([]);
+      setModelsError(String(err));
     } finally {
       setLoadingModels(false);
     }
@@ -199,6 +204,17 @@ export default function AgentsPage() {
   const getModelsForTarget = useCallback(
     (targetId: string): string[] => customTargetModels[targetId] ?? selectedGlobalModels,
     [customTargetModels, selectedGlobalModels],
+  );
+
+  // 把模型 id 映射成导入对象，并带上网关 /v1/models 声明的真实上下文窗口。
+  // 严禁编造：网关未回传 context_length 时省略该字段，由后端按「未知」处理。
+  const toImportModels = useCallback(
+    (ids: string[]): api.AgentImportModel[] =>
+      ids.map((id) => {
+        const ctx = gatewayModels.find((m) => m.id === id)?.context_length;
+        return typeof ctx === "number" && ctx > 0 ? { id, context_window: ctx } : { id };
+      }),
+    [gatewayModels],
   );
 
   // 切换当前 target 的模型多选
@@ -258,7 +274,7 @@ export default function AgentsPage() {
 
     setOperatingTarget(target.id);
     try {
-      const outcome = await api.importAgentClient(target.id, models);
+      const outcome = await api.importAgentClient(target.id, toImportModels(models));
       toast.success(`已成功更新 ${target.label}`, {
         description: `已写入 ${outcome.models?.length ?? models.length} 个模型配置（默认主模型: ${models[0]}），已自动安全备份`,
       });
@@ -292,7 +308,7 @@ export default function AgentsPage() {
     for (const target of targets) {
       const models = getModelsForTarget(target.id);
       try {
-        await api.importAgentClient(target.id, models);
+        await api.importAgentClient(target.id, toImportModels(models));
         successCount++;
       } catch {
         failCount++;
@@ -544,6 +560,7 @@ export default function AgentsPage() {
           <ModelsView
             models={gatewayModels}
             loadingModels={loadingModels}
+            modelsError={modelsError}
             activeClient={activeClient}
             targets={targets}
             customTargetModels={customTargetModels}

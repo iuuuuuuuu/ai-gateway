@@ -5,14 +5,22 @@
 //! ai-gateway serve        # 只起服务不开浏览器（--port / --no-open）
 //! ai-gateway status       # 终端输出当前账号
 //! ai-gateway version      # 版本号
+//! ai-gateway --task-run <key>   # 计划任务模式：跑一个任务后退出
 //! ```
+//!
+//! ## 为什么要有 `--task-run`
+//!
+//! 设置页的「计划任务」注册的启动器指向本 exe。schtasks 触发时以
+//! `--task-run <key>` 调用，必须**跑完即退出**，不能顺手起一个服务 ——
+//! 否则每次定时触发都会占住端口、并在浏览器里弹出新标签页。
+//! 因此在 `serve()` 之前分流。
 
 mod api;
 
 use serde_json::json;
 
 use ai_gateway_core::modules::{
-    account, auth_file, checkin, config, process, refresh, rotate, travel, update,
+    account, auth_file, checkin, cli_task, config, process, refresh, rotate, travel, update,
 };
 
 fn default_port() -> u16 {
@@ -119,17 +127,50 @@ fn print_status() {
     println!("账号数: {}", account::load_accounts().len());
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // 计划任务模式必须在 `#[tokio::main]` 之前分流：`cli_task::run_cli_task`
+    // 会自建一个 tokio runtime 并在里面 `block_on`，而本函数已被
+    // `#[tokio::main]` 的 runtime 包着 —— 在 runtime 里再起 runtime 会直接
+    // panic（"Cannot start a runtime from within a runtime"）。
+    // 复用桌面端的写法：main 保持同步，只在 serve 分支里手建 runtime。
+    if let Some(task) = parse_task_mode(&args) {
+        std::process::exit(cli_task::run_cli_task(&task));
+    }
+
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("serve");
     match cmd {
         "status" => print_status(),
         "version" | "--version" | "-V" => {
             println!("ai-gateway {}", env!("CARGO_PKG_VERSION"));
         }
-        "serve" | _ => serve(&args).await,
+        // serve 分支才需要 async：`serve()` 自己 block_on 一个多线程 runtime
+        "serve" | _ => {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("运行时初始化失败: {e}");
+                    std::process::exit(1);
+                }
+            };
+            runtime.block_on(serve(&args));
+        }
     }
+}
+
+/// 解析 `--task-run <name>`（必须是第一个参数）。
+///
+/// 与桌面端 `src-tauri/src/main.rs` 的同名函数保持一致：都要求任务名非空、
+/// 且位置固定，避免把别的子命令误判成任务模式。
+fn parse_task_mode(args: &[String]) -> Option<String> {
+    if args.len() >= 3 && args[1] == "--task-run" {
+        return Some(args[2].clone()).filter(|s| !s.is_empty());
+    }
+    None
 }
 
 async fn serve(args: &[String]) {
@@ -182,5 +223,36 @@ fn open_browser(addr: &str) {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn 解析任务模式参数() {
+        assert_eq!(
+            parse_task_mode(&args(&["ai-gateway", "--task-run", "trae-checkin"])),
+            Some("trae-checkin".to_string())
+        );
+        // 缺任务名
+        assert_eq!(parse_task_mode(&args(&["ai-gateway", "--task-run"])), None);
+        // 空任务名
+        assert_eq!(
+            parse_task_mode(&args(&["ai-gateway", "--task-run", ""])),
+            None
+        );
+        // 不是第一个参数（避免把别的子命令误判成任务模式）
+        assert_eq!(
+            parse_task_mode(&args(&["ai-gateway", "serve", "--task-run", "x"])),
+            None
+        );
+        // 无参数 = 正常启动服务，不是任务模式
+        assert_eq!(parse_task_mode(&args(&["ai-gateway"])), None);
     }
 }

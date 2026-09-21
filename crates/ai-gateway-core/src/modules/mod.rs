@@ -2,6 +2,8 @@ pub mod account;
 pub mod agent_import;
 // 多应用档案表（5 应用 × 3 快照布局）：切换流程的表驱动参数源。
 pub mod app_profile;
+// Trae / 豆包 / 应用切换的宿主无关操作层（Tauri 与 webui 共用，避免两边逻辑漂移）
+pub mod apps_ops;
 pub mod auth_file;
 pub mod checkin;
 // CLI 任务模式（--task-run <key>，刻意不启动 Tauri）

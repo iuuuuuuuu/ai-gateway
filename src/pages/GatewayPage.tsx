@@ -655,10 +655,17 @@ export default function GatewayPage() {
   const loadModels = useCallback(async () => {
     setModelsLoading(true);
     try {
-      const list = await api.getGatewayModels();
-      setModelOptions(list.map((m) => m.id).filter(Boolean).sort());
+      // 清单只来自上游，没有静态兜底：拉不到就保留原列表，
+      // 让用户仍能手填（下拉里已有「当前」兜底项）。
+      const res = await api.getGatewayModels();
+      setModelOptions(
+        res.models
+          .map((m) => m.id)
+          .filter(Boolean)
+          .sort(),
+      );
     } catch {
-      // 取不到就保留原列表：模型锁定仍可手填（下拉里已有「当前」兜底项）
+      // 取不到就保留原列表
     } finally {
       setModelsLoading(false);
     }

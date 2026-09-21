@@ -21,6 +21,8 @@ import { cn } from "@/lib/utils";
 interface ModelsViewProps {
   models: GatewayModelItem[];
   loadingModels: boolean;
+  /** 上游清单拉取失败的原因；非空时 `models` 必为空。 */
+  modelsError: string | null;
   targets: AgentClientTarget[];
   activeClient: AgentClientTarget | null;
   customTargetModels: Record<string, string[]>;
@@ -75,6 +77,7 @@ function ModelChips({ assigned, limit = 3 }: { assigned: string[]; limit?: numbe
 export function ModelsView({
   models,
   loadingModels,
+  modelsError,
   targets,
   activeClient,
   customTargetModels,
@@ -155,13 +158,23 @@ export function ModelsView({
         {models.length === 0 ? (
           <div className="space-y-2.5 rounded-xl border border-dashed border-border/70 bg-muted/15 p-6 text-center">
             <Cpu className="mx-auto size-7 text-muted-foreground/60" />
-            <div className="text-sm font-medium">尚未从网关获取到上游模型</div>
+            <div className="text-sm font-medium">
+              {loadingModels ? "正在从上游拉取模型…" : "未能从上游获取模型清单"}
+            </div>
+            {/* 把真实原因原样显示：清单只来自上游，没有静态兜底，
+                所以「为什么没有」必须由用户看见，而不是一句笼统的「未获取到」。 */}
+            {modelsError ? (
+              <p className="mx-auto max-w-lg rounded-lg bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                {modelsError}
+              </p>
+            ) : null}
             <p className="mx-auto max-w-md text-xs text-muted-foreground">
-              网关尚未启动或正在同步。前往「兼容网关」启动服务后，网关会自动拉取您账号下的全部真实可用模型。
+              模型清单只从上游实时拉取，没有内置兜底列表。请确认网关已启动、账号池中有可用账号，
+              且出站代理可达上游，然后点「重新拉取」。
             </p>
             <div className="flex items-center justify-center gap-2 pt-1">
               <Button size="sm" asChild className="h-7 text-xs">
-                <Link to="/gateway">前往「兼容网关」启动网关 →</Link>
+                <Link to="/gateway">前往「兼容网关」检查账号与代理 →</Link>
               </Button>
             </div>
           </div>

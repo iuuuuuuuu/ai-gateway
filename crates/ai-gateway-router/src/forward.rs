@@ -13,10 +13,27 @@
 //!
 //! - 传输层错误（超时/连接被拒/DNS）→ 只换号，**不喂熔断**
 //! - 业务错误 → 按 `classify` 结果施加冷却 / 禁用 / 熔断
-//! - 上下文超长 → **立即失败**，不换号（同一请求体发给任何账号都同样失败）
+//! - 上下文超长 → **立即失败**（确定性错误，重试无用）
+//! - 请求被上游拒绝（11155 思维链缺失、11140 安全审核）→ **原地重试**，
+//!   预算 2 次；用尽才按请求侧错误落定
 //!
-//! 最后一条是唯一改变对外状态码的路径；其余失败沿用 503 `no_healthy_account`
+//! 最后两类是改变对外状态码的路径；其余失败沿用 503 `no_healthy_account`
 //! 契约（语义是「账号池暂时不可用，稍后重试」）。
+//!
+//! # 为什么「请求被拒」要重试（实测数据，勿凭直觉回退）
+//!
+//! 实测 11140 在同一请求体上按 **~10~25%** 概率**随机**出现，与账号、模型、
+//! 协议都无关（会话粘性钉住单账号仍随机；hy3 与 deepseek 失败率相同；
+//! Chat 与 Responses 失败率相同；连「列出三原色」这种无害纯文本也 20 次挂 2 次）。
+//!
+//! 同一份 body 连发 40 次：首轮成功 30 次，把 10 次失败原样重发（最多 2 次）
+//! 后 **10/10 全部救回，0 次重试仍失败** —— 单请求成功率 75% → 100%。
+//!
+//! 结论：上游审核判定带服务端抖动，**不是**确定的请求侧错误。原实现按
+//! 「换号无用」直接短路返回，等于把上游抖动原样透传给用户 —— agent 一个任务
+//! 要发几十上百个请求，单次 90% 的成功率会让整轮任务几乎必然失败，
+//! 用户看到的就是「OpenAI 格式完全用不了」。
+
 
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
@@ -25,7 +42,8 @@ use crate::auth::Auth;
 use crate::pool::{CoolKind, Pool, Region};
 use crate::session::Router;
 use crate::upstream::classify::{
-    self, context_too_long_message, friendly_message, ErrKind, UpstreamError,
+    self, context_too_long_message, friendly_message, request_rejected_message, ErrKind,
+    UpstreamError,
 };
 use crate::upstream::client::{ChatOutcome, Client};
 use crate::upstream::sse;
@@ -41,6 +59,9 @@ pub enum FailureKind {
     Upstream,
     /// 请求上下文超出模型窗口：请求侧错误，换号无用。
     ContextTooLong,
+    /// 请求内容被上游拒绝（11155 思维链缺失 / 11140 安全审核）：
+    /// 已用尽重试预算，按请求侧错误落定，原样回传上游状态与文案。
+    RequestRejected,
     /// 带图片的请求需要特定区域的账号，而该区域此刻没有可用账号。
     ImageRegionUnavailable,
 }
@@ -223,7 +244,24 @@ pub async fn forward_chat(
     // 因此循环正常结束时必然为空；`release` 仍是幂等的（take 语义）。
     let mut held_uid: Option<String> = None;
 
-    for _ in 0..ctx.max_rotate.max(1) {
+    // 「请求被拒」的**原地重试**预算（跨整个循环共享，不按账号重置）。
+    //
+    // 为什么必须重试：实测 11140（安全审核）在同一请求体上按 ~10~25% 概率
+    // **随机**出现 —— 同一份 body 连发 40 次，首轮 75% 成功，对失败的原请求
+    // 重发最多 2 次后成功率 100%（10/10 全部救回，0 次重试仍失败）。
+    // 上游的审核判定显然带服务端抖动，而原实现把它当「请求侧错误、换号无用」
+    // 直接短路返回 —— 等于把上游抖动原样透传给用户，表现就是「agent 经常报错」。
+    //
+    // 11155（思维链缺失）同样纳入重试：它多数是请求侧真问题（重试会再失败），
+    // 但实测也存在与 11140 同样的偶发抖动，重试成本仅一次上游调用，
+    // 而漏判的代价是用户整个任务失败。
+    const REJECT_RETRY_BUDGET: usize = 2;
+    let mut reject_retries_left = REJECT_RETRY_BUDGET;
+
+    // 重试与换号**共用同一个循环**，因此循环上界必须是两者之和 ——
+    // 否则重试会把换号预算吃光（max_rotate 缺省才 3），
+    // 表现为「账号一抖动就没得换了」。
+    for _ in 0..(ctx.max_rotate.max(1) + REJECT_RETRY_BUDGET) {
         // ── 选号：优先粘性命中，其次按模型 + 区域挑（短暂持锁）──
         let mut acct: Option<Auth> = None;
         if let Some(uid) = sticky_uid.clone() {
@@ -342,10 +380,43 @@ pub async fn forward_chat(
                     .to_string(),
                 );
 
-                // 上下文超长是**请求侧**错误：换号无用（同一请求体发给任何账号都同样
-                // 失败），继续轮转只会把整个请求体对着每个账号重传一遍，
-                // 最后还被伪装成「账号全部不可用」，把排查方向引向账号故障。
-                if kind == ErrKind::ContextTooLong {
+                // 请求侧错误：换号**通常**无用（同一请求体发给任何账号都同样
+                // 失败）。但「通常」不足以支撑直接失败 —— 实测 11140 / 11155 都带
+                // 上游侧抖动，同一请求体重发即可成功（见循环上方的实测数据）。
+                //
+                // 因此这里先消耗重试预算**原地重试**；预算用尽才按请求侧错误
+                // 落定。上下文超长不在此列：它是确定性的，重试纯属浪费。
+                if kind == ErrKind::RequestRejected && reject_retries_left > 0 {
+                    reject_retries_left -= 1;
+                    // 记一行再重试：上游抖动是**唯一**只能靠日志发现的故障模式，
+                    // 不记的话「重试救回来了」与「上游本来就没抖」无法区分，
+                    // 抖动恶化到重试也压不住时没有任何先兆。
+                    eprintln!(
+                        "[forward] upstream rejected, retrying (left={reject_retries_left}): \
+                         model={model} uid={} status={status} body={}",
+                        acct.uid,
+                        classify::truncate(&resp_body, 200),
+                    );
+                    release(ctx.pool, &mut held_uid);
+                    // 不 push 进 `tried`：下一个账号很可能是同一个（池子小，
+                    // 且抖动与账号无关），排除它只会让「重试」变成「换号」，
+                    // 反而绕开刚证明可用的那个账号。
+                    continue;
+                }
+                if kind == ErrKind::ContextTooLong || kind == ErrKind::RequestRejected {
+                    let (fk, message) = if kind == ErrKind::ContextTooLong {
+                        (
+                            FailureKind::ContextTooLong,
+                            // 保留上游原文：下游客户端靠文案识别上下文溢出
+                            // 并触发自动压缩，只回我们自己的措辞会让它认不出。
+                            context_too_long_message(&resp_body),
+                        )
+                    } else {
+                        (
+                            FailureKind::RequestRejected,
+                            request_rejected_message(&resp_body),
+                        )
+                    };
                     let uid = acct.uid.clone();
                     release(ctx.pool, &mut held_uid);
                     return (
@@ -356,11 +427,9 @@ pub async fn forward_chat(
                         }),
                         status,
                         Some(ForwardFailure {
-                            kind: FailureKind::ContextTooLong,
+                            kind: fk,
                             status,
-                            // 保留上游原文：下游客户端靠文案识别上下文溢出
-                            // 并触发自动压缩，只回我们自己的措辞会让它认不出。
-                            message: context_too_long_message(&resp_body),
+                            message,
                         }),
                     );
                 }
@@ -552,6 +621,9 @@ pub fn apply_error_policy(
         ErrKind::Server => {
             pool.note_error(uid);
         }
+        // 请求侧拒绝（11155 / 11140）在轮转循环里已短路返回，理论上走不到这里；
+        // 即便到达也绝不罚账号 —— 账号什么都没做错。
+        ErrKind::RequestRejected => {}
         // 其余（Client / None）：只换号不罚（防雪崩），不喂熔断。
         _ => {}
     }

@@ -299,130 +299,12 @@ fn image_capability_fields() -> Value {
     })
 }
 
-/// 给静态表条目补上能力字段。
-///
-/// 静态表取自 `/v3/config` 的 `agents[cli].models`，实测（2026-09-16，国服 16 个
-/// cli 模型 + 国际版 21 个模型池）该清单下**全部**模型 `supportsImages=true`。
-///
-/// 本 crate 目前只内置静态表（无动态拉取），因此统一标注为支持图片。
-/// 不标注的话，客户端会把所有模型当纯文本 —— 图片能力整个消失，而网关
-/// 看起来完全正常（返回 200 + 完整列表），是最难排查的一类问题。
-///
-/// **刻意不补思考等级**：上游未声明档位时网关也不声明。谎报的档位要么被上游
-/// 降级、要么被忽略，用户看到的是「调了没生效」，比不下发更难排查。
-fn with_image_capability(mut entries: Vec<Value>) -> Vec<Value> {
-    for entry in entries.iter_mut() {
-        if let Some(obj) = entry.as_object_mut() {
-            if let Some(caps) = image_capability_fields().as_object() {
-                for (k, v) in caps {
-                    obj.entry(k.clone()).or_insert_with(|| v.clone());
-                }
-            }
-        }
-    }
-    entries
-}
-
-/// 静态 CN 模型表（动态接口失败时的回退）。
-///
-/// 与 Go 侧 `staticModels` 完全一致（含 created / context_length 取值）。
-fn static_models_cn() -> Vec<Value> {
-    const IDS: &[&str] = &[
-        "glm-5.2",
-        "glm-5.1",
-        "glm-5v-turbo",
-        "kimi-k2.7",
-        "minimax-m3",
-        "hy3",
-        "hy3-preview",
-        "hy3-preview-agent",
-        "deepseek-v4-pro",
-        "deepseek-v4-flash",
-    ];
-    with_image_capability(
-        IDS.iter()
-            .map(|id| {
-                json!({
-                    "id": id,
-                    "object": "model",
-                    "created": 1753600000,
-                    "owned_by": "workbuddy",
-                    "context_length": 131072,
-                })
-            })
-            .collect(),
-    )
-}
-
-/// 国际版静态模型表。
-///
-/// 国际版的 `/console/enterprises/personal/models` 在当前版本返回 500，
-/// 无法动态拉取，因此内置一份。
-fn static_models_intl() -> Vec<Value> {
-    const SHORT: &[(&str, i64)] = &[
-        ("default-model", 200000),
-        ("fast-model", 176000),
-        ("balanced-model", 176000),
-        ("primary-model", 176000),
-        ("deep-model", 176000),
-    ];
-    const STD: &[&str] = &[
-        "hy4-preview",
-        "hy3",
-        "deepseek-v4.1-flash",
-        "gpt-6-astra",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.3-codex",
-        "gemini-3.5-flash",
-        "glm-5.3",
-        "glm-5.2",
-        "kimi-k3",
-        "kimi-k2.6",
-    ];
-    let mut out = Vec::new();
-    for (id, ctx) in SHORT {
-        out.push(json!({
-            "id": id, "object": "model", "created": 1753600000,
-            "owned_by": "workbuddy-intl", "context_length": ctx,
-        }));
-    }
-    for id in STD {
-        out.push(json!({
-            "id": id, "object": "model", "created": 1753600000,
-            "owned_by": "workbuddy-intl", "context_length": 131072,
-        }));
-    }
-    with_image_capability(out)
-}
-
-/// 合并两个区域的模型（按 id 去重，国服优先）。
-///
-/// `/v1/models` 没有账号上下文，因此返回并集：客户端据此得知全部可用名称。
-fn static_models_all() -> Vec<Value> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for m in static_models_cn().into_iter().chain(static_models_intl()) {
-        if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
-            if id.is_empty() || !seen.insert(id.to_string()) {
-                continue;
-            }
-            out.push(m);
-        }
-    }
-    out
-}
-
-/// `GET /v1/models` —— 模型列表（需鉴权）。
 /// 生成思考等级（reasoning effort）字段。
 ///
 /// 与 [`image_capability_fields`] 是**正交**的两个维度（一个是「能不能收图」，
 /// 一个是「思考用哪档」），因此独立成函数、独立调用，不合并成一个 map。
 ///
-/// `efforts` 为空 = 上游未声明（含固定档模型、静态兜底表）→ 返回 `None`，
+/// `efforts` 为空 = 上游未声明（含固定档模型）→ 返回 `None`，
 /// **不下发任何键**。这与图片能力的三态语义一致：宁可不写，也不要凭空编造档位 ——
 /// 客户端会拿着编造的档位去发请求，而该档位要么被上游降级、要么被忽略，
 /// 用户看到的是「我明明调了 max 却没生效」这类无从排查的现象。
@@ -466,10 +348,10 @@ fn model_reasoning_fields(efforts: &[String], default_effort: &str) -> Option<Va
 
 /// `GET /v1/models` —— 模型列表（需鉴权）。
 ///
-/// # 动态优先，静态兜底
+/// # 只下发上游实时清单
 ///
-/// 优先抽一个账号向上游拉真实清单（带 `context_length` / `max_tokens` /
-/// **思考档位** / 图片能力），失败或池为空时退回内置静态表。
+/// 抽一个账号向上游拉真实清单（带 `context_length` / `max_tokens` /
+/// **思考档位** / 图片能力）。拉不到就**明确失败**，不下发任何内置静态表。
 ///
 /// 为什么必须动态拉：思考等级（`reasoning.supportedEfforts` / `effort`）**只有**
 /// 上游知道 —— 静态表里没有任何档位信息，只靠它下发会让客户端永远看不到档位，
@@ -477,23 +359,53 @@ fn model_reasoning_fields(efforts: &[String], default_effort: &str) -> Option<Va
 ///（降级或在「支持档全部高于请求档」时被 floor 抬升），界面上表现为
 /// 「我明明调了 max 却没生效」。
 ///
-/// 静态兜底表**刻意不补档位**：上游没暴露时网关也不编造 —— 编造的档位要么被
-/// 上游降级、要么被忽略，比不下发更难排查。
+/// 为什么删掉静态表：静态清单会随上游改版失真，且**失真不可见** ——
+/// 实测内置表里的 `kimi-k2.5` / `minimax-m3` / `hy3-preview` / `deepseek-v4-flash`
+/// 在上游早已不存在（现为 `kimi-k2.6` / `kimi-k3` / `hy4-preview-f` 等），
+/// 客户端选中后请求必然失败，而清单看上去完全正常，用户无从判断
+/// 「是模型没了、还是账号/配置有问题」。
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(r) = check_auth(&state, &headers) {
         return r;
     }
 
-    let data = match fetch_dynamic_models(&state).await {
-        Some(list) => list,
-        None => static_models_all(),
-    };
-    json_response(StatusCode::OK, json!({ "object": "list", "data": data }))
+    match fetch_dynamic_models(&state).await {
+        Some(list) => json_response(
+            StatusCode::OK,
+            json!({ "object": "list", "data": list, "source": "upstream" }),
+        ),
+        // 503（而非 200 + 空 data）：让宿主与客户端都能区分「上游拉不到」与
+        // 「上游就是没有模型」。空 data 会被多数客户端静默渲染成空下拉，
+        // 用户只看到一个空列表，仍然不知道该去查账号还是查网络。
+        None => {
+            let hint = {
+                let pool = match state.pool.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                if pool.servable_now() {
+                    "已选到可用账号，但上游模型接口未返回数据（多为上游故障或出站代理不通）"
+                } else {
+                    "账号池中没有可用账号，无法向上游拉取模型清单"
+                }
+            };
+            json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({
+                    "error": {
+                        "message": format!("无法从上游获取模型清单：{hint}"),
+                        "type": "api_error",
+                        "code": "models_unavailable",
+                    }
+                }),
+            )
+        }
+    }
 }
 
 /// 抽一个健康账号向上游拉模型清单，包装成 OpenAI `/v1/models` 条目。
 ///
-/// 返回 `None` 表示拿不到（池为空 / 上游失败 / 解析失败），由调用方退回静态表。
+/// 返回 `None` 表示拿不到（池为空 / 上游失败 / 解析失败），由调用方给出 503。
 ///
 /// 只试一个账号即可：模型清单是**产品级**的，同一个区域里任何账号看到的都一样。
 /// 多试几个只会在上游故障时放大延迟，不会提高成功率。
@@ -511,9 +423,9 @@ async fn fetch_dynamic_models(state: &Arc<AppState>) -> Option<Vec<Value>> {
         Ok(v) if !v.is_empty() => v,
         Ok(_) => return None,
         Err(e) => {
-            // 拉取失败是**预期**路径（国际版模型接口实测会返回 500），
-            // 不是错误，降级到静态表即可，不打 error 级日志。
-            eprintln!("[models] 动态拉取失败，回退静态表: {e}");
+            // 拉取失败是**预期**路径（国际版模型接口实测会返回 500）：
+            // 记为 warn 级、不上抛，由调用方转成 503 —— 不再降级到静态表。
+            eprintln!("[models] 上游拉取失败: {e}");
             return None;
         }
     };
@@ -744,6 +656,8 @@ impl Wire {
     /// - 上下文超长：Chat / Responses 用 `context_length_exceeded`；
     ///   Anthropic 语义里它是 `invalid_request_error`（其真实文案即
     ///   "prompt is too long: ..."），而非 `request_too_large`（那是字节数超限）。
+    /// - 请求被上游拒绝（11155 / 11140）：三端统一用 `invalid_request_error`
+    ///   语义；HTTP 状态与原文由调用方保留上游值，客户端据此识别为请求侧失败。
     /// - 单一模型拒绝：Chat 用 `model_not_allowed`（本网关为 chat 形状定的码），
     ///   Responses / Anthropic 用各自的 `invalid_request_error`。
     /// - 其余：Chat 沿用 `no_healthy_account`；另两个协议用 `api_error` / `upstream_error`。
@@ -753,6 +667,7 @@ impl Wire {
             (Wire::Chat, F::ContextTooLong) => "context_length_exceeded",
             (Wire::Responses, F::ContextTooLong) => "context_length_exceeded",
             (Wire::Messages, F::ContextTooLong) => "invalid_request_error",
+            (_, F::RequestRejected) => "invalid_request_error",
             (Wire::Chat, F::ImageRegionUnavailable) => "image_region_unavailable",
             (Wire::Messages, F::ImageRegionUnavailable) => "invalid_request_error",
             (Wire::Responses, F::ImageRegionUnavailable) => "invalid_request_error",
@@ -1402,79 +1317,38 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// 拿不到上游清单时必须**明确失败**（503 + `models_unavailable`）。
+    ///
+    /// 这是删除静态表后的核心契约：宁可报错，也不下发一份会随上游改版失真的
+    /// 内置清单 —— 失真的清单看上去完全正常，客户端选中后请求必然失败，
+    /// 用户无从判断「是模型没了、还是账号/配置有问题」。
     #[tokio::test]
-    async fn models_returns_union_with_cn_first() {
+    async fn models_fails_loudly_without_upstream() {
+        // 池为空 → fetch_dynamic_models 拿不到账号 → 必须 503。
         let app = router(test_state(""));
         let res = app
             .oneshot(Request::builder().uri("/v1/models").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
         let v = body_json(res).await;
-        assert_eq!(v["object"], "list");
-        let data = v["data"].as_array().unwrap();
-        // 国服优先去重：glm-5.2 应出现且 owned_by 为 workbuddy
-        let glm = data.iter().find(|m| m["id"] == "glm-5.2").unwrap();
-        assert_eq!(glm["owned_by"], "workbuddy");
-        assert_eq!(glm["context_length"], 131072);
-        assert_eq!(glm["created"], 1753600000);
-        // id 唯一
-        let mut ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
-        let n = ids.len();
-        ids.sort();
-        ids.dedup();
-        assert_eq!(ids.len(), n, "模型 id 应去重");
+        assert_eq!(v["error"]["code"], "models_unavailable");
+        // 绝不能退回「200 + 一份静态 data」
+        assert!(v.get("data").is_none(), "不得下发任何静态模型清单");
+        // 提示必须点明「没有可用账号」，让用户知道去查哪里
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("账号"), "应指出账号池为空: {msg}");
     }
 
-    /// `/v1/models` 必须下发模型能力（图片输入）。
-    ///
-    /// 实测缺陷（2026-09-16）：模型列表只有 id/object/created/owned_by/context_length，
-    /// 没有任何能力字段，于是「有多模态模型但客户端发不出图片」。能读该字段的
-    /// 客户端（OpenClaw 的 Codex/Copilot/HuggingFace/OpenRouter/Vercel/LM Studio
-    /// 解析器）拿不到能力信号，只能按纯文本处理 —— 构建期完全看不出来。
+    /// 鉴权仍先于模型拉取：未带 key 时必须 401，而不是 503。
     #[tokio::test]
-    async fn models_expose_image_capability_spellings() {
-        let app = router(test_state(""));
+    async fn models_requires_auth_before_upstream() {
+        let app = router(test_state("secret"));
         let res = app
             .oneshot(Request::builder().uri("/v1/models").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let v = body_json(res).await;
-        let data = v["data"].as_array().unwrap();
-        let glm = data.iter().find(|m| m["id"] == "glm-5.2").unwrap();
-
-        // 各客户端读的拼写都不同，逐条锁住，避免以后有人"清理重复字段"。
-        assert_eq!(glm["supportsImages"], true);
-        for key in ["input_modalities", "inputModalities"] {
-            let mods = glm[key].as_array().expect("应为数组（OpenClaw Codex）");
-            assert!(mods.iter().any(|m| m == "image"), "{key} 应含 image");
-        }
-        assert_eq!(glm["capabilities"]["vision"], true, "OpenClaw LM Studio");
-        assert_eq!(
-            glm["capabilities"]["supports"]["vision"], true,
-            "OpenClaw Copilot"
-        );
-        assert!(
-            glm["architecture"]["input_modalities"]
-                .as_array()
-                .is_some_and(|m| m.iter().any(|x| x == "image")),
-            "OpenClaw HuggingFace"
-        );
-        assert!(
-            glm["architecture"]["modality"]
-                .as_str()
-                .is_some_and(|m| m.contains("image")),
-            "OpenClaw OpenRouter 形如 text+image->text"
-        );
-        assert!(
-            glm["tags"].as_array().is_some_and(|t| t.iter().any(|x| x == "vision")),
-            "OpenClaw Vercel AI Gateway"
-        );
-
-        // 国际版静态表条目也要带能力（两个区域共用同一套标注）
-        let astra = data.iter().find(|m| m["id"] == "gpt-6-astra").unwrap();
-        assert_eq!(astra["supportsImages"], true, "国际版条目也应带能力字段");
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -1646,22 +1520,5 @@ mod tests {
         let efforts = vec!["low".to_string()];
         let f = model_reasoning_fields(&efforts, "  low  ").unwrap();
         assert_eq!(f["default_effort"], json!("low"));
-    }
-
-    /// 静态兜底表**不编造**档位：上游不暴露，网关也不暴露。
-    #[test]
-    fn static_table_does_not_fabricate_efforts() {
-        let data = static_models_all();
-        assert!(!data.is_empty());
-        for m in &data {
-            assert!(
-                m.get("supported_efforts").is_none(),
-                "静态表不得编造档位: {}",
-                m["id"]
-            );
-            assert!(m.get("reasoning").is_none(), "{}", m["id"]);
-            // 图片能力仍要有（那是实测确认存在的）
-            assert_eq!(m["supportsImages"], json!(true), "{}", m["id"]);
-        }
     }
 }

@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   CalendarCheck,
   Coins,
+  Download,
   Fingerprint,
   Loader2,
   MonitorSmartphone,
@@ -292,6 +293,29 @@ function SnapshotList({
   );
 }
 
+/**
+ * 汇总一次本机导入的结果并提示。
+ *
+ * 三个计数分开报是有意义的：「新增」是发现了新账号，「更新」只是凭证变新，
+ * 「跳过」表示账号在本机但那份 JWT 比账号库里的更旧（防降级拦下了）——
+ * 后两种情况下用户不该以为「什么都没发生」。
+ */
+function reportImport(summary: api.TraeImportSummary) {
+  if (summary.error) {
+    toast.warning(`未能读取本机登录态：${summary.error}`);
+    return;
+  }
+  const parts: string[] = [];
+  if (summary.appended) parts.push(`新增 ${summary.appended}`);
+  if (summary.updated) parts.push(`更新 ${summary.updated}`);
+  if (summary.skipped) parts.push(`跳过 ${summary.skipped}（本机凭证较旧）`);
+  if (parts.length === 0) {
+    toast.info("本机登录态与账号库一致，无需更新。");
+    return;
+  }
+  toast.success(`已从本机导入：${parts.join(" · ")}`);
+}
+
 export default function TraePage() {
   const [activeApp, setActiveApp] = useState(TRAE_APPS[0]);
   const [accounts, setAccounts] = useState<TraeAccountMeta[]>([]);
@@ -387,11 +411,28 @@ export default function TraePage() {
   const doDiscover = async () => {
     setBusy(true);
     try {
-      const res = await api.traeDiscoverAccounts();
+      // 发现即导入：JWT 就在客户端本地 Cookies 里，没必要让用户手贴一遍
+      const res = await api.traeDiscoverAndImport();
       setDiscovered(res.accounts);
       if (res.accounts.length === 0) {
         toast.info("未在本机发现 Trae 登录痕迹。请先启动客户端并登录一次。");
+      } else {
+        reportImport(res.import);
       }
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doImportLocal = async () => {
+    setBusy(true);
+    try {
+      const res = await api.traeImportLocal();
+      reportImport(res.import);
+      await load();
     } catch (e) {
       toast.error(api.asError(e));
     } finally {
@@ -465,6 +506,10 @@ export default function TraePage() {
             </p>
           </div>
           <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" disabled={busy} onClick={() => void doImportLocal()}>
+              <Download className="size-3.5" />
+              从本机登录态导入
+            </Button>
             <Button variant="outline" size="sm" disabled={busy} onClick={() => void doDiscover()}>
               <UserPlus className="size-3.5" />
               发现本机账号
@@ -588,7 +633,8 @@ export default function TraePage() {
                     <Coins className="size-4" />
                     <AlertTitle>还没有 Trae 账号</AlertTitle>
                     <AlertDescription>
-                      可以点「发现本机账号」从客户端读取，或粘贴 Cloud-IDE-JWT 手动添加。
+                      点「从本机登录态导入」即可自动读取客户端里已登录的账号
+                      （JWT 就在本机 Cookies 中，无需手贴）；也可以「发现本机账号」或手动粘贴。
                     </AlertDescription>
                   </Alert>
                 ) : (
@@ -643,7 +689,8 @@ export default function TraePage() {
                   <CardHeader className="pb-3">
                     <CardTitle className="text-base">本机发现</CardTitle>
                     <CardDescription>
-                      uid 由客户端使用痕迹推导。标记为「无法确认」的候选
+                      uid 由客户端使用痕迹推导，「发现」时会顺带把本机登录态里的 JWT
+                      自动导入账号库。标记为「无法确认」的候选
                       <strong className="text-foreground">不会</strong>入池 ——
                       它的 uid 属于账户中心编号体系，与账号库不是同一套编号。
                     </CardDescription>
@@ -686,16 +733,18 @@ export default function TraePage() {
                             variant="outline"
                             disabled={busy}
                             onClick={async () => {
-                              // 本机发现只给出 uid，凭证仍需用户粘贴 JWT ——
-                              // 客户端把 JWT 存在加密的 vscdb 里，离线取不出明文
+                              // 正常情况下「发现」已自动导入该账号的 JWT；
+                              // 走到这里说明本机 Cookies 里没有它的凭证
+                              // （例如只在另一个应用登录过、或客户端已清缓存）。
+                              // 保留手动入口，让用户能补 JWT / rename / 填 refresh token。
                               setAddName(item.appLabel);
                               setAddOpen(true);
                               toast.info(
-                                "请粘贴该账号的 Cloud-IDE-JWT（客户端登录态是加密存储的，无法离线读取）",
+                                "本机登录态里没找到该账号的凭证，请手动粘贴 Cloud-IDE-JWT 补充",
                               );
                             }}
                           >
-                            添加
+                            手动补充
                           </Button>
                         )}
                       </div>

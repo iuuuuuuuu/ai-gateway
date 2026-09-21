@@ -11,10 +11,11 @@
 //! 4. body 命中 sessionDeadMarkers → 禁用
 //! 5. `429` → 模型级限流（6004）优先，否则软冷却
 //! 6. 上下文超长（11115）→ 请求侧错误，换号无用
-//! 7. `404` → 短冷却
-//! 8. `>=500` → 服务端错误（喂熔断）
-//! 9. `>=400` → 客户端错误（只换号不罚）
-//! 10. 其余 → 无错误
+//! 7. 请求被拒（11155 思维链缺失 / 11140 安全审核）→ 请求侧错误，立即失败
+//! 8. `404` → 短冷却
+//! 9. `>=500` → 服务端错误（喂熔断）
+//! 10. `>=400` → 客户端错误（只换号不罚）
+//! 11. 其余 → 无错误
 //!
 //! 两处**非显然的顺序**，改前务必读完：
 //!
@@ -52,6 +53,13 @@ pub enum ErrKind {
     ///
     /// **请求侧**错误：同一请求体发给任何账号都会同样失败，换号无用。
     ContextTooLong,
+    /// 请求内容被上游明确拒绝（400 code=11155 思维链缺失 /
+    /// 403 code=11140 未通过安全审核）。
+    ///
+    /// 与 [`ErrKind::ContextTooLong`] 同属**请求侧**错误：同一请求体发给
+    /// 任何账号结果都一样，轮转账号不仅无用，还会把「这条请求不合法」伪装成
+    /// 「账号全部不可用」，并白白冷却整个账号池。
+    RequestRejected,
 }
 
 impl ErrKind {
@@ -67,6 +75,7 @@ impl ErrKind {
             ErrKind::Client => "client",
             ErrKind::ModelRate => "model_rate",
             ErrKind::ContextTooLong => "context_too_long",
+            ErrKind::RequestRejected => "request_rejected",
         }
     }
 }
@@ -167,6 +176,22 @@ const CONTEXT_TOO_LONG_MARKERS: &[&str] = &[
 /// 而 14018 藏在 `error.data.code`。
 const CREDIT_EXHAUSTED_CODE: i64 = 14018;
 
+/// 上游「请求内容被拒绝」的业务码（请求侧错误，换号无用）：
+/// - `11155`：思考模式要求回传上一轮 reasoning_content（reasoning_content_missing）
+/// - `11140`：内容未通过安全审核（request illegal）
+const REQUEST_REJECTED_CODES: &[i64] = &[11155, 11140];
+
+/// 「请求被拒绝」的文案兜底（中英双通道）。
+///
+/// 业务码是主信号；文案兜底用于上游改码不改文案 / 业务码放在 extError.code
+/// 字符串里（11155 的实测形状）的场景。
+const REQUEST_REJECTED_MARKERS: &[&str] = &[
+    "reasoning_content_missing",
+    "reasoning content from the previous turn",
+    "did not pass the safety review",
+    "内容未通过安全审核",
+];
+
 /// 上游业务时区（CST，UTC+8），用于解释**无时区后缀**的时间字面量。
 ///
 /// 为什么不用本机时区：上游是国服服务，其重置时刻按 CST 计；用本机时区解释会让
@@ -223,6 +248,33 @@ pub fn is_context_too_long(body: &str) -> bool {
         .any(|m| lower.contains(&m.to_lowercase()))
 }
 
+/// 报告响应是否为「请求内容被上游明确拒绝」（请求侧错误，换号无用）。
+///
+/// 三路判定，任一命中即成立：顶层业务码 11155/11140、
+/// `extError.code` 为对应语义串（11155 实测放在这里）、或真实文案关键词。
+/// 不按 status 门控：两者实测分别为 400 / 403，判定依据是业务语义。
+pub fn is_request_rejected(body: &str) -> bool {
+    if let Some(code) = envelope_code(body) {
+        if REQUEST_REJECTED_CODES.contains(&code) {
+            return true;
+        }
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if v.get("extError")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str())
+            .map(|c| c.eq_ignore_ascii_case("reasoning_content_missing"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    let lower = body.to_lowercase();
+    REQUEST_REJECTED_MARKERS
+        .iter()
+        .any(|m| lower.contains(&m.to_lowercase()) || body.contains(m))
+}
+
 /// 报告 429 响应体是否为「模型级限流」（该账号该模型额度用尽）。
 pub fn is_model_rate_limited(body: &str) -> bool {
     if envelope_code(body) == Some(MODEL_RATE_CODE) {
@@ -266,6 +318,11 @@ pub fn classify(status: u16, body: &str) -> ErrKind {
     // 放在 429 之后是有意的：429 一律按限流归类，保持既有语义不变。
     if is_context_too_long(body) {
         return ErrKind::ContextTooLong;
+    }
+    // 同为请求侧错误（11155 思维链缺失 / 11140 安全审核）：立即失败，
+    // 不轮转、不罚账号。
+    if is_request_rejected(body) {
+        return ErrKind::RequestRejected;
     }
     if status == 404 {
         return ErrKind::NotFound;
@@ -426,16 +483,11 @@ pub fn friendly_message(kind: ErrKind, status: u16, body: &str) -> String {
     }
 }
 
-/// 把上下文超长的上游响应体提炼成一条**保留原文**的客户端消息。
+/// 把上游统一信封里的 `msg` 与多语言 `displayMsg` 提炼成一条**保留原文**
+/// 的客户端消息（`<msg>（<displayMsg>）`，两者皆缺时回退原始 body）。
 ///
-/// 为什么必须保留上游原文：下游客户端靠文案模式识别上下文溢出
-///（`prompt is too long` / `context_length_exceeded` / `exceeds the model context limit`），
-/// 据此触发自动压缩并重试。若只回我们自己的措辞，客户端就认不出这是溢出，
-/// 只会把它当成普通失败。
-///
-/// 因此输出形如：`<上游 msg>（<中文 displayMsg>）`，两种语言的特征串都在，
-/// 中文提示同时给人类看。上游字段缺失时逐级回退，最终回退到原始 body。
-pub fn context_too_long_message(body: &str) -> String {
+/// 11115 / 11140 / 11155 等请求侧拒绝共用同一个信封形状，因此共用本函数。
+fn envelope_display_message(body: &str) -> String {
     let v = serde_json::from_str::<serde_json::Value>(body).unwrap_or(serde_json::Value::Null);
     let primary = v
         .get("msg")
@@ -472,6 +524,24 @@ pub fn context_too_long_message(body: &str) -> String {
         (false, false) if primary.contains(hint) => primary.to_string(),
         (false, false) => format!("{primary}（{hint}）"),
     }
+}
+
+/// 把上下文超长的上游响应体提炼成一条**保留原文**的客户端消息。
+///
+/// 为什么必须保留上游原文：下游客户端靠文案模式识别上下文溢出
+///（`prompt is too long` / `context_length_exceeded` / `exceeds the model context limit`），
+/// 据此触发自动压缩并重试。若只回我们自己的措辞，客户端就认不出这是溢出，
+/// 只会把它当成普通失败。
+pub fn context_too_long_message(body: &str) -> String {
+    envelope_display_message(body)
+}
+
+/// 把「请求被上游拒绝」（11140 / 11155）的响应体提炼成保留原文的消息。
+///
+/// 与上下文超长同理：原文里的业务语义（safety review / reasoning content）
+/// 对客户端与用户的排查都有用，网关只做信封解包，不改写成「账号不可用」。
+pub fn request_rejected_message(body: &str) -> String {
+    envelope_display_message(body)
 }
 
 /// 按字符边界截断（Go 侧按字节，这里按字符以免切碎 UTF-8）。
@@ -582,6 +652,39 @@ mod tests {
         assert!(msg.contains("对话内容超出模型长度上限"), "{msg}");
     }
 
+    /// 11155 思维链缺失 / 11140 安全审核：请求侧错误，独立成 kind，
+    /// 绝不能落进通用 4xx 去轮转全部账号。
+    #[test]
+    fn request_rejected_detection() {
+        // 11155 实测完整信封（业务码在顶层 code，语义码在 extError.code）
+        let body11155 = r#"{"code":11155,"msg":"the reasoning content from the previous turn must be passed back in thinking mode","extError":{"code":"reasoning_content_missing","type":"invalid_request_error","StatusCode":400}}"#;
+        assert_eq!(classify(400, body11155), ErrKind::RequestRejected);
+        assert!(is_request_rejected(body11155));
+
+        // 只有 extError 语义码（上游改码不改文案时仍能识别）
+        assert!(is_request_rejected(
+            r#"{"extError":{"code":"reasoning_content_missing"}}"#
+        ));
+
+        // 11140 安全审核（HTTP 403，带中英 displayMsg）
+        let body11140 = r#"{"code":11140,"msg":"request illegal","displayMsg":{"en":"The content did not pass the safety review. Please adjust and retry.","zh":"内容未通过安全审核，请调整后重试。"}}"#;
+        assert_eq!(classify(403, body11140), ErrKind::RequestRejected);
+
+        // 文案兜底：缺业务码时英文文案也能命中
+        assert_eq!(
+            classify(
+                403,
+                "The content did not pass the safety review. Please adjust and retry."
+            ),
+            ErrKind::RequestRejected
+        );
+
+        // 消息保留上游原文 + 中文提示
+        let msg = request_rejected_message(body11140);
+        assert!(msg.contains("request illegal"), "{msg}");
+        assert!(msg.contains("内容未通过安全审核"), "{msg}");
+    }
+
     #[test]
     fn reset_time_parsing_utc8() {
         let now = Utc.with_ymd_and_hms(2026, 9, 15, 5, 0, 0).unwrap();
@@ -668,6 +771,7 @@ mod tests {
         assert_eq!(ErrKind::None.as_str(), "none");
         assert_eq!(ErrKind::ModelRate.as_str(), "model_rate");
         assert_eq!(ErrKind::ContextTooLong.as_str(), "context_too_long");
+        assert_eq!(ErrKind::RequestRejected.as_str(), "request_rejected");
     }
 
     #[test]

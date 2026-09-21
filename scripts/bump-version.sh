@@ -31,7 +31,11 @@ done
 # Cargo.lock 里 workspace 各 crate 的 version（只替换紧随包名之后的那一行）。
 # 必须锚定包名：Cargo.lock 里 bit-set / bit-vec / ctor 等第三方 crate 的版本号
 # 也恰好是 0.8.0 这类值，一律全局替换会误伤依赖锁。
-sed -i -E "/^name = \"ai-gateway-(core|gateway|rust|server)\"/{n;s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$V\"/}" Cargo.lock
+#
+# 注意 `router` 必须在候选里：漏掉它会让 Cargo.lock 里 ai-gateway-router 的版本
+# 停在旧值，而 CI 的 `cargo check --workspace` 会因锁文件与清单不一致而失败 ——
+# 现象是「本地 bump 完看着都对，一打 tag 就挂」。
+sed -i -E "/^name = \"ai-gateway-(core|gateway|router|rust|server)\"/{n;s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$V\"/}" Cargo.lock
 
 # 主包 optionalDependencies 引用版本（用 node 解析 JSON，避免正则误伤）
 node -e "

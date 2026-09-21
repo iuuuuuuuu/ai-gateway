@@ -27,6 +27,7 @@ import type {
   GatewayMode,
   GatewayModeSwitchResult,
   GatewayModelItem,
+  GatewayModelsResult,
   GatewayStartResult,
   GatewayStatus,
   GatewayPortCheck,
@@ -741,10 +742,16 @@ export function setAllowedModel(model: string): Promise<GatewayModeSwitchResult>
 // 一键导入：接入本机 AI 客户端
 // ---------------------------------------------------------------------------
 
-/** 获取网关可用模型列表（优先动态查询网关，网关未就绪时回退静态并集）。 */
-export async function getGatewayModels(): Promise<GatewayModelItem[]> {
-  const res = await call<{ models?: GatewayModelItem[] }>("get_gateway_models");
-  return res.models ?? [];
+/**
+ * 获取网关可用模型列表。
+ *
+ * **只返回上游实时清单**：网关侧不再有内置静态表，拉不到就明确失败。
+ * `error` 非空时 `models` 必为空数组 —— 调用方必须把 `error` 显示出来，
+ * 不要渲染成「空的模型选择器」，否则用户分不清是没账号、代理不通还是真没模型。
+ */
+export async function getGatewayModels(): Promise<GatewayModelsResult> {
+  const res = await call<{ models?: GatewayModelItem[]; error?: string | null }>("get_gateway_models");
+  return { models: res.models ?? [], error: res.error ?? null };
 }
 
 /**

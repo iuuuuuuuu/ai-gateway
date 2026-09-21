@@ -17,9 +17,14 @@ use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
 use ai_gateway_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits, export_import,
-    oauth, process, refresh, rotate, session, switch, token_stats, travel, update,
+    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits,
+    export_import, oauth, process, refresh, rotate, session, switch, token_stats, travel, update,
 };
+
+/// Trae / 豆包 / 应用切换的 HTTP 处理器（业务逻辑在 core 的 `apps_ops`）。
+mod apps_api;
+/// 本地代理与计划任务的 HTTP 处理器（业务逻辑在 core 的 `host_ops` / `apps_ops`）。
+mod proxy_api;
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
 /// 前端切 tab 频繁触发命令行导致卡顿/闪窗。
@@ -128,14 +133,147 @@ pub fn router() -> Router {
             "/api/update/config",
             get(api_update_config).post(api_save_update_config),
         )
+        // ---- 应用环境 / 登录态切换（Trae 系 + 豆包）----
+        //
+        // 这一组前端 api.ts 早已登记了 HTTP 路由，但服务端一条都没有：
+        // webui 下账号列表 404 → 页面永远「还没有账号」，导入按钮点了也只是
+        // 弹 404。补上它，Trae / 豆包的账号导入在浏览器形态才真正可用。
+        .route("/api/apps/env", get(apps_api::api_app_env_check))
+        .route(
+            "/api/apps/manual-path",
+            post(apps_api::api_app_set_manual_path),
+        )
+        .route("/api/apps/switch", post(apps_api::api_app_switch_action))
+        .route("/api/apps/progress", get(apps_api::api_app_progress))
+        .route("/api/apps/current", get(apps_api::api_app_current_account))
+        .route("/api/apps/snapshots", get(apps_api::api_app_list_snapshots))
+        .route(
+            "/api/apps/snapshots/delete",
+            post(apps_api::api_app_delete_snapshot),
+        )
+        .route(
+            "/api/apps/settings",
+            get(apps_api::api_get_app_settings).post(apps_api::api_save_app_settings),
+        )
+        // ---- Trae 账号 ----
+        .route("/api/trae/accounts", get(apps_api::api_trae_list_accounts))
+        .route(
+            "/api/trae/accounts/add",
+            post(apps_api::api_trae_add_account),
+        )
+        .route(
+            "/api/trae/accounts/delete",
+            post(apps_api::api_trae_delete_account),
+        )
+        .route("/api/trae/discover", get(apps_api::api_trae_discover_accounts))
+        .route(
+            "/api/trae/discover/import",
+            post(apps_api::api_trae_discover_and_import),
+        )
+        .route(
+            "/api/trae/import-local",
+            post(apps_api::api_trae_import_local),
+        )
+        .route("/api/trae/entitlement", get(apps_api::api_trae_entitlement))
+        .route("/api/trae/device", get(apps_api::api_trae_device_info))
+        .route("/api/trae/checkin", post(apps_api::api_trae_checkin_run))
+        .route(
+            "/api/trae/credits/history",
+            get(apps_api::api_trae_credits_history),
+        )
+        .route(
+            "/api/trae/cooldown/clear",
+            post(apps_api::api_trae_clear_cooldown),
+        )
+        // ---- 豆包账号与凭证 ----
+        .route(
+            "/api/doubao/accounts",
+            get(apps_api::api_doubao_list_accounts),
+        )
+        .route(
+            "/api/doubao/accounts/save",
+            post(apps_api::api_doubao_save_account),
+        )
+        .route(
+            "/api/doubao/accounts/delete",
+            post(apps_api::api_doubao_delete_account),
+        )
+        .route(
+            "/api/doubao/credential",
+            get(apps_api::api_doubao_get_credential).post(apps_api::api_doubao_set_credential),
+        )
+        .route(
+            "/api/doubao/credential/captured",
+            get(apps_api::api_doubao_captured_credential),
+        )
+        .route(
+            "/api/doubao/credential/apply",
+            post(apps_api::api_doubao_credential_auto_apply),
+        )
+        .route("/api/doubao/keepalive", post(apps_api::api_doubao_keepalive))
+        .route("/api/doubao/renew", post(apps_api::api_doubao_renew))
+        .route("/api/doubao/diagnose", get(apps_api::api_doubao_diagnose))
+        .route("/api/doubao/quota", get(apps_api::api_doubao_fetch_quota))
+        .route(
+            "/api/doubao/quota/batch",
+            post(apps_api::api_doubao_quota_batch),
+        )
+        .route("/api/doubao/probe", get(apps_api::api_doubao_probe_account))
+        .route(
+            "/api/doubao/chatdata/backup",
+            post(apps_api::api_doubao_backup_chatdata),
+        )
+        .route(
+            "/api/doubao/chatdata/restore",
+            post(apps_api::api_doubao_restore_chatdata),
+        )
+        .route(
+            "/api/doubao/chatdata/info",
+            get(apps_api::api_doubao_chatdata_info),
+        )
+        .route(
+            "/api/doubao/chats/export",
+            post(apps_api::api_doubao_export_chats),
+        )
+        // ---- 本地 MITM 代理 ----
+        //
+        // 与上面一组同样的问题：前端登记了路由，服务端一条都没有。
+        // 代理本体跑在本服务进程内（见 api/proxy_api.rs 的模块注释）。
+        .route("/api/proxy/config", get(proxy_api::api_proxy_config))
+        .route("/api/proxy/status", get(proxy_api::api_proxy_status))
+        .route("/api/proxy/start", post(proxy_api::api_proxy_start))
+        .route("/api/proxy/stop", post(proxy_api::api_proxy_stop))
+        .route("/api/proxy/cert", get(proxy_api::api_proxy_cert_status))
+        .route(
+            "/api/proxy/cert/generate",
+            post(proxy_api::api_proxy_cert_generate),
+        )
+        .route(
+            "/api/proxy/capture-local",
+            post(proxy_api::api_proxy_capture_local),
+        )
+        .route("/api/proxy/cleanup", post(proxy_api::api_proxy_cleanup))
+        .route(
+            "/api/proxy/parse-upstream",
+            post(proxy_api::api_proxy_parse_upstream),
+        )
+        .route("/api/proxy/progress", get(proxy_api::api_proxy_progress))
+        // ---- 计划任务（schtasks）----
+        .route("/api/tasks/status", get(proxy_api::api_task_status))
+        .route("/api/tasks/register", post(proxy_api::api_task_register))
+        .route(
+            "/api/tasks/unregister",
+            post(proxy_api::api_task_unregister),
+        )
+        .route("/api/tasks/run", post(proxy_api::api_task_run_now))
         .fallback(static_handler)
 }
 
-fn json_ok(v: Value) -> Response {
+pub fn json_ok(v: Value) -> Response {
     Json(v).into_response()
 }
 
-fn json_err(e: String, code: StatusCode) -> Response {
+pub fn json_err(e: String, code: StatusCode) -> Response {
     (code, Json(json!({ "ok": false, "error": e }))).into_response()
 }
 
@@ -950,11 +1088,13 @@ fn gateway_root_and_key() -> (String, String) {
     (format!("http://127.0.0.1:{port}"), api_key)
 }
 
-/// GET /api/gateway/models —— 返回网关支持的模型列表（优先动态查询）。
+/// GET /api/gateway/models —— 返回网关支持的模型列表（**只从上游实时拉取**）。
+///
+/// `error` 非空时 `models` 必为空数组 —— 前端据此显示明确的原因，
+/// 而不是渲染一个空的模型选择器让用户自己猜。
 async fn api_gateway_models() -> Response {
-    json_ok(json!({
-        "models": ai_gateway_core::modules::gateway::fetch_models().await,
-    }))
+    let (models, error) = ai_gateway_core::modules::gateway::fetch_models().await;
+    json_ok(json!({ "models": models, "error": error }))
 }
 
 /// GET /api/gateway/usage?days=7 —— 网关累计 Token 用量（days 省略 = 全部历史）。
@@ -985,9 +1125,51 @@ async fn api_agents_detect() -> Response {
     }))
 }
 
+/// 解析导入请求里的模型列表：兼容两种格式。
+///
+/// - 新格式（推荐）：`["glm-5.2", ...]` 或 `[{ "id": "glm-5.2", "context_window": 1000000 }, ...]`
+/// - 旧格式：纯字符串数组 `["glm-5.2", ...]`（上下文窗口未知）
+///
+/// `context_window` 只接受正整数；缺失 / 0 / 非法值一律记为「未知」，
+/// 由下游决定省略声明 —— 不能编造上下文窗口。
+fn parse_import_models(value: Option<&Value>) -> Vec<ai_gateway_core::modules::agent_import::ModelSpec> {
+    use ai_gateway_core::modules::agent_import::ModelSpec;
+
+    let Some(arr) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    arr.iter()
+        .filter_map(|item| match item {
+            Value::String(id) => {
+                let id = id.trim();
+                if id.is_empty() {
+                    None
+                } else {
+                    Some(ModelSpec::new(id))
+                }
+            }
+            Value::Object(obj) => {
+                let id = obj.get("id").and_then(Value::as_str)?.trim();
+                if id.is_empty() {
+                    return None;
+                }
+                let ctx = obj
+                    .get("context_window")
+                    .or_else(|| obj.get("context_length"))
+                    .and_then(Value::as_u64)
+                    .filter(|v| *v > 0)
+                    .unwrap_or(0);
+                Some(ModelSpec::with_context_window(id, ctx))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// POST /api/gateway/agents/import —— 把网关接入指定客户端（支持多模型）。
 ///
-/// body: { "target": "codex", "models": ["glm-5.2", "deepseek-v4-flash"] }
+/// body: { "target": "codex", "models": ["glm-5.2", { "id": "deepseek-v4-flash", "context_window": 1000000 }] }
 async fn api_agents_import(Json(body): Json<Value>) -> Response {
     let target = body
         .get("target")
@@ -1007,19 +1189,17 @@ async fn api_agents_import(Json(body): Json<Value>) -> Response {
         );
     }
 
-    let models: Vec<String> = match body.get("models").and_then(Value::as_array) {
-        Some(arr) => arr
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(str::to_string)
-            .collect(),
-        None => match body.get("model").and_then(Value::as_str) {
-            Some(m) if !m.trim().is_empty() => vec![m.trim().to_string()],
-            _ => vec!["deepseek-v4-flash".to_string()],
-        },
-    };
+    let mut models = parse_import_models(body.get("models"));
+    if models.is_empty() {
+        models = match body.get("model").and_then(Value::as_str) {
+            Some(m) if !m.trim().is_empty() => {
+                vec![ai_gateway_core::modules::agent_import::ModelSpec::new(m.trim())]
+            }
+            _ => vec![ai_gateway_core::modules::agent_import::ModelSpec::new(
+                "deepseek-v4-flash",
+            )],
+        };
+    }
 
     match ai_gateway_core::modules::agent_import::import_target(&target, &base, &api_key, &models) {
         Ok(outcome) => json_ok(json!({
@@ -1045,16 +1225,12 @@ async fn api_agents_batch_import(Json(body): Json<Value>) -> Response {
         );
     }
 
-    let models: Vec<String> = match body.get("models").and_then(Value::as_array) {
-        Some(arr) => arr
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(str::to_string)
-            .collect(),
-        None => vec!["deepseek-v4-flash".to_string()],
-    };
+    let mut models = parse_import_models(body.get("models"));
+    if models.is_empty() {
+        models = vec![ai_gateway_core::modules::agent_import::ModelSpec::new(
+            "deepseek-v4-flash",
+        )];
+    }
 
     let target_ids: Option<Vec<String>> = body.get("targets").and_then(Value::as_array).map(|arr| {
         arr.iter()
@@ -1082,7 +1258,7 @@ async fn api_agents_batch_import(Json(body): Json<Value>) -> Response {
                 "files": o.files,
                 "models": o.models,
             })).collect::<Vec<_>>(),
-            "models": models,
+            "models": models.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
         })),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }

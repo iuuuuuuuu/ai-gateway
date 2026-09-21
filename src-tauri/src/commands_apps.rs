@@ -4,6 +4,12 @@
 //! 所有业务逻辑都在 `ai_gateway_core::modules` 里 —— core 不依赖 Tauri，
 //! 因此同一套逻辑也能被 HTTP server 形态复用。
 //!
+//! 具体来说，Trae / 豆包 / 应用切换的业务逻辑都在
+//! `ai_gateway_core::modules::apps_ops`：桌面端与 webui 共用同一份实现，
+//! 这里只剩「把 Tauri 参数解包 → 调 apps_ops → 把进度转成 Tauri 事件」。
+//! **不要**把业务逻辑写回这个文件 —— 一旦写回来，webui 就又会漏掉它
+//! （Trae / 豆包的账号导入在浏览器形态长期 404，就是这么来的）。
+//!
 //! ## 为什么这些命令要 `async` + `spawn_blocking`
 //!
 //! 切换账号、备份对话、设备标识重置都会**关闭并启动客户端进程**，耗时可达数十秒。
@@ -13,11 +19,18 @@
 
 use serde_json::{json, Value};
 
-use ai_gateway_core::modules::{
-    app_profile::{profile_for, TargetApp},
-    config, doubao_account, doubao_chats, doubao_quota, doubao_session, scheduler, switcher,
-    trae_account, trae_checkin, trae_device, trae_discover,
-};
+use ai_gateway_core::modules::{apps_ops, config, switcher};
+
+/// 把 `apps_ops` 的进度转发成 Tauri 事件。
+struct EventSink<E: Fn(&str, &str) + Send + Sync> {
+    emit: E,
+}
+
+impl<E: Fn(&str, &str) + Send + Sync> apps_ops::ProgressSink for EventSink<E> {
+    fn step(&self, stage: &str, status: switcher::StepStatus, message: &str) {
+        (self.emit)(stage, &format!("{}|{message}", status.as_str()));
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 环境检测
@@ -26,107 +39,17 @@ use ai_gateway_core::modules::{
 /// 应用安装/运行状态（供界面「环境配置」页）。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn app_env_check(target_app: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let app = TargetApp::parse(&target_app);
-        let store = config::store_dir();
-        let prof = profile_for(app, &store);
-
-        // exe 发现失败不是错误 —— 只是「未安装」，界面据此提示用户手动指定路径
-        let exe = {
-            let args = switcher::RunArgs {
-                action: switcher::Action::BackupCurrent,
-                target_app: app,
-                user_id: None,
-                proxy_port: None,
-                include_indexeddb: false,
-                expected_current_uid: String::new(),
-                store_dir: store.clone(),
-            };
-            let sess = switcher::Session::new(&args);
-            switcher::locate::find_exe(&sess).ok()
-        };
-
-        let snapshot_count = std::fs::read_dir(&prof.profiles_dir)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|e| {
-                        let name = e.file_name().to_string_lossy().to_string();
-                        e.path().is_dir() && name != "last" && !name.ends_with(".bak")
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
-
-        let manual_path = config::app_setting_str(prof.settings_path_key);
-
-        // 运行状态单独算：复用 Session 的档案，避免重复构造
-        let running = {
-            let args = switcher::RunArgs {
-                action: switcher::Action::BackupCurrent,
-                target_app: app,
-                user_id: None,
-                proxy_port: None,
-                include_indexeddb: false,
-                expected_current_uid: String::new(),
-                store_dir: store.clone(),
-            };
-            let sess = switcher::Session::new(&args);
-            switcher::proc::is_running(&sess)
-        };
-
-        Ok(json!({
-            "targetApp": app.as_str(),
-            "appName": prof.app_name,
-            "layout": prof.layout.as_str(),
-            "installed": exe.is_some(),
-            "exePath": exe.map(|p| p.to_string_lossy().to_string()),
-            "dataDir": prof.data_dir.to_string_lossy(),
-            "dataDirExists": prof.data_dir.is_dir(),
-            "profilesDir": prof.profiles_dir.to_string_lossy(),
-            "snapshotCount": snapshot_count,
-            "manualPath": manual_path,
-            "settingsPathKey": prof.settings_path_key,
-            "running": running,
-        }))
-    })
-    .await
-    .map_err(|e| format!("环境检测失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || apps_ops::app_env_check(&target_app))
+        .await
+        .map_err(|e| format!("环境检测失败: {e}"))?
 }
 
 /// 保存应用的手动 exe 路径（空串 = 清除）。
 #[tauri::command(rename_all = "camelCase")]
-pub fn app_set_manual_path(target_app: String, path: String) -> Result<Value, String> {
-    let app = TargetApp::parse(&target_app);
-    let prof = profile_for(app, &config::store_dir());
-    let trimmed = path.trim();
-    if !trimmed.is_empty() {
-        let p = std::path::Path::new(trimmed);
-        if !p.is_file() {
-            return Err(format!("路径不存在或不是文件: {trimmed}"));
-        }
-        if !ai_gateway_core::modules::app_profile::exe_matches(p, &prof) {
-            return Err(format!(
-                "该文件不是 {} 的可执行文件（期望文件名：{}）",
-                prof.app_name,
-                prof.exe_names.join(" 或 ")
-            ));
-        }
-    }
-    config::set_app_setting(prof.settings_path_key, json!(trimmed)).map_err(|e| e.to_string())?;
-    // 路径变了，清掉 exe 缓存，否则下次仍命中旧路径
-    let args = switcher::RunArgs {
-        action: switcher::Action::BackupCurrent,
-        target_app: app,
-        user_id: None,
-        proxy_port: None,
-        include_indexeddb: false,
-        expected_current_uid: String::new(),
-        store_dir: config::store_dir(),
-    };
-    let sess = switcher::Session::new(&args);
-    switcher::locate::clear_exe_cache(&sess, &prof);
-    Ok(json!({ "ok": true }))
+pub async fn app_set_manual_path(target_app: String, path: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || apps_ops::app_set_manual_path(&target_app, &path))
+        .await
+        .map_err(|e| format!("设置安装路径失败: {e}"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -147,95 +70,51 @@ pub async fn switch_action(
     include_indexeddb: Option<bool>,
     expected_current_uid: Option<String>,
 ) -> Result<Value, String> {
-    use tauri::Emitter;
-
-    let act = match action.trim() {
-        "Switch" | "switch" => switcher::Action::Switch,
-        "SaveCurrentLogin" | "save" => switcher::Action::SaveCurrentLogin,
-        "BackupCurrent" | "backup" => switcher::Action::BackupCurrent,
-        "RestoreOnly" | "restore" => switcher::Action::RestoreOnly,
-        "ResetDeviceIds" | "resetDeviceIds" => switcher::Action::ResetDeviceIds,
-        "KeepAlive" | "keepalive" => switcher::Action::KeepAlive,
-        other => return Err(format!("未知动作: {other}")),
+    let req = apps_ops::SwitchRequest {
+        action: action.clone(),
+        target_app: target_app.clone(),
+        user_id: user_id.clone(),
+        proxy_port,
+        include_indexeddb,
+        expected_current_uid,
     };
-    let app_kind = TargetApp::parse(&target_app);
 
     tauri::async_runtime::spawn_blocking(move || {
-        // 事件转发 sink：core 不依赖 Tauri，进度经回调送回宿主
-        struct EventSink {
-            app: tauri::AppHandle,
-        }
-        impl switcher::ProgressSink for EventSink {
-            fn step(&self, stage: &str, status: switcher::StepStatus, message: &str) {
-                let _ = self.app.emit(
+        use tauri::Emitter;
+
+        // 进度转 Tauri 事件；core 不依赖 Tauri，进度经回调送回宿主
+        let progress_app = app.clone();
+        let progress_app_done = app.clone();
+        let emit_action = action.clone();
+        let emit_app = target_app.clone();
+        let emit_user_id = user_id.clone();
+
+        let sink = EventSink {
+            emit: move |stage: &str, message: &str| {
+                let _ = progress_app.emit(
                     "switch-progress",
-                    json!({
-                        "stage": stage,
-                        "status": status.as_str(),
-                        "message": message,
-                    }),
+                    json!({ "stage": stage, "message": message }),
                 );
-            }
-        }
-
-        let collector = switcher::VecSink::new();
-        struct Fanout<'a> {
-            a: &'a dyn switcher::ProgressSink,
-            b: &'a dyn switcher::ProgressSink,
-        }
-        impl switcher::ProgressSink for Fanout<'_> {
-            fn step(&self, stage: &str, status: switcher::StepStatus, message: &str) {
-                self.a.step(stage, status, message);
-                self.b.step(stage, status, message);
-            }
-        }
-
-        let sink_events = EventSink { app: app.clone() };
-        let sink = Fanout {
-            a: &sink_events,
-            b: &collector,
+            },
         };
 
-        let args = switcher::RunArgs {
-            action: act,
-            target_app: app_kind,
-            user_id: user_id.clone(),
-            proxy_port,
-            include_indexeddb: include_indexeddb.unwrap_or(false),
-            expected_current_uid: expected_current_uid.unwrap_or_default(),
-            store_dir: config::store_dir(),
-        };
+        let payload = apps_ops::switch_action(req, &sink)?;
+        let success = payload
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
-        let outcome = switcher::run_action(args, &sink);
-        let payload = match &outcome {
-            Ok(message) => json!({
-                "success": true,
-                "message": message,
-                "steps": collector.steps(),
-            }),
-            Err(error) => json!({
-                "success": false,
-                "error": error,
-                "steps": collector.steps(),
-            }),
-        };
-        let _ = app.emit(
+        let _ = progress_app_done.emit(
             "switch-done",
             json!({
-                "action": action,
-                "targetApp": app_kind.as_str(),
-                "userId": user_id,
-                "success": outcome.is_ok(),
+                "action": emit_action,
+                "targetApp": emit_app,
+                "userId": emit_user_id,
+                "success": success,
                 "raw": payload.to_string(),
             }),
         );
-        outcome.map(|message| {
-            json!({
-                "ok": true,
-                "message": message,
-                "steps": collector.steps(),
-            })
-        })
+        Ok(payload)
     })
     .await
     .map_err(|e| format!("切换任务失败: {e}"))?
@@ -244,95 +123,23 @@ pub async fn switch_action(
 /// 当前登录态属于哪个账号（读 `current_account.txt`）。
 #[tauri::command(rename_all = "camelCase")]
 pub fn current_account(target_app: String) -> Value {
-    let app = TargetApp::parse(&target_app);
-    let args = switcher::RunArgs {
-        action: switcher::Action::BackupCurrent,
-        target_app: app,
-        user_id: None,
-        proxy_port: None,
-        include_indexeddb: false,
-        expected_current_uid: String::new(),
-        store_dir: config::store_dir(),
-    };
-    let sess = switcher::Session::new(&args);
-    json!({ "userId": switcher::get_current_account(&sess) })
+    apps_ops::current_account(&target_app)
 }
 
 /// 列出某应用的登录态快照。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn list_snapshots(target_app: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let app = TargetApp::parse(&target_app);
-        let prof = profile_for(app, &config::store_dir());
-        let Ok(entries) = std::fs::read_dir(&prof.profiles_dir) else {
-            return Ok(json!({ "snapshots": [] }));
-        };
-        let current = {
-            let args = switcher::RunArgs {
-                action: switcher::Action::BackupCurrent,
-                target_app: app,
-                user_id: None,
-                proxy_port: None,
-                include_indexeddb: false,
-                expected_current_uid: String::new(),
-                store_dir: config::store_dir(),
-            };
-            let sess = switcher::Session::new(&args);
-            switcher::get_current_account(&sess)
-        };
-
-        let mut snapshots: Vec<Value> = entries
-            .flatten()
-            .filter(|e| e.path().is_dir())
-            .filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().to_string();
-                // `last` 是安全槽、`*.bak` 是上一代备份，都不是「账号快照」
-                if name == "last" || name.ends_with(".bak") {
-                    return None;
-                }
-                let path = entry.path();
-                Some(json!({
-                    "userId": name,
-                    "isCurrent": name == current,
-                    "modifiedAt": entry
-                        .metadata()
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs()),
-                    "hasMeta": path.join("snapshot_meta.json").exists(),
-                }))
-            })
-            .collect();
-        snapshots.sort_by(|a, b| {
-            b.get("modifiedAt")
-                .and_then(Value::as_i64)
-                .unwrap_or(0)
-                .cmp(&a.get("modifiedAt").and_then(Value::as_i64).unwrap_or(0))
-        });
-        Ok(json!({ "snapshots": snapshots, "currentUserId": current }))
-    })
-    .await
-    .map_err(|e| format!("读取快照列表失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || apps_ops::list_snapshots(&target_app))
+        .await
+        .map_err(|e| format!("读取快照列表失败: {e}"))?
 }
 
 /// 删除某个账号的登录态快照（含 `.bak`）。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn delete_snapshot(target_app: String, user_id: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        doubao_account::ensure_uid_safe(&user_id)?;
-        let app = TargetApp::parse(&target_app);
-        let prof = profile_for(app, &config::store_dir());
-        let slot = prof.slot_dir(&user_id);
-        if !slot.exists() {
-            return Err(format!("账号 {user_id} 没有快照"));
-        }
-        std::fs::remove_dir_all(&slot).map_err(|e| format!("删除快照失败: {e}"))?;
-        let _ = std::fs::remove_dir_all(prof.profiles_dir.join(format!("{user_id}.bak")));
-        Ok(json!({ "ok": true }))
-    })
-    .await
-    .map_err(|e| format!("删除快照失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || apps_ops::delete_snapshot(&target_app, &user_id))
+        .await
+        .map_err(|e| format!("删除快照失败: {e}"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -342,28 +149,9 @@ pub async fn delete_snapshot(target_app: String, user_id: String) -> Result<Valu
 /// Trae 账号列表（JWT 已脱敏）。
 #[tauri::command]
 pub async fn trae_list_accounts() -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let accounts: Vec<Value> = trae_account::load_accounts()
-            .iter()
-            .map(trae_account::account_meta)
-            .collect();
-        let cooldowns = trae_checkin::all_cooldowns();
-        // 把冷却信息并进账号元数据，界面一次请求就能渲染完整状态
-        let accounts: Vec<Value> = accounts
-            .into_iter()
-            .map(|mut acc| {
-                if let Some(uid) = acc.get("userId").and_then(Value::as_str) {
-                    if let Some(cd) = cooldowns.get(uid) {
-                        acc["cooldown"] = cd.clone();
-                    }
-                }
-                acc
-            })
-            .collect();
-        json!({ "accounts": accounts })
-    })
-    .await
-    .map_err(|e| format!("读取 Trae 账号失败: {e}"))
+    tauri::async_runtime::spawn_blocking(apps_ops::trae_list_accounts)
+        .await
+        .map_err(|e| format!("读取 Trae 账号失败: {e}"))
 }
 
 /// 手动添加/更新 Trae 账号（粘贴 JWT）。
@@ -374,17 +162,7 @@ pub async fn trae_add_account(
     refresh_token: Option<String>,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let info = trae_account::parse_jwt(&jwt);
-        let uid = info
-            .user_id
-            .ok_or_else(|| "无法从 JWT 解析出账号 id，请确认粘贴的是完整的 Cloud-IDE-JWT".to_string())?;
-        let acc = trae_account::upsert_account(
-            &uid,
-            name.as_deref(),
-            &jwt,
-            refresh_token.as_deref(),
-        )?;
-        Ok(json!({ "ok": true, "account": trae_account::account_meta(&acc) }))
+        apps_ops::trae_add_account(&jwt, name.as_deref(), refresh_token.as_deref())
     })
     .await
     .map_err(|e| format!("添加 Trae 账号失败: {e}"))?
@@ -393,59 +171,49 @@ pub async fn trae_add_account(
 /// 删除 Trae 账号。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn trae_delete_account(user_id: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        trae_account::delete_account(&user_id)?;
-        Ok(json!({ "ok": true }))
-    })
-    .await
-    .map_err(|e| format!("删除 Trae 账号失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || apps_ops::trae_delete_account(&user_id))
+        .await
+        .map_err(|e| format!("删除 Trae 账号失败: {e}"))?
 }
 
 /// 发现本机登录过的 Trae 账号（双应用）。
 #[tauri::command]
 pub async fn trae_discover_accounts() -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let discovered = trae_discover::discover_all();
-        json!({
-            "accounts": discovered,
-            "apps": [
-                { "kind": "TraeWork", "label": "Trae Work" },
-                { "kind": "Trae", "label": "Trae" },
-            ],
-        })
-    })
-    .await
-    .map_err(|e| format!("发现本机 Trae 账号失败: {e}"))
+    tauri::async_runtime::spawn_blocking(apps_ops::trae_discover_accounts)
+        .await
+        .map_err(|e| format!("发现本机 Trae 账号失败: {e}"))
+}
+
+/// 从本机登录态导入 Trae 账号（解客户端本地 Cookies，无需开客户端/代理）。
+#[tauri::command]
+pub async fn trae_import_local() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(apps_ops::trae_import_local)
+        .await
+        .map_err(|e| format!("导入本机 Trae 登录态失败: {e}"))?
+}
+
+/// 发现本机 Trae 账号并立即导入凭证（发现即补全）。
+#[tauri::command]
+pub async fn trae_discover_and_import() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(apps_ops::trae_discover_and_import)
+        .await
+        .map_err(|e| format!("发现并导入 Trae 账号失败: {e}"))
 }
 
 /// 读取某个应用的套餐身份。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn trae_entitlement(app_kind: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        trae_discover::read_entitlement(&app_kind).unwrap_or_else(|| json!({}))
-    })
-    .await
-    .map_err(|e| format!("读取套餐信息失败: {e}"))
+    tauri::async_runtime::spawn_blocking(move || apps_ops::trae_entitlement(&app_kind))
+        .await
+        .map_err(|e| format!("读取套餐信息失败: {e}"))
 }
 
 /// 读取/重置账号的设备指纹。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn trae_device_info(user_id: String, reset: Option<bool>) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let device = if reset.unwrap_or(false) {
-            trae_device::reset_device_for(&user_id)
-        } else {
-            trae_device::resolve_device(&user_id)
-        };
-        Ok(json!({
-            "userId": user_id,
-            "deviceId": device.device_id,
-            "sessionId": device.session_id,
-            "marketUserId": device.market_user_id,
-        }))
-    })
-    .await
-    .map_err(|e| format!("读取设备指纹失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || apps_ops::trae_device_info(&user_id, reset))
+        .await
+        .map_err(|e| format!("读取设备指纹失败: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -461,78 +229,29 @@ pub async fn trae_checkin_run(
 ) -> Result<Value, String> {
     use tauri::Emitter;
 
-    let accounts: Vec<Value> = match user_ids.filter(|ids| !ids.is_empty()) {
-        Some(ids) => trae_account::load_accounts()
-            .into_iter()
-            .filter(|a| {
-                a.get("user_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|uid| ids.iter().any(|i| i == uid))
-            })
-            .collect(),
-        None => trae_account::load_accounts(),
-    };
-    if accounts.is_empty() {
-        return Err("没有可签到的 Trae 账号".to_string());
-    }
-
-    let total = accounts.len();
-    let _ = app.emit("checkin-progress", json!({ "type": "start", "total": total }));
-
-    let summary = trae_checkin::run_round(&accounts, retry.unwrap_or(1)).await;
-
     // 逐账号推送进度（前端据此实时刷新列表）
-    for (index, outcome) in summary.outcomes.iter().enumerate() {
-        let _ = app.emit(
-            "checkin-progress",
-            json!({
-                "type": "account",
-                "index": index,
-                "userId": outcome.user_id,
-                "name": outcome.name,
-                "status": outcome.status,
-                "code": outcome.code,
-                "message": outcome.message,
-                "credits": outcome.credits,
-                "delta": outcome.delta,
-                "errorType": outcome.error_type,
-                "cooldownUntil": outcome.cooldown_until,
-            }),
-        );
-    }
-    let result = summary.to_json();
-    let _ = app.emit(
-        "checkin-progress",
-        json!({
-            "type": "done",
-            "ok": summary.ok,
-            "already": summary.already,
-            "failed": summary.failed,
-            "skipped": summary.skipped,
-        }),
-    );
-    Ok(result)
+    let sink = EventSink {
+        emit: move |stage: &str, message: &str| {
+            let _ = app.emit("checkin-progress", json!({ "stage": stage, "data": message }));
+        },
+    };
+    apps_ops::trae_checkin_run(user_ids, retry, &sink).await
 }
 
 /// Trae 签到历史（积分趋势）。
 #[tauri::command]
 pub async fn trae_credits_history() -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        json!({ "records": trae_checkin::load_credits_history() })
-    })
-    .await
-    .map_err(|e| format!("读取积分历史失败: {e}"))
+    tauri::async_runtime::spawn_blocking(apps_ops::trae_credits_history)
+        .await
+        .map_err(|e| format!("读取积分历史失败: {e}"))
 }
 
 /// 清除某账号的签到冷却。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn trae_clear_cooldown(user_id: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        trae_checkin::clear_cooldown(&user_id);
-        Ok(json!({ "ok": true }))
-    })
-    .await
-    .map_err(|e| format!("清除冷却失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || apps_ops::trae_clear_cooldown(&user_id))
+        .await
+        .map_err(|e| format!("清除冷却失败: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -542,18 +261,9 @@ pub async fn trae_clear_cooldown(user_id: String) -> Result<Value, String> {
 /// 豆包账号列表（凭证已脱敏）。
 #[tauri::command]
 pub async fn doubao_list_accounts() -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let accounts: Vec<Value> = doubao_account::load_accounts()
-            .iter()
-            .map(doubao_account::account_view)
-            .collect();
-        json!({
-            "accounts": accounts,
-            "lastKeepaliveAt": doubao_account::last_keepalive_at(),
-        })
-    })
-    .await
-    .map_err(|e| format!("读取豆包账号失败: {e}"))
+    tauri::async_runtime::spawn_blocking(apps_ops::doubao_list_accounts)
+        .await
+        .map_err(|e| format!("读取豆包账号失败: {e}"))
 }
 
 /// 新增/更新豆包账号。
@@ -564,13 +274,7 @@ pub async fn doubao_save_account(
     note: Option<String>,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let acc = doubao_account::upsert_account(
-            &user_id,
-            name.as_deref(),
-            note.as_deref(),
-            true,
-        )?;
-        Ok(json!({ "ok": true, "account": doubao_account::account_view(&acc) }))
+        apps_ops::doubao_save_account(&user_id, name.as_deref(), note.as_deref())
     })
     .await
     .map_err(|e| format!("保存豆包账号失败: {e}"))?
@@ -579,29 +283,17 @@ pub async fn doubao_save_account(
 /// 删除豆包账号。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn doubao_delete_account(user_id: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        doubao_account::delete_account(&user_id)?;
-        Ok(json!({ "ok": true }))
-    })
-    .await
-    .map_err(|e| format!("删除豆包账号失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || apps_ops::doubao_delete_account(&user_id))
+        .await
+        .map_err(|e| format!("删除豆包账号失败: {e}"))?
 }
 
 /// 读取账号的**明文**凭证（仅供编辑弹窗回填；界面需自行脱敏展示）。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn doubao_get_credential(user_id: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let acc = doubao_account::find_account(&user_id)
-            .ok_or_else(|| "账号不存在".to_string())?;
-        Ok(json!({
-            "userId": user_id,
-            "sessionId": acc.get("session_id"),
-            "sidGuard": acc.get("sid_guard"),
-            "ttwid": acc.get("ttwid"),
-        }))
-    })
-    .await
-    .map_err(|e| format!("读取凭证失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || apps_ops::doubao_get_credential(&user_id))
+        .await
+        .map_err(|e| format!("读取凭证失败: {e}"))?
 }
 
 /// 设置账号凭证。
@@ -613,15 +305,12 @@ pub async fn doubao_set_credential(
     ttwid: Option<String>,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let acc = doubao_account::apply_credential(
+        apps_ops::doubao_set_credential(
             &user_id,
             session_id.as_deref(),
             sid_guard.as_deref(),
             ttwid.as_deref(),
-            "manual",
-            true,
-        )?;
-        Ok(json!({ "ok": true, "account": doubao_account::account_view(&acc) }))
+        )
     })
     .await
     .map_err(|e| format!("设置凭证失败: {e}"))?
@@ -630,77 +319,40 @@ pub async fn doubao_set_credential(
 /// 读取最近一次抓包凭证（供「从代理抓包自动填充」按钮）。
 #[tauri::command]
 pub async fn doubao_captured_credential() -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(|| match doubao_account::load_captured() {
-        Some(captured) => {
-            let sid = captured
-                .get("session_id")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            json!({
-                "available": true,
-                "uid": captured.get("uid"),
-                "host": captured.get("host"),
-                "capturedAt": captured.get("captured_at"),
-                // 回填按钮需要明文才能填进输入框；仅本机、仅此一处
-                "sessionId": sid,
-                "sidGuard": captured.get("sid_guard"),
-                "ttwid": captured.get("ttwid"),
-            })
-        }
-        None => json!({ "available": false }),
-    })
-    .await
-    .map_err(|e| format!("读取抓包凭证失败: {e}"))
+    tauri::async_runtime::spawn_blocking(apps_ops::doubao_captured_credential)
+        .await
+        .map_err(|e| format!("读取抓包凭证失败: {e}"))
 }
 
 /// 把抓包凭证回写到账号池（幂等：无变化返回 `applied: false`）。
 #[tauri::command]
 pub async fn doubao_credential_auto_apply() -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(|| match doubao_account::auto_apply_captured()? {
-        Some(account) => Ok(json!({ "applied": true, "account": account })),
-        None => Ok(json!({ "applied": false })),
-    })
-    .await
-    .map_err(|e| format!("回写凭证失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(apps_ops::doubao_credential_auto_apply)
+        .await
+        .map_err(|e| format!("回写凭证失败: {e}"))?
 }
 
 /// 会话保活（启动客户端 → 等待 → 关闭，触发服务端滑动续期）。
-#[tauri::command(rename_all = "camelCase")]
+#[tauri::command]
 pub async fn doubao_keepalive(app: tauri::AppHandle) -> Result<Value, String> {
     use tauri::Emitter;
 
+    let app_done = app.clone();
+    let sink = EventSink {
+        emit: move |stage: &str, message: &str| {
+            let _ = app.emit(
+                "keepalive-progress",
+                json!({ "stage": stage, "message": message }),
+            );
+        },
+    };
     tauri::async_runtime::spawn_blocking(move || {
-        struct EventSink {
-            app: tauri::AppHandle,
-        }
-        impl switcher::ProgressSink for EventSink {
-            fn step(&self, stage: &str, status: switcher::StepStatus, message: &str) {
-                let _ = self.app.emit(
-                    "keepalive-progress",
-                    json!({ "stage": stage, "status": status.as_str(), "message": message }),
-                );
-            }
-        }
-
-        let args = switcher::RunArgs {
-            action: switcher::Action::KeepAlive,
-            target_app: TargetApp::Doubao,
-            user_id: None,
-            proxy_port: None,
-            include_indexeddb: false,
-            expected_current_uid: String::new(),
-            store_dir: config::store_dir(),
-        };
-        let sink = EventSink { app: app.clone() };
-        let outcome = switcher::run_action(args, &sink);
-        if outcome.is_ok() {
-            let _ = doubao_account::set_last_keepalive(&config::utc_iso());
-        }
-        let _ = app.emit(
+        let outcome = apps_ops::doubao_keepalive(&sink);
+        let _ = app_done.emit(
             "keepalive-done",
             json!({ "success": outcome.is_ok(), "raw": format!("{outcome:?}") }),
         );
-        outcome.map(|message| json!({ "ok": true, "message": message }))
+        outcome
     })
     .await
     .map_err(|e| format!("保活任务失败: {e}"))?
@@ -709,14 +361,13 @@ pub async fn doubao_keepalive(app: tauri::AppHandle) -> Result<Value, String> {
 /// HTTP 续期探活（诊断/续期；`syncOnly` 为真时只做诊断）。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn doubao_renew(sync_only: Option<bool>) -> Result<Value, String> {
-    let summary = doubao_session::run_renewal(sync_only.unwrap_or(false)).await;
-    Ok(summary.to_json())
+    Ok(apps_ops::doubao_renew(sync_only.unwrap_or(false)).await)
 }
 
 /// 会话与凭证诊断。
 #[tauri::command]
 pub async fn doubao_diagnose() -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(|| Ok(doubao_session::diagnose()))
+    tauri::async_runtime::spawn_blocking(move || Ok(apps_ops::doubao_diagnose()))
         .await
         .map_err(|e| format!("诊断失败: {e}"))?
 }
@@ -724,37 +375,25 @@ pub async fn doubao_diagnose() -> Result<Value, String> {
 /// 查询单个账号的会员额度。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn doubao_fetch_quota(user_id: String) -> Result<Value, String> {
-    let parsed = doubao_quota::fetch_single(&user_id).await?;
-    let view = doubao_quota::to_view(&user_id, &parsed);
-    // 写回额度缓存，账号列表无需重复查询
-    let level = parsed.level.clone();
-    let expire = parsed.expire_at.clone();
-    let summary = parsed.summary();
-    let _ = doubao_account::mutate_account(&user_id, |obj| {
-        obj.insert("quota_level".to_string(), json!(level));
-        obj.insert("quota_expire_at".to_string(), json!(expire));
-        obj.insert("quota_summary".to_string(), json!(summary));
-        obj.insert("quota_checked_at".to_string(), json!(config::utc_iso()));
-    });
-    Ok(view)
+    apps_ops::doubao_fetch_quota(&user_id).await
 }
 
 /// 批量巡检全部账号的额度。
 #[tauri::command]
 pub async fn doubao_quota_batch() -> Result<Value, String> {
-    Ok(doubao_quota::run_batch().await)
+    Ok(apps_ops::doubao_quota_batch().await)
 }
 
 /// 账号会话探活。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn doubao_probe_account(user_id: String) -> Result<Value, String> {
-    Ok(doubao_quota::probe_account(&user_id).await)
+    Ok(apps_ops::doubao_probe_account(&user_id).await)
 }
 
 /// 备份账号的客户端对话状态。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn doubao_backup_chatdata(user_id: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || doubao_chats::backup_chatdata(&user_id))
+    tauri::async_runtime::spawn_blocking(move || apps_ops::doubao_backup_chatdata(&user_id))
         .await
         .map_err(|e| format!("备份对话失败: {e}"))?
 }
@@ -762,7 +401,7 @@ pub async fn doubao_backup_chatdata(user_id: String) -> Result<Value, String> {
 /// 恢复账号的客户端对话状态。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn doubao_restore_chatdata(user_id: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || doubao_chats::restore_chatdata(&user_id))
+    tauri::async_runtime::spawn_blocking(move || apps_ops::doubao_restore_chatdata(&user_id))
         .await
         .map_err(|e| format!("恢复对话失败: {e}"))?
 }
@@ -770,7 +409,7 @@ pub async fn doubao_restore_chatdata(user_id: String) -> Result<Value, String> {
 /// 查询账号的对话备份信息。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn doubao_chatdata_info(user_id: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || Ok(doubao_chats::chatdata_info(&user_id)))
+    tauri::async_runtime::spawn_blocking(move || Ok(apps_ops::doubao_chatdata_info(&user_id)))
         .await
         .map_err(|e| format!("读取备份信息失败: {e}"))?
 }
@@ -782,12 +421,7 @@ pub async fn doubao_export_chats(
     limit_convs: Option<usize>,
     max_pages: Option<usize>,
 ) -> Result<Value, String> {
-    doubao_chats::export_account(
-        &user_id,
-        limit_convs.unwrap_or(50),
-        max_pages.unwrap_or(10),
-    )
-    .await
+    apps_ops::doubao_export_chats(&user_id, limit_convs, max_pages).await
 }
 
 /// 读取应用设置。
@@ -806,35 +440,21 @@ pub fn save_app_settings(patch: Value) -> Result<Value, String> {
 // 计划任务（Windows schtasks）
 // ---------------------------------------------------------------------------
 
-/// 把界面传来的任务标识解析成 [`scheduler::TaskKind`]。
-fn parse_task_kind(kind: &str) -> Result<scheduler::TaskKind, String> {
-    scheduler::TaskKind::ALL
-        .iter()
-        .find(|k| k.launcher_name() == kind.trim() || k.task_name() == kind.trim())
-        .copied()
-        .ok_or_else(|| format!("未知任务: {kind}"))
-}
-
 /// 查询全部计划任务的注册状态。
 #[tauri::command]
 pub async fn task_status() -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        // schtasks 是子进程调用（可达数秒），必须离开主线程，
-        // 否则设置页一打开界面就卡住。
-        Ok(json!({ "tasks": scheduler::all_task_status() }))
-    })
-    .await
-    .map_err(|e| format!("查询计划任务失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(apps_ops::task_status)
+        .await
+        .map_err(|e| format!("查询计划任务失败: {e}"))
 }
 
 /// 注册（或覆盖）一个每日计划任务。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn task_register(kind: String, time: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let task = parse_task_kind(&kind)?;
+        // 桌面端用**自己的** exe：它以 `--task-run <key>` 触发任务
         let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
-        let message = scheduler::register_daily_task(task, &time, &exe, &config::store_dir())?;
-        Ok(json!({ "ok": true, "message": message }))
+        apps_ops::task_register(&kind, &time, &exe)
     })
     .await
     .map_err(|e| format!("注册计划任务失败: {e}"))?
@@ -843,25 +463,15 @@ pub async fn task_register(kind: String, time: String) -> Result<Value, String> 
 /// 删除计划任务。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn task_unregister(kind: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let task = parse_task_kind(&kind)?;
-        scheduler::unregister_task(task)?;
-        Ok(json!({ "ok": true }))
-    })
-    .await
-    .map_err(|e| format!("删除计划任务失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || apps_ops::task_unregister(&kind))
+        .await
+        .map_err(|e| format!("删除计划任务失败: {e}"))?
 }
 
 /// 立即执行一次任务（不依赖计划任务，用于验证配置是否正确）。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn task_run_now(kind: String) -> Result<Value, String> {
-    let task = parse_task_kind(&kind)?;
-    let key = task.cli_key().to_string();
-    // 任务内部会跑 HTTP 请求或启停客户端，必须在 blocking 线程里同步跑完
-    tauri::async_runtime::spawn_blocking(move || {
-        let code = ai_gateway_core::modules::cli_task::run_cli_task(&key);
-        Ok(json!({ "ok": code == 0, "exitCode": code }))
-    })
-    .await
-    .map_err(|e| format!("执行任务失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || apps_ops::task_run_now(&kind))
+        .await
+        .map_err(|e| format!("执行任务失败: {e}"))?
 }

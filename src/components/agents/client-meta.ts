@@ -54,7 +54,8 @@ const CLIENT_METAS: Record<string, ClientMeta> = {
   codex: {
     protocol: "OpenAI Responses",
     protocolBadge: "POST /v1/responses",
-    description: "Codex CLI 终端助手。完美兼容 0.146+ 版本强制要求的 Responses API 协议。",
+    description:
+      "Codex CLI 终端助手。完美兼容 0.146+ 版本强制要求的 Responses API 协议；凭据走 provider 内联 bearer，不改动 auth.json 与 ChatGPT 登录态。",
   },
   dsh: {
     protocol: "OpenAI Chat",

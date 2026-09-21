@@ -171,6 +171,23 @@ fn responses_session_key(req: &ResponsesRequest) -> String {
 /// `input` 有两种形态：
 /// - 纯字符串：直接当 user 消息
 /// - item 数组：逐条按 `type` 分派
+///
+/// # reasoning 条目的回传（思考模式多轮对话的硬性要求）
+///
+/// Codex 桌面端配置了 `disable_response_storage = true`，每轮都会把**完整历史**
+/// 原样回传，其中上一轮的思维链是独立的 `reasoning` item：
+/// `{"type":"reasoning","content":[{"type":"reasoning_text","text":"..."}],"summary":[]}`。
+///
+/// 上游（DeepSeek / 腾讯云系思考模型）在思考模式下要求：**思维链必须作为
+/// 对应 assistant 消息的 `reasoning_content` 字段随历史回传**，缺失即
+/// HTTP 400 code=11155 `reasoning_content_missing`。因此这里不能再丢弃
+/// reasoning item，而是把正文暂存起来，挂到紧随其后的 assistant 轮次
+/// （assistant 消息或 function_call）上。
+///
+/// 同一 assistant 轮次在 Responses 线里可能平铺成多个 item
+///（reasoning + 正文 message + 若干并行 function_call），转回 Chat 形态时
+/// 合并成**一条** assistant 消息 —— 这正是上游当初下发的原始形状
+///（一条消息同时带 content / tool_calls / reasoning_content）。
 pub fn responses_input_to_messages(input: Option<&Value>) -> Result<Vec<Value>, String> {
     let Some(input) = input else {
         return Ok(Vec::new());
@@ -180,22 +197,57 @@ pub fn responses_input_to_messages(input: Option<&Value>) -> Result<Vec<Value>, 
         Value::String(text) => Ok(vec![json!({"role": "user", "content": text})]),
         Value::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
+            // 暂存待挂载的推理正文；多个连续 reasoning item 的正文以空行拼接。
+            let mut pending_reasoning = String::new();
             for item in items {
                 let Some(obj) = item.as_object() else { continue };
                 match str_field(obj, "type").as_str() {
                     "message" => {
-                        if let Some(msg) = responses_message_to_chat(obj) {
+                        let Some(mut msg) = responses_message_to_chat(obj) else {
+                            continue;
+                        };
+                        if str_field(obj, "role").eq_ignore_ascii_case("assistant") {
+                            attach_pending_reasoning(&mut msg, &mut pending_reasoning);
+                            out.push(msg);
+                        } else {
+                            // reasoning_content 只能挂在 assistant 消息上；
+                            // 前面若有找不到归属的孤立推理，在这里放弃。
+                            pending_reasoning.clear();
                             out.push(msg);
                         }
                     }
-                    "function_call" => out.push(responses_function_call_to_chat(obj)),
-                    "function_call_output" => out.push(responses_function_output_to_chat(obj)),
-                    // 推理条目不回转给上游：上游不接受该形状，
-                    // 且内容已体现在后续 assistant 消息里。
-                    "reasoning" => {}
+                    "function_call" => {
+                        let mut msg = responses_function_call_to_chat(obj);
+                        attach_pending_reasoning(&mut msg, &mut pending_reasoning);
+                        // 与上一条 assistant 消息合并（同轮正文 + 并行工具调用）。
+                        if out.last().is_some_and(is_assistant_message) {
+                            if let Some(prev) = out.last_mut() {
+                                merge_tool_calls(prev, &msg);
+                            }
+                        } else {
+                            out.push(msg);
+                        }
+                    }
+                    "function_call_output" => {
+                        // tool 应答不携带推理；正常情况下 pending 已被前面的
+                        // function_call 消费，这里只防御孤立场景。
+                        pending_reasoning.clear();
+                        out.push(responses_function_output_to_chat(obj))
+                    }
+                    // 推理条目：正文暂存，等待下一个 assistant 轮次挂载。
+                    "reasoning" => {
+                        let text = responses_reasoning_text(obj);
+                        if !text.is_empty() {
+                            if !pending_reasoning.is_empty() {
+                                pending_reasoning.push_str("\n\n");
+                            }
+                            pending_reasoning.push_str(&text);
+                        }
+                    }
                     // 缺 type 时按 message 兜底（部分客户端省略）。
                     "" => {
                         if let Some(msg) = responses_message_to_chat(obj) {
+                            pending_reasoning.clear();
                             out.push(msg);
                         }
                     }
@@ -206,6 +258,88 @@ pub fn responses_input_to_messages(input: Option<&Value>) -> Result<Vec<Value>, 
         }
         _ => Err("invalid responses input items".into()),
     }
+}
+
+/// 判断消息是否为 assistant 角色。
+fn is_assistant_message(v: &Value) -> bool {
+    v.get("role")
+        .and_then(|r| r.as_str())
+        .is_some_and(|r| r.eq_ignore_ascii_case("assistant"))
+}
+
+/// 把暂存的推理正文挂到 assistant 消息的 `reasoning_content` 字段上。
+///
+/// 挂载后清空暂存：一条思维链只属于一个 assistant 轮次，不能重复下发。
+fn attach_pending_reasoning(msg: &mut Value, pending: &mut String) {
+    if pending.is_empty() {
+        return;
+    }
+    if let Some(obj) = msg.as_object_mut() {
+        // 已有该字段时不覆盖（防御异常输入里的重复 reasoning）。
+        obj.entry("reasoning_content")
+            .or_insert_with(|| Value::String(std::mem::take(pending)));
+    }
+    pending.clear();
+}
+
+/// 把 `src`（function_call 转成的 assistant 消息）的 tool_calls 合并进 `dst`。
+///
+/// `src` 只有 role + tool_calls，没有正文字段；dst 可能带 content /
+/// reasoning_content，两者保持不动。
+fn merge_tool_calls(dst: &mut Value, src: &Value) {
+    let Some(src_calls) = src.get("tool_calls").and_then(|v| v.as_array()) else {
+        return;
+    };
+    if let Some(dst_obj) = dst.as_object_mut() {
+        let merged = match dst_obj.remove("tool_calls") {
+            Some(Value::Array(existing)) => existing
+                .iter()
+                .cloned()
+                .chain(src_calls.iter().cloned())
+                .collect::<Vec<_>>(),
+            _ => src_calls.clone(),
+        };
+        dst_obj.insert("tool_calls".into(), Value::Array(merged));
+    }
+}
+
+/// 从 Responses `reasoning` item 提取明文思维链。
+///
+/// 优先取 `content` 里的 `reasoning_text` 分片（Codex 回传的形状）；
+/// 没有明文 content 时退回 `summary` 里的 `summary_text`（兼容只带摘要的
+/// 客户端）；两者都没有（例如官方服务只给 `encrypted_content`）则返回空串，
+/// 此时没有可回传的内容，与上游不接收该形状的事实一致。
+fn responses_reasoning_text(item: &Map<String, Value>) -> String {
+    let text = reasoning_piece_text(item.get("content"), "reasoning_text");
+    if !text.is_empty() {
+        return text;
+    }
+    reasoning_piece_text(item.get("summary"), "summary_text")
+}
+
+/// 拼接 reasoning content/summary 数组里指定类型分片的文本。
+fn reasoning_piece_text(v: Option<&Value>, piece_type: &str) -> String {
+    let pieces = match v {
+        Some(Value::String(s)) => return s.clone(),
+        Some(Value::Array(a)) => a,
+        // 单个分片对象也容忍。
+        Some(Value::Object(_)) => {
+            return reasoning_piece_text(
+                Some(&Value::Array(vec![v.cloned().unwrap_or(Value::Null)])),
+                piece_type,
+            );
+        }
+        _ => return String::new(),
+    };
+    let mut out = String::new();
+    for piece in pieces {
+        let Some(m) = piece.as_object() else { continue };
+        let ty = str_field(m, "type");
+        if ty == piece_type || ty.is_empty() {
+            out.push_str(&str_field(m, "text"));
+        }
+    }
+    out
 }
 
 /// 转换一条 Responses message item。
@@ -244,10 +378,19 @@ fn responses_content_to_chat(v: Option<&Value>) -> Option<Value> {
                     }
                     "input_image" => {
                         text_only = false;
-                        parts.push(json!({
+                        // `detail` 必须随分片下发：Codex 对图片一律发
+                        // `detail: "high"`，丢弃它会让上游按默认档（low/auto）
+                        // 处理，小图与截图里的细节被降采样掉，表现为模型看不清
+                        // 图里的内容。未携带时保持省略，交给上游默认。
+                        let mut part = json!({
                             "type": "image_url",
                             "image_url": {"url": str_field(m, "image_url")},
-                        }));
+                        });
+                        let detail = str_field(m, "detail");
+                        if !detail.is_empty() {
+                            part["detail"] = json!(detail);
+                        }
+                        parts.push(part);
                     }
                     _ => {}
                 }
@@ -365,6 +508,25 @@ pub fn chat_to_responses(chat: &Map<String, Value>, model: &str) -> Value {
     };
 
     let mut output: Vec<Value> = Vec::new();
+    // 非流式聚合（见 upstream/sse.rs 的 aggregate）会把推理累计在 message
+    // 的 `reasoning_content` 里；这里还原成与流式转换同构的 reasoning 输出项，
+    // 保证两条入口给客户端的 output 形状一致。
+    let reasoning = chat
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("reasoning_content"))
+        .and_then(|r| r.as_str())
+        .unwrap_or("");
+    if !reasoning.is_empty() {
+        output.push(json!({
+            "id": format!("rs0_{id}"),
+            "type": "reasoning",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": reasoning}],
+        }));
+    }
     let text = chat_message_text(chat);
     if !text.is_empty() {
         output.push(json!({
@@ -499,6 +661,26 @@ mod tests {
         assert_eq!(parts[0]["type"], json!("text"));
         assert_eq!(parts[1]["type"], json!("image_url"));
         assert_eq!(parts[1]["image_url"]["url"], json!("data:image/png;base64,AAA"));
+        // 未携带 detail 时不得凭空补一个档位，交给上游默认。
+        assert!(parts[1].get("detail").is_none(), "{parts:?}");
+    }
+
+    /// Codex 对图片发 `detail: "high"`，必须原样透传。
+    ///
+    /// 丢弃它会让上游按默认档降采样，截图/小图里的细节被抹掉 ——
+    /// 用户看到的现象是「模型看不清图」。
+    #[test]
+    fn image_detail_is_preserved() {
+        let input = json!([{
+            "type": "message", "role": "user",
+            "content": [
+                {"type": "input_text", "text": "look"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAA", "detail": "high"}
+            ]
+        }]);
+        let msgs = responses_input_to_messages(Some(&input)).unwrap();
+        let parts = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(parts[1]["detail"], json!("high"), "{parts:?}");
     }
 
     /// function_call / function_call_output 的配对转换。
@@ -518,16 +700,110 @@ mod tests {
         assert_eq!(msgs[1]["content"], json!("result"));
     }
 
-    /// reasoning 条目必须丢弃（上游不接受该形状）。
+    /// 无正文的 reasoning 条目（如只有空 summary / 仅加密内容）不产生消息，
+    /// 也不影响后续 user 消息。
     #[test]
-    fn reasoning_items_are_dropped() {
+    fn empty_reasoning_items_are_ignored() {
         let input = json!([
-            {"type": "reasoning", "summary": []},
+            {"type": "reasoning", "summary": [], "content": [], "encrypted_content": null},
             {"type": "message", "role": "user", "content": "x"}
         ]);
         let msgs = responses_input_to_messages(Some(&input)).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], json!("user"));
+    }
+
+    /// reasoning 正文必须挂到紧随其后的 assistant 消息的 reasoning_content
+    /// 字段上（思考模式多轮对话的上游硬性要求，缺失即 11155）。
+    #[test]
+    fn reasoning_text_attached_to_following_assistant() {
+        let input = json!([
+            {"type": "message", "role": "user", "content": "q"},
+            {"type": "reasoning", "summary": [], "content": [
+                {"type": "reasoning_text", "text": "think "}
+            ]},
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "a"}
+            ]}
+        ]);
+        let msgs = responses_input_to_messages(Some(&input)).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1]["role"], json!("assistant"));
+        assert_eq!(msgs[1]["content"], json!("a"));
+        assert_eq!(msgs[1]["reasoning_content"], json!("think "));
+    }
+
+    /// 多个连续 reasoning 条目的正文按顺序拼接后挂载一次。
+    #[test]
+    fn multiple_reasoning_items_concatenate() {
+        let input = json!([
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "一"}]},
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "二"}]},
+            {"type": "message", "role": "assistant", "content": "a"}
+        ]);
+        let msgs = responses_input_to_messages(Some(&input)).unwrap();
+        assert_eq!(msgs[0]["reasoning_content"], json!("一\n\n二"));
+    }
+
+    /// reasoning 后面是 function_call：挂到 tool_calls assistant 消息上；
+    /// 同轮多个并行 function_call 合并进同一条 assistant 消息。
+    #[test]
+    fn reasoning_attached_and_parallel_calls_merged() {
+        let input = json!([
+            {"type": "message", "role": "user", "content": "q"},
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "r"}]},
+            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+            {"type": "function_call", "call_id": "c2", "name": "g", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "r1"},
+            {"type": "function_call_output", "call_id": "c2", "output": "r2"}
+        ]);
+        let msgs = responses_input_to_messages(Some(&input)).unwrap();
+        // user + 合并后的 assistant + 两条 tool 应答
+        assert_eq!(msgs.len(), 4, "{msgs:?}");
+        assert_eq!(msgs[1]["role"], json!("assistant"));
+        assert_eq!(msgs[1]["reasoning_content"], json!("r"));
+        let calls = msgs[1]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2, "并行调用必须合并进同一条消息");
+        assert_eq!(calls[0]["id"], json!("c1"));
+        assert_eq!(calls[1]["id"], json!("c2"));
+        assert_eq!(msgs[2]["role"], json!("tool"));
+        assert_eq!(msgs[3]["role"], json!("tool"));
+    }
+
+    /// reasoning + 正文 message + function_call 同轮输出合并成一条 assistant
+    /// 消息（content / reasoning_content / tool_calls 三者俱全）。
+    #[test]
+    fn reasoning_text_and_tool_call_merge_into_one_assistant() {
+        let input = json!([
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "r"}]},
+            {"type": "message", "role": "assistant", "content": "答"},
+            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+        ]);
+        let msgs = responses_input_to_messages(Some(&input)).unwrap();
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert_eq!(msgs[0]["role"], json!("assistant"));
+        assert_eq!(msgs[0]["content"], json!("答"));
+        assert_eq!(msgs[0]["reasoning_content"], json!("r"));
+        assert_eq!(
+            msgs[0]["tool_calls"][0]["id"],
+            json!("c1"),
+            "正文后的同轮工具调用应合并进该 assistant 消息"
+        );
+        assert_eq!(msgs[1]["role"], json!("tool"));
+    }
+
+    /// 找不到 assistant 归属的孤立推理（后面直接是 user 消息）不挂载、不伪造。
+    #[test]
+    fn orphan_reasoning_before_user_is_dropped() {
+        let input = json!([
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "r"}]},
+            {"type": "message", "role": "user", "content": "q"}
+        ]);
+        let msgs = responses_input_to_messages(Some(&input)).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], json!("user"));
+        assert!(msgs[0].get("reasoning_content").is_none());
     }
 
     #[test]
@@ -606,6 +882,27 @@ mod tests {
         assert_eq!(out["output"][0]["type"], json!("function_call"));
         assert_eq!(out["output"][0]["call_id"], json!("c1"));
         assert_eq!(out["output"][0]["name"], json!("f"));
+    }
+
+    /// 非流式聚合的 reasoning_content 必须还原成 reasoning 输出项
+    ///（与流式转换同构，且必须排在 message 前面）。
+    #[test]
+    fn chat_to_responses_includes_reasoning_item() {
+        let c = obj(json!({
+            "id": "r1",
+            "choices": [{"message": {
+                "reasoning_content": "think",
+                "content": "answer"
+            }, "finish_reason": "stop"}]
+        }));
+        let out = chat_to_responses(&c, "m");
+        let output = out["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], json!("reasoning"));
+        assert_eq!(output[0]["content"][0]["type"], json!("reasoning_text"));
+        assert_eq!(output[0]["content"][0]["text"], json!("think"));
+        assert_eq!(output[0]["summary"].as_array().unwrap().len(), 0);
+        assert_eq!(output[1]["type"], json!("message"));
+        assert_eq!(output[1]["content"][0]["text"], json!("answer"));
     }
 
     /// usage 缺失时给全 0（Codex 解析 null 会报错）。

@@ -434,6 +434,50 @@ fn select_export_uids(candidates: &[String], only: &Option<Vec<String>>) -> Vec<
     }
 }
 
+/// 网关日志文件路径：`<store>/logs/gateway.log`。
+///
+/// 与设备代理的 `logs/proxy.log` 同目录，便于用户一处找齐。
+pub fn gateway_log_file() -> PathBuf {
+    store_dir().join("logs").join("gateway.log")
+}
+
+/// 单个日志文件的轮转上限（8 MiB）。
+///
+/// 取值理由：满速跑一天 agent 的网关输出量在百 KB 级，8 MiB 足够覆盖很长一段
+/// 历史；再大就只是在浪费磁盘 —— 排查靠的是最近失败的那几屏。
+const GATEWAY_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// 轮转时保留的历史份数（`.1` … `.2`）。
+const GATEWAY_LOG_KEEP: usize = 2;
+
+/// 轮转日志：`gateway.log` → `.1` → `.2`（最老的丢弃），再返回可写的句柄。
+///
+/// 为什么自己轮转而不引入日志框架：网关（子进程）是**追加写**方，
+/// 宿主只负责在每次启动时把过大的文件让开。这样网关侧零改动、
+/// 也不需要它理解轮转，进程被杀也不会丢已写入的内容。
+fn open_gateway_log() -> std::io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+
+    let path = gateway_log_file();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    // 超限才轮转：正常启动不产生任何多余文件。
+    let too_big = std::fs::metadata(&path).map(|m| m.len() >= GATEWAY_LOG_MAX_BYTES).unwrap_or(false);
+    if too_big {
+        let oldest = path.with_extension(format!("log.{GATEWAY_LOG_KEEP}"));
+        let _ = std::fs::remove_file(&oldest);
+        for i in (1..GATEWAY_LOG_KEEP).rev() {
+            let from = path.with_extension(format!("log.{i}"));
+            let to = path.with_extension(format!("log.{}", i + 1));
+            let _ = std::fs::rename(&from, &to);
+        }
+        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    }
+
+    OpenOptions::new().create(true).append(true).open(&path)
+}
+
 /// 网关工作模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayMode {
@@ -1110,9 +1154,29 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
     let mut cmd = Command::new(&exe);
     cmd.arg("-config")
         .arg(&native_cfg)
-        .current_dir(gateway_dir())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .current_dir(gateway_dir());
+    // 网关输出落盘而不是丢弃。
+    //
+    // 原实现是 `Stdio::null()`，于是网关**任何**故障都不可观测：它只在启动时
+    // 打一行、上游模型拉取失败时打一行，其余全靠 HTTP 响应码。
+    // 排一个「上游随机 403」花掉了整轮手搓复现 —— 没有日志的代价就是每次都得
+    // 重建现场。这里保留 stdout/stderr 原样，只换去向。
+    match open_gateway_log() {
+        Ok(f) => {
+            let f2 = f.try_clone().ok();
+            cmd.stdout(Stdio::from(f));
+            // stderr 克隆失败时退化为 null 而不是整体失败：日志是观测手段，
+            // 不能因为它而让网关起不来。
+            cmd.stderr(match f2 {
+                Some(f2) => Stdio::from(f2),
+                None => Stdio::null(),
+            });
+        }
+        Err(e) => {
+            eprintln!("[gateway] 无法打开网关日志文件，本次运行不记录日志: {e}");
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
     // 非 Windows 平台不需要抑制控制台窗口，保持默认行为。
     #[cfg(target_os = "windows")]
     {
@@ -1505,8 +1569,14 @@ pub async fn switch_mode(mode: GatewayMode, pinned_uid: Option<String>) -> Value
     })
 }
 
-/// 从运行中的网关动态拉取上游模型列表。仅从网关实时获取，不使用内置静态模型。
-pub async fn fetch_models() -> Vec<Value> {
+/// 从运行中的网关拉取上游模型列表。
+///
+/// **只从网关实时获取，不使用内置静态清单**：网关的 `/v1/models` 本身就是
+/// 从上游现拉的，这里再兜一份静态表只会引入两处会各自失真的副本。
+/// 拿不到就返回空列表，由调用方把「拉不到」明确呈现给用户。
+///
+/// 返回 `(models, error)`：`error` 非空表示这次没拿到，`models` 必为空。
+pub async fn fetch_models() -> (Vec<Value>, Option<String>) {
     let cfg = load_gateway_config();
     let port = cfg.get("port").and_then(Value::as_u64).unwrap_or(7863) as u16;
     let api_key = cfg
@@ -1520,56 +1590,51 @@ pub async fn fetch_models() -> Vec<Value> {
         .timeout(std::time::Duration::from_millis(2000))
         .build();
 
-    if let Ok(c) = client {
-        let mut req = c.get(&url);
-        if !api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {api_key}"));
-        }
-        if let Ok(resp) = req.send().await {
-            if resp.status().is_success() {
-                if let Ok(json) = resp.json::<Value>().await {
-                    if let Some(arr) = json.get("data").and_then(Value::as_array) {
-                        if !arr.is_empty() {
-                            return arr.clone();
-                        }
-                    }
-                }
+    // 网关没在跑是**最常见**的一种失败（「先配好模型再启动」的顺序下必然发生），
+    // 单独给一句可操作的提示，而不是笼统的「连接失败」。
+    if !is_running() {
+        return (
+            Vec::new(),
+            Some("网关未运行：模型清单来自上游，需先启动网关再刷新".to_string()),
+        );
+    }
+
+    let Ok(c) = client else {
+        return (Vec::new(), Some("无法创建 HTTP 客户端".to_string()));
+    };
+    let mut req = c.get(&url);
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {api_key}"));
+    }
+
+    match req.send().await {
+        Err(e) => (
+            Vec::new(),
+            Some(format!("连接网关失败（127.0.0.1:{port}）：{e}")),
+        ),
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+            if !status.is_success() {
+                // 网关对「上游拉不到」返回 503 + error.message，原样透传这句
+                // 更有用：它已区分了「没有可用账号」与「上游故障」。
+                let msg = body
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("网关返回 HTTP {}", status.as_u16()));
+                return (Vec::new(), Some(msg));
+            }
+            match body.get("data").and_then(Value::as_array) {
+                Some(arr) if !arr.is_empty() => (arr.clone(), None),
+                _ => (
+                    Vec::new(),
+                    Some("网关未返回任何模型（上游清单为空）".to_string()),
+                ),
             }
         }
     }
-
-    // 网关未运行 / 未就绪 → 回退内置静态清单。
-    //
-    // 为什么必须有回退：模型下拉若为空，用户就无法选择「单一模型」，
-    // 而「配置模型」这一步通常发生在**启动网关之前**（先配好再启动）——
-    // 若只依赖运行中的网关，这个顺序下功能直接不可用（实测就是空列表）。
-    static_models()
-}
-
-/// 内置模型清单（网关不可达时的回退）。
-///
-/// 取自上游已知的常用模型；运行中的网关会返回更权威的动态列表，
-/// 此处仅保证「未启动时也能选」。
-fn static_models() -> Vec<Value> {
-    const IDS: &[&str] = &[
-        "deepseek-v4.1-flash",
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
-        "deepseek-v3-2-volc",
-        "glm-5.3",
-        "glm-5.3-flash",
-        "glm-5.2",
-        "glm-4.7",
-        "kimi-k3-1",
-        "kimi-k2.5",
-        "minimax-m3",
-        "hunyuan-chat",
-        "gpt-5.6-sol",
-        "gemini-3.5-flash",
-    ];
-    IDS.iter()
-        .map(|id| json!({ "id": id, "object": "model", "owned_by": "workbuddy" }))
-        .collect()
 }
 
 /// 从运行中的网关拉取 Token 用量统计（GET /usage）。
@@ -1664,6 +1729,20 @@ mod tests {
         let out = super::overlay(base, &json!({"b": 9}));
         assert_eq!(out["a"], 1);
         assert_eq!(out["b"], 9);
+    }
+
+    /// 日志轮转：超限时把 gateway.log 让开成 .1，并把 `.2` 丢弃。
+    ///
+    /// 直接调 `open_gateway_log` 会依赖真实 store 目录（测试会污染用户数据），
+    /// 因此这里复刻轮转的**命名规则**并断言它 —— 规则错了（如把
+    /// `gateway.log` 变成 `gateway.1`）用户就再也找不到日志文件。
+    #[test]
+    fn log_rotation_uses_expected_names() {
+        let p = PathBuf::from("C:/x/logs/gateway.log");
+        assert_eq!(p.with_extension("log.1").file_name().unwrap(), "gateway.log.1");
+        assert_eq!(p.with_extension("log.2").file_name().unwrap(), "gateway.log.2");
+        // 轮转不能改掉路径本身，否则网关子进程下次仍写原名而历史对不上
+        assert_eq!(p.file_name().unwrap(), "gateway.log");
     }
 
     // 回归保护：切换「负载均衡 ↔ 指定账号」时，导出与清理必须用同一判定。

@@ -85,3 +85,6 @@ src-tauri/tauri.dev-sandbox.conf.json
 # 这些只应上传到 GitHub Release，不入库：安装包 11 MB 量级，进 git 历史后
 # 永远删不掉，且公开仓库没必要存二进制。发布走 release.yml 或 gh release upload。
 /dist-bin/
+# 打包的**统一输出目录**（scripts/package-release.ps1 固定写到这里）。
+# 与 dist-bin/ 同理不入库：只是待上传的产物，不是源码。
+/release-out/

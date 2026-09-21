@@ -6,7 +6,7 @@
 //! |---|---|---|---|
 //! | 1 | Claude Code | `~/.claude/settings.json` | Anthropic Messages |
 //! | 2 | Claude Desktop | `%LOCALAPPDATA%\Claude-3p\configLibrary\*.json` | Anthropic Messages (3P) |
-//! | 3 | Codex | `~/.codex/config.toml` + `auth.json` | OpenAI Responses |
+//! | 3 | Codex | `~/.codex/config.toml` + 模型目录（`auth.json` 绝不触碰） | OpenAI Responses |
 //! | 4 | DeepSeek Harness (DSH) | `~/.dsh/settings.yaml` + `.credentials.yaml` | OpenAI Chat |
 //! | 5 | OpenCode | `~/.config/opencode/opencode.json` | OpenAI Chat |
 //! | 6 | Pi | `~/.pi/agent/models.json` | OpenAI Chat |
@@ -21,6 +21,7 @@
 //!   - 写入前一律备份原文件到 `~/.wb-switch/agent-backups/<target>/<时间戳>/`；
 //!   - 只覆盖托管字段，保留用户其余配置（尤其是 MCP / 主题 / 项目信任列表 / 插件）；
 //!   - 生成 `manifest.json`，可随时一键安全回滚至修改前状态；
+//!   - Codex 的 `auth.json`（ChatGPT 登录态）绝不触碰：不写、不备份、不回滚；
 //!   - 支持模型多选：配置时将用户选中的所有模型同步注入客户端配置。
 
 use std::path::{Path, PathBuf};
@@ -49,6 +50,14 @@ pub const TARGETS: [&str; 12] = [
 const PROVIDER_NAME: &str = "AI Gateway";
 /// Codex 的 provider key（必须是合法 TOML 表名）。
 const CODEX_PROVIDER_KEY: &str = "workbuddy";
+/// 本网关写入 Codex 主目录的模型目录文件名（`model_catalog_json` 相对 CODEX_HOME 解析）。
+///
+/// Codex 桌面端 / IDE 的模型选择器只渲染 `model_catalog_json` 指向的目录条目，
+/// 选中后把条目的 `slug` 作为请求 `model` 发出。必须使用本网关自己的目录文件，
+/// 不能沿用机器上其他切换工具（如 CC Switch）留下的目录 —— 那里的 slug
+/// （`vendor/model` 形态）属于别的代理端点，切到本网关后会出现「选择器显示的
+/// 模型」与「实际请求的模型」完全对不上的问题。
+const CODEX_CATALOG_FILE: &str = "ai-gateway-model-catalog.json";
 /// DSH 的 provider key。
 const DSH_PROVIDER_KEY: &str = "workbuddy";
 /// DSH 凭据引用的环境变量名。
@@ -366,21 +375,20 @@ fn detect_claude_desktop(gateway_base: &str, api_key: &str) -> TargetStatus {
 
 fn detect_codex(gateway_base: &str, api_key: &str) -> TargetStatus {
     let config = codex_home().join("config.toml");
-    let auth = codex_home().join("auth.json");
     let installed = codex_home().is_dir() || config.is_file();
 
+    // 已接入的判据全部落在 config.toml 上：本网关的 provider 块存在、
+    // base_url 指向本网关、内联 bearer 与当前 API Key 一致。
+    // **不能**再以 auth.json 里的 OPENAI_API_KEY 为判据 —— 接入本网关不再
+    // 触碰 auth.json（ChatGPT 登录态必须原样保留），密钥通过 provider 块的
+    // `experimental_bearer_token` 内联传递。
     let mut configured = false;
     if let Ok(text) = std::fs::read_to_string(&config) {
+        let provider_ok = text.contains("[model_providers.workbuddy]")
+            || text.contains("[model_providers.'workbuddy']");
         let base_ok = text.contains(gateway_base);
-        let key_ok = read_json(&auth)
-            .and_then(|v| {
-                v.get("OPENAI_API_KEY")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .map(|k| k == api_key)
-            .unwrap_or(false);
-        configured = base_ok && key_ok;
+        let key_ok = api_key.is_empty() || text.contains(api_key);
+        configured = provider_ok && base_ok && key_ok;
     }
 
     let version = if installed {
@@ -701,7 +709,8 @@ pub fn backup_files(target: &str, paths: &[PathBuf]) -> Result<PathBuf, String> 
 
     let mut manifest = Map::new();
     for (index, path) in paths.iter().enumerate() {
-        if !path.is_file() {
+        if !path.is_file() || is_protected_login_file(target, path) {
+            // 登录态文件既不进备份、也更不会被恢复（见 is_protected_login_file）。
             continue;
         }
         let name = format!("{index}-{}", path.file_name().unwrap_or_default().to_string_lossy());
@@ -752,7 +761,26 @@ pub fn list_backups(target: &str) -> Vec<Value> {
     out
 }
 
-/// 从指定备份恢复文件。
+/// Codex 存放 ChatGPT 登录态的文件名。
+const CODEX_AUTH_FILE: &str = "auth.json";
+
+/// 该路径是否属于**绝不可触碰**的用户登录态文件。
+///
+/// Codex 的 `auth.json` 是 ChatGPT 的 OAuth 凭据：旧版本接入网关时会把网关
+/// API Key 写进该文件并删掉 `tokens`，直接把用户挤下线。因此本工具对它采取
+/// 最严格的策略 —— 写入不碰、备份不收、恢复不写回：
+///   - 备份不收：历史备份里可能存着被旧版本污染过的登录态；
+///   - 恢复不写回：否则「一键回滚」会绕过「接入不改用户登录」的承诺。
+///
+/// 其它客户端不受影响（例如某些客户端的 `auth.json` 本就是自己的配置）。
+fn is_protected_login_file(target: &str, path: &Path) -> bool {
+    target == "codex"
+        && path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(CODEX_AUTH_FILE))
+}
+
+/// 从指定备份恢复文件（跳过登录态文件，见 [`is_protected_login_file`]）。
 pub fn restore_backup(target: &str, backup_id: &str) -> Result<usize, String> {
     let dir = backup_root().join(target).join(backup_id);
     let manifest_path = dir.join("manifest.json");
@@ -778,6 +806,11 @@ pub fn restore_backup(target: &str, backup_id: &str) -> Result<usize, String> {
         let content = std::fs::read_to_string(&backup_file)
             .map_err(|e| format!("读取备份文件失败: {e}"))?;
         let target_path = PathBuf::from(target_path_str);
+        if is_protected_login_file(target, &target_path) {
+            // 只回滚配置，绝不复原用户登录态（历史备份里可能存着被旧版本
+            // 污染过的 auth.json，写回会让用户的 ChatGPT 登录再次失效）。
+            continue;
+        }
         if let Some(parent) = target_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -801,19 +834,66 @@ pub struct ImportOutcome {
     pub models: Vec<String>,
 }
 
+/// 待写入客户端的一个模型，及其**上游声明的真实上下文窗口**。
+///
+/// context_window 只能来自网关 `/v1/models` 的 `context_length`
+/// （即上游 `/v3/config` 的 `maxInputTokens`），单位是 token。
+///
+/// 含 0 表示「未知」：调用方拿不到上游真值时必须留 0，由各客户端生成器
+/// 决定是省略该字段还是不下发声明 —— **绝不能**编一个像样的数字去糊弄，
+/// 否则用户看到的上下文条就是个假值（本结构体存在的全部理由）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSpec {
+    /// 模型 id，与网关 `/v1/models` 的 `id` 完全一致。
+    pub id: String,
+    /// 上游真实上下文窗口（token）；0 = 未知。
+    pub context_window: u64,
+}
+
+impl ModelSpec {
+    /// 只带 id 的模型（上下文窗口未知）。
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into(), context_window: 0 }
+    }
+
+    /// 带上游上下文窗口的模型。
+    pub fn with_context_window(id: impl Into<String>, context_window: u64) -> Self {
+        Self { id: id.into(), context_window }
+    }
+}
+
+impl From<String> for ModelSpec {
+    fn from(id: String) -> Self {
+        Self::new(id)
+    }
+}
+
+impl From<&str> for ModelSpec {
+    fn from(id: &str) -> Self {
+        Self::new(id)
+    }
+}
+
+/// 把纯模型名列表降级成 [ModelSpec]（上下文窗口未知）。
+///
+/// 供只关心模型名的客户端沿用旧的 `&[String]` 调用形态。
+fn specs_from_ids(models: &[String]) -> Vec<ModelSpec> {
+    models.iter().cloned().map(ModelSpec::from).collect()
+}
+
 /// 把网关配置接入指定目标客户端（支持多模型）。
 pub fn import_target(
     target: &str,
     gateway_base: &str,
     api_key: &str,
-    models: &[String],
+    models: &[ModelSpec],
 ) -> Result<ImportOutcome, String> {
     if api_key.trim().is_empty() {
         return Err("请先在网关设置里填写 API Key（客户端必须携带凭据）".to_string());
     }
     let base = gateway_base.trim_end_matches('/');
     let safe_models = if models.is_empty() {
-        vec!["deepseek-v4-flash".to_string()]
+        vec![ModelSpec::new("deepseek-v4-flash")]
     } else {
         models.to_vec()
     };
@@ -835,12 +915,22 @@ pub fn import_target(
     }
 }
 
+/// 兼容入口：只给模型名时按「上下文窗口未知」处理。
+pub fn import_target_names(
+    target: &str,
+    gateway_base: &str,
+    api_key: &str,
+    models: &[String],
+) -> Result<ImportOutcome, String> {
+    import_target(target, gateway_base, api_key, &specs_from_ids(models))
+}
+
 /// 针对指定 targets 列表批量导入/更新。
 pub fn import_targets(
     target_ids: &[String],
     gateway_base: &str,
     api_key: &str,
-    models: &[String],
+    models: &[ModelSpec],
 ) -> Result<Vec<ImportOutcome>, String> {
     let mut outcomes = Vec::new();
     for id in target_ids {
@@ -850,11 +940,21 @@ pub fn import_targets(
     Ok(outcomes)
 }
 
+/// 兼容入口：只给模型名时按「上下文窗口未知」处理。
+pub fn import_targets_names(
+    target_ids: &[String],
+    gateway_base: &str,
+    api_key: &str,
+    models: &[String],
+) -> Result<Vec<ImportOutcome>, String> {
+    import_targets(target_ids, gateway_base, api_key, &specs_from_ids(models))
+}
+
 /// 一键接入/更新所有检测到已安装的客户端。
 pub fn import_all_installed(
     gateway_base: &str,
     api_key: &str,
-    models: &[String],
+    models: &[ModelSpec],
 ) -> Result<Vec<ImportOutcome>, String> {
     let targets = detect_all(gateway_base, api_key);
     let mut outcomes = Vec::new();
@@ -867,7 +967,16 @@ pub fn import_all_installed(
     Ok(outcomes)
 }
 
-fn import_claude_code(base: &str, api_key: &str, models: &[String]) -> Result<ImportOutcome, String> {
+/// 兼容入口：只给模型名时按「上下文窗口未知」处理。
+pub fn import_all_installed_names(
+    gateway_base: &str,
+    api_key: &str,
+    models: &[String],
+) -> Result<Vec<ImportOutcome>, String> {
+    import_all_installed(gateway_base, api_key, &specs_from_ids(models))
+}
+
+fn import_claude_code(base: &str, api_key: &str, models: &[ModelSpec]) -> Result<ImportOutcome, String> {
     let path = claude_code_home().join("settings.json");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建 Claude 配置目录失败: {e}"))?;
@@ -875,7 +984,8 @@ fn import_claude_code(base: &str, api_key: &str, models: &[String]) -> Result<Im
 
     // Claude Code 只有 Sonnet/Opus/Haiku/Fable 四个槽位，多余模型无法承载，
     // 明确截断并如实回传实际写入的模型列表（避免 UI 报告未生效的数量）。
-    let slot_models: Vec<String> = models.iter().take(CLAUDE_SLOT_LIMIT).cloned().collect();
+    let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
+    let slot_models: Vec<String> = ids.iter().take(CLAUDE_SLOT_LIMIT).cloned().collect();
 
     let backup = backup_files("claude-code", &[path.clone()])?;
     let existing = std::fs::read_to_string(&path).ok();
@@ -890,13 +1000,14 @@ fn import_claude_code(base: &str, api_key: &str, models: &[String]) -> Result<Im
     })
 }
 
-fn import_claude_desktop(base: &str, api_key: &str, models: &[String]) -> Result<ImportOutcome, String> {
+fn import_claude_desktop(base: &str, api_key: &str, models: &[ModelSpec]) -> Result<ImportOutcome, String> {
     let dir = claude_desktop_3p_dir();
     let library = dir.join("configLibrary");
     std::fs::create_dir_all(&library).map_err(|e| format!("创建 Claude 3P 目录失败: {e}"))?;
 
     // 与 Claude Code 相同：profile 只有四个槽位，超出部分截断并如实回传。
-    let slot_models: Vec<String> = models.iter().take(CLAUDE_SLOT_LIMIT).cloned().collect();
+    let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
+    let slot_models: Vec<String> = ids.iter().take(CLAUDE_SLOT_LIMIT).cloned().collect();
 
     let normal_config = claude_desktop_dir().join("claude_desktop_config.json");
     let threep_config = dir.join("claude_desktop_config.json");
@@ -941,34 +1052,50 @@ fn import_claude_desktop(base: &str, api_key: &str, models: &[String]) -> Result
     })
 }
 
-fn import_codex(base: &str, api_key: &str, models: &[String]) -> Result<ImportOutcome, String> {
-    let home = codex_home();
-    std::fs::create_dir_all(&home).map_err(|e| format!("创建 Codex 目录失败: {e}"))?;
-    let config_path = home.join("config.toml");
-    let auth_path = home.join("auth.json");
+fn import_codex(base: &str, api_key: &str, models: &[ModelSpec]) -> Result<ImportOutcome, String> {
+    import_codex_into(&codex_home(), base, api_key, models)
+}
 
-    let backup = backup_files("codex", &[config_path.clone(), auth_path.clone()])?;
+/// `import_codex` 的可注入实现：home 由调用方给出，便于测试隔离。
+fn import_codex_into(
+    home: &Path,
+    base: &str,
+    api_key: &str,
+    models: &[ModelSpec],
+) -> Result<ImportOutcome, String> {
+    std::fs::create_dir_all(home).map_err(|e| format!("创建 Codex 目录失败: {e}"))?;
+    let config_path = home.join("config.toml");
+    let catalog_path = home.join(CODEX_CATALOG_FILE);
+
+    // auth.json **既不读也不写、也不进备份**：
+    // 它持有用户 ChatGPT 账号的 OAuth tokens，本工具必须在任何路径上都不碰它，
+    // 包括「一键回滚」—— 历史备份里可能存着被旧版本污染过的登录态，一旦恢复
+    // 就会把用户挤下线。本网关的凭据走 provider 块的 `experimental_bearer_token`，
+    // 与 ChatGPT 登录态天然互不干扰（cc-switch 对第三方 provider 也是同样语义）。
+    let backup = backup_files("codex", &[config_path.clone(), catalog_path.clone()])?;
 
     let existing_cfg = std::fs::read_to_string(&config_path).ok();
-    let cfg_text = build_codex_config(existing_cfg.as_deref(), base, models)?;
+    let cfg_text = build_codex_config(existing_cfg.as_deref(), base, api_key, models)?;
     atomic_write(&config_path, &cfg_text).map_err(|e| format!("写入 Codex config 失败: {e}"))?;
 
-    let existing_auth = std::fs::read_to_string(&auth_path).ok();
-    let auth_text = build_codex_auth(existing_auth.as_deref(), api_key)?;
-    atomic_write(&auth_path, &auth_text).map_err(|e| format!("写入 Codex auth 失败: {e}"))?;
+    // 写入本网关自己的模型目录：选择器看到什么，请求就发什么（slug = 真实模型名）。
+    let catalog_text = build_codex_model_catalog(models);
+    atomic_write(&catalog_path, &catalog_text)
+        .map_err(|e| format!("写入 Codex 模型目录失败: {e}"))?;
 
     Ok(ImportOutcome {
         target: "codex".to_string(),
         backup_dir: backup.to_string_lossy().to_string(),
         files: vec![
             config_path.to_string_lossy().to_string(),
-            auth_path.to_string_lossy().to_string(),
+            catalog_path.to_string_lossy().to_string(),
         ],
-        models: models.to_vec(),
+        models: models.iter().map(|m| m.id.clone()).collect(),
     })
 }
 
-fn import_dsh(base: &str, api_key: &str, models: &[String]) -> Result<ImportOutcome, String> {
+fn import_dsh(base: &str, api_key: &str, models: &[ModelSpec]) -> Result<ImportOutcome, String> {
+    let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
     let home = dsh_home();
     std::fs::create_dir_all(&home).map_err(|e| format!("创建 DSH 目录失败: {e}"))?;
     let settings_path = home.join("settings.yaml");
@@ -977,7 +1104,7 @@ fn import_dsh(base: &str, api_key: &str, models: &[String]) -> Result<ImportOutc
     let backup = backup_files("dsh", &[settings_path.clone(), credentials_path.clone()])?;
 
     let existing = std::fs::read_to_string(&settings_path).ok();
-    let settings = build_dsh_settings(existing.as_deref(), base, models)?;
+    let settings = build_dsh_settings(existing.as_deref(), base, &ids)?;
     atomic_write(&settings_path, &settings).map_err(|e| format!("写入 DSH settings 失败: {e}"))?;
 
     let creds_existing = std::fs::read_to_string(&credentials_path).ok();
@@ -992,47 +1119,49 @@ fn import_dsh(base: &str, api_key: &str, models: &[String]) -> Result<ImportOutc
             settings_path.to_string_lossy().to_string(),
             credentials_path.to_string_lossy().to_string(),
         ],
-        models: models.to_vec(),
+        models: models.iter().map(|m| m.id.clone()).collect(),
     })
 }
 
-fn import_opencode(base: &str, api_key: &str, models: &[String]) -> Result<ImportOutcome, String> {
+fn import_opencode(base: &str, api_key: &str, models: &[ModelSpec]) -> Result<ImportOutcome, String> {
+    let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
     let path = opencode_config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建 OpenCode 目录失败: {e}"))?;
     }
     let backup = backup_files("opencode", &[path.clone()])?;
     let existing = std::fs::read_to_string(&path).ok();
-    let text = build_opencode_config(existing.as_deref(), base, api_key, models)?;
+    let text = build_opencode_config(existing.as_deref(), base, api_key, &ids)?;
     atomic_write(&path, &text).map_err(|e| format!("写入 OpenCode 配置失败: {e}"))?;
 
     Ok(ImportOutcome {
         target: "opencode".to_string(),
         backup_dir: backup.to_string_lossy().to_string(),
         files: vec![path.to_string_lossy().to_string()],
-        models: models.to_vec(),
+        models: models.iter().map(|m| m.id.clone()).collect(),
     })
 }
 
-fn import_pi(base: &str, api_key: &str, models: &[String]) -> Result<ImportOutcome, String> {
+fn import_pi(base: &str, api_key: &str, models: &[ModelSpec]) -> Result<ImportOutcome, String> {
+    let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
     let path = pi_models_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建 Pi 目录失败: {e}"))?;
     }
     let backup = backup_files("pi", &[path.clone()])?;
     let existing = std::fs::read_to_string(&path).ok();
-    let text = build_pi_models(existing.as_deref(), base, api_key, models)?;
+    let text = build_pi_models(existing.as_deref(), base, api_key, &ids)?;
     atomic_write(&path, &text).map_err(|e| format!("写入 Pi 配置失败: {e}"))?;
 
     Ok(ImportOutcome {
         target: "pi".to_string(),
         backup_dir: backup.to_string_lossy().to_string(),
         files: vec![path.to_string_lossy().to_string()],
-        models: models.to_vec(),
+        models: models.iter().map(|m| m.id.clone()).collect(),
     })
 }
 
-fn import_grok_build(base: &str, api_key: &str, models: &[String]) -> Result<ImportOutcome, String> {
+fn import_grok_build(base: &str, api_key: &str, models: &[ModelSpec]) -> Result<ImportOutcome, String> {
     let home = grok_home();
     std::fs::create_dir_all(&home).map_err(|e| format!("创建 Grok 目录失败: {e}"))?;
     let config_path = home.join("config.toml");
@@ -1045,11 +1174,11 @@ fn import_grok_build(base: &str, api_key: &str, models: &[String]) -> Result<Imp
         target: "grok-build".to_string(),
         backup_dir: backup.to_string_lossy().to_string(),
         files: vec![config_path.to_string_lossy().to_string()],
-        models: models.to_vec(),
+        models: models.iter().map(|m| m.id.clone()).collect(),
     })
 }
 
-fn import_zcode(base: &str, api_key: &str, models: &[String]) -> Result<ImportOutcome, String> {
+fn import_zcode(base: &str, api_key: &str, models: &[ModelSpec]) -> Result<ImportOutcome, String> {
     let path = zcode_config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建 ZCode 目录失败: {e}"))?;
@@ -1063,11 +1192,11 @@ fn import_zcode(base: &str, api_key: &str, models: &[String]) -> Result<ImportOu
         target: "zcode".to_string(),
         backup_dir: backup.to_string_lossy().to_string(),
         files: vec![path.to_string_lossy().to_string()],
-        models: models.to_vec(),
+        models: models.iter().map(|m| m.id.clone()).collect(),
     })
 }
 
-fn import_kimi_code(base: &str, api_key: &str, models: &[String]) -> Result<ImportOutcome, String> {
+fn import_kimi_code(base: &str, api_key: &str, models: &[ModelSpec]) -> Result<ImportOutcome, String> {
     let home = kimi_code_home();
     std::fs::create_dir_all(&home).map_err(|e| format!("创建 Kimi Code 目录失败: {e}"))?;
     let config_path = home.join("config.toml");
@@ -1080,11 +1209,11 @@ fn import_kimi_code(base: &str, api_key: &str, models: &[String]) -> Result<Impo
         target: "kimi-code".to_string(),
         backup_dir: backup.to_string_lossy().to_string(),
         files: vec![config_path.to_string_lossy().to_string()],
-        models: models.to_vec(),
+        models: models.iter().map(|m| m.id.clone()).collect(),
     })
 }
 
-fn import_openclaw(base: &str, api_key: &str, models: &[String]) -> Result<ImportOutcome, String> {
+fn import_openclaw(base: &str, api_key: &str, models: &[ModelSpec]) -> Result<ImportOutcome, String> {
     let path = openclaw_config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建 OpenClaw 目录失败: {e}"))?;
@@ -1098,43 +1227,45 @@ fn import_openclaw(base: &str, api_key: &str, models: &[String]) -> Result<Impor
         target: "openclaw".to_string(),
         backup_dir: backup.to_string_lossy().to_string(),
         files: vec![path.to_string_lossy().to_string()],
-        models: models.to_vec(),
+        models: models.iter().map(|m| m.id.clone()).collect(),
     })
 }
 
-fn import_hermes(base: &str, api_key: &str, models: &[String]) -> Result<ImportOutcome, String> {
+fn import_hermes(base: &str, api_key: &str, models: &[ModelSpec]) -> Result<ImportOutcome, String> {
+    let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
     let path = hermes_config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建 Hermes 目录失败: {e}"))?;
     }
     let backup = backup_files("hermes", &[path.clone()])?;
     let existing = std::fs::read_to_string(&path).ok();
-    let text = build_hermes_config(existing.as_deref(), base, api_key, models)?;
+    let text = build_hermes_config(existing.as_deref(), base, api_key, &ids)?;
     atomic_write(&path, &text).map_err(|e| format!("写入 Hermes 配置失败: {e}"))?;
 
     Ok(ImportOutcome {
         target: "hermes".to_string(),
         backup_dir: backup.to_string_lossy().to_string(),
         files: vec![path.to_string_lossy().to_string()],
-        models: models.to_vec(),
+        models: models.iter().map(|m| m.id.clone()).collect(),
     })
 }
 
-fn import_minimax_code(base: &str, api_key: &str, models: &[String]) -> Result<ImportOutcome, String> {
+fn import_minimax_code(base: &str, api_key: &str, models: &[ModelSpec]) -> Result<ImportOutcome, String> {
+    let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
     let path = minimax_config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建 MiniMax Code 目录失败: {e}"))?;
     }
     let backup = backup_files("minimax-code", &[path.clone()])?;
     let existing = std::fs::read_to_string(&path).ok();
-    let text = build_minimax_config(existing.as_deref(), base, api_key, models)?;
+    let text = build_minimax_config(existing.as_deref(), base, api_key, &ids)?;
     atomic_write(&path, &text).map_err(|e| format!("写入 MiniMax Code 配置失败: {e}"))?;
 
     Ok(ImportOutcome {
         target: "minimax-code".to_string(),
         backup_dir: backup.to_string_lossy().to_string(),
         files: vec![path.to_string_lossy().to_string()],
-        models: models.to_vec(),
+        models: models.iter().map(|m| m.id.clone()).collect(),
     })
 }
 
@@ -1337,19 +1468,55 @@ pub fn build_claude_desktop_meta(existing: Option<&str>) -> Result<String, Strin
     render_json(Value::Object(root))
 }
 
-/// 生成 Codex config.toml：覆盖 provider 表与顶层 model。
-pub fn build_codex_config(existing: Option<&str>, base: &str, models: &[String]) -> Result<String, String> {
-    let primary = models.first().map(String::as_str).unwrap_or("deepseek-v4-flash");
+/// 转义 TOML 基本字符串（`"..."`）内容：只需处理反斜杠与双引号。
+fn toml_basic_string_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// 生成 Codex config.toml：覆盖 provider 表、顶层 model 与模型目录指向。
+///
+/// ## 凭据：`experimental_bearer_token` 内联，不碰 auth.json
+///
+/// 旧实现把网关 API Key 写进 `auth.json` 的 `OPENAI_API_KEY` 并删掉
+/// `tokens` / `last_refresh`、把 `auth_mode` 改成 `apikey` —— 这会把用户
+/// 在 Codex 桌面端登录的 ChatGPT 账号**直接挤掉线**（tokens 一旦删除，
+/// 桌面端只能重新走 OAuth 登录）。
+///
+/// `experimental_bearer_token` 是 Codex 官方支持的 provider 级字段：
+/// Codex 对该 provider 的请求直接以 `Authorization: Bearer <key>` 发出，
+/// 既不读 `OPENAI_API_KEY` 也不依赖 ChatGPT tokens。于是：
+///   - ChatGPT 官方 provider 继续使用 auth.json 里的登录态；
+///   - 本网关 provider 使用内联 bearer；
+/// 两套凭据并存，用户随时可在桌面端切换，互不覆盖。
+///
+/// 刻意**不写** `requires_openai_auth = true`：该字段语义是「复用 ChatGPT
+/// 登录态」，仅适用于 OpenAI 自家 provider；第三方网关写它只会让鉴权来源
+/// 变得含糊。
+///
+/// ## 模型：model_catalog_json 与 model 严格对齐
+///
+/// 桌面端模型选择器渲染 `model_catalog_json` 目录里的条目，选中项的 `slug`
+/// 即请求 `model`。顶层 `model` 必须是目录中某个 slug（取第一个选中模型），
+/// 否则就会出现「列表显示的模型」与「当前实际选中模型」对不上的现象。
+pub fn build_codex_config(
+    existing: Option<&str>,
+    base: &str,
+    api_key: &str,
+    models: &[ModelSpec],
+) -> Result<String, String> {
+    let primary = models.first().map(|m| m.id.as_str()).unwrap_or("deepseek-v4-flash");
+    let bearer = toml_basic_string_escape(api_key);
     let mut text = existing.unwrap_or("").to_string();
 
     text = set_toml_top_level(&text, "model_provider", &format!("\"{CODEX_PROVIDER_KEY}\""));
-    text = set_toml_top_level(&text, "model", &format!("\"{primary}\""));
+    text = set_toml_top_level(&text, "model", &format!("\"{}\"", toml_basic_string_escape(primary)));
+    text = set_toml_top_level(&text, "model_catalog_json", &format!("\"{CODEX_CATALOG_FILE}\""));
     text = set_toml_top_level(&text, "model_reasoning_effort", "\"high\"");
     text = set_toml_top_level(&text, "disable_response_storage", "true");
 
     let table = format!("[model_providers.{CODEX_PROVIDER_KEY}]");
     let body = format!(
-        "{table}\nname = \"{PROVIDER_NAME}\"\nbase_url = \"{base}/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n"
+        "{table}\nname = \"{PROVIDER_NAME}\"\nbase_url = \"{base}/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{bearer}\"\n"
     );
     text = replace_toml_table(&text, &table, &body);
     if !text.ends_with('\n') {
@@ -1358,14 +1525,72 @@ pub fn build_codex_config(existing: Option<&str>, base: &str, models: &[String])
     Ok(text)
 }
 
-/// 生成 Codex auth.json：写入 OpenAI 形态的 API Key。
-pub fn build_codex_auth(existing: Option<&str>, api_key: &str) -> Result<String, String> {
-    let mut root = parse_json_object(existing)?;
-    root.insert("OPENAI_API_KEY".into(), json!(api_key));
-    root.remove("tokens");
-    root.remove("last_refresh");
-    root.insert("auth_mode".into(), json!("apikey"));
-    render_json(Value::Object(root))
+/// 生成 Codex 桌面端模型目录文件（`model_catalog_json`）。
+///
+/// 结构对齐 Codex 桌面端（26.x）实测可识别的目录 schema（与 CC Switch
+/// 生成的目录同构）：每个模型一条，`slug` / `display_name` / `description`
+/// 全部直接使用网关侧真实模型名 —— 选择器所见即请求所发，无需任何转译。
+///
+/// 能力声明：
+///   - 输入模态统一 `text + image`：网关上游 `/v3/config` 的 cli 模型实测
+///     全部支持图片（国服 / 国际版均然）；
+///   - 思考档位声明 `none / high` 两档并默认 `high`，与 config.toml 顶层
+///     强制写入的 `model_reasoning_effort = "high"` 保持一致。
+pub fn build_codex_model_catalog(models: &[ModelSpec]) -> String {
+    const BASE_INSTRUCTIONS: &str =
+        "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.";
+
+    let entries: Vec<Value> = models
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            // context_window 是 Codex 桌面端「已用 / 总上下文」进度条的分母来源；
+            // 它按 context_window 直接显示（实测：ctx=500000 / max=1000000 / pct=95
+            // → 会话日志 model_context_window = 475000）。
+            //
+            // 上游拿不到真值（context_window == 0）时退化为保守下限 131072：
+            // Codex 对缺失该字段会写成 null，进度条同样不可用；
+            // **绝不**编造更大数字，否则用户看到的是假容量，更容易踩上下文超限。
+            let ctx = if m.context_window == 0 { 131_072 } else { m.context_window };
+            json!({
+                "additional_speed_tiers": [],
+                "availability_nux": null,
+                "base_instructions": BASE_INSTRUCTIONS,
+                "context_window": ctx,
+                "default_reasoning_level": "high",
+                "default_reasoning_summary": "none",
+                "description": m.id,
+                "display_name": m.id,
+                "effective_context_window_percent": 95,
+                "experimental_supported_tools": [],
+                "input_modalities": ["text", "image"],
+                "max_context_window": ctx,
+                // 与 CC Switch 目录同一基线，保证桌面端按既定顺序排列。
+                "priority": 1000 + i,
+                "service_tiers": [],
+                "shell_type": "shell_command",
+                "slug": m.id,
+                "support_verbosity": false,
+                "supported_in_api": true,
+                "supported_reasoning_levels": [
+                    { "description": "Disable Thinking", "effort": "none" },
+                    { "description": "Enabled Thinking", "effort": "high" }
+                ],
+                "supports_image_detail_original": false,
+                "supports_parallel_tool_calls": false,
+                "supports_reasoning_summaries": true,
+                "supports_search_tool": false,
+                "truncation_policy": { "limit": 10000, "mode": "bytes" },
+                "upgrade": null,
+                "visibility": "list"
+            })
+        })
+        .collect();
+
+    // 结构完全由本函数控制（键名皆静态），序列化不会失败；失败时返回空目录
+    // 也比 panic 安全（调用方处于写文件路径）。
+    serde_json::to_string_pretty(&json!({ "models": entries }))
+        .unwrap_or_else(|_| String::from("{\"models\":[]}"))
 }
 
 /// 生成 OpenCode 配置：写入 provider.workbuddy 及多个选定模型。
@@ -1439,9 +1664,9 @@ pub fn build_grok_config(
     existing: Option<&str>,
     base: &str,
     api_key: &str,
-    models: &[String],
+    models: &[ModelSpec],
 ) -> Result<String, String> {
-    let primary = models.first().map(String::as_str).unwrap_or("deepseek-v4-flash");
+    let primary = models.first().map(|m| m.id.as_str()).unwrap_or("deepseek-v4-flash");
     let text = existing.unwrap_or("");
     let mut out = if text.trim().is_empty() {
         format!("[models]\ndefault = \"{primary}\"\n")
@@ -1451,9 +1676,17 @@ pub fn build_grok_config(
     };
 
     for m in models {
-        let table_header = format!("[model.\"{m}\"]");
+        let id = &m.id;
+        let table_header = format!("[model.\"{id}\"]");
+        // 上下文窗口是客户端用来算「剩余空间」的分母：只有上游给出真值时才写，
+        // 否则直接省略该字段，避免 Grok 展示一个编造出来的容量。
+        let ctx_line = if m.context_window > 0 {
+            format!("context_window = {}\n", m.context_window)
+        } else {
+            String::new()
+        };
         let model_body = format!(
-            "{table_header}\nmodel = \"{m}\"\nbase_url = \"{base}/v1\"\nname = \"{PROVIDER_NAME}\"\napi_key = \"{api_key}\"\napi_backend = \"responses\"\ncontext_window = 500000\n"
+            "{table_header}\nmodel = \"{id}\"\nbase_url = \"{base}/v1\"\nname = \"{PROVIDER_NAME}\"\napi_key = \"{api_key}\"\napi_backend = \"responses\"\n{ctx_line}"
         );
         out = replace_toml_table(&out, &table_header, &model_body);
     }
@@ -1465,7 +1698,7 @@ pub fn build_zcode_config(
     existing: Option<&str>,
     base: &str,
     api_key: &str,
-    models: &[String],
+    models: &[ModelSpec],
 ) -> Result<String, String> {
     let mut root = parse_json_object(existing)?;
     if !root.get("provider").map(Value::is_object).unwrap_or(false) {
@@ -1475,18 +1708,22 @@ pub fn build_zcode_config(
 
     let mut models_map = Map::new();
     for m in models {
+        // 上下文窗口只在有上游真值时声明：
+        // ZCode 会把它当作可发送 prompt 的上限，编大等于放任请求打到上游才报错。
+        let limit = if m.context_window > 0 {
+            json!({ "context": m.context_window, "output": 8192 })
+        } else {
+            json!({ "output": 8192 })
+        };
         models_map.insert(
-            m.clone(),
+            m.id.clone(),
             json!({
                 "reasoning": {
                     "enabled": true,
                     "variants": ["low", "medium", "high", "max"],
                     "defaultVariant": "max"
                 },
-                "limit": {
-                    "context": 200000,
-                    "output": 8192
-                },
+                "limit": limit,
                 // 必须声明 image：ZCode 由 modalities.input 推导 supportsImages
                 // （app.asar 里 `w.supportsImages = y.modalities.input.includes("image")`），
                 // 而 supportsImages=false 会让它把图片从请求里直接丢掉
@@ -1532,9 +1769,9 @@ pub fn build_kimi_code_config(
     existing: Option<&str>,
     base: &str,
     api_key: &str,
-    models: &[String],
+    models: &[ModelSpec],
 ) -> Result<String, String> {
-    let primary = models.first().map(String::as_str).unwrap_or("deepseek-v4-flash");
+    let primary = models.first().map(|m| m.id.as_str()).unwrap_or("deepseek-v4-flash");
     let text = existing.unwrap_or("");
     let mut out = set_toml_top_level(text, "default_model", &format!("\"{primary}\""));
 
@@ -1545,9 +1782,16 @@ pub fn build_kimi_code_config(
     out = replace_toml_table(&out, provider_table, &provider_body);
 
     for m in models {
-        let table_header = format!("[models.\"{m}\"]");
+        let id = &m.id;
+        let table_header = format!("[models.\"{id}\"]");
+        // 上游没给真值时省略 max_context_size，而不是编一个 200000。
+        let ctx_line = if m.context_window > 0 {
+            format!("max_context_size = {}\n", m.context_window)
+        } else {
+            String::new()
+        };
         let model_body = format!(
-            "{table_header}\nprovider = \"workbuddy\"\nmodel = \"{m}\"\nmax_context_size = 200000\ncapabilities = [\"tool_use\"]\n"
+            "{table_header}\nprovider = \"workbuddy\"\nmodel = \"{id}\"\n{ctx_line}capabilities = [\"tool_use\"]\n"
         );
         out = replace_toml_table(&out, &table_header, &model_body);
     }
@@ -1559,9 +1803,9 @@ pub fn build_openclaw_config(
     existing: Option<&str>,
     base: &str,
     api_key: &str,
-    models: &[String],
+    models: &[ModelSpec],
 ) -> Result<String, String> {
-    let primary = models.first().map(String::as_str).unwrap_or("deepseek-v4-flash");
+    let primary = models.first().map(|m| m.id.as_str()).unwrap_or("deepseek-v4-flash");
     let mut root = match existing.map(str::trim).filter(|s| !s.is_empty()) {
         None => Map::new(),
         Some(text) => parse_json_or_json5(text)?,
@@ -1579,14 +1823,18 @@ pub fn build_openclaw_config(
     let models_list: Vec<Value> = models
         .iter()
         .map(|m| {
-            json!({
-                "id": m,
-                "name": m,
-                "contextWindow": 1048576,
+            let mut entry = json!({
+                "id": m.id,
+                "name": m.id,
                 "reasoning": true,
                 "input": ["text", "image"],
                 "maxTokens": 131072
-            })
+            });
+            // 只声明上游真值；拿不到时省略字段，避免 OpenClaw 展示假容量。
+            if m.context_window > 0 {
+                entry["contextWindow"] = json!(m.context_window);
+            }
+            entry
         })
         .collect();
 
@@ -1613,7 +1861,7 @@ pub fn build_openclaw_config(
     }
     let d_models = defaults.get_mut("models").and_then(Value::as_object_mut).unwrap();
     for m in models {
-        let qualified = format!("workbuddy/{m}");
+        let qualified = format!("workbuddy/{}", m.id);
         d_models.insert(qualified, json!({ "alias": "WorkBuddy" }));
     }
     defaults.insert("model".into(), json!({ "primary": format!("workbuddy/{primary}") }));
@@ -2047,7 +2295,7 @@ mod tests {
     #[test]
     fn codex_config_uses_responses_and_keeps_other_tables() {
         let existing = "model = \"old\"\n\n[mcp_servers.foo]\ncommand = \"x\"\n";
-        let out = build_codex_config(Some(existing), "http://127.0.0.1:7863", &["glm-5.2".into()]).unwrap();
+        let out = build_codex_config(Some(existing), "http://127.0.0.1:7863", "sk-x", &["glm-5.2".into()]).unwrap();
         assert!(out.contains("wire_api = \"responses\""), "must use responses:\n{out}");
         assert!(!out.contains("wire_api = \"chat\""));
         assert!(out.contains("base_url = \"http://127.0.0.1:7863/v1\""));
@@ -2055,23 +2303,86 @@ mod tests {
         assert!(out.contains("[mcp_servers.foo]"), "must keep unrelated tables:\n{out}");
     }
 
+    /// 网关凭据必须通过 provider 块的 experimental_bearer_token 内联传递，
+    /// 且不得出现 requires_openai_auth（那是 ChatGPT 登录态专用字段）。
+    /// 这样 auth.json 里的 ChatGPT tokens 才能原样保留、不被挤下线。
     #[test]
-    fn codex_config_is_idempotent() {
-        let models = vec!["m".to_string()];
-        let first = build_codex_config(None, "http://127.0.0.1:7863", &models).unwrap();
-        let second = build_codex_config(Some(&first), "http://127.0.0.1:7863", &models).unwrap();
-        assert_eq!(first.matches("[model_providers.workbuddy]").count(), 1);
-        assert_eq!(second.matches("[model_providers.workbuddy]").count(), 1);
+    fn codex_config_inlines_bearer_without_openai_auth() {
+        let out = build_codex_config(None, "http://127.0.0.1:7863", "sk-secret", &["m".into()]).unwrap();
+        assert!(
+            out.contains("experimental_bearer_token = \"sk-secret\""),
+            "应内联 bearer 凭据:\n{out}"
+        );
+        assert!(
+            !out.contains("requires_openai_auth"),
+            "第三方 provider 不得声明 requires_openai_auth:\n{out}"
+        );
+    }
+
+    /// 密钥里的特殊字符必须按 TOML 基本字符串规则转义，否则生成的 config.toml
+    /// 无法被 Codex 解析（引号会提前截断字符串）。
+    #[test]
+    fn codex_config_escapes_bearer_token() {
+        let out = build_codex_config(None, "http://127.0.0.1:7863", r#"a"b\c"#, &["m".into()]).unwrap();
+        assert!(
+            out.contains(r#"experimental_bearer_token = "a\"b\\c""#),
+            "密钥中的 \" 与 \\ 必须转义:\n{out}"
+        );
+    }
+
+    /// 顶层 model 必须与模型目录里的某个 slug 严格对应（取第一个选中模型），
+    /// 且 model_catalog_json 指向本网关自己的目录文件。
+    /// 这正是修复「选择器显示的模型与实际选中模型不一致」的关键约束。
+    #[test]
+    fn codex_config_model_aligns_with_catalog_slug() {
+        let models = vec![
+            ModelSpec::with_context_window("deepseek-v4-flash", 1_000_000),
+            ModelSpec::with_context_window("glm-5.2", 1_000_000),
+            ModelSpec::with_context_window("kimi-k2.6", 1_000_000),
+        ];
+        let cfg = build_codex_config(None, "http://127.0.0.1:7863", "sk-x", &models).unwrap();
+        assert!(cfg.contains("model = \"deepseek-v4-flash\""), "默认主模型应为首个选中项:\n{cfg}");
+        assert!(
+            cfg.contains(&format!("model_catalog_json = \"{CODEX_CATALOG_FILE}\"")),
+            "必须指向网关自己的模型目录:\n{cfg}"
+        );
+
+        let catalog_text = build_codex_model_catalog(&models);
+        let catalog: Value = serde_json::from_str(&catalog_text).expect("目录必须是合法 JSON");
+        let slugs: Vec<&str> = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["slug"].as_str().unwrap())
+            .collect();
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(slugs, ids, "目录 slug 顺序必须与选中模型一致");
+        // 顶层 model 必须命中目录条目，否则桌面端无法高亮当前模型。
+        assert!(slugs.contains(&"deepseek-v4-flash"));
+        // 每个条目都要声明 text+image 与默认 high 思考档。
+        for entry in catalog["models"].as_array().unwrap() {
+            let modalities = entry["input_modalities"].as_array().unwrap();
+            assert!(modalities.iter().any(|v| v == "image"));
+            assert_eq!(entry["default_reasoning_level"], "high");
+        }
+        // 上下文窗口必须原样落到每个目录条目，不能再用写死的 131072：
+        // Codex 显示值 = context_window × effective_context_window_percent / 100。
+        for entry in catalog["models"].as_array().unwrap() {
+            assert_eq!(entry["context_window"], 1_000_000);
+            assert_eq!(entry["max_context_window"], 1_000_000);
+            assert_eq!(entry["effective_context_window_percent"], 95);
+        }
     }
 
     #[test]
-    fn codex_auth_drops_oauth_fields() {
-        let existing = r#"{"tokens":{"a":1},"last_refresh":"x","OPENAI_API_KEY":"old"}"#;
-        let out = build_codex_auth(Some(existing), "sk-new").unwrap();
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["OPENAI_API_KEY"], "sk-new");
-        assert_eq!(v["auth_mode"], "apikey");
-        assert!(v.get("tokens").is_none());
+    fn codex_config_is_idempotent() {
+        let models = vec![ModelSpec::new("m")];
+        let first = build_codex_config(None, "http://127.0.0.1:7863", "sk-x", &models).unwrap();
+        let second = build_codex_config(Some(&first), "http://127.0.0.1:7863", "sk-x", &models).unwrap();
+        assert_eq!(first.matches("[model_providers.workbuddy]").count(), 1);
+        assert_eq!(second.matches("[model_providers.workbuddy]").count(), 1);
+        assert_eq!(second.matches("experimental_bearer_token").count(), 1);
+        assert_eq!(second.matches("model_catalog_json").count(), 1);
     }
 
     #[test]
@@ -2193,7 +2504,7 @@ mod tests {
 
     #[test]
     fn grok_build_config_writes_multiple_models() {
-        let models = vec!["m1".to_string(), "m2".to_string()];
+        let models = vec![ModelSpec::new("m1"), ModelSpec::new("m2")];
         let out = build_grok_config(None, "http://127.0.0.1:7863", "sk-test", &models).unwrap();
         assert!(out.contains("default = \"m1\""));
         assert!(out.contains("[model.\"m1\"]"));
@@ -2202,7 +2513,7 @@ mod tests {
 
     #[test]
     fn zcode_config_writes_multiple_models() {
-        let models = vec!["m1".to_string(), "m2".to_string()];
+        let models = vec![ModelSpec::new("m1"), ModelSpec::new("m2")];
         let out = build_zcode_config(None, "http://127.0.0.1:7863", "sk-test", &models).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         // kind 必须是 ZCode 认识的枚举值，否则该 provider 不被加载。
@@ -2213,7 +2524,7 @@ mod tests {
 
     #[test]
     fn kimi_code_config_writes_multiple_models() {
-        let models = vec!["m1".to_string(), "m2".to_string()];
+        let models = vec![ModelSpec::new("m1"), ModelSpec::new("m2")];
         let out = build_kimi_code_config(None, "http://127.0.0.1:7863", "sk-test", &models).unwrap();
         assert!(out.contains("default_model = \"m1\""));
         // 凭据挂在 provider 表；模型条目必须带 provider 引用，否则 Kimi CLI 判为无效配置。
@@ -2228,7 +2539,7 @@ mod tests {
     #[test]
     fn openclaw_config_writes_multiple_models() {
         let json5 = "{ models: { mode: 'merge', providers: {} } }";
-        let models = vec!["m1".to_string(), "m2".to_string()];
+        let models = vec![ModelSpec::new("m1"), ModelSpec::new("m2")];
         let out = build_openclaw_config(Some(json5), "http://127.0.0.1:7863", "sk-test", &models).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         let list = v["models"]["providers"]["workbuddy"]["models"].as_array().unwrap();
@@ -2401,6 +2712,161 @@ permissionMode: bypassPermissions
             err.contains("未做修改"),
             "错误信息应说明未改动原文件，否则用户会担心配置已被破坏: {err}"
         );
+    }
+
+    /// 恢复备份只能回滚**配置**，绝不能把备份里的 Codex `auth.json` 写回。
+    ///
+    /// 旧版本接入网关时会往 auth.json 写 API Key 并删掉 OAuth tokens，
+    /// 因此历史备份里可能正躺着一份被污染的登录态；若恢复时无差别写回，
+    /// 「接入不改用户登录」的承诺就被「一键回滚」绕过了。
+    #[test]
+    fn restore_backup_never_writes_back_codex_auth_json() {
+        use crate::modules::config::test_isolation::Isolated;
+
+        let iso = Isolated::new("agent-restore-auth");
+        let codex_home = iso.dir().join("codex-home");
+        std::fs::create_dir_all(codex_home.join("nested")).unwrap();
+
+        let config_path = codex_home.join("config.toml");
+        let auth_path = codex_home.join("auth.json");
+        // 大写 / 嵌套路径：备份清单里的原路径形态千奇百怪，都按文件名识别。
+        let nested_auth_path = codex_home.join("nested").join("AUTH.JSON");
+        std::fs::write(&config_path, "modified-config").unwrap();
+        std::fs::write(&auth_path, "modified-auth").unwrap();
+        std::fs::write(&nested_auth_path, "modified-nested-auth").unwrap();
+
+        let backup_id = "1750000000000";
+        let backup_dir = backup_root().join("codex").join(backup_id);
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("0-config.toml"), "original-config").unwrap();
+        std::fs::write(backup_dir.join("1-auth.json"), "original-auth").unwrap();
+        std::fs::write(backup_dir.join("2-AUTH.JSON"), "original-nested-auth").unwrap();
+        let manifest = json!({
+            "0-config.toml": config_path.to_string_lossy(),
+            "1-auth.json": auth_path.to_string_lossy(),
+            "2-AUTH.JSON": nested_auth_path.to_string_lossy(),
+            "target": "codex",
+            "createdAt": 1_750_000_000_000i64,
+        });
+        std::fs::write(
+            backup_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let restored = restore_backup("codex", backup_id).unwrap();
+        assert_eq!(restored, 1, "只有 config.toml 应被恢复");
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "original-config");
+        assert_eq!(
+            std::fs::read_to_string(&auth_path).unwrap(),
+            "modified-auth",
+            "恢复备份不得改动 Codex 的 ChatGPT 登录态"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&nested_auth_path).unwrap(),
+            "modified-nested-auth",
+            "嵌套路径下同名的登录态文件同样不得改动"
+        );
+    }
+
+    /// `backup_files` 必须**主动跳过** Codex 的 auth.json：
+    /// 即使调用方（或将来新增的路径）把登录态文件名传进来，也不该写进备份，
+    /// 从源头上杜绝「备份里存在用户登录态」这件事。
+    #[test]
+    fn backup_files_skips_codex_auth_json() {
+        use crate::modules::config::test_isolation::Isolated;
+
+        let iso = Isolated::new("agent-backup-skip-auth");
+        let dir = iso.dir().join("codex-home");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let auth_path = dir.join("auth.json");
+        std::fs::write(&config_path, "cfg").unwrap();
+        std::fs::write(&auth_path, r#"{"tokens":{"access_token":"secret"}}"#).unwrap();
+
+        let backup_dir =
+            backup_files("codex", &[config_path.clone(), auth_path.clone()]).unwrap();
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(backup_dir.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let obj = manifest.as_object().unwrap();
+        assert!(!obj.is_empty(), "config.toml 仍应被备份");
+        assert!(
+            obj.values()
+                .all(|v| v.as_str() != Some(auth_path.to_string_lossy().as_ref())),
+            "auth.json 绝不能出现在备份清单里: {manifest}"
+        );
+        for entry in std::fs::read_dir(&backup_dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            let lower = name.to_string_lossy().to_ascii_lowercase();
+            assert!(
+                !lower.contains("auth.json"),
+                "备份目录里不得落盘任何 auth.json 副本: {lower}"
+            );
+        }
+    }
+
+    /// 端到端：跑一次真实的 Codex 导入，auth.json 必须**逐字节不变**。
+    ///
+    /// 这是用户可见承诺的直接回归防线 —— 无论写 config.toml / 模型目录，
+    /// 也无论生成什么备份，用户的 ChatGPT 登录态都不能被动过。
+    #[test]
+    fn import_codex_leaves_auth_json_untouched() {
+        use crate::modules::config::test_isolation::Isolated;
+
+        let iso = Isolated::new("agent-import-codex-auth");
+        let codex_home = iso.dir().join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+
+        let auth_path = codex_home.join("auth.json");
+        let oauth = r#"{"OPENAI_API_KEY":null,"tokens":{"access_token":"oauth-token","refresh_token":"r"},"last_refresh":"2026-09-21T00:00:00Z","auth_mode":"chatgpt"}"#;
+        std::fs::write(&auth_path, oauth).unwrap();
+        let before = std::fs::read(&auth_path).unwrap();
+
+        let models = vec![ModelSpec::with_context_window("glm-5.2", 200_000)];
+        let outcome = import_codex_into(&codex_home, "http://127.0.0.1:7863", "sk-gateway", &models)
+            .unwrap();
+        assert_eq!(outcome.target, "codex");
+
+        let after = std::fs::read(&auth_path).unwrap();
+        assert_eq!(before, after, "接入网关后 ChatGPT 登录态必须逐字节不变");
+        assert_eq!(std::fs::read_to_string(&auth_path).unwrap(), oauth);
+
+        // config.toml 确实被写了，且凭据走 bearer 而非 auth.json。
+        let cfg = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+        assert!(cfg.contains("experimental_bearer_token = \"sk-gateway\""), "{cfg}");
+        assert!(!cfg.contains("requires_openai_auth"), "{cfg}");
+    }
+    /// 保护只针对 Codex 的登录态：其它客户端的备份恢复语义保持不变，
+    /// 避免误伤（例如某些客户端的 auth.json 就是它自己的配置文件）。
+    #[test]
+    fn restore_backup_only_protects_codex_auth_json() {
+        use crate::modules::config::test_isolation::Isolated;
+
+        let iso = Isolated::new("agent-restore-other-auth");
+        let dir = iso.dir().join("other-home");
+        std::fs::create_dir_all(&dir).unwrap();
+        let auth_path = dir.join("auth.json");
+        std::fs::write(&auth_path, "modified").unwrap();
+
+        let backup_id = "1750000000001";
+        let backup_dir = backup_root().join("claude-code").join(backup_id);
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("0-auth.json"), "original").unwrap();
+        let manifest = json!({
+            "0-auth.json": auth_path.to_string_lossy(),
+            "target": "claude-code",
+            "createdAt": 1_750_000_000_001i64,
+        });
+        std::fs::write(
+            backup_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(restore_backup("claude-code", backup_id).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(&auth_path).unwrap(), "original");
     }
 
     #[test]

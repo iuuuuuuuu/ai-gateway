@@ -43,8 +43,8 @@ const MODELS_CONFIG_UA: &str = "WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/2.137.1";
 
 /// 模型配置接口路径。
 ///
-/// 不用 `/console/enterprises/personal/models`：该接口在国际版恒返回 500，
-/// 导致国际版永远只能靠硬编码静态表。`/v3/config` 两个区域都可用。
+/// 不用 `/console/enterprises/personal/models`：该接口在国际版恒返回 500。
+/// `/v3/config` 两个区域都可用。
 const MODELS_CONFIG_PATH: &str = "/v3/config";
 
 /// 单次响应体读取上限（1 MiB），防止上游异常时吃满内存。

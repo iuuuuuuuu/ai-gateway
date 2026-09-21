@@ -271,6 +271,8 @@ pub fn run() {
             commands_apps::trae_add_account,
             commands_apps::trae_delete_account,
             commands_apps::trae_discover_accounts,
+            commands_apps::trae_import_local,
+            commands_apps::trae_discover_and_import,
             commands_apps::trae_entitlement,
             commands_apps::trae_device_info,
             commands_apps::trae_checkin_run,

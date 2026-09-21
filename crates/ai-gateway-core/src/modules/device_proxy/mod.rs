@@ -21,6 +21,8 @@
 pub mod bypass;
 pub mod ca;
 pub mod handler;
+// 宿主无关的代理操作层（进程内单例 + 事件回调），桌面端与 webui 共用
+pub mod host_ops;
 pub mod local_capture;
 pub mod logger;
 pub mod sys_proxy;

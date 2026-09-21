@@ -847,12 +847,14 @@ pub fn detect_agent_clients() -> Result<Value, String> {
     }))
 }
 
-/// 获取网关模型列表（优先从运行中的网关拉取，失败回退预置列表）。
+/// 获取网关模型列表（**只从上游实时拉取**，无内置静态清单）。
+///
+/// `error` 非空时 `models` 必为空数组 —— 前端据此显示明确的原因，
+/// 而不是渲染一个空的模型选择器让用户自己猜。
 #[tauri::command]
 pub async fn get_gateway_models() -> Result<Value, String> {
-    Ok(json!({
-        "models": ai_gateway_core::modules::gateway::fetch_models().await,
-    }))
+    let (models, error) = ai_gateway_core::modules::gateway::fetch_models().await;
+    Ok(json!({ "models": models, "error": error }))
 }
 
 /// 获取网关累计 Token 用量统计（days 省略 = 全部历史）。
@@ -861,24 +863,69 @@ pub async fn get_gateway_usage(days: Option<i64>) -> Result<Value, String> {
     Ok(ai_gateway_core::modules::gateway::fetch_usage(days).await)
 }
 
+/// 解析前端传入的模型列表，兼容两种格式：
+///
+/// - 新格式（推荐）：`[{ "id": "glm-5.2", "contextWindow": 1000000 }, ...]`
+/// - 旧格式：纯字符串数组 `["glm-5.2", ...]`（上下文窗口未知）
+///
+/// `contextWindow` / `context_length` 只接受正整数；缺失 / 0 / 非法值
+/// 一律记为「未知」，由下游决定省略声明 —— 不能编造上下文窗口。
+fn parse_import_models(value: Option<&Value>) -> Vec<ai_gateway_core::modules::agent_import::ModelSpec> {
+    use ai_gateway_core::modules::agent_import::ModelSpec;
+
+    let Some(arr) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    arr.iter()
+        .filter_map(|item| match item {
+            Value::String(id) => {
+                let id = id.trim();
+                if id.is_empty() {
+                    None
+                } else {
+                    Some(ModelSpec::new(id))
+                }
+            }
+            Value::Object(obj) => {
+                let id = obj.get("id").and_then(Value::as_str)?.trim();
+                if id.is_empty() {
+                    return None;
+                }
+                let ctx = obj
+                    .get("contextWindow")
+                    .or_else(|| obj.get("context_window"))
+                    .or_else(|| obj.get("context_length"))
+                    .and_then(Value::as_u64)
+                    .filter(|v| *v > 0)
+                    .unwrap_or(0);
+                Some(ModelSpec::with_context_window(id, ctx))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// 把网关接入指定客户端（写配置 + 自动备份，支持多模型）。
 #[tauri::command(rename_all = "camelCase")]
 pub fn import_agent_client(
     target: String,
     model: Option<String>,
-    models: Option<Vec<String>>,
+    models: Option<Value>,
 ) -> Result<Value, String> {
     let (base, api_key, _) = gateway_root_base();
     if api_key.trim().is_empty() {
         return Err("请先在网关设置里填写 API Key：客户端需要凭据才能鉴权".to_string());
     }
-    let model_list = match models {
-        Some(list) if !list.is_empty() => list,
-        _ => match model.filter(|m| !m.trim().is_empty()) {
-            Some(m) => vec![m],
-            None => vec![default_gateway_model()],
-        },
-    };
+    let mut model_list = parse_import_models(models.as_ref());
+    if model_list.is_empty() {
+        model_list = match model.filter(|m| !m.trim().is_empty()) {
+            Some(m) => vec![ai_gateway_core::modules::agent_import::ModelSpec::new(m.trim())],
+            None => vec![ai_gateway_core::modules::agent_import::ModelSpec::new(
+                default_gateway_model(),
+            )],
+        };
+    }
 
     let outcome = ai_gateway_core::modules::agent_import::import_target(
         &target, &base, &api_key, &model_list,
@@ -896,17 +943,19 @@ pub fn import_agent_client(
 #[tauri::command(rename_all = "camelCase")]
 pub fn batch_import_agent_clients(
     targets: Option<Vec<String>>,
-    models: Option<Vec<String>>,
+    models: Option<Value>,
 ) -> Result<Value, String> {
     let (base, api_key, _) = gateway_root_base();
     if api_key.trim().is_empty() {
         return Err("请先在网关设置里填写 API Key：客户端需要凭据才能鉴权".to_string());
     }
 
-    let model_list = match models {
-        Some(list) if !list.is_empty() => list,
-        _ => vec![default_gateway_model()],
-    };
+    let mut model_list = parse_import_models(models.as_ref());
+    if model_list.is_empty() {
+        model_list = vec![ai_gateway_core::modules::agent_import::ModelSpec::new(
+            default_gateway_model(),
+        )];
+    }
 
     let outcomes = match targets {
         Some(ids) if !ids.is_empty() => {
@@ -926,7 +975,7 @@ pub fn batch_import_agent_clients(
             "files": o.files,
             "models": o.models,
         })).collect::<Vec<_>>(),
-        "models": model_list,
+        "models": model_list.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
     }))
 }
 
@@ -955,7 +1004,7 @@ pub fn list_agent_backups(target: String) -> Result<Value, String> {
     }))
 }
 
-/// 默认模型：优先取网关模型列表的第一项，失败时回退到静态表首项。
+/// 默认模型：模型清单只来自上游，无法在此同步获取，故用固定兜底值。
 fn default_gateway_model() -> String {
     "deepseek-v4-flash".to_string()
 }

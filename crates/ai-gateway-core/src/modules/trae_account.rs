@@ -213,6 +213,61 @@ pub fn upsert_account(
     Ok(acc)
 }
 
+/// 账号名是否是**占位名**（自动生成、没有信息量）。
+///
+/// 两类占位名：
+/// - `auto_<uid 前 8 位>` —— 代理/本地捕获自动追加账号时的命名
+/// - `账号_<uid 前 8 位>` —— [`upsert_account`] 未给名字时的兜底
+///
+/// 只有占位名才允许被自动改名。用户手动取的名字（哪怕恰好叫 "auto_xxx" 之外的任何值）
+/// 一律保留 —— 自动改名覆盖用户输入是不可接受的。
+pub fn is_placeholder_name(name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return true;
+    }
+    if let Some(rest) = name.strip_prefix("auto_") {
+        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric());
+    }
+    if let Some(rest) = name.strip_prefix("账号_") {
+        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric());
+    }
+    false
+}
+
+/// 仅在账号名还是占位名时改名为 `name`（用户自定义名绝不覆盖）。
+///
+/// 用途：「发现本机账号」已经读到了套餐身份（如 `Pro`），但账号是捕获流程
+/// 自动建的、名字还叫 `auto_<uid8>` —— 把这个信息填进去，用户一眼能认出是哪个号。
+///
+/// 返回是否真的改了名。
+pub fn set_name_if_placeholder(uid: &str, name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    let mut accounts = load_accounts();
+    let Some(acc) = accounts
+        .iter_mut()
+        .find(|a| a.get("user_id").and_then(Value::as_str) == Some(uid.trim()))
+    else {
+        return false;
+    };
+    let current = acc.get("name").and_then(Value::as_str).unwrap_or("");
+    if !is_placeholder_name(current) {
+        return false;
+    }
+    if current == name {
+        return false;
+    }
+    let Some(obj) = acc.as_object_mut() else {
+        return false;
+    };
+    obj.insert("name".to_string(), json!(name));
+    obj.insert("updated_at".to_string(), json!(config::utc_iso()));
+    save_accounts(&accounts).is_ok()
+}
+
 /// 删除账号。
 pub fn delete_account(uid: &str) -> Result<(), String> {
     let mut accounts = load_accounts();
@@ -430,5 +485,60 @@ mod tests {
         assert_eq!(meta["name"], "测试号");
         assert_eq!(meta["hasRefreshToken"], true);
         assert_eq!(meta["jwtStatus"], "ok");
+    }
+
+    #[test]
+    fn 占位名识别() {
+        // 捕获流程自动生成的两种占位名
+        assert!(is_placeholder_name("auto_18839192"));
+        assert!(is_placeholder_name("账号_18839192"));
+        // 空名按占位处理（可被填上有信息量的名字）
+        assert!(is_placeholder_name(""));
+        assert!(is_placeholder_name("   "));
+        // 用户取的名字一律不算占位
+        assert!(!is_placeholder_name("主号"));
+        assert!(!is_placeholder_name("Trae Work · Pro"));
+        // 前缀像但不是占位（后面不是 uid 片段）→ 保守当作自定义名
+        assert!(!is_placeholder_name("auto_"));
+        assert!(!is_placeholder_name("账号_"));
+        assert!(!is_placeholder_name("账号_主号"));
+    }
+
+    #[test]
+    fn 只在占位名时才自动改名() {
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae-rename");
+
+        // 捕获自动建的账号（占位名）→ 可被填上套餐身份
+        upsert_account("1883919207380040", None, "Cloud-IDE-JWT a.b.c", None).unwrap();
+        assert!(
+            is_placeholder_name(&display_name(&find_account("1883919207380040").unwrap())),
+            "upsert 未给名字时应落成占位名"
+        );
+        assert!(set_name_if_placeholder("1883919207380040", "Trae Work · Pro"));
+        assert_eq!(
+            display_name(&find_account("1883919207380040").unwrap()),
+            "Trae Work · Pro"
+        );
+        // 同名重复调用 → 无变化
+        assert!(!set_name_if_placeholder("1883919207380040", "Trae Work · Pro"));
+
+        // 用户手动改过名字 → **绝不**覆盖
+        upsert_account("1994398417874030", Some("我的主号"), "Cloud-IDE-JWT a.b.c", None).unwrap();
+        assert!(!set_name_if_placeholder("1994398417874030", "Trae · Free"));
+        assert_eq!(
+            display_name(&find_account("1994398417874030").unwrap()),
+            "我的主号",
+            "用户自定义名不得被自动改名覆盖"
+        );
+
+        // 账号不存在 / 空名字 → 安全返回 false
+        assert!(!set_name_if_placeholder("no-such-uid", "x"));
+        assert!(!set_name_if_placeholder("1883919207380040", "  "));
+        assert_eq!(
+            display_name(&find_account("1883919207380040").unwrap()),
+            "Trae Work · Pro",
+            "空名字不得把已有名字清掉"
+        );
     }
 }
