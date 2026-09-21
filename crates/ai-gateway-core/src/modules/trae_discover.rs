@@ -35,13 +35,20 @@ const VSCDB_SUFFIX: &str = r"User\globalStorage\state.vscdb";
 /// 每个应用给多个候选：客户端改过目录名（`TRAE SOLO` → `TRAE SOLO CN`），
 /// 只认一个会让老安装的用户发现不到账号。
 pub fn app_data_dirs(app_kind: &str) -> Vec<PathBuf> {
-    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    app_data_dirs_under(app_kind, &std::env::var("APPDATA").unwrap_or_default())
+}
+
+/// [`app_data_dirs`] 的纯函数内核：显式接收 APPDATA 根目录。
+///
+/// 拆出来是为了让测试不必 `set_var("APPDATA")` —— 环境变量是进程全局的，
+/// 并行测试下会互相串扰（详见 `gtm_users_evidence_under` 的注释）。
+fn app_data_dirs_under(app_kind: &str, appdata: &str) -> Vec<PathBuf> {
     match app_kind {
         "TraeWork" => vec![
-            PathBuf::from(&appdata).join("TRAE SOLO CN"),
-            PathBuf::from(&appdata).join("TRAE SOLO"),
+            PathBuf::from(appdata).join("TRAE SOLO CN"),
+            PathBuf::from(appdata).join("TRAE SOLO"),
         ],
-        "Trae" => vec![PathBuf::from(&appdata).join("Trae CN")],
+        "Trae" => vec![PathBuf::from(appdata).join("Trae CN")],
         _ => vec![],
     }
 }
@@ -298,8 +305,18 @@ pub fn read_entitlement(app_kind: &str) -> Option<Value> {
 /// 与 [`vscdb_uid_evidence`] 同理：改名后的两个目录会并存且可能各自记录了
 /// 不同账号，只看第一个会把另一个目录的账号漏掉。
 fn gtm_users_evidence_all(app_kind: &str) -> HashMap<String, UidEvidence> {
+    gtm_users_evidence_under(app_kind, &std::env::var("APPDATA").unwrap_or_default())
+}
+
+/// [`gtm_users_evidence_all`] 的**纯函数内核**：显式接收 APPDATA 根目录。
+///
+/// 抽出它只为可测性：直接测 `gtm_users_evidence_all` 需要 `set_var("APPDATA")`，
+/// 而环境变量是**进程全局**的 —— 并行跑测试时其他用例可能读到被改写的值
+///（实测该用例本地单跑通过、CI 全量跑必失败，就是并行串扰所致）。
+/// 这里把根目录改成入参后，测试不再需要碰任何全局状态。
+fn gtm_users_evidence_under(app_kind: &str, appdata: &str) -> HashMap<String, UidEvidence> {
     let mut out: HashMap<String, UidEvidence> = HashMap::new();
-    for dir in app_data_dirs(app_kind) {
+    for dir in app_data_dirs_under(app_kind, appdata) {
         let path = dir.join(STORAGE_SUFFIX);
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
@@ -569,7 +586,9 @@ mod tests {
         // 回归：客户端改名后 `TRAE SOLO` 与 `TRAE SOLO CN` 会**并存**，
         // 各自可能记录不同账号。只读第一个目录会让另一个目录的账号整体消失。
         //
-        // 这里不依赖真实 APPDATA：直接构造两个目录，临时把 APPDATA 指过去。
+        // 走 `app_data_dirs_under` 而不是临时改 APPDATA：环境变量是进程全局的，
+        // `set_var` 会与并行跑的其他用例互相串扰 —— 本用例曾因此在本地单跑通过、
+        // CI 全量跑必失败。纯函数内核让这里零全局副作用。
         let base = std::env::temp_dir().join(format!(
             "ai-gateway-trae-gtm-{}-{}",
             std::process::id(),
@@ -593,13 +612,7 @@ mod tests {
         write_storage("TRAE SOLO CN", "1883919207380040", 1_778_078_246_409);
         write_storage("TRAE SOLO", "7679751654497928200", 1_788_081_577_344);
 
-        let old = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", &base);
-        let merged = gtm_users_evidence_all("TraeWork");
-        match old {
-            Some(v) => std::env::set_var("APPDATA", v),
-            None => std::env::remove_var("APPDATA"),
-        }
+        let merged = gtm_users_evidence_under("TraeWork", &base.to_string_lossy());
         let _ = std::fs::remove_dir_all(&base);
 
         assert_eq!(merged.len(), 2, "两个目录的账号都要被看到，实际: {merged:?}");
