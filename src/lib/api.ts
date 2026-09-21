@@ -171,6 +171,8 @@ const ROUTES: Record<string, Route> = {
   trae_add_account: { method: "POST", path: "/api/trae/accounts/add" },
   trae_delete_account: { method: "POST", path: "/api/trae/accounts/delete" },
   trae_discover_accounts: { method: "GET", path: "/api/trae/discover" },
+  trae_import_local: { method: "POST", path: "/api/trae/import-local" },
+  trae_discover_and_import: { method: "POST", path: "/api/trae/discover/import" },
   trae_entitlement: { method: "GET", path: "/api/trae/entitlement" },
   trae_device_info: { method: "GET", path: "/api/trae/device" },
   trae_checkin_run: { method: "POST", path: "/api/trae/checkin" },
@@ -760,27 +762,45 @@ export function detectAgentClients(): Promise<AgentDetectionResult> {
   return call<AgentDetectionResult>("detect_agent_clients");
 }
 
-/** 将本网关配置一键接入指定的客户端（支持单模型或多选模型）。 */
+/** 导入模型：可只给 id，也可携带上游真实上下文窗口。 */
+export interface AgentImportModel {
+  id: string;
+  /** 上游声明的真实上下文窗口（token）；未知时省略，不得编造。 */
+  context_window?: number;
+}
+
+/**
+ * 将本网关配置一键接入指定的客户端（支持单模型或多选模型）。
+ *
+ * 同时兼容 `string[]`（上下文窗口未知）与 `AgentImportModel[]`
+ * （携带 `context_window`，Codex 等客户端据此显示正确的上下文容量）。
+ */
 export function importAgentClient(
   target: string,
-  models?: string[] | string,
+  models?: Array<string | AgentImportModel> | AgentImportModel | string,
 ): Promise<AgentImportResult> {
   const modelList = Array.isArray(models)
     ? models
+        .map((m) =>
+          typeof m === "string" ? { id: m.trim() } : { ...m, id: m.id?.trim() },
+        )
+        .filter((m) => Boolean(m.id))
     : typeof models === "string" && models.trim()
-      ? [models.trim()]
-      : undefined;
+      ? [{ id: models.trim() }]
+      : models && typeof models === "object" && models.id?.trim()
+        ? [{ ...models, id: models.id.trim() }]
+        : undefined;
   return call<AgentImportResult>("import_agent_client", {
     target,
     models: modelList,
-    model: modelList?.[0],
+    model: modelList?.[0]?.id,
   });
 }
 
 /** 批量一键接入/更新多个客户端。若不传 targets，则自动更新所有已检测到安装的客户端。 */
 export function batchImportAgentClients(
   targets?: string[],
-  models?: string[],
+  models?: Array<string | AgentImportModel>,
 ): Promise<AgentBatchImportResult> {
   return call<AgentBatchImportResult>("batch_import_agent_clients", {
     targets,
@@ -970,6 +990,44 @@ export function traeDiscoverAccounts(): Promise<{
 }> {
   return call<{ accounts: TraeDiscoveredAccount[]; apps: { kind: string; label: string }[] }>(
     "trae_discover_accounts",
+  );
+}
+
+/** 一次本机登录态导入的结果计数（见 Rust 侧 CaptureSummary）。 */
+export interface TraeImportSummary {
+  /** 新入库的账号数。 */
+  appended: number;
+  /** 凭证变新而更新的账号数。 */
+  updated: number;
+  /** 因本机凭证比账号库更旧、被防降级拦下的次数。 */
+  skipped: number;
+  /** appended + updated。 */
+  total: number;
+  /** 读取本机登录态失败时的原因（此时各计数均为 0）。 */
+  error?: string;
+}
+
+/** 发现本机登录过的 Trae 账号；顺带把本机登录态里的 JWT 一并导入账号库。 */
+export function traeDiscoverAndImport(): Promise<{
+  accounts: TraeDiscoveredAccount[];
+  import: TraeImportSummary;
+  apps: { kind: string; label: string }[];
+}> {
+  return call<{
+    accounts: TraeDiscoveredAccount[];
+    import: TraeImportSummary;
+    apps: { kind: string; label: string }[];
+  }>("trae_discover_and_import");
+}
+
+/** 单独从本机登录态导入 Trae 账号（不需要客户端在运行，也无需开代理/装 CA）。 */
+export function traeImportLocal(): Promise<{
+  ok: boolean;
+  import: TraeImportSummary;
+  accounts: TraeAccountMeta[];
+}> {
+  return call<{ ok: boolean; import: TraeImportSummary; accounts: TraeAccountMeta[] }>(
+    "trae_import_local",
   );
 }
 
