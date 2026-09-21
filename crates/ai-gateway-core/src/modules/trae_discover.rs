@@ -26,9 +26,17 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 
 /// `storage.json` 相对应用数据目录的后缀。
-const STORAGE_SUFFIX: &str = r"User\globalStorage\storage.json";
+///
+/// **必须用 `/` 而不是 `\`**：`Path::join` 在 Unix 下把 `\` 当普通字符，
+/// 于是 `r"User\globalStorage\storage.json"` 会变成一个**单段文件名**
+/// （整个串里没有路径分隔符），路径永远不存在 —— 表现为 Linux/macOS 上
+/// 该功能静默失效、只在 Windows 上「看着正常」。
+/// `Path::join` 在 Windows 上同样接受 `/`，因此用 `/` 两边都对。
+const STORAGE_SUFFIX: &str = "User/globalStorage/storage.json";
 /// `state.vscdb` 相对应用数据目录的后缀。
-const VSCDB_SUFFIX: &str = r"User\globalStorage\state.vscdb";
+///
+/// 与 [`STORAGE_SUFFIX`] 同理，必须用 `/`。
+const VSCDB_SUFFIX: &str = "User/globalStorage/state.vscdb";
 
 /// 应用数据目录候选（按优先级）。
 ///
@@ -598,7 +606,9 @@ mod tests {
                 .as_nanos()
         ));
         let write_storage = |dir: &str, uid: &str, ts: i64| {
-            let p = base.join(dir).join(r"User\globalStorage");
+            // 用 `/` 分段（与 STORAGE_SUFFIX 一致）：`\` 在 Unix 下不是分隔符，
+            // 写进去会变成一个含反斜杠的单段文件名，读侧永远找不到。
+            let p = base.join(dir).join("User/globalStorage");
             std::fs::create_dir_all(&p).unwrap();
             let body = json!({
                 "icube_gtm.users": { uid: {"updatedTime": ts} }
