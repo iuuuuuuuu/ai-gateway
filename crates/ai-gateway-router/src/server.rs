@@ -671,6 +671,15 @@ fn record_usage(state: &Arc<AppState>, uid: &str, model: &str, usage: Option<&Va
 /// 很容易突破 8MB，而**静默截断**会把合法 JSON 切成半截字节透传给上游，
 /// 上游报 `unexpected EOF`，表现为「请求参数有误」—— 客户端完全无法定位到是网关截断。
 const MAX_REQUEST_BODY: usize = 32 << 20;
+/// 流式响应的空闲心跳间隔。
+///
+/// 上游思考阶段会长时间零字节（实测 DeepSeek 推理模型可达 20 s 以上），
+/// 而 Codex 自带 5 min 空闲超时、各类反代/负载均衡通常 60~120 s。周期性发一个
+/// **真事件**能同时压住这两类超时。
+///
+/// 为什么不用 SSE 注释帧（`: ping`）：`eventsource-stream` 把注释行直接丢弃，
+/// `stream.next()` 根本不返回，定时器**不会**被重置 —— 心跳必须是被解析的真事件。
+const STREAM_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 各协议在「请求体超限 / 读取失败」两种情形下使用的错误码。
 ///
@@ -1059,7 +1068,27 @@ fn responses_stream_response(
         }
         yield Ok::<_, std::io::Error>(out.take());
         loop {
-            match frames.next_frame().await {
+            // 空闲心跳：上游思考阶段可能长时间零字节（实测 20 s+）。这里用
+            // timeout 包住「取下一帧」，超时就发一个真事件，把客户端与中间层
+            // 的空闲计时器一起压住（见 STREAM_HEARTBEAT_INTERVAL）。
+            //
+            // 取消是安全的：next_frame 只在收到完整字节片后才推进内部缓冲，
+            // 被 timeout 丢弃不会丢数据。
+            let next = match tokio::time::timeout(
+                STREAM_HEARTBEAT_INTERVAL,
+                frames.next_frame(),
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(_) => {
+                    if state.heartbeat(&mut out).is_ok() && !out.is_empty() {
+                        yield Ok(out.take());
+                    }
+                    continue;
+                }
+            };
+            match next {
                 Some(Ok(text)) => {
                     for line in text.lines() {
                         if let Some(payload) = line.strip_prefix("data: ") {
@@ -1127,11 +1156,16 @@ fn responses_stream_response(
 }
 
 /// SSE 响应头（三个协议入口共用）。
+///
+/// `Connection: keep-alive` 与 `X-Accel-Buffering: no` 都是「别缓冲」信号：
+/// 少了它们，中间的反代（nginx 默认 proxy_buffering on）会把整条流攒起来，
+/// 表现为「等很久、然后一次性刷出」或长时间无字节被判定为空闲超时。
 fn sse_headers() -> axum::http::response::Builder {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
         .header("X-Accel-Buffering", "no")
 }
 

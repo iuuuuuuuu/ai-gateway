@@ -40,6 +40,37 @@ struct ToolCall {
     added: bool,
 }
 
+/// 一个 reasoning 输出项的累积状态。
+///
+/// 上游（DeepSeek 等推理模型）把思维链放在 `delta.reasoning_content` 里，
+/// 且**先于**正文 `delta.content` 输出。它必须映射成 Responses 协议里
+/// 独立的 `reasoning` item —— 缺少它会让「思考阶段」在网关侧变成一段
+/// 完全静默的空档（实测可达 20 s 以上），客户端/中间层按空闲超时掐断连接，
+/// 表现为「回答写到一半突然断流」。
+#[derive(Debug, Default)]
+struct ReasoningItem {
+    id: String,
+    /// 在 `output` 数组中的下标（见 [`ResponsesStreamState::alloc_slot`]）。
+    index: usize,
+    /// 已累积的推理正文。
+    text: String,
+    /// 是否已发出 `output_item.added` 与 `output_item.done`。
+    added: bool,
+    done: bool,
+}
+
+/// `output` 数组里的槽位。
+///
+/// 顺序即 `output_index` 的分配顺序：reasoning / 正文 / 各工具调用**共享**
+/// 同一个递增下标空间，绝不能各自从 0 开始（客户端按 (response, output_index)
+/// 对齐 item，撞下标会让增量落到错误的 item 上）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemSlot {
+    Reasoning(usize),
+    Text,
+    Tool(i64),
+}
+
 /// 流式转换的累积状态。
 pub struct ResponsesStreamState {
     response_id: String,
@@ -54,6 +85,10 @@ pub struct ResponsesStreamState {
     usage: Option<Value>,
     /// 上游在流中途发过终止性 error 帧时的原因；非空表示本次必须按失败收尾。
     upstream_err: Option<String>,
+    /// 已开启的 reasoning 输出项（按出现顺序，下标即 `ItemSlot::Reasoning(i)`）。
+    reasoning_items: Vec<ReasoningItem>,
+    /// `output` 数组各槽位的分配顺序（决定 `output_index`）。
+    items: Vec<ItemSlot>,
 }
 
 impl ResponsesStreamState {
@@ -71,7 +106,29 @@ impl ResponsesStreamState {
             tool_order: Vec::new(),
             usage: None,
             upstream_err: None,
+            reasoning_items: Vec::new(),
+            items: Vec::new(),
         }
+    }
+
+    /// 分配（或复用）一个输出槽位，返回它在 `output` 数组中的下标。
+    ///
+    /// reasoning / 正文 / 工具三者共用同一递增下标空间；重复调用同一槽位
+    /// 返回同一个下标（幂等），因此可安全地在每个分片上调用。
+    fn alloc_slot(&mut self, slot: ItemSlot) -> usize {
+        if let Some(i) = self.items.iter().position(|s| *s == slot) {
+            return i;
+        }
+        self.items.push(slot);
+        self.items.len() - 1
+    }
+
+    /// 取一个已分配槽位的下标（未分配时按「追加」预估，不改变状态）。
+    fn slot_index(&self, slot: ItemSlot) -> usize {
+        self.items
+            .iter()
+            .position(|s| *s == slot)
+            .unwrap_or(self.items.len())
     }
 
     /// 递增并返回序号。
@@ -112,6 +169,26 @@ impl ResponsesStreamState {
         )
     }
 
+    /// 发出一个 `response.in_progress` 心跳。
+    ///
+    /// 用途：上游思考阶段可能长时间只有 reasoning 增量、甚至完全静默，而任何
+    /// 中间层（含 Codex 自带的 5 min idle timeout）都会在长时间收不到**事件**时
+    /// 掐断连接。注意 SSE 注释帧（`: ping`）不算事件 —— `eventsource-stream`
+    /// 把注释丢弃、`stream.next()` 根本不返回，因此心跳必须是**真事件**。
+    /// `response.in_progress` 在 Codex 侧是显式忽略的空操作，安全。
+    pub fn heartbeat(&mut self, out: &mut super::anthropic_stream::SseOut) -> Result<(), String> {
+        let seq = self.seq();
+        let snap = self.snapshot("in_progress", None);
+        out.write(
+            "response.in_progress",
+            &json!({
+                "type": "response.in_progress",
+                "sequence_number": seq,
+                "response": snap,
+            }),
+        )
+    }
+
     /// 开启文本输出项（幂等）。
     fn start_text_item(&mut self, out: &mut super::anthropic_stream::SseOut) -> Result<(), String> {
         if self.text_started {
@@ -121,12 +198,13 @@ impl ResponsesStreamState {
         self.text_item_id = format!("msg_{}", self.response_id);
         let seq = self.seq();
         let item_id = self.text_item_id.clone();
+        let output_index = self.alloc_slot(ItemSlot::Text);
         out.write(
             "response.output_item.added",
             &json!({
                 "type": "response.output_item.added",
                 "sequence_number": seq,
-                "output_index": 0,
+                "output_index": output_index,
                 "item": {
                     "id": item_id,
                     "type": "message",
@@ -176,25 +254,38 @@ impl ResponsesStreamState {
         for ci in choices {
             let Some(choice) = ci.as_object() else { continue };
             if let Some(delta) = choice.get("delta").and_then(|d| d.as_object()) {
+                // 推理增量：开/续 reasoning item，绝不混进正文（见 ReasoningItem）。
+                let reasoning = str_field(delta, "reasoning_content");
+                if !reasoning.is_empty() {
+                    self.write_reasoning_delta(out, &reasoning)?;
+                }
+                // 正文一律先关掉 reasoning item：Codex 只认「最后一个
+                // output_item.added」为 active item，正文增量落在 reasoning item
+                // 上会被当成推理正文而非回答。
                 let text = str_field(delta, "content");
                 if !text.is_empty() {
+                    self.close_reasoning_item(out)?;
                     self.start_text_item(out)?;
                     self.text.push_str(&text);
                     let seq = self.seq();
                     let item_id = self.text_item_id.clone();
+                    let output_index = self.slot_index(ItemSlot::Text);
                     out.write(
                         "response.output_text.delta",
                         &json!({
                             "type": "response.output_text.delta",
                             "sequence_number": seq,
                             "item_id": item_id,
-                            "output_index": 0,
+                            "output_index": output_index,
                             "content_index": 0,
                             "delta": text,
                         }),
                     )?;
                 }
                 if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                    if !tcs.is_empty() {
+                        self.close_reasoning_item(out)?;
+                    }
                     for tci in tcs {
                         let Some(call) = tci.as_object() else { continue };
                         self.consume_tool_call(out, call)?;
@@ -215,6 +306,7 @@ impl ResponsesStreamState {
         if !self.tool_calls.contains_key(&idx) {
             self.tool_order.push(idx);
             self.tool_calls.insert(idx, ToolCall::default());
+            self.alloc_slot(ItemSlot::Tool(idx));
         }
         let id = str_field(call, "id");
         let fn_obj = call.get("function").and_then(|f| f.as_object());
@@ -282,13 +374,9 @@ impl ResponsesStreamState {
         Ok(())
     }
 
-    /// 工具项在 `output` 数组中的下标（文本项占 0 时顺延 1）。
+    /// 工具项在 `output` 数组中的下标（与 reasoning / 正文共用递增下标空间）。
     fn tool_output_index(&self, idx: i64) -> usize {
-        1 + self
-            .tool_order
-            .iter()
-            .position(|&x| x == idx)
-            .unwrap_or(self.tool_order.len())
+        self.slot_index(ItemSlot::Tool(idx))
     }
 
     /// 发出一个 `response.function_call_arguments.delta`。
@@ -311,6 +399,119 @@ impl ResponsesStreamState {
                 "delta": args,
             }),
         )
+    }
+
+    /// 开启（或复用）当前 reasoning 输出项，返回它在 `reasoning_items` 中的下标。
+    ///
+    /// `ReasoningItemReasoningSummary` 在 Codex 侧**没有** `serde(default)`，
+    /// 因此 `summary` 是必填字段 —— 缺它会整条 item 反序列化失败（只记一条
+    /// debug 日志），表现与「没有推理」无异。
+    fn open_reasoning_item(
+        &mut self,
+        out: &mut super::anthropic_stream::SseOut,
+    ) -> Result<usize, String> {
+        let need_new = self.reasoning_items.last().map(|r| r.done).unwrap_or(true);
+        if need_new {
+            let id = format!(
+                "rs{}_{}",
+                self.reasoning_items.len(),
+                self.response_id
+            );
+            self.reasoning_items.push(ReasoningItem {
+                id,
+                ..Default::default()
+            });
+        }
+        let i = self.reasoning_items.len() - 1;
+        if self.reasoning_items[i].added {
+            return Ok(i);
+        }
+        let index = self.alloc_slot(ItemSlot::Reasoning(i));
+        self.reasoning_items[i].added = true;
+        self.reasoning_items[i].index = index;
+        let seq = self.seq();
+        let id = self.reasoning_items[i].id.clone();
+        out.write(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "sequence_number": seq,
+                "output_index": index,
+                "item": {
+                    "id": id,
+                    "type": "reasoning",
+                    "summary": [],
+                },
+            }),
+        )?;
+        Ok(i)
+    }
+
+    /// 写入一段推理增量。
+    ///
+    /// 用 `response.reasoning_text.delta`（原始推理正文）而非
+    /// `response.reasoning_summary_text.delta`：后者在 Codex 侧必须带
+    /// `summary_index`，缺了会被整帧丢弃。
+    fn write_reasoning_delta(
+        &mut self,
+        out: &mut super::anthropic_stream::SseOut,
+        delta: &str,
+    ) -> Result<(), String> {
+        let i = self.open_reasoning_item(out)?;
+        self.reasoning_items[i].text.push_str(delta);
+        let index = self.reasoning_items[i].index;
+        let id = self.reasoning_items[i].id.clone();
+        let seq = self.seq();
+        out.write(
+            "response.reasoning_text.delta",
+            &json!({
+                "type": "response.reasoning_text.delta",
+                "sequence_number": seq,
+                "item_id": id,
+                "output_index": index,
+                "content_index": 0,
+                "delta": delta,
+            }),
+        )
+    }
+
+    /// 关闭当前 reasoning 输出项（幂等）。
+    ///
+    /// 必须显式关：Codex 只认最后一个 `output_item.added` 为 active item，
+    /// 不关就开正文 item，正文增量会被算进推理正文里。
+    fn close_reasoning_item(
+        &mut self,
+        out: &mut super::anthropic_stream::SseOut,
+    ) -> Result<(), String> {
+        let Some(i) = self.reasoning_items.len().checked_sub(1) else {
+            return Ok(());
+        };
+        if !self.reasoning_items[i].added || self.reasoning_items[i].done {
+            return Ok(());
+        }
+        self.reasoning_items[i].done = true;
+        let index = self.reasoning_items[i].index;
+        let seq = self.seq();
+        let item = Self::reasoning_item_value(&self.reasoning_items[i]);
+        out.write(
+            "response.output_item.done",
+            &json!({
+                "type": "response.output_item.done",
+                "sequence_number": seq,
+                "output_index": index,
+                "item": item,
+            }),
+        )
+    }
+
+    /// 组装完整的 `reasoning` 输出项。
+    fn reasoning_item_value(r: &ReasoningItem) -> Value {
+        json!({
+            "id": r.id,
+            "type": "reasoning",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": r.text}],
+        })
     }
 
     /// 组装完整的 assistant message 输出项。
@@ -340,15 +541,26 @@ impl ResponsesStreamState {
         })
     }
 
-    /// 收尾输出项列表。
+    /// 收尾输出项列表（按槽位分配顺序，与各事件里的 `output_index` 一致）。
     fn output_items(&self) -> Vec<Value> {
-        let mut items: Vec<Value> = Vec::with_capacity(1 + self.tool_order.len());
-        if self.text_started {
-            items.push(self.text_message_item());
-        }
-        for idx in &self.tool_order {
-            if let Some(tc) = self.tool_calls.get(idx) {
-                items.push(Self::function_call_item(tc));
+        let mut items: Vec<Value> = Vec::with_capacity(self.items.len());
+        for slot in &self.items {
+            match slot {
+                ItemSlot::Reasoning(i) => {
+                    if let Some(r) = self.reasoning_items.get(*i) {
+                        items.push(Self::reasoning_item_value(r));
+                    }
+                }
+                ItemSlot::Text => {
+                    if self.text_started {
+                        items.push(self.text_message_item());
+                    }
+                }
+                ItemSlot::Tool(idx) => {
+                    if let Some(tc) = self.tool_calls.get(idx) {
+                        items.push(Self::function_call_item(tc));
+                    }
+                }
             }
         }
         items
@@ -359,32 +571,31 @@ impl ResponsesStreamState {
     /// Codex 0.146 只在 `output_item.done` 时把输出项收进会话状态，
     /// 缺它会导致终端不显示回复（见模块文档第 1 条）。
     pub fn finish_items(&mut self, out: &mut super::anthropic_stream::SseOut) -> Result<(), String> {
-        if self.text_started {
-            let seq = self.seq();
-            let item = self.text_message_item();
-            out.write(
-                "response.output_item.done",
-                &json!({
-                    "type": "response.output_item.done",
-                    "sequence_number": seq,
-                    "output_index": 0,
-                    "item": item,
-                }),
-            )?;
-        }
-        for idx in self.tool_order.clone() {
-            let Some(tc) = self.tool_calls.get(&idx) else {
-                continue;
+        for slot in self.items.clone() {
+            let (index, item) = match slot {
+                // reasoning 的 done 在 close_reasoning_item 时已发（正文一开始
+                // 就把它关掉，不能拖到这里 —— 否则正文增量会落到推理 item 上）。
+                ItemSlot::Reasoning(_) => continue,
+                ItemSlot::Text => {
+                    if !self.text_started {
+                        continue;
+                    }
+                    (self.slot_index(ItemSlot::Text), self.text_message_item())
+                }
+                ItemSlot::Tool(idx) => {
+                    let Some(tc) = self.tool_calls.get(&idx) else {
+                        continue;
+                    };
+                    (self.slot_index(ItemSlot::Tool(idx)), Self::function_call_item(tc))
+                }
             };
-            let item = Self::function_call_item(tc);
             let seq = self.seq();
-            let output_index = self.tool_output_index(idx);
             out.write(
                 "response.output_item.done",
                 &json!({
                     "type": "response.output_item.done",
                     "sequence_number": seq,
-                    "output_index": output_index,
+                    "output_index": index,
                     "item": item,
                 }),
             )?;
@@ -394,11 +605,15 @@ impl ResponsesStreamState {
 
     /// 成功收尾：`output_text.done` → 每个 item 的 `done` → `response.completed`。
     pub fn finish(&mut self, out: &mut super::anthropic_stream::SseOut) -> Result<(), String> {
+        // 只推理没有正文（或上游在此断掉）时也要把 reasoning item 关上，
+        // 否则 finished 状态里留着一个 added 未 done 的 item。
+        self.close_reasoning_item(out)?;
         if !self.text_started {
             self.start_text_item(out)?;
         }
         let seq = self.seq();
         let item_id = self.text_item_id.clone();
+        let output_index = self.slot_index(ItemSlot::Text);
         let text = self.text.clone();
         out.write(
             "response.output_text.done",
@@ -406,7 +621,7 @@ impl ResponsesStreamState {
                 "type": "response.output_text.done",
                 "sequence_number": seq,
                 "item_id": item_id,
-                "output_index": 0,
+                "output_index": output_index,
                 "content_index": 0,
                 "text": text,
             }),
@@ -775,5 +990,168 @@ mod tests {
             .find(|p| p["type"] == json!("response.completed"))
             .unwrap();
         assert_eq!(done["response"]["id"], json!("chatcmpl-real"));
+    }
+    /// **回归**：上游的 `reasoning_content` 必须转成可见事件，不能是静默空档。
+    ///
+    /// 修复前的行为是「整段推理一个字都不发」，思考阶段在网关侧表现为
+    /// 十几秒的零字节空档，客户端/中间层按空闲超时掐断连接 —— 用户看到
+    /// 「回答突然断流」。这里断言推理阶段**至少**有 added + delta + done。
+    #[test]
+    fn reasoning_content_is_streamed_not_dropped() {
+        let mut out = SseOut::new();
+        let mut st = ResponsesStreamState::new("m");
+        st.created_event(&mut out).unwrap();
+        st.consume(
+            &mut out,
+            &chunk(json!({"choices":[{"index":0,"delta":{"reasoning_content":"想一下"}}]})),
+        )
+        .unwrap();
+        let frames = out.take();
+
+        let events: Vec<String> = frames
+            .lines()
+            .filter_map(|l| l.strip_prefix("event: ").map(str::to_string))
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.reasoning_text.delta",
+            ],
+            "推理阶段必须有可见事件（否则客户端会因空闲超时断流）"
+        );
+
+        let ps = payloads(&frames);
+        let added = ps
+            .iter()
+            .find(|p| p["type"] == json!("response.output_item.added"))
+            .unwrap();
+        assert_eq!(added["item"]["type"], json!("reasoning"));
+        // `summary` 在 Codex 侧是必填字段（无 serde(default)），缺了整条 item
+        // 反序列化会失败。
+        assert!(
+            added["item"].get("summary").is_some(),
+            "reasoning item 必须带 summary 字段: {added}"
+        );
+        let delta = ps
+            .iter()
+            .find(|p| p["type"] == json!("response.reasoning_text.delta"))
+            .unwrap();
+        assert_eq!(delta["delta"], json!("想一下"));
+        // Codex 的 ReasoningContentDelta 分支要求 content_index 存在。
+        assert_eq!(delta["content_index"], json!(0));
+    }
+
+    /// 推理正文绝不能混进 assistant 正文（两者在客户端是不同的事件类型）。
+    #[test]
+    fn reasoning_text_is_not_merged_into_answer() {
+        let mut out = SseOut::new();
+        let mut st = ResponsesStreamState::new("m");
+        st.consume(
+            &mut out,
+            &chunk(json!({"choices":[{"index":0,"delta":{"reasoning_content":"推理"}}]})),
+        )
+        .unwrap();
+        st.consume(
+            &mut out,
+            &chunk(json!({"choices":[{"index":0,"delta":{"content":"答案"}}]})),
+        )
+        .unwrap();
+        st.finish(&mut out).unwrap();
+
+        let ps = payloads(&out.take());
+        let text_deltas: String = ps
+            .iter()
+            .filter(|p| p["type"] == json!("response.output_text.delta"))
+            .filter_map(|p| p["delta"].as_str())
+            .collect();
+        assert_eq!(text_deltas, "答案", "正文增量里不能混进推理内容");
+
+        let done = ps
+            .iter()
+            .find(|p| p["type"] == json!("response.completed"))
+            .unwrap();
+        let output = done["response"]["output"].as_array().unwrap();
+        let answer = output
+            .iter()
+            .find(|o| o["type"] == json!("message"))
+            .unwrap();
+        assert_eq!(answer["content"][0]["text"], json!("答案"));
+        let reasoning = output
+            .iter()
+            .find(|o| o["type"] == json!("reasoning"))
+            .unwrap();
+        assert_eq!(reasoning["content"][0]["text"], json!("推理"));
+    }
+
+    /// reasoning / 正文 / 工具三者的 `output_index` 必须互不冲突，且
+    /// `completed.output` 的顺序与之一致（客户端按 (response, index) 对齐 item）。
+    #[test]
+    fn reasoning_text_tool_indices_do_not_collide() {
+        let mut out = SseOut::new();
+        let mut st = ResponsesStreamState::new("m");
+        st.consume(
+            &mut out,
+            &chunk(json!({"choices":[{"index":0,"delta":{"reasoning_content":"想"}}]})),
+        )
+        .unwrap();
+        st.consume(
+            &mut out,
+            &chunk(json!({"choices":[{"index":0,"delta":{"content":"答"}}]})),
+        )
+        .unwrap();
+        st.consume(
+            &mut out,
+            &chunk(json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"id":"c1","function":{"name":"f","arguments":"{}"}}
+            ]}}]})),
+        )
+        .unwrap();
+        st.finish(&mut out).unwrap();
+
+        let ps = payloads(&out.take());
+        let mut kinds: Vec<(String, i64)> = Vec::new();
+        for p in ps.iter().filter(|p| p["type"] == json!("response.output_item.added")) {
+            kinds.push((
+                p["item"]["type"].as_str().unwrap_or_default().to_string(),
+                p["output_index"].as_i64().unwrap(),
+            ));
+        }
+        assert_eq!(
+            kinds,
+            vec![
+                ("reasoning".to_string(), 0),
+                ("message".to_string(), 1),
+                ("function_call".to_string(), 2),
+            ],
+            "三种 item 必须共享同一递增下标空间: {kinds:?}"
+        );
+
+        // completed.output 的下标必须与各自事件里的 output_index 一一对应。
+        let done = ps
+            .iter()
+            .find(|p| p["type"] == json!("response.completed"))
+            .unwrap();
+        let output = done["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 3, "{output:?}");
+        assert_eq!(output[0]["type"], json!("reasoning"));
+        assert_eq!(output[1]["type"], json!("message"));
+        assert_eq!(output[2]["type"], json!("function_call"));
+    }
+
+    /// 心跳必须是**真事件**：SSE 注释帧不会被 `stream.next()` 返回，
+    /// 因此不能用来重置 Codex 的空闲超时。
+    #[test]
+    fn heartbeat_emits_real_event() {
+        let mut out = SseOut::new();
+        let mut st = ResponsesStreamState::new("m");
+        st.heartbeat(&mut out).unwrap();
+        let frames = out.take();
+        assert_eq!(count_events(&frames, "response.in_progress"), 1);
+        let ps = payloads(&frames);
+        assert_eq!(ps[0]["type"], json!("response.in_progress"));
+        // Codex 侧按 kind 分支，必须能被正常解析（非注释帧）。
+        assert!(ps[0]["sequence_number"].is_i64());
     }
 }
