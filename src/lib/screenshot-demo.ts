@@ -1,12 +1,20 @@
 import type {
   AccountMeta, AgentBackupItem, AgentClientTarget, AgentDetectionResult, AppStatus, AutoRotateConfig,
   CheckinConfig, CheckinLog,
+  CliQuotaAccount, CliQuotaStatusItem,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
   GatewayModelItem, GatewayStatus, GatewayUsageGroup, GatewayUsageResult,
   GithubConfig, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals,
   TravelConfig, TravelStatus,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
+// 只导入类型：`import type` 在编译期被完全擦除，不会与 api.ts 形成运行时循环引用。
+// 加这组注解的目的是让「假数据形状与真实返回形状不一致」变成编译错误 ——
+// screenshotDemoResponse 的返回值被 `as T` 强转，不注解的话 tsc 查不出任何偏差。
+import type {
+  AppEnvStatus, ProxyLogList, ProxyLogsOverview, TaskStatusItem,
+  TraeCheckinTrends, TraeCreditDetail, TraeUsageHistory,
+} from "./api";
 
 export const screenshotDemoEnabled = demoModeEnabled;
 
@@ -563,6 +571,568 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
       targets: demoAgentTargets(),
     } satisfies AgentDetectionResult;
     case "list_agent_backups": return { backups: demoAgentBackups(String(args?.target ?? "claude-code")) };
+    case "get_cli_quota_status": return { providers: demoCliQuotaStatus() };
+    case "get_cli_quotas": return { accounts: demoCliQuotaAccounts() };
+    // ---- Trae ----
+    case "trae_list_accounts": return { accounts: demoTraeAccounts() };
+    case "trae_credits_stats": return demoTraeCreditsStats(typeof args?.days === "number" ? args.days : 30);
+    case "trae_credits_history": return { records: demoTraeCreditsRecords() };
+    case "trae_pay_status_cache": return demoTraePayStatusCache();
+    case "groups_list": return demoGroups(String(args?.app ?? "trae"));
+    // ---- 豆包 ----
+    case "doubao_list_accounts": return demoDoubaoAccounts();
+    case "doubao_history": return demoDoubaoHistory(typeof args?.days === "number" ? args.days : 14);
+    case "doubao_settings": return { doubao_snapshot_include_idb: false };
+    // ---- 通用 ----
+    case "in_app_schedule_view": return { tasks: demoInAppTasks() };
+    case "get_codebuddy_cn_ide_status": return {
+      installed: true,
+      running: false,
+      exePath: "/demo/CodeBuddy CN.app",
+      version: "1.0.0",
+      dataDir: "/demo/Library/Application Support/CodeBuddy CN",
+      loggedIn: true,
+      accountMasked: "demo***@example.com",
+      error: null,
+    };
+    case "proxy_logs_list": return demoProxyLogs(typeof args?.limit === "number" ? args.limit : 50);
+    case "proxy_logs_overview": return demoProxyLogsOverview();
+    // ---- 点击即读：详情 / 凭证弹窗 ----
+    case "proxy_log_detail": return demoProxyLogDetail(String(args?.id ?? ""));
+    case "trae_credit_detail": return demoTraeCreditDetail(String(args?.userId ?? ""));
+    case "trae_account_jwt": return {
+      userId: String(args?.userId ?? "7000000000000001"),
+      jwt: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.demo.signature",
+    };
+    // ---- 挂载即读：缺一个就会让对应卡片整块空白 ----
+    case "app_env_check": return demoAppEnv(String(args?.targetApp ?? "TraeWork"));
+    case "proxy_config": return {
+      port: 8899,
+      domains: "api.trae.cn,*.trae.cn,*.doubao.com",
+      defaultDomains: "api.trae.cn,*.trae.cn,*.doubao.com",
+      lastPort: 8899,
+      existingSystemProxy: null,
+    };
+    case "proxy_status": return { running: true, port: 8899, captured: 3 };
+    case "proxy_cert_status": return {
+      certsDir: "/demo/certs",
+      caCerPath: "/demo/certs/ai-gateway-ca.cer",
+      caPemPath: "/demo/certs/ai-gateway-ca.pem",
+      caExists: true,
+      hint: "演示模式：未安装真实 CA 证书",
+    };
+    case "task_status": return { tasks: demoTasks() };
+    case "trae_checkin_trends": return demoCheckinTrends(typeof args?.days === "number" ? args.days : 30);
+    case "trae_usage_history": return demoUsageHistory();
     default: throw new Error(`演示模式缺少只读数据: ${command}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// 演示数据：Trae / 豆包 / 日志
+// ---------------------------------------------------------------------------
+
+/**
+ * 演示模式下的 Trae 账号。
+ *
+ * 刻意让三行覆盖三种 JWT 状态（正常 / 临近过期 / 已失效），
+ * 截图里一眼能看到徽章配色差异，而不是三行全绿。
+ */
+function demoTraeAccounts() {
+  const states = [
+    { userId: "7000000000000001", name: "测试 A", jwtStatus: "ok" as const, jwtExpHours: 412, credits: 3280, group: "g-work" },
+    { userId: "7000000000000002", name: "测试 B", jwtStatus: "warn" as const, jwtExpHours: 26, credits: 940, group: null },
+    { userId: "7000000000000003", name: "测试 C", jwtStatus: "expired" as const, jwtExpHours: -3, credits: null, group: "g-personal" },
+  ];
+  return states.map((s, i) => ({
+    userId: s.userId,
+    name: s.name,
+    addedAt: localDate(20 - i * 5),
+    updatedAt: localDate(i),
+    jwtStatus: s.jwtStatus,
+    jwtExpHours: s.jwtExpHours,
+    jwtExpTimestamp: Math.floor(Date.now() / 1000) + Math.round(s.jwtExpHours * 3600),
+    hasRefreshToken: i !== 2,
+    refreshTokenInvalid: i === 2,
+    refreshTokenFails: i === 2 ? 3 : 0,
+    refreshTokenExpiresAt: i === 2 ? null : Math.floor(Date.now() / 1000) + 20 * 86400,
+    refreshedAt: i === 2 ? null : localDate(0),
+    canRefresh: i !== 2,
+    deviceIdMasked: `dc_${(1000 + i * 7).toString(16)}***${i}f`,
+    payIdentity: i === 0 ? "Pro" : null,
+    payExpireAt: i === 0 ? localDate(-40) : null,
+    creditsTotal: s.credits,
+    creditsUpdatedAt: s.credits === null ? null : localDate(0),
+    group: s.group,
+  }));
+}
+
+/** 演示模式下的 Trae 积分趋势（含一个缺数据的天，验证断线显示）。 */
+function demoTraeCreditsStats(days: number) {
+  const count = Math.min(days, 30);
+  const waves = [1, 0.96, 0.91, 0.99, 0.94, 0.9, 0.87];
+  const daily = Array.from({ length: count }, (_, i) => {
+    const daysAgo = count - 1 - i;
+    // 第 4 天故意缺数据：界面必须断线而不是连成一条直线
+    if (daysAgo === 4) return { date: localDate(daysAgo), total: null, consumed: null };
+    const total = Math.round(4200 * waves[i % 7]);
+    return {
+      date: localDate(daysAgo),
+      total,
+      consumed: daysAgo === count - 1 ? null : 40 + ((i * 17) % 90),
+    };
+  });
+  const observed = daily.filter((d) => d.total !== null);
+  const last = observed[observed.length - 1];
+  const first = observed[0];
+  return {
+    days: count,
+    daily,
+    summary: {
+      latestTotal: last?.total ?? null,
+      firstTotal: first?.total ?? null,
+      consumed: observed.reduce((sum, d) => sum + (d.consumed ?? 0), 0) || null,
+      observedDays: observed.length,
+      change: observed.length >= 2 ? last!.total! - first!.total! : null,
+    },
+    accounts: [
+      { userId: "7000000000000001", name: "测试 A", credits: 3280, updatedAt: localDate(0) },
+      { userId: "7000000000000002", name: "测试 B", credits: 940, updatedAt: localDate(0) },
+      { userId: "7000000000000003", name: "测试 C", credits: null, updatedAt: null },
+    ],
+  };
+}
+
+/** 演示模式下的积分快照原始记录。 */
+function demoTraeCreditsRecords() {
+  return Array.from({ length: 12 }, (_, i) => {
+    const daysAgo = 11 - i;
+    const credits = Math.round(4200 - i * 60);
+    return {
+      date: localDate(daysAgo),
+      userId: "7000000000000001",
+      credits,
+      delta: i === 0 ? 0 : -60,
+    };
+  });
+}
+
+/** 演示模式下的套餐缓存。 */
+function demoTraePayStatusCache() {
+  return {
+    "7000000000000001": {
+      identity: "Pro",
+      expireAt: localDate(-40),
+      checkedAt: localDate(0),
+    },
+  };
+}
+
+/** 演示模式下的分组（含一个空分组，验证空态）。 */
+function demoGroups(app: string) {
+  return {
+    app,
+    groups: [
+      { id: "g-work", name: "工作", color: "blue", createdAt: localDate(30), count: 1 },
+      { id: "g-personal", name: "个人", color: "green", createdAt: localDate(25), count: 1 },
+      { id: "g-empty", name: "待整理", color: "slate", createdAt: localDate(3), count: 0 },
+    ],
+    membership: { "7000000000000001": "g-work", "7000000000000003": "g-personal" },
+  };
+}
+
+/** 演示模式下的豆包账号（覆盖正常 / 临期 / 已过期三种分层的健康态）。 */
+function demoDoubaoAccounts() {
+  const days = [18, 4, -2];
+  const names = ["测试 A", "测试 B", "测试 C"];
+  return {
+    lastKeepaliveAt: localDate(1),
+    currentUserId: "8000000000000001",
+    accounts: days.map((d, i) => ({
+      userId: `800000000000000${i + 1}`,
+      name: names[i],
+      note: null,
+      addedAt: localDate(30 - i * 8),
+      lastActiveAt: localDate(i),
+      sessionIdMasked: `sid_***${i}a2f`,
+      sidGuardMasked: `sg_***${i}b7c`,
+      ttwidMasked: `tt_***${i}c9d`,
+      hasSessionId: d > -2,
+      hasTtwid: d > -2,
+      sessionExpireAt: localDate(-d),
+      expired: d < 0,
+      sessionState: d < 0 ? ("expired" as const) : ("ok" as const),
+      expiryTier: d < 0 ? ("expired" as const) : d <= 7 ? ("soon" as const) : ("fresh" as const),
+      daysLeft: d,
+      sessionSource: i === 2 ? null : "抓包自动获取",
+      cookiesSyncedAt: localDate(i),
+      lastRenewAt: i === 2 ? null : localDate(1),
+      quotaLevel: d < 0 ? null : "基础版",
+      quotaExpireAt: d < 0 ? null : localDate(-d),
+      quotaSummary: d < 0 ? null : "当前时段剩余 62%",
+      quotaCheckedAt: d < 0 ? null : localDate(0),
+      quotaUsedPercent: d < 0 ? null : 38,
+      hasSnapshot: true,
+      sizeBytes: 18_400_000 - i * 2_100_000,
+      fileCount: 240 - i * 30,
+      lastModified: Math.floor(Date.now() / 1000) - i * 86400,
+      isCurrent: i === 0,
+      orphanSnapshot: false,
+    })),
+  };
+}
+
+/** 演示模式下的豆包运维健康史。 */
+function demoDoubaoHistory(days: number) {
+  const count = Math.min(days, 14);
+  const events = Array.from({ length: count }, (_, i) => {
+    const daysAgo = i;
+    const failed = daysAgo === 2;
+    return {
+      kind: failed ? ("renew" as const) : ("keepalive" as const),
+      ts: atLocalTime(daysAgo, 9, 30),
+      date: localDate(daysAgo),
+      ok: !failed,
+      message: failed ? "HTTP 续期失败，已回退到客户端保活" : "保活完成，会话已续期",
+      userId: "8000000000000001",
+    };
+  });
+  return {
+    events,
+    trend: Array.from({ length: count }, (_, i) => ({
+      date: localDate(count - 1 - i),
+      usedPercent: 20 + ((i * 13) % 55),
+      level: "基础版",
+      uid: "8000000000000001",
+    })),
+    health: {
+      days: count,
+      keepalive: count - 1,
+      renew: 1,
+      quota: count,
+      ok: count,
+      failed: 1,
+      lastKeepaliveAt: localDate(1),
+    },
+    requestedDays: days,
+  };
+}
+
+/** 演示模式下的应用内调度任务（含一个从未跑过的，验证空态）。 */
+function demoInAppTasks() {
+  return [
+    { kind: "traeCheckin", label: "Trae 签到", at: "08:30", lastRunDay: localDate(0) },
+    { kind: "traeCreditsSnapshot", label: "Trae 积分快照", at: "09:00", lastRunDay: localDate(0) },
+    { kind: "doubaoRenewHttp", label: "豆包探活续期", at: "09:30", lastRunDay: localDate(1) },
+    { kind: "doubaoQuota", label: "豆包额度巡检", at: "10:00", lastRunDay: null },
+  ];
+}
+
+/** 演示模式下的抓包日志（两条 HTTP + 一条 WebSocket + 一条流式）。 */
+function demoProxyLogs(limit: number): ProxyLogList {
+  const all = [
+    {
+      id: "proxy_req_2025-01-15.log:3",
+      timestamp: `${localDate(0)} 09:41:12`,
+      method: "HTTP POST",
+      host: "api.trae.cn",
+      path: "/trae/api/v1/pay/query_user_usage_group_by_session",
+      status: "200 OK",
+      size: 4128,
+    },
+    {
+      id: "proxy_req_2025-01-15.log:2",
+      timestamp: `${localDate(0)} 09:38:04`,
+      method: "HTTP POST",
+      host: "api.trae.cn",
+      path: "/v1/chat/completions",
+      status: "200 OK",
+      size: 86_240,
+      sseModel: "claude-sonnet-4",
+      sseTokens: "p:120 c:340 t:460",
+    },
+    {
+      id: "proxy_req_2025-01-15.log:1",
+      timestamp: `${localDate(0)} 09:12:55`,
+      method: "WebSocket",
+      host: "ws.trae.cn",
+      path: "/ws/chat",
+      status: "101 Upgrade",
+      size: 1820,
+    },
+    {
+      id: "proxy_req_2025-01-14.log:0",
+      timestamp: `${localDate(1)} 21:07:31`,
+      method: "HTTP GET",
+      host: "api.trae.cn",
+      path: "/trae/api/v1/user/current",
+      status: "401 Unauthorized",
+      size: 640,
+    },
+  ];
+  return { entries: all.slice(0, limit), total: all.length };
+}
+
+/** 演示模式下的抓包日志目录概况。 */
+function demoProxyLogsOverview(): ProxyLogsOverview {
+  return {
+    dir: "/demo/logs",
+    fileCount: 2,
+    totalBytes: 2_418_000,
+    oldest: localDate(1),
+    newest: localDate(0),
+  };
+}
+
+/** 演示模式下的抓包日志详情（与 demoProxyLogs 的条目 id 对应）。 */
+function demoProxyLogDetail(id: string): string {
+  return [
+    "==================== REQUEST ====================",
+    "POST /api/v1/chat/completions HTTP/1.1",
+    "Host: api.trae.cn",
+    "Authorization: Bearer ***REDACTED***",
+    "Content-Type: application/json",
+    "",
+    '{"model":"claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"写一个快排"}]}',
+    "",
+    "==================== RESPONSE ===================",
+    "HTTP/1.1 200 OK",
+    "Content-Type: text/event-stream",
+    "",
+    "data: {\"model\":\"claude-sonnet-4\",\"choices\":[{\"delta\":{\"content\":\"好的\"}}]}",
+    "data: {\"usage\":{\"prompt_tokens\":1280,\"completion_tokens\":430}}",
+    "data: [DONE]",
+    "",
+    `# 演示数据：${id}`,
+  ].join("\n");
+}
+
+/** 演示模式下的单账号积分明细（含一个拿不到数据的来源错误）。 */
+function demoTraeCreditDetail(userId: string): TraeCreditDetail {
+  return {
+    userId,
+    total: 1860,
+    packs: [
+      { name: "Pro 订阅额度", remaining: 1240, total: 1500, expireAt: localDate(-12) },
+      { name: "活动赠送", remaining: 620, total: 600, expireAt: localDate(-3) },
+    ],
+    payIdentity: "pro_trial",
+    payExpireAt: localDate(-25),
+    errors: [],
+  };
+}
+
+/** 演示模式下的应用环境（三种应用都按已装返回，布局各不相同）。 */
+function demoAppEnv(targetApp: string): AppEnvStatus {
+  const isDoubao = targetApp === "Doubao";
+  const isCn = targetApp === "Trae";
+  return {
+    targetApp,
+    appName: isDoubao ? "豆包" : isCn ? "Trae" : "Trae Work",
+    layout: isDoubao ? ("chromium" as const) : ("icube" as const),
+    installed: true,
+    exePath: isDoubao ? "/demo/Doubao.app" : isCn ? "/demo/Trae CN.app" : "/demo/Trae Work.app",
+    dataDir: isDoubao ? "/demo/Doubao/User Data" : "/demo/Trae/User",
+    dataDirExists: true,
+    profilesDir: "/demo/profiles",
+    snapshotCount: 3,
+    manualPath: null,
+    settingsPathKey: isDoubao ? "doubao_path" : isCn ? "trae_cn_path" : "trae_path",
+    running: true,
+    version: isDoubao ? "2.28.13_win" : "1.0.9",
+    versionSource: isDoubao ? "/demo/Doubao/User Data/Local State" : "/demo/Trae/product.json",
+    settingsFile: "/demo/app_settings.json",
+  };
+}
+
+/** 演示模式下的计划任务（含一个未注册的，验证空态）。 */
+function demoTasks(): TaskStatusItem[] {
+  return [
+    { kind: "traeCheckin", name: "AIGateway_TraeCheckin", label: "Trae 签到", cliKey: "trae-checkin", registered: true, time: "08:30", error: null },
+    { kind: "traeCreditsSnapshot", name: "AIGateway_TraeCreditsSnapshot", label: "Trae 积分快照", cliKey: "trae-credits-snapshot", registered: true, time: "09:00", error: null },
+    { kind: "doubaoRenew", name: "AIGateway_DoubaoRenew", label: "豆包保活", cliKey: "doubao-keepalive", registered: true, time: "09:30", error: null },
+    { kind: "doubaoQuota", name: "AIGateway_DoubaoQuota", label: "豆包额度巡检", cliKey: "doubao-quota", registered: false, time: "10:00", error: null },
+  ];
+}
+
+/** 演示模式下的签到成功率趋势（含一天全是「已签到」、一天有失败）。 */
+function demoCheckinTrends(days: number): TraeCheckinTrends {
+  const count = Math.min(days, 30);
+  const points = Array.from({ length: count }, (_, i) => {
+    const daysAgo = count - 1 - i;
+    // 第 6 天全是「已签到」：算成功，但绿段为空 —— 验证灰段配色
+    if (daysAgo === 6) {
+      return { date: localDate(daysAgo), ok: 0, already: 3, failed: 0, total: 3, successRate: 100 };
+    }
+    // 第 3 天有失败 —— 验证红段
+    if (daysAgo === 3) {
+      return { date: localDate(daysAgo), ok: 2, already: 0, failed: 1, total: 3, successRate: 66.7 };
+    }
+    return { date: localDate(daysAgo), ok: 3, already: 0, failed: 0, total: 3, successRate: 100 };
+  });
+  const ok = points.reduce((s, p) => s + p.ok, 0);
+  const already = points.reduce((s, p) => s + p.already, 0);
+  const failed = points.reduce((s, p) => s + p.failed, 0);
+  const total = points.reduce((s, p) => s + p.total, 0);
+  return {
+    days: count,
+    points,
+    summary: {
+      ok,
+      already,
+      failed,
+      total,
+      observedDays: points.length,
+      successRate: total === 0 ? null : Math.round(((ok + already) / total) * 1000) / 10,
+    },
+  };
+}
+
+/** 演示模式下的官方积分消耗历史（含一个失败账号，验证告警条）。 */
+function demoUsageHistory(): TraeUsageHistory {
+  const daily = Array.from({ length: 14 }, (_, i) => {
+    const daysAgo = 13 - i;
+    const credits = 40 + Math.round(38 * Math.abs(Math.sin(i)));
+    return {
+      date: localDate(daysAgo),
+      credits,
+      sessions: 2 + (i % 4),
+      models: { "claude-sonnet-4": Math.round(credits * 0.7), "gpt-5": Math.round(credits * 0.3) },
+      inputTokens: 12_400 + i * 320,
+      outputTokens: 3_100 + i * 90,
+      cacheReadTokens: 8_200 + i * 140,
+    };
+  });
+  const total = daily.reduce((s, d) => s + d.credits, 0);
+  return {
+    fetchedAt: Date.now(),
+    cached: true,
+    accounts: [
+      {
+        userId: "7000000000000001",
+        name: "测试 A",
+        ok: true,
+        error: null,
+        daily,
+        totalCredits: total,
+        sessions: daily.reduce((s, d) => s + d.sessions, 0),
+        models: [
+          { model: "claude-sonnet-4", credits: Math.round(total * 0.7) },
+          { model: "gpt-5", credits: Math.round(total * 0.3) },
+        ],
+      },
+      {
+        userId: "7000000000000002",
+        name: "测试 B",
+        ok: false,
+        error: "刷新凭证已失效，请重新登录该账号",
+        daily: [],
+        totalCredits: 0,
+        sessions: 0,
+        models: [],
+      },
+    ],
+  };
+}
+
+/**
+ * 演示用的 CLI 登录态。
+ *
+ * 覆盖三种界面分支：正常有额度、有登录但查询失败、未登录 —— 截图里能看到
+ * 全部状态，而不是只有happy path。
+ */
+function demoCliQuotaStatus(): CliQuotaStatusItem[] {
+  return [
+    { provider: "claude", label: "Claude", loggedIn: true, loginHint: "在终端运行 claude 完成登录" },
+    { provider: "antigravity", label: "Antigravity", loggedIn: true, loginHint: "登录 Google Antigravity 客户端" },
+    { provider: "codex", label: "Codex", loggedIn: true, loginHint: "运行 codex login 完成登录" },
+    { provider: "xai", label: "Grok", loggedIn: false, loginHint: "运行 grok login 完成登录" },
+    { provider: "kimi", label: "Kimi", loggedIn: false, loginHint: "在 Kimi Code 中登录后重试" },
+  ];
+}
+
+/** 演示用的 CLI 额度（含一个失败态与一个未知百分比窗口）。 */
+function demoCliQuotaAccounts(): CliQuotaAccount[] {
+  const now = Date.now();
+  return [
+    {
+      id: "claude:demo",
+      provider: "claude",
+      providerLabel: "Claude",
+      label: "demo@example.com",
+      loggedIn: true,
+      source: "~/.claude/.credentials.json",
+      plan: "Max",
+      windows: [
+        { label: "5 小时", remainingPercent: 72, resetAtMs: now + 42 * 60 * 1000, detail: null },
+        { label: "7 天", remainingPercent: 38, resetAtMs: now + 3 * 86400 * 1000, detail: null },
+        { label: "Sonnet 7 天", remainingPercent: null, resetAtMs: null, detail: "上游未提供该窗口" },
+      ],
+      error: null,
+      fetchedAt: now,
+      resetCredits: null,
+      subscriptionActiveUntil: null,
+    },
+    {
+      id: "antigravity:demo",
+      provider: "antigravity",
+      providerLabel: "Antigravity",
+      label: "demo@example.com",
+      loggedIn: true,
+      source: "Windows 凭据管理器 · gemini:antigravity",
+      plan: "Pro",
+      windows: [
+        { label: "Gemini 5h", remainingPercent: 64, resetAtMs: now + 5 * 3600 * 1000, detail: null },
+      ],
+      error: null,
+      fetchedAt: now,
+      resetCredits: null,
+      subscriptionActiveUntil: null,
+    },
+    {
+      id: "codex:demo",
+      provider: "codex",
+      providerLabel: "Codex",
+      label: "demo@example.com",
+      loggedIn: true,
+      source: "~/.codex/auth.json",
+      plan: "Plus",
+      windows: [
+        { label: "5 小时", remainingPercent: 91, resetAtMs: now + 3 * 3600 * 1000, detail: null },
+        { label: "每周", remainingPercent: 22, resetAtMs: now + 4 * 86400 * 1000, detail: null },
+      ],
+      error: null,
+      fetchedAt: now,
+      resetCredits: { available: 2, applicable: 1, earliestExpiryMs: now + 20 * 86400 * 1000 },
+      subscriptionActiveUntil: new Date(now + 26 * 86400 * 1000).toISOString(),
+    },
+    {
+      id: "xai:demo",
+      provider: "xai",
+      providerLabel: "Grok",
+      label: "Grok",
+      loggedIn: false,
+      source: "",
+      plan: null,
+      windows: [],
+      error: null,
+      fetchedAt: 0,
+      resetCredits: null,
+      subscriptionActiveUntil: null,
+    },
+    {
+      id: "kimi:demo",
+      provider: "kimi",
+      providerLabel: "Kimi",
+      label: "Kimi",
+      loggedIn: false,
+      source: "",
+      plan: null,
+      windows: [],
+      error: null,
+      fetchedAt: 0,
+      resetCredits: null,
+      subscriptionActiveUntil: null,
+    },
+  ];
 }
