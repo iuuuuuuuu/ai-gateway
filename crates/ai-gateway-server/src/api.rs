@@ -171,7 +171,12 @@ pub fn router() -> Router {
         // 「每个账号都能领取，可以跟 workbuddy 一样显示一个一键领取（所有账号）」
         .route("/api/qoder/campaigns-all", post(api_qoder_campaigns_all))
         .route("/api/qoder/claim-all-campaigns", post(api_qoder_claim_all_campaigns))
-        // 领取权益活动。**用户显式触发**，不做自动化（见 campaign.go）。
+        // 领取权益活动。既支持**用户显式触发**（本路由），
+        // 也支持**后台自动领取**（2026-09-22 所有者要求后改为支持）。
+        //
+        // 此前这里写着「不做自动化（见 campaign.go）」—— 该结论已撤销：
+        // 实测该端点不需要验证码，且活动每天 10:00 (UTC+8) 重置、
+        // 不领就作废。详见 `go-gateway/internal/qoder/campaign.go` 文件头。
         .route("/api/qoder/claim-campaign", post(api_qoder_claim_campaign))
         // ---- ZCode（Z.AI / 智谱）----
         // 与 Qoder 的差异：凭证是用户可复制的字符串，故导入是主路径。
@@ -1653,11 +1658,12 @@ async fn api_gateway_stop() -> Response {
 }
 
 /// POST /api/gateway/restart —— 重启网关（应用新配置/新账号）。
+///
+/// ⚠ 走 `restart_gateway_serialized`（带互斥），不要在这里各写一份 stop+start：
+/// 后台自动同步与 Tauri 命令也走同一条路径，分散写会让它们互相插队 ——
+/// 用户点「重启」时看到「网关已在运行」（2026-09-22 所有者现场）。
 async fn api_gateway_restart() -> Response {
-    ai_gateway_core::modules::gateway::stop_gateway();
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    let cfg = ai_gateway_core::modules::gateway::load_gateway_config();
-    match ai_gateway_core::modules::gateway::start_gateway(&cfg).await {
+    match ai_gateway_core::modules::gateway::restart_gateway_serialized().await {
         Ok(v) => json_ok(v),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }

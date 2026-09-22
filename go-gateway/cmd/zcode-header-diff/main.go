@@ -67,14 +67,17 @@ func main() {
 		fmt.Printf("载入凭证失败: %v\n", err)
 		os.Exit(1)
 	}
+	// 取第一个账号即可 —— 本工具用来对比"我们发的头"与"官方抓包的头"，
+	// 与具体是哪个账号无关。
+	//
+	// ⚠ 2026-09-21：此前这里硬编码了一个**真实账号 uid**，那是所有者本机的
+	// 标识，不该出现在公开仓库里。改为不依赖具体账号。
 	var cred *zcode.Cred
-	for _, c := range creds {
-		if c.UID == "zcode-1b2941c020ef" {
-			cred = c
-		}
+	if len(creds) > 0 {
+		cred = creds[0]
 	}
 	if cred == nil {
-		fmt.Println("找不到目标账号")
+		fmt.Println("没有可用账号")
 		os.Exit(1)
 	}
 

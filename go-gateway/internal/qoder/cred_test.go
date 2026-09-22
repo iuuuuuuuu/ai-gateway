@@ -198,7 +198,14 @@ func TestLoginStartRejectsUnknownRegion(t *testing.T) {
 }
 
 // TestLoginStartBuildsAuthURL 授权链接的形状与两区域名。
+//
+// ⚠ `redirect_uri` **不再**是必含项（2026-09-22 按官方源码改正）：
+// 国际版带 `qoder-app://`，国服**不传**（官方 app.asar 里是 null）。
+// 此前这条把它列进"必须有"，是因为旧实现两区都硬编码了
+// `qoder-work-cn://` —— 一个本机从未注册的协议。
+// 「两区都有」这个共同点掩盖了「两区都错」。
 func TestLoginStartBuildsAuthURL(t *testing.T) {
+	t.Setenv(oauthEnvRedirectURI, "")
 	for _, region := range []Region{RegionCN, RegionIntl} {
 		s, err := LoginStart(region)
 		if err != nil {
@@ -207,7 +214,8 @@ func TestLoginStartBuildsAuthURL(t *testing.T) {
 		if !strings.HasPrefix(s.AuthURL, region.Website()+"/device/selectAccounts?") {
 			t.Errorf("%s 授权链接前缀错误: %s", region, s.AuthURL)
 		}
-		for _, must := range []string{"challenge=", "challenge_method=S256", "nonce=", "machine_id=", "client_id=", "redirect_uri="} {
+		// 两区**都**必须有的参数（redirect_uri 不在其中，见函数注释）
+		for _, must := range []string{"challenge=", "challenge_method=S256", "nonce=", "machine_id=", "client_id="} {
 			if !strings.Contains(s.AuthURL, must) {
 				t.Errorf("%s 授权链接缺少 %s：%s", region, must, s.AuthURL)
 			}
@@ -222,15 +230,89 @@ func TestLoginStartBuildsAuthURL(t *testing.T) {
 	}
 }
 
-// TestLoginStartUsesSameClientIDForBothRegions 两区共用同一 client_id。
+// TestLoginStartUsesOfficialClientID 授权 URL 必须用**官方客户端的** client_id。
 //
-// 这是实测结论（两区授权页都 302 进登录页），也是"双区只需改域名"的依据。
-// 若哪天有人给国际版换了一个 client_id，这条会红 —— 那时要重新验证。
-func TestLoginStartUsesSameClientIDForBothRegions(t *testing.T) {
+// # ⚠ 这条测试的前身是错的，值得记下来（2026-09-22）
+//
+// 旧版本叫 `TestLoginStartUsesSameClientIDForBothRegions`，注释写着
+// 「实测结论（两区授权页都 302 进登录页）」—— 那个"实测"**方法是错的**：
+// `/device/selectAccounts` 对**任何** client_id 都回 302 进登录页，
+// **不做校验**。真正的校验在用户点「确认授权」那一刻。
+//
+// 于是那条测试**只能证明"两区用了同一个字符串"**，
+// 完全证明不了"这个字符串是对的"—— 它把两个错值都放行了。
+//
+// 现在改为对着**官方 app.asar 里读出的真实值**断言：
+//
+//	%LOCALAPPDATA%\Programs\Qoder\resources\app.asar      （国际版）
+//	%LOCALAPPDATA%\Programs\Qoder CN\resources\app.asar   （国服）
+//	    authClientIds: { prod: "732aef47-…", test: "732aef47-…" }
+//
+// ⚠ 断言的是**常量**而不是 URL 里有没有某个字符串：
+// 常量错了这条就红，而不是等用户在浏览器点确认才发现。
+func TestLoginStartUsesOfficialClientID(t *testing.T) {
+	const official = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa"
+	if oauthClientIDDefault != official {
+		t.Errorf("client_id 必须是官方客户端的值 %q（从 app.asar 读出），实际 %q",
+			official, oauthClientIDDefault)
+	}
+	// 环境变量未设时，生成的 URL 里必须是这个值。
+	t.Setenv(oauthEnvClientID, "")
 	cn, _ := LoginStart(RegionCN)
 	intl, _ := LoginStart(RegionIntl)
-	if !strings.Contains(cn.AuthURL, oauthClientID) || !strings.Contains(intl.AuthURL, oauthClientID) {
-		t.Error("两区都应使用同一个 client_id")
+	for _, c := range []*LoginSession{cn, intl} {
+		if !strings.Contains(c.AuthURL, official) {
+			t.Errorf("授权 URL 应含官方 client_id %q，实际：%s", official, c.AuthURL)
+		}
+		if strings.Contains(c.AuthURL, "1c5e33e1") {
+			t.Errorf("授权 URL 仍含**旧的错值** 1c5e33e1…（那正是国际版登录"+
+				"报「参数无效」的原因）：%s", c.AuthURL)
+		}
+	}
+}
+
+// TestRedirectURIMatchesOfficialPerRegion redirect_uri 必须与官方**按区域**一致。
+//
+// 官方两个客户端在这里**不同**（从各自 app.asar 读出）：
+//
+//	国际版  authRedirectUris: { stable: "qoder-app://" }
+//	国服    authRedirectUris: { stable: null          }   ← 不传
+//
+// ⚠ 旧代码两区都用 `qoder-work-cn://` —— 一个**本机从未注册**的协议
+//（实测 HKCR 只有 `qoder` 与 `qoder-cn`）。
+func TestRedirectURIMatchesOfficialPerRegion(t *testing.T) {
+	t.Setenv(oauthEnvRedirectURI, "")
+
+	intl, _ := LoginStart(RegionIntl)
+	if !strings.Contains(intl.AuthURL, "redirect_uri=qoder-app") {
+		t.Errorf("国际版应带 redirect_uri=qoder-app://，实际：%s", intl.AuthURL)
+	}
+
+	cn, _ := LoginStart(RegionCN)
+	if strings.Contains(cn.AuthURL, "redirect_uri=") {
+		t.Errorf("国服**不应**带 redirect_uri 参数（官方为 null）：%s", cn.AuthURL)
+	}
+	// 两区都不该再出现那个未注册的旧协议
+	for _, c := range []*LoginSession{cn, intl} {
+		if strings.Contains(c.AuthURL, "qoder-work-cn") {
+			t.Errorf("授权 URL 仍含未注册的旧协议 qoder-work-cn：%s", c.AuthURL)
+		}
+	}
+}
+
+// TestClientIDEnvOverride 环境变量可覆盖 client_id（对齐官方客户端行为）。
+//
+// 官方实现里 `QODER_AUTH_CLIENT_ID` 优先 —— 保留这个能力，
+// 将来上游改 client_id 时不必重新打包就能热修。
+func TestClientIDEnvOverride(t *testing.T) {
+	t.Setenv(oauthEnvClientID, "11111111-2222-4333-8444-555555555555")
+	got := clientID()
+	if got != "11111111-2222-4333-8444-555555555555" {
+		t.Errorf("环境变量应覆盖 client_id，实际 %q", got)
+	}
+	s, _ := LoginStart(RegionIntl)
+	if !strings.Contains(s.AuthURL, "11111111-2222-4333-8444-555555555555") {
+		t.Errorf("覆盖后的值应出现在授权 URL 里：%s", s.AuthURL)
 	}
 }
 

@@ -46,6 +46,12 @@ func (s *Scheduler) RunTravelNow() {
 		if a == nil || a.RefreshToken == "" {
 			continue
 		}
+		// ⚠ 产品闸门（2026-09-22）：猫猫旅行是 WorkBuddy 专属 ——
+		// Qoder/ZCode 账号没有猫猫，跑它只会拿到 401 并写脏记录。
+		// 走 accountScopeSkip 而不是就地判产品：与其它任务共用单一闸门。
+		if a.ProductOf() != auth.ProductWorkBuddy {
+			continue
+		}
 		if !s.checkinScopeAllows(a) {
 			continue
 		}

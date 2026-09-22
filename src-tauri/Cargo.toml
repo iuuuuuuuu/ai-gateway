@@ -1,6 +1,6 @@
 [package]
 name = "ai-gateway"
-version = "1.0.7"
+version = "1.0.8"
 description = "ai-gateway —— WorkBuddy 账号切换工具（Rust/Tauri 版）"
 authors = ["apple"]
 edition = "2021"
@@ -39,7 +39,15 @@ ai-gateway-core = { path = "../crates/ai-gateway-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+# ZCode 验证码求解服务（captcha_webview）：本地 HTTP 服务收网关的求解请求。
+#
+# hyper 的版本与 features 与 `crates/ai-gateway-core` 的 device_proxy 保持一致 ——
+# 两处各写一份版本号迟早会分叉，而 hyper 的 0.x/1.x 之间 API 不兼容。
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+url = "2"
 # 单实例保护：多开会并发写 accounts.json 并重复启停网关
 tauri-plugin-single-instance = "2"
 tauri-plugin-notification = "2"

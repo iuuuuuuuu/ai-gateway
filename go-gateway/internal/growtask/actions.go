@@ -126,10 +126,35 @@ func SupportedCodes() []string {
 // 刻意**不**尝试伪造 —— 伪造捐赠回执属于欺诈，且必然失败（回执由真实支付链路产生）。
 const philanthropyeCode = "Expert_Philanthropy"
 
+// workstationCode 工作台搭建师：需**桌面端换血对话**，不适合自动化。
+//
+// # 为什么不做（2026-09-20 对照参考脚本 workbuddyv3 后确认）
+//
+// 参考脚本的 `t_workstation` 实现方式是：
+//
+//	1. 把 WorkBuddy 桌面端的 `.info` 认证文件**换成目标账号**（改本机登录态）
+//	2. `taskkill /F /IM WorkBuddy.exe` **杀掉用户的桌面端**
+//	3. 重启它，等 8 秒
+//	4. 通过 CDP 发一条带 `expert://WorkspaceBuilder` 资源引用的对话
+//	5. 再杀一次、重启一次，恢复原登录态
+//
+// **这四步都在动用户正在用的桌面端**：改登录态、杀进程、重启两次。
+// 网关跑在后台（可能正被别的客户端使用），做这些会：
+//
+//	· 打断用户正在进行的桌面端会话（数据可能未保存）
+//	· 与「网关只做 HTTP 层自动化」的定位冲突 —— 它是服务，不该操作 GUI
+//	· 失败时可能把用户桌面端留在"换了登录态但没恢复"的状态
+//
+// 故**如实标为需人工**，而不是硬做。收益（一个任务的积分）远小于风险。
+const workstationCode = "workstation_expert"
+
 // UnsupportedHint 返回不可自动任务的操作指引（供界面展示）。
 func UnsupportedHint(code string) string {
 	if code == philanthropyeCode {
 		return "该任务需真实捐款：服务端在领奖时校验捐赠回执，无法通过接口绕过；请按任务说明在客户端内完成"
+	}
+	if code == workstationCode {
+		return "该任务需在 WorkBuddy 桌面端内与「工作台搭建师」专家对话（网关不操作桌面端：那会打断你正在用的会话）；请在客户端内完成"
 	}
 	return "该任务需要客户端内的人工操作，无法自动完成；请按任务说明在官方客户端操作"
 }

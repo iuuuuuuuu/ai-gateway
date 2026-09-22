@@ -1,6 +1,8 @@
 import { cn } from "@/lib/utils";
 import workbuddyIcon from "@/assets/workbuddy-official-icon.png";
 import codebuddyCnIdeIcon from "@/assets/codebuddy-cn-ide-icon.png";
+import qoderIcon from "@/assets/qoder-official-icon.png";
+import zcodeIcon from "@/assets/zcode-official-icon.png";
 
 const appIconUrl = `${import.meta.env.BASE_URL}icon-transparent.png`;
 
@@ -156,71 +158,83 @@ export function DoubaoMark({ size = 32, className }: MarkProps) {
 }
 
 /**
- * Qoder 图标。
+ * Qoder 图标 —— **官方应用图标**（2026-09-22 改为官方资源）。
  *
- * 用「尖括号 + 中心点」表达「代码 + 智能体」，与 Qoder 的定位一致。
- * 配色用 Qoder 品牌的深紫蓝渐变，与豆包（蓝紫）、Trae（深灰）在同排时
- * 能一眼区分 —— 三个产品图标并列时靠**色相**而非细节区分，小尺寸下更可靠。
+ * # 为什么改了（此前是自绘的「尖括号 + 中心点」）
  *
- * 刻意**不**去抓官方 logo 图片：本仓库是公开仓库，引入第三方商标资源有
- * 授权问题；且现有各产品的 mark 也都是自绘几何图形（见 WorkBuddyMark 等），
- * 统一自绘比混用图片更一致。
+ * 所有者原话：
+ *
+ *	「zcode后面不还是一个闪电小卡片么?还不是官方的logo  qoder也一样」
+ *
+ * 此前的注释写着「刻意不抓官方 logo：本仓库是公开仓库，引入第三方商标
+ * 资源有授权问题」—— **那个理由是错的/过期的**：仓库里早就有官方资源
+ *（`workbuddy-official-icon.png`、`agent-icons/zcode.png`），
+ * 本组件自身也在用 `workbuddyIcon`。既然 WorkBuddy 用的是官方图，
+ * 只把 Qoder/ZCode 留在自绘就是不统一 —— 而且自绘的实心渐变块
+ * 当水印时会显出一整块色斑（见 `product-account-card.tsx` 的说明）。
+ *
+ * # 来源
+ *
+ * 从**本机已安装的 Qoder 官方客户端**提取：
+ *
+ *	%LOCALAPPDATA%\Programs\Qoder CN\.qoder-versions\<ver>\
+ *	  resources\application-icons\qoder-light.png   (1024×1024)
+ *
+ * ⚠ 用的是 `qoder-light.png` 而非 `qoder-light-windows.png`：
+ * 后者在右上角带一个「CN」折角标（那是国服客户端的标记），
+ * 而我们的账号可能是国际版 —— 带 CN 角标会对国际版用户形成误导。
+ * `qoder-light.png` 只有图标本体与圆角底。
  */
 export function QoderMark({ size = 32, className }: MarkProps) {
   return (
     <span
       aria-hidden
-      className={cn(
-        "inline-flex shrink-0 items-center justify-center rounded-[22%] bg-gradient-to-br from-violet-500 to-purple-700 text-white shadow-sm",
-        className,
-      )}
+      className={cn("relative inline-flex shrink-0 overflow-hidden rounded-[22%]", className)}
       style={{ width: size, height: size }}
     >
-      <svg viewBox="0 0 24 24" fill="none" className="size-[62%]" aria-hidden="true">
-        <path
-          d="M8.6 7.4 4.2 12l4.4 4.6M15.4 7.4 19.8 12l-4.4 4.6"
-          stroke="currentColor"
-          strokeWidth="1.9"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-        <circle cx="12" cy="12" r="1.85" fill="currentColor" />
-      </svg>
+      {/* 与 WorkBuddyMark 同款：官方 app icon 自带约 10% 透明边距，
+          放大 118% 居中裁掉透明圈后与其它图标视觉尺寸一致。 */}
+      <img
+        src={qoderIcon}
+        alt=""
+        className="absolute left-1/2 top-1/2 size-[118%] max-w-none -translate-x-1/2 -translate-y-1/2 object-cover"
+      />
     </span>
   );
 }
 
 /**
- * ZCode 图标。
+ * ZCode 图标 —— **官方应用图标**（2026-09-22 改为官方资源）。
  *
- * 用「闪电 + 折线」表达「编码加速」，与 ZCode 的定位（GLM 编码套餐代理）一致。
- * 配色用青绿→翠绿渐变，与同排的 WorkBuddy（蓝）、Qoder（紫）、Trae（深灰）、
- * 豆包（蓝紫）都能一眼区分 —— 多个产品图标并列时靠**色相**而非细节区分，
- * 小尺寸下更可靠。
+ * # 为什么改了（此前是自绘的「闪电」）
  *
- * 与 QoderMark 同样的理由**不**抓官方 logo：本仓库是公开仓库，
- * 引入第三方商标资源有授权问题；自绘也更符合现有各 mark 的一致风格。
+ * 所有者原话：
+ *
+ *	「zcode后面不还是一个闪电小卡片么?还不是官方的logo  qoder也一样」
+ *
+ * 此前的注释写着「不抓官方 logo：公开仓库引入第三方商标有授权问题」——
+ * **那个理由是错的/过期的**：`src/assets/agent-icons/zcode.png`
+ * 就是官方图标，而且**智能体管理页早就在用它**（`AgentsPage.tsx`）。
+ * 同一个产品在仓库里有两套图标（一页自绘、一页官方）本身就是不一致。
+ *
+ * # 来源
+ *
+ * `src/assets/zcode-official-icon.png` —— 与 `agent-icons/zcode.png`
+ * 是同一个文件（此处复制一份是为了让 `assets/` 下的官方图标命名一致：
+ * `workbuddy-official-icon` / `qoder-official-icon` / `zcode-official-icon`）。
  */
 export function ZcodeMark({ size = 32, className }: MarkProps) {
   return (
     <span
       aria-hidden
-      className={cn(
-        "inline-flex shrink-0 items-center justify-center rounded-[22%] bg-gradient-to-br from-teal-400 to-emerald-600 text-white shadow-sm",
-        className,
-      )}
+      className={cn("relative inline-flex shrink-0 overflow-hidden rounded-[22%]", className)}
       style={{ width: size, height: size }}
     >
-      <svg viewBox="0 0 24 24" fill="none" className="size-[62%]" aria-hidden="true">
-        {/* 闪电：表达"加速" */}
-        <path
-          d="M13.2 3.2 6.6 13h4.4l-.8 7.8 6.6-9.8h-4.4l.8-7.8Z"
-          stroke="currentColor"
-          strokeWidth="1.8"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-      </svg>
+      <img
+        src={zcodeIcon}
+        alt=""
+        className="absolute left-1/2 top-1/2 size-[118%] max-w-none -translate-x-1/2 -translate-y-1/2 object-cover"
+      />
     </span>
   );
 }

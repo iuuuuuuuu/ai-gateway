@@ -139,8 +139,13 @@ import { PRODUCT_LABELS, productAccentOf } from "@/lib/product-accent";
 import type { GatewayModelItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-/** 区域标识 → 展示名。 */
-const REGION_LABEL: Record<string, string> = {
+/**
+ * 区域标识 → 展示名。
+ *
+ * 导出供 GatewayPage 的用量区复用（那里要显示"哪个区域用了多少"）。
+ * 两处各写一份必然会分叉，而区域名是**要读准**的内容。
+ */
+export const REGION_LABEL: Record<string, string> = {
   cn: "国服",
   intl: "国际版",
   global: "国际版",
@@ -262,35 +267,95 @@ export function CopyableForm({ form }: { form: string }) {
 }
 
 /**
+ * 倍率显示文本（三态，**必须区分**）。
+ *
+ * - `number` → `x0.03`（`0` 是**确定的免费**，显示 `免费`）
+ * - `null`   → `x—`（上游**未声明**：不知道，**不是**免费）
+ * - `undefined`（键缺席）→ 空串（该平台没有倍率概念，不显示）
+ *
+ * ⚠ 把 `null` 当成 0（免费）是本功能最容易犯的错：它会让用户以为
+ * 不扣积分，而实际可能正在烧额度。故 `null` 与 `0` 的文案必须不同。
+ *
+ * 导出供「智能体管理」页与用量区复用 —— 三处口径必须一致。
+ */
+export function multiplierText(m: number | null | undefined): string {
+  if (m === undefined) return "";
+  if (m === null) return "x—";
+  if (m === 0) return "免费";
+  // 去掉尾随零（0.03 保留两位、0.5 显示 0.5 而不是 0.50）
+  return `x${Number(m.toFixed(4))}`;
+}
+
+/**
  * 平台徽标（**只读**）。
  *
  * 视觉与「智能体管理」页的平台开关 chip 完全同款：同一个
  * `productAccentOf` 配色、同一组类名。区别只有元素类型 ——
  * 那边是 `<button aria-pressed>`（点击写配置），这里是 `<span>`
  * （纯展示，不改任何东西）。所有者本轮的要求是"同步样式"，不是"同步交互"。
+ *
+ * # 倍率（2026-09-21 所有者要求）
+ *
+ * 原话：「模型清单 也要显示出 对应平台的倍率」。
+ *
+ * 倍率跟在平台名后面（如 `WorkBuddy 国服 x0.03`），因为倍率是
+ * **(平台, 区域)** 的属性 —— 同一个模型名在两区倍率可以相反，
+ * 只有跟着平台/区域一起显示才有意义。网关已按 (平台,区域) 拆成
+ * 多条渠道，故这里每条各显示自己的倍率。
  */
-function ProductBadge({ product, regions }: { product: string; regions?: string[] }) {
+function ProductBadge({
+  product,
+  regions,
+  region,
+  creditMultiplier,
+}: {
+  product: string;
+  regions?: string[];
+  /** 单数区域（新字段）。优先于 regions。 */
+  region?: string;
+  creditMultiplier?: number | null;
+}) {
   const accent = productAccentOf(product);
   const label = PRODUCT_LABELS[product] || product;
-  const regionText = (regions || [])
+  // 区域：新字段单数优先，回退旧数组（向后兼容旧网关）。
+  const regionCodes = region ? [region] : regions || [];
+  const regionText = regionCodes
     .map((r) => REGION_LABEL[r] || r)
     .filter(Boolean)
     .join(" / ");
+  const mult = multiplierText(creditMultiplier);
+  const title = [regionText ? `${label}（${regionText}）` : label, mult]
+    .filter(Boolean)
+    .join(" ");
   return (
     <span
       data-slot="model-product"
       data-product={product}
-      // 区域与 AgentsPage 同款：进 title 悬浮，不占可见文字
-      //（它在紧随其后的可复制写法里是明写的，信息不丢）。
-      title={regionText ? `${label}（${regionText}）` : label}
+      data-multiplier={mult || undefined}
+      // 区域进 title 悬浮，不占可见文字（它在紧随其后的可复制写法里是明写的）。
+      // 倍率则**可见** —— 所有者要的就是"显示出来"，藏进 title 等于没做。
+      title={title}
       className={cn(
-        "rounded border px-1.5 py-0.5 text-[11px] font-medium leading-4",
+        "inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] font-medium leading-4",
         accent.border,
         accent.bg,
         accent.text,
       )}
     >
-      {label}
+      <span>
+        {label}
+        {regionText ? ` ${regionText}` : ""}
+      </span>
+      {mult && (
+        <span
+          data-slot="model-multiplier"
+          // 倍率用等宽字体 + 略淡的前景色：它是**数字**，要与平台名区分开，
+          // 且同一列的数字要对齐（等宽字体让 `x0.03` 与 `x0.5` 宽度可比）。
+          className="font-mono text-[10px] tabular-nums opacity-80"
+        >
+          {mult}
+        </span>
+      )}
     </span>
   );
 }
@@ -514,9 +579,13 @@ export function ModelRoutingList({
                     )}
                     {channels.map((c) => (
                       <ProductBadge
-                        key={`${c.product}-${(c.regions || []).join(",")}`}
+                        // key 含区域与倍率：一个模型同一平台可能有多条
+                        //（不同区域各自一行），只用 product 会撞 key。
+                        key={`${c.product}-${c.region || (c.regions || []).join(",")}-${c.creditMultiplier ?? "?"}`}
                         product={c.product}
                         regions={c.regions}
+                        region={c.region}
+                        creditMultiplier={c.creditMultiplier}
                       />
                     ))}
                   </div>

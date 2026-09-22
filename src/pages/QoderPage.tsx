@@ -9,9 +9,16 @@ import {
   Globe,
   Loader2,
   RefreshCw,
-  Upload,
 } from "lucide-react";
 import { QoderMark } from "@/components/product-marks";
+import {
+  PlatformConfigButton,
+  PlatformConfigDialog,
+} from "@/components/platform-config-dialog";
+import {
+  ProductClaimNowCard,
+  ProductTasksConfigCard,
+} from "@/components/product-tasks-config";
 import { ProductAccountCard, ProductAccountGrid } from "@/components/product-account-card";
 // 记录视图：任务执行记录 + 额度消耗明细（所有者 2026-09-20 要求）。
 // 与 WorkBuddy 账号卡共用同一个组件 —— 三处的筛选与措辞必须一致。
@@ -74,16 +81,64 @@ function regionVariant(region: QoderRegion): "default" | "secondary" | "outline"
   return "outline";
 }
 
-/** 到期时间展示。 */
-function expiryText(expireAt: number): { text: string; urgent: boolean } {
-  if (!expireAt) return { text: "未知", urgent: false };
-  // 后端给的是 Unix 秒；>1e12 说明已经是毫秒（容错）
-  const ms = expireAt > 1e12 ? expireAt : expireAt * 1000;
-  const days = Math.floor((ms - Date.now()) / 86400000);
-  const date = new Date(ms).toLocaleDateString();
-  if (days < 0) return { text: `已过期（${date}）`, urgent: true };
-  if (days <= 7) return { text: `${days} 天后（${date}）`, urgent: true };
-  return { text: date, urgent: false };
+/**
+ * 额度数据的**上次更新时间**文案。
+ *
+ * # 为什么不再显示"到期时间"（2026-09-21 所有者反馈）
+ *
+ * 所有者原话：
+ *
+ *	「qoder那个改成上次更新时间吧,你那个过期时间根本不准确」
+ *
+ * 他是对的，实测证据（`GET https://qoder.cn/api/v2/me/usages/big_model_credits`，
+ * 用他自己的账号）：
+ *
+ *	expire_at（账号库里存的）        = 0            ← 上游根本没给
+ *	plan_quota.quota_detail[0].expires_at = 0      ← 套餐档也是 0
+ *	lastResetAt = 1782804793719  → 2026-06-30     ← 已过去
+ *	nextResetAt = 1784014393945  → 2026-07-14     ← **已过期 68 天**
+ *
+ * 即：该接口所有与"时间"相关的字段要么是 0、要么早已失效，
+ * 拿它们推算"额度何时到期"必然不准。而 `lastSeenAt`（最近一次刷新
+ * 账号数据的时刻）是**我们自己写入的真实时间**，含义明确、不会过期。
+ *
+ * # 三个 100 是什么（同一份实测响应）
+ *
+ * `resource_package_quota.quota_detail` 有**三个** bonus 包，各 100 credits，
+ * 合计 300 —— 与界面上「剩余 300 / 300」一致。它们各有自己的 `expires_at`
+ *（2026-10-19 / 10-20 / 10-21），但那是**资源包各自的有效期**，
+ * 不是"额度周期"，混用会误导。故这里不展示它们。
+ *
+ * # 文案口径
+ *
+ * 时钟图标现在表示**数据新鲜度**，不是"还剩多久"。故措辞明确写
+ * 「更新于 …」，避免用户再把它读成到期倒计时（这正是上一版的毛病）。
+ */
+function lastUpdatedText(lastSeenAt: string): { text: string; urgent: boolean } {
+  if (!lastSeenAt) return { text: "尚未刷新", urgent: false };
+  // 后端存的是 `2026-09-21T06-18-22Z` 这种「日期与时分用 - 分隔」的形式，
+  // 而那是**非标准 ISO**（标准应为 `T06:18:22Z`），`new Date()` 在部分
+  // 引擎上会解析失败。故显式换算：只取日期与时分，把第 3、4 个 `-` 换回 `:`。
+  //
+  // ⚠ 必须容错：解析不出来时退回原文而不是「Invalid Date」——
+  // 后者会让用户以为数据坏了。
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})Z$/.exec(lastSeenAt);
+  const d = m
+    ? new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]))
+    : new Date(lastSeenAt);
+  if (Number.isNaN(d.getTime())) return { text: lastSeenAt, urgent: false };
+
+  const days = Math.floor((Date.now() - d.getTime()) / 86400000);
+  if (days <= 0) {
+    // 今天：显示具体时刻，让用户能判断"刚刚刷新过"还是"今早刷过"。
+    return {
+      text: `更新于 ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`,
+      urgent: false,
+    };
+  }
+  const stamp = `${d.getMonth() + 1}/${d.getDate()}`;
+  // 超过 7 天标黄：额度可能已经不是最新的了，值得提醒重新刷新。
+  return { text: `更新于 ${stamp}（${days} 天前）`, urgent: days > 7 };
 }
 
 
@@ -409,6 +464,8 @@ export default function QoderPage() {
 
   // 登录对话框
   const [loginOpen, setLoginOpen] = useState(false);
+  /** Qoder 平台配置弹窗（2026-09-22 新增）。 */
+  const [configOpen, setConfigOpen] = useState(false);
   const [loginRegion, setLoginRegion] = useState<Exclude<QoderRegion, ""> | "">("");
   const [loginUrl, setLoginUrl] = useState<string | null>(null);
   const [loginState, setLoginState] = useState<"idle" | "waiting" | "ok" | "error">("idle");
@@ -416,9 +473,6 @@ export default function QoderPage() {
   const pollTimer = useRef<number | null>(null);
 
   // 导入对话框
-  const [importOpen, setImportOpen] = useState(false);
-  const [importPath, setImportPath] = useState("");
-  const [importResult, setImportResult] = useState<api.QoderImportResult | null>(null);
 
   // 编辑备注
   const [editTarget, setEditTarget] = useState<QoderAccountRow | null>(null);
@@ -576,28 +630,6 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
     setLoginRegion("");
   }, [stopPolling]);
 
-  const doImport = useCallback(async () => {
-    if (!importPath.trim()) {
-      toast.error("请填写凭证文件或目录的路径");
-      return;
-    }
-    setBusy("import");
-    try {
-      const r = await api.qoderImportCredentials(importPath.trim());
-      setImportResult(r);
-      if (r.importedCount > 0) {
-        toast.success(`已导入 ${r.importedCount} 个账号`);
-        void refresh();
-      }
-      if (r.failedCount > 0) {
-        toast.error(`${r.failedCount} 个文件导入失败，详见下方`);
-      }
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(null);
-    }
-  }, [importPath, refresh]);
 
   /**
    * 从客户端一键导入。
@@ -717,6 +749,68 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
     }
   }, []);
 
+  /**
+   * 只刷新**一个账号**的活动与账号数据（2026-09-21 所有者要求）。
+   *
+   * 所有者原话：
+   *
+   *	「单个账号的点击，应该只刷新操作的这个账号」
+   *	「一键跑批量任务,就是跑完再更新」
+   *
+   * 与 `openCampaigns()`（拉全部账号）相对：
+   *
+   *	单账号操作 → 本函数（只查这一个）
+   *	批量操作   → `openCampaigns()` + `refresh()`（跑完统一刷新一次）
+   *
+   * # 为什么两样都要刷新
+   *
+   *	活动状态 —— 决定"还能不能再领"（徽标要从可领变成已领）
+   *	账号数据 —— 决定"余额显示多少"（领到的权益直接加在 credits 上）
+   *
+   * 旧实现只刷活动、不刷账号数据，于是用户看到"提示领到了，
+   * 但卡片上的余额没变" —— 那正是所有者报的"没有自动刷新账号信息"。
+   */
+  const refreshOneAccount = useCallback(
+    async (uid: string) => {
+      // ① 活动：单账号查（后端按 uid 过滤，只打一次上游）。
+      try {
+        const r = await api.qoderCampaigns(uid);
+        setCampaigns((prev) => {
+          if (!prev) return prev;
+          // 单数接口返回的形状（QoderCampaignsResult）与批量接口的条目
+          //（QoderAccountCampaigns）字段名不同，这里做一次显式换算 ——
+          // 直接塞进去会让下游读 `claimable`（number）时拿到 undefined。
+          const entry: api.QoderAccountCampaigns = {
+            uid: r.uid,
+            nickname: prev.accounts.find((a) => a.uid === uid)?.nickname ?? "",
+            status: r.status,
+            // 单数接口的 `claimable` 是 bool，批量条目是「可领活动数」。
+            claimable: r.claimable ? (r.campaigns?.length ?? 0) : 0,
+            campaigns: r.campaigns,
+            campaignUrl: r.campaignUrl,
+          };
+          // 整条替换而不是合并：领取后状态可能从"可领"变"已领"，
+          // 合并会让旧的可领状态残留。
+          const accounts = prev.accounts.filter((a) => a.uid !== uid);
+          accounts.push(entry);
+          return {
+            ...prev,
+            accounts,
+            claimableTotal: accounts.reduce((s, a) => s + (a.claimable || 0), 0),
+            accountsWithClaimable: accounts.filter((a) => (a.claimable || 0) > 0).length,
+          };
+        });
+      } catch {
+        // 查不到活动不是错误（可能只是当前没有）。但也不要静默 ——
+        // 退化成全量刷新，保证界面至少反映某个**真实**状态而不是旧的。
+        await openCampaigns();
+      }
+      // ② 账号数据（credits 余额）：领到的权益会直接改变它。
+      await refresh();
+    },
+    [openCampaigns, refresh],
+  );
+
 
   /**
    * 领取**一个账号**名下所有可领的活动。
@@ -831,11 +925,30 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
         });
       }
 
-      // 领取后状态会变（CLAIMABLE → CLAIMED），重新拉一次才算数
-      await openCampaigns();
+      // 领取后状态会变（CLAIMABLE → CLAIMED），重新拉一次才算数。
+      //
+      // # 为什么单个账号只刷新**它自己**（2026-09-21 所有者要求）
+      //
+      // 所有者原话：
+      //
+      //	「单个账号的点击，应该只刷新操作的这个账号」
+      //
+      // 旧实现调 `openCampaigns()`（拉**全部账号**的活动）—— 点一个账号
+      // 却把所有账号的活动都重查一遍：多账号时是 N 次上游请求，
+      // 而且列表会整体重渲染（用户正在看的别的卡片闪一下）。
+      //
+      // 现在：只刷新这个账号的活动 + 账号数据（credits 余额会变，
+      // 因为领到的权益直接加在余额上）。
+      //
+      // ⚠ 两条都要刷新，缺一不可：
+      //   · 活动状态 —— 决定"还能不能再领"（徽标要变 CLAIMED）
+      //   · 账号数据 —— 决定"余额显示多少"（用户最直观的反馈）
+      // 旧实现只刷前者，所以出现"领到了但余额没变"的观感 ——
+      // 那正是所有者报的"没有自动刷新账号信息"。
+      await refreshOneAccount(acc.uid);
       setClaimingUid(null);
     },
-    [openCampaigns, rows],
+    [refreshOneAccount, rows],
   );
 
   /**
@@ -906,8 +1019,18 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
           description: "所有账号的活动都已经领过了",
         });
       }
-      // 领取后状态会变，重新拉一次才算数
+      // 批量任务**跑完之后统一刷新一次**（2026-09-21 所有者要求）。
+      //
+      // 所有者原话：「一键跑批量任务,就是跑完再更新」。
+      //
+      // 即：批量过程中**不**逐个账号刷新（那会是 N 次上游请求、
+      // 而且列表在整个过程中反复重渲染），等这一批全部跑完再拉一次。
+      //
+      // ⚠ 两样都要刷新（与单账号路径同一理由）：
+      //   · 活动状态 —— 徽标从"可领"变"已领"
+      //   · 账号数据 —— credits 余额（领到的权益直接加在它上面）
       await openCampaigns();
+      await refresh();
     } catch (e) {
       toast.error("一键领取失败", {
         description: e instanceof Error ? e.message : String(e),
@@ -915,7 +1038,7 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
     } finally {
       setClaimingAll(false);
     }
-  }, [openCampaigns]);
+  }, [openCampaigns, refresh]);
 
   /**
    * 账号列表的「刷新」按钮：**同时**重查账号与权益活动。
@@ -941,14 +1064,43 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
   //
   // 为什么不在页面加载时直接查：那时 rows 还是空的，挑不出账号。
   //
-  // 为什么只查一次（`campaignsAutoDone` 标记）：`openCampaigns` 依赖
-  // `rows`，而 `rows` 会被 refresh 反复替换 —— 不设标记就会每次刷新
-  // 都打一次上游。用户想更新时点账号列表上的「刷新」（见 `refreshAll`）。
-  const campaignsAutoDone = useRef(false);
+  // # ⚠⚠ 这个"只查一次"的标记曾经漏掉新账号（2026-09-22 所有者现场）
+  //
+  //	「国际版的活动我看跟国内一样，也能领积分，我刚成功登录了国际版
+  //	  但是没有执行领取积分的操作」
+  //	「是那个本账号任务 就没有显示领取积分的操作」
+  //
+  // # 根因
+  //
+  // 标记是**会话级**的，一旦置 true 就再也不查。而**新增账号**（登录、
+  // 导入）不会重置它：
+  //
+  //	1. 打开页面 → 只有国服账号 → 查一次 → campaignsAutoDone = true
+  //	2. 登录国际版 → refresh() 更新 rows，但标记已 true → **不查**
+  //	3. ⇒ 国际版账号的 campaigns 永远是 undefined
+  //	   ⇒ qoderTasksOf() 返回 [] ⇒ **菜单里没有"领取积分"**
+  //
+  // 用户看到的现象正是第 3 步。而"领取"本身是好的 ——
+  // 手动点刷新/重进页面就能领，所以这个缺陷**只在"刚加完账号"时出现**，
+  // 极容易在自测中被漏掉（我自己就没测到）。
+  //
+  // # 修法：记住"上次查询覆盖了哪些账号"，账号集合变了就重查
+  //
+  // 不能简单地每次 rows 变化都查 —— `rows` 会被 refresh 反复替换
+  //（额度刷新、状态轮询），那样每次刷新都打一次上游。
+  // 用**账号集合的指纹**做判据：只有增减账号才重查，
+  // 纯粹的额度更新（集合不变）不触发。
+  const campaignsAutoDoneFor = useRef<string>("");
   useEffect(() => {
-    if (campaignsAutoDone.current) return;
     if (loading || rows.length === 0) return;
-    campaignsAutoDone.current = true;
+    // 指纹 = 全部 uid 排序后拼接。顺序无关，只关心"是不是同一批账号"。
+    const fingerprint = rows
+      .map((r) => r.uid)
+      .filter(Boolean)
+      .sort()
+      .join(",");
+    if (campaignsAutoDoneFor.current === fingerprint) return;
+    campaignsAutoDoneFor.current = fingerprint;
     void openCampaigns();
   }, [loading, rows, openCampaigns]);
 
@@ -1027,6 +1179,15 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
                 管理 Qoder 账号的登录态、额度与到期时间，并与 WorkBuddy 账号一起参与网关路由。
               </p>
             </div>
+            {/* Qoder 平台配置入口（2026-09-22 新增）。
+                收进弹窗而不是平铺：配置是"偶尔改的"，
+                平铺会把下面的账号列表挤到很远处。 */}
+            <PlatformConfigButton
+              className="mt-1 shrink-0"
+              onClick={() => setConfigOpen(true)}
+            >
+              配置
+            </PlatformConfigButton>
           </div>
         </header>
 
@@ -1095,15 +1256,23 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
 
         {/* 账号列表 */}
         <Card>
+          {/* ⚠ 操作区布局对齐 WorkBuddy 账号页（2026-09-22 所有者要求：
+              「zcode和qoder操作布局改一下,都改成和workbuddy一样的」）。
+
+              WorkBuddy 的分组是三段：
+                · 左：标题 + 副标题（`flex-1`，窄屏自动换行）
+                · 中：主操作（实心主按钮）
+                · 右：次要操作（`ghost` 小按钮）
+              这里照搬，让三页的"加账号"入口在同一个位置、同一种视觉层级。 */}
           <CardHeader>
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-4">
+              <div className="min-w-[190px] flex-1">
                 <CardTitle>账号列表</CardTitle>
-                <CardDescription>
+                <CardDescription className="mt-1">
                   国服与国际版共用同一套账号管理；区域决定登录与调用使用哪套端点。
                 </CardDescription>
               </div>
-              <div className="flex flex-wrap gap-2">
+              <div className="flex flex-wrap items-center gap-2.5">
                 <TooltipProvider delayDuration={400}>
                   {/* 一键领取（所有账号）—— 所有者的需求。
                       只在真有可领的时候才可点，避免用户点了却什么也没发生。 */}
@@ -1160,10 +1329,14 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
                   <Download className={cn("mr-2 h-4 w-4", clientImporting && "animate-spin")} />
                   从客户端导入
                 </Button>
-                <Button variant="outline" size="sm" onClick={() => setImportOpen(true)}>
-                  <Upload className="mr-2 h-4 w-4" />
-                  导入凭证文件
-                </Button>
+                {/* ⚠「导入凭证文件」已于 2026-09-22 **删除**（所有者要求）。
+                    原话：「qoder的导入已有凭证也没用,也删了吧」。
+
+                    它要用户手工填一个凭证文件路径，而「从客户端导入」会
+                    自动读 Qoder 客户端已登录的凭证 —— 后者是前者的超集
+                    且不用用户知道路径。上面那条注释也早就写着它是
+                    「降级为次要入口」，既然实测没用就直接删掉，
+                    不留一个需要用户猜路径的入口。 */}
                 <Button variant="outline" size="sm" onClick={() => setLoginOpen(true)}>
                   <Download className="mr-2 h-4 w-4" />
                   登录新账号
@@ -1204,7 +1377,7 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
                  所有者的要求：「ZCODE和Qoder和Workbuddy采用一样的卡片布局」。 */
               <ProductAccountGrid>
                 {rows.map((row) => {
-                  const exp = expiryText(row.expireAt);
+                  const exp = lastUpdatedText(row.lastSeenAt);
                   const creditsText =
                     row.credits > 0
                       ? row.creditsTotal > 0
@@ -1245,6 +1418,9 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
                         creditsLabel: "剩余 Credits",
                         expiryText: exp.text,
                         expiryUrgent: exp.urgent,
+                        // 时钟图标在 Qoder 上表示**数据新鲜度**（不是额度周期）——
+                        // 上游给不出可靠的时间（见 lastUpdatedText 的注释）。
+                        expiryKind: "last-updated",
                         models: row.models,
                         hasCredential: row.hasCredential,
                         disabled: row.disabled,
@@ -1459,72 +1635,6 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
           </DialogContent>
         </Dialog>
 
-        {/* 导入对话框 */}
-        <Dialog open={importOpen} onOpenChange={setImportOpen}>
-          <DialogContent className="sm:max-w-lg">
-            <DialogHeader>
-              <DialogTitle>导入已有凭证</DialogTitle>
-              <DialogDescription>
-                填写凭证文件或所在目录的路径。目录会扫描其中的 qoder*.json 文件。
-              </DialogDescription>
-            </DialogHeader>
-
-            <div className="space-y-4 py-2">
-              <div className="space-y-2">
-                <Label htmlFor="qoder-import-path">路径</Label>
-                <Input
-                  id="qoder-import-path"
-                  placeholder="C:\Users\你\qoder-auths"
-                  value={importPath}
-                  onChange={(e) => setImportPath(e.target.value)}
-                />
-                <p className="text-xs text-muted-foreground">
-                  支持嵌套形与扁平形两种凭证格式；区域会按凭证里的域名自动判断。
-                </p>
-              </div>
-
-              {importResult && (
-                <>
-                  <Separator />
-                  {importResult.imported.length > 0 && (
-                    <div className="space-y-1">
-                      <div className="text-sm font-medium text-emerald-600">
-                        成功 {importResult.importedCount} 个
-                      </div>
-                      {importResult.imported.map((x) => (
-                        <div key={x.file} className="font-mono text-xs text-muted-foreground">
-                          {x.file} → {x.uid.slice(0, 12)}（{regionLabel(x.region)}）
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  {importResult.failed.length > 0 && (
-                    <div className="space-y-1">
-                      <div className="text-sm font-medium text-destructive">
-                        失败 {importResult.failedCount} 个
-                      </div>
-                      {importResult.failed.map((x) => (
-                        <div key={x.file} className="text-xs text-muted-foreground">
-                          <span className="font-mono">{x.file}</span>：{x.error}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setImportOpen(false)}>
-                关闭
-              </Button>
-              <Button onClick={() => void doImport()} disabled={busy === "import"}>
-                {busy === "import" && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                开始导入
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
 
         {/* 编辑备注 */}
         <Dialog open={editTarget !== null} onOpenChange={(o) => !o && setEditTarget(null)}>
@@ -1582,6 +1692,20 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
           </div>
         </DialogContent>
       </Dialog>
+        {/* Qoder 平台配置（2026-09-22 新增）。
+            使用与 WorkBuddy / ZCode 同一个 `PlatformConfigDialog` 外壳，
+            三页的形状保持一致。 */}
+        <PlatformConfigDialog
+          open={configOpen}
+          onOpenChange={setConfigOpen}
+          title="Qoder 配置"
+          description="权益活动的自动领取与手动领取。这些配置只对 Qoder 与 ZCode 生效。"
+        >
+          <div className="min-w-0 space-y-10">
+            <ProductTasksConfigCard />
+            <ProductClaimNowCard />
+          </div>
+        </PlatformConfigDialog>
       </div>
     </TooltipProvider>
   );

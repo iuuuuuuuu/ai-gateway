@@ -118,6 +118,14 @@ type chatResult struct {
 	// 调用方据此决定**怎么读这个流**：WorkBuddy 已是 OpenAI 形状，直接透传；
 	// Qoder 是嵌套形状，必须先翻译。搞混会得到空回答（HTTP 仍 200）。
 	Product  string
+	// Region 本次结果来自哪个区域（"cn" / "intl"；空 = 该平台不分区）。
+	//
+	// 用途：/usage 的计费归属要按区域拆开显示（所有者 2026-09-21 要求
+	// 「分区域各列一行」）—— 因为倍率按区域不同（实测
+	// deepseek-v4.1-flash 国服计费、国际版免费）。
+	//
+	// 从**选中的账号**的 Domain 判定，与选号逻辑同一口径（见 auth.RegionOf）。
+	Region   string
 	Stream   io.ReadCloser
 	Response map[string]any
 }
@@ -274,7 +282,7 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 	//	· 前缀**没有任何效果**
 	// 实测确认（uitest/diag-429-isolate.cjs）：
 	//
-	//	`global:deepseek-v4.1-flash` → 选中 uid=4ea736d4（**国服**）
+	//	`global:deepseek-v4.1-flash` → 选中 uid={wb-uid}（**国服**）
 	//
 	// 写了区域前缀却选中国服账号 —— 与"前缀被丢弃"是同一个症状，
 	// 只是这次是**我自己的疏忽**（算出了正确值却没用它）。
@@ -393,7 +401,65 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 		tried[acct.UID] = true
 		lastUID = acct.UID
 
-		if !h.cfg.Pool.Acquire(acct.UID) {
+		// ⚠ 3012 熔断兜底：**发请求之前**先看上游是否正在风控。
+		//
+		// 放在这里才真正止住放大：一次请求内第一个账号吃到 3012 后，
+		// 循环走到 i+1 再来这里 —— 熔断已置位，于是直接返回，
+		// **不再拿后面的账号去撞**。
+		//
+		// 见 unusual.go 文件头：旧行为会把池里所有账号挨个打一遍，
+		// 每个都吃一次 3012 —— 那对上游风控而言是最坏形状。
+		//
+		// ⚠ 这里**不**区分 i 是否 > 0（我第一版写了 `if i > 0`，被测试抓出来）：
+		//
+		//	写 `i > 0` 的理由是"第一次尝试不该被上一轮留下的熔断挡住"，
+		//	听起来合理，实际却让**熔断期间每个新请求仍会打一次上游** ——
+		//	用户每重试一次就再撞一次风控，而所有者要的正是"别重试"。
+		//	测试 TestUnusualActivityBreakerBlocksNextRequest 直接抓到了这个
+		//	（1 → 2 次）。
+		//
+		// 熔断期就是要**一个请求都不发**；用户看到的是一条说清原因
+		//（与账号无关、多久恢复）的错误，而不是一次注定失败的尝试。
+		if tripped, wait := unusual.tripped(); tripped {
+			log.Printf("chat: 3012 熔断中（还需 %s），不发请求（本请求已试 %d 个账号）",
+				wait.Round(time.Second), i)
+			uid := lastUID
+			if heldUID != "" {
+				h.cfg.Pool.Release(heldUID)
+				heldUID = ""
+				uid = lastUID
+			}
+			return &chatResult{UID: uid, Model: model}, http.StatusServiceUnavailable,
+				&forwardFailure{
+					Kind:    FailureUnusualActivity,
+					Status:  http.StatusServiceUnavailable,
+					Message: unusualActivityMessage(wait),
+				}
+		}
+
+		// 占在途名额。**名额满时等一会儿，而不是立刻换号/失败**（2026-09-22）。
+		//
+		// # 为什么（所有者现场：客户端每次失败、curl 却成功）
+		//
+		// DSH 客户端的 pi-ai 层带 `retryProviderRequest`（默认重试 5 次），
+		// 每个重试都是**独立并发请求**。而 `max_in_flight` 曾只有 3 ⇒
+		// 并发 4/5 时后两个必然选不出号 ⇒ 503「所有账号不可用」——
+		// 而那账号**完全健康**（实测 cooling=false / disabled=false）。
+		//
+		// 在途名额是**瞬时**资源（一个请求几秒就释放），名额暂时满
+		// ≠ 账号不可用。故这里等一小会儿（默认 1.5s，远小于客户端超时），
+		// 让重试风暴里的请求排队而不是成片失败。
+		//
+		// ⚠ 等待有上限且尊重 ctx 取消：等不到就照旧换号，
+		// 不会把请求无限挂住（见 pool.AcquireWait 的注释）。
+		//
+		// ⚠ `InFlightWait < 0` = 显式关闭等待（回滚出口）：
+		// 此时传 0 给 AcquireWait，它只试一次，行为与改动前逐字相同。
+		wait := h.cfg.InFlightWait
+		if wait < 0 {
+			wait = 0
+		}
+		if !h.cfg.Pool.AcquireWait(ctx, acct.UID, wait) {
 			if stickyUID != "" && acct.UID == stickyUID && h.cfg.Session != nil {
 				h.cfg.Session.Unbind(sessKey)
 				stickyUID = ""
@@ -488,6 +554,35 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 			lastBody = string(respBody)
 			lastTransportErr = nil
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+
+			// ⚠ 3012「unusual activity」：**立即停止换号**（详见 unusual.go）。
+			//
+			// 必须放在下面的 WAF / 请求侧错误判定**之前**也行、之后也行 ——
+			// 它的判据（响应体里的 3012 或 "unusual activity"）与那两者不重叠：
+			//
+			//	· WAF 判据是 403 + 非业务信封/边缘特征
+			//	· 3012 的载体实测是 **405**，且体是标准业务信封
+			//
+			// 放在这里（紧跟 Classify）是因为它要做的事与分类最相关：
+			// 把"这一次拒绝"升级成"整个进程暂停"。
+			//
+			// ⚠ 刻意**不罚账号**（不调 applyErrorPolicy / fail）：
+			// 3012 与账号无关，罚号会让好账号在风控过去后仍被冷却，
+			// 把"上游临时风控"变成"我们自己造成的持续故障"。
+			if isUnusualActivity(status, string(respBody)) {
+				until := unusual.note3012()
+				uid := acct.UID
+				releaseHeld()
+				log.Printf("chat uid=%s product=%s: 上游 3012 unusual activity，"+
+					"已熔断至 %s（不再换号重试）",
+					uid, acct.ProductOf(), until.In(time.Local).Format("15:04:05"))
+				return &chatResult{UID: uid, Model: model}, http.StatusServiceUnavailable,
+					&forwardFailure{
+						Kind:    FailureUnusualActivity,
+						Status:  http.StatusServiceUnavailable,
+						Message: unusualActivityMessage(time.Until(until)),
+					}
+			}
 
 			// WAF 403：可能拦的是**出口 IP**，不是账号（见 wafip.go 的实测记录）。
 			//
@@ -662,6 +757,12 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 		}
 
 		h.cfg.Pool.NoteSuccess(acct.UID)
+		// 上游成功 ⇒ 3012 熔断**立刻复位**（见 unusual.go 的 noteSuccess）。
+		//
+		// 为什么成功要清：它证明上游此刻不再风控。继续熔断会让用户在一次
+		// 短暂抖动之后仍然被**我们自己的网关**挡在门外 —— 那是我们制造的故障，
+		// 而 3012 本身是上游临时的、会自己过期的限制。
+		unusual.noteSuccess()
 		// 粘性跟随最终成功号。
 		if sessKey != "" && h.cfg.Session != nil {
 			h.cfg.Session.Bind(sessKey, acct.UID)
@@ -674,9 +775,17 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 		if isProduct {
 			product = acct.ProductOf()
 		}
+		// 区域：WorkBuddy 的账号分 cn/intl（倍率按区域不同，故 /usage 要拆开）。
+		//
+		// 非 WorkBuddy 产品（Qoder/ZCode）不分区 —— 它们的账号池没有
+		// 区域维度，给它们标一个区域会是编造。故只在 WorkBuddy 路径上取。
+		region := ""
+		if !isProduct {
+			region = acct.Region().String()
+		}
 
 		if stream {
-			return &chatResult{UID: uid, Model: modelOf(body), Product: product, Stream: rc}, status, nil
+			return &chatResult{UID: uid, Model: modelOf(body), Product: product, Region: region, Stream: rc}, status, nil
 		}
 
 		// 非流式：按产品选择聚合方式。
@@ -701,7 +810,7 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 		if aggErr != nil {
 			return nil, http.StatusBadGateway, aggErr
 		}
-		return &chatResult{UID: uid, Model: modelOf(body), Product: product, Response: resp}, http.StatusOK, nil
+		return &chatResult{UID: uid, Model: modelOf(body), Product: product, Region: region, Response: resp}, http.StatusOK, nil
 	}
 
 	msg := "all accounts unavailable (cooling/disabled)"
@@ -816,6 +925,18 @@ const (
 	// 故单独成型：不轮转、不冷却账号，直接说"这个模型在这条通道上不存在，
 	// 等多久都不会出现"，并给出可操作的出路（换模型 / 用区域前缀）。
 	FailureModelNotInRegion
+	// FailureUnusualActivity 上游回了 3012「unusual activity」风控，
+	// 网关已**主动停止换号重试**（详见 unusual.go）。
+	//
+	// 所有者 2026-09-21 的选择：他明确要「3012 后自动退避一段时间不重试」，
+	// 而不是让网关把 21 个账号挨个打一遍 —— 后者对上游风控而言是最坏形状。
+	//
+	// 为什么要单独成型（而不是继续落进 no_healthy_account）：
+	//
+	//	· 默认契约说「账号全部不可用」⇒ 用户去查账号池，**方向完全错**；
+	//	  实测 3012 与账号无关（同一账号一分钟后即可用、官方客户端也吃它）。
+	//	· 它要传达的是「等一会儿，别换号」—— 与「账号池耗尽」的处置相反。
+	FailureUnusualActivity
 )
 
 // imageRegionUnavailableMessage 生成「带图片请求缺少该区域账号」的说明。

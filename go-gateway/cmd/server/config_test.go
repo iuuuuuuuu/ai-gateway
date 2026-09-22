@@ -77,8 +77,21 @@ func TestNewPoolConfigDefaults(t *testing.T) {
 	if err := c.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
+	// 单账号在途上限。演变：3 → 32 → **8**（2026-09-22）。
+	//
+	//	· 3  太小：客户端会**并发重试**（DSH 的 pi-ai 默认 5 次），
+	//	      而 qoder / zcode 各只有 1 个账号 ⇒ 上限即该产品总并发，
+	//	      5 次重试里后 2 次必然 503。
+	//	· 32 太大：**恰好等于 qoder 上游的并发天花板**
+	//	      （实测并发 32 → 31/32，1 个报「上游服务异常 HTTP 503」）。
+	//	      把上限设成"刚好等于上游能力"⇒ 余量为零，
+	//	      网关自己的巡检/保活一叠加就越界 —— 所有者现场正是这个。
+	//	· 8  有约 4 倍余量，且高于客户端重试次数；超额请求由
+	//	      `server.Config.InFlightWait` 排队而非失败。
 	if c.Pool.MaxInFlight != 3 {
-		t.Errorf("max_in_flight=%d want 3", c.Pool.MaxInFlight)
+		t.Errorf("max_in_flight=%d want 8（3 会让并发重试成片 503；"+
+			"32 会顶到 qoder 上游的上限而触发上游 503）",
+			c.Pool.MaxInFlight)
 	}
 	if c.Pool.BreakerThreshold != 3 {
 		t.Errorf("breaker_threshold=%d want 3", c.Pool.BreakerThreshold)
@@ -708,5 +721,132 @@ func TestPromptEnvModeInvalidFailsFast(t *testing.T) {
 	t.Setenv("WB2A_PROMPT_MODE", "bogus")
 	if _, err := Load(""); err == nil {
 		t.Fatal("env 传入非法 prompt.mode 应报错")
+	}
+}
+
+// loadConfigJSON 写一份临时配置并加载。
+func loadConfigJSON(t *testing.T, body string) *Config {
+	t.Helper()
+	fp := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("加载配置失败: %v", err)
+	}
+	return c
+}
+
+// TestQoderClaimDefaultsTwoWindows 默认**早晚两次**领取（2026-09-22 所有者要求）。
+//
+// 原话：「qoder改为 早十点,晚九点 两次触发,防止错漏」。
+//
+// ⚠ 为什么是两个时点而不是一个：活动每天 10:00（UTC+8）重置、单条时限约
+// 22 小时。只排一个时点的话，任何一次抖动（上游 5xx / 网络超时 /
+// 网关当时没在跑）都会让**当天彻底领不到**，而用户不会收到任何提示。
+func TestQoderClaimDefaultsTwoWindows(t *testing.T) {
+	c := Default()
+	want := []int{10, 21}
+	if len(c.Schedule.QoderClaimHours) != len(want) {
+		t.Fatalf("默认应有 2 个领取时点（早十点/晚九点），实际 %v", c.Schedule.QoderClaimHours)
+	}
+	for i, h := range want {
+		if c.Schedule.QoderClaimHours[i] != h {
+			t.Errorf("第 %d 个时点应为 %d，实际 %d（完整：%v）",
+				i+1, h, c.Schedule.QoderClaimHours[i], c.Schedule.QoderClaimHours)
+		}
+	}
+}
+
+// TestQoderClaimSplitDefaultsToMasterSwitch 分产品开关缺席时回落到总闸。
+//
+// # 为什么这条最重要
+//
+// 拆分（2026-09-22「权益自动领取 qoder zcode 拆分开」）必须**向后兼容**：
+// 存量配置里只有 `product_tasks_enabled`，没有两个新键。若新键用了值类型
+// `bool`，缺键就是 false ⇒ **所有老用户的自动领取被静默关掉**，而活动
+// 不领就过期作废，用户完全不会察觉。
+//
+// 这正是字段声明成 `*bool` 的理由，也是本测试要钉住的行为。
+func TestQoderClaimSplitDefaultsToMasterSwitch(t *testing.T) {
+	// 总闸开、两个分产品键都缺席 ⇒ 两个都应视为「开」
+	on := loadConfigJSON(t, `{"listen":":9999","api_key":"k",
+		"schedule":{"product_tasks_enabled":true}}`)
+	if !on.QoderClaimOn() {
+		t.Error("总闸为 true 且 qoder_claim_enabled 缺席时，QoderClaimOn 应为 true" +
+			"（否则老配置的自动领取会被静默关掉）")
+	}
+	if !on.ZcodeClaimOn() {
+		t.Error("总闸为 true 且 zcode_claim_enabled 缺席时，ZcodeClaimOn 应为 true")
+	}
+
+	// 总闸关、分产品键缺席 ⇒ 两个都应视为「关」
+	off := loadConfigJSON(t, `{"listen":":9999","api_key":"k",
+		"schedule":{"product_tasks_enabled":false}}`)
+	if off.QoderClaimOn() {
+		t.Error("总闸为 false 且未显式打开时，QoderClaimOn 应为 false")
+	}
+	if off.ZcodeClaimOn() {
+		t.Error("总闸为 false 且未显式打开时，ZcodeClaimOn 应为 false")
+	}
+}
+
+// TestQoderClaimSplitOverridesMasterSwitch 分产品键**优先于**总闸（拆分的意义所在）。
+//
+// ⚠ 这条是「拆分」这个需求的核心：用户要能「只关 Qoder、留着 ZCode」
+//（或反过来）。若分产品键不能覆盖总闸，两个开关就只是摆设。
+func TestQoderClaimSplitOverridesMasterSwitch(t *testing.T) {
+	// 总闸开，但显式关掉 Qoder、留着 ZCode
+	c := loadConfigJSON(t, `{"listen":":9999","api_key":"k",
+		"schedule":{"product_tasks_enabled":true,
+		            "qoder_claim_enabled":false,
+		            "zcode_claim_enabled":true}}`)
+	if c.QoderClaimOn() {
+		t.Error("显式 qoder_claim_enabled=false 必须能单独关掉 Qoder" +
+			"（否则'拆分开'这个需求没有实现）")
+	}
+	if !c.ZcodeClaimOn() {
+		t.Error("关 Qoder 不该连带关掉 ZCode —— 两个开关必须互相独立")
+	}
+
+	// 反向：总闸关，但显式只打开 Qoder
+	c2 := loadConfigJSON(t, `{"listen":":9999","api_key":"k",
+		"schedule":{"product_tasks_enabled":false,
+		            "qoder_claim_enabled":true}}`)
+	if !c2.QoderClaimOn() {
+		t.Error("显式 qoder_claim_enabled=true 应能单独打开 Qoder")
+	}
+	if c2.ZcodeClaimOn() {
+		t.Error("只打开 Qoder 时 ZCode 应仍跟随总闸（false）")
+	}
+}
+
+// TestQoderClaimHoursRejectsInvalidHour 非法小时必须**启动即报错**。
+//
+// 与其它排程同款取舍：静默把非法值当成"某点照常执行"会让用户以为
+// 自己已经关掉/改好了，实际行为与他以为的不一致。
+func TestQoderClaimHoursRejectsInvalidHour(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "config.json")
+	body := `{"listen":":9999","api_key":"k","schedule":{"qoder_claim_hours":[10,24]}}`
+	if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(fp); err == nil {
+		t.Fatal("小时 24 非法，应在启动时报错而不是静默接受")
+	}
+}
+
+// TestQoderClaimHoursEmptyStaysEmpty 显式空数组 = 关闭时点制，**不要**回落默认值。
+//
+// ⚠ 这是 `normalize` 里那个 `== nil` 判断（而非 `len()==0`）的理由：
+// 空数组是用户明确表达的"不要按小时跑"，把它改回 [10,21] 就等于
+// 用户关不掉时点制。
+func TestQoderClaimHoursEmptyStaysEmpty(t *testing.T) {
+	c := loadConfigJSON(t, `{"listen":":9999","api_key":"k",
+		"schedule":{"qoder_claim_hours":[]}}`)
+	if len(c.Schedule.QoderClaimHours) != 0 {
+		t.Errorf("显式空数组应保持为空（用户要关掉时点制），实际 %v",
+			c.Schedule.QoderClaimHours)
 	}
 }

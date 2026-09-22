@@ -23,8 +23,12 @@ import (
 )
 
 // TestTraceHeadersLifecycle 追踪头的三类生命周期必须分清。
+//
+// ⚠ 2026-09-21 起按**通道**区分：本用例测 coding-plan（发全部 5 个头）。
+// start-plan 的契约另见 TestTraceHeadersStartPlanOmitsQueryAndSession。
 func TestTraceHeadersLifecycle(t *testing.T) {
-	id := Identity{AccountID: "zcode-1b2941c020ef"}
+	id := Identity{AccountID: "zcode-abcdef123456"}
+	// false = coding-plan（API Key 通道），发全部 5 个头
 	a := id.TraceHeaders()
 	b := id.TraceHeaders()
 
@@ -138,8 +142,8 @@ func TestLooksLikeUUID(t *testing.T) {
 	}
 	no := []string{
 		"",
-		"zcode-1b2941c020ef",
-		"19331730795565300",
+		"zcode-abcdef123456",
+		"12345678901234567",
 		"8fc6b5b0fb134801b1de988f41d14eed",   // 无连字符
 		"8fc6b5b0-fb13-4801-b1de-988f41d14ee", // 少一位
 		"8fc6b5b0-fb13-4801-b1de-988f41d14eedd",

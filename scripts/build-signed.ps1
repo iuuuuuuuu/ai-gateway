@@ -50,7 +50,12 @@ param(
     [string]$Bundles = "nsis",
     [string]$KeyFile = "",
     [string]$PasswordFile = "",
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    # 跳过 Go 网关重建，沿用 embedded/ 下现有的产物。
+    #
+    # 只建议在"确定网关没动、只想快速重打前端/UI"时使用 —— 它会**放弃**
+    # 本次构建对"内嵌网关新鲜度"的保证（校验仍会跑，但基准是旧产物）。
+    [switch]$SkipGateway
 )
 
 $ErrorActionPreference = "Stop"
@@ -117,7 +122,7 @@ function Get-KeyKind {
 }
 
 # ── 1) 定位私钥 ────────────────────────────────────────────────────────
-Write-Host "==> [1/3] 检查签名私钥" -ForegroundColor Cyan
+Write-Host "==> [1/4] 检查签名私钥" -ForegroundColor Cyan
 
 if (-not (Test-Path -LiteralPath $KeyFile)) {
     throw @"
@@ -138,7 +143,7 @@ if ($keyKind -notmatch 'secret key') {
 Write-Host "    私钥：$KeyFile"
 
 # ── 2) 口令 + keyid 预检（构建前快速失败）───────────────────────────────
-Write-Host "==> [2/3] 校验口令与密钥配对" -ForegroundColor Cyan
+Write-Host "==> [2/4] 校验口令与密钥配对" -ForegroundColor Cyan
 
 if (-not (Test-Path -LiteralPath $PasswordFile)) {
     throw @"
@@ -228,8 +233,56 @@ if ($CheckOnly) {
     return
 }
 
-# ── 3) 构建 ────────────────────────────────────────────────────────────
-Write-Host "==> [3/3] 构建签名安装包（bundles=$Bundles）" -ForegroundColor Cyan
+# ── 3) 构建/刷新内嵌的 Go 网关 ─────────────────────────────────────────
+#
+# # 为什么这一步必须在这里（2026-09-21 所有者反馈，这是结构性缺陷）
+#
+# 所有者原话：
+#
+#	「我发现每次都会内嵌的是旧的网关，没办法从构建上，直接写一个脚本
+#	  一次性处理掉这个问题吗？」
+#
+# 根因：`crates/ai-gateway-core/build.rs` 会**无条件内嵌**
+# `crates/ai-gateway-core/embedded/gateway.exe` 里当时躺着的那一份，
+# 而**本脚本此前从不构建网关**（只有 build-single.ps1 有那段逻辑）。
+#
+# 于是：改了 `go-gateway/` 的代码但没手动重建 embedded/gateway.exe，
+# 打出来的包就内嵌旧网关 —— 症状是"新功能在开发机上好好的，装完却没有"，
+# 而构建日志里**没有任何异常**。所有者已经不止一次踩到。
+#
+# 修法：把构建网关做成打包的**前置步骤**，并在构建后做指纹校验。
+# 「记得先手动跑一次」不是修法 —— 那正是会忘的事。
+$embeddedGw = Join-Path $root "crates/ai-gateway-core/embedded/gateway.exe"
+$gwScript = Join-Path $PSScriptRoot "build-gateway.ps1"
+
+Write-Host "==> [3/4] 构建/刷新内嵌网关（Go）" -ForegroundColor Cyan
+if (-not (Test-Path -LiteralPath $gwScript)) {
+    throw "未找到 $gwScript —— 内嵌网关无法保证新鲜，拒绝继续构建"
+}
+
+# -Force：打包场景下一律重建。
+#
+# 为什么不用"源码比产物新才重建"的增量判断：Go 的构建很快（约 10 秒），
+# 而"内嵌了旧网关"这个错误的代价极高（一个装完才发现功能没生效的安装包）。
+# 用 10 秒换"绝不可能内嵌旧网关"，在这个场景下是明显划算的交易。
+# （需要快速迭代 UI 时可用 -SkipGateway 跳过，见下方参数。）
+if ($SkipGateway) {
+    Write-Host "    跳过（-SkipGateway，沿用现有 embedded/gateway.exe）" -ForegroundColor Yellow
+    if (-not (Test-Path -LiteralPath $embeddedGw)) {
+        throw "-SkipGateway 但 embedded/gateway.exe 不存在：无法内嵌任何网关"
+    }
+} else {
+    & $gwScript -Force | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "构建内嵌网关失败（exit $LASTEXITCODE）" }
+}
+
+# 记下**构建前**的指纹：构建后要拿它比对，确认内嵌的确实是这一份。
+$gwHashBefore = (Get-FileHash -LiteralPath $embeddedGw -Algorithm SHA256).Hash
+$gwSizeBefore = [math]::Round((Get-Item -LiteralPath $embeddedGw).Length / 1MB, 2)
+Write-Host ("    待内嵌网关：{0} MB  SHA256 {1}…" -f $gwSizeBefore, $gwHashBefore.Substring(0, 16)) -ForegroundColor Green
+
+# ── 4) 构建 ────────────────────────────────────────────────────────────
+Write-Host "==> [4/4] 构建签名安装包（bundles=$Bundles）" -ForegroundColor Cyan
 Push-Location $root
 try {
     if (-not (Test-Path (Join-Path $root "node_modules"))) {
@@ -265,6 +318,154 @@ finally {
     $env:TAURI_SIGNING_PRIVATE_KEY = $prevKey
     $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $prevPw
 }
+
+# ── 校验 A：内嵌的确实是刚构建的那份网关 ───────────────────────────────
+#
+# # 这一步是本次修复的核心（2026-09-21）
+#
+# 光"构建前重建网关"还不够 —— 那只能保证**磁盘上**的 embedded/gateway.exe
+# 是新的，不能保证**打进包里**的是它。中间还隔着 build.rs 的查找顺序：
+#
+#	1. 环境变量 AI_GATEWAY_ROUTER_BIN
+#	2. crates/ai-gateway-core/embedded/gateway[.exe]
+#	3. 仓库根 dist/gateway[.exe]
+#
+# 若环境变量或 dist/ 下躺着一份**更早**的网关，build.rs 会优先内嵌它，
+# 而构建日志只有一行 `cargo:warning=已内嵌网关: <路径>`（极易忽略）。
+#
+# 故这里做**双端指纹比对**：
+#   · 构建后重新哈希 embedded/gateway.exe —— 必须与构建前一致
+#     （若中途被别的进程改过，说明有并发构建，产物不可信）
+#   · 再确认没有"更高优先级"的候选路径在截胡
+#
+# 这是"内嵌旧网关"在物理上无法交付的最后一道闸。
+Write-Host "==> 校验内嵌网关指纹" -ForegroundColor Cyan
+
+$gwHashAfter = (Get-FileHash -LiteralPath $embeddedGw -Algorithm SHA256).Hash
+if ($gwHashAfter -ne $gwHashBefore) {
+    throw @"
+内嵌网关在构建期间被改动，产物不可信。
+
+  构建前：$gwHashBefore
+  构建后：$gwHashAfter
+
+可能原因：有另一个构建/脚本正在并发写 $embeddedGw。
+请确认没有并发构建后重试。
+"@
+}
+Write-Host ("    embedded/gateway.exe 未被改动  [OK]") -ForegroundColor Green
+
+# 检查有没有"更高优先级"的候选在截胡 build.rs 的选择。
+#
+# 只报告**存在的**候选：build.rs 会按顺序取第一个 >1MB 的文件。
+# 若 dist/gateway.exe 存在且比 embedded 的旧，那它**不会**被选中
+#（embedded 在它前面），故只需在它比 embedded 新时才警告 ——
+# 那种情况下 build.rs 仍然选 embedded，所以其实无害，但值得提示。
+$routerBin = $env:AI_GATEWAY_ROUTER_BIN
+if ($routerBin -and (Test-Path -LiteralPath $routerBin)) {
+    $rh = (Get-FileHash -LiteralPath $routerBin -Algorithm SHA256).Hash
+    if ($rh -ne $gwHashBefore) {
+        throw @"
+检测到 AI_GATEWAY_ROUTER_BIN 指向**另一份**网关，它会覆盖 embedded/ 的选择。
+
+  AI_GATEWAY_ROUTER_BIN = $routerBin
+  它的 SHA256          = $rh
+  embedded 的 SHA256   = $gwHashBefore
+
+build.rs 的查找顺序里环境变量**优先于** embedded/，故本次包内嵌的是它，
+而不是你刚构建的那份。请 unset 该变量或让它指向同一份产物。
+"@
+    }
+    Write-Host "    AI_GATEWAY_ROUTER_BIN 与 embedded 一致  [OK]" -ForegroundColor Green
+}
+
+$distGw = Join-Path $root "dist/gateway.exe"
+if (Test-Path -LiteralPath $distGw) {
+    $dh = (Get-FileHash -LiteralPath $distGw -Algorithm SHA256).Hash
+    if ($dh -eq $gwHashBefore) {
+        Write-Host "    dist/gateway.exe 与 embedded 一致（无影响）" -ForegroundColor Green
+    } else {
+        # embedded 在查找顺序里**先于** dist/，故 build.rs 选的是 embedded。
+        # 这里只提示，不失败 —— 但要让用户知道 dist/ 里躺着一份不同的网关，
+        # 因为它是个容易被误认为"生效了"的陷阱。
+        Write-Host ("    提示：dist/gateway.exe 与本次内嵌的不同（SHA256 {0}…）。" -f $dh.Substring(0, 16)) -ForegroundColor Yellow
+        Write-Host ("          build.rs 的查找顺序里 embedded/ 优先，故本次内嵌的仍是 embedded 那份。" ) -ForegroundColor Yellow
+        Write-Host ("          若你期望的是 dist/ 那份，请设 AI_GATEWAY_ROUTER_BIN 指向它。" ) -ForegroundColor Yellow
+    }
+}
+
+# ── 3.5) 校验内嵌前端是**当次构建**的那份（2026-09-21）────────────────
+#
+# # 为什么需要它（真实事故）
+#
+# 所有者报告：
+#
+#	「zcode 这里还是老卡片啊 你是不是没打包？」
+#
+# 查证结果：**代码与安装包都是对的，但他装的是更早的那一版**。
+# 而我在排查时用了一个**不可靠的判据**（在 exe 里搜前端代码里的字符串），
+# 得出"新渲染没进包"的错误结论，白绕了一大圈 —— 因为 Tauri 对 JS
+# **内容**做了压缩，那些字符串在 exe 里根本搜不到
+#（连早就存在的老标识 `product-usage-bar` 也搜不到）。
+#
+# 可靠且简单的判据是**资源文件名**：
+#
+#	· `dist/index.html` 里写死了它引用哪个 `assets/index-XXXX.js`
+#	· 那个名字是 Vite 按**内容哈希**生成的 —— 内容变则名字变
+#	· 文件名在 exe 里是**明文**（Tauri 只压 JS 内容，不压文件名）
+#
+# 于是比对「exe 里出现的 index-*.js 名字」与「dist/index.html 引用的名字」
+# 就能确定内嵌的是不是当前前端 —— 一次字符串查找，无需启动 GUI。
+#
+# ⚠ 为什么这一步是必要的：`tauri-build` 的 build script 里
+# `rerun-if-changed` **不包含** `../dist`，故前端重建**不会**触发
+# 重新嵌入 —— cargo 可能沿用上一次编进二进制的旧前端。
+# 这与上面"内嵌旧网关"是**同型**缺陷，只是换成了前端。
+Write-Host "==> 校验内嵌前端指纹" -ForegroundColor Cyan
+
+$distIndex = Join-Path $root "dist/index.html"
+if (-not (Test-Path -LiteralPath $distIndex)) {
+    throw "找不到 $distIndex —— 前端没构建，无法校验内嵌资源"
+}
+
+$distHtml = Get-Content -LiteralPath $distIndex -Raw
+$assetMatch = [regex]::Match($distHtml, 'assets/index-[A-Za-z0-9_\-]+\.js')
+if (-not $assetMatch.Success) {
+    throw "无法从 $distIndex 解析出入口 JS 文件名（Vite 产物格式变了？）"
+}
+$wantAsset = $assetMatch.Value
+Write-Host "    dist 入口：$wantAsset"
+
+$appExe = Join-Path $root "target/release/ai-gateway.exe"
+if (-not (Test-Path -LiteralPath $appExe)) {
+    throw "找不到 $appExe —— 打包产物缺失，无法校验内嵌前端"
+}
+$appText = [System.Text.Encoding]::ASCII.GetString(
+    [System.IO.File]::ReadAllBytes($appExe))
+$embeddedAssets = @(
+    [regex]::Matches($appText, 'assets/index-[A-Za-z0-9_\-]+\.js') |
+        ForEach-Object { $_.Value } | Sort-Object -Unique
+)
+
+if ($embeddedAssets -notcontains $wantAsset) {
+    throw @"
+内嵌前端不是当次构建的那份，产物不可信。
+
+  dist 引用：$wantAsset
+  exe 内嵌 ：$($embeddedAssets -join ', ')
+
+可能原因：
+  · tauri-build 的 build script 没有重跑 —— 它的 rerun-if-changed 列表里
+    **没有** ../dist，故前端重建**不会**触发重新嵌入
+  · 有并发构建在写 target/release
+
+修法（按顺序试）：
+  1) cargo clean -p ai-gateway    然后重跑本脚本
+  2) 仍不行：删 target/release/ai-gateway.exe 再构建
+  3) 再不行：cargo clean 全量重建（慢，但一定干净）
+"@
+}
+Write-Host "    内嵌前端与 dist 一致：$wantAsset  [OK]" -ForegroundColor Green
 
 # ── 4) 校验产物与签名 ──────────────────────────────────────────────────
 Write-Host "==> 校验产物签名" -ForegroundColor Cyan

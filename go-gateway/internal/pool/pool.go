@@ -22,6 +22,7 @@
 package pool
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"math/rand/v2"
@@ -419,6 +420,37 @@ type Pool struct {
 	// 宿主没透传时不能因为"不知道"就把账号排掉 —— 那会让所有人不可用。
 	productModelSet map[string]map[string]bool
 
+	// productModelFallbackSet 网关**自己补的兜底清单**（同样小写归一）。
+	//
+	// # 与 productModelSet 的分工（2026-09-22，这是本轮修复的核心）
+	//
+	//	productModelSet          宿主给的清单 —— 来自上游**真实查询**，可信
+	//	productModelFallbackSet  网关补的清单 —— 来自内置静态表，是**猜测**
+	//
+	// 前者用于**两个**判断（"不排除"与"声明"），后者**只用于"不排除"**。
+	//
+	// # 为什么必须分开（所有者现场）
+	//
+	//	发 `GLM-5.3`        → 400 model_not_in_region
+	//	发 `Auto`           → 400 model_not_in_region
+	//	发 `Qwen3.8-Flash`  → **200 正常**
+	//
+	// 差别在**重叠**：`Qwen3.8-Flash` 只有 qoder 声明（路由唯一）；
+	// 而 `GLM-5.3` / `Auto` 同时被 workbuddy（内置静态表里有 `glm-5.3` /
+	// `auto`）与 qoder 声明。
+	//
+	// `pickForModelAny` 优先只在"明确声明"的产品里挑 ⇒ 两个产品都进
+	// `declared` ⇒ 一起竞争 ⇒ 池里 **19 个 WorkBuddy 账号 vs 1 个 qoder**
+	// ⇒ 大概率选到 WorkBuddy，而它其实**没有** `GLM-5.3`
+	//（静态表是网关的猜测，不是上游的真实能力）⇒ 11102。
+	//
+	// 修法：兜底清单不参与"声明"竞争，只保证"不排除"。
+	// 即"我不知道 WorkBuddy 提供什么，所以别排除它；但也别声称它提供"。
+	//
+	// ⚠ 旧注释曾写「多列几个不会让任何账号失去资格，所以宁可补全」——
+	// 那句话在引入 `declared` 优先逻辑之后就**失效了**，见上。
+	productModelFallbackSet map[string]map[string]bool
+
 	// costWeight 成本乘子的强度（0 = 成本不参与，1 = 满强度）。
 	//
 	// 设计意图（见 design.md §2.3）：成本是**小幅微调**，不是主导项。
@@ -604,6 +636,35 @@ func (p *Pool) SetProductModels(byProduct map[string][]string) {
 	p.mu.Unlock()
 }
 
+// SetProductModelsFallback 设置网关**自己补的**兜底清单（只影响"不排除"）。
+//
+// 见 `productModelFallbackSet` 字段的注释：它与 `SetProductModels` 的分工是
+//
+//	SetProductModels          宿主清单（可信）→ 参与"不排除"与"声明"
+//	SetProductModelsFallback  网关兜底（猜测）→ **只**参与"不排除"
+//
+// 入参形状与 `SetProductModels` 相同。传空 map 等于清空兜底。
+func (p *Pool) SetProductModelsFallback(byProduct map[string][]string) {
+	set := make(map[string]map[string]bool, len(byProduct))
+	for prod, models := range byProduct {
+		if prod == "" {
+			continue
+		}
+		m := make(map[string]bool, len(models))
+		for _, id := range models {
+			if id = strings.ToLower(strings.TrimSpace(id)); id != "" {
+				m[id] = true
+			}
+		}
+		if len(m) > 0 {
+			set[prod] = m
+		}
+	}
+	p.mu.Lock()
+	p.productModelFallbackSet = set
+	p.mu.Unlock()
+}
+
 // ProductOffersModel 报告某产品是否提供该模型。
 //
 // 返回 (是否提供, 是否有该产品的清单)。第二个返回值让调用方能区分
@@ -737,9 +798,70 @@ func (p *Pool) Acquire(uid string) bool {
 	}
 }
 
+// AcquireWait 是 `Acquire` 的**等待版**：名额满时短暂轮询等待，而不是立刻失败。
+//
+// # 为什么必须有它（2026-09-22，所有者报告的现场）
+//
+// 所有者用 DSH 客户端发 `qoder:Qwen3.8-Flash`，**每次都失败**：
+//
+//	503 {"code":"no_healthy_account",
+//	     "message":"上游服务异常（HTTP 503），已切换到其他账号"}
+//
+// 而**同样的请求用 curl 发就成功**。差别在于 DSH 的
+// `@earendil-works/pi-ai` 层带 `retryProviderRequest`（默认重试 5 次，
+// 见 `openai-completions.js:213`），而每个重试都是**独立的并发请求**。
+//
+// 实测确认的边界（本机 :7864）：
+//
+//	并发 3 → 3×200          （= max_in_flight）
+//	并发 4 → 3×200 + 1×503  ← 客户端 5 次重试必然撞上
+//	并发 5 → 3×200 + 2×503
+//
+// 把 `max_in_flight` 提到 100 后，并发 5/10/15/20 **全部 200**
+//（qoder 上游实测能扛 20 并发，网关的 3 是过度保守）。
+//
+// # 为什么"等待"比"直接失败"正确
+//
+// 在途名额是**瞬时**资源：一个请求几秒就结束并释放名额。
+// 名额暂时满 ≠ 账号不可用。旧行为把两者混为一谈 ——
+// 用户看到「所有账号不可用（冷却/禁用）」，而去查一个**完全健康**的账号
+//（实测该账号 `cooling=false`、`disabled=false`、`in_flight=0`）。
+//
+// ⚠ 等待有上限（`wait`），且尊重 `ctx` 取消 —— 不能因为等名额
+// 把请求无限挂住（客户端已放弃的请求不该继续占着 goroutine）。
+//
+// 返回 false 表示：等满了 `wait` 仍未拿到名额，**或** ctx 已取消。
+// 调用方应把它当作"这个号暂时用不了"，继续轮转下一个账号。
+func (p *Pool) AcquireWait(ctx context.Context, uid string, wait time.Duration) bool {
+	// 先试一次：绝大多数请求（未达上限）在这里就成功，不引入任何延迟
+	if p.Acquire(uid) {
+		return true
+	}
+
+	// 名额满：短暂轮询。间隔取 5ms —— 足够快地拿到刚释放的名额，
+	// 又不至于把 CPU 打满（等待上限通常 <2s，即最多几百次检查）。
+	//
+	// 为什么不用 sync.Cond / channel 唤醒：名额的释放方（`Release`）
+	// 在**请求结束**路径上，那里不该引入额外的同步开销与死锁风险。
+	// 轮询在这个量级（每账号几十个并发）完全够用，且实现简单到不会错。
+	const pollEvery = 5 * time.Millisecond
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		time.Sleep(pollEvery)
+		if p.Acquire(uid) {
+			return true
+		}
+	}
+	return false
+}
+
 // Release 释放一个在途名额。幂等减到 0 为止（防重复释放扣成负数）。
-func (p *Pool) Release(uid string) {
-	p.mu.RLock()
+func (p *Pool) Release(uid string) {	p.mu.RLock()
 	e, ok := p.byUID[uid]
 	p.mu.RUnlock()
 	if !ok {
@@ -1017,9 +1139,52 @@ func (p *Pool) PickForModelProductRegion(
 	p.mu.RUnlock()
 
 	if rot {
-		return p.pickRotationStrict(scoped, model)
+		if a := p.pickRotationStrict(scoped, model); a != nil {
+			return a
+		}
+	} else if a := p.pickStrict(scoped, model); a != nil {
+		return a
 	}
-	return p.pickStrict(scoped, model)
+
+	// 该产品一个健康账号都没有 —— **不直接返回 nil**（2026-09-22 修正）。
+	//
+	// # 所有者现场
+	//
+	//	客户端固定用 `qoder:Qwen3.8-Flash`，突然全部 503：
+	//	  {"code":"no_healthy_account","message":"all accounts unavailable (cooling/disabled)"}
+	//
+	// 查证：qoder 只有 **1 个**账号，它连续吃到 3 次上游 503
+	//（`applyErrorPolicy` 的 ErrServer 分支 → `NoteError` → 达阈值熔断），
+	// 于是被熔断 **30 分钟**。而产品前缀请求只能选该产品的账号，
+	// `pickStrict` 又刻意不兜底 ⇒ 选不出 ⇒ 整个产品**彻底不可用 30 分钟**。
+	//
+	// # 为什么这里必须兜底（而 pickStrict 的"不兜底"在别处是对的）
+	//
+	// `pickStrict` 不兜底是为了避免**跨区域/跨产品**的降级（那会让图片被
+	// 换成占位符、或拿错平台的凭证）。但本函数的排除集**已经锁死了产品**，
+	// 兜底只在**同一产品内部**选，不存在"降级到别的产品"的问题。
+	//
+	// 而熔断的语义是"这个号可能不好，**换个号**" —— 当该产品**只有一个号**时，
+	// 熔断就失去了意义：没有别的号可换，熔断只是把一次**上游瞬时故障**
+	//（5xx）放大成 30 分钟的**全量停服**。
+	//
+	// 取舍：宁可拿这个"可能不好"的号去试一次 ——
+	//
+	//	· 上游已恢复 ⇒ 请求成功（用户不必干等 30 分钟）
+	//	· 上游仍故障 ⇒ 用户看到**真实的上游错误**，而不是
+	//	  "所有账号不可用"这种把排查方向引向账号的错误提示
+	//
+	// 两种情况都不比现状差。且 `tried` 仍在排除集里，**一次请求内不会重复打同一个号**。
+	//
+	// ⚠ 只在"该产品**确实**一个健康号都没有"时兜底：只要有一个健康的，
+	// 上面的严格路径就返回了，本分支根本不会执行 —— 所以多账号产品的
+	// 熔断保护**完全不受影响**。
+	//
+	// ⚠ 复用 `pickEarliestExpiryLocked`（它已正确跳过 disabled / NoRoute /
+	// 硬冷却 / 模型冷却 / 在途占满），且 `scoped` 同时充当"只在本产品内选"
+	// 的排除集 —— 不必再写一份筛选，避免两条路径的判据分叉
+	//（本文件已有 `TestSelectionPathsAgreeOnNoRoute` 钉住那次教训）。
+	return p.pickEarliestExpiryLocked(scoped, time.Now(), model)
 }
 
 // pickForModelAny 原有行为：不做区域过滤。
@@ -1057,19 +1222,78 @@ func (p *Pool) pickForModelAny(model string, tried map[string]bool) *auth.Auth {
 	for uid := range tried {
 		scoped[uid] = true
 	}
+
+	// ⚠⚠ 两轮排除（2026-09-21 修复：裸名 Qwen3.8-Flash 被路由到 WorkBuddy）
+	//
+	// 第 1 轮：**明确声明不提供**该模型的产品 → 排除。
+	//   即"有清单、且清单里没有它"。这是确定的否定，永远可以排除。
+	//
+	// 第 2 轮：**没声明提供**的产品（清单未知，或清单里没有）
+	//   → **先记下，本轮不排除**。
+	//   若第 1 轮之后还有"明确声明提供"的候选，就只在它们里挑；
+	//   否则再放开用这些（见下面的 preferDeclared）。
+	//
+	// # 为什么不能像旧代码那样"未知 ⇒ 照常参与"
+	//
+	// 旧代码：`if !productMayServeLocked(...) { scoped[uid] = true }`，
+	// 而 `productMayServeLocked` 对"清单未知"返回 **true**（不排除）。
+	//
+	// 于是当 `product_models` **缺 workbuddy** 时（宿主那侧来自用户白名单，
+	// 默认为空 ⇒ 不写），WorkBuddy 账号**不被排除**，而它没有
+	// `Qwen3.8-Flash` ⇒ 请求在撞上第一个 WorkBuddy 账号时就回 11102，
+	// 压根轮不到真正有这个模型的 qoder 账号。
+	//
+	// 所有者的现场正是如此：
+	//
+	//	`Qwen3.8-Flash`        → 400 model_not_in_region
+	//	`qoder:Qwen3.8-Flash`  → 成功
+	//
+	// 关键区别：**"不知道" ≠ "能满足"**。未知只该让它在**没有更好选择时**
+	// 兜底，而不该让它与"明确声明提供"的产品**平等竞争** ——
+	// 后者才是这个模型真正该去的地方。
+	var declared, unknown []string
 	for uid, e := range p.byUID {
 		if e.a == nil {
 			continue
 		}
-		if !p.productMayServeLocked(e.a.ProductOf(), model) {
+		if p.productDeclaresModelLocked(e.a.ProductOf(), model) {
+			declared = append(declared, uid)
+		} else if !p.productMayServeLocked(e.a.ProductOf(), model) {
+			// 有清单且明确没有 → 确定排除
 			scoped[uid] = true
+		} else {
+			// 清单未知（或该产品不参与多产品约束）→ 兜底候选
+			unknown = append(unknown, uid)
 		}
 	}
 	p.mu.RUnlock()
-	if rot {
-		return p.pickRotation(scoped, model)
+
+	pick := func(t map[string]bool) *auth.Auth {
+		if rot {
+			return p.pickRotation(t, model)
+		}
+		return p.pick(t, model)
 	}
-	return p.pick(scoped, model)
+
+	// 优先只在"明确声明提供该模型"的产品里挑。
+	if len(declared) > 0 {
+		pref := make(map[string]bool, len(scoped))
+		for uid := range scoped {
+			pref[uid] = true
+		}
+		// 把兜底候选也排除掉，让选号只看声明过的产品。
+		for _, uid := range unknown {
+			pref[uid] = true
+		}
+		if acct := pick(pref); acct != nil {
+			return acct
+		}
+		// 声明过的产品里挑不到（都在冷却/在途占满）——**不能直接放弃**，
+		// 否则"声明了但暂时不可用"会让请求 503，而兜底候选明明能用。
+		// 故继续往下走，用完整候选集（含未知）再挑一次。
+	}
+
+	return pick(scoped)
 }
 
 // productMayServeLocked 是 productMayServe 的**持锁**版本。
@@ -1080,9 +1304,79 @@ func (p *Pool) productMayServeLocked(product, model string) bool {
 	if model == "" || !p.multiProductOn {
 		return true
 	}
+	key := strings.ToLower(strings.TrimSpace(model))
 	set, ok := p.productModelSet[product]
 	if !ok || len(set) == 0 {
-		return true // 不知道这个产品提供什么 → 不排除
+		// 宿主没有这个产品的可信清单。
+		//
+		// ⚠ 但网关可能补过兜底清单 —— 它在这里**有效**（本函数问的是
+		// "是否不排除"，兜底清单正是为此存在）。
+		if fb, ok2 := p.productModelFallbackSet[product]; ok2 && len(fb) > 0 {
+			return fb[key]
+		}
+		return true // 完全不知道这个产品提供什么 → 不排除
+	}
+	if set[key] {
+		return true
+	}
+	// 可信清单里没有，但兜底清单里有 ⇒ 仍然不排除。
+	//
+	// 为什么不直接 `return false`：宿主那份清单可能**不完整**
+	//（例如只列了用户白名单里的几个），而兜底清单是"网关已知的更多
+	// 可能性"。两者取并集才安全 —— 排除一个其实能服务的账号，
+	// 用户会看到"模型明明存在却报不可用"。
+	if fb, ok2 := p.productModelFallbackSet[product]; ok2 && fb[key] {
+		return true
+	}
+	return false
+}
+
+// productDeclaresModelLocked 报告该产品**明确声明**提供该模型。
+//
+// 与 productMayServeLocked 的区别（这个区别是本次修复的核心）：
+//
+//	productMayServeLocked       "是否**不排除**它" —— 清单未知时返回 true（宁可放行）
+//	productDeclaresModelLocked  "是否**明确列出**了它" —— 清单未知时返回 false
+//
+// # 为什么只看**宿主**清单，不看网关兜底清单（2026-09-22 修正）
+//
+// 兜底清单（`productModelFallbackSet`）来自网关的内置静态表，是**猜测**：
+// 它列的是"网关以为 WorkBuddy 支持的模型"，而不是上游的真实能力。
+//
+// 曾经把它也算作"声明"，结果是所有者现场：
+//
+//	发 `GLM-5.3` → 400 model_not_in_region（而 `Qwen3.8-Flash` 正常）
+//
+// 因为 `GLM-5.3` 同时被兜底清单（`glm-5.3`）与 qoder 的可信清单声明
+// ⇒ 两个产品都进 `declared` ⇒ 一起竞争 ⇒ 19 个 WorkBuddy 账号压倒
+// 1 个 qoder 账号 ⇒ 选到其实**没有**该模型的 WorkBuddy ⇒ 11102。
+//
+// 而 `Qwen3.8-Flash` 只有 qoder 声明（路由唯一）⇒ 正常。
+//
+// ⇒ **"声明"必须是可信的**。兜底清单只用于"不排除"。
+//
+// # 为什么要区分（2026-09-21 所有者报的现场）
+//
+//	发 `Qwen3.8-Flash`（裸名）→ 400 model_not_in_region
+//	发 `qoder:Qwen3.8-Flash`   → 成功
+//
+// 根因：`product_models` 里**只有 qoder / zcode，没有 workbuddy**
+//（宿主侧那份来自用户白名单，默认为空 ⇒ 不写 workbuddy）。
+// 于是"workbuddy 清单未知" ⇒ `productMayServeLocked` 返回 true ⇒
+// **不排除 WorkBuddy 账号**。而 WorkBuddy 没有 Qwen3.8-Flash ⇒ 上游回 11102，
+// 请求在**撞上第一个 WorkBuddy 账号**时就失败了，压根没轮到 qoder 账号。
+//
+// 关键洞察：**"不知道"不该等同于"能满足"**。
+// 旧逻辑把未知当作"可以服务"，于是当清单不全时，未列出的产品会**抢占**
+// 那些其实只有别的产品才有的模型。而按"声明"排序后，清单不全最坏只是
+// "没优先到"，绝不会让请求撞到一个明显不匹配的产品上。
+func (p *Pool) productDeclaresModelLocked(product, model string) bool {
+	if model == "" || !p.multiProductOn {
+		return false
+	}
+	set, ok := p.productModelSet[product]
+	if !ok || len(set) == 0 {
+		return false // 清单未知 → 不算"声明"
 	}
 	return set[strings.ToLower(strings.TrimSpace(model))]
 }

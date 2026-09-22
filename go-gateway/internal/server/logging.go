@@ -23,20 +23,86 @@ var chatLogEnabled = true
 
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
-	start  time.Time
-	model  string
-	mode   string // "stream" | "sync"
-	uid    string // 完整 uid，展示时只取前 8 位
-	ttfb   time.Duration
-	toks   int // <0 表示 usage 缺失 → 显示 "-"
-	status int
+	start time.Time
+	// model **客户端原始请求体里的**模型名（可能带 `国服:` / `zcode:` 这类路由前缀）。
+	//
+	// 用途仅限**日志**：把用户实际写的那个名字记下来，排查时能一眼看出
+	// "他写的是带前缀的形式"。
+	model string
+	// usageModel 用于 **Token 用量统计**的模型名：已剥掉路由前缀的**裸名**。
+	//
+	// # 为什么必须与 model 分开（2026-09-21 所有者报的缺陷）
+	//
+	// 所有者截图里同一份用量被拆成了三行：
+	//
+	//	deepseek-v4.1-flash · 国际版      732.9M
+	//	zcode:GLM-5.3-Flash               1.9K
+	//	国服:deepseek-v4.1-flash · 国服   12
+	//
+	// 第三行是**同一个模型**，只因用户写的是 `国服:deepseek-v4.1-flash`
+	// 就被统计成了另一个模型名 —— 用量被割裂，倍率也就无从按模型汇总。
+	//
+	// 根因：统计直接用了 `parseModelFromBody(body)`（原始体），
+	// 而前缀是给**网关的选号指令**，不属于模型标识（`resolveModel` 早就
+	// 把它剥掉了，只是那之后没回填到统计上）。
+	//
+	// 空 = 未回填（如产品路径未走到 resolveModel），此时 `usageName()`
+	// 回落到 model，行为与修复前一致。
+	usageModel string
+	mode       string // "stream" | "sync"
+	uid        string // 完整 uid，展示时只取前 8 位
+	ttfb       time.Duration
+	toks       int // <0 表示 usage 缺失 → 显示 "-"
+	status     int
 
 	// counters/hasCounters 为网关 Token 用量统计的采集结果（与日志字段解耦：
 	// 日志只关心 output，统计需要完整的输入/输出/缓存计量）。
 	counters    usage.Counters
 	hasCounters bool
 
+	// billing 本次请求的**计费归属**（平台/区域/倍率），供 /usage 按归属拆开。
+	//
+	// 为什么放在 chatStat 而不是在 recordUsage 里现查：归属要在**选号完成时**
+	// 才知道（选中的是哪个产品的哪个区域账号），而 recordUsage 是在流读完后
+	// 才调用的 —— 那时选号上下文已经出栈。故在选号处填一次、这里带着走。
+	billing usage.Billing
+
 	logged bool
+}
+
+// usageName 返回**统计用**的模型名：优先裸名，未回填时回落原始名。
+func (s *chatStat) usageName() string {
+	if s.usageModel != "" {
+		return s.usageModel
+	}
+	return s.model
+}
+
+// setModel 设置本次请求的模型名（原始写法），**同时**算好统计用的裸名。
+//
+// # 为什么要有这个方法而不是直接赋 `stat.model = req.Model`
+//
+// 三个协议入口都会在 `newChatStat` 之后用自己的解析结果覆盖 model
+//（messages / responses 从各自的结构体取 `req.Model`，而不是从 JSON 体）。
+// 直接赋值会让 `usageModel` 停在 `newChatStat` 时的值 —— 而那时若
+// 请求体结构与入口期望的不一致（如 Anthropic 体走 chat 入口），
+// `parseModelFromBody` 可能取不到 model，裸名就丢了。
+//
+// 收敛到一处赋值，保证 model 与 usageModel **永远同步更新**。
+func (s *chatStat) setModel(raw string) {
+	s.model = raw
+	usage := raw
+	if raw != "" && raw != "-" {
+		if _, _, bare := resolveModel(raw); bare != "" {
+			usage = bare
+		}
+	}
+	s.usageModel = usage
+}
+
+// setBilling 记录本次请求的计费归属（由选号处调用）。
+func (s *chatStat) setBilling(b usage.Billing) {
+	s.billing = b
 }
 
 // setCounters 记录一次可用的完整计量。
@@ -53,12 +119,33 @@ func (s *chatStat) setUsageMap(u map[string]any) {
 }
 
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
+//
+// # 为什么在这里就剥掉路由前缀（2026-09-21 修正）
+//
+// `model` 保留客户端原始写法（日志要如实显示"他写的是 `国服:xxx`"），
+// 而 `usageModel` 存**裸名**供 Token 用量统计。
+//
+// 为什么放在这里而不是各协议入口：三个入口（chat / messages / responses）
+// 都调本函数，在此处剥一次就全都有了。若在入口各写一次，将来新增协议
+// 必然漏 —— 而漏的表现是"用量又被拆成两个模型名"，从界面上看只是
+// 多了一行，很难联想到是统计口径问题。
 func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 	mode := "sync"
 	if stream {
 		mode = "stream"
 	}
-	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
+	raw := parseModelFromBody(body)
+	// `resolveModel` 返回 (product, realm, bare)。这里只取 bare：
+	// 前缀是给**选号**用的指令，不属于模型标识。
+	//
+	// ⚠ 不能对 `-`（解析失败的占位）调它：那不是模型名，剥了也没意义。
+	usage := raw
+	if raw != "" && raw != "-" {
+		if _, _, bare := resolveModel(raw); bare != "" {
+			usage = bare
+		}
+	}
+	return &chatStat{start: now, model: raw, usageModel: usage, mode: mode, toks: -1}
 }
 
 // done 幂等落一行表格日志。

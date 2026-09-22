@@ -15,7 +15,7 @@
 //! `~/.zcode/v2/credentials.json` 的 `oauth:bigmodel:user_info` 里，
 //! 只是被 `enc:v1:` 加密了：
 //!
-//!   {"id":"19331730795565300","username":"wish","displayName":"wish","avatarUrl":"..."}
+//!   {"id":"12345678901234567","username":"wish","displayName":"wish","avatarUrl":"..."}
 //!
 //! ## 解密方案（**逐字**从客户端 app.asar 提取，不是猜的）
 //!
@@ -73,29 +73,98 @@ const ENV_SECRET: &str = "ZCODE_CREDENTIAL_SECRET";
 pub struct ZcodeIdentity {
     /// 用户名（如 `wish`）。
     pub username: String,
-    /// 展示名（通常与 username 相同）。
+    /// 展示名（实测上游叫 `name`，如 `旅行者5800`）。
     pub display_name: String,
-    /// 账号 ID（数字串）。
+    /// 账号 ID（数字串或 UUID）。
     pub id: String,
     /// 头像 URL。
     pub avatar_url: String,
     /// 当前活跃服务商（`bigmodel` / `zai`）。
     pub active_provider: String,
+    /// 邮箱；**手机号登录时是 `{手机号}@phone.local`**。
+    ///
+    /// 见 `phone_from_email()` 与 `best_name()` 的说明。
+    pub email: String,
+    /// 手机号（从 `email` 解析得出；不是手机号登录时为空）。
+    ///
+    /// 在 `identity_from_doc` 解析时就填好，而不是每次现算 ——
+    /// 这样 `best_name()` 可以照旧返回 `&str`（既有调用点依赖该签名）。
+    pub phone: String,
 }
 
 impl ZcodeIdentity {
     /// 最适合给用户看的名字。
     ///
-    /// 优先级：displayName → username → id。
-    /// 全都空时返回空串（调用方据此回退到别的名字源）。
+    /// # 优先级（2026-09-21 按所有者要求调整）
+    ///
+    ///	1. `display_name`（上游字段 `name`，如 `旅行者5800`）
+    ///	2. `username`
+    ///	3. **手机号**（从 email 里提取）
+    ///	4. `id`
+    ///
+    /// 所有者原话：
+    ///
+    /// > 「我记得接口返回的有，名字跟手机号，**没名字就显示手机号**」
+    ///
+    /// ⚠ 手机号排在 `id` **之前**：`id` 是一串 UUID/长数字，对用户没有
+    /// 任何辨识意义；手机号至少是他自己的号。两者都没有时才回退到 id。
     pub fn best_name(&self) -> &str {
-        for s in [&self.display_name, &self.username, &self.id] {
+        for s in [&self.display_name, &self.username, &self.phone, &self.id] {
             if !s.trim().is_empty() {
                 return s.trim();
             }
         }
         ""
     }
+
+    /// 展示名（拥有所有权的版本），供需要 `String` 的调用方。
+    pub fn best_name_owned(&self) -> String {
+        self.best_name().to_string()
+    }
+}
+
+/// 从 `{手机号}@phone.local` 形态的 email 里提取手机号。
+///
+/// # 为什么要单独处理
+///
+/// 上游对**手机号登录**的账号构造一个假邮箱：
+///
+/// ```text
+/// 13900000000@phone.local
+/// ```
+///
+/// `phone.local` 是保留域名（不可解析），它不是真邮箱。直接显示
+/// 「13900000000@phone.local」对用户是噪音；而只显示号码才是他认得的。
+///
+/// # 判据
+///
+/// 域名是 `phone.local`，且 `@` 前是**纯数字**（长度 >= 6）。
+/// 任一不满足就返回空串 —— 那说明它是真邮箱（如 `a@b.com`），
+/// 此时**不该**把它当手机号显示。
+fn phone_from_email(email: &str) -> String {
+    let e = email.trim();
+    let Some((local, domain)) = e.split_once('@') else {
+        return String::new();
+    };
+    if !domain.eq_ignore_ascii_case("phone.local") {
+        return String::new();
+    }
+    let local = local.trim();
+    if local.len() < 6 || !local.chars().all(|c| c.is_ascii_digit()) {
+        return String::new();
+    }
+    local.to_string()
+}
+
+/// 按顺序取第一个非空字符串字段（上游不同服务商/版本键名不一致）。
+fn first_of(v: &Value, keys: &[&str]) -> String {
+    for k in keys {
+        let s = str_of(v, k);
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    String::new()
 }
 
 /// credentials.json 的位置。
@@ -194,8 +263,38 @@ pub fn decrypt_value(raw: &str, key: &[u8; 32]) -> Result<String, String> {
 pub fn identity_from_doc(doc: &Value, key: &[u8; 32]) -> Option<ZcodeIdentity> {
     let obj = doc.as_object()?;
 
-    // user_info 里有 username / displayName；键名按服务商变化，
+    // user_info 里有账号名与头像；键名按服务商变化，
     // 故按后缀匹配而不是写死 `oauth:bigmodel:user_info`。
+    //
+    // # ⚠⚠ 2026-09-21 修正：字段名此前**全读错了**
+    //
+    // 所有者原话：
+    //
+    // > 「而且 zcode 到现在都没获取到正确的名字，也要修复，我记得接口返回的
+    // >   有，名字跟手机号，没名字就显示手机号」
+    //
+    // 实测解密官方 `oauth:zai:user_info`（本机真实值）：
+    //
+    // ```json
+    // {"user_id":"…","email":"13900000000@phone.local",
+    //  "avatar":"https://chat.z.ai/user.png","name":"旅行者5800"}
+    // ```
+    //
+    // 而旧代码读的是 `username` / `displayName` / `id` / `avatarUrl` ——
+    // **四个字段名全部不存在** ⇒ 解析结果恒为空 ⇒ 界面上永远没有名字。
+    //
+    // 教训：这段代码是照着**参考实现的示例**写的（它的样例用
+    // `username`/`displayName`），而从没对着**真实的解密结果**核对过。
+    // 与 `CAPTURED-SPEC.md` 那条教训同源 —— 二手示例不能当规格。
+    //
+    // # 现在按**优先级**读多个候选名
+    //
+    // 上游不同服务商/版本的键名不一致，故每个字段都给出候选：
+    //
+    //	名字   name → username → displayName → nickName
+    //	标识   user_id → id → sub
+    //	头像   avatar → avatarUrl
+    //	邮箱   email（手机号登录时形如 `{手机号}@phone.local`）
     let mut ident = ZcodeIdentity::default();
     for (k, v) in obj {
         if !k.ends_with(":user_info") {
@@ -204,10 +303,19 @@ pub fn identity_from_doc(doc: &Value, key: &[u8; 32]) -> Option<ZcodeIdentity> {
         let Some(raw) = v.as_str() else { continue };
         let Ok(plain) = decrypt_value(raw, key) else { continue };
         let Ok(info) = serde_json::from_str::<Value>(&plain) else { continue };
-        ident.username = str_of(&info, "username");
-        ident.display_name = str_of(&info, "displayName");
-        ident.id = str_of(&info, "id");
-        ident.avatar_url = str_of(&info, "avatarUrl");
+        // 名字：实测是 `name`（参考实现的 `username`/`displayName` 不存在，
+        // 但保留为候选 —— 别的服务商可能用它们）。
+        ident.display_name = first_of(&info, &["name", "displayName", "nickName", "username"]);
+        ident.username = first_of(&info, &["username", "name", "nickName"]);
+        // 账号标识：实测是 `user_id`。
+        ident.id = first_of(&info, &["user_id", "id", "sub"]);
+        // 头像：实测是 `avatar`。
+        ident.avatar_url = first_of(&info, &["avatar", "avatarUrl"]);
+        // 邮箱/手机号 —— 手机号登录时上游把它塞在 email 里，
+        // 形如 `13900000000@phone.local`（见下面 phone_from_email 的说明）。
+        ident.email = first_of(&info, &["email", "phoneNumber", "phone"]);
+        // 手机号在**解析时**就提取好，这样 best_name() 能照旧返回 &str。
+        ident.phone = phone_from_email(&ident.email);
         break;
     }
 
@@ -328,12 +436,17 @@ mod tests {
     }
 
     // 真实形状（本机实测值手工脱敏后）→ 能解析出名字。
+    //
+    // ⚠ 本用例用的是**参考实现示例**里的字段名（`username`/`displayName`），
+    // 而**不是**上游真实返回的名字 —— 这正是那个 bug 藏了这么久的原因：
+    // 测试与实现读了同一份错误的示例，于是"测试通过"掩盖了"线上没名字"。
+    // 真实形状见下面 `parses_upstream_real_field_names`。
     #[test]
     fn parses_real_credentials_shape() {
         let secret = "fixture-secret";
         let key = derive_key(secret);
         let info = json!({
-            "id": "19331730795565300",
+            "id": "12345678901234567",
             "username": "wish",
             "displayName": "wish",
             "avatarUrl": "https://example.invalid/a.png",
@@ -349,9 +462,130 @@ mod tests {
         let ident = identity_from_doc(&doc, &key).expect("应解析出身份");
         assert_eq!(ident.username, "wish");
         assert_eq!(ident.display_name, "wish");
-        assert_eq!(ident.id, "19331730795565300");
+        assert_eq!(ident.id, "12345678901234567");
         assert_eq!(ident.active_provider, "bigmodel");
         assert_eq!(ident.best_name(), "wish");
+    }
+
+    /// ★ 上游**真实**字段名：`name` / `user_id` / `avatar` / `email`。
+    ///
+    /// # 为什么必须有这条（2026-09-21 所有者报的缺陷）
+    ///
+    /// 所有者原话：
+    ///
+    /// > 「而且 zcode 到现在都没获取到正确的名字，也要修复，我记得接口返回的
+    /// >   有，名字跟手机号，没名字就显示手机号」
+    ///
+    /// 实测解密官方 `oauth:zai:user_info`（本机真实值，此处已脱敏）：
+    ///
+    /// ```json
+    /// {"user_id":"{uuid}","email":"{手机号}@phone.local",
+    ///  "avatar":"https://chat.z.ai/user.png","name":"旅行者5800"}
+    /// ```
+    ///
+    /// 而旧实现读的是 `username` / `displayName` / `id` / `avatarUrl` ——
+    /// **四个字段名全部不存在** ⇒ 恒为空 ⇒ 界面上永远没有名字。
+    ///
+    /// 夹具**逐字**照真实形状写，故意**不含** `username`/`displayName`：
+    /// 若实现又退回只读那两个字段，这条会红。
+    #[test]
+    fn parses_upstream_real_field_names() {
+        let secret = "fixture-secret";
+        let key = derive_key(secret);
+        let info = json!({
+            "user_id": "00000000-0000-4000-8000-000000000001",
+            "email": "13900000000@phone.local",
+            "avatar": "https://chat.z.ai/user.png",
+            "name": "旅行者5800"
+        });
+        let doc = json!({
+            "oauth:zai:user_info": client_encrypt(&info.to_string(), secret),
+            "oauth:active_provider": client_encrypt("zai", secret),
+        });
+
+        let ident = identity_from_doc(&doc, &key).expect("应解析出身份");
+        assert_eq!(ident.display_name, "旅行者5800", "名字在 `name` 字段里");
+        assert_eq!(
+            ident.id, "00000000-0000-4000-8000-000000000001",
+            "账号标识在 `user_id` 字段里"
+        );
+        assert_eq!(ident.avatar_url, "https://chat.z.ai/user.png", "头像在 `avatar` 里");
+        assert_eq!(ident.email, "13900000000@phone.local");
+        assert_eq!(ident.phone, "13900000000", "手机号应从 email 里提取出来");
+        assert_eq!(ident.best_name(), "旅行者5800", "有名字就用名字");
+    }
+
+    /// 没有名字时**回退到手机号**（所有者明确要求）。
+    ///
+    /// 所有者原话：
+    ///
+    /// > 「我记得接口返回的有，名字跟手机号，**没名字就显示手机号**」
+    #[test]
+    fn falls_back_to_phone_when_no_name() {
+        let secret = "fixture-secret";
+        let key = derive_key(secret);
+        // 刻意只有 email、没有 name
+        let info = json!({
+            "user_id": "00000000-0000-4000-8000-000000000002",
+            "email": "13900000000@phone.local",
+            "avatar": "https://chat.z.ai/user.png"
+        });
+        let doc = json!({
+            "oauth:zai:user_info": client_encrypt(&info.to_string(), secret),
+        });
+
+        let ident = identity_from_doc(&doc, &key).expect("有手机号也算解析成功");
+        assert_eq!(ident.best_name(), "13900000000", "没名字就该显示手机号");
+    }
+
+    /// 手机号**优先于 id**（id 对用户没有辨识意义）。
+    #[test]
+    fn phone_preferred_over_id() {
+        let mut ident = ZcodeIdentity {
+            id: "00000000-0000-4000-8000-000000000003".into(),
+            phone: "13900000000".into(),
+            email: "13900000000@phone.local".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            ident.best_name(),
+            "13900000000",
+            "手机号应优先于 id —— id 是一串 UUID，用户认不出来"
+        );
+        // 连手机号都没有时才回退 id
+        ident.phone.clear();
+        ident.email.clear();
+        assert_eq!(ident.best_name(), "00000000-0000-4000-8000-000000000003");
+    }
+
+    /// `phone_from_email` 只认 `{纯数字}@phone.local`，真邮箱一律返回空。
+    ///
+    /// # 为什么要严格
+    ///
+    /// 把 `someone@example.com` 当手机号显示是**编造数据** ——
+    /// 用户会以为那是自己的号码。故域名与内容都要校验。
+    #[test]
+    fn phone_from_email_is_strict() {
+        // 认
+        assert_eq!(phone_from_email("13900000000@phone.local"), "13900000000");
+        assert_eq!(phone_from_email("13900000000@PHONE.LOCAL"), "13900000000", "域名大小写不敏感");
+        assert_eq!(phone_from_email(" 13900000000@phone.local "), "13900000000", "两侧空白应忽略");
+        // 不认（真邮箱 / 形态不对）
+        for bad in [
+            "someone@example.com",
+            "13900000000@example.com",
+            "abc@phone.local",       // 非纯数字
+            "12345@phone.local",     // 太短（<6）
+            "13900000000",           // 没有 @
+            "@phone.local",          // 本地部分为空
+            "",
+        ] {
+            assert_eq!(
+                phone_from_email(bad),
+                "",
+                "不该把 {bad:?} 当成手机号（那是编造数据）"
+            );
+        }
     }
 
     // 只有 username、没有 displayName 时也要能给出名字

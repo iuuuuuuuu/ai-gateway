@@ -19,7 +19,38 @@ function DropdownMenuContent({ className, sideOffset = 6, ...props }: React.Comp
         data-slot="dropdown-menu-content"
         sideOffset={sideOffset}
         className={cn(
-          "z-50 min-w-36 overflow-hidden rounded-lg border bg-popover p-1.5 text-popover-foreground shadow-[0_10px_30px_rgba(15,23,42,.12)]",
+          "z-50 min-w-36 rounded-lg border bg-popover p-1.5 text-popover-foreground shadow-[0_10px_30px_rgba(15,23,42,.12)]",
+          // ⚠⚠ 高度自适应 + 可滚动（2026-09-22 修）。
+          //
+          // # 所有者现场
+          //
+          //	「workbuddy账号点击菜单后超出屏幕,无法向下滚动」
+          //
+          // # 根因：这里原本是 `overflow-hidden`
+          //
+          // `overflow-hidden` 的语义是**裁掉**溢出内容，而不是让人滚。
+          // 账号菜单本轮新增了「全部成长任务」分组（动态拉取，实测 19 项），
+          // 菜单长到 20+ 项、高过一屏 —— 于是超出部分**既看不到也滚不到**。
+          //
+          // # 为什么 Radix 的碰撞检测没兜住
+          //
+          // Radix 会把菜单**挪**进视口（翻转/位移），但它只保证
+          // "菜单框在视口内"，**不负责让内容可滚动**。
+          // 内容高于视口时，超出部分就是不可达的。
+          //
+          // # 正确做法：用 Radix 提供的 CSS 变量
+          //
+          // Radix 在 Content 上挂 `--radix-dropdown-menu-content-available-height`
+          // （视口内实际可用高度，已扣掉碰撞边距）。用它当 max-height
+          // 比写死 `70vh` 精确：菜单靠近屏幕底边时会自动变矮，
+          // 而不是先撑到 70vh 再被裁。
+          //
+          // ⚠ `overflow-y-auto`（而非 `overflow-auto`）：只让纵向滚，
+          // 横向保持不滚（菜单项都是 truncate 的，不需要横向滚动）。
+          //
+          // ⚠ 这修的是**全站所有下拉菜单**（本文件是共用组件）——
+          // 那个缺陷本来就不只影响账号卡片，只是账号菜单最长、最先撞上。
+          "max-h-[var(--radix-dropdown-menu-content-available-height)] overflow-y-auto overflow-x-hidden",
           "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95",
           "data-[side=bottom]:slide-in-from-top-1 data-[side=left]:slide-in-from-right-1 data-[side=right]:slide-in-from-left-1 data-[side=top]:slide-in-from-bottom-1",
           className,

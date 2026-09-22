@@ -31,6 +31,7 @@ import (
 	"strings"
 	"time"
 
+	"workbuddy2api/internal/qoder"
 	"workbuddy2api/internal/zcode"
 )
 
@@ -42,19 +43,57 @@ const productTaskTimeout = 3 * time.Minute
 
 // newProductTasksRunner 构造**手动触发**执行体（界面上的「立即领取」）。
 //
-// 返回 nil 表示"当前构建没有 ZCode"（此时排程与手动入口都跳过，不报错）。
+// 返回 nil 表示"当前构建两个产品都没有"（此时排程与手动入口都跳过，不报错）。
 //
-// ⚠ 手动路径与自动路径**共用同一套领取逻辑**（`zcode.ClaimScheduler`），
-// 只是绕过它的 hold 闸门并加一个总超时 —— 两条路径各写一份领取实现
-// 必然出现"手动能领、自动领不到"这类分歧。
-func newProductTasksRunner(zc *zcode.Dispatch, sched *zcode.ClaimScheduler) func() (string, error) {
-	if zc == nil {
+// ⚠ 手动路径与自动路径**共用同一套领取逻辑**（`zcode.ClaimScheduler` /
+// `qoder.ClaimAllCampaigns`），只是绕过 hold 闸门并加一个总超时 ——
+// 两条路径各写一份领取实现必然出现"手动能领、自动领不到"这类分歧。
+//
+// # ⚠ 2026-09-22 修正：此前只跑 ZCode，**漏了 Qoder**
+//
+// 所有者要求「qoder改为 早十点,晚九点 两次触发,防止错漏」。
+// 而那个时点触发走的就是本执行体，它当时只调 `runZcodeClaimsNow` ——
+// 结果是**Qoder 的活动在排程路径上根本不会被领**（手动按钮能领，
+// 因为那条路走宿主侧的 `claim_all_campaigns`）。
+//
+// 现在两个产品都跑：先 Qoder 再 ZCode，**串行**且各自独立计结果 ——
+// 一个产品失败不影响另一个（Qoder 挂了不该让 ZCode 也停）。
+func newProductTasksRunner(
+	zd *zcode.Dispatch,
+	sched *zcode.ClaimScheduler,
+	qoderAuthDir string,
+	qoderEnabled bool,
+) func() (string, error) {
+	if zd == nil && !qoderEnabled {
 		return nil
 	}
 	return func() (string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), productTaskTimeout)
 		defer cancel()
-		return runZcodeClaimsNow(ctx, zc, sched)
+
+		var parts []string
+		// ---- Qoder（先跑：它的活动每天 10:00 重置，越早领越不易过期）----
+		if qoderEnabled && strings.TrimSpace(qoderAuthDir) != "" {
+			if out, err := qoder.ClaimAllCampaigns(ctx, qoderAuthDir); err != nil {
+				// ⚠ 不 return：Qoder 失败不该阻断 ZCode（两个产品互相独立）
+				parts = append(parts, fmt.Sprintf("Qoder 领取失败：%v", err))
+			} else {
+				parts = append(parts, fmt.Sprintf(
+					"Qoder 领取 %v 项（失败 %v）",
+					out["claimedCount"], out["failedCount"],
+				))
+			}
+		}
+		// ---- ZCode ----
+		if zd != nil {
+			detail, err := runZcodeClaimsNow(ctx, zd, sched)
+			if err != nil {
+				parts = append(parts, fmt.Sprintf("ZCode 领取失败：%v", err))
+			} else if detail != "" {
+				parts = append(parts, detail)
+			}
+		}
+		return strings.Join(parts, "；"), nil
 	}
 }
 

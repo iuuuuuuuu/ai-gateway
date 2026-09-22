@@ -175,6 +175,15 @@ func main() {
 	if cfg.Pool.ZcodeCaptchaDir != "" {
 		cs := zcode.SharedCaptchaSolver()
 		cs.SetDir(cfg.Pool.ZcodeCaptchaDir)
+		// 外部求解（宿主 WebView2）优先：真实浏览器环境，比模拟环境更快更稳。
+		//
+		// 见 ZcodeCaptchaSolverURL 的注释（含实测数据：929ms 拿到 param）。
+		// 这里只做"有就配上"：没有配置时行为与改动前逐字相同（纯本地 Node）。
+		if cfg.Pool.ZcodeCaptchaSolverURL != "" {
+			cs.SetExternalSolver(cfg.Pool.ZcodeCaptchaSolverURL, cfg.Pool.ZcodeCaptchaSolverToken)
+			log.Printf("ZCode 验证码求解：**外部服务优先**（宿主 WebView2）%s，本地求解作为回退",
+				cfg.Pool.ZcodeCaptchaSolverURL)
+		}
 		if reason := cs.UnavailableReason(); reason != "" {
 			// 组件不全 → **如实报**，而不是静默失效
 			//（那会让用户看到 3007 却不知道为什么）
@@ -182,6 +191,12 @@ func main() {
 		} else {
 			log.Printf("ZCode 验证码求解已启用：%s", cfg.Pool.ZcodeCaptchaDir)
 		}
+	} else if cfg.Pool.ZcodeCaptchaSolverURL != "" {
+		// 只有外部求解（没释放本地求解器）—— 这也是合法配置。
+		cs := zcode.SharedCaptchaSolver()
+		cs.SetExternalSolver(cfg.Pool.ZcodeCaptchaSolverURL, cfg.Pool.ZcodeCaptchaSolverToken)
+		log.Printf("ZCode 验证码求解：仅外部服务（宿主 WebView2）%s",
+			cfg.Pool.ZcodeCaptchaSolverURL)
 	} else {
 		// 目录为空 = 求解器没释放出来。这是**发行包缺陷**，必须显眼。
 		log.Printf("⚠ ZCode 验证码求解器未配置（zcode_captcha_dir 为空）：" +
@@ -340,6 +355,13 @@ func main() {
 		NightOwlDisabled:    !cfg.Schedule.NightOwlEnabled,
 		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
 		TrialDisabled:       !cfg.Schedule.TrialEnabled,
+		// Qoder 权益领取时点与开关（2026-09-22 新增）。
+		//
+		// ⚠ 用 `cfg.QoderClaimOn()` 而不是某个具体字段：它封装了
+		// 「分产品键优先、缺席回落到总闸」的两级语义（见该方法说明）。
+		// 这里直接读 `QoderClaimEnabled` 会把老配置（只有总闸）当成关闭。
+		QoderClaimHours:    cfg.Schedule.QoderClaimHours,
+		QoderClaimDisabled: !cfg.QoderClaimOn(),
 		ActivityReportCount:  cfg.Schedule.ActivityReportCount,
 		CheckinScope:         cfg.Schedule.CheckinScope,
 		Records:              recorder,
@@ -505,15 +527,31 @@ func main() {
 			zd.LoadCreds,
 			// enabled 读配置（支持运行时改，不必重启）。
 			//
-			// ⚠ 配置字段是 `ProductTasksEnabled`（**启用**语义），
-			// 直接取反即可。我第一版手滑写成 `ProductTasksDisabled` ——
-			// 那个字段根本不存在（config.Schedule 里没有它）。
-			func() bool { return cfg.Schedule.ProductTasksEnabled },
+			// ⚠ 2026-09-22 改为**分产品开关**：
+			// 此前读的是总闸 `ProductTasksEnabled`，而 Qoder 与 ZCode
+			// 的用户诉求完全不同（一个要"每天领额度"，一个要"抢限量套餐"），
+			// 合成一个开关会让用户想关 A 却把 B 也关了。
+			//
+			// 所有者原话：「权益自动领取 qoder zcode 拆分开,不要合成一个」。
+			//
+			// `ZcodeClaimOn()` 内部处理了回落：分产品键缺席时跟总闸走，
+			// 故老配置行为不变（见该方法的说明）。
+			func() bool { return cfg.ZcodeClaimOn() },
 		)
 		// 手动「立即领取」与自动路径**共用同一套领取逻辑**（见 ClaimOnce）。
-		sch.SetProductTasksRunner(newProductTasksRunner(zd, claimSched))
-		log.Printf("ZCode 自动领取：启动即跑，之后每 %v 轮询（失败冷却 %v）",
-			zcode.ClaimPollInterval, zcode.ClaimCooldown)
+		//
+		// ⚠ 必须把 Qoder 的凭证目录与开关一并传进去（2026-09-22 修正）：
+		// 此前只传 ZCode，导致**排程路径永远不领 Qoder 的活动** ——
+		// 而所有者明确要求「qoder改为 早十点,晚九点 两次触发」。
+		sch.SetProductTasksRunner(newProductTasksRunner(
+			zd, claimSched,
+			qoderDir,          // Qoder 凭证目录（领取要遍历账号）
+			cfg.QoderClaimOn(), // 分产品开关（缺席回落总闸）
+		))
+		log.Printf("ZCode 自动领取：启动即跑，之后每 %v 轮询（失败冷却 %v，开关=%v）",
+			zcode.ClaimPollInterval, zcode.ClaimCooldown, cfg.ZcodeClaimOn())
+		log.Printf("Qoder 权益领取：时点 %v（开关=%v，超时 %v 补一轮轮询）",
+			cfg.Schedule.QoderClaimHours, cfg.QoderClaimOn(), cfg.Schedule.QoderClaimIntervalMinutes)
 
 		// 成本维度：让各产品按"单位额度消耗率"参与加权（见 design.md §2.3）。
 		p.SetMultiProduct(true, 0.3)
@@ -529,7 +567,56 @@ func main() {
 		//
 		// ⚠ 传空值时 SetProductModels 会清成"不约束"（回到既有行为），
 		// 不会误排除所有账号。
-		p.SetProductModels(cfg.Pool.ProductModels)
+		//
+		// ⚠⚠ 2026-09-21：宿主那份清单**可能缺 workbuddy**（它来自用户的
+		// 「限制使用的模型」白名单，默认为空 ⇒ 不写那一项），而缺了会让
+		// 裸名请求被路由到 WorkBuddy 账号 —— 见 pool.pickForModelAny 的注释
+		//（所有者现场：`Qwen3.8-Flash` 报 11102，加 `qoder:` 前缀才好）。
+		//
+		// 故这里**补一份网关自己已知的 WorkBuddy 模型名**作为兜底：
+		// 来源是网关**实际下发**给客户端的静态表（server.StaticWorkBuddyModelIDs），
+		// 与 `/v1/models` 同源，不会两边分叉。
+		//
+		// ===================================================================
+		// ⚠⚠⚠ 2026-09-22 修正：这份**兜底清单不能参与"声明"竞争**
+		// ===================================================================
+		//
+		// 原注释写着「它是"声明"用的，不是"否定"用的 —— 多列几个不会让
+		// 任何账号失去资格，所以宁可补全」。**那句话在引入 `declared`
+		// 优先逻辑之后就失效了。**
+		//
+		// 所有者现场（2026-09-22）：
+		//
+		//	发 `GLM-5.3`   → 400 model_not_in_region
+		//	发 `Auto`      → 400 model_not_in_region
+		//	发 `Qwen3.8-Flash` → **200 正常**
+		//
+		// 差别在**重叠**：`Qwen3.8-Flash` 只有 qoder 声明（路由唯一），
+		// 而 `GLM-5.3` / `Auto` 同时被 workbuddy（这份兜底）与 qoder 声明。
+		//
+		// `pickForModelAny` 的做法是"优先只在**明确声明**的产品里挑"，
+		// 于是两个产品都进 `declared` → 一起参与竞争 → 池里
+		// **19 个 WorkBuddy 账号 vs 1 个 qoder 账号** ⇒ 大概率选到
+		// WorkBuddy，而它其实**没有** `GLM-5.3`（静态表是网关的**猜测**，
+		// 不是上游的真实能力清单）⇒ 上游回 11102。
+		//
+		// ⇒ 修法：兜底清单**只用于"不排除"**（`productMayServe`），
+		// 不用于"声明"（`productDeclaresModel`）。即"我不知道 WorkBuddy
+		// 提供什么，所以别排除它；但也别声称它提供"。
+		//
+		// 实现见 `Pool.SetProductModelsFallback` —— 清单分成两份：
+		//
+		//	productModelSet          宿主给的**可信**清单（来自上游真实查询）
+		//	productModelFallbackSet  网关补的**猜测**清单（只影响"不排除"）
+		pm := cfg.Pool.ProductModels
+		fallback := map[string][]string{}
+		if len(pm["workbuddy"]) == 0 {
+			fallback["workbuddy"] = server.StaticWorkBuddyModelIDs()
+			log.Printf("product_models 缺 workbuddy：已补 %d 个模型作为**兜底**（只用于「不排除」，不参与「声明」竞争）",
+				len(fallback["workbuddy"]))
+		}
+		p.SetProductModelsFallback(fallback)
+		p.SetProductModels(pm)
 	} else {
 		log.Printf("多产品路由已关闭（pool.multi_product=false）：只使用 WorkBuddy 账号")
 	}
@@ -554,6 +641,12 @@ func main() {
 		// —— 表现为「代码写了、测试也过了，但运行时根本调不到」。
 		// 实测验证方式：`strings gateway.exe | findstr growth/tasks` 应有命中。
 		GrowthTasks: newGrowthTaskAPI(p, up, recorder),
+		// 短信登录成功后登记账号（2026-09-22 新增）。
+		//
+		// ⚠ 必须在这里接线，否则 `/login/sms/verify` 会明确报
+		// 「cannot register accounts」—— 表现为"验证码发得出、输入也对，
+		// 但登录就是失败"，而错误信息只在服务端日志里。
+		SMSLogin: newSMSLoginFunc(p, cfg.AuthDir),
 		// 「限制使用的模型」白名单：三个工作模式都生效，空 = 不限制（默认）。
 		//
 		// 直接把已解析的切片传下去（不再按 rotation 过滤）：限制模型与「用哪些
@@ -599,6 +692,37 @@ func main() {
 		log.Printf("积分到期巡检已禁用（pool.credit_refresh_enabled=false）：到期分层仅依赖签到与宿主同步")
 	}
 
+	// ── 配置与多产品凭证的热重载（2026-09-21 所有者报的缺陷）──────────
+	//
+	// # 缺陷现象
+	//
+	// 所有者原话：
+	//
+	//	「兼容网关启动之后，我再添加的 zcode 和 qoder 账号，模型清单路由
+	//	  也没有显示 qoder 和 zcode 支持的账号，应该要自动重启或者热重载的」
+	//	「而且 /v1/models 接口，也没有返回 qoder 和 zcode 支持的模型，这也是个 bug」
+	//
+	// # 根因链（逐层可核）
+	//
+	//	① 宿主在**新增/刷新账号**后会重写 `gateway_native_config.json`
+	//	   （Rust 侧 `resync_native_config`），把 `pool.product_models`
+	//	   更新为最新清单、并把新账号写进 qoder/zcode 的 auths 目录；
+	//	② 但 Go 网关只在 main 开头 `Load(*cfgPath)` **读一次**，
+	//	   多产品凭证目录也只在启动时扫一次；
+	//	③ ⇒ 运行中的网关永远看不到新账号与它们的模型清单。
+	//
+	// 用户的期望是"加了账号就该能用"，而实际要手动重启整个应用
+	//（重启还会掐断正在进行的对话）。
+	//
+	// # 为什么用轮询而不是 fsnotify
+	//
+	// 与 `pool.WatchAuthDir` 同一理由（见 internal/pool/watch.go 的包注释）：
+	// 零新依赖，且在网络盘/容器里不丢事件。配置变更是**低频**事件
+	//（用户点一次"刷新账号"），5 秒的延迟完全可以接受。
+	if *cfgPath != "" {
+		startConfigWatch(ctx, *cfgPath, h, p, cfg, qoderDispatch, zcodeDispatch)
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           h,
@@ -618,6 +742,212 @@ func main() {
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")
+}
+
+// configWatchInterval 配置文件的轮询周期。
+//
+// 5 秒与 `pool.WatchAuthDir` 的默认值一致：配置变更是低频事件
+//（用户点一次"刷新账号"），5 秒延迟无感；而更密只会带来无谓的 IO。
+const configWatchInterval = 5 * time.Second
+
+// startConfigWatch 轮询配置文件与多产品凭证目录，变化时热重载。
+//
+// # 为什么两件事放在同一个循环里
+//
+// 它们的触发源是**同一个用户动作**（"刷新账号"/"新增账号"）：
+// 宿主会同时（a）重写配置里的 `product_models`、（b）往 qoder/zcode
+// 的 auths 目录写新凭证。分成两个循环只会让"清单更新了但账号还没进池"
+// 这个中间态持续更久 —— 那正是用户看到的"模型列表里有但选了说账号不可用"。
+//
+// # 为什么凭证热加载要单独做（不能复用 pool.WatchAuthDir）
+//
+// `pool.WatchAuthDir` 只监听 **WorkBuddy 的 auth_dir**，且其剔除逻辑
+// 显式放过非 WorkBuddy 账号（见 pool.keepWorkBuddyOnly）。多产品的
+// qoder/zcode 凭证目录**从来没被监听** —— 这是本次要补的缺口。
+func startConfigWatch(
+	ctx context.Context,
+	cfgPath string,
+	h *server.Handler,
+	p *pool.Pool,
+	bootCfg *Config,
+	qoderDispatch, zcodeDispatch server.ProductUpstream,
+) {
+	// 基线：当前文件 mtime 与大小，以及各产品已加载的凭证指纹。
+	lastCfg := fileStamp(cfgPath)
+	lastCreds := map[string]string{
+		"qoder": dirStamp(resolveAuthDir(bootCfg.Pool.QoderAuthDir, qoder.DefaultAuthDir, qoderDispatch != nil)),
+		"zcode": dirStamp(resolveAuthDir(bootCfg.Pool.ZcodeAuthDir, zcode.DefaultAuthDir, zcodeDispatch != nil)),
+	}
+
+	go func() {
+		ticker := time.NewTicker(configWatchInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+
+			// ---- ① 配置热重载（product_models 等数据类字段）----
+			if stamp := fileStamp(cfgPath); stamp != lastCfg {
+				next, err := Load(cfgPath)
+				if err != nil {
+					// 解析失败**不覆盖**现有配置：宿主可能正写到一半
+					//（非原子写）。保持旧配置比装载一份残缺的好。
+					log.Printf("配置已变化但解析失败（保留当前配置，稍后重试）：%v", err)
+				} else {
+					h.ReloadDynamic(&server.DynamicConfig{
+						ProductModels: next.Pool.ProductModels,
+						PromptMode:    next.Prompt.Mode,
+						PromptText:    next.PromptText,
+					})
+					lastCfg = stamp
+					if n := len(next.Pool.ProductModels); n > 0 {
+						log.Printf("配置热重载：模型清单已更新（%d 个产品）", n)
+					} else {
+						log.Printf("配置热重载：模型清单已更新（空）")
+					}
+				}
+			}
+
+			// ---- ② 多产品凭证热加载 ----
+			for _, spec := range []struct {
+				product string
+				dir     string
+				load    func() (int, error)
+			}{
+				{"qoder", resolveAuthDir(bootCfg.Pool.QoderAuthDir, qoder.DefaultAuthDir, qoderDispatch != nil),
+					func() (int, error) { return reloadQoder(p, bootCfg) }},
+				{"zcode", resolveAuthDir(bootCfg.Pool.ZcodeAuthDir, zcode.DefaultAuthDir, zcodeDispatch != nil),
+					func() (int, error) { return reloadZcode(p, bootCfg) }},
+			} {
+				if spec.dir == "" {
+					continue // 该产品未启用
+				}
+				stamp := dirStamp(spec.dir)
+				if stamp == lastCreds[spec.product] {
+					continue
+				}
+				lastCreds[spec.product] = stamp
+				n, err := spec.load()
+				if err != nil {
+					log.Printf("%s 凭证热加载失败：%v", spec.product, err)
+					continue
+				}
+				log.Printf("%s 凭证热加载：目录已变化，重新载入 %d 个账号", spec.product, n)
+			}
+		}
+	}()
+}
+
+// resolveAuthDir 算出某产品的凭证目录（配置为空时用默认值；产品未启用时返回空）。
+func resolveAuthDir(configured string, fallback func() string, enabled bool) string {
+	if !enabled {
+		return ""
+	}
+	if configured != "" {
+		return configured
+	}
+	return fallback()
+}
+
+// fileStamp 文件的"变更指纹"（mtime + 大小）。
+//
+// 只比 mtime 会漏掉"同一秒内改两次"（mtime 精度到秒时），
+// 加上大小能挡住绝大多数漏判；而真正的原子替换（写临时文件再 rename）
+// 两种都会变。取不到文件时返回空串 —— 与"文件不存在"这一态对应。
+func fileStamp(path string) string {
+	if path == "" {
+		return ""
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%d:%d", st.ModTime().UnixNano(), st.Size())
+}
+
+// dirStamp 目录内文件的"变更指纹"（各文件 mtime+大小的汇总）。
+//
+// 汇总成单个字符串：调用方只需判断"变了没有"，
+// 逐文件比对会让每个周期都分配一堆字符串。
+//
+// 目录为空/不存在时返回空串 —— 与"该产品未启用"这一态一致
+//（调用方对空串直接跳过，不再尝试加载）。
+func dirStamp(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(&b, "%s=%d:%d;", e.Name(), info.ModTime().UnixNano(), info.Size())
+	}
+	return b.String()
+}
+
+// reloadQoder 重新扫描 Qoder 凭证目录并同步进池。
+func reloadQoder(p *pool.Pool, cfg *Config) (int, error) {
+	dir := resolveAuthDir(cfg.Pool.QoderAuthDir, qoder.DefaultAuthDir, true)
+	if dir == "" {
+		return 0, nil
+	}
+	creds, failed, err := qoder.LoadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	for _, f := range failed {
+		log.Printf("Qoder 凭证解析失败，已跳过：%s", f)
+	}
+	n := 0
+	for _, cr := range creds {
+		if cr.UID == "" {
+			continue
+		}
+		if cr.EnsureFingerprint() {
+			if err := cr.SaveAtomic(); err != nil {
+				log.Printf("Qoder 账号 %s 保存机器指纹失败：%v", maskUID(cr.UID), err)
+			}
+		}
+		p.Add(qoderAuthOf(cr))
+		n++
+	}
+	return n, nil
+}
+
+// reloadZcode 重新扫描 ZCode 凭证目录并同步进池。
+func reloadZcode(p *pool.Pool, cfg *Config) (int, error) {
+	dir := resolveAuthDir(cfg.Pool.ZcodeAuthDir, zcode.DefaultAuthDir, true)
+	if dir == "" {
+		return 0, nil
+	}
+	creds, failed, err := zcode.LoadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	for _, f := range failed {
+		log.Printf("ZCode 凭证解析失败，已跳过：%s", f)
+	}
+	n := 0
+	for _, cr := range creds {
+		if cr.UID == "" {
+			continue
+		}
+		p.Add(zcodeAuthOf(cr))
+		n++
+	}
+	return n, nil
 }
 
 // describeProxyScope 拼一行**如实**的代理适用范围日志。

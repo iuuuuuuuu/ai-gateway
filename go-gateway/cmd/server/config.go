@@ -76,6 +76,19 @@ type Config struct {
 		TrialEnabled     bool `json:"trial_enabled"`     // 缺省 true；false = 关 trial 领取
 		// ProductTasksEnabled Qoder/ZCode 日常任务的**自动执行**（缺省 true）。
 		//
+		// ⚠⚠ 已于 2026-09-22 **拆分**（所有者要求：「权益自动领取 qoder zcode
+		// 拆分开,不要合成一个」）。现在请用下面两个**分产品**的开关：
+		//
+		//	QoderClaimEnabled  Qoder 权益活动自动领取
+		//	ZcodeClaimEnabled  ZCode 套餐/权益自动领取
+		//
+		// 本字段**保留为兼容用的总闸**：任一新产品开关**未显式配置**时回落到它。
+		// 这样老配置（只有 `product_tasks_enabled`）行为完全不变，
+		// 而新界面写的是分产品开关。
+		//
+		// ⚠ 不要删掉它 —— 删了会让所有存量配置的"自动领取"在某次升级后
+		// 静默失效（缺键 ⇒ 零值 false ⇒ 不领 ⇒ 活动过期作废）。
+		//
 		// # 默认开的理由（所有者 2026-09-20 要求）
 		//
 		// 原话：「qoder这个活动卡片…而且任务也应该自动执行」、
@@ -95,6 +108,37 @@ type Config struct {
 		// 两个端点都幂等（Qoder `replayed:true` / ZCode `1003 already_claimed`），
 		// 故最坏情况只是"今天已经领过了"。
 		ProductTasksEnabled bool `json:"product_tasks_enabled"`
+		// QoderClaimEnabled Qoder 权益活动**自动领取**（缺省继承总闸）。
+		//
+		// 用 `*bool` 而非 `bool`：需要区分「没配」与「配了 false」——
+		// 前者要回落到总闸，后者是用户明确要关。
+		// 用值类型的话缺键 = false，会把老配置全变成"关闭"。
+		QoderClaimEnabled *bool `json:"qoder_claim_enabled"`
+		// ZcodeClaimEnabled ZCode 套餐**自动领取**（缺省继承总闸）。
+		//
+		// 同上用 `*bool` 区分「没配」与「显式关」。
+		ZcodeClaimEnabled *bool `json:"zcode_claim_enabled"`
+		// QoderClaimHours Qoder 权益活动的**每日领取时点**（本地时间，24 小时制）。
+		//
+		// # 为什么要有它（2026-09-22 所有者要求）
+		//
+		// 原话：「qoder改为 早十点,晚九点 两次触发,防止错漏」。
+		//
+		// 活动每天 10:00（UTC+8）重置，只领一次的话——某一轮网络抖动、
+		// 上游 5xx、或恰好在重置前跑过——当天就**领不到了**（额度作废）。
+		// 两个时点互相兜底：早上那轮失败，晚上 21:00 还有一次机会。
+		//
+		// 缺省 `[10, 21]`（见 Default）；空数组 = 不做时点制领取
+		//（那时只靠下面 `QoderClaimIntervalMinutes` 的轮询）。
+		QoderClaimHours []int `json:"qoder_claim_hours"`
+		// QoderClaimIntervalMinutes Qoder 自动领取的**轮询间隔**（分钟），0 = 只用上面两个时点。
+		//
+		// 为什么要保留轮询而不纯靠时点：时点制在两个整点之间完全不动，
+		// 若用户在 10:30 打开软件、那时还没领到（比如 10:00 那轮失败），
+		// 就要**干等到 21:00**。轮询让它在下一轮就补上。
+		//
+		// 缺省 20（与宿主侧 `PATROL_INTERVAL` 一致），此时点制是额外保障。
+		QoderClaimIntervalMinutes int `json:"qoder_claim_interval_minutes"`
 		// ActivityReportCount 每号每日上报条数，默认 3。
 		//
 		// 取 3 而非 1：单条上报偶发被服务端丢弃（缺 userId 时 200 但静默丢弃），
@@ -273,6 +317,33 @@ type Config struct {
 		//
 		// 空 = 不启用（网关回落到如实报 3007）。
 		ZcodeCaptchaDir string `json:"zcode_captcha_dir"`
+
+		// ZcodeCaptchaSolverURL 宿主提供的**外部求解服务**地址
+		//（形如 `http://127.0.0.1:51234/solve`）。
+		//
+		// # 为什么需要它（2026-09-21 所有者提出的方案）
+		//
+		// 本地求解要起 Node 子进程 + happy-dom **模拟**浏览器，两个硬伤：
+		//
+		//	① 要求用户机器有 Node（为此外置了 81MB node.exe）
+		//	② 模拟环境被风控盯上，实测成功率仅约 40%（靠调 stallMs 提到 88%）
+		//
+		// 而官方 ZCode 客户端用的是**真实浏览器环境**（已从 app.asar 核实：
+		// `script.src = ".../aliyunCaptcha/AliyunCaptcha.js"` +
+		// `inst.startTracelessVerification()`）。
+		//
+		// 宿主自带真实 WebView2（Win10/11 预装，零体积）。实测脚本化调用
+		//（`uitest/probe-captcha-in-browser.cjs`，有头 Chrome，无人工点击）：
+		//
+		//	initAliyunCaptcha +10ms → getInstance +600ms →
+		//	success（param 280 字符）**+929ms**
+		//
+		// 即不到 1 秒，比本地 Node（~3 秒）更快，且不占安装包体积。
+		//
+		// 配置后**外部优先**，本地 Node 作为回退（外部不可用时仍能工作）。
+		ZcodeCaptchaSolverURL string `json:"zcode_captcha_solver_url"`
+		// ZcodeCaptchaSolverToken 调外部求解服务时的共享密钥（同机 IPC 鉴权）。
+		ZcodeCaptchaSolverToken string `json:"zcode_captcha_solver_token"`
 
 		// ZcodeCaptchaEnabled 是否**主动求解**验证码。
 		//
@@ -485,6 +556,19 @@ func Default() *Config {
 	c.Schedule.SchoolHours = []int{12}
 	c.Schedule.TrialHours = []int{9, 21}
 	c.Schedule.ProductTasksEnabled = true
+	// Qoder 自动领取的两个时点（2026-09-22 所有者要求）：
+	//	「qoder改为 早十点,晚九点 两次触发,防止错漏」
+	//
+	// 活动每天 10:00（UTC+8）重置 ⇒ 10 点是重置后第一轮；
+	// 21 点兜底 —— 早上那轮若因网络/上游抖动失败，晚上还能领到。
+	c.Schedule.QoderClaimHours = []int{10, 21}
+	// 时点之外每 20 分钟补一轮（与宿主 `PATROL_INTERVAL` 对齐）。
+	// 理由见字段注释：纯时点制会让"10:00 失败"的用户干等到 21:00。
+	c.Schedule.QoderClaimIntervalMinutes = 20
+	// ⚠ QoderClaimEnabled / ZcodeClaimEnabled 刻意**不在这里赋默认值**：
+	// 它们是 `*bool`，nil = "没配" ⇒ 由 QoderClaimOn()/ZcodeClaimOn()
+	// 回落到 ProductTasksEnabled。若在这里赋 &true，就再也分不清
+	// "用户显式开着" 与 "没配"，分产品开关会失去意义。
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 	c.Schedule.CheckinEnabled = true
@@ -503,6 +587,38 @@ func Default() *Config {
 	// 缺省 passthrough：透传客户端原始 system。老配置没有 prompt 块，
 	// 必须保持既有行为不变（见 Prompt.Mode 的注释）。
 	c.Prompt.Mode = "passthrough"
+	// 单账号最大在途请求数。**三个产品统一用 3**（2026-09-22 所有者指定）。
+	//
+	// # 值的演变（每次都是实测驱动，别再凭感觉改）
+	//
+	//	3  → 32 → 8 → 16 → **3**（本版）
+	//
+	//	· 最初的 3：没有排队机制时，客户端并发重试（DSH 的 pi-ai 默认 5 次）
+	//	  的第 4、5 个会被直接拒 ⇒ 用户看到「每次都失败」。
+	//	· 32：**恰好压在 qoder 上游的并发天花板（≈30）上** ⇒ 一重试就越界，
+	//	  报「上游服务异常（HTTP 503）」。**把上限设成等于上游能力是错的**。
+	//	· 8 / 16：实测 16 时并发 20 全通过。
+	//
+	// # ⚠ 为什么现在敢回到 3
+	//
+	// 关键变化：**名额满时不再直接拒绝，而是排队等待**
+	//（`server.Config.InFlightWait`，默认 3000ms；见
+	// `pool.AcquireWait`）。当初 3 会失败，是因为满了就 `Acquire` 失败、
+	// 立刻回 503 —— 现在超额的请求会等前一个完成，通常几十毫秒就拿到名额。
+	//
+	// 所以「3」现在的含义是"每个账号同时最多跑 3 个"，而**不是**
+	// "第 4 个请求就失败"。这两个语义差别是本值能回到 3 的前提。
+	//
+	// # 为什么三个产品统一
+	//
+	// 所有者原话：「还有单个账号并发还是改为3个,qoder workbuddy zcode都一样」。
+	// 统一的好处：行为可预期、排查时不用记"哪个产品是多少"。
+	// 多账号产品不受影响 —— 19 个 WorkBuddy 账号各自 3 ⇒ 总并发 57。
+	//
+	// ⚠ 若某天又出现"并发重试成片 503"，先确认 `InFlightWait > 0`
+	//（0 表示关闭等待，等于退回旧行为），再考虑调这个值。
+	//
+	// 详见 `crates/ai-gateway-core/src/modules/gateway.rs` 同名键的注释。
 	c.Pool.MaxInFlight = 3
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
@@ -673,7 +789,27 @@ func (c *Config) normalize() error {
 	}
 	// 签到区域范围：只接受 cn / all，其余（含缺省空串）一律回落 cn。
 	c.Schedule.CheckinScope = normalizeCheckinScope(c.Schedule.CheckinScope)
+
+	// Qoder 自动领取的时点/轮询缺省（2026-09-22 拆分时新增）。
+	//
+	// ⚠ 这里必须再兜一次默认值（Default() 里已有一份）：
+	// `Load` 是先 `Default()` 再 `json.Unmarshal` 覆盖 —— 但用户若在配置里
+	// 显式写了 `"qoder_claim_hours": []`（空数组），Unmarshal 会把默认值
+	// **覆盖成空**。空数组的语义是"不做时点制领取"，那是合法配置，
+	// 故这里**不能**把空数组改回 [10,21]（那会让用户关不掉时点制）。
+	// 只有 nil（键完全缺席且 Default 也没给）才补默认 —— 实际不会发生，
+	// 但保留判断以防将来 Default() 被改动。
+	if c.Schedule.QoderClaimHours == nil {
+		c.Schedule.QoderClaimHours = []int{10, 21}
+	}
+	// 轮询间隔：负数是非法值（写错），归一到默认；0 是合法的"只靠时点"。
+	if c.Schedule.QoderClaimIntervalMinutes < 0 {
+		c.Schedule.QoderClaimIntervalMinutes = 20
+	}
 	if err := c.validateScheduleHours(); err != nil {
+		return err
+	}
+	if err := c.validateQoderClaimHours(); err != nil {
 		return err
 	}
 	return c.normalizePrompt()
@@ -768,4 +904,51 @@ func checkHourRange(field, switchKey string, hours []int) error {
 		}
 	}
 	return nil
+}
+
+// validateQoderClaimHours 校验 Qoder 领取时点（0-23）。
+//
+// 与 `validateScheduleHours` 分开，是因为它的"关闭方式"不同：
+// 其它任务的开关是 `xxx_enabled=false`，而 Qoder 领取关闭有两级
+//（`qoder_claim_enabled=false` 或 `product_tasks_enabled=false`），
+// 报错信息里要同时给出两者，否则用户不知道该改哪个。
+func (c *Config) validateQoderClaimHours() error {
+	for _, h := range c.Schedule.QoderClaimHours {
+		if h < 0 || h > 23 {
+			return fmt.Errorf(
+				"schedule.qoder_claim_hours: %d 不是合法小时（0-23）；"+
+					"如要关闭 Qoder 自动领取请设 schedule.qoder_claim_enabled=false"+
+					"（或总闸 schedule.product_tasks_enabled=false）", h)
+		}
+	}
+	return nil
+}
+
+// QoderClaimOn 该不该自动领 Qoder 权益活动。
+//
+// # 两级开关的语义（2026-09-22 拆分）
+//
+//		qoder_claim_enabled  **显式**配置 ⇒ 以它为准
+//		未配置（nil）        ⇒ 回落到总闸 product_tasks_enabled
+//
+// 这样两种用户都对：
+//
+//   - 老配置只有总闸：行为完全不变（分产品键缺席 ⇒ 跟总闸走）
+//   - 新界面写了分产品键：各产品互不影响
+//
+// ⚠ 这就是字段用 `*bool` 而不是 `bool` 的全部理由 —— 值类型缺键是 false，
+// 会把所有老配置变成"关闭"，而活动不领就过期作废。
+func (c *Config) QoderClaimOn() bool {
+	if c.Schedule.QoderClaimEnabled != nil {
+		return *c.Schedule.QoderClaimEnabled
+	}
+	return c.Schedule.ProductTasksEnabled
+}
+
+// ZcodeClaimOn 该不该自动领 ZCode 套餐。语义同 QoderClaimOn。
+func (c *Config) ZcodeClaimOn() bool {
+	if c.Schedule.ZcodeClaimEnabled != nil {
+		return *c.Schedule.ZcodeClaimEnabled
+	}
+	return c.Schedule.ProductTasksEnabled
 }

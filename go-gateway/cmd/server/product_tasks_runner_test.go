@@ -88,10 +88,19 @@ func TestProductTaskTimeoutIsBounded(t *testing.T) {
 	}
 }
 
-// TestNewProductTasksRunnerNilWhenNoDispatch 没有 zcode 时返回 nil（跳过，不报错）。
+// TestNewProductTasksRunnerNilWhenNoDispatch 两个产品都没有时返回 nil（跳过，不报错）。
+//
+// ⚠ 2026-09-22 修正：签名多了 Qoder 的两个参数。
+// 「关闭」现在有**两个**来源 —— ZCode 无 dispatch、Qoder 开关为 false ——
+// 必须**两个都关**才返回 nil；只要有一个产品要跑，就得给出执行体，
+// 否则会出现「Qoder 开着但排程什么都不做」的静默失效。
 func TestNewProductTasksRunnerNilWhenNoDispatch(t *testing.T) {
-	if fn := newProductTasksRunner(nil, nil); fn != nil {
-		t.Error("没有 zcode dispatch 时应返回 nil（调用方据此跳过，而不是报错）")
+	if fn := newProductTasksRunner(nil, nil, "", false); fn != nil {
+		t.Error("两个产品都不可用时才应返回 nil（调用方据此跳过，而不是报错）")
+	}
+	// Qoder 开着（有目录）⇒ 即使是 nil dispatch 也必须给出执行体
+	if fn := newProductTasksRunner(nil, nil, "/tmp/qoder", true); fn == nil {
+		t.Error("Qoder 开关为 true 时必须返回执行体 —— 否则排程静默不领 Qoder")
 	}
 }
 

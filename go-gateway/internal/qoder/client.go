@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -58,6 +59,54 @@ func New() *Client {
 		},
 		Timeout: 30 * time.Second,
 	}
+}
+
+// SetProxy 设置出站代理；空字符串 = **真直连**。
+//
+// # 为什么必须有它（2026-09-22 定位到「国际版登录连不上」）
+//
+// 所有者报告 Qoder **国际版登录不可用**。实测（本机 :7890 是用户的梯子）：
+//
+//	国际版 token 端点 openapi.qoder.sh
+//	    直连        → HTTP 000（wsarecv 连接失败）
+//	    走 7890 代理 → HTTP 404（正常，404 = 尚未授权）
+//	国服   openapi.qoder.com.cn  → 直连也通
+//
+// 即**国际版必须走代理**，而本包此前**到处都没有代理**（`New()` 的
+// Transport 没有 `Proxy` 字段 ⇒ 只读环境变量，读不到宿主的配置）。
+//
+// 宿主侧其实早就配好了（`proxy_scope.intl = true`），只是登录子命令
+// **没读它** —— 于是"配置看起来对、功能却不通"。
+//
+// ⚠ 与 `zcode.Client.SetProxy` 同款口径：
+//   · 空地址 = 显式直连，**不回落** `http.ProxyFromEnvironment`
+//     （否则"关了代理"仍会走环境变量里的代理，表现为开关无效）
+//   · 重建 Transport（Go 的 Transport 一旦用过就不能改 Proxy）
+func (c *Client) SetProxy(raw string) error {
+	raw = strings.TrimSpace(raw)
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConns = 100
+	tr.MaxIdleConnsPerHost = 20
+	tr.IdleConnTimeout = 90 * time.Second
+	// 保留禁 h2 这一条（见 New 的说明）：重置 Transport 时漏掉它，
+	// 流式对话会重新被上游中途断开 —— 那种回归极难联想回这里。
+	tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+
+	if raw != "" {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("解析代理地址失败: %w", err)
+		}
+		tr.Proxy = http.ProxyURL(u)
+	} else {
+		tr.Proxy = nil
+	}
+
+	c.HTTP = &http.Client{
+		Transport: tr,
+		Timeout:   180 * time.Second,
+	}
+	return nil
 }
 
 func (c *Client) http() *http.Client {
@@ -309,7 +358,7 @@ type Quota struct {
 //
 // ```json
 // {
-//   "userId": "019f1772-...",
+//   "userId": "{qoder-uid}-...",
 //   "userType": "personal_standard",
 //   "usageType": "credits",
 //   "totalUsagePercentage": 0.0,

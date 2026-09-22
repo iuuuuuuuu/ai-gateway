@@ -62,6 +62,30 @@ type Config struct {
 	// TrialDisabled 显式关闭 trial 领取排程（schedule.trial_enabled=false）。
 	TrialDisabled bool
 
+	// QoderClaimHours Qoder 权益活动的每日领取时点，默认 [10, 21]。
+	//
+	// # 所有者要求（2026-09-22）
+	//
+	//	「qoder改为 早十点,晚九点 两次触发,防止错漏」
+	//
+	// # 为什么要两个时点（不是"多此一举"）
+	//
+	// 活动**每天 10:00（UTC+8）重置**，且单条时限约 22 小时。
+	// 只排一个时点的话，任何一次抖动都会让**当天彻底领不到**：
+	//
+	//	· 上游 5xx / 网络超时
+	//	· 恰好在该时点前已跑过（时点未到就重置了）
+	//	· 网关当时没在运行
+	//
+	// 两个时点互相兜底：10 点是重置后第一轮，21 点再确认一次。
+	// 端点幂等（已领会回 `replayed:true`），故重复执行无副作用。
+	QoderClaimHours []int
+	// QoderClaimDisabled 显式关闭 Qoder 自动领取排程。
+	//
+	// 对应 `schedule.qoder_claim_enabled=false` **或**总闸
+	// `schedule.product_tasks_enabled=false`（两级回落见 Config.QoderClaimOn）。
+	QoderClaimDisabled bool
+
 
 	// RunProductTasks 产品日常任务的**执行体**，由网关自己实现（见 main.go）。
 	//
@@ -350,7 +374,48 @@ func (s *Scheduler) RunTaskFor(name, accountUID string) (TaskRunResult, error) {
 //
 // 口径与各任务遍历循环里的区域过滤**逐条对应** —— 两处若不一致，
 // 就会出现「预检说能跑、实际跑空」的矛盾。
+//
+// # ⚠⚠ 产品闸门（2026-09-22 修的真实缺陷：Qoder/ZCode 跑了 WorkBuddy 的任务）
+//
+// 所有者现场：Qoder 账号的记录里出现「开学季活动」「活跃上报」「夜猫子任务」，
+// ZCode 也一样（原话：「这个qoder怎么执行workbuddy的任务了?」
+// 「zcode我看到记录里面,也会跑workbuddy的任务,这不要串任务好吗?」）。
+//
+// # 根因
+//
+// 本函数此前**只判区域**（国服/国际版），**完全不判产品**。
+// 而所有养号任务都是遍历 `Pool.List()` 的（见 activity.go / nightowl.go /
+// growthmap.go / school.go），那个列表包含**所有产品**的账号。
+//
+// 于是 Qoder / ZCode 账号被当成 WorkBuddy 账号：
+//
+//	· 打到 WorkBuddy 的 growth 端点 —— 带着 Qoder 的凭证 ⇒ **401**
+//	  （记录里那条「开学季活动…upstream client (http 401)」就是它）
+//	· 在账号记录里写下**根本不属于它**的任务记录 ⇒ 用户以为账号有问题
+//
+// ⚠ 为什么 `checkinScopeAllows` 拦不住：它只看 `upstream.IsIntl(a)`，
+// 而 Qoder/ZCode 账号的 Domain **不是** workbuddy.ai ⇒ 被判成"国服" ⇒ 放行。
+// 区域与产品是**两个正交的维度**，不能用其中一个代替另一个。
+//
+// ⚠ 这些任务是 **WorkBuddy 专属**语义（签到、猫猫、活跃上报、夜猫子、
+// 开学季、活跃地图）—— 它们打的是 WorkBuddy 的接口，用 WorkBuddy 的
+// 事件模型。Qoder/ZCode 有自己的任务体系（权益活动 / 套餐领取，
+// 走 `TaskNameProductTasks`），**不该混进来**。
+//
+// 判据用 `ProductOf()`（它把空值与 "workbuddy" 都归成 workbuddy），
+// 而不是 `a.Product == ""` —— 后者会漏掉显式写了 "workbuddy" 的账号。
 func (s *Scheduler) accountScopeSkip(name string, a *auth.Auth) (string, bool) {
+	// ---- 产品闸门：以下任务全是 WorkBuddy 专属 ----
+	//
+	// 白名单式判断（列"谁能跑"而不是"谁不能跑"）：将来新增产品时
+	// 默认**不参与**，而不是默认参与 —— 前者是安全的失败方向。
+	switch name {
+	case TaskNameActivity, TaskNameNightOwl, TaskNameSchool, TaskNameGrowthMap, TaskNameTrial:
+		if a.ProductOf() != auth.ProductWorkBuddy {
+			return "该任务是 WorkBuddy 专属：其它产品有自己的任务体系", false
+		}
+	}
+
 	switch name {
 	case TaskNameTrial:
 		// trial 只跑国际版（国服无此端点），与 runTrial 的过滤相反。
@@ -473,6 +538,13 @@ const (
 	taskNightOwl
 	taskSchool
 	taskTrial
+	// taskQoderClaim Qoder 权益活动领取（2026-09-22 新增）。
+	//
+	// ⚠ 它与 `taskTrial`/`taskCheckin` 等**不是**同一类：那些跑 WorkBuddy
+	// 的账号任务，这个跑的是 Qoder 的活动领取。放在同一个 slot 列表里
+	// 是因为**排程机制**（时点 → nextFire）完全一样，复用它最省事，
+	// 也保证"到点该跑什么"只有一个真相来源。
+	taskQoderClaim
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -501,6 +573,14 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	if !s.cfg.TrialDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.TrialHours), taskTrial})
+	}
+	// Qoder 权益活动领取（2026-09-22 新增，所有者要求早晚两次）。
+	//
+	// ⚠ 复用同一套 slot 机制而不是另起一个循环：`nextWake` 是"到点该跑什么"
+	// 的**唯一真相来源**，加一个独立 ticker 就会有两个调度器各算各的，
+	// 到点时可能同时触发、也可能互相错开（前者并发、后者漏跑）。
+	if !s.cfg.QoderClaimDisabled {
+		slots = append(slots, slot{nextFire(now, s.cfg.QoderClaimHours), taskQoderClaim})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -553,6 +633,17 @@ func (s *Scheduler) Run(ctx context.Context) {
 					s.runCareTask(TaskNameSchool, func() { s.runSchool(ctx) })
 				case taskTrial:
 					s.runCareTask(TaskNameTrial, func() { s.runTrial(ctx) })
+				case taskQoderClaim:
+					// Qoder 权益领取（2026-09-22 新增）。
+					//
+					// 复用 `runProductTasks`（那条路径本来就在，只是此前
+					// 没有任何排程时点指向它）—— 它内部走 `RunProductTasks`
+					// 执行体，会同时处理 Qoder 与 ZCode，且自带
+					// claimTask/releaseTask 去重与「任务留痕」。
+					//
+					// ⚠ 不新建执行体：两条路径各写一份领取逻辑必然分叉
+					//（"手动能领、自动领不到"这类问题就是这么来的）。
+					s.runCareTask(TaskNameProductTasks, func() { s.runProductTasks(ctx) })
 				}
 			}
 		}
@@ -605,6 +696,13 @@ func (s *Scheduler) refreshCreditsWithGap(ctx context.Context) {
 		if a == nil || a.RefreshToken == "" {
 			continue
 		}
+		// ⚠ 产品闸门（2026-09-22）：下面这条出站请求打的是 **WorkBuddy** 端点。
+		// 不判产品时，Qoder/ZCode 账号会被带着自己的凭证打过去 ⇒ 401，
+		// 并在账号记录里留下不属于它的错误（所有者现场：
+		// 「这个qoder怎么执行workbuddy的任务了?」）。
+		if a.ProductOf() != auth.ProductWorkBuddy {
+			continue
+		}
 		if i > 0 {
 			select {
 			case <-ctx.Done():
@@ -641,6 +739,12 @@ func (s *Scheduler) RunCheckinNow() {
 		if a == nil || a.RefreshToken == "" {
 			continue
 		}
+		// ⚠ 产品闸门（2026-09-22）：签到是 WorkBuddy 专属。
+		// 此前只判区域，于是 Qoder/ZCode 账号也被拿去签到 ——
+		// 带错凭证打到 WorkBuddy 端点必 401，且往账号记录里写脏数据。
+		if a.ProductOf() != auth.ProductWorkBuddy {
+			continue
+		}
 		if !s.checkinScopeAllows(a) {
 			continue
 		}
@@ -674,6 +778,13 @@ func (s *Scheduler) RunCreditRefreshNow() {
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
+	continue
+}
+		// ⚠ 产品闸门（2026-09-22）：下面这条出站请求打的是 **WorkBuddy** 端点。
+		// 不判产品时，Qoder/ZCode 账号会被带着自己的凭证打过去 ⇒ 401，
+		// 并在账号记录里留下不属于它的错误（所有者现场：
+		// 「这个qoder怎么执行workbuddy的任务了?」）。
+		if a.ProductOf() != auth.ProductWorkBuddy {
 			continue
 		}
 		info, err := s.cfg.Upstream.UserResourceDetail(a)
@@ -703,6 +814,13 @@ func (s *Scheduler) RunKeepaliveNow() {
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
+			continue
+		}
+		// ⚠ 产品闸门（2026-09-22）：下面这条出站请求打的是 **WorkBuddy** 端点。
+		// 不判产品时，Qoder/ZCode 账号会被带着自己的凭证打过去 ⇒ 401，
+		// 并在账号记录里留下不属于它的错误（所有者现场：
+		// 「这个qoder怎么执行workbuddy的任务了?」）。
+		if a.ProductOf() != auth.ProductWorkBuddy {
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {

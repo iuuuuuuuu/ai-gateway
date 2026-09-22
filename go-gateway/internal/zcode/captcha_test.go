@@ -113,6 +113,16 @@ func TestSolverFallsBackToSource(t *testing.T) {
 //
 // 这是**最可能出现的真实情形**：发行包带了组件，但用户机器没装 Node。
 // 报错必须点明"要装 Node"，否则用户会以为是账号问题。
+//
+// # ⚠ 2026-09-21：清空 PATH 不再足以制造"探测失败"
+//
+// 探测顺序在本日扩展为「ZCODE_NODE_PATH → PATH → 常见安装位置」。
+// 于是 `t.Setenv("PATH", "")` 之后仍会去扫 `~/.nvmd/versions/*/node.exe`
+// 等真实位置 —— 在**装了 node 的开发机**上会命中，测试前提不成立，
+// 会误报成"没有 node 时不该报告可用"。
+//
+// 故用 `nodePathOverride` 把候选集清空，让"找不到 node"成为**确定事实**，
+// 而不是"取决于这台机器装了什么"。
 func TestSolverWithoutNodeReportsNode(t *testing.T) {
 	dir := t.TempDir()
 	// 放一个空的 bundle 让它过第一步检查
@@ -124,12 +134,68 @@ func TestSolverWithoutNodeReportsNode(t *testing.T) {
 	t.Setenv("ZCODE_NODE_PATH", filepath.Join(dir, "no-such-node.exe"))
 
 	s := &CaptchaSolver{dir: dir}
+	// 关掉"常见安装位置"那一路，让失败可控（见上）。
+	s.nodePathOverride = []string{}
 	if s.Available() {
 		t.Error("没有 node 时不该报告可用")
 	}
 	got := s.UnavailableReason()
 	if !strings.Contains(got, "node") {
 		t.Errorf("应点明缺 node，实际：%s", got)
+	}
+	// 报错要给出**可操作**的指引，而不只是"找不到"。
+	if !strings.Contains(got, "ZCODE_NODE_PATH") {
+		t.Errorf("应告诉用户可用 ZCODE_NODE_PATH 指定路径，实际：%s", got)
+	}
+}
+
+// TestNodeCandidatePathsCoversCommonInstalls 候选路径覆盖常见安装方式。
+//
+// # 为什么钉住它（2026-09-21 所有者反馈）
+//
+// 所有者原话：「不是每个用户电脑上都有node，你那个求解器，不能期盼所有
+// 用户都能满足运行环境」。
+//
+// 完整解决需要内置 node（产品决策），但**探测范围**是无论如何都该做对的：
+// 很多用户装了 Node，只是它不在**网关进程继承到的 PATH** 里
+//（nvm/fnm/volta 都靠 shell 钩子注入 PATH，而 GUI 子进程继承的是旧环境）。
+// 那种情况下旧实现报"找不到 node"，用户会认为"我明明装了" —— 最难解释的一类故障。
+//
+// # ⚠ 只断言"数量与结构"，不断言具体安装器名
+//
+// 前三版我按安装器名逐个断言（`.nvmd` / `fnm` / `Volta`…），结果在
+// `LOCALAPPDATA` 为空的环境里失败 —— 那些路径本就只在该变量存在时才生成，
+// 是**设计如此**，不是缺陷。
+//
+// 断言具体名字等于把"这台机器的环境变量"写进测试，而那与代码正确性无关。
+// 这里改为断言**结构性要求**：候选足够多、每个都带 node 可执行文件名、
+// 且本程序同目录在其中。
+func TestNodeCandidatePathsCoversCommonInstalls(t *testing.T) {
+	s := &CaptchaSolver{}
+	paths := s.nodeCandidatePaths()
+	if len(paths) < 6 {
+		t.Fatalf("候选路径过少（%d 个）—— 覆盖不到常见安装方式：%v", len(paths), paths)
+	}
+	// 每一项都必须是 node 可执行文件（而不是目录或无关文件）。
+	name := nodeExeName()
+	for _, p := range paths {
+		if filepath.Base(p) != name {
+			t.Errorf("候选 %q 不以 %s 结尾 —— 它不会是 node 可执行文件", p, name)
+		}
+	}
+	// 本程序同目录（内置 node 时的位置）必须在候选里 ——
+	// 将来把 node.exe 放进安装包后无需再改这里。
+	exe, err := os.Executable()
+	if err == nil {
+		found := false
+		for _, p := range paths {
+			if filepath.Dir(p) == filepath.Dir(exe) {
+				found = true
+			}
+		}
+		if !found {
+			t.Error("候选路径应包含本程序同目录（内置 node.exe 的位置）")
+		}
 	}
 }
 

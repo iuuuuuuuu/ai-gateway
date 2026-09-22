@@ -1,5 +1,5 @@
-import { ArrowRight, Ban, CalendarCheck, CalendarHeart, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Gift, Globe, GraduationCap, History, Info, Loader2, MapPin, Moon, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2, Zap } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { ArrowRight, Ban, CalendarCheck, CalendarHeart, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Gift, Globe, GraduationCap, History, Info, ListChecks, Loader2, MapPin, Moon, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2, Zap } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -22,7 +22,7 @@ import { accountReloginAlarm } from "@/lib/account-expiry";
 import { cn } from "@/lib/utils";
 import { AccountRecordsView } from "@/components/account-records-view";
 import { demoModeEnabled } from "@/lib/demo-mode";
-import type { AccountMeta, AccountRunningTask, CreditExpiry, CreditResource, GatewayTaskName, TravelStatus } from "@/lib/types";
+import type { AccountMeta, AccountRunningTask, CreditExpiry, CreditResource, GatewayTaskName, GrowthTaskView, TravelStatus } from "@/lib/types";
 
 const AVATAR_TONES = [
   "bg-emerald-100 text-emerald-800",
@@ -406,6 +406,95 @@ function growthMapAvailability(account: AccountMeta): TaskAvailability {
 }
 
 /**
+ * 全部成长任务的动态列表（本账号）。
+ *
+ * # 为什么需要它（2026-09-22 所有者反馈）
+ *
+ *	「workbuddy单账号点击任务下面 对比上面支持的任务并不完整,需要补全」
+ *
+ * 菜单里此前是**硬编码**的 6 项，而后端 `growtask/actions.go` 的表里有
+ * 18+ 项。硬编码必然漏 —— 这次只是把它暴露出来了而已。
+ *
+ * 改为打开菜单时向 `POST /tasks/growth {"action":"list"}` 拉**全量**清单：
+ * 上游加任务时界面自动跟上，不需要再改这段代码。
+ *
+ * ⚠ `list` 是**只读**的（后端 `ListTasks` 明确无任何写操作），
+ * 所以打开菜单就拉一次是安全的，不会消耗任何额度。
+ */
+function useGrowthTasks(
+  accountId: string,
+  enabled: boolean,
+): { tasks: GrowthTaskView[] | null; error: string | null } {
+  const [tasks, setTasks] = useState<GrowthTaskView[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!enabled) return;
+    let alive = true;
+    setTasks(null);
+    setError(null);
+    void (async () => {
+      try {
+        const res = await api.runGrowthTask("list", accountId);
+        if (!alive) return;
+        if (!res.ok) {
+          // 后端明确说不 ok（如账号正忙）时如实显示，不要静默空列表 ——
+          // 空列表会被读成"这个号没有任务"，而那是另一个意思。
+          setError(res.error || "读取任务列表失败");
+          setTasks([]);
+          return;
+        }
+        setTasks(res.tasks ?? []);
+      } catch (e) {
+        if (!alive) return;
+        setError(api.asError(e));
+        setTasks([]);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [accountId, enabled]);
+
+  return { tasks, error };
+}
+
+/** 任务列表项的显示名：优先上游标题，回落任务码（任务码总比空白强）。 */
+function growthTaskLabel(t: GrowthTaskView): string {
+  return t.title?.trim() || t.task_code;
+}
+
+/**
+ * 该任务能否被本工具自动完成。
+ *
+ * ⚠ 三个条件缺一不可：
+ *   `automatable` —— 后端知道怎么做（有对应的 action 实现）
+ *   `needs_chat`  —— 需要真实对话，**会消耗额度**，界面必须让用户知情
+ *   非 `claimed`  —— 已领过的不必再点
+ */
+function growthTaskRunnable(t: GrowthTaskView): boolean {
+  if (t.status === "claimed") return false;
+  return t.automatable === true;
+}
+
+/**
+ * 该任务的补充说明：为什么做不了 / 点了会怎样。
+ *
+ * 这两种信息**都很重要**且互斥：
+ *   · 做不了（非 automatable）→ 用户需要知道该去客户端手动做什么
+ *   · 能做但花额度（needs_chat）→ 用户需要知道点下去会消耗 token
+ */
+function growthTaskHint(t: GrowthTaskView): string | null {
+  if (!t.automatable) {
+    // 后端给的 hint 最准（它知道具体原因），回落 description
+    return t.hint?.trim() || t.description?.trim() || null;
+  }
+  if (t.status === "claimed") return null;
+  if (t.needs_chat) return "需要真实对话，会消耗额度";
+  return t.action_desc?.trim() || null;
+}
+
+/**
  * 校园日活动（school_season）：限时活动，**只在小程序内完成**。
  *
  * 两点与「开学季活动」不同，菜单文案要能让人分得清：
@@ -631,6 +720,23 @@ interface Props {
   /** 正在执行的成长任务码（用于置灰与转圈）。 */
   growthTaskRunning?: string;
   /**
+   * 一键执行该账号**全部可自动完成的成长任务**（所有者 2026-09-22 要求）。
+   *
+   *	「workbuddy每个账号再加一个按钮,就是点击后 可以一键执行
+   *	  当前 账号 所能执行的全部任务」
+   *
+   * 与 `onRunGrowthTask` 同一个接口，只是**不传 taskCode**
+   *（后端 `runOne` 见 code 为空即跑全部待办，内含报名/回读/领奖）。
+   */
+  onRunAllGrowthTasks?: (accountId: string) => void;
+  /**
+   * 正在跑「全部任务」的账号 id；null/undefined = 没有在跑。
+   *
+   * ⚠ 必须按**账号**区分而不是用一个布尔：并发时每张卡片都要知道
+   * "是我在跑吗"，一个全局布尔会让所有卡片的按钮一起转圈。
+   */
+  growthAllRunningAccountId?: string | null;
+  /**
    * 本账号参与了**正在跑的那一轮**养号任务时下发的标记；否则为 null/undefined。
    *
    * 由父级按 `taskRuntime.processedIds.includes(account.id)` 判定 —— 注意是
@@ -696,7 +802,7 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
   );
 }
 
-export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, onCheckin, onRefresh, onAdopt, onRunTask, taskRunning, onRunGrowthTask, growthTaskRunning, runningTask, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, onCheckin, onRefresh, onAdopt, onRunTask, taskRunning, onRunGrowthTask, growthTaskRunning, onRunAllGrowthTasks, growthAllRunningAccountId, runningTask, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
   /** 备注编辑弹窗；`noteDraft` 是受控输入（打开时用当前备注初始化）。 */
   const [noteOpen, setNoteOpen] = useState(false);
@@ -706,6 +812,15 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
   const [detailOpen, setDetailOpen] = useState(false);
   /** 账号记录弹窗：任务 / 积分 / Token 三类事件，带日期筛选。 */
   const [recordsOpen, setRecordsOpen] = useState(false);
+  /**
+   * 全部成长任务清单（本账号）。
+   *
+   * ⚠ **只在菜单打开时拉取**（`menuOpen`）：拉取要发一次 HTTP 请求，
+   * 19 个账号的页面若每张卡片挂载时都拉，会瞬间打出 19 个请求 ——
+   * 而用户可能一个菜单都不会打开。
+   */
+  const [menuOpen, setMenuOpen] = useState(false);
+  const { tasks: growthTasks } = useGrowthTasks(account.id, menuOpen);
   const name = account.nickname || account.uid || "未命名账号";
   /** 需重新登录时的报警内容；账号仍能自愈（access token 过期）时为 null。
    *  判定口径集中在 `@/lib/account-expiry`，与兼容网关页共用同一套。 */
@@ -866,7 +981,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
               </Button>
             </DemoAction>
           ) : (
-            <DropdownMenu>
+            <DropdownMenu onOpenChange={setMenuOpen}>
               <DropdownMenuTrigger asChild>
                 <Button variant="ghost" size="icon" className={cn("rounded-lg text-muted-foreground hover:text-foreground", compact ? "size-7" : "size-8")} aria-label={`管理账号 ${name}`} title="更多账号操作">
                   <Ellipsis />
@@ -968,7 +1083,138 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   disabled: featuresDisabled || !onRunGrowthTask || growthTaskRunning !== undefined,
                   busy: growthTaskRunning === "school_season",
                 })}
+                {/* ── 全部成长任务（动态拉取）─────────────────────────────
+                    所有者 2026-09-22：「workbuddy单账号点击任务下面 对比上面
+                    支持的任务并不完整,需要补全」。
+
+                    # 此前为什么"不完整"
+
+                    上面那些菜单项是**硬编码**的 —— 只有签到/旅行/领养 +
+                    5 个遍历任务 + 校园日，共 6 项。而后端「成长任务」实际有
+                    **18+ 项**（见 `growtask/actions.go` 的 actions 表），
+                    界面上根本点不到它们。
+
+                    # 现在怎么补
+
+                    后端早就有 `POST /tasks/growth {"action":"list"}`，
+                    它会返回该账号**全部**任务及其状态（`GrowthTaskView`）。
+                    本区块就把它**全量渲染**出来 —— 上游加任务时界面自动跟上，
+                    不需要再改前端。
+
+                    ⚠ 与「养号任务」分组**并列而不是合并**：那 5 项走
+                    `/tasks/run`（整轮、只有任务名），这些走 `/tasks/growth`
+                    （逐任务、可指定 code）。接口语义不同，混在一起会让
+                    "点了没反应"很难排查。 */}
                 <DropdownMenuSeparator />
+                <DropdownMenuLabel>全部成长任务（本账号）</DropdownMenuLabel>
+                {/* ── 一键执行全部（所有者 2026-09-22 要求）────────────────
+                    「workbuddy每个账号再加一个按钮,就是点击后 可以一键执行
+                      当前 账号 所能执行的全部任务」
+
+                    放在这一组**最前面**：它是这一组的"全选"动作，
+                    用户扫一眼菜单就该看到它，而不是滚到十几项之后。
+
+                    ⚠ 不传 taskCode ⇒ 后端跑该账号的全部待办
+                    （含报名、回读进度、自动领奖），比逐项点更省事也更不容易漏。
+
+                    ⚠ 全程禁用：后端有**账号级互斥**，连点会让第二次
+                    直接报「该账号的任务正在执行中」。禁用 + 转圈 +
+                    toast 提示三件一起，才能避免用户以为"没反应"而连点。
+
+                    ⚠ 用 `growthAllRunningAccountId === account.id` 判断，
+                    而不是 `growthTaskRunning === "__all__"`：后者对所有
+                    卡片都为真，会让 19 张卡片的按钮一起转圈。 */}
+                <DropdownMenuItem
+                  className="items-start"
+                  disabled={
+                    featuresDisabled ||
+                    !onRunAllGrowthTasks ||
+                    growthTaskRunning !== undefined ||
+                    growthAllRunningAccountId != null
+                  }
+                  title="依次执行该账号所有可自动完成的成长任务（可能包含真实对话，耗时一到几分钟）"
+                  onSelect={() => onRunAllGrowthTasks?.(account.id)}
+                >
+                  <span className="mt-0.5 flex shrink-0">
+                    {growthAllRunningAccountId === account.id ? (
+                      <Loader2 className="animate-spin" />
+                    ) : (
+                      <ListChecks />
+                    )}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate">
+                      {growthAllRunningAccountId === account.id
+                        ? "正在执行全部任务…"
+                        : "一键执行全部任务"}
+                    </span>
+                    <span className="mt-0.5 block whitespace-normal text-[11px] leading-4 text-muted-foreground">
+                      {growthAllRunningAccountId === account.id
+                        ? "十几项依次执行，请勿重复点击"
+                        : "含报名、回读进度与自动领奖；耗时一到几分钟"}
+                    </span>
+                  </span>
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                {growthTasks === null ? (
+                  <DropdownMenuItem disabled>
+                    <Loader2 className="animate-spin" />
+                    正在读取任务列表…
+                  </DropdownMenuItem>
+                ) : growthTasks.length === 0 ? (
+                  <DropdownMenuItem disabled>
+                    <Info />
+                    该账号暂无可读取的成长任务
+                  </DropdownMenuItem>
+                ) : (
+                  growthTasks.map((t) => (
+                    <DropdownMenuItem
+                      key={t.task_code}
+                      className="items-start"
+                      // 可自动完成 **且** 本账号适用才可点；其余置灰但**保留显示** ——
+                      // 用户需要看到"有哪些任务、为什么做不了"，藏起来等于没补全。
+                      disabled={
+                        featuresDisabled ||
+                        !onRunGrowthTask ||
+                        growthTaskRunning !== undefined ||
+                        !growthTaskRunnable(t)
+                      }
+                      title={growthTaskHint(t) ?? undefined}
+                      aria-label={`${growthTaskLabel(t)}（${t.status_text}）`}
+                      onSelect={() => onRunGrowthTask?.(t.task_code, account.id)}
+                    >
+                      <span className="mt-0.5 flex shrink-0">
+                        {growthTaskRunning === t.task_code ? (
+                          <Loader2 className="animate-spin" />
+                        ) : t.status === "claimed" ? (
+                          <CircleCheck className="text-emerald-600" />
+                        ) : t.automatable ? (
+                          <Sparkles />
+                        ) : (
+                          <Info />
+                        )}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="flex items-center gap-2">
+                          <span className="min-w-0 flex-1 truncate">{growthTaskLabel(t)}</span>
+                          {t.progress && (
+                            <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
+                              {t.progress}
+                            </span>
+                          )}
+                        </span>
+                        {/* 第二行：状态 + 为何做不了。两者都要，缺一个用户就得猜。 */}
+                        <span className="mt-0.5 block whitespace-normal text-[11px] leading-4 text-muted-foreground">
+                          {t.status_text}
+                          {growthTaskHint(t) ? ` · ${growthTaskHint(t)}` : ""}
+                        </span>
+                      </span>
+                    </DropdownMenuItem>
+                  ))
+                )}
+
+                <DropdownMenuSeparator />
+                <DropdownMenuLabel>备注</DropdownMenuLabel>
                 {/* 备注：授权进来的账号常只带邮箱/手机号/随机 uid，看不出「这是谁的号」，
                     因此给一个自定义标签。文案随是否已有备注变化，避免用户以为要重填。 */}
                 <DropdownMenuItem onSelect={() => setNoteOpen(true)}>

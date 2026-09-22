@@ -279,8 +279,8 @@ func (h *Handler) fetchModelsForRegion(region auth.Region) []upstream.ModelInfo 
 //	② 那个 Qoder 账号（domain=qoder.com.cn）没有 `product` 字段，
 //	   `ProductOf()` 把空串归一成 workbuddy ⇒ 被当成 WorkBuddy 账号；
 //	③ `qoder.com.cn` 不以 `.ai` 结尾 ⇒ `Region()` 判成 **cn**；
-//	④ `ProbeUIDs()` 按 **uid 字典序**排序 ⇒ `019f1772…` 排在
-//	   `11b8eb03…` / `1f3c55e5…` 之前 ⇒ **它被选中国服探测**；
+//	④ `ProbeUIDs()` 按 **uid 字典序**排序 ⇒ `{qoder-uid}…` 排在
+//	   `{exp-uid}…` / `1f3c55e5…` 之前 ⇒ **它被选中国服探测**；
 //	⑤ 拿 Qoder 的 token 去打 WorkBuddy 的 `/v3/config` ⇒ **空清单**；
 //	⑥ `len(infos)==0` ⇒ 判定国服"没拉到" ⇒ 所有 cn 侧模型都带
 //	   `unverified_regions=[cn]` ⇒ 界面说「国服未检测到真值」。
@@ -693,8 +693,27 @@ type productChannel struct {
 	Product string
 	// Label 给人看的名字（界面直接显示这个）。
 	Label string
-	// Regions 该平台在哪些区域提供此模型（可能为空）。
-	Regions []string
+	// Region 本渠道所属区域码（"cn" / "intl"；空 = 该平台不分区）。
+	//
+	// # 为什么从 Regions []string 改成单值（2026-09-21 所有者要求）
+	//
+	// 所有者原话：「模型清单 也要显示出 对应平台的倍率」+「分区域各列一行」。
+	//
+	// 倍率**按区域不同**（实测 deepseek-v4.1-flash 国服计费、国际版免费），
+	// 所以一个渠道只能属于一个区域 —— 否则一个渠道要承载两个倍率，
+	// 必然有一个显示错。改单值后，两区就是两条渠道、界面两行。
+	Region string
+	// CreditMultiplier 该渠道（= 该平台在该区域）的计费倍率。
+	//
+	// 与 regionCapability.CreditMultiplier 同一套三态语义：
+	// nil = 上游未声明（**不是**免费）。
+	CreditMultiplier *float64
+	// HasMultiplier 该平台**是否有倍率概念**。
+	//
+	// 为什么要与 nil 分开：ZCode 目前没有倍率数据源，它既不是"倍率 0"
+	// 也不是"未声明"，而是"这个平台没有这个概念"。三种状态在界面上
+	// 要表达不同（`x0.5` / `—` / 不显示倍率列），故必须能区分。
+	HasMultiplier bool
 }
 
 // channelLabels 平台标识 → 显示名。
@@ -764,7 +783,36 @@ func (h *Handler) mergedModelList() []map[string]any {
 			addID(mi.ID)
 		}
 	}
-	for _, entries := range [][]map[string]any{staticModels, staticModelsIntl} {
+	// 静态表：**只补该区域真值没取到的那一侧**（2026-09-21 修正）。
+	//
+	// # 为什么必须按区域判断（所有者报的缺陷）
+	//
+	// 所有者原话：
+	//
+	//	「国际版既然不支持，为什么你还能跑出来这个模型？接口返回没有就不要
+	//	  搞出来，懂吗？」
+	//
+	// 旧代码无条件把两张静态表的**全部**模型加进 order，于是国际版真值里
+	// 没有的 `hy4-preview`（它只被写进了国际版静态表）照样出现在
+	// `/v1/models` 里 —— 清单宣称了一个用不了的模型。
+	//
+	// 静态表是手抄的、必然过期（本文件 FromStatic 的注释已强调"静态表只该
+	// 用来提供信息，不该用来否定存在"）。此处是它的对偶：**有真值时，
+	// 静态表也不该用来宣称存在**。
+	//
+	// 分区域判断而不是"任一区有真值就全不用"：国服可能拉到、国际版拉不到，
+	// 此时只有国际版那一侧需要兜底。
+	for region, entries := range map[auth.Region][]map[string]any{
+		auth.RegionCN:   staticModels,
+		auth.RegionIntl: staticModelsIntl,
+	} {
+		dyn := cnInfos
+		if region == auth.RegionIntl {
+			dyn = intlInfos
+		}
+		if len(dyn) > 0 {
+			continue // 该区域有真值 → 静态表不参与宣称
+		}
 		for _, m := range entries {
 			if id, _ := m["id"].(string); id != "" {
 				addID(id)
@@ -829,15 +877,69 @@ func (h *Handler) mergedModelList() []map[string]any {
 	}
 	// ② WorkBuddy 的模型：补「workbuddy:模型名」与区域组合，
 	//    以及**纯区域**前缀（`国际版:模型名`）—— 那是老客户端就在用的写法。
-	for _, entries := range [][]map[string]any{staticModels, staticModelsIntl} {
+	//
+	// ⚠ 同样按区域判断真值（2026-09-21）：别名是"这个写法能用"的**承诺**，
+	// 给真值里没有的模型编一个区域别名，与把它写进 order 是同一种错误 ——
+	// 用户看到 `国际版:hy4-preview` 就会去用它。
+	//
+	// 三种写法都要给（所有者要求的四种路由写法里，WorkBuddy 占三种）：
+	//
+	//	workbuddy:模型名         只指定平台
+	//	workbuddy:国服:模型名     平台 + 区域（三段）
+	//	国服:模型名               只指定区域
+	//
+	// 无区域的那几种（`workbuddy:模型名` / 裸名）只要该模型**在任何一区**
+	// 真实存在就有意义（网关会自己选区），故下面两条对两区都补。
+	{
+		// 先补"与区域无关"的两条：取自两区真值的并集（静态兜底同理）。
+		ids := map[string]bool{}
+		for _, infos := range [][]upstream.ModelInfo{cnInfos, intlInfos} {
+			for _, mi := range infos {
+				ids[mi.ID] = true
+			}
+		}
+		// 两区都没拉到真值 → 退回静态表（否则清单会空掉）。
+		if len(ids) == 0 {
+			for _, entries := range [][]map[string]any{staticModels, staticModelsIntl} {
+				for _, m := range entries {
+					if id, _ := m["id"].(string); id != "" {
+						ids[id] = true
+					}
+				}
+			}
+		}
+		for id := range ids {
+			addAlias(id, productWorkBuddy+":"+id)
+		}
+	}
+	// 再按区域补「平台:区域:模型名」与「区域:模型名」—— 只在**该区真值有它**时补。
+	for region, entries := range map[auth.Region][]map[string]any{
+		auth.RegionCN:   staticModels,
+		auth.RegionIntl: staticModelsIntl,
+	} {
+		dyn := cnInfos
+		if region == auth.RegionIntl {
+			dyn = intlInfos
+		}
+		label := realmLabelOf(region)
+		if label == "" {
+			continue
+		}
+		// 真值可用 → 只用真值；否则退回静态表。
+		if len(dyn) > 0 {
+			for _, mi := range dyn {
+				addAlias(mi.ID, productWorkBuddy+":"+label+":"+mi.ID)
+				addAlias(mi.ID, label+":"+mi.ID)
+			}
+			continue
+		}
 		for _, m := range entries {
 			id, _ := m["id"].(string)
 			if id == "" {
 				continue
 			}
-			addAlias(id, productWorkBuddy+":"+id)
-			addAlias(id, productWorkBuddy+":"+realmIntlCN+":"+id)
-			addAlias(id, realmIntlCN+":"+id)
+			addAlias(id, productWorkBuddy+":"+label+":"+id)
+			addAlias(id, label+":"+id)
 		}
 	}
 
@@ -851,25 +953,117 @@ func (h *Handler) mergedModelList() []map[string]any {
 		}
 	}
 
-	// 组装：id → 提供它的平台集合
+	// 组装：id → 提供它的 (平台, 区域) 集合
+	//
+	// # 每个 (产品, 区域) 一条渠道（2026-09-21 所有者要求）
+	//
+	// 所有者原话：「模型清单 也要显示出 对应平台的倍率」+「分区域各列一行」。
+	//
+	// 倍率按区域不同（实测 deepseek-v4.1-flash 国服计费、国际版免费），
+	// 故每个区域各自成一条渠道，各自带自己的倍率 —— 界面上一行一个。
+	//
+	// 倍率从**同一个 capabilityIndex** 取（`idx.byRegion[region][id]`），
+	// 而不是另起一套查询：那张表已经是「动态真值优先、静态兜底」的
+	// 权威来源，重复取数必然分叉。
 	channels := map[string][]productChannel{}
-	// WorkBuddy：两区动态清单 + 静态表都算它提供的
+	multiplierOf := func(region auth.Region, id string) *float64 {
+		if idx == nil {
+			return nil
+		}
+		m := idx.byRegion[region]
+		if m == nil {
+			return nil
+		}
+		return m[id].CreditMultiplier
+	}
+	// WorkBuddy：两区动态清单各成一条渠道，各自带该区倍率
 	for _, mi := range cnInfos {
-		channels[mi.ID] = appendChannel(channels[mi.ID], productChannel{Product: "workbuddy", Label: channelLabels["workbuddy"], Regions: []string{"cn"}})
+		channels[mi.ID] = appendChannel(channels[mi.ID], productChannel{
+			Product: "workbuddy", Label: channelLabels["workbuddy"],
+			Region:           regionCodeCN,
+			CreditMultiplier: multiplierOf(auth.RegionCN, mi.ID),
+			HasMultiplier:    true,
+		})
 	}
 	for _, mi := range intlInfos {
-		channels[mi.ID] = appendChannel(channels[mi.ID], productChannel{Product: "workbuddy", Label: channelLabels["workbuddy"], Regions: []string{"intl"}})
+		channels[mi.ID] = appendChannel(channels[mi.ID], productChannel{
+			Product: "workbuddy", Label: channelLabels["workbuddy"],
+			Region:           regionCodeIntl,
+			CreditMultiplier: multiplierOf(auth.RegionIntl, mi.ID),
+			HasMultiplier:    true,
+		})
 	}
-	for _, entries := range [][]map[string]any{staticModels, staticModelsIntl} {
+	// 静态表：**只在该区域真值没取到时**才补渠道（真正的"回退"语义）。
+	//
+	// # ⚠ 这是 2026-09-21 修的一个真实缺陷（所有者报的）
+	//
+	// 所有者原话：
+	//
+	//	「国际版既然不支持，为什么你还能跑出来这个模型？接口返回没有就不要
+	//	  搞出来，懂吗？」
+	//
+	// 实测（他自己的 5 个国际版账号）：
+	//
+	//	/v1/models          hy4-preview → channels: [workbuddy/cn, workbuddy/intl]
+	//	/v1/models/regions  国际版真值 22 个模型 **不含 hy4-preview**（有 hy4-preview-f）
+	//
+	// 即：网站在**宣称**国际版支持一个它其实没有的模型。用户按清单写
+	// `workbuddy:国际版:hy4-preview` 就会失败 —— 那正是他遇到的困惑。
+	//
+	// 根因在下面这段循环：它**无条件**把两张静态表的模型都加进渠道，
+	// 哪怕动态真值早就拿到了。于是静态表从"回退"变成了"宣称"。
+	//
+	// 而静态表是**手抄的、必然过期**（本文件其它注释已多次强调这一点，
+	// 例如 FromStatic 字段的注释："静态表只该用来提供信息，不该用来否定存在"）。
+	// 这里补上对偶的一半：**静态表也不该用来宣称存在** —— 有真值时以真值为准。
+	//
+	// # 为什么按区域分别判断
+	//
+	// 国服可能拉到、国际版拉不到（或反之）。只有**拉不到的那一侧**才需要
+	// 静态兜底；另一侧有真值，静态表参与只会造成上面的"编造"。
+	//
+	// 为什么倍率留 nil：手抄表里没有 credits（见 buildCapabilityIndex 的注释）。
+	// HasMultiplier 仍为 true —— WorkBuddy 这个平台**有**倍率概念，
+	// 只是这一条没取到值，界面应显示「—」（不知道）而不是不显示该列。
+	for region, entries := range map[auth.Region][]map[string]any{
+		auth.RegionCN:   staticModels,
+		auth.RegionIntl: staticModelsIntl,
+	} {
+		// 该区域的动态真值取到了吗？取到就不让静态表参与。
+		dyn := cnInfos
+		if region == auth.RegionIntl {
+			dyn = intlInfos
+		}
+		if len(dyn) > 0 {
+			continue
+		}
+		code := regionCodeCN
+		if region == auth.RegionIntl {
+			code = regionCodeIntl
+		}
 		for _, m := range entries {
 			id, _ := m["id"].(string)
 			if id == "" {
 				continue
 			}
-			channels[id] = appendChannel(channels[id], productChannel{Product: "workbuddy", Label: channelLabels["workbuddy"]})
+			channels[id] = appendChannel(channels[id], productChannel{
+				Product: "workbuddy", Label: channelLabels["workbuddy"],
+				Region:           code,
+				CreditMultiplier: multiplierOf(region, id),
+				HasMultiplier:    true,
+			})
 		}
 	}
 	// Qoder / ZCode：来自账号池的缓存清单
+	//
+	// 这两个产品**不按区域分**（它们的账号池不分 cn/intl），故 Region 留空 ——
+	// 一个产品一条渠道。
+	//
+	// 倍率：Qoder 有 `price_factor`（账号级、不分区），但那个值来自
+	// 账号登录时的模型清单，**不在本函数的可见范围内**（本函数只读
+	// h.cfg.ProductModels 的模型名清单）。故这里 HasMultiplier 留 false，
+	// 界面不显示倍率列 —— 宁可不说，也不编一个可能错的数字。
+	// ZCode 目前没有倍率数据源，同上。
 	for _, pm := range productModels {
 		label := channelLabels[pm.Product]
 		if label == "" {
@@ -925,24 +1119,40 @@ func (h *Handler) mergedModelList() []map[string]any {
 	return out
 }
 
-// appendChannel 加一个渠道，去重（同平台只留一条，区域合并）。
-// 去重键是 **Product**：同一平台的多个区域算一条渠道、区域合并显示。
-// 若不去重，WorkBuddy 的国服+国际版会让每个模型都出现两条 "WorkBuddy"，
-// 界面上看起来像重复而不是"两个平台"。
+// appendChannel 加一个渠道，去重键是 **(Product, Region)**。
+//
+// # 为什么去重键从 Product 改成 (Product, Region)（2026-09-21 所有者要求）
+//
+// 所有者原话：
+//
+//	「模型清单 也要显示出 对应平台的倍率」
+//	「分区域各列一行」
+//
+// 计费倍率**是按区域不同的** —— 同名模型在两区可能是不同的后端、
+// 计费也不同。实测（2026-08-18 拉两区 /v3/config）：
+//
+//	deepseek-v4.1-flash   国服 "x0.03"（计费）   国际版 "x0.00"（免费）
+//
+// 旧实现按 Product 合并区域（一条 "WorkBuddy" 带 regions:["cn","intl"]），
+// 那样**一个渠道只能承载一个倍率**，两区不同时必然有一个被显示错。
+// 而"显示错的倍率"比"不显示"更糟：用户会据它判断该烧哪个账号的额度。
+//
+// 故现在一个 (产品, 区域) 一条渠道，各自带自己的倍率 —— 界面上一行一个，
+// 正是所有者要的"分区域各列一行"。
+//
+// ⚠ 无区域的渠道（如 Qoder/ZCode 这类不分区、或静态兜底表条目）
+// 用 Region == "" 表示，同产品只留一条。
 func appendChannel(list []productChannel, c productChannel) []productChannel {
 	for i := range list {
-		if list[i].Product == c.Product {
-			for _, r := range c.Regions {
-				dup := false
-				for _, have := range list[i].Regions {
-					if have == r {
-						dup = true
-						break
-					}
-				}
-				if !dup {
-					list[i].Regions = append(list[i].Regions, r)
-				}
+		if list[i].Product == c.Product && list[i].Region == c.Region {
+			// 同 (产品, 区域) 已存在：倍率取**已声明的那个**。
+			//
+			// 为什么是"已声明优先"而不是"后来的覆盖"：同一条渠道可能被
+			// 多个来源追加（动态真值 + 静态兜底），而静态表**不编造倍率**
+			//（见 buildCapabilityIndex 的注释）。若让 nil 覆盖了真值，
+			// 用户会看到"未声明"而不是真实倍率。
+			if list[i].CreditMultiplier == nil && c.CreditMultiplier != nil {
+				list[i].CreditMultiplier = c.CreditMultiplier
 			}
 			return list
 		}
@@ -954,12 +1164,33 @@ func appendChannel(list []productChannel, c productChannel) []productChannel {
 //
 // 同时给 `product`（稳定标识，程序用）与 `label`（显示名，界面用）：
 // 只给标识会让界面自己去映射，只给显示名则界面没法按平台过滤。
+//
+// # 倍率字段 `creditMultiplier` 的三态（2026-09-21 新增）
+//
+//	数字  → 上游声明的倍率
+//	null  → 上游**未声明**（不知道，**不是**免费）
+//	缺席  → 该平台没有倍率概念（ZCode 目前如此）
+//
+// ⚠ 三种状态必须可区分：把 null 当成 0（免费）会让用户以为不扣积分，
+// 而它可能正在烧额度。这与 `regionCapability.CreditMultiplier` 的三态
+// 语义逐字一致（见那里的注释）。
+//
+// 同时下发 `region`：界面要按区域分组/拆行显示，而 `regions`（复数）
+// 是旧字段，保留它是为了向后兼容（旧前端仍在读）。
 func channelsToJSON(chs []productChannel) []map[string]any {
 	out := make([]map[string]any, 0, len(chs))
 	for _, c := range chs {
 		e := map[string]any{"product": c.Product, "label": c.Label}
-		if len(c.Regions) > 0 {
-			e["regions"] = c.Regions
+		if c.Region != "" {
+			// 单数 region：本渠道（= 本行）属于哪个区域。
+			e["region"] = c.Region
+			// 兼容旧消费方：它读的是 regions 数组。
+			e["regions"] = []string{c.Region}
+		}
+		if c.HasMultiplier {
+			// 显式写 null 表示"未声明"——JSON 里 nil 会被序列化成 null，
+			// 这正是我们要的三态中间态。
+			e["creditMultiplier"] = c.CreditMultiplier
 		}
 		out = append(out, e)
 	}
@@ -1017,16 +1248,22 @@ func (h *Handler) productRegions(product string) []auth.Region {
 //
 // 配置缺失时返回空：模型清单退化成只有 WorkBuddy 的，**不报错** ——
 // 缺一份可选配置不该让整个 /v1/models 失败。
+//
+// ⚠ 读的是 `DynamicSnapshot()` 而不是 `h.cfg`（2026-09-21）：宿主在
+// 新增/刷新账号后会重写配置文件，那份更新靠热重载进到这里 ——
+// 读 `h.cfg` 会永远停在启动时的旧清单，表现为"加了 Qoder/ZCode 账号
+// 但模型清单里始终没有它们"（所有者报的缺陷）。
 func (h *Handler) productModels() []productModel {
 	var out []productModel
+	models := h.DynamicSnapshot().ProductModels
 	// 顺序稳定：按产品名排序，让输出的渠道顺序可复现
-	products := make([]string, 0, len(h.cfg.ProductModels))
-	for p := range h.cfg.ProductModels {
+	products := make([]string, 0, len(models))
+	for p := range models {
 		products = append(products, p)
 	}
 	sort.Strings(products)
 	for _, p := range products {
-		for _, id := range h.cfg.ProductModels[p] {
+		for _, id := range models[p] {
 			id = strings.TrimSpace(id)
 			if id != "" {
 				out = append(out, productModel{ID: id, Product: p})

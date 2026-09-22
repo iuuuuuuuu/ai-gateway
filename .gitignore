@@ -94,3 +94,7 @@ src-tauri/tauri.dev-sandbox.conf.json
 # 这些只应上传到 GitHub Release，不入库：安装包 11 MB 量级，进 git 历史后
 # 永远删不掉，且公开仓库没必要存二进制。发布走 release.yml 或 gh release upload。
 /dist-bin/
+
+# 测试可能留下的池状态文件（不应提交）
+go-gateway/internal/pool/test-*
+

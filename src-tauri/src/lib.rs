@@ -4,6 +4,12 @@ mod commands;
 mod commands_apps;
 // 本地 MITM 代理的命令层（系统代理编排 + 事件转发）
 mod commands_proxy;
+// ZCode 验证码求解：用宿主自带的 WebView2 跑阿里云官方 SDK。
+//
+// 为什么需要它：ZCode 对话通道要求 `X-Aliyun-Captcha-Verify-Param`，
+// 而此前靠 Node + happy-dom **模拟**浏览器求解（成功率约 40%，且要求用户装 Node）。
+// WebView2 是真实浏览器环境（Win10/11 预装、零体积），实测 0.9 秒拿到 param。
+mod captcha_webview;
 #[cfg(desktop)]
 mod tray;
 
@@ -16,6 +22,31 @@ const SCREENSHOT_DEMO_ENV: &str = "AI_GATEWAY_SCREENSHOT_DEMO";
 
 pub(crate) fn is_screenshot_demo() -> bool {
     std::env::var(SCREENSHOT_DEMO_ENV).as_deref() == Ok("1")
+}
+
+/// 生成一个随机令牌（用于本地求解服务的鉴权）。
+///
+/// 为什么不用固定的：这个令牌是**同机 IPC 的唯一门槛**。固定值等于没有 ——
+/// 任何能读到本仓库（开源）的进程都能调我们的求解端口，把每次求解
+/// 变成"替别人向上游发请求"。
+///
+/// 不引入 `rand` 依赖：本仓库没用到它，而为 16 字节随机值加一个 crate
+/// 不值得。改用系统时间 + 进程 id + 地址熵混哈希 —— 对"防误用"这个
+/// 威胁模型足够（对手是同机的普通用户进程，不是密码学攻击者）。
+fn random_token() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id() as u128;
+    let addr = &nanos as *const _ as u128;
+    // 简易混合：异或 + 乘法扩散，再取十六进制
+    let mut x = nanos ^ (pid << 64) ^ addr;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    format!("{x:032x}")
 }
 
 /// 后台循环：自动签到启动即核验、每 30 分钟补签；自动轮换每 30 秒检查；每天一次保活。
@@ -166,6 +197,30 @@ pub fn run() {
 
     let app = builder
         .setup(|app| {
+            // ZCode 验证码求解服务（WebView2）。
+            //
+            // 必须在 setup 里**尽早**注册 state 并启动：网关启动时就要拿到
+            // 求解服务地址（见 `zcode_captcha_solver_url` 的透传），
+            // 晚注册会让"第一次 ZCode 对话"拿不到地址而回退到本地 Node 求解
+            //（那正是我们要摆脱的路径）。
+            //
+            // 令牌用随机值：同机其它进程能扫到端口，而每次求解都会向上游发请求；
+            // 没有令牌就可能被当成免费求解器刷。
+            {
+                let token = random_token();
+                let state = captcha_webview::CaptchaWebviewState::new(token);
+                app.manage(state);
+                captcha_webview::spawn_solver_server(app.handle().clone());
+                // 预热：提前建隐藏窗口并加载官方 SDK。
+                //
+                // 为什么必须做（所有者反馈「首次对话 29 秒」）：
+                // 那 29 秒的三段成本里，"建 WebView2 窗口"与"下载 SDK"都**只付一次**；
+                // 在用户发请求之前先付掉，用户就感受不到。
+                //
+                // 只加载 SDK、不发起验证请求 —— 后者需要上游下发的
+                // scene/region/prefix，且无谓的验证请求本身是风控关注点。
+                captcha_webview::warmup_prefetch(app.handle().clone());
+            }
             #[cfg(desktop)]
             {
                 tray::setup(app)?;
@@ -288,6 +343,8 @@ pub fn run() {
             commands::save_gateway_config,
             commands::run_gateway_task,
             commands::run_growth_task,
+        commands::sms_send,
+        commands::sms_verify,
             commands::check_gateway_port,
             commands::kill_gateway_port_holder,
             commands::get_gateway_port_holder,
@@ -301,6 +358,13 @@ pub fn run() {
             commands::restart_gateway,
             commands::sync_gateway_accounts,
             commands::get_gateway_usage,
+            // ZCode 验证码求解（WebView2）：状态查询。
+            //
+            // ⚠ 曾经还有一个 `captcha_webview_result`（求解页回报 param）。
+            // 页面已改用同源 fetch（见 captcha_webview 的 SOLVER_PAGE_PATH 注释），
+            // 那条入口连同命令一起删了 —— 留着会让"结果从哪来"含糊，
+            // 且会诱使后来者再用 IPC（那里有两个静默坑）。
+            captcha_webview::captcha_webview_status,
             // 一键导入：接入本机 AI 客户端
             commands::detect_agent_clients,
             commands::get_gateway_models,
@@ -380,6 +444,7 @@ pub fn run() {
             // ---- 本地 MITM 代理（设备身份隔离 + 凭证抓取） ----
             commands_proxy::proxy_config,
             commands_proxy::proxy_status,
+        commands_proxy::proxy_check,
             commands_proxy::proxy_start,
             commands_proxy::proxy_stop,
             commands_proxy::proxy_cert_status,

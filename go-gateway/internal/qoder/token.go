@@ -129,14 +129,83 @@ func (c *Cred) RefreshToken(ctx context.Context, hc *http.Client) error {
 // 方式 A：OAuth PKCE 设备流登录
 // ---------------------------------------------------------------------------
 
-// oauthClientID Qoder 桌面客户端的 client_id。
+// oauthClientID Qoder 官方客户端的 client_id（**从官方 app.asar 源码读出**）。
 //
-// 实测（2026-09-18）：**同一个 client_id 在国服与国际版都被接受**
-//（两区授权页均 302 进入登录页），所以不需要为国际版单独申请。
-const oauthClientID = "1c5e33e1-364d-4ce6-b02c-acaa81274a5c"
+// # ⚠⚠ 这里此前是错的，导致国际版登录失败（2026-09-22 修）
+//
+// 旧值 `1c5e33e1-364d-4ce6-b02c-acaa81274a5c` 的注释写着
+// 「实测同一个 client_id 在国服与国际版都被接受（两区授权页均 302）」——
+// **那个实测方法本身是错的**：`/device/selectAccounts` 对**任何**
+// client_id 都回 302 进登录页，**不校验**。真正的校验发生在
+// 用户在授权页点「确认」那一刻，而那时才返回「参数无效」。
+//
+// 于是这条"实测"把两个区都判成了通过，掩盖了真实差异。
+//
+// # 真正的值（来源可靠：官方客户端自己的代码）
+//
+// 从**两个**官方客户端的 `resources/app.asar` 里读出，**完全一致**：
+//
+//	%LOCALAPPDATA%\Programs\Qoder\resources\app.asar      （国际版）
+//	%LOCALAPPDATA%\Programs\Qoder CN\resources\app.asar   （国服）
+//	    authClientIds: { prod: "732aef47-…", test: "732aef47-…" }
+//
+// 取证方式：在该 asar 里搜 `authClientIds`。**两个客户端用同一个
+// client_id**，所以这里不需要按区域分。
+//
+// ⚠ 这个值可以用环境变量 `QODER_AUTH_CLIENT_ID` 覆盖（官方客户端
+// 就是这么写的，见其 `Kje()` 函数）—— 保留同样的能力，便于将来上游改值
+// 时不必重新打包。见 `clientID()`。
+const oauthClientIDDefault = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa"
 
-// oauthRedirectURI 授权回调（客户端自定义 scheme，不需要本地起服务）。
-const oauthRedirectURI = "qoder-work-cn://"
+// oauthEnvClientID 允许用环境变量覆盖 client_id（对齐官方客户端行为）。
+const oauthEnvClientID = "QODER_AUTH_CLIENT_ID"
+
+// clientID 返回本次登录该用的 client_id。
+//
+// 优先环境变量（便于上游改值时热修），否则用从官方客户端读出的默认值。
+func clientID() string {
+	if v := strings.TrimSpace(os.Getenv(oauthEnvClientID)); v != "" {
+		return v
+	}
+	return oauthClientIDDefault
+}
+
+// oauthRedirectURIDefault 授权回调 scheme。
+//
+// # ⚠ 同样是按官方源码改正的（2026-09-22）
+//
+// 官方两个客户端**不同**：
+//
+//	国际版 app.asar: authRedirectUris: { stable: "qoder-app://", canary: "qoder-canary://" }
+//	国服   app.asar: authRedirectUris: { stable: null,           canary: null }
+//
+// 即**国服根本不传 redirect_uri**，国际版传 `qoder-app://`。
+//
+// 旧代码两区都用 `qoder-work-cn://` —— 那是个**从未注册过**的协议
+//（实测本机 HKCR 只有 `qoder` 与 `qoder-cn`）。
+//
+// ⚠ 注意：设备流的 token 是靠 **poll** 拿的，浏览器回调失败**不影响**
+// 登录结果（所有者实测：回调没打开客户端，登录照样成功）。
+// 但 `redirect_uri` 仍要跟官方一致 —— 上游在**授权提交**时校验它，
+// 传一个未注册的 scheme 正是"参数无效"的来源之一。
+const oauthRedirectURIStable = "qoder-app://"
+
+// oauthEnvRedirectURI 允许用环境变量覆盖 redirect_uri。
+const oauthEnvRedirectURI = "QODER_AUTH_REDIRECT_URI"
+
+// redirectURIFor 返回该区域该用的 redirect_uri；空串 = **不传该参数**。
+//
+// 国服返回空（官方就是 null），国际版返回 `qoder-app://`。
+func redirectURIFor(r Region) string {
+	if v := strings.TrimSpace(os.Getenv(oauthEnvRedirectURI)); v != "" {
+		return v
+	}
+	if r == RegionIntl {
+		return oauthRedirectURIStable
+	}
+	// 国服：官方不传。传了反而可能被判参数不符。
+	return ""
+}
 
 // LoginSession 一次登录过程的状态（发起与轮询之间传递）。
 type LoginSession struct {
@@ -163,11 +232,22 @@ func LoginStart(region Region) (*LoginSession, error) {
 	nonce := NewUUID()
 	machineID := NewUUID()
 
-	base := region.Website()
-	authURL := fmt.Sprintf(
-		"%s/device/selectAccounts?challenge=%s&challenge_method=S256&nonce=%s&machine_id=%s&client_id=%s&redirect_uri=%s",
-		base, challenge, nonce, machineID, oauthClientID, url.QueryEscape(oauthRedirectURI),
-	)
+	// 参数顺序与官方 `zje()` 一致：
+	//	challenge, challenge_method, nonce, machine_id, client_id[, redirect_uri]
+	//
+	// ⚠ `redirect_uri` **只在非空时才拼**（官方是
+	// `...e.redirectUri ? { redirect_uri: e.redirectUri } : {}`）——
+	// 国服传一个空参数与"不传"在上游看来可能不同，按官方来。
+	q := url.Values{}
+	q.Set("challenge", challenge)
+	q.Set("challenge_method", "S256")
+	q.Set("nonce", nonce)
+	q.Set("machine_id", machineID)
+	q.Set("client_id", clientID())
+	if ru := redirectURIFor(region); ru != "" {
+		q.Set("redirect_uri", ru)
+	}
+	authURL := region.Website() + "/device/selectAccounts?" + q.Encode()
 	return &LoginSession{
 		Verifier:  verifier,
 		Nonce:     nonce,

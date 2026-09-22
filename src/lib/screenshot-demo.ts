@@ -529,6 +529,31 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "qoder_import_from_client":
       return { imported: 0, failed: 0, enriched: 0, enrichError: "" };
 
+    // ---- 网关配置（Qoder / ZCode 的「配置」弹窗要读它）----
+    //
+    // 那两个弹窗里的「权益自动领取」开关初始值取自 `get_gateway_config`
+    // 的 `product_tasks_enabled`。缺这条会给默认分支抛异常 ⇒
+    // **弹窗里的开关显示不出来**（只有一块空卡片），走查时看不到真实样式。
+    //
+    // 演示值取 `true`：与真实首装默认一致（缺键即 true），
+    // 这样截图里看到的是"功能开着"的正常态。
+    case "get_gateway_config":
+      return {
+        config: {
+          enabled: true,
+          port: 7864,
+          listen: ":7864",
+          api_key: "sk-demo",
+          auto_start: true,
+          mode: "multi_product",
+          product_tasks_enabled: true,
+          activity_report_count: 3,
+          last_status: "running",
+        },
+      };
+    case "get_gateway_status":
+      return { running: true, port: 7864, pid: 12345, accounts: demoAccounts.length };
+
     default: throw new Error(`演示模式缺少只读数据: ${command}`);
   }
 }

@@ -13,8 +13,8 @@ package server
 //	② 那个 Qoder 账号（domain=qoder.com.cn）没有 `product` 字段，
 //	   `ProductOf()` 把空串归一成 workbuddy ⇒ 被当成 WorkBuddy 账号；
 //	③ `qoder.com.cn` 不以 `.ai` 结尾 ⇒ `Region()` 判成 **cn**；
-//	④ `ProbeUIDs()` 按 **uid 字典序**排序 ⇒ `019f1772…` 排在
-//	   `11b8eb03…` 之前 ⇒ **它被选中国服探测**；
+//	④ `ProbeUIDs()` 按 **uid 字典序**排序 ⇒ `zzzz0001…` 排在
+//	   `{exp-uid}…` 之前 ⇒ **它被选中国服探测**；
 //	⑤ 拿 Qoder 的 token 去打 WorkBuddy 的 `/v3/config` ⇒ **空清单**；
 //	⑥ `len(infos)==0` ⇒ 判定国服"没拉到" ⇒ 全部 cn 侧模型带
 //	   `unverified_regions=[cn]`。
@@ -27,7 +27,7 @@ package server
 // 我最初只能看到 `last_error: <时间戳>`，查不出国服为什么失败 ——
 // 我的独立探针用**同一个 exe、同一份配置**能拉到 16 个国服模型，
 // 而网关拉不到。补上 `last_error_message` 后一步就定位到
-// 「账号 019f1772 → models api returned empty list」。
+// 「账号 zzzz0001 → models api returned empty list」。
 // 故 `last_error_message` 也必须由测试锁定（见下）。
 
 import (
@@ -45,7 +45,7 @@ import (
 func TestProbeSkipsOtherProductsAccounts(t *testing.T) {
 	// Qoder 账号的 uid 故意排在最前（字典序），复现所有者现场的选中顺序。
 	qoderAcct := &auth.Auth{
-		UID:         "019f1772-aaaa", // 字典序在 "cn-1" 之前
+		UID:         "zzzz0001-aaaa", // 字典序在 "cn-1" 之前（占位 uid）
 		AccessToken: "dt-qoder-token",
 		Domain:      "qoder.com.cn",
 		Product:     auth.ProductQoder,
@@ -123,7 +123,7 @@ func TestProbeFailureMessageNamesAccountAndReason(t *testing.T) {
 	})
 	h := NewHandler(Config{
 		Pool: testPoolWith(
-			&auth.Auth{UID: "019f1772-cccc", AccessToken: "t", Domain: "copilot.tencent.com", SoonestExpireAt: 1 << 40},
+			&auth.Auth{UID: "zzzz0001-cccc", AccessToken: "t", Domain: "copilot.tencent.com", SoonestExpireAt: 1 << 40},
 		),
 		Upstream:  up,
 		MaxRotate: 1,
@@ -145,7 +145,7 @@ func TestProbeFailureMessageNamesAccountAndReason(t *testing.T) {
 			"只记时间戳等于没记：我最初就是因为这个查不出国服为什么失败")
 	}
 	// 必须指认**哪个账号**（短 uid 足够）
-	if !contains(msg, "019f1772") {
+	if !contains(msg, "zzzz0001") {
 		t.Errorf("原因里应指认失败的账号（前 8 位 uid），实际：%s", msg)
 	}
 	// 必须说清**为什么**（空清单 / 错误）

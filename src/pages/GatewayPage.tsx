@@ -64,8 +64,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { ModelRoutingList } from "@/components/model-routing-list";
-import { PRODUCT_LABELS, productAccentOf } from "@/lib/product-accent";
+import { ModelRoutingList, REGION_LABEL, multiplierText } from "@/components/model-routing-list";import { PRODUCT_LABELS, productAccentOf } from "@/lib/product-accent";
 import * as api from "@/lib/api";
 import { SENSITIVE_STRING_INPUT_PROPS } from "@/lib/sensitive-input";
 import { useAccountsStore } from "@/stores/accounts";
@@ -200,6 +199,29 @@ const USAGE_STRONG_TEXT = "text-muted-strong";
  * 超过 7 行才提示，避免把"还有内容"这件事变成常驻噪音。
  */
 const USAGE_LIST_VISIBLE_ROWS = 7;
+
+/**
+ * 用量列表里的一行（可能带计费归属）。
+ *
+ * # 为什么可能不带归属
+ *
+ * 三种情况没有归属信息，都必须能表示：
+ *
+ *   ① 旧版本网关不返回 `modelBilling` → 整个列表退化成按模型名一行
+ *   ② 该模型没有计费明细（老数据、或非 WorkBuddy 平台）
+ *   ③ 有明细但只有一份 → 不拆行，仍是一行（但把倍率附上）
+ *
+ * 故归属字段全是可选的：`undefined` 表示"这条没有该信息"，
+ * 与"有信息但值为 null（未声明倍率）"是两件事（见 multiplierText）。
+ */
+type UsageBillingRow = {
+  rowKey: string;
+  model: GatewayUsageGroup;
+  product?: string;
+  region?: string;
+  hasMultiplier?: boolean;
+  creditMultiplier?: number | null;
+};
 
 /**
  * 网关页布局，持久化到 localStorage。
@@ -450,6 +472,7 @@ function UsageBarRow({
   onToggle,
   dataSlot,
   valueSlot,
+  dataRegion,
 }: {
   label: string;
   value: number;
@@ -473,6 +496,19 @@ function UsageBarRow({
    * 测试才能断言「这个 span 的文字本身变了」，而不是「整行里出现过这个数」。
    */
   valueSlot?: string;
+  /**
+   * 本行所属区域码（`cn` / `intl`），写入 `data-region`。
+   *
+   * # 为什么需要它（2026-09-21 所有者要求）
+   *
+   * 所有者要求「国际版和国内版是两个倍率，所以左边应该出现两个
+   * deepseek-v4.1-flash 模型」。拆成两行后，**两行的模型名相同** ——
+   * 测试与自动化若要断言"国际版那一行的用量是 X"，只靠模型名无法区分。
+   *
+   * `data-region` 给它们一个稳定的区分点（视觉上的区分由 label 里的
+   * 区域后缀承担）。
+   */
+  dataRegion?: string;
 }) {
   const percent = max > 0 ? Math.max(3, Math.round((value / max) * 100)) : 0;
   // 可点时必须用真实的 <button>（而不是给 div 挂 onClick）：键盘 Tab / Enter 与
@@ -496,7 +532,7 @@ function UsageBarRow({
       }
     : { className: "space-y-1.5 px-4 py-2 sm:px-5" };
   return (
-    <Root {...(rootProps as Record<string, unknown>)} data-slot={dataSlot}>
+    <Root {...(rootProps as Record<string, unknown>)} data-slot={dataSlot} data-region={dataRegion}>
       <div className="flex items-baseline justify-between gap-3 text-xs">
         <span className="flex min-w-0 items-center gap-1.5">
           {/*
@@ -3370,6 +3406,81 @@ export default function GatewayPage() {
   }, [usageModelsScoped, usageScopeAccount, usageAccountModels, crossByUidModel]);
 
   /**
+   * 把用量列表按**计费归属**拆开（2026-09-21 所有者要求）。
+   *
+   * # 为什么需要它
+   *
+   * 所有者原话：
+   *
+   *   「兼容网关的token用量也要显示出这个模型的倍率（如果有多个 则需要拆开显示）」
+   *
+   * 「多个」= 同一个模型名由多个平台/区域提供，各自倍率不同。网关的
+   * `modelBilling` 已经把用量按 (平台, 区域, 倍率) 拆开记好了，
+   * 这里把它展平成**多行**：每个归属一行，各自带自己的倍率。
+   *
+   * # 为什么不改 `models` 那一份
+   *
+   * `models` 是按模型名聚合的（一行一个模型），下游的筛选、交叉过滤、
+   * 日趋势都建立在"一行一个模型"这个前提上。就地拆开会破坏那些逻辑
+   * （同一个模型名出现两次，`key` 撞车、筛选计数翻倍）。
+   * 故这里只在**渲染前**做一次展平，且仅当该模型确实有多份归属时。
+   *
+   * # 只有一份归属时**不拆**
+   *
+   * 拆开的价值是"让用户看到不同倍率"。只有一份时拆了反而让列表变长、
+   * 每行都重复同样的模型名 —— 那是噪音。故只有 >1 份才拆。
+   */
+  const usageBillingRows = useMemo(() => {
+    const billing = usageSnapshot?.modelBilling;
+    if (!billing) return null; // 旧网关：无倍率信息，退化成按模型名一行
+    const rows: UsageBillingRow[] = [];
+    for (const model of usageModelsDisplay) {
+      const groups = billing[model.key];
+      if (!groups || groups.length === 0) {
+        // 该模型没有计费明细（老数据 / 非 WorkBuddy）—— 原样一行，不带倍率。
+        rows.push({ rowKey: model.key, model });
+        continue;
+      }
+      if (groups.length === 1) {
+        // 只有一份归属：不拆，但把倍率附上（这就是"显示出倍率"）。
+        const g = groups[0];
+        rows.push({
+          rowKey: model.key,
+          model,
+          product: g.product,
+          region: g.region,
+          hasMultiplier: g.hasMultiplier,
+          creditMultiplier: g.creditMultiplier,
+        });
+        continue;
+      }
+      // 多份归属：按用量降序**各列一行**。
+      const sorted = [...groups].sort((a, b) => (b.total ?? 0) - (a.total ?? 0));
+      for (const g of sorted) {
+        rows.push({
+          rowKey: `${model.key}\u0000${g.product ?? ""}\u0000${g.region ?? ""}\u0000${g.creditMultiplier ?? "?"}`,
+          // 每行的数值用**该归属自己的**用量，而不是全局合计 ——
+          // 否则两行显示同样的数字，用户无法判断哪个平台用了多少。
+          model: {
+            ...model,
+            total: g.total ?? 0,
+            records: g.records ?? 0,
+            input: g.input ?? 0,
+            output: g.output ?? 0,
+            cacheWrite: g.cacheWrite ?? 0,
+            cacheRead: g.cacheRead ?? 0,
+          },
+          product: g.product,
+          region: g.region,
+          hasMultiplier: g.hasMultiplier,
+          creditMultiplier: g.creditMultiplier,
+        });
+      }
+    }
+    return rows;
+  }, [usageModelsDisplay, usageSnapshot]);
+
+  /**
    * 「点模型 → 右侧每行的数值换成该模型在该账号上的量」—— 反方向同理。
    *
    * 所有者的要求是**双向**的（「点账号换模型的数字，点模型换账号的数字」）。
@@ -4934,19 +5045,79 @@ export default function GatewayPage() {
                 */}
                 <div className="mt-1 max-h-[420px] overflow-y-auto" data-slot="usage-model-list">
                   {usageModelsDisplay.length > 0 ? (
-                    usageModelsDisplay.map((model) => (
-                      <UsageBarRow
-                        key={model.key}
-                        dataSlot="usage-model-row"
-                        valueSlot="usage-model-value"
-                        label={model.key}
-                        value={model.total}
-                        max={usageMaxModelScoped}
-                        meta={`${exactTokenFormatter.format(model.records)} 次调用 · 输入 ${formatUsageCompact(model.input)} / 输出 ${formatUsageCompact(model.output)}`}
-                        selected={usageCrossModel === model.key}
-                        onToggle={() => toggleUsageModelFilter(model.key)}
-                      />
-                    ))
+                    // 有计费明细时按归属**拆开显示**（每个平台/区域一行，各带倍率）。
+                    // 见 usageBillingRows 的注释：只有一份归属时不拆。
+                    (usageBillingRows ??
+                      usageModelsDisplay.map(
+                        (model): UsageBillingRow => ({ rowKey: model.key, model }),
+                      )
+                    ).map(
+                      (row) => {
+                        const model = row.model;
+                        // 倍率文本：三态（数字 / null=未声明 / 缺省=无此概念）。
+                        const mult = row.hasMultiplier ? multiplierText(row.creditMultiplier) : "";
+                        // 平台+区域标签。
+                        const regionLabel = row.region ? REGION_LABEL[row.region] || row.region : "";
+                        const productLabel = row.product
+                          ? PRODUCT_LABELS[row.product] || row.product
+                          : "";
+                        const srcLabel = [productLabel, regionLabel].filter(Boolean).join(" ");
+                        /*
+                         * # 左边要**按区域各显示一行**（2026-09-21 所有者要求）
+                         *
+                         * 所有者原话：
+                         *
+                         *   「国际版和国内版是两个倍率，所以左边应该出现两个
+                         *     deepseek-v4.1-flash 模型，然后显示对应的计量和倍率」
+                         *
+                         * ⚠ 第一版我只把区域放进了 meta 小字，`label` 仍是裸模型名 ——
+                         * 于是两行看起来**完全一样**，用户根本分不出哪行是国际版。
+                         * 那等于没拆。
+                         *
+                         * # 为什么把区域拼进 label 而不是把倍率拼进去
+                         *
+                         * label 是**这一行的身份**（用户据它区分"我点的是哪一个"），
+                         * 而倍率是它的**属性**（会随上游调整而变）。身份用区域，
+                         * 属性用倍率 —— 两者的稳定性不同，不能互换。
+                         *
+                         * 倍率仍留在 meta 里显示，信息不丢。
+                         *
+                         * ⚠⚠ 2026-09-21 修正：这里此前**只**拼了 `regionLabel`，
+                         * 把上面算好的 `srcLabel`（平台+区域）晾着没用。后果是
+                         * **回填出来的历史行完全看不出平台** —— 因为它们有
+                         * `product` 但没有 `region`（历史数据里没有区域信息），
+                         * 于是 `regionLabel` 为空、label 退化成裸模型名。
+                         *
+                         * 所有者原话：「这个应该持久化平台 显示啊,这要不刚开始
+                         * 都没办法区分」—— 他要的正是"看得见平台"。
+                         *
+                         * 故改用 `srcLabel`：有区域时显示「平台 区域」，
+                         * 只有平台时显示「平台」。两者都比"什么都不显示"强。
+                         */
+                        const label = srcLabel ? `${model.key} · ${srcLabel}` : model.key;
+                        return (
+                          <UsageBarRow
+                            key={row.rowKey}
+                            dataSlot="usage-model-row"
+                            valueSlot="usage-model-value"
+                            // 供测试/自动化按区域定位某一行（两个同名的行只能靠它区分）
+                            dataRegion={row.region || undefined}
+                            label={label}
+                            value={model.total}
+                            max={usageMaxModelScoped}
+                            meta={[
+                              srcLabel,
+                              mult ? `倍率 ${mult}` : "",
+                              `${exactTokenFormatter.format(model.records)} 次调用 · 输入 ${formatUsageCompact(model.input)} / 输出 ${formatUsageCompact(model.output)}`,
+                            ]
+                              .filter(Boolean)
+                              .join(" · ")}
+                            selected={usageCrossModel === model.key}
+                            onToggle={() => toggleUsageModelFilter(model.key)}
+                          />
+                        );
+                      },
+                    )
                   ) : (
                     // 空结果必须给可读说明，且要说清**为什么**空 —— 两级筛选叠加后
                     // 「什么都没有」与「筛没了」是两件事，后者要告诉用户放宽哪一级。

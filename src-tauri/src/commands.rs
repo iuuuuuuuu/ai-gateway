@@ -827,6 +827,28 @@ pub fn save_gateway_config(
     activity_report_count: Option<i64>,
     prompt_mode: Option<String>,
     prompt_file: Option<String>,
+    // Qoder / ZCode 权益活动自动领取**总闸**（2026-09-22 新增）。
+    //
+    // ⚠ 前端必须传 **camelCase** 的 `productTasksEnabled` —— Tauri 的
+    // serde 会把 snake_case 当未知字段**静默丢弃**，表现为
+    // 「关掉了却还在自动领」，且从界面上完全看不出来。
+    //
+    // 2026-09-22 起它是**兜底总闸**：下面两个分产品键优先，缺席时回落它。
+    product_tasks_enabled: Option<bool>,
+    // **Qoder** 权益自动领取（2026-09-22 拆分新增）。camelCase: `qoderClaimEnabled`。
+    //
+    // 三态：`None` = 没配（回落总闸）/ `Some(true)` / `Some(false)`。
+    // ⚠ 保持 `None` 这一态是刻意的 —— 见 types.ts 同名字段的说明。
+    qoder_claim_enabled: Option<bool>,
+    // **ZCode** 套餐自动领取（2026-09-22 拆分新增）。camelCase: `zcodeClaimEnabled`。
+    zcode_claim_enabled: Option<bool>,
+    // Qoder 领取时点（0-23 的整点列表）。camelCase: `qoderClaimHours`。
+    //
+    // ⚠ 用 `Option<Vec<i64>>` 而非 `Vec<i64>`：空数组是合法值
+    //（= 关掉时点制），要能与"没传"区分开。
+    qoder_claim_hours: Option<Vec<i64>>,
+    // Qoder 领取的轮询间隔（分钟，0 = 只用时点）。camelCase: `qoderClaimIntervalMinutes`。
+    qoder_claim_interval_minutes: Option<i64>,
 ) -> Result<Value, String> {
     let mut patch = serde_json::Map::new();
     if let Some(p) = port {
@@ -876,6 +898,25 @@ pub fn save_gateway_config(
     }
     if let Some(n) = activity_report_count {
         patch.insert("activity_report_count".to_string(), json!(n));
+    }
+    // Qoder / ZCode 权益自动领取总开关：与上面各开关同款「传了才覆盖」。
+    // 未传时保留磁盘上的现值（缺键时下游回落 true = 继续自动领）。
+    if let Some(v) = product_tasks_enabled {
+        patch.insert("product_tasks_enabled".to_string(), json!(v));
+    }
+    // 分产品开关（2026-09-22 拆分）：与上面同款「传了才覆盖」。
+    // 未传时保留磁盘现值（缺键 ⇒ 下游回落总闸）。
+    if let Some(v) = qoder_claim_enabled {
+        patch.insert("qoder_claim_enabled".to_string(), json!(v));
+    }
+    if let Some(v) = zcode_claim_enabled {
+        patch.insert("zcode_claim_enabled".to_string(), json!(v));
+    }
+    if let Some(v) = qoder_claim_hours {
+        patch.insert("qoder_claim_hours".to_string(), json!(v));
+    }
+    if let Some(v) = qoder_claim_interval_minutes {
+        patch.insert("qoder_claim_interval_minutes".to_string(), json!(v));
     }
     // 自定义系统提示词：同样「传了才覆盖」，未传则保留磁盘上的现有值 ——
     // 旧客户端不传这两个字段，绝不能把它们重置（那会把用户已配好的提示词抹掉）。
@@ -941,6 +982,20 @@ pub async fn run_growth_task(
         task_code.as_deref().unwrap_or(""),
     )
     .await)
+}
+
+/// 发送短信登录验证码（2026-09-22 新增）。
+///
+/// ⚠ **真实发短信**：会消耗上游配额并触发频控，界面必须做倒计时防连点。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn sms_send(phone: String, region: String) -> Result<Value, String> {
+    Ok(ai_gateway_core::modules::gateway::sms_send(&phone, &region).await)
+}
+
+/// 用验证码换 token 并登记账号（2026-09-22 新增）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn sms_verify(phone: String, sms_code: String, region: String) -> Result<Value, String> {
+    Ok(ai_gateway_core::modules::gateway::sms_verify(&phone, &sms_code, &region).await)
 }
 
 /// 检测端口是否可用。
@@ -1112,10 +1167,11 @@ pub fn stop_gateway() -> Result<Value, String> {
 /// 重启网关（应用新配置/新账号）。
 #[tauri::command]
 pub async fn restart_gateway() -> Result<Value, String> {
-    ai_gateway_core::modules::gateway::stop_gateway();
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    let cfg = ai_gateway_core::modules::gateway::load_gateway_config();
-    ai_gateway_core::modules::gateway::start_gateway(&cfg).await
+    // ⚠ 必须走 `restart_gateway_serialized`，不要在这里各写一份 stop+start：
+    // 后台自动同步（`apply_pending_restart`）与 WebUI 端点也走同一条路径，
+    // 分散写会让它们互相插队 —— 用户点「重启」时看到「网关已在运行」
+    // （2026-09-22 所有者现场）。见 `GATEWAY_RESTART_LOCK` 的注释。
+    ai_gateway_core::modules::gateway::restart_gateway_serialized().await
 }
 
 /// 双向同步账号；auto_reload 时按需重启网关。

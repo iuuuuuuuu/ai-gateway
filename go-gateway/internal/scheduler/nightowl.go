@@ -103,7 +103,11 @@ func (s *Scheduler) runNightOwl(ctx context.Context) {
 			continue
 		}
 		// 与活跃上报共用区域开关（国际版 growth 域不可用）。
-		if !s.checkinScopeAllows(a) {
+		// ⚠ 产品 + 区域闸门，统一走 accountScopeSkip（**单一真相来源**）。
+		// 此前这里只调 checkinScopeAllows（只判区域），于是 Qoder/ZCode
+		// 账号会被当成 WorkBuddy 跑这些任务 —— 打 WorkBuddy 端点吃 401、
+		// 还在账号记录里写下不属于它的任务（见 accountScopeSkip 的长注释）。
+		if _, ok := s.accountScopeSkip(TaskNameNightOwl, a); !ok {
 			continue
 		}
 		if !first {

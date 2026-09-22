@@ -1,5 +1,50 @@
 # ZCode 验证码求解器的**单文件打包**说明
 
+## ⚠ 2026-09-21：主路径已改为宿主的 WebView2，本地 Node 求解降级为回退
+
+**现在正常情况下这份文档里的 Node 求解器不会被用到。**
+
+新的主路径：宿主自带的 **WebView2**（Windows 10/11 预装，零体积）在真实浏览器
+环境里跑阿里云官方 SDK —— 与官方 ZCode 客户端同一做法（已从
+`D:\APP\ZCode\resources\app.asar` 核实）。
+
+数据对比（都是实测）：
+
+| | 本地 Node + happy-dom（旧主路径） | 宿主 WebView2（新主路径） |
+|---|---|---|
+| 安装包体积 | +81MB（要内置 node.exe） | **0**（系统自带） |
+| 单次求解 | 约 3 秒 | **929 毫秒** |
+| 成功率 | 约 40%（调 stallMs 后 88%） | 官方路径 |
+| 环境 | 模拟，被风控盯上 | 真实浏览器 |
+
+实测记录（`uitest/probe-captcha-in-browser.cjs`，有头窗口，脚本触发无人工点击）：
+
+```text
+[+10ms]   initAliyunCaptcha 已调用
+[+600ms]  getInstance 触发
+[+601ms]  调用 startTracelessVerification()
+[+929ms]  success，param 长度 280
+```
+
+### 那这份文档还有什么用
+
+**回退路径仍然保留**：宿主服务不可用时（还没启动完、端口异常、用户环境特殊），
+网关会自动回退到这里描述的本地 Node 求解 —— 有总比完全没有好。
+
+故 `solver.bundle.cjs` 继续随包分发（不到 1MB，单个文件，不拖慢安装）。
+
+### 为什么**不**再内置 node.exe
+
+曾一度把 81MB 的 `node.exe` 放进本目录以解决"用户没装 Node"的问题。
+WebView2 方案落地后已移除 —— 那是本方案要消除的主要代价。
+
+用户若恰好装了 Node，回退路径会自动找到（探测 14 处常见安装位置，
+含 nvm/nvmd/fnm/volta/scoop/choco/winget/官方安装包/程序同目录）。
+
+---
+
+## 以下是**回退路径**的说明（本地 Node 求解）
+
 ## 为什么有这个文件
 
 ZCode 对话通道要求 `X-Aliyun-Captcha-Verify-Param`（实测回

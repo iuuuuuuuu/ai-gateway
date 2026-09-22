@@ -111,6 +111,151 @@ pub async fn proxy_status() -> Value {
     })
 }
 
+/// **检测代理是否真的能用**（2026-09-22 所有者要求：
+/// 「本地代理,配置之后再加上检测按钮」）。
+///
+/// # 为什么需要"检测"而不是只看"运行中"
+///
+/// `proxy_status` 只能告诉你**进程在跑**，不能告诉你：
+///
+///   · 端口是否真的在监听（进程活着但 bind 失败过）
+///   · 系统代理是否真的指向了它（用户手工改过、或被别的软件覆盖）
+///   · CA 证书是否已装（没装的话 HTTPS 全报证书错，而进程一切正常）
+///   · 上游是否能通（配错了目标域名时，请求会 502）
+///
+/// 这四件事**都会让用户觉得"代理坏了"**，而 `running: true` 一个都答不了。
+/// 故本命令逐项检查，并给出**可直接行动**的结论。
+///
+/// # 返回
+///
+/// ```json
+/// { "ok": true, "checks": [
+///     { "name": "端口监听", "ok": true,  "detail": "127.0.0.1:8899 可连接" },
+///     { "name": "系统代理", "ok": false, "detail": "指向 127.0.0.1:9999，与本代理不一致" }
+/// ]}
+/// ```
+///
+/// ⚠ `ok` 是**所有检查项都通过**才为 true —— 界面据此决定显示绿色还是红色，
+/// 不要用"没有失败的"这种含糊口径。
+#[tauri::command]
+pub async fn proxy_check() -> Result<Value, String> {
+    let store = config::store_dir();
+    let port = sys_proxy::last_proxy_port(&store);
+
+    let running = {
+        let guard = proxy_slot().lock().await;
+        guard.as_ref().is_some_and(ProxyServer::is_running)
+    };
+
+    let mut checks: Vec<Value> = Vec::new();
+    let mut all_ok = true;
+    let mut push = |name: &str, ok: bool, detail: String| {
+        all_ok = all_ok && ok;
+        checks.push(json!({ "name": name, "ok": ok, "detail": detail }));
+    };
+
+    // ---- 1. 进程是否在跑 ----
+    push(
+        "代理进程",
+        running,
+        if running {
+            "正在运行".to_string()
+        } else {
+            "未运行 —— 点「启动代理」后重试".to_string()
+        },
+    );
+
+    // ---- 2. 端口是否真的可连接 ----
+    //
+    // ⚠ 用**真实 TCP 连接**而不是查配置里的端口号：
+    // 进程活着但没监听（bind 失败、被防火墙拦）是真实会发生的，
+    // 只看数字会把那种情况判成通过。
+    match port {
+        Some(p) if p > 0 => {
+            let addr = format!("127.0.0.1:{p}");
+            let connected = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                tokio::net::TcpStream::connect(&addr),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+            push(
+                "端口监听",
+                connected,
+                if connected {
+                    format!("{addr} 可连接")
+                } else {
+                    format!("{addr} 连不上 —— 代理可能没真正监听（防火墙或被占用）")
+                },
+            );
+        }
+        _ => push("端口监听", false, "没有记录到端口，请先启动一次代理".to_string()),
+    }
+
+    // ---- 3. 系统代理是否指向本代理 ----
+    //
+    // 这是最常见的"看起来在跑、实际没生效"：系统代理被别的软件改了，
+    // 或用户上次停止时没还原干净。
+    //
+    // ⚠ `get_existing_win_proxy` 返回的是**三元组**
+    // `(启用, ProxyServer, ProxyOverride)`，不是单个字符串。
+    match sys_proxy::get_existing_win_proxy() {
+        Some((_, server, _override)) => {
+            let expected = port.map(|p| format!("127.0.0.1:{p}"));
+            let matches = expected.as_deref().is_some_and(|e| server.contains(e));
+            push(
+                "系统代理",
+                matches,
+                if matches {
+                    format!("已指向本代理（{server}）")
+                } else {
+                    format!("当前是 {server}，与本代理不一致 —— 浏览器流量不会经过本代理")
+                },
+            );
+        }
+        None => push(
+            "系统代理",
+            !running,
+            if running {
+                "系统里没有代理设置 —— 代理在跑但没接管系统代理".to_string()
+            } else {
+                "没有代理设置（代理也未运行，符合预期）".to_string()
+            },
+        ),
+    }
+
+    // ---- 4. CA 证书是否已生成 ----
+    //
+    // 没装证书时 HTTPS 会全部报证书错误，而进程一切正常 ——
+    // 用户很容易误判成"代理坏了"。
+    //
+    // ⚠ 路径口径与 `proxy_cert_status` **必须一致**（都是
+    // `store_dir()/certs`）—— 两边各算一次迟早会算出不同的值，
+    // 而那种错法表现为"检测说没证书、生成按钮说已生成"。
+    let certs = config::store_dir().join("certs");
+    let ca_exists = certs.join("ca.pem").exists() || certs.join("ca.cer").exists();
+    push(
+        "CA 证书",
+        ca_exists,
+        if ca_exists {
+            format!("已生成（{}）", certs.display())
+        } else {
+            "尚未生成 —— 点「生成证书」；未装证书时 HTTPS 会报证书错误".to_string()
+        },
+    );
+
+    Ok(json!({
+        "ok": all_ok,
+        "checks": checks,
+        // 检查时间：界面显示"上次检测于 …"，避免用户看着旧结果判断当前状态
+        "checkedAt": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    }))
+}
+
 /// 启动代理并接管系统代理。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn proxy_start(

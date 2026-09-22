@@ -71,7 +71,7 @@ pub struct ZcodeAccount {
     /// 使用者的反馈：「已授权后,也不显示头像」—— 头像就在客户端
     /// `credentials.json` 的 `oauth:*:user_info` 里，登录后刷新即可补上。
     pub avatar_url: String,
-    /// 上游**账号**标识（如 `19331730795565300`）；空 = 未知。
+    /// 上游**账号**标识（如 `12345678901234567`）；空 = 未知。
     ///
     /// 用途：识别「同一账号的多把 API key」—— 它们的 `uid` 不同
     ///（uid 是凭证哈希），但 `account_id` 相同，在用户看来就是重复。
@@ -111,6 +111,41 @@ pub struct ZcodeAccount {
     pub plan_kind: String,
     /// 生效中的套餐明细（上游原样透传，供界面展示套餐名与说明）。
     pub plans: Vec<Value>,
+    /// **各模型桶**的额度明细（上游 `billing/balance` 的 `balances[]` 原样透传）。
+    ///
+    /// # ⚠⚠ 为什么必须有它（2026-09-21 所有者报的缺陷）
+    ///
+    /// 所有者原话：
+    ///
+    /// > 「那八百万额度，是 glm5.3flash 五百万，三百万 glm5.3，zcode 账号
+    /// >   flash 模型额度我用完了，你优化一下显示，那里应该拆分成两个模型的
+    /// >   额度，而不是一个的」
+    ///
+    /// 上游返回的是**两个独立条目**（`uitest/zcode-config-samples/billing-balance.json`
+    /// 是抓到的真实样本）：
+    ///
+    /// ```text
+    /// show_name = "GLM-5.3"        total_units = 3,000,000
+    /// show_name = "GLM-5.3-Flash"  total_units = 5,000,000
+    /// ```
+    ///
+    /// 而界面只显示合计的 **8,000,000** —— 于是「Flash 用完了」这件事
+    /// **完全看不出来**（它被另一个模型的剩余量掩盖了）。
+    ///
+    /// # 为什么之前没有它
+    ///
+    /// Go 侧 `FetchQuota` **早就**把每个 balance 解析成独立的 `QuotaEntry`，
+    /// CLI 也输出了 `entries`，Rust 的 `refresh_account` 甚至收到了它 ——
+    /// 但**写回账号记录时丢掉了**（本结构体没有对应字段）。
+    /// 于是前端永远只能看到求和值。这是"数据一路都有、最后一跳丢掉"的典型。
+    ///
+    /// # 字段形状（与 Go 的 `zcode-login quota` 输出一致）
+    ///
+    /// ```json
+    /// [{"showName":"GLM-5.3","remaining":3000000,"total":3000000,
+    ///   "used":0,"unitType":"token","expiresAt":…}]
+    /// ```
+    pub quota_entries: Vec<Value>,
 }
 
 impl ZcodeAccount {
@@ -130,6 +165,10 @@ impl ZcodeAccount {
             "planExpireAt": self.plan_expire_at,
             "planKind": self.plan_kind,
             "plans": self.plans,
+            // ⚠ 各模型桶的明细 —— 界面据此**按模型拆开**显示额度。
+            // 没有它就只能显示求和值，而求和会把"某个模型已用完"掩盖掉
+            //（见字段定义处的说明）。
+            "quotaEntries": self.quota_entries,
             "avatarUrl": self.avatar_url,
             "accountId": self.account_id,
             "models": self.models,
@@ -150,20 +189,32 @@ pub fn load_accounts() -> Result<Vec<ZcodeAccount>, String> {
     let doc: Value = serde_json::from_str(&raw).map_err(|e| format!("ZCode 账号库格式错误: {e}"))?;
     let arr = doc.get("accounts").and_then(Value::as_array).cloned().unwrap_or_default();
 
-    let mut out: Vec<ZcodeAccount> = arr
-        .iter()
-        .filter_map(|v| {
-            let uid = v.get("uid").and_then(Value::as_str)?.trim().to_string();
-            if uid.is_empty() {
-                return None;
-            }
-            Some(ZcodeAccount {
-                uid,
-                nickname: str_of(v, "nickname"),
-                note: str_of(v, "note"),
-                provider: str_of(v, "provider"),
-                disabled: v.get("disabled").and_then(Value::as_bool).unwrap_or(false),
-                created_at: str_of(v, "createdAt"),
+    let mut out: Vec<ZcodeAccount> = arr.iter().filter_map(account_from_value).collect();
+    out.sort_by(|a, b| a.uid.cmp(&b.uid));
+    Ok(out)
+}
+
+/// 从账号库里的一个 JSON 对象解析出 `ZcodeAccount`（uid 为空/缺失时返回 None）。
+///
+/// # 为什么抽成独立函数
+///
+/// 原先这段逻辑**内联在 `load_accounts` 里**，导致它无法被单测覆盖 ——
+/// 而"新增字段后老记录能否解析"正是最需要测的一条
+///（解析失败会让所有老账号在升级后凭空消失）。
+///
+/// 抽出来后测试可以直接构造 JSON 调它，不必真的去写账号库文件。
+fn account_from_value(v: &Value) -> Option<ZcodeAccount> {
+    let uid = v.get("uid").and_then(Value::as_str)?.trim().to_string();
+    if uid.is_empty() {
+        return None;
+    }
+    Some(ZcodeAccount {
+        uid,
+        nickname: str_of(v, "nickname"),
+        note: str_of(v, "note"),
+        provider: str_of(v, "provider"),
+        disabled: v.get("disabled").and_then(Value::as_bool).unwrap_or(false),
+        created_at: str_of(v, "createdAt"),
                 last_seen_at: str_of(v, "lastSeenAt"),
                 credits: i64_of(v, "credits"),
                 credits_total: i64_of(v, "creditsTotal"),
@@ -173,6 +224,14 @@ pub fn load_accounts() -> Result<Vec<ZcodeAccount>, String> {
                 plan_kind: str_of(v, "planKind"),
                 plans: v
                     .get("plans")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+                // 各模型桶的额度明细（界面按模型拆开显示用）。
+                // 老账号记录里没有这个字段 ⇒ 空数组 ⇒ 界面回退到显示求和值
+                //（与改动前一致），不会报错也不会显示成 0。
+                quota_entries: v
+                    .get("quotaEntries")
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default(),
@@ -189,11 +248,7 @@ pub fn load_accounts() -> Result<Vec<ZcodeAccount>, String> {
                             .collect()
                     })
                     .unwrap_or_default(),
-            })
-        })
-        .collect();
-    out.sort_by(|a, b| a.uid.cmp(&b.uid));
-    Ok(out)
+    })
 }
 
 /// 原子写回账号库（先写临时文件再 rename）。
@@ -325,6 +380,19 @@ fn apply_patch(a: &mut ZcodeAccount, patch: &Value) {
             "plans" => {
                 if let Some(arr) = v.as_array() {
                     a.plans = arr.clone();
+                }
+            }
+            // 各模型桶的额度明细（2026-09-21 新增）。
+            //
+            // 与 `plans` 同样**允许空数组覆盖**：上游可能真的回一个空
+            // `balances`（套餐刚到期、账号被限），那时留着上次的明细会让
+            // 界面显示已经不存在的额度 —— 比"暂时没有明细"更误导。
+            //
+            // ⚠ 这与 `models` 的取舍相反（那里空数组不覆盖），
+            // 因为 `models` 的抖动多半是网络问题，而额度明细是**当下读数**。
+            "quotaEntries" => {
+                if let Some(arr) = v.as_array() {
+                    a.quota_entries = arr.clone();
                 }
             }
             // 身份字段：由 `refresh_account` 从客户端登录态补上。
@@ -678,6 +746,75 @@ mod tests {
         for k in ["uid", "nickname", "note", "provider", "disabled", "credits", "creditsTotal"] {
             assert!(v.get(k).is_some(), "视图缺少字段 {k}");
         }
+    }
+
+    /// 各模型桶的额度明细必须能**写入**、能**读出**、能**透出给前端**。
+    ///
+    /// # 为什么要专门守它（2026-09-21 所有者报的缺陷）
+    ///
+    /// 所有者原话：
+    ///
+    /// > 「那八百万额度，是 glm5.3flash 五百万，三百万 glm5.3，zcode 账号
+    /// >   flash 模型额度我用完了，你优化一下显示，那里应该拆分成两个模型的
+    /// >   额度，而不是一个的」
+    ///
+    /// 上游按模型分桶（GLM-5.3 = 300 万、GLM-5.3-Flash = 500 万），
+    /// 而界面只显示求和 800 万 —— 「Flash 已用完」被另一个模型的剩余量掩盖。
+    ///
+    /// 根因是**写入端没把这个字段放进 patch**（Go 侧算了、CLI 输出了、
+    /// Rust 也收到了，但没落库）。这条测试把三个环节都钉住：
+    ///
+    ///	① apply_patch 能写入 quotaEntries
+    ///	② to_view 会输出 quotaEntries（键名与前端约定一致）
+    ///	③ 空数组可覆盖（上游真回空 balances 时不该留旧明细）
+    #[test]
+    fn quota_entries_round_trip() {
+        let entries = json!([
+            { "showName": "GLM-5.3",       "remaining": 3000000i64, "total": 3000000i64, "used": 0i64 },
+            { "showName": "GLM-5.3-Flash", "remaining": 0i64,       "total": 5000000i64, "used": 5000000i64 },
+        ]);
+
+        // ① 写入
+        let mut a = ZcodeAccount::default();
+        apply_patch(&mut a, &json!({ "quotaEntries": entries }));
+        assert_eq!(a.quota_entries.len(), 2, "两个模型桶都必须被写入");
+
+        // ② 透出给前端（键名 `quotaEntries` —— 前端按它读，改名会静默变 undefined）
+        let v = a.to_view();
+        let arr = v
+            .get("quotaEntries")
+            .and_then(Value::as_array)
+            .expect("视图必须含 quotaEntries，否则界面只能显示求和值");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].get("showName").and_then(Value::as_str), Some("GLM-5.3"));
+        assert_eq!(arr[1].get("remaining").and_then(Value::as_i64), Some(0));
+
+        // ③ 空数组可覆盖（"这次上游没给明细"要如实反映）
+        apply_patch(&mut a, &json!({ "quotaEntries": [] }));
+        assert!(a.quota_entries.is_empty(), "空数组应能清空明细（套餐到期等场景）");
+    }
+
+    /// 老账号记录（没有 `quotaEntries` 字段）解析后必须是**空数组**而不是报错。
+    ///
+    /// 这个字段是 2026-09-21 新增的，升级前落盘的账号记录里没有它 ——
+    /// 解析失败会让所有老账号在升级后**凭空消失**，那比少一个明细严重得多。
+    /// 空数组的语义是"没有明细" ⇒ 界面回退到只显示求和值（与改动前一致）。
+    #[test]
+    fn legacy_account_without_quota_entries_loads() {
+        let raw = json!({
+            "uid": "zcode-legacy",
+            "nickname": "老账号",
+            "credits": 8000000i64,
+            "creditsTotal": 8000000i64,
+            // 刻意**不含** quotaEntries —— 升级前的形态
+        });
+        let a = account_from_value(&raw).expect("老记录必须仍能解析");
+        assert_eq!(a.uid, "zcode-legacy");
+        assert_eq!(a.credits, 8000000);
+        assert!(
+            a.quota_entries.is_empty(),
+            "缺失字段应解析成空数组（界面据此回退到求和值）"
+        );
     }
 
     // 「停止接流量」开关必须**写进凭证文件**（`account.no_route`）。

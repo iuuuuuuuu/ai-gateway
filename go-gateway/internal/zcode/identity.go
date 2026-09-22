@@ -291,40 +291,53 @@ func osCategory(goos string) string {
 
 // TraceHeaders 返回**追踪头**（对话通道用）。
 //
-// # ⚠⚠ 2026-09-20 重大更正：这些 id 的**生命周期**此前搞错了
+// # ⚠⚠ 2026-09-21：我差点按一条**已被证伪**的注释改错，记录在此
 //
-// 抓包对比官方客户端**相隔 58 分钟**的两次成功请求：
+// 所有者原话：
 //
-//	头                 10:01:26              10:59:12              行为
-//	─────────────────────────────────────────────────────────────────────
-//	x-query-id        01a0bc8b-dd41-…       01a0bcc0-dd41-…       每条消息**不同**
-//	x-request-id      04f0cee5-ab55-…       f816eb32-8fa5-…       每请求**不同**
-//	x-session-id      8fc6b5b0-fb13-…       8fc6b5b0-fb13-…       **完全相同**
-//	x-zcode-trace-id  65638a21-a6ea-…       65638a21-a6ea-…       **完全相同**
+//	「还有zcode为什么在官方就不触发,在你这里就触发,你好好看看官方代码
+//	  还有参考实现 好好排查」
 //
-// 而旧实现**四个全都每请求重新随机生成**（见 git 历史）。
+// 我照着这条线索查了参考实现（`test-bin/ref-zcode2api/app/identity.py` 的
+// `build_trace_headers`），它写着：
 //
-// 为什么这很可能是 3012 的真因：风控看的是**行为模式**。
-// 一个"每发一条消息就换一次 trace-id / session-id"的客户端，
-// 在服务端看来与脚本无异 —— 真实客户端的会话标识在整个会话期内是**稳定的**。
+//	渠道差异（关键，**误发会触发上游 3012 "unusual activity"**）：
+//	  · start-plan（JWT 通道）：只发 3 个头，**不发** x-query-id / x-session-id
+//	  · coding-plan（API Key 通道）：额外发这两个
 //
-// 故现在按生命周期分三类：
+// 看起来完全解释了"官方不触发、我们触发"。**但它是错的。**
 //
-//	每请求新   x-request-id        （官方每请求都换）
-//	每条消息新 x-query-id          （官方每条消息都换）
-//	每会话稳定 x-session-id        （官方会话期内不变）
-//	每会话稳定 x-zcode-trace-id    （官方会话期内不变）
+// 本仓库的 `CAPTURED-SPEC.md` 记着一次 Reqable 抓包，抓的正是
+// start-plan 端点：
 //
-// ## "每会话"的粒度
+//	POST https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages
+//	（providerId = account:zai-start-plan → zcode-plan/anthropic）
 //
-// 我们没有真实会话概念（网关是无状态的），故粒度取"**每账号稳定**"：
-//   · `sessionID` 非空时用它（调用方若能给出真实会话 id 更好）
-//   · 否则用**账号标识**派生（同一账号恒定 → 上游看到的是一个稳定会话）
+// 而官方客户端在该请求里**确实发了**这两个头（逐字值都在文档里）：
 //
-// 这比"每请求随机"接近官方行为得多。真正的会话级复用需要网关层
-// 透传客户端的 session id，那是更大的改动（见 TraceHeaders 的用法）。
+//	x-query-id:    01a0bc8b-d86e-7e99-9808-73c0d0a52642
+//	x-session-id:  8fc6b5b0-fb13-4801-b1de-988f41d14eed
 //
-// ⚠ 每次调用仍要**重新生成** x-request-id / x-query-id（它们本来就该变）。
+// 即：**start-plan 也发这两个头**。参考实现那条注释要么针对别的版本，
+// 要么本身就是错的（CAPTURED-SPEC.md 第 54-60 行已把这个矛盾记下来）。
+//
+// 结论：**不按参考实现改**。抓包是唯一可靠判据（文档原话：
+// 「这条测试的价值不在于锁住 3 或 5，而在于锁住『与抓包一致』」）。
+//
+// 教训：参考实现的注释是**二手信息**，可能过时或针对别的通道/版本；
+// 本项目自己的抓包才是一手证据。改动这类协议细节前先读
+// `CAPTURED-SPEC.md`，不要只凭参考实现的注释。
+//
+// # 生命周期（2026-09-20 抓包实测）
+//
+// 对比官方相隔 58 分钟的两次成功请求：
+//
+//	x-query-id        每条消息**不同**
+//	x-request-id      每请求**不同**
+//	x-session-id      **完全相同**（会话级稳定）
+//	x-zcode-trace-id  **完全相同**（会话级稳定）
+//
+// 故本函数按此生命周期生成（旧实现四个全随机，那与脚本无异）。
 func (i Identity) TraceHeaders() map[string]string {
 	// 会话级稳定值：优先用调用方给的会话 id，否则按账号派生。
 	//
@@ -349,7 +362,7 @@ func (i Identity) TraceHeaders() map[string]string {
 	//
 	// 为什么不直接用 AccountID 本身：官方这两个值是 **UUID 形态**
 	//（上游会对"看着不像 UUID"的值回 429/3001，见 NewDeviceMid 的注释）。
-	// 而账号标识可能是 `zcode-1b2941c020ef` 或长数字 —— 直接发会被拒。
+	// 而账号标识可能是 `zcode-abcdef123456` 或长数字 —— 直接发会被拒。
 	traceID := stableUUID("zcode-trace:" + sessionID)
 	stableSession := stableUUID("zcode-session:" + sessionID)
 	// 若调用方给的就是 UUID 形态的会话 id，直接用它作为 session-id
@@ -360,8 +373,8 @@ func (i Identity) TraceHeaders() map[string]string {
 	return map[string]string{
 		"x-request-id":         newTraceID(), // 每请求新（官方如此）
 		"x-zcode-session-type": "main",
-		"x-zcode-trace-id":     traceID,      // 每会话稳定
-		"x-query-id":           newTraceID(), // 每条消息新（官方如此）
+		"x-zcode-trace-id":     traceID,       // 每会话稳定
+		"x-query-id":           newTraceID(),  // 每条消息新（官方如此）
 		"x-session-id":         stableSession, // 每会话稳定
 	}
 }

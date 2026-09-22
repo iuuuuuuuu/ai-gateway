@@ -160,6 +160,97 @@ func loadSession(authDir, sessionID string) (*LoginSession, error) {
 // 输出一律是**单行 JSON**（宿主按行解析），错误写 stderr 并以非零码退出。
 //
 // 返回值即进程退出码。
+// newCLI 构造一个**已按配置挂好代理**的客户端。
+//
+// # 为什么登录子命令必须自己读代理配置（2026-09-22）
+//
+// 所有者报告 Qoder **国际版登录不可用**。用最小 Go 程序实测根因：
+//
+//	openapi.qoder.sh（国际版 token 端点）
+//	    不加 HTTPS_PROXY → net/http: TLS handshake timeout   ❌
+//	    加  HTTPS_PROXY  → HTTP 404（= 尚未授权，正常）      ✅
+//	openapi.qoder.com.cn（国服）直连也通
+//
+// 即**国际版必须走代理**。而 Go 的 `http.Transport` **只读环境变量**
+//（`HTTP_PROXY`/`HTTPS_PROXY`），**不读 Windows 的 WinINET 系统代理设置**
+//（注册表 `Internet Settings\ProxyServer`）。
+//
+// 宿主（Tauri）把用户填的代理写进 `gateway_native_config.json`，
+// **不设环境变量**（那样会影响整个应用）。于是登录子命令
+// 既读不到系统代理、也读不到配置文件 ⇒ **国际版登录必然失败**。
+//
+// ⚠ 这不是"代理配错了"，是"配置根本没被读" —— 界面上开关看着全对。
+//
+// # 为什么取 intl 的开关
+//
+// `Client` 只有一个出站 client（与 main.go 里 ZCode 的取舍同款），
+// 而 `proxy_scope` 是分区的。登录场景取 **intl**：
+// 国服多挂一层代理不影响正确性；反之会让国际版继续连不上 ——
+// 那正是本次要修的。
+//
+// ⚠ 读不到配置**不报错**，返回裸 `New()`：登录不该因为配置文件
+// 缺失/损坏而完全不可用。
+func newCLI(authDir string) *Client {
+	// ⚠ 这里必须是 `New()`，**不能**是 `newCLI(authDir)` ——
+	// 那样就是无限递归（实测报 `goroutine stack exceeds 1000000000-byte limit`）。
+	// 这个错是我自己批量把 `New()` 替换成 `newCLI(...)` 时，
+	// 把本函数体内这一行也换掉造成的。记在这里防止再犯。
+	c := New()
+	proxy, intl := loadProxyConfig(authDir)
+	if !intl || strings.TrimSpace(proxy) == "" {
+		return c
+	}
+	if err := c.SetProxy(proxy); err != nil {
+		// 地址坏掉时退回直连，并把原因说清楚 —— 静默忽略会让用户
+		// 以为是"代理配了但没用"，而实际是地址根本解析不了。
+		fmt.Fprintf(os.Stderr, "代理地址无效，本次登录将直连：%v\n", err)
+		return c
+	}
+	return c
+}
+
+// loadProxyConfig 从网关配置文件里读出 (代理地址, 是否国际版走代理)。
+//
+// 找不到文件时返回 ("", false) —— 调用方据此走直连。
+func loadProxyConfig(authDir string) (string, bool) {
+	// 配置文件与凭证目录同属一个数据目录：
+	//   <data>/gateway/gateway_native_config.json
+	//   <data>/qoder/auths
+	// 用 authDir 往上找而不是写死 %USERPROFILE% —— 既支持自定义数据目录，
+	// 也让测试能指向临时目录。
+	var candidates []string
+	if d := filepath.Dir(filepath.Dir(authDir)); d != "" {
+		candidates = append(candidates,
+			filepath.Join(d, "gateway", "gateway_native_config.json"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates,
+			filepath.Join(home, ".wb-switch", "gateway", "gateway_native_config.json"))
+	}
+	if env := strings.TrimSpace(os.Getenv("AI_GATEWAY_HOME")); env != "" {
+		candidates = append(candidates,
+			filepath.Join(env, "gateway", "gateway_native_config.json"))
+	}
+
+	for _, p := range candidates {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var doc struct {
+			Proxy      string `json:"proxy"`
+			ProxyScope struct {
+				Intl bool `json:"intl"`
+			} `json:"proxy_scope"`
+		}
+		if json.Unmarshal(raw, &doc) != nil {
+			continue
+		}
+		return strings.TrimSpace(doc.Proxy), doc.ProxyScope.Intl
+	}
+	return "", false
+}
+
 func RunLoginCLI(args []string, defaultAuthDir string) int {
 	if len(args) == 0 {
 		// ⚠ 帮助文案必须与**实际派发的子命令**一致。
@@ -267,7 +358,7 @@ func runQuota(args []string, defaultAuthDir string) int {
 		return 0
 	}
 
-	cli := New()
+	cli := newCLI(*authDir)
 	q, err := cli.FetchQuota(context.Background(), c)
 	if err != nil {
 		writeJSON(map[string]any{"status": "error", "uid": c.UID, "message": err.Error()})
@@ -313,7 +404,7 @@ func runModels(args []string, defaultAuthDir string) int {
 		return 0
 	}
 
-	cli := New()
+	cli := newCLI(*authDir)
 	models, err := cli.FetchModels(context.Background(), c)
 	if err != nil {
 		writeJSON(map[string]any{"status": "error", "uid": c.UID, "message": err.Error()})
@@ -349,7 +440,13 @@ func runModels(args []string, defaultAuthDir string) int {
 // 输出：`{"status":"ok","uid":...,"showCampaign":true,"claimable":true,
 //        "campaignUrl":"...","campaigns":[{...}]}`
 //
-// ⚠ 只查询、**不领取**。领取要阿里云验证码，见 campaign.go 的边界说明。
+// ⚠ 本子命令**只查询**（那是它的职责，不是能力限制）。
+//
+// 此前这里写着「不领取。领取要阿里云验证码」—— **后半句是错的**
+//（2026-09-22 实测纠正）：领取端点 `/sash/api/v1/me/campaigns/{id}/claim`
+// **不需要任何验证码**，与官方客户端点「领取」按钮同构。
+// 领取走 `claim-campaign` / `claim-all-campaigns`。
+// 详见 `campaign.go` 文件头。
 func runCampaigns(args []string, defaultAuthDir string) int {
 	fs := flag.NewFlagSet("qoder-login campaigns", flag.ContinueOnError)
 	uid := fs.String("uid", "", "账号 uid")
@@ -368,7 +465,7 @@ func runCampaigns(args []string, defaultAuthDir string) int {
 		return 0
 	}
 
-	cli := New()
+	cli := newCLI(*authDir)
 	st, err := cli.FetchCampaigns(context.Background(), c)
 	if err != nil {
 		writeJSON(map[string]any{"status": "error", "uid": c.UID, "message": err.Error()})
@@ -415,7 +512,7 @@ func runCampaignsAll(args []string, defaultAuthDir string) int {
 
 	creds, failed, _ := LoadDir(*authDir)
 	accounts := make([]map[string]any, 0, len(creds))
-	cli := New()
+	cli := newCLI(*authDir)
 	var claimableTotal, withClaimable int
 
 	// 先列出加载失败的（有文件但解析不了）—— 如实报，不静默丢
@@ -490,21 +587,32 @@ func countClaimableCLI(campaigns []Campaign) int {
 // 只由用户在界面上显式点击触发。**不做定时自动领取** ——
 // 那与"用户点一下"不是一回事，且会让账号表现出非人类的活动模式。
 // 见 campaign.go 的说明。
-func runClaimAllCampaigns(args []string, defaultAuthDir string) int {
-	fs := flag.NewFlagSet("qoder-login claim-all-campaigns", flag.ContinueOnError)
-	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
-	if err := fs.Parse(args); err != nil {
-		return 2
+// ClaimAllCampaigns 一键领取**所有账号**的可领取权益活动（可复用实现）。
+//
+// # 为什么从 CLI 里抽出来（2026-09-22）
+//
+// 原来的实现整个写在 `runClaimAllCampaigns`（CLI 子命令）里，只有
+// `qoder-login claim-all-campaigns` 能调到。而网关的**定时排程**
+//（`scheduler` 的 `taskQoderClaim`，所有者要求早晚两次）也需要跑同一件事 ——
+// 但它是 Go 内部调用，进不了 CLI。
+//
+// 若不抽出来，就得在调度器里**再写一份**领取逻辑 ⇒ 两份必然分叉，
+// 出现"手动能领、自动领不到"这类问题（ZCode 那边就踩过同型的坑）。
+// 故抽成这个函数，CLI 与调度器**共用**。
+//
+// 返回值的形状与 CLI 的 JSON 输出一致，便于复用同一套解析。
+func ClaimAllCampaigns(ctx context.Context, authDir string) (map[string]any, error) {
+	creds, _, err := LoadDir(authDir)
+	if err != nil {
+		return nil, err
 	}
-
-	creds, _, _ := LoadDir(*authDir)
 	accounts := make([]map[string]any, 0, len(creds))
-	cli := New()
+	cli := newCLI(authDir)
 	var claimedCount, failedCount, nothingCount int
 
 	for _, c := range creds {
 		// 先查该账号有哪些可领的（不重犯"只查一个账号"的错）
-		st, err := cli.FetchCampaigns(context.Background(), c)
+		st, err := cli.FetchCampaigns(ctx, c)
 		if err != nil {
 			failedCount++
 			accounts = append(accounts, map[string]any{
@@ -532,7 +640,7 @@ func runClaimAllCampaigns(args []string, defaultAuthDir string) int {
 
 		done := make([]map[string]any, 0, len(targets))
 		for _, camp := range targets {
-			r, cerr := cli.ClaimCampaign(context.Background(), c, camp.CampaignID)
+			r, cerr := cli.ClaimCampaign(ctx, c, camp.CampaignID)
 			if cerr != nil {
 				failedCount++
 				done = append(done, map[string]any{
@@ -561,13 +669,28 @@ func runClaimAllCampaigns(args []string, defaultAuthDir string) int {
 		})
 	}
 
-	writeJSON(map[string]any{
+	return map[string]any{
 		"status":       "ok",
 		"accounts":     accounts,
 		"claimedCount": claimedCount,
 		"failedCount":  failedCount,
 		"nothingCount": nothingCount,
-	})
+	}, nil
+}
+
+func runClaimAllCampaigns(args []string, defaultAuthDir string) int {
+	fs := flag.NewFlagSet("qoder-login claim-all-campaigns", flag.ContinueOnError)
+	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	out, err := ClaimAllCampaigns(context.Background(), *authDir)
+	if err != nil {
+		writeJSON(map[string]any{"status": "error", "message": err.Error()})
+		return 0
+	}
+	writeJSON(out)
 	return 0
 }
 
@@ -602,7 +725,7 @@ func runClaimCampaign(args []string, defaultAuthDir string) int {
 		return 0
 	}
 
-	cli := New()
+	cli := newCLI(*authDir)
 	r, err := cli.ClaimCampaign(context.Background(), c, *campaignID)
 	if err != nil {
 		writeJSON(map[string]any{"status": "error", "uid": c.UID, "message": err.Error()})
@@ -648,7 +771,7 @@ func runJobToken(args []string, defaultAuthDir string) int {
 		return 0
 	}
 
-	cli := New()
+	cli := newCLI(*authDir)
 	t, err := cli.FetchJobToken(context.Background(), c)
 	if err != nil {
 		writeJSON(map[string]any{"status": "error", "uid": c.UID, "message": err.Error()})
@@ -827,7 +950,7 @@ func runLoginPoll(args []string, defaultAuthDir string) int {
 		return 1
 	}
 
-	c := New()
+	c := newCLI(*authDir)
 	cr, err := LoginPoll(context.Background(), c.HTTP, s, *authDir)
 	if err != nil {
 		// 未授权：这是**正常中间态**，不是错误 —— 宿主据此显示"请继续在浏览器完成授权"

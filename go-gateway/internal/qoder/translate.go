@@ -90,7 +90,7 @@ func agentBody(openAIMessages []map[string]any, modelKey string) ([]byte, error)
 			"features":  []any{},
 			"imageUrls": nil,
 		},
-		"messages": openAIMessages,
+		"messages": normalizeDeveloperRoles(openAIMessages),
 		"business": map[string]any{
 			"id":       NewUUID(),
 			"begin_at": now.UnixMilli(),
@@ -106,6 +106,65 @@ func agentBody(openAIMessages []map[string]any, modelKey string) ([]byte, error)
 // 单独提成常量并写清理由，是因为它看起来"只是个元数据字段"、
 // 很容易被当成无用字段删掉 —— 而删掉它，思考内容就静默没了。
 const modelSourceSystem = "system"
+
+// normalizeDeveloperRoles 把 `developer` 角色改写成 `system`（2026-09-22 修复）。
+//
+// # 所有者现场
+//
+//	「关闭 developer 角色,关闭后就能用了」
+//
+// 修复前的现象是**对话根本发不出去**，每次都报：
+//
+//	503 {"code":"no_healthy_account",
+//	     "message":"上游服务异常（HTTP 503），已切换到其他账号"}
+//
+// 而同一个网关、同一时刻，`zcode:` 与 `curl` 直接发**都是好的** ——
+// 所有者因此反复说「zcode 没问题、qoder 不行」。
+//
+// # 根因
+//
+// 客户端对 `openai-completions` 协议会用 **`developer` 角色替代 `system`**
+//（OpenAI 较新的规范；pi-ai 的 `supportsDeveloperRole` 为 true 时就会这样发）。
+// 而 **qoder 上游只认 `system`**。
+//
+// `agentBody` 此前是 `"messages": openAIMessages` —— 原样透传，
+// 于是带 `developer` 的请求一发给上游就是 503。
+//
+// # 为什么只有 qoder 中招
+//
+// 另外两条上游路径**都已做过**这个规范化：
+//
+//	· `internal/upstream/payload.go:225`（WorkBuddy：明写
+//	  `if role == "developer" { msg["role"] = "system" }`）
+//	· `internal/zcode/translate.go`（ZCode，走 Anthropic 协议时归一化）
+//
+// qoder 是**唯一漏掉的那条**。这解释了"只有 qoder 不行"。
+//
+// # ⚠ 复现的关键是组合，不是 `developer` 本身
+//
+//	developer 单独发（不带 tools、非流式）    → 上游**容忍**，200
+//	developer + tools + 流式                  → **必然 503**
+//
+// 只测裸 `developer` 会误判成"没问题"（我第一遍就这么测错了）。
+// 回归测试 `developer_role_test.go` 因此用的是**完整客户端形态**。
+//
+// # 为什么就地改而不是要求客户端别发
+//
+// `developer` 是完全合法的 OpenAI 角色，客户端有权发。
+// 上游不认是我们的适配责任 —— 三条路径里两条已经这么做了，
+// 补上第三条才是"一致"，而不是让用户去关一个标准功能。
+func normalizeDeveloperRoles(messages []map[string]any) []map[string]any {
+	for _, msg := range messages {
+		role, ok := msg["role"].(string)
+		if !ok {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(role), "developer") {
+			msg["role"] = "system"
+		}
+	}
+	return messages
+}
 
 // deriveSessionID 由「模型 + 首条用户文本」**确定性派生** session_id。
 //

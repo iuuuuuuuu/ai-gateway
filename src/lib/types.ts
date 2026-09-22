@@ -726,6 +726,44 @@ export interface GatewayConfig {
   trial_enabled?: boolean;
   /** 每号每日活跃上报条数（默认 3，上限 20）。 */
   activity_report_count?: number;
+  /**
+   * Qoder / ZCode 权益活动**自动领取总闸**（2026-09-22 新增）。
+   *
+   * 缺省（undefined / 缺键）= **true**，即继续自动领 —— 与
+   * `checkin_enabled` 等开关同款语义：老配置保持既有行为，
+   * 只有显式 `false` 才关闭。
+   *
+   * ⚠ 2026-09-22 起它是**总闸**：下面两个分产品开关优先，缺席时回落它。
+   * 界面上**不再单独暴露**这个键（用户看到的是两个分产品开关）——
+   * 它是给存量配置兜底用的，不是给人手改的。
+   */
+  product_tasks_enabled?: boolean;
+  /**
+   * **Qoder** 权益活动自动领取（2026-09-22 拆分新增）。
+   *
+   * ⚠ 三态语义（Go 侧用 `*bool` 实现，这里用 `undefined` 表达同一件事）：
+   *
+   *	undefined → **没配**，回落到总闸 `product_tasks_enabled`
+   *	true      → 显式开
+   *	false     → 显式关
+   *
+   * **必须保留 undefined 这一态**：写成 `?? false` 会让所有存量配置
+   * 变成"关闭"，而活动每天 10:00 (UTC+8) 重置、不领就过期作废。
+   */
+  qoder_claim_enabled?: boolean;
+  /** **ZCode** 套餐自动领取（2026-09-22 拆分新增）。三态语义同 `qoder_claim_enabled`。 */
+  zcode_claim_enabled?: boolean;
+  /**
+   * Qoder 权益活动的**每日领取时点**（本地时间，0-23），缺省 `[10, 21]`。
+   *
+   * 所有者要求：「qoder改为 早十点,晚九点 两次触发,防止错漏」。
+   *
+   * ⚠ 空数组是**合法值**（= 关掉时点制、只靠轮询）—— 界面不要把它
+   * 当成"没配"而回填默认值，否则用户关不掉。
+   */
+  qoder_claim_hours?: number[];
+  /** Qoder 自动领取的轮询间隔（分钟），0 = 只用上面的时点。缺省 20。 */
+  qoder_claim_interval_minutes?: number;
 
   // ---- 自定义系统提示词（写进网关 config.json 的 prompt 块）----
   //
@@ -1237,9 +1275,44 @@ export interface GatewayUsageSnapshot {
    * 缺失（老版本网关）时按「无明细」处理，不回退到假的交叉结果。
    */
   accountModels?: Record<string, GatewayUsageGroup[]>;
+  /**
+   * 模型 → 该模型的**按计费归属拆开**的用量列表（2026-09-21 新增）。
+   *
+   * # 为什么需要它（所有者要求）
+   *
+   * 原话：「兼容网关的token用量也要显示出这个模型的倍率
+   *（如果有多个 则需要拆开显示）」。
+   *
+   * `models` 是按模型名聚合的（一行一个模型），无法承载倍率 —— 同一模型名
+   * 可能由多个平台/区域提供、各自倍率不同（实测 `deepseek-v4.1-flash`
+   * 国服计费、国际版免费），合并成一行只能显示其中一个倍率，必然误导。
+   *
+   * 这里额外给一份按归属拆开的视图，界面据此把同一模型的多份用量分行显示。
+   *
+   * 缺失（老版本网关）时按「无倍率信息」处理，退化成按模型名一行。
+   */
+  modelBilling?: Record<string, GatewayUsageBillingGroup[]>;
   /** 按日期升序的日聚合。 */
   daily?: GatewayUsageGroup[];
   dailyByModel?: Record<string, GatewayUsageGroup[]>;
+}
+
+/**
+ * 一份**带计费归属**的用量（模型 × 平台 × 区域 × 倍率）。
+ *
+ * 倍率三态与 `ModelChannel.creditMultiplier` 同一套语义：
+ * number = 已声明（0 是确定的免费）/ null = 未声明（不是免费）/
+ * 键缺席 = 该平台没有倍率概念。
+ */
+export interface GatewayUsageBillingGroup extends GatewayUsageGroup {
+  /** 平台标识：workbuddy / qoder / zcode。 */
+  product?: string;
+  /** 区域码：cn / intl（缺省 = 该平台不分区）。 */
+  region?: string;
+  /** 该平台是否有倍率概念（false = 界面不显示倍率）。 */
+  hasMultiplier?: boolean;
+  /** 计费倍率；null = 未声明。 */
+  creditMultiplier?: number | null;
 }
 
 /** get_gateway_usage 的统一响应：网关不可达时 usage 为 null 且带 error。 */
@@ -1423,14 +1496,38 @@ export interface GatewayModelItem {
   aliases?: string[];
 }
 
-/** 模型的一个来源平台。 */
+/** 模型的一个来源平台（一个 (平台, 区域) 组合 = 一条）。 */
 export interface ModelChannel {
   /** 稳定标识：`workbuddy` / `qoder` / `zcode`。用于过滤与分组。 */
   product: string;
   /** 显示名：`WorkBuddy` / `Qoder` / `ZCode`。界面直接显示。 */
   label: string;
-  /** 该平台在哪些区域提供此模型（可能缺省）。 */
+  /**
+   * 本渠道所属区域码：`cn` / `intl`（缺省 = 该平台不分区）。
+   *
+   * # 为什么是单值而不是数组（2026-09-21 起）
+   *
+   * 旧字段 `regions` 是数组（同平台多区域合并成一条）。但**计费倍率按区域
+   * 不同** —— 实测 `deepseek-v4.1-flash` 国服 x0.03、国际版 x0.00。
+   * 合并后一条渠道只能承载一个倍率，两区不同时必然有一个显示错，
+   * 而显示错的倍率比不显示更糟：用户会据它判断该烧哪个账号的额度。
+   *
+   * 现在一个 (平台, 区域) 一条渠道，界面上一行一个 —— 即所有者要的
+   * 「分区域各列一行」。
+   */
+  region?: string;
+  /** @deprecated 旧字段（数组），仅为兼容旧网关保留。新代码读 `region`。 */
   regions?: string[];
+  /**
+   * 该渠道的**计费倍率**。三态，必须区分：
+   *
+   * - `number` — 上游声明的倍率（`0` 是**确定的免费**）
+   * - `null`   — 上游**未声明**（不知道，**不是**免费）
+   * - `undefined`（键缺席）— 该平台没有倍率概念（ZCode 目前如此）
+   *
+   * ⚠ 把 `null` 当成 0 会让用户以为不扣积分，而它可能正在烧额度。
+   */
+  creditMultiplier?: number | null;
 }
 
 /** POST /api/gateway/agents/import 接入响应。 */

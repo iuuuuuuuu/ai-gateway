@@ -63,6 +63,14 @@ type growthStub struct {
 	streakCalls  int
 	heatmapCalls int
 	chancesCalls int
+
+	// 盲盒（2026-09-20 新增任务）。默认 affordable=0 = 能量不足 ⇒ 不开盒，
+	// 这样既有测试（只关心礼包/补偿/兑换/抽奖）不受影响。
+	blindboxEnergy      int64
+	blindboxAffordable  int64
+	blindboxReject      int
+	blindboxQuotaCalls  int
+	blindboxBodies      []string
 }
 
 func (g *growthStub) handler() http.HandlerFunc {
@@ -162,6 +170,29 @@ func (g *growthStub) handler() http.HandlerFunc {
 				g.chances--
 			}
 			_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{"prize_code":"c10","prize_name":"10 积分","prize_type":"credit","credit_amount":10}}`))
+
+		case "/activity/growth/buddy/quota":
+			// 盲盒配额（2026-09-20 新增的任务）。
+			//
+			// ⚠ 必须在这里给分支：缺了它假上游会回 404，而
+			// `logGrowthErr` 把 404 当成**真故障**记 WARN ——
+			// 于是 `TestGrowthBenefitsBusinessErrorStaysSilent`
+			// 会因为"多了个未实现的端点"而失败（我加盲盒时就踩到了）。
+			g.blindboxQuotaCalls++
+			body, _ := json.Marshal(map[string]any{
+				"code": 0, "msg": "OK",
+				"data": map[string]any{"balance": g.blindboxEnergy, "affordable": g.blindboxAffordable},
+			})
+			_, _ = w.Write(body)
+
+		case "/activity/growth/buddy/open":
+			g.blindboxBodies = append(g.blindboxBodies, readBody(r))
+			if g.blindboxReject != 0 {
+				w.WriteHeader(g.blindboxReject)
+				_, _ = w.Write([]byte(`{"code":400,"msg":"insufficient energy"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{"results":[{"instance":{"name":"小红花","rarity":3},"template":{"name":"小红花","rarity":"R"}}]}}`))
 
 		case "/billing/meter/claim-gift":
 			g.giftCalls++
@@ -1037,5 +1068,59 @@ func TestLogGrowthErrSilentForBusinessRejection(t *testing.T) {
 	}
 	if upstream.IsBusinessRejection(&upstream.Error{Kind: upstream.ErrServer, Status: 500, Msg: "boom"}) {
 		t.Error("5xx 不是业务拒绝（必须记 WARN，否则故障无人知晓）")
+	}
+}
+
+// TestGrowthBlindboxOpensWhenEnergyEnough 能量足够时开盒（2026-09-20 新增任务）。
+//
+// 对照所有者给的参考脚本 workbuddyv3 的 `t_blindbox`：
+// 查配额 → 有 affordable 就开（每次消耗能量，最多 MaxBlindboxOpens 个）。
+func TestGrowthBlindboxOpensWhenEnergyEnough(t *testing.T) {
+	resetGrowthDelay(t)
+	g := &growthStub{blindboxEnergy: 100, blindboxAffordable: 3}
+	s := newGrowthScheduler(t, g, growthAuth())
+
+	s.RunGrowthMapNow()
+
+	if g.blindboxQuotaCalls == 0 {
+		t.Fatal("应查一次盲盒配额")
+	}
+	if len(g.blindboxBodies) != 1 {
+		t.Fatalf("能量足够时应开一次盒，实际 %d 次", len(g.blindboxBodies))
+	}
+	// 请求体里的 count 应是 affordable（3，未超上限）
+	if !strings.Contains(g.blindboxBodies[0], `"count":3`) {
+		t.Errorf("count 应为 affordable=3，实际请求体：%s", g.blindboxBodies[0])
+	}
+}
+
+// TestGrowthBlindboxSkippedWhenNoEnergy 能量不足时**不发**开盒请求。
+//
+// 那是最常见的状态（每天能量都可能不够），不该产生无谓的上游写。
+func TestGrowthBlindboxSkippedWhenNoEnergy(t *testing.T) {
+	resetGrowthDelay(t)
+	g := &growthStub{blindboxEnergy: 5, blindboxAffordable: 0}
+	s := newGrowthScheduler(t, g, growthAuth())
+
+	s.RunGrowthMapNow()
+
+	if len(g.blindboxBodies) != 0 {
+		t.Errorf("affordable=0 时不该开盒，实际 %d 次", len(g.blindboxBodies))
+	}
+}
+
+// TestGrowthBlindboxCapsAtLimit 单轮开盒数有上限（不把能量一次吃光）。
+func TestGrowthBlindboxCapsAtLimit(t *testing.T) {
+	resetGrowthDelay(t)
+	g := &growthStub{blindboxEnergy: 9999, blindboxAffordable: 99}
+	s := newGrowthScheduler(t, g, growthAuth())
+
+	s.RunGrowthMapNow()
+
+	if len(g.blindboxBodies) != 1 {
+		t.Fatalf("应开一次盒（内部按上限夹数量），实际 %d 次", len(g.blindboxBodies))
+	}
+	if !strings.Contains(g.blindboxBodies[0], `"count":5`) {
+		t.Errorf("count 应被夹到上限 5，实际请求体：%s", g.blindboxBodies[0])
 	}
 }

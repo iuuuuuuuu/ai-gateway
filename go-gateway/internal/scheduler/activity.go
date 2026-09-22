@@ -58,7 +58,11 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		}
 		// 区域过滤：国际版的 growth 接口暂无真实数据，默认只跑国服。
 		// （与签到共用 checkinScopeAllows，语义一致：schedule.checkin_scope=all 时全跑。）
-		if !s.checkinScopeAllows(a) {
+		// ⚠ 产品 + 区域闸门，统一走 accountScopeSkip（**单一真相来源**）。
+		// 此前这里只调 checkinScopeAllows（只判区域），于是 Qoder/ZCode
+		// 账号会被当成 WorkBuddy 跑这些任务 —— 打 WorkBuddy 端点吃 401、
+		// 还在账号记录里写下不属于它的任务（见 accountScopeSkip 的长注释）。
+		if _, ok := s.accountScopeSkip(TaskNameActivity, a); !ok {
 			continue
 		}
 		if !first {

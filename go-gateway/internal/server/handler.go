@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/scheduler"
@@ -33,6 +35,14 @@ type Config struct {
 	RedisMode    string
 	SoftCooldown time.Duration // 429 冷却，默认 60s
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+	// InFlightWait 在途名额满时的等待上限（2026-09-22 新增）。
+	//
+	// 0 = 用默认值 1500ms。设成负值可**关闭等待**（回到"名额满即换号"的
+	// 旧行为）—— 留这个出口是为了"等待引入了新问题"时能一键回滚。
+	//
+	// 为什么需要它：客户端（如 DSH 的 pi-ai 层）会并发重试，
+	// 名额满时立刻失败会让整批重试成片 503。见 pool.AcquireWait 的注释。
+	InFlightWait time.Duration
 	// Usage Token 用量统计器（可选；nil = 不统计，/usage 返回 enabled=false）。
 	Usage *usage.Stats
 	// RunTaskFor 手动触发养号任务（活跃上报 / 夜猫子 / 开学季 / trial / 活跃地图）。
@@ -54,6 +64,14 @@ type Config struct {
 	// 为什么需要它：这 17 个成长任务的实现此前只存在于库里、没有任何对外入口，
 	// 因此被链接器的死代码消除剔出了二进制 —— 表现为「代码写了但根本调不到」。
 	GrowthTasks *GrowthTaskAPI
+
+	// SMSLogin 短信登录成功后**登记账号**的回调（2026-09-22 新增）。
+	//
+	// 与 RunTask / GrowthTasks 同样的依赖倒置：server 包只负责换 token，
+	// 而"账号库 + 凭证文件"是**宿主的**数据结构（见 smslogin.go 的说明）。
+	// nil = 该能力不可用（如单测），此时 /login/sms/verify 明确报错而不是
+	// "换了 token 但没人存" —— 后者会让用户以为登录成功、重启后账号却不见了。
+	SMSLogin SMSLoginFunc
 
 	// Qoder Qoder 产品的上游实现；nil = 该产品不可用（多产品关闭）。
 	//
@@ -126,7 +144,23 @@ const ServiceName = "workbuddy2api"
 
 // Handler 主路由。
 type Handler struct {
+	// cfg 启动时定下的配置，**运行期只读**。
+	//
+	// 为什么不在这里支持热更新（见 dynamic）：本结构有 85 处读取点
+	// 散布在 forward/handler/capability/admin/dispatch 五个文件里。
+	// 若把 cfg 本身变成可替换，那些读取点全都要持锁 —— 改动面极大，
+	// 而其中绝大多数字段（Pool / Upstream / 各种回调）**本来就不会变**。
+	//
+	// 需要热更新的字段收在 dynamic 里，只有真正读它们的少数几处
+	// 需要改（见 DynamicConfig）。
 	cfg Config
+	// dynamic 可热更新的配置字段（2026-09-21 新增）。
+	//
+	// 用 atomic.Pointer 而不是 RWMutex：读方是**请求路径**（/v1/models
+	// 每个客户端列一次模型就调一次），而写方是低频的"宿主重写了配置"。
+	// atomic 的读开销是一次指针加载，无锁竞争，且天然不会有撕裂读。
+	dynamic atomic.Pointer[DynamicConfig]
+
 	mux *http.ServeMux
 	// allowed 「限制使用的模型」白名单（已归一化：剥前缀、去空白）。
 	//
@@ -136,6 +170,85 @@ type Handler struct {
 	//
 	// 空（nil 或零长度）= 不限制，这是默认值也是老配置的行为。
 	allowed []string
+}
+
+// DynamicConfig 可在运行期热更新的配置字段。
+//
+// # 为什么需要它（2026-09-21 所有者报的缺陷）
+//
+// 所有者原话：
+//
+//	「兼容网关启动之后，我再添加的 zcode 和 qoder 账号，模型清单路由
+//	  也没有显示 qoder 和 zcode 支持的账号，应该要自动重启或者热重载的」
+//	「而且 /v1/models 接口，也没有返回 qoder 和 zcode 支持的模型，这也是个 bug」
+//
+// 根因链（逐层可核）：
+//
+//	① 宿主在**新增/刷新账号**后会重写 `gateway_native_config.json`
+//	   （Rust 侧 `resync_native_config`），把 `pool.product_models`
+//	   更新为最新的模型清单；
+//	② 但 Go 网关只在 `main` 开头 `Load(*cfgPath)` **读一次**，
+//	   之后再也不读 —— 改文件对运行中的进程完全不可见；
+//	③ 于是 `/v1/models` 的 channels 里永远没有 Qoder/ZCode。
+//
+// 用户的期望是"加了账号就该能用"，而实际要手动重启整个应用。
+//
+// # 哪些字段能热更新、哪些不能
+//
+// 能：**数据类**字段（模型清单、提示词）—— 它们只是被读取的数据，
+// 换掉不影响任何已建立的连接或后台任务。
+//
+// 不能：监听地址/端口（要重建 listener，属重启语义）、
+//       Pool / Upstream / 各回调（持有连接池与后台 goroutine，
+//       换掉会泄漏且让在途请求失去归属）。
+type DynamicConfig struct {
+	// ProductModels 各产品实际可用的模型清单（`{"qoder":[...],"zcode":[...]}`）。
+	//
+	// 这是本机制要解决的**主要**字段：它决定 `/v1/models` 的 channels
+	// 里有没有 Qoder/ZCode（所有者报的缺陷正是"加了账号但清单里没有"）。
+	ProductModels map[string][]string
+	// PromptMode / PromptText 系统提示词替换（用户改提示词后无需重启）。
+	PromptMode string
+	PromptText string
+}
+
+// DynamicSnapshot 返回当前的可热更新配置（永不为 nil）。
+//
+// # 未初始化时**回落读 h.cfg**（2026-09-21 修正）
+//
+// 为什么不能简单返回空结构：本包与其它包里有大量测试（与少量生产代码）
+// 直接字面量构造 `&Handler{cfg: ...}`，**绕过了 NewHandler** ——
+// 那条路径不会初始化 dynamic。若这里返回空结构，那些调用方拿到的
+// 模型清单会**静默变成空**，表现为"测试莫名红了 / 某条路径没了渠道"，
+// 而根因（没走 NewHandler）从现象上完全看不出来。
+//
+// 回落到 `h.cfg` 让两种构造方式得到**同一份初值**：
+//
+//	走 NewHandler  → dynamic 已初始化，读它（可热更新）
+//	直接构造       → dynamic 为 nil，读 cfg（等价于"从未热更新过"）
+//
+// 这样 `productModels()` 无论哪种构造方式都返回正确结果，
+// 而热重载只在 NewHandler 那条路径上生效（那是唯一有监听器的路径）。
+func (h *Handler) DynamicSnapshot() *DynamicConfig {
+	if d := h.dynamic.Load(); d != nil {
+		return d
+	}
+	// 回落到启动配置。语义与"刚启动、还没热更新过"一致。
+	return &DynamicConfig{
+		ProductModels: h.cfg.ProductModels,
+		PromptMode:    h.cfg.PromptMode,
+		PromptText:    h.cfg.PromptText,
+	}
+}
+
+// ReloadDynamic 用新配置替换可热更新字段（由配置监听器调用）。
+//
+// 只覆盖 DynamicConfig 里的字段，其余一律不动 —— 见 DynamicConfig 的注释。
+func (h *Handler) ReloadDynamic(next *DynamicConfig) {
+	if next == nil {
+		return
+	}
+	h.dynamic.Store(next)
 }
 
 // NewHandler 构建 handler。
@@ -148,6 +261,24 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
+	}
+	// 在途等待上限：未设置(0)时用 3000ms；**负值表示关闭等待**（回滚出口）。
+	//
+	// # 为什么是 3000ms（2026-09-22 从 1500 调整）
+	//
+	// 它与 `max_in_flight`（生产默认 8）是一对：上限越低，排队的请求越多，
+	// 单次等待就需要越长才不会白等。
+	//
+	// 取值依据：
+	//   - qoder 一次请求通常 2~8 秒（长流式更久），排队等 3s 是合理区间
+	//   - 客户端自己的重试间隔是 1~4s（所有者截图：「重试延迟 1060 /
+	//     1941 / 3699 毫秒」）—— 3s **短于**客户端放弃的时间
+	//   - 远小于上游超时（`upstream.timeout_seconds` 默认 120s）
+	//
+	// ⚠ 等待是**有代价**的（占着一个 goroutine），所以不能设太大；
+	// 3s 是"够覆盖一次排队、又不至于把连接挂死"的折中。
+	if cfg.InFlightWait == 0 {
+		cfg.InFlightWait = 3000 * time.Millisecond
 	}
 	// 缺省 passthrough：未显式配置时严格保持既有行为（透传客户端原始 system）。
 	// 直接在 Config 上兜底而不是依赖调用方传对，是为了让「忘记传」也不可能
@@ -166,6 +297,13 @@ func NewHandler(cfg Config) *Handler {
 		mux:     http.NewServeMux(),
 		allowed: normalizeAllowedModels(append(append([]string{}, cfg.AllowedModels...), cfg.AllowedModel)),
 	}
+	// 可热更新字段的初值：与启动配置一致。
+	// 之后由 main 的配置监听器在检测到文件变化时替换。
+	h.dynamic.Store(&DynamicConfig{
+		ProductModels: cfg.ProductModels,
+		PromptMode:    cfg.PromptMode,
+		PromptText:    cfg.PromptText,
+	})
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("POST /responses", h.withAuth(h.responses))
@@ -188,6 +326,12 @@ func NewHandler(cfg Config) *Handler {
 	// 未鉴权暴露等于给人一个刷账号活跃度的开关。
 	h.mux.HandleFunc("POST /tasks/run", h.withAuth(h.tasksRun))
 	h.mux.HandleFunc("POST /tasks/growth", h.withAuth(h.growthTasks))
+	// 手机号 + 短信验证码登录（2026-09-22 新增）。
+	//
+	// ⚠ 用 withAuth：这两个端点会**向真实手机号发短信**（可能触发上游
+	// 频控甚至计费），未鉴权暴露等于给任何人一个刷短信的开关。
+	h.mux.HandleFunc("POST /login/sms/send", h.withAuth(h.smsSend))
+	h.mux.HandleFunc("POST /login/sms/verify", h.withAuth(h.smsVerify))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
 }
@@ -422,11 +566,60 @@ func (h *Handler) usageReport(w http.ResponseWriter, r *http.Request) {
 
 // recordUsage 把一次请求采集到的完整用量写入统计；无计量或未装配统计时跳过。
 // 只统计成功请求（上游返回了可用 usage 的请求），失败请求不计入。
+//
+// 走 RecordBilled（带计费归属）而不是 Record：所有者要求用量处显示倍率，
+// 而倍率是**归属的属性**（哪个平台、哪个区域），不带归属就无从显示。
 func (h *Handler) recordUsage(s *chatStat) {
 	if h.cfg.Usage == nil || !s.hasCounters {
 		return
 	}
-	h.cfg.Usage.Record(s.uid, s.model, s.counters)
+	h.cfg.Usage.RecordBilled(s.uid, s.usageName(), s.billing, s.counters)
+}
+
+// fillBilling 从一次成功的转发结果推出**计费归属**，写进 stat。
+//
+// # 为什么需要它（2026-09-21 所有者要求）
+//
+// 所有者原话：
+//
+//	「兼容网关的token用量也要显示出这个模型的倍率（如果有多个 则需要拆开显示）」
+//
+// 倍率**按平台与区域不同**：
+//
+//	WorkBuddy  按区域（实测 deepseek-v4.1-flash 国服 x0.03、国际版 x0.00）
+//	Qoder      有 price_factor，但不分区、且不在本函数的可见范围内
+//	ZCode      目前没有倍率数据源
+//
+// 故这里只对 **WorkBuddy** 填真值：从 capabilityIndex 取该区域该模型的倍率。
+// 取不到时保持 nil（HasMultiplier=true，界面显示「—」= 不知道），
+// **不编造数字** —— 编造的倍率会让用户据它判断该烧哪个账号的额度。
+//
+// Qoder/ZCode 的 HasMultiplier 保持 false：界面不显示倍率列。
+// 宁可不说，也不给一个可能错的数字。
+func (h *Handler) fillBilling(st *chatStat, result *chatResult) {
+	if st == nil || result == nil {
+		return
+	}
+	product := result.Product
+	if product == "" {
+		product = auth.ProductWorkBuddy
+	}
+	b := usage.Billing{Product: product, Region: result.Region}
+
+	// 只有 WorkBuddy 有「按区域的计费倍率」这一概念。
+	if product == auth.ProductWorkBuddy {
+		b.HasMultiplier = true
+		region := auth.RegionCN
+		if result.Region == regionCodeIntl {
+			region = auth.RegionIntl
+		}
+		if idx := h.buildCapabilityIndex(); idx != nil {
+			if m := idx.byRegion[region]; m != nil {
+				b.Multiplier = m[result.Model].CreditMultiplier
+			}
+		}
+	}
+	st.setBilling(b)
 }
 
 // withImageCapability 给静态表条目补上能力字段。
@@ -480,10 +673,40 @@ var staticModels = withImageCapability([]map[string]any{
 	{"id": "kimi-k2.6", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 256000},
 })
 
+// StaticWorkBuddyModelIDs 返回内置的 WorkBuddy 模型名（两张静态表的并集）。
+//
+// # 用途：补全 `pool.product_models` 缺失的 workbuddy 项
+//
+// 见 `cmd/server/main.go` 调用处与 `pool.pickForModelAny` 的注释：
+// 宿主透传的清单来自用户的「限制使用的模型」白名单（默认为空 ⇒ 不写
+// workbuddy），缺了它会让**裸名**请求被路由到 WorkBuddy 账号而回 11102。
+//
+// # 为什么这里"宁可多列"是安全的
+//
+// 这个清单只用于 `productDeclaresModelLocked`（判断"是否**明确声明**提供"），
+// 不用于"否定"。多列几个模型的最坏后果是"某个模型优先去 WorkBuddy 试一次"，
+// 而不是"某个账号被永久排除"。故并集比精确更重要 —— 与
+// `staticModels` 那份"只提供信息、不否定存在"的定位一致。
+func StaticWorkBuddyModelIDs() []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(staticModels)+len(staticModelsIntl))
+	for _, tbl := range [][]map[string]any{staticModels, staticModelsIntl} {
+		for _, m := range tbl {
+			id, _ := m["id"].(string)
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // staticModelsIntl 国际版静态模型表（动态接口失败时的回退）。
 //
 // 取自 /v3/config 的 data.agents[name=="cli"].models（实测 2026-09-15），
-// 即客户端选模型时真正看到的清单，另加 hy4-preview（见下）。
+// 即客户端选模型时真正看到的清单。
 //
 // 历史：此前该表抄自本地缓存 acc-product-config-v3.json，其中
 //   - gpt-5.3-codex 属于 CodeBuddy 产品清单，不在 WorkBuddy 的 cli 清单里；
@@ -491,9 +714,31 @@ var staticModels = withImageCapability([]map[string]any{
 //
 // 现已按 /v3/config 校正。
 //
-// 关于 hy4-preview：它不在 cli 清单里，但**实测可用**（HTTP 200 正常出流），
-// 且出现在 /v3/config 的 data.models 与 productFeaturesConfig.ModelTrialBanner 中
-// （作为 hy4-preview-f 的试用目标模型）。保留它，避免用户手动指定时报「模型不存在」。
+// # ⚠ hy4-preview 已从本表**移除**（2026-09-21 所有者要求）
+//
+// 所有者原话：
+//
+//	「国际版既然不支持，为什么你还能跑出来这个模型？接口返回没有就不要
+//	  搞出来，懂吗？」
+//
+// 他的要求是：**上游没返回的模型，一个都不许出现在清单里**。
+//
+// 而旧代码把 `hy4-preview` 同时写进国服表与国际版表。实测（2026-09-21，
+// 用他自己的 5 个国际版账号拉两区真值）：
+//
+//	国服 16 个模型   含 hy4-preview    ✓
+//	国际版 22 个模型 **不含 hy4-preview** ✗
+//	国际版有 hy4-preview-f（注意 -f 后缀，是**另一个**模型）
+//
+// 于是 `/v1/models` 把 `hy4-preview` 标成「国服 + 国际版」双渠道，
+// 但国际版根本调不到它 —— 用户按清单指定国际版就会失败。
+//
+// 旧注释的理由是"它不在 cli 清单里但实测可用，保留它避免手动指定时报模型不存在"。
+// 那个理由**不成立**：保留在**国际版**表里意味着**宣称国际版支持它**，
+// 而实测国际版调用它并不通（且上游真值明确没有）。「避免报不存在」的正确
+// 做法是不写它，让用户看到"这个模型不在清单里"——那才是**如实**。
+//
+// 国服那张表**保留**它：国服真值确实有（且实测出流正常）。
 //
 // 注意与国服的差异（这也是客户端选模型时最易踩的坑）：
 //
@@ -505,8 +750,8 @@ var staticModelsIntl = withImageCapability([]map[string]any{
 	{"id": "balanced-model", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 256000},
 	{"id": "primary-model", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 272000},
 	{"id": "deep-model", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 200000},
+	// ⚠ hy4-preview-f **保留**（国际版真值里有它），hy4-preview 已移除（见上方注释）。
 	{"id": "hy4-preview-f", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 300000},
-	{"id": "hy4-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 200000},
 	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 192000},
 	{"id": "deepseek-v4.1-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 300000},
 	{"id": "gpt-6-astra", "object": "model", "created": 1753600000, "owned_by": "workbuddy-intl", "context_length": 400000},
@@ -633,6 +878,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.uid = result.UID
+	// 计费归属：本次请求走的是哪个平台/区域、倍率多少。
+	//
+	// 必须在**选号完成后**填（这里），因为 recordUsage 是在 defer 里、
+	// 流读完之后才跑的 —— 那时 result 已带上 Product/Region。
+	h.fillBilling(st, result)
 
 	if result.Stream != nil {
 		st.status = http.StatusOK
@@ -806,6 +1056,17 @@ func openAIFailure(err error) (code, msg string) {
 		// 状态码由调用方原样透出（forwardChat 返回的 400），**不走 503** ——
 		// 503 会让客户端去重试，而这里等多久都不会出现（要换模型/加区域前缀）。
 		return "model_not_in_region", f.Message
+	}
+	if f := failureOf(err); f != nil && f.Kind == FailureUnusualActivity {
+		// 上游 3012 风控、网关已主动熔断（见 unusual.go）。
+		//
+		// 独立错误码的理由与 egress_ip_blocked 完全同构：
+		//
+		//	· 落进 no_healthy_account（"账号全部不可用"）会引导用户去查账号池，
+		//	  而 3012 **与账号无关**（实测同一账号一分钟后即可用）；
+		//	· 客户端据此可以**不要立即重试** —— 这正是所有者要的效果
+		//	（「3012 后自动退避一段时间不重试」）。
+		return "unusual_activity", f.Message
 	}
 	// 其余交给 errorCodeFor（当前只有 model_not_allowed 与 no_healthy_account），
 	// 即 chat/completions 一直以来的行为。

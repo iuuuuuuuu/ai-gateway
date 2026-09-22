@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -195,7 +196,7 @@ func (r *Runner) RunAll(ctx context.Context, a *auth.Auth) []ItemResult {
 			Code: "(任务列表)", Status: StatusError,
 			Message: "拉取任务列表失败: " + err.Error(),
 		})
-		r.record(a.UID, "拉取任务列表失败: "+err.Error(), records.ResultFailed)
+			r.record(a.UID, "成长任务", "(任务列表)", "拉取任务列表失败: "+err.Error(), records.ResultFailed)
 		return out
 	}
 	byCode := indexTasks(before)
@@ -253,8 +254,36 @@ func (r *Runner) RunOne(ctx context.Context, a *auth.Auth, code string) ItemResu
 		}
 	}
 	item := r.runAction(ctx, a, *act, t)
-	r.record(a.UID, item.Message, resultFor(item.Status))
+	// ⚠ 标题必须带**具体任务名**（2026-09-22 修）。
+	//
+	// # 所有者现场
+	//
+	//	「任务执行记录我看也没有,这些任务执行都是需要记录的」
+	//
+	// 记录**确实在写**，但 18 项成长任务此前**共用同一个标题**
+	//（`recordsTitle = "成长任务"`），而 `TaskDaily` 的去重键是
+	// 「账号 + 标题 + 结果，每天一条」——
+	// 于是同一天跑 5 项，记录里**只剩 1 条「成长任务」**，
+	// 用户完全看不出哪几项做了什么。功能没坏，是**粒度过粗**。
+	//
+	// 现在标题用上游给的任务标题（回落任务码），去重键自然按项分开：
+	// 一天跑 N 项就有 N 条记录，且每条标题自解释。
+	r.record(a.UID, growthRecordTitle(t, code), code, item.Message, resultFor(item.Status))
 	return item
+}
+
+// growthRecordTitle 账号记录里的标题：优先上游标题，回落任务码。
+//
+// ⚠ 回落用**任务码**而不是笼统的"成长任务"：任务码虽不漂亮，
+// 但至少能区分是哪一项；笼统标题会让去重把多项合成一条（本次修的缺陷）。
+func growthRecordTitle(t *upstream.GrowthTask, code string) string {
+	if t == nil {
+		return code
+	}
+	if s := strings.TrimSpace(t.Title); s != "" {
+		return s
+	}
+	return code
 }
 
 // acceptPending 批量报名尚未报名的任务，返回一条汇总结论（无待报名项时返回 nil）。
@@ -454,20 +483,37 @@ func (r *Runner) summarize(a *auth.Auth, items []ItemResult) {
 	if failed > 0 {
 		result = records.ResultFailed
 	}
-	r.record(a.UID, detail, result)
+	r.record(a.UID, recordsTitle, "", detail, result)
 }
 
 // record 写一条账号记录（Records 为 nil 时是安全的空操作）。
-func (r *Runner) record(uid, detail, result string) {
+//
+// `title` 是记录里显示的任务名；`code` 为具体任务码（整轮汇总时为空）。
+//
+// # ⚠ 为什么标题要**按任务区分**（2026-09-22 修）
+//
+// 所有者反馈「任务执行记录我看也没有」。查证后发现记录**一直在写**，
+// 但 18 项成长任务此前共用标题「成长任务」，而 `TaskDaily` 的去重键是
+// 「账号 + 标题 + 结果，每天一条」⇒ 同一天跑多项只留一条，
+// 用户看不到具体跑了什么。**粒度过粗被误读成"没有记录"。**
+func (r *Runner) record(uid, title, code, detail, result string) {
 	if r.rec == nil {
 		return
 	}
+	// 标题为空时回落任务码 —— 绝不用笼统的"成长任务"：
+	// 那正是把多项合成一条的原因。
+	if strings.TrimSpace(title) == "" {
+		title = code
+	}
+	if strings.TrimSpace(title) == "" {
+		title = recordsTitle
+	}
 	// 用 Daily 而非 Task：用户连点「一键完成」会产生多轮，
 	// 每轮都写会让记录区被同一件事刷满。
-	r.rec.TaskDaily(uid, recordsTitle, result, detail)
+	r.rec.TaskDaily(uid, title, result, detail)
 }
 
-// recordsTitle 账号记录里的任务名（宿主界面按此分组显示）。
+// recordsTitle 整轮汇总时的记录标题（逐项记录用具体任务名，见 record）。
 const recordsTitle = "成长任务"
 
 // resultFor 把执行状态映射为账号记录的结果类型。

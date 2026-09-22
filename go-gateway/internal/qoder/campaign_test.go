@@ -72,7 +72,7 @@ func TestCampaignsSendsAllThreeRequiredParts(t *testing.T) {
 // 两个活动分别是"可领取"与"已领取"，覆盖两种 claimStatus。
 func TestCampaignsParsesRealShape(t *testing.T) {
 	raw := `{
-	  "uid":"019f1772-4976-7393-b4d4-b93ab04b7fe7",
+	  "uid":"{uuid}",
 	  "showCampaign":true,
 	  "claimable":true,
 	  "campaignUrl":"https://openapi.qoder.com.cn/growth-page/activity-iframe",

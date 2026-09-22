@@ -27,9 +27,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 )
 
 // Cred 一个 ZCode 账号的凭证。
@@ -91,7 +94,33 @@ type Cred struct {
 	// 实测上游**只校验格式**（UUID 形态），随机生成的也通过 ——
 	// 不需要是注册过的设备。持久化的意义是"同一账号始终表现为同一台设备"，
 	// 否则服务端会看到"一个账号被大量设备查询"。
+	//
+	// ## ⚠ 2026-09-21 修正：不再无条件随机
+	//
+	// 上面那句"随机生成的也通过"只说对了一半 —— **首次**随机没问题，
+	// 但**每次启动都换一个**就会被判风控。所有者报的现象是
+	//「官方不触发、我们触发」，查证结果：
+	//
+	//	官方客户端   固定值，持久化在 ~/.zcode/v2/telemetry-state.json
+	//	我们的凭证   没有 device_mid 字段
+	//	旧实现       每次进程启动 NewDeviceMid() 随机一个
+	//
+	// 而参考实现明确警告：「生成一次、永久复用、落盘、绝不每请求随机」。
+	//
+	// 现在的顺序：凭证里的 > 官方客户端那个 > 随机；取到前两者后**固化写回**
+	//（见 LoadFile），此后与外部文件无关。
+	//
+	// 注意它也用于**对话请求体**的 `metadata.user_id.device_id`
+	//（见 client.go 的 BuildAnthropicBodyWithMeta），故不只是控制面的事。
 	DeviceMid string
+	// deviceMidNeedsPersist 加载时发现凭证里没有 device_mid，需要固化写回。
+	//
+	// 为什么不直接在 parseBytes 里写：那里拿不到 `FilePath`（它由 LoadFile
+	// 在 parseBytes 返回后才赋值），调用 SaveAtomic 必然失败
+	//（它的第一行就是「凭证没有来源路径，无法写回」）。
+	// 我第一版正是那么写的 —— 用显式标记把"要不要写"传给知道路径的调用方，
+	// 而不是依赖"调用点必须晚于赋值"这种隐含顺序。
+	deviceMidNeedsPersist bool
 
 	// JWTIssuedAt JWT 的签发时刻（Unix 秒）；0 = 未知。
 	//
@@ -109,7 +138,7 @@ type Cred struct {
 	//
 	// 但**同一个上游账号可以有多把 key**：
 	//
-	//	智谱账号 19331730795565300
+	//	智谱账号 12345678901234567
 	//	  ├─ key A → uid zcode-aaaa…（本地第 1 条账号）
 	//	  └─ key B → uid zcode-bbbb…（本地第 2 条，用户看来就是"重复"）
 	//
@@ -347,7 +376,92 @@ func LoadFile(path string) (*Cred, error) {
 	if c.UID == "" {
 		c.UID = CredKey(c.Credential)
 	}
+	// ⚠ device_mid 固化（2026-09-21 所有者要求）。
+	//
+	// # 为什么要落盘，而不是每次读官方文件
+	//
+	// 所有者原话：
+	//
+	//	「我在想这个 deviceMid 是不是一个账号绑定一个,稳定使用
+	//	  这样子是不是好一点?」→「要的」
+	//
+	// 他的直觉指向一个真实风险：**读官方文件是"借用"**，而官方客户端
+	// 可能重装 / 换机器 / 重置状态 —— 那时 `telemetry-state.json` 会变，
+	// 我们的指纹**跟着变**，又回到"同账号多设备"的老问题。
+	//
+	// 落盘后语义变成：**第一次借用，之后永久固化**。这正是参考实现的做法
+	//（`device_mid()` 首次生成后写进 `data/device_mid`，注释：
+	// 「首次生成后持久化」「生成一次、永久复用、落盘、绝不每请求随机」）。
+	//
+	// # 多账号时天然满足"一账号一个"
+	//
+	// 每个凭证文件各存各的 device_mid：
+	//
+	//	· 单账号（所有者的情况）：首次借用官方那个，与官方客户端一致
+	//	· 多账号：各自的凭证里固化各自的值，互不影响
+	//
+	// 注意 deviceMid 的**语义是"设备"而非"账号"**（官方 telemetry 也是
+	// 机器级、一个文件一个值），所以这里不是"刻意让每个账号不同"，
+	// 而是"一旦某账号用过某个值，就让它一直用下去"—— 稳定性才是重点。
+	//
+	// # 为什么只在"缺失时"写（由 parseBytes 的标记决定）
+	//
+	// 已有 `device_mid` 时不写：那是**无谓的磁盘写**，而 `LoadFile` 在
+	// 每个请求路径上都会被调用（额度查询、对话、领取…）。每次加载都
+	// 重写凭证文件既慢又危险（并发写、原子替换的窗口）。
+	//
+	// 写入失败**不影响功能**：内存里的值仍然有效，只是下次启动会
+	// 重新借用/生成。故只记日志，不返回错误 —— 让"落盘失败"变成
+	// "这个账号查不到额度"是过度反应。
+	if c.deviceMidNeedsPersist {
+		persistDeviceMidOnce(c)
+	}
 	return c, nil
+}
+
+// deviceMidPersisted 已固化过 device_mid 的凭证路径集合。
+//
+// # 为什么需要它（并发缺陷，2026-09-21 自查发现）
+//
+// `LoadFile` **在每个对话请求路径上都会被调用**
+//（`Dispatch.ChatStream` → `credOf` → `LoadFile`，见 dispatch.go）。
+// 首次加载时多个并发请求会同时走到固化逻辑：
+//
+//	两者都读到"凭证里没有 device_mid" ⇒ 都置位 ⇒ 都写
+//	两者用**同一个 tmp 路径**（`FilePath + ".tmp"`）⇒ 互相覆盖
+//
+// 后果：`os.Rename` 可能失败（一方已把 tmp 改名走），而 Windows 上
+// 把文件 rename 到已存在的目标也可能失败。最坏情况是某个请求的
+// `LoadFile` 返回错误 —— 而它本该是纯粹的读操作。
+//
+// 用"每个路径只固化一次"消除这个窗口：值本来就是确定的
+//（凭证里的 > 官方文件 > 随机），重复写没有意义。
+//
+// 进程内即可：固化只在本进程首次加载时需要，跨进程由**磁盘上的
+// device_mid 字段**保证（第二个进程读到它就不再写）。
+var (
+	deviceMidPersistedMu sync.Mutex
+	deviceMidPersisted   = map[string]bool{}
+)
+
+// persistDeviceMidOnce 每个凭证路径最多固化一次（并发安全）。
+func persistDeviceMidOnce(c *Cred) {
+	deviceMidPersistedMu.Lock()
+	if deviceMidPersisted[c.FilePath] {
+		deviceMidPersistedMu.Unlock()
+		return
+	}
+	// 先占位再解锁：让并发的第二个调用者直接返回，
+	// 而不是排队等第一次写完又写一遍。
+	deviceMidPersisted[c.FilePath] = true
+	deviceMidPersistedMu.Unlock()
+
+	// 写入失败**不影响功能**：内存里的值仍然有效，只是下次启动会
+	// 重新借用/生成。故只记日志，不返回错误 —— 让"落盘失败"变成
+	// "这个账号查不到额度"是过度反应。
+	if err := c.SaveAtomic(); err != nil {
+		log.Printf("zcode: device_mid 固化失败（本次仍有效，下次会重新借用）: %v", err)
+	}
 }
 
 // parseBytes 解析凭证字节；path 仅用于错误信息与文件名兜底。
@@ -438,12 +552,185 @@ func parseBytes(raw []byte, path string) (*Cred, error) {
 
 	// 控制面设备标识。缺失时**补一个**而不是留空 ——
 	// 空值会让额度查询恒回 3001（实测），而那看起来像"这个账号没有额度"。
+	//
+	// ⚠⚠ 2026-09-21 修正：优先用**官方客户端已持久化的** deviceMid。
+	//
+	// # 所有者的问题
+	//
+	//	「还有zcode为什么在官方就不触发,在你这里就触发,你好好看看官方代码
+	//	  还有参考实现 好好排查」
+	//
+	// # 查证结果（三方对照，证据链完整）
+	//
+	//	官方客户端   固定值，持久化在 ~/.zcode/v2/telemetry-state.json
+	//	我们的凭证   字段列表里**没有** device_mid
+	//	旧实现       每次进程启动 NewDeviceMid() 随机一个
+	//
+	// 而参考实现明确警告过这条：
+	//
+	//	「device fingerprint 稳定：X-Device-Mid 生成一次、永久复用、落盘、
+	//	  **绝不每请求随机**」
+	//
+	// 每次重启换一个设备指纹，对上游风控而言就是**同一个账号被大量不同设备
+	// 使用** —— 这是判"unusual activity"的典型依据，也正是官方不触发而
+	// 我们触发的原因。
+	//
+	// # ⚠⚠⚠ 2026-09-21 二次修正：**一个账号一个设备标识**
+	//
+	// 所有者原话（他纠正了我一个方向性错误）：
+	//
+	//	「我觉得一个账号一个机器码还是有必要的,可以视为在同一个局域网内的
+	//	  账号,但不能视为同一个设备上并发不同的账号」
+	//
+	// 他是对的，我上一版是**反的**。上一版让所有账号共用官方那一个
+	// deviceMid（"与官方共享同一设备身份"），而上游看到的是：
+	//
+	//	设备 X → 账号 A, B, C, …, T   ← **一台设备并发 20 个账号**
+	//
+	// 这恰恰是**号商 / 脚本**的典型形状，比"多台设备各用一个账号"可疑得多。
+	// 他的类比很准：
+	//
+	//	同一局域网  → 共享公网 IP   → 上游能理解（NAT 后面本来就有很多人）
+	//	同一设备    → 共享 deviceMid → **不能理解**（一台机器开 20 个号？）
+	//
+	// 官方客户端就是"一设备一账号"（它只有一个登录账号），故正确形状是
+	// **每个账号一个稳定的设备标识**。
+	//
+	// # 借用官方值的**唯一**条件
+	//
+	// 只有当"这个凭证的账号"**就是**官方客户端登录的那个账号时，才用官方
+	// 的 deviceMid —— 那时我们与官方客户端是**同一个账号、同一台设备**，
+	// 共享标识才是真实且一致的。
+	//
+	// 判据：官方 `~/.zcode/v2/credentials.json` 里的 account uuid
+	//（形如 `…:account:zai-individual-coding-plan:account:{uuid}:api-key`）
+	// 与凭证的 `account_id` 相等。
+	//
+	// 单账号用户（官方登录的账号就是他导入网关的那个）会命中此条件，
+	// 于是行为与"直接用官方值"一致；多账号时其余账号各自独立。
+	//
+	// 其余账号：生成一个**稳定的随机** UUID 并落盘固化
+	//（`NewDeviceMid` 是随机，但落盘后不再变 —— 参考实现的
+	//「生成一次、永久复用、落盘、绝不每请求随机」）。
 	c.DeviceMid = rawStr(doc, "device_mid")
 	if !IsUUID(c.DeviceMid) {
-		c.DeviceMid = NewDeviceMid()
+		c.DeviceMid = mintDeviceMid(c.AccountID)
+		// ⚠ 这里**只算好值**，落盘交给 LoadFile（见那里的说明）。
+		//
+		// 为什么不能在这里 SaveAtomic：本函数（parseBytes）拿不到
+		// `c.FilePath` —— 那是 LoadFile 在本函数**返回之后**才设置的。
+		// 在这里调用必然失败（SaveAtomic 的第一行就是
+		// 「凭证没有来源路径，无法写回」）。我第一版正是这么写的，
+		// 靠"调用点必须晚于 FilePath 赋值"这条隐含顺序才不出错 ——
+		// 而那种隐含顺序正是最容易在重构时被打断的东西。
+		//
+		// 故把"是否需要固化"作为**显式信号**传出去，由知道路径的调用方执行。
+		c.deviceMidNeedsPersist = true
 	}
 
 	return c, nil
+}
+
+// mintDeviceMid 为新账号产生一个设备标识：与官方同账号则借用，否则随机。
+//
+// 见调用处的长注释：**一个账号一个设备标识**是正确形状，
+// 共用会让上游看到"一台设备并发一批账号"（号商特征）。
+//
+// 返回空串是不可能的（`NewDeviceMid` 总会给一个 UUID），
+// 保留 string 返回是为了让调用点读起来自然。
+func mintDeviceMid(accountID string) string {
+	if accountID != "" {
+		if off := officialAccountUUID(); off != "" && strings.EqualFold(off, accountID) {
+			// 同一个账号 ⇒ 与官方客户端共享设备标识才是真实的。
+			if v := officialDeviceMid(); v != "" {
+				return v
+			}
+		}
+	}
+	// 其余账号：各自独立的随机值，落盘后永久固化。
+	return NewDeviceMid()
+}
+
+// officialAccountUUID 读官方客户端**当前登录账号**的 uuid（读不到返回空串）。
+//
+// # 来源
+//
+// `~/.zcode/v2/credentials.json` 的键里嵌着账号 uuid：
+//
+//	account-provider:coding-plan:account:zai-individual-coding-plan:
+//	    account:{uuid}:api-key
+//	              ^^^^^^^^^^^^
+//
+// 值本身是加密的（`enc:v1:…`），但**键名是明文** —— 我们只需要那个 uuid。
+//
+// # 为什么要它
+//
+// 决定"能不能借用官方 deviceMid"：只有当凭证的账号**就是**官方登录的
+// 那个账号时，共享设备标识才真实（同一账号、同一台设备）。
+// 其余账号必须各自独立，否则上游会看到"一台设备并发一批账号"。
+//
+// 只读、容错：文件不存在 / 解析失败 / 找不到 uuid → 返回空串，
+// 调用方据此走"随机"分支（那总是安全的）。
+func officialAccountUUID() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	raw, err := os.ReadFile(filepath.Join(home, ".zcode", "v2", "credentials.json"))
+	if err != nil {
+		return ""
+	}
+	// 不整体解析 JSON：值是加密串，而我们只关心**键名**里的 uuid。
+	// 用正则直接扫键，避免为一个字段依赖文件的具体 JSON 形状。
+	// 形如 `account:{uuid}` 或 `…:account:{uuid}:api-key`
+	re := regexp.MustCompile(`account:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`)
+	m := re.FindSubmatch(raw)
+	if len(m) < 2 {
+		return ""
+	}
+	return string(m[1])
+}
+
+// officialDeviceMid 读官方客户端持久化的 deviceMid（读不到返回空串）。
+//
+// # 来源
+//
+// 官方客户端把它存在：
+//
+//	~/.zcode/v2/telemetry-state.json
+//	{ "deviceMid": "{uuid}", "lastDailyActiveDate": "2026-09-21" }
+//
+// 本机实测该文件确实存在且含固定值。
+//
+// # 为什么读它而不是自己生成
+//
+// 见调用处（`loadCred`）的长注释：官方**固定**、我们**每次随机**，
+// 那正是"官方不触发、我们触发"的差异。用官方那个值，我们的请求
+// 就与官方共享同一设备身份。
+//
+// # 只读、容错
+//
+// 不写回、不修改官方文件（那是官方客户端的资产，我们只借用标识）。
+// 文件不存在 / 格式不对 / 值不是 UUID → 一律返回空串，由调用方回退随机。
+func officialDeviceMid() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	raw, err := os.ReadFile(filepath.Join(home, ".zcode", "v2", "telemetry-state.json"))
+	if err != nil {
+		return ""
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return ""
+	}
+	v, _ := doc["deviceMid"].(string)
+	v = strings.TrimSpace(v)
+	if !IsUUID(v) {
+		return ""
+	}
+	return v
 }
 
 // LoadDir 扫描目录下 zcode*.json，返回成功解析的凭证与失败清单。

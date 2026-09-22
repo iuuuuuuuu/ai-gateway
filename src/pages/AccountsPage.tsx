@@ -13,6 +13,7 @@ import {
   MapPin,
   Moon,
   QrCode,
+  MessageSquare,
   RefreshCw,
   Rows3,
   Sparkles,
@@ -21,6 +22,16 @@ import {
 } from "lucide-react";
 
 import { AccountCard } from "@/components/account-card";
+import {
+  AutoCareTasksCard,
+  AutoCheckinCard,
+  AutoRotateCard,
+  PermissionCheckCard,
+} from "@/components/workbuddy-settings";
+import {
+  PlatformConfigButton,
+  PlatformConfigDialog,
+} from "@/components/platform-config-dialog";
 import { DemoAction } from "@/components/demo-action";
 import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -48,6 +59,7 @@ import {
 import { ExportAccountsDialog } from "@/components/export-accounts-dialog";
 import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
 import { ImportLocalDialog } from "@/components/import-local-dialog";
+import { SmsLoginDialog } from "@/components/sms-login-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import { TaskQueuePanel } from "@/components/task-queue-panel";
@@ -100,22 +112,73 @@ function isWorkbuddyCurrent(account: AccountMeta, current: AppStatus["current"] 
   );
 }
 
+/**
+ * 分批并发执行，限制**同时在途**的请求数。
+ *
+ * # 为什么必须限流（2026-09-22 所有者现场）
+ *
+ *	「最近几次打包后每次打开都先要反应一会儿,要不然点击就是无响应」
+ *
+ * # 根因：启动瞬间的并发风暴
+ *
+ * 下面两个 `Promise.all` 会对**每个账号**各发一次 IPC：
+ *
+ *	签到状态  19 个
+ *	旅行状态  19 个
+ *	         ─────
+ *	          38 个并发 Tauri IPC
+ *
+ * 每个 IPC 都经宿主转发到网关、再打到上游。38 个同时涌入时：
+ *   · WebView2 的主线程要处理 38 个 IPC 回调 → 界面卡住（"无响应"）
+ *   · 网关/上游连接池被占满 → 后续点击的请求排队
+ *
+ * 且这发生在**打开页面的瞬间**，正是用户点什么都觉得"没反应"的时刻。
+ *
+ * # 取 4 并发
+ *
+ * 19 个账号分 5 批，每批 4 个，比一次 19 个平缓得多；
+ * 又比串行（19 轮）快得多。这个数字与网关侧的 `max_in_flight=3`
+ * 同量级 —— 再高也只是把压力推给上游。
+ *
+ * ⚠ 用 `Array.from(index)` 而不是 `map`：下面用索引做游标，
+ * 需要精确控制"下一个取谁"，`map` 的迭代器语义在这里不直观。
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    // 每个 worker 反复"取下一个还没被领的任务"，直到取完。
+    // 用自增游标而不是切片：切片会让每个 worker 固定负责一段，
+    // 某一段慢时会拖住整批，而游标法天然是"谁能干谁接着干"。
+    for (;;) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 /** 并行查询今日签到；失败的账号不写入，由调用方保留原值。 */
 async function fetchTodayCheckinMap(
   accountIds: string[],
   isStale?: () => boolean,
 ): Promise<Record<string, boolean>> {
-  const entries = await Promise.all(
-    accountIds.map(async (id) => {
-      try {
-        const res = await api.getCheckinStatus(id);
-        if (isStale?.() || !res.ok) return null;
-        return [id, res.todayCheckedIn] as const;
-      } catch {
-        return null;
-      }
-    }),
-  );
+  const entries = await mapWithConcurrency(accountIds, STARTUP_FETCH_CONCURRENCY, async (id) => {
+    try {
+      const res = await api.getCheckinStatus(id);
+      if (isStale?.() || !res.ok) return null;
+      return [id, res.todayCheckedIn] as const;
+    } catch {
+      return null;
+    }
+  });
   const next: Record<string, boolean> = {};
   for (const entry of entries) {
     if (entry) next[entry[0]] = entry[1];
@@ -128,23 +191,29 @@ async function fetchTravelMap(
   accountIds: string[],
   isStale?: () => boolean,
 ): Promise<Record<string, TravelStatus>> {
-  const entries = await Promise.all(
-    accountIds.map(async (id) => {
-      try {
-        const res = await api.getTravelStatus(id);
-        if (isStale?.()) return null;
-        return [id, res] as const;
-      } catch {
-        return null;
-      }
-    }),
-  );
+  const entries = await mapWithConcurrency(accountIds, STARTUP_FETCH_CONCURRENCY, async (id) => {
+    try {
+      const res = await api.getTravelStatus(id);
+      if (isStale?.()) return null;
+      return [id, res] as const;
+    } catch {
+      return null;
+    }
+  });
   const next: Record<string, TravelStatus> = {};
   for (const entry of entries) {
     if (entry) next[entry[0]] = entry[1];
   }
   return next;
 }
+
+/**
+ * 启动期拉取账号状态的**在途并发上限**。
+ *
+ * 见 `mapWithConcurrency` 的说明：不限流时 19 个账号会一次性打出
+ * 38 个并发 IPC，把 WebView2 主线程堵住（表现为"打开后一会儿才响应"）。
+ */
+const STARTUP_FETCH_CONCURRENCY = 4;
 
 export default function AccountsPage() {
   const {
@@ -163,12 +232,16 @@ export default function AccountsPage() {
     refreshCredits,
   } = useAccountsStore();
   const [oauthOpen, setOauthOpen] = useState(false);
+  /** WorkBuddy 平台配置弹窗（2026-09-22 从设置页迁来，收进弹窗）。 */
+  const [workbuddyConfigOpen, setWorkbuddyConfigOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   /** 跨账号任务队列面板（批量跑成长任务，带实时进度） */
   const [taskQueueOpen, setTaskQueueOpen] = useState(false);
   /** 从本机导入（扫描当前登录态 + 历史快照 + 切换备份）弹框 */
   const [importLocalOpen, setImportLocalOpen] = useState(false);
+  /** 手机号 + 短信验证码登录弹窗（2026-09-22 新增）。 */
+  const [smsOpen, setSmsOpen] = useState(false);
   const [switchAccount, setSwitchAccount] = useState<AccountMeta | null>(null);
   const [autoCheckinConfig, setAutoCheckinConfig] = useState<CheckinConfig | null>(null);
   const [autoCheckinSaving, setAutoCheckinSaving] = useState(false);
@@ -203,6 +276,16 @@ export default function AccountsPage() {
    * 共用一个状态会让「哪个菜单项该转圈」判断不出来。
    */
   const [growthTaskRunning, setGrowthTaskRunning] = useState<string>();
+  /**
+   * 正在跑「一键执行本账号全部任务」的账号 id；null = 没有在跑。
+   *
+   * ⚠ 与 `growthTaskRunning` 分开是必要的：那个是字符串状态，
+   * 逐项执行时存 taskCode，整轮执行时存哨兵 `"__all__"` ——
+   * 而"整轮"必须知道**是哪个账号**在跑：一次只能有一个账号跑整轮
+   *（后端有账号级互斥，两个账号并发整轮会互相抢不到锁），
+   * 界面据此只禁用那一张卡片的按钮，而不是全部。
+   */
+  const [growthAllAccountId, setGrowthAllAccountId] = useState<string | null>(null);
   /**
    * 网关侧正在执行的养号任务（含「哪些账号已跑过」）。
    *
@@ -614,6 +697,66 @@ export default function AccountsPage() {
   }
 
   /**
+   * 手动执行该账号**全部可自动完成的成长任务**（所有者 2026-09-22 要求）。
+   *
+   *	「workbuddy每个账号再加一个按钮,就是点击后 可以一键执行
+   *	  当前 账号 所能执行的全部任务」
+   *
+   * # 为什么不需要新接口
+   *
+   * `action=run` **不传 taskCode** 时后端就是跑该账号的全部待办
+   *（见 `growth_tasks.go` 的 `runOne`：`if code == "" { r.RunAll(...) }`）——
+   * 它内部含报名、回读进度、自动领奖，比前端逐项循环更省请求也更不容易漏。
+   *
+   * ⚠ 但它**要等整个账号跑完才一次性返回**（十几项、每项可能含真实对话，
+   * 分钟级）。故必须：
+   *   · 给出明确的"正在执行"提示（否则用户以为没反应会连点）
+   *   · 全程禁用按钮（后端有账号级互斥，连点会让第二次直接失败）
+   *
+   * ⚠ `"__all__"` 是**哨兵值**，用于让卡片知道是"整轮"在跑而非某项：
+   * 逐项执行时这个变量存 taskCode，两者必须能区分开，
+   * 否则界面会显示成"正在执行某个不存在的任务"。
+   */
+  async function onRunAllGrowthTasks(accountId: string) {
+    setGrowthTaskRunning("__all__");
+    setGrowthAllAccountId(accountId);
+    toast.info("正在执行该账号的全部任务", {
+      description:
+        "十几项任务依次执行，可能包含真实对话，通常需要一到几分钟。请勿重复点击。",
+      duration: 8000,
+    });
+    try {
+      const res = await api.runGrowthTask("run", accountId);
+      if (!res.ok) {
+        toast.error("一键执行失败", { description: res.error || "未知错误" });
+      } else {
+        // 汇总只给计数，逐项 message 太长；细节交给「查看记录」
+        //（本次同时修好了记录的标题粒度，现在每项一条）。
+        const items = res.items ?? [];
+        const failed = items.filter((i) => i.status === "error");
+    const done = items.filter((i) => i.status === "done");
+        const skipped = items.filter((i) => i.status === "skipped");
+        const desc =
+          `共 ${items.length} 项：完成 ${done.length}、跳过 ${skipped.length}、失败 ${failed.length}` +
+          (failed.length > 0
+            ? `\n失败项：${failed.map((i) => i.task_code).join("、")}`
+            : "");
+        if (failed.length > 0) {
+          toast.error("部分任务未完成", { description: desc, duration: 10000 });
+        } else {
+          toast.success("本账号任务已执行", { description: desc, duration: 8000 });
+        }
+      }
+      void fetchAll();
+    } catch (e) {
+      toast.error("一键执行失败", { description: api.asError(e) });
+    } finally {
+      setGrowthTaskRunning(undefined);
+      setGrowthAllAccountId(null);
+    }
+  }
+
+  /**
    * 手动执行一个**成长任务**（当前只有校园日 school_season）。
    *
    * 与 onRunTask 的区别不只是接口：成长任务是**逐任务**的，且校园日的完成
@@ -905,6 +1048,12 @@ export default function AccountsPage() {
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-4 pt-1">
+            {/* WorkBuddy 专属配置入口（2026-09-22 从设置页迁来）。
+                收进弹窗而不是平铺：那四张卡片一千三百多行，
+                平铺会把下面的账号列表挤到很远处。 */}
+            <PlatformConfigButton onClick={() => setWorkbuddyConfigOpen(true)}>
+              配置
+            </PlatformConfigButton>
             <div className="flex items-center gap-2.5">
               <span className="group relative inline-flex cursor-default">
                 <span
@@ -969,6 +1118,19 @@ export default function AccountsPage() {
                 onClick={() => setOauthOpen(true)}
               >
                 <QrCode />OAuth 登录添加
+              </Button>
+            </DemoAction>
+            {/* 手机号 + 短信验证码：**唯一不依赖桌面端**的添加方式。
+                放在 OAuth 右边而不是藏进菜单 —— 没有桌面客户端的用户
+                第一眼就该看到它（服务器/远程场景尤其需要）。 */}
+            <DemoAction>
+              <Button
+                className="h-10 px-4"
+                variant="outline"
+                onClick={() => setSmsOpen(true)}
+                title="用手机号 + 短信验证码添加账号，无需安装桌面客户端"
+              >
+                <MessageSquare />手机号登录
               </Button>
             </DemoAction>
             <DemoAction>
@@ -1306,6 +1468,8 @@ export default function AccountsPage() {
                 taskRunning={taskRunning}
                 onRunGrowthTask={onRunGrowthTask}
                 growthTaskRunning={growthTaskRunning}
+                onRunAllGrowthTasks={onRunAllGrowthTasks}
+                growthAllRunningAccountId={growthAllAccountId}
                 runningTask={runningTaskByAccountId.get(a.id) ?? null}
                 todayCheckedIn={checkinMap[a.id]}
                 travelStatus={travelMap[a.id]}
@@ -1331,7 +1495,41 @@ export default function AccountsPage() {
         )}
       </section>
 
+      {/* ---- WorkBuddy 平台配置（2026-09-22 从设置页迁来，改为弹窗）----
+          所有者要求：
+            · 「设置页面的每个平台的配置,迁移到每个平台自己的页面去,
+               不要留在设置页面」
+            · 「这些配置应该单独做到一个按钮上,配置  然后点击弹窗进行配置」
+
+          这四张卡片**只对 WorkBuddy 生效**（签到、养号任务、CodeBuddy CLI
+          轮换、认证目录权限检测）。平铺的话一千三百多行会把账号列表淹掉，
+          故收进弹窗 —— 日常看账号、偶尔改配置。
+          组件体一字未改，见 `components/workbuddy-settings.tsx` 的说明。 */}
+      <PlatformConfigDialog
+        open={workbuddyConfigOpen}
+        onOpenChange={setWorkbuddyConfigOpen}
+        title="WorkBuddy 配置"
+        description="自动签到、养号任务、CodeBuddy CLI 轮换与认证目录权限。这些配置只对 WorkBuddy 生效。"
+      >
+        <div className="min-w-0 space-y-12">
+          <AutoCheckinCard />
+          <AutoCareTasksCard />
+          <AutoRotateCard />
+          <PermissionCheckCard />
+        </div>
+      </PlatformConfigDialog>
+
       <OAuthLoginDialog open={oauthOpen} onOpenChange={setOauthOpen} />
+      {/* 手机号 + 短信验证码登录。成功后刷新列表 —— 新账号要立刻出现，
+          否则用户会以为没加上而重复操作（那会再发一条短信）。 */}
+      <SmsLoginDialog
+        open={smsOpen}
+        onOpenChange={setSmsOpen}
+        onSuccess={(msg) => {
+          toast.success(msg, { description: "账号已加入列表" });
+          void fetchAll();
+        }}
+      />
       {/* 跨账号任务队列面板。onFinished 里刷新账号列表与积分：
           成长任务会写账号记录并可能带来领奖积分，不刷新的话卡片上还是旧值。 */}
       <TaskQueuePanel

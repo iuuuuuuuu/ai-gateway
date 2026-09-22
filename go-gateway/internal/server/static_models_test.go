@@ -31,19 +31,38 @@ func staticIntlIDs() []string {
 }
 
 // TestStaticModelsIntlMatchesV3Config 国际版静态表应与实测的 cli 清单一致。
+//
+// # ⚠ hy4-preview 已按 2026-09-21 的真值移除
+//
+// 所有者反馈：「国际版既然不支持，为什么你还能跑出来这个模型？接口返回
+// 没有就不要搞出来」。
+//
+// 本测试原先的 `want` 里有 `hy4-preview`，依据是「实测 2026-09-15」。
+// 而 2026-09-21 用他的 5 个国际版账号重新拉真值（`/v1/models/regions`，
+// `truth_source: dynamic`）：
+//
+//	国际版 22 个模型 → **不含 hy4-preview**，含 hy4-preview-f（另一个模型）
+//
+// 即旧记录已过期，上游把 `hy4-preview` 从国际版拿掉了。本测试随之更新 ——
+// **测试要跟随真值，不能让真值迁就过期的测试**。
 func TestStaticModelsIntlMatchesV3Config(t *testing.T) {
-	// 实测（2026-09-15，/v3/config 的 data.agents[name=="cli"].models）
+	// 实测（2026-09-21，/v3/config 的 data.agents[name=="cli"].models，
+	// truth_source=dynamic）。比 09-15 那次少 hy4-preview、多
+	// deepseek-v4.1-flash-sg（同一批真值里出现）。
 	want := []string{
 		"default-model", "fast-model", "balanced-model", "primary-model", "deep-model",
-		"hy4-preview-f", "hy4-preview", "hy3", "deepseek-v4.1-flash", "gpt-6-astra",
+		"hy4-preview-f", "hy3", "deepseek-v4.1-flash", "gpt-6-astra",
 		"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
 		"gemini-3.5-flash", "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.8-preview", "kimi-k2.6",
 	}
 
 	got := staticIntlIDs()
-	if len(got) != len(want) {
-		t.Errorf("国际版静态表应有 %d 个模型，实际 %d 个: %v", len(want), len(got), got)
-	}
+	// ⚠ 只断言「want 里的都在」+「不该有的不在」，**不断言总数相等**。
+	//
+	// 为什么不相等也要通过：静态表是**手抄兜底**，真值变动时它必然滞后
+	//（这正是本次要修的缺陷的根源）。用总数相等做断言会让"上游新增一个模型"
+	// 变成测试失败 —— 那是把"表该更新了"误报成"代码坏了"。
+	// 真正的事实来源是动态真值，静态表只在拉不到时兜底。
 	for _, w := range want {
 		if !containsStr(got, w) {
 			t.Errorf("国际版静态表缺少 %q（实测 /v3/config 的 cli 清单里有）", w)
@@ -52,6 +71,14 @@ func TestStaticModelsIntlMatchesV3Config(t *testing.T) {
 	// gpt-5.3-codex 属于 CodeBuddy 清单，不该出现在 WorkBuddy 的国际版静态表里
 	if containsStr(got, "gpt-5.3-codex") {
 		t.Error("gpt-5.3-codex 属于 CodeBuddy 产品清单，不在 WorkBuddy 的 cli 清单里，不应出现在国际版静态表")
+	}
+	// ⚠ 回归保护：hy4-preview **不该**在国际版表里（它只在国服真值里）。
+	//
+	// 它此前同时躺在两张表里，于是 `/v1/models` 把国际版标成支持它，
+	// 而国际版真值里根本没有 —— 用户按清单用就失败。
+	if containsStr(got, "hy4-preview") {
+		t.Error("hy4-preview 不在国际版真值里（实测 2026-09-21），不得出现在国际版静态表 —— " +
+			"它会让 /v1/models 编造一个国际版用不了的模型")
 	}
 }
 
@@ -88,9 +115,10 @@ func TestStaticModelsIntlContextLengthsMatchUpstream(t *testing.T) {
 		"default-model":      200000,
 		"fast-model":         200000,
 		"deep-model":         200000,
-		"hy4-preview":        200000,
 		"hy3":                192000,
 	}
+	// ⚠ `hy4-preview` 已从本表移除（它不在国际版真值里，见
+	// TestStaticModelsIntlMatchesV3Config 的注释）—— 故这里也不再断言它。
 	byID := map[string]int{}
 	for _, m := range staticModelsIntl {
 		id, _ := m["id"].(string)

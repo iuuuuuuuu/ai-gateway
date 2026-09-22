@@ -32,7 +32,6 @@
 //! 会话状态由 Go 侧自己持有（内存 + 临时文件），宿主只传 sessionId。
 
 use std::path::PathBuf;
-use std::process::Command;
 
 use serde_json::{json, Value};
 
@@ -43,7 +42,30 @@ fn run_login_cmd(args: &[&str]) -> Result<Value, String> {
     let exe = gateway::resolve_gateway_exe()
         .ok_or_else(|| "找不到网关可执行文件，无法登录 Qoder（请先安装或配置网关）".to_string())?;
 
-    let out = Command::new(&exe)
+    // ⚠ **必须**走 `cmd_builder`（它加 `CREATE_NO_WINDOW`）—— 2026-09-22 修。
+    //
+    // # 所有者现场
+    //
+    //	「为什么每次开机都弹这个cmd,你看看我看像这个软件的」
+    //
+    // 截图是一个标题为 `C:\Users\<用户>\.wb-switch\...` 的黑窗口 ——
+    // 那正是**网关可执行文件的工作目录**。
+    //
+    // # 根因
+    //
+    // `gateway-*.exe` 是 **Console 子系统**的 PE（实测子系统值 = 3）。
+    // 而这里此前写的是裸 `Command::new(&exe)` —— 没加 `CREATE_NO_WINDOW`，
+    // 于是每调一次登录子命令，Windows 就为它**分配一个控制台窗口**，
+    // 标题即工作目录。
+    //
+    // 而 `refresh_account`（开机后、以及每 20 分钟巡检）都会调到这里，
+    // 所以表现成"每次开机弹一个 cmd"。
+    //
+    // ⚠ 同目录的 `zcode_login.rs` 有**同一个**缺陷，一起修了。
+    // 而 `agent_import.rs` 是对的（它自己写了 `creation_flags(0x0800_0000)`）——
+    // 两处对、两处漏，正是"各处自己写一遍"必然产生的漂移。
+    // 统一走 `cmd_builder` 才能避免再漏。
+    let out = crate::modules::process::cmd_builder(&exe)
         .arg("qoder-login")
         .args(args)
         .output()
@@ -149,12 +171,39 @@ pub fn login_poll(session_id: &str) -> Result<Value, String> {
             // 也不自动更新这些信息」）。失败不阻断登录，只透出原因。
             let enrich = refresh_account(&uid);
 
+            // ⚠ 登录成功后**立即领一次**权益活动（2026-09-22 所有者现场）。
+            //
+            // # 为什么不能只靠后台巡检
+            //
+            // 巡检是 **20 分钟**一轮（见 `multi_product_credit_patrol`）。
+            // 用户刚登录完打开账号菜单，看到的是"没有领取积分的操作" ——
+            // 因为此刻还没轮到巡检。他的原话：
+            //
+            //	「我刚成功登录了国际版 但是没有执行领取积分的操作」
+            //
+            // 活动每天 10:00 重置、当天不领就作废，让用户白等 20 分钟
+            // 甚至以为功能坏了，都不该是默认行为。
+            //
+            // # 为什么用 `claim_all_campaigns` 而不是只领这一个账号
+            //
+            // 它的实现就是**遍历账号库**（见其文档），领取是幂等的
+            //（已领会回 `replayed:true`），顺带把其它账号当天的漏领也补上。
+            // 为"只领这一个"另写一条路径，反而多一份要维护的代码。
+            //
+            // 失败**不阻断登录**：登录已经成功了，领取失败只影响积分，
+            // 不该让用户看到"登录失败"。故只记日志。
+            let claim = claim_all_campaigns();
+            if let Err(e) = &claim {
+                eprintln!("[权益自动领取] 登录后立即领取失败（不影响登录）: {e}");
+            }
+
             Ok(json!({
                 "status": "ok",
                 "uid": uid,
                 "account": acc.to_view(),
                 "enriched": enrich.is_ok(),
                 "enrichError": enrich.err(),
+                "claimed": claim.is_ok(),
             }))
         }
         "error" => Err(r
@@ -344,15 +393,40 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
 
 /// 查询账号的**权益活动**（Qoder 的「每天领 100 Credits」那类）。
 ///
-/// # 只读，不代领
+/// # ⚠⚠ 这里此前写着「只读，不代领」，那是**错的**（2026-09-22 实测纠正）
 ///
-/// 领取要阿里云验证码（`X-Aliyun-Captcha-Verify-Param`）—— 那是服务端的
-/// 防滥用机制。本函数**只查询**并返回活动页地址，由用户自己去页面上点
-/// 「领取」。绕过验证码等于帮用户破坏服务端风控，**不做**。
+/// 原文写的是：
+///
+/// > 领取要阿里云验证码 —— 那是服务端的防滥用机制。本函数**只查询**…… 由用户
+/// > 自己去页面上点「领取」。绕过验证码等于帮用户破坏服务端风控，**不做**。
+///
+/// **所有者指出："验证码被印证过早就是你瞎写的,可以自动领取,根本也不需要人机验证"。**
+/// 实测（`gw.exe qoder-login claim-campaign`，2026-09-22）**确实不需要任何验证码**：
+///
+///	{"claimed":true,"replayed":false,"status":"ok",
+///	 "grantId":"01a0c73f-78e0-7436-ab13-f8cf93ec4bb6"}
+///
+/// # 根因：我把两个端点搞混了
+///
+///	/api/v1/zcode-plan/billing/claim      → ZCode 套餐申领，**要**验证码
+///	/sash/api/v1/me/campaigns/{id}/claim  → 本函数用的，**不要**验证码
+///
+/// 后者与**官方客户端点那个「领取」按钮完全同构**：同样的 host、同样的头、
+/// 同样的令牌。没有任何风控绕过。
+///
+/// ⚠ `internal/qoder/campaign.go:156-165` 里**已经写过**这次纠正，但本文件的
+/// 旧注释没跟着改，于是留下了"需要验证码 / 不做自动领取"的错误说法。
+/// **改协议结论时要全文搜索旧结论**，否则会留下互相矛盾的注释 ——
+/// 这种注释比没有注释更糟：后人会照着它做出错误决定。
+///
+/// # 现在：可以自动领取
+///
+/// 批量领取走 `claim-all-campaigns`（已有实现），与 ZCode 的自动领取同样
+/// 由后台调度触发。
 ///
 /// # 这个功能为什么值得单独做
 ///
-/// 活动是**限时**的（实测那条 `endAt` 只差 22 小时），且每天重置。
+/// 活动是**限时**的（实测那条 `endAt` 只差 22 小时），且每天重置（10:00 UTC+8）。
 /// 用户不知道就白白错过。所以界面上要能看到"有 N 个可领取"。
 /// **批量**查所有账号的权益活动（所有者的需求）。
 ///
@@ -514,12 +588,21 @@ fn count_claimable(campaigns: &Value) -> i64 {
 ///	· 单个账号/单个活动失败**不中断**其余 —— 用户要的是"能领的都领到"
 ///	· 返回逐账号、逐活动的结果，界面据此如实展示
 ///
-/// # ⚠ 这是**写操作**，只能由用户显式点击触发
+/// # ⚠ 已支持**定时自动领取**（2026-09-22 所有者要求后改动）
 ///
-/// 它用用户自己的令牌打官方接口（与官方客户端点那个「领取」按钮同构，
-/// **不需要人机验证**）。但**不做定时自动领取** —— 那与"用户点一下"
-/// 不是一回事，且会让账号表现出非人类的活动模式。
-/// 见 `campaign.go` 的说明。
+/// 它用用户自己的令牌打官方接口，与官方客户端点那个「领取」按钮**完全同构**，
+/// 实测**不需要任何验证码**（见文件头"只读，不代领"那段的纠正）。
+///
+/// 此前的注释写着「**不做定时自动领取** …… 会让账号表现出非人类的活动模式」，
+/// **该结论已撤销**。理由：
+///
+///   - 与用户点按钮同构的**一次 POST**，不构成"非人类模式"；
+///   - 活动**每天 10:00 (UTC+8) 重置**、时限约 22 小时 ——
+///     不自动领就**直接过期作废**，对用户是净损失；
+///   - ZCode 的自动领取早已在跑，两条产品线口径必须一致。
+///
+/// 定时入口：`multi_product_credit_patrol::run_once`（随额度巡检一起跑）。
+/// 本函数仍是**手动一键领取**的入口，两条路径共用同一实现。
 pub fn claim_all_campaigns() -> Result<Value, String> {
     let uids = qoder_account::credential_uids();
     if uids.is_empty() {
@@ -740,7 +823,7 @@ pub fn claim_campaign(uid: &str, campaign_id: &str) -> Result<Value, String> {
 ///
 /// `account_records.json` 的 `accountId` 约定是**宿主账号库的 uuid**
 ///（`account-card.tsx` 内嵌记录视图时用 `fixedAccountId={account.id}` 过滤）。
-/// 而 Qoder 侧只有自己的 `uid`（形如 `qoder-019f1772-…`）—— 直接写进去，
+/// 而 Qoder 侧只有自己的 `uid`（形如 `qoder-{qoder-uid}-…`）—— 直接写进去，
 /// 记录会出现在「全部账号」视图里，但**点进那个账号的卡片看不到**。
 ///
 /// 宿主账号库里没有 Qoder 账号（那里只有 WorkBuddy 账号），故这里退而
@@ -1107,5 +1190,77 @@ mod tests {
             { "campaignId": "n", "actionType": "VIEW_DETAILS", "benefit": null },
         ]);
         assert_eq!(count_claimable(&campaigns), 0);
+    }
+
+    /// 调网关子命令时**必须**走 `cmd_builder`（含 CREATE_NO_WINDOW）。
+    ///
+    /// # 为什么必须有这条（2026-09-22 所有者报告的真实缺陷）
+    ///
+    ///	「为什么每次开机都弹这个cmd,你看看我看像这个软件的」
+    ///
+    /// 截图是一个标题为 `C:\Users\<用户>\.wb-switch\...` 的黑窗口。
+    ///
+    /// # 根因
+    ///
+    /// `gateway-*.exe` 是 **Console 子系统**的 PE（实测子系统值 = 3）。
+    /// 裸 `Command::new(&exe)` 没加 `CREATE_NO_WINDOW` ⇒ Windows 为它
+    /// **分配一个控制台窗口**，标题即工作目录（数据目录）。
+    ///
+    /// 而 `refresh_account`（开机、以及每 20 分钟巡检）都会走到这里，
+    /// 于是表现成"每次开机弹一个 cmd"。
+    ///
+    /// ⚠ 这类缺陷**不会有任何报错**，只是多一个窗口 ——
+    /// 靠人读代码很容易看漏（同目录 `agent_import.rs` 就写对了，
+    /// 两处对两处漏，正是"各处自己写一遍"必然产生的漂移）。
+    /// 故用测试钉住：只允许 `cmd_builder`，不允许出现裸 `Command::new`。
+    #[test]
+    fn login_cmd_uses_no_window_builder() {
+        // ⚠ 运行时读文件而不是 include_str!：后者嵌进编译产物，
+        // 只在 mtime 变化时更新，验证"测试是否有效"时会得到假绿。
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/modules/qoder_login.rs");
+        let src = std::fs::read_to_string(path).expect("读不到本文件");
+
+        // 只看 run_login_cmd 的函数体（按花括号深度切，避免被注释里的
+        // 同名文本误判 —— 上面的说明里就写了 `Command::new`）
+        let start = src.find("fn run_login_cmd").expect("找不到 run_login_cmd");
+        let body = &src[start..];
+        let mut depth = 0i32;
+        let mut seen = false;
+        let mut end = body.len();
+        for (i, ch) in body.char_indices() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    seen = true;
+                }
+                '}' => {
+                    depth -= 1;
+                    if seen && depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // 剥掉注释行：说明文字里含 `Command::new(&exe)`，不剥会永远为真
+        let code: String = body[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            code.contains("cmd_builder"),
+            "run_login_cmd 必须用 `cmd_builder`（它加 CREATE_NO_WINDOW）——\n\
+             网关是 Console 子系统，裸 spawn 会让每次开机/巡检时\n\
+             弹出一个标题为数据目录的黑窗口。\n\n代码：\n{code}"
+        );
+        assert!(
+            !code.contains("Command::new"),
+            "run_login_cmd 里不能再出现裸 `Command::new` ——\n\
+             它没有 CREATE_NO_WINDOW，会弹出 cmd 黑窗口（本次修的正是这个）。\n\n\
+             代码：\n{code}"
+        );
     }
 }

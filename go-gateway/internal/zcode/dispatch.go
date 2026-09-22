@@ -121,6 +121,13 @@ func (d *Dispatch) ChatStream(ctx context.Context, a *auth.Auth, openAIBody []by
 
 	rc, status, respBody, err := d.client.StreamChat(ctx, cr, body)
 	if err != nil {
+		// ⚠ 必须打日志：这个错误此前**完全不可见** —— server 层把它归成
+		// 「无法连接上游（网络超时 / 连接被拒）」，把排查方向引向网络与代理，
+		// 而真正原因（翻译失败 / 凭证字段缺失 / 代理地址非法）只存在于这个
+		// err 里。2026-09-21 定位「网关恒 503」时，正是这条日志把
+		// `invalid character 'm'` 暴露出来，否则只能靠猜。
+		log.Printf("zcode dispatch: ChatStream 失败 uid=%s provider=%s: %v%s",
+			cr.UID, cr.Provider, err, malformedBodyNote(body))
 		return nil, 0, nil, err
 	}
 	// 上游的响应**已经是标准 OpenAI**（流式与非流式都是），
@@ -135,6 +142,38 @@ func (d *Dispatch) ChatStream(ctx context.Context, a *auth.Auth, openAIBody []by
 // 故这里实现一个等价的聚合。
 func (d *Dispatch) Aggregate(r io.Reader, model string) (map[string]any, error) {
 	return AggregateOpenAI(r, model)
+}
+
+// truncateForLog 截断日志里的请求体。
+func truncateForLog(b []byte, n int) string {
+	s := string(b)
+	if len(s) > n {
+		return s[:n] + "…(截断)"
+	}
+	return s
+}
+
+// malformedBodyNote 仅当请求体**不是合法 JSON** 时附上原文片段。
+//
+// # 为什么加这个条件（而不是无条件打 body）
+//
+// 请求体含用户的对话内容。无条件打进日志等于把用户隐私写进磁盘上的
+// 日志文件 —— 本仓库对这类泄露是有明确立场的（见 `MaskSecret` 的注释：
+// 「日志可能被用户贴到 issue 里」）。
+//
+// 但"body 不是合法 JSON"是**病态状态**：正常客户端与我们的改写链都只会
+// 产出合法 JSON，走到这里说明请求体在到达本函数前就被破坏了。那种情况下
+// 没有原文就完全无法定位（实测：`invalid character 'm'` 这个报错本身
+// 不透露任何关于"哪一段坏了"的信息），而此时的 body 也几乎不可能
+// 是正常的用户对话。
+//
+// 返回空串（不追加任何内容）表示"body 正常，无需附注"。
+func malformedBodyNote(body []byte) string {
+	if json.Valid(body) {
+		return ""
+	}
+	return fmt.Sprintf("\n  ⚠ 请求体不是合法 JSON（这本身即是缺陷线索），前 200 字节：%s",
+		truncateForLog(body, 200))
 }
 
 // normalizeModel 把客户端模型名映射成上游 id（映射不到时回退原样）。
@@ -252,10 +291,46 @@ func credOf(a *auth.Auth) *Cred {
 		Credential: a.AccessToken,
 		FilePath:   a.FilePath,
 		Provider:   ProviderOfDomain(a.Domain),
+		// ⚠⚠ 以下三项**必须**从凭证文件回读，不能省（2026-09-21 实测缺陷）。
+		//
+		// 症状：同一个账号、同一个模型，独立探针（直接 LoadDir 得到完整 Cred）
+		// 回 **HTTP 200**，而走网关恒回 `503 no_healthy_account` /
+		// 「无法连接上游（网络超时）」。
+		//
+		// 根因：`auth.Auth` 只承载选号需要的字段（UID / 凭证串 / 产品 / 域名），
+		// 而 `applyHeaders` 的鉴权是
+		//
+		//	token := cr.JWT; if token == "" { token = cr.Credential }
+		//
+		// 即**优先用 JWT**。本函数此前只填了 Credential、没填 JWT，于是
+		// 网关永远回落到 `{apiKey}.{secret}` 形态的 Credential —— 那是
+		// **按量计费通道**的凭证，拿去打 start-plan 通道（Anthropic Messages）
+		// 必然被拒。而 `isStartPlan()` 同样只看 JWT，于是端点也会选错。
+		//
+		// 三个字段的用途：
+		//	JWT       鉴权头 + 端点选择（isStartPlan）—— 缺它必失败
+		//	DeviceMid metadata.user_id 的 device_id（与 x-device-mid 同源）
+		//	AccountID x-session-id / trace-id 的稳定标识来源
+		//
+		// 读不到文件（凭证被删/路径失效）时保持零值，行为与修复前一致
+		//（由 applyHeaders 的 Credential 回落兜底），不 panic 也不报错。
 	}
 	if c.Provider == ProviderUnknown {
 		// 域名认不出服务商时按 Z.AI（endpointsOf 的默认行为）
 		c.Provider = ProviderZAI
+	}
+	// 从凭证文件回读 JWT / DeviceMid / AccountID。
+	//
+	// 为什么要回读而不是让宿主透传：`auth.Auth` 的字段集是**跨产品共用**的
+	//（见 main.go 的 qoderAuthOf / zcodeAuthOf），给 ZCode 单独加三个字段会
+	// 污染其它产品。而凭证文件就在 FilePath 上，回读是唯一不破坏抽象的做法。
+	if full, err := LoadFile(a.FilePath); err == nil && full != nil {
+		c.JWT = full.JWT
+		c.JWTIssuedAt = full.JWTIssuedAt
+		c.DeviceMid = full.DeviceMid
+		c.AccountID = full.AccountID
+		c.CaptchaParam = full.CaptchaParam
+		c.CaptchaRegion = full.CaptchaRegion
 	}
 	return c
 }

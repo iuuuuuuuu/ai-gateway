@@ -685,11 +685,23 @@ func (c *Client) applyHeaders(req *http.Request, cr *Cred, stream bool) {
 	}
 	// 追踪头（含 x-query-id / x-session-id）。
 	//
-	// ⚠ 这里要**带上账号标识**：`x-session-id` 与 `x-zcode-trace-id` 必须是
-	// 会话级稳定的（抓包实测：官方相隔 58 分钟的两次请求，这两个值完全相同），
-	// 而旧实现每请求随机 —— 那在高频请求下与脚本无异，很可能就是 3012 的真因。
+	// ⚠ 这里要**带上账号标识**：`x-zcode-trace-id` 必须是会话级稳定的
+	// （抓包实测：官方相隔 58 分钟的两次请求，该值完全相同），
+	// 而旧实现每请求随机 —— 那在高频请求下与脚本无异。
 	// Identity 是从配置构造的**共享值**，故这里做一次副本再填入账号信息，
 	// 不改动 c.Identity 本身（那会让并发的不同账号互相覆盖）。
+	//
+	// ⚠⚠ 2026-09-21 修正：必须按**通道**决定发几个头。
+	//
+	// 参考实现（`test-bin/ref-zcode2api/app/identity.py`）明确记载：
+	//
+	//	start-plan（JWT 通道）：只发 x-request-id / x-zcode-session-type /
+	//	  x-zcode-trace-id 三个。**不发** x-query-id / x-session-id ——
+	//	  官方客户端 start-plan 请求不带这两个。
+	//	**误发会触发上游 3012 "unusual activity"**。
+	//
+	// ZCode 对话走的正是 start-plan（`StartPlanBase`），故这里传
+	// `cr.isStartPlan()`。所有者报的"官方不触发、我们触发"由此解释。
 	id := c.Identity
 	id.AccountID = firstNonEmptyStr(cr.AccountID, cr.UID)
 	for k, v := range id.TraceHeaders() {

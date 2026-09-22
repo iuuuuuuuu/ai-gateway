@@ -704,9 +704,9 @@ async fn apply_pending_restart() {
         SyncAction::Restart => {
             SYNC_DEFER_ROUNDS.store(0, Ordering::SeqCst);
             SYNC_RESTART_PENDING.store(false, Ordering::SeqCst);
-            let cfg = load_gateway_config();
-            stop_gateway();
-            match start_gateway(&cfg).await {
+            // ⚠ 走串行化入口：与用户手点的「重启」共用同一把锁，
+            // 否则两边会互相插队（用户看到「网关已在运行」）。
+            match restart_gateway_serialized().await {
                 Ok(_) => eprintln!("[gateway] 检测到账号变化，已自动重启网关以加载新账号"),
                 Err(e) => eprintln!("[gateway] 账号变化后重启网关失败: {e}"),
             }
@@ -1033,6 +1033,71 @@ pub fn sync_auth_to_accounts() -> Result<Vec<String>, String> {
 
 static GATEWAY_PROC: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 static GATEWAY_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 网关**重启**的互斥锁（2026-09-22 补，修一个真实的竞态）。
+///
+/// # 为什么需要它（所有者现场）
+///
+/// 所有者报告：
+///
+///	「我点击重启，提示 网关已在运行」
+///	「重启后也还是在报错503」
+///
+/// 而网关进程的启动时刻（07:54:00）**早于**那次熔断（07:56:35）——
+/// 说明那次「重启」**根本没有重启成功**。
+///
+/// # 根因：`stop` 与 `start` 之间没有互斥，两个调用方会互相插队
+///
+/// 有三处会走「stop → start」：
+///
+///	1. `commands::restart_gateway`（用户点「重启」按钮）
+///	2. `api::api_gateway_restart`（WebUI 的同名端点）
+///	3. `apply_pending_restart`（后台自动同步，账号变化时）
+///
+/// 它们**各自** `stop_gateway()` + `start_gateway()`，而 `start_gateway`
+/// 开头就是 `if is_running() { return Err("网关已在运行") }`。
+///
+/// 于是这个交错会让用户的「重启」**必然失败**：
+///
+///	后台线程：stop_gateway()   ← 关掉旧的
+///	用户线程：stop_gateway()   ← 关了空 slot（no-op）
+///	后台线程：start_gateway()  ← 起新的，GATEWAY_RUNNING = true
+///	用户线程：start_gateway()  ← 看到 true ⇒ **返回「网关已在运行」**
+///
+/// 用户看到的是「网关已在运行」这个**自相矛盾**的提示（他刚点了重启），
+/// 而真正的问题是：他以为重启了，其实没有 —— 熔断状态原封不动。
+///
+/// # 修法
+///
+/// 把「stop → 等 → start」整段串行化。持有本锁期间别的重启请求排队等待，
+/// 而不是插进别人的 stop/start 中间。
+///
+/// ⚠ 用 `tokio::sync::Mutex` 而不是 `std::sync::Mutex`：临界区里有
+/// `.await`（`start_gateway` 内部等端口就绪最多 20s）。`std` 的锁跨 await
+/// 持有会阻塞整个 runtime（且 `MutexGuard` 不是 `Send`，跨 await 直接编译不过）。
+static GATEWAY_RESTART_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn restart_lock() -> &'static tokio::sync::Mutex<()> {
+    GATEWAY_RESTART_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// 重启网关：**串行化**的 stop → 等端口释放 → start。
+///
+/// 三处调用方（Tauri 命令 / WebUI 端点 / 后台自动同步）都必须走这里，
+/// 不要各自写 stop+start（见 `GATEWAY_RESTART_LOCK` 的注释：分散写会互相插队）。
+///
+/// 返回 `start_gateway` 的结果（成功 = 新网关已就绪）。
+pub async fn restart_gateway_serialized() -> Result<Value, String> {
+    // 持有锁覆盖整个 stop→start：期间别的重启请求排队，不会插进中间
+    let _guard = restart_lock().lock().await;
+    stop_gateway();
+    // 等旧进程真正释放端口。`stop_gateway` 内部已 wait 过子进程，
+    // 但 TerminateJobObject 是**异步**生效的 —— 立刻 start 会撞上
+    // 「端口已被占用」（而那个报错完全不提"上一个进程还没退干净"）。
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let cfg = load_gateway_config();
+    start_gateway(&cfg).await
+}
 
 fn proc_slot() -> &'static Mutex<Option<Child>> {
     GATEWAY_PROC.get_or_init(|| Mutex::new(None))
@@ -2026,10 +2091,38 @@ fn product_models_for_gateway() -> Value {
     // 网关认为"不知道 WorkBuddy 提供什么" ⇒ 不排除 ⇒ **缺陷依旧**。
     // 即：光改 Go 侧不够，清单必须包含 workbuddy 才生效。
     //
-    // 来源：用户配置的「限制使用的模型」白名单（`pool.allowed_model`）。
-    // ⚠ 它为空时**不插入**（表示"不限制"，网关侧也据此不约束）——
-    // 空数组插进去会被 Go 侧当成"它不提供任何模型"的风险，
-    // 虽然 Go 侧已对空集合做了保护，但两边都不做更稳妥。
+    // ===================================================================
+    // ⚠⚠⚠ 2026-09-21：这段**改不动**，真正的修复在 Go 侧（勿重复尝试）
+    // ===================================================================
+    //
+    // 所有者报的现场：
+    //
+    //	发 `Qwen3.8-Flash`（裸名）→ 400 model_not_in_region
+    //	发 `qoder:Qwen3.8-Flash`   → 成功
+    //
+    // 根因：`allowed_models()` 是**用户配置的白名单**，默认为空 ⇒
+    // workbuddy 进不了 `product_models` ⇒ 网关认为"不知道它提供什么" ⇒
+    // 不排除其账号 ⇒ 裸名的候选集里混进 WorkBuddy 账号，而它没这个模型 ⇒ 11102。
+    //
+    // 我试了两条**都会让事情更糟**的路，记录下来免得重复踩：
+    //
+    //	① 换成 `static_models()`（内置 14 个模型）
+    //	   ⇒ WorkBuddy 实际提供 **31** 个，另外 17 个
+    //	     （`glm-5.1` / `hy3` / `kimi-k2.8-preview` / `gpt-5.5` …）
+    //	     会被**误排除** —— 那些模型本来能用，改完反而不能用了。
+    //
+    //	② 在这里补一份"完整清单"
+    //	   ⇒ `write_native_config` 是**同步**函数，拿不到 async 的
+    //	     `fetch_models()`；而静态补一份必然过时（本文件别处已强调
+    //	     "静态表只该用来提供信息，不该用来否定存在"）。
+    //
+    // ⇒ 结论：宿主这边**给不出**可靠清单，不该硬给。
+    //   正确做法是让网关**优先**选"声明提供该模型"的产品，而把
+    //   "清单未知"的产品（含 workbuddy）留作回退 —— 见 Go 侧
+    //   `pool.pickForModelAny` 的注释。那样清单不全最坏只是"没优先到"，
+    //   不会让任何账号失去资格。
+    //
+    // 保留原行为（白名单非空时才写，语义上是"用户限制"而非"产品能力"）。
     let wb = allowed_models();
     if !wb.is_empty() {
         out.insert("workbuddy".into(), json!(wb));
@@ -2356,6 +2449,58 @@ pub fn resync_native_config() -> Result<PathBuf, String> {
     write_native_config(&cfg)
 }
 
+// ---------------------------------------------------------------------------
+// 外部验证码求解服务（宿主 WebView2）的地址槽
+// ---------------------------------------------------------------------------
+
+/// 外部求解服务的 (url, token)，由 `src-tauri` 在启动服务后写入。
+///
+/// # 为什么用全局槽而不是参数
+///
+/// 求解服务住在 **`src-tauri`**（那里才有 `AppHandle`，能建 WebView 窗口），
+/// 而网关配置由**本 crate**（`ai-gateway-core`）生成。两者之间没有直接的
+/// 调用关系 —— `ai-gateway-core` 是被 `src-tauri` 依赖的下层，下层不能反向
+/// 依赖上层。
+///
+/// 三条路可选：
+///
+///	① 给 `write_native_config` 加参数 → 要改它的**所有**调用点（含测试），
+///	   而绝大多数调用点与验证码无关
+///	② 让 `ai-gateway-core` 定义 trait，`src-tauri` 注入实现 → 为一个字符串
+///	   引入一套回调节，过重
+///	③ **全局槽**（本方案）：`src-tauri` 启动服务后 `set`，配置生成时 `get`
+///
+/// ③ 的代价是"全局可变状态"，但它在这里是**进程级单例语义**（一个宿主进程
+/// 只有一个求解服务），与 `redisstore`/`logger` 等处的既有做法一致。
+///
+/// ⚠ 未设置时返回空串 —— 网关据此回退到本地 Node 求解，行为与改动前一致。
+static EXTERNAL_SOLVER: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+/// 注册外部求解服务地址（由宿主在服务启动后调用）。
+///
+/// 重复调用**不会覆盖**（`OnceLock` 语义）：地址在进程生命周期内不变，
+/// 而"能重复设置"只会让调用方以为可以改，反而埋下时序问题。
+/// 若确实需要换地址（如服务重启换端口），应重启网关而非改这里。
+pub fn set_external_solver(url: String, token: String) {
+    let _ = EXTERNAL_SOLVER.set((url, token));
+}
+
+/// 外部求解服务地址（未设置时为空串）。
+fn external_solver_url() -> String {
+    EXTERNAL_SOLVER
+        .get()
+        .map(|(u, _)| u.clone())
+        .unwrap_or_default()
+}
+
+/// 外部求解服务的共享令牌（未设置时为空串）。
+fn external_solver_token() -> String {
+    EXTERNAL_SOLVER
+        .get()
+        .map(|(_, t)| t.clone())
+        .unwrap_or_default()
+}
+
 fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
     let dir = gateway_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -2370,7 +2515,10 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
     // 迟早会算出不同的值，而那种错法表现为「静默不记录」，极难排查。
     let records_file = crate::modules::account_records::account_records_file();
 
-    let native = json!({
+    // ⚠ 分产品开关（qoder_claim_enabled / zcode_claim_enabled）**只在该键
+    // 真存在时才插入** —— 见下方注释。因为 `json!` 宏没有条件插入语法，
+    // 故先构造 native，再用 `insert` 补这两个键。
+    let mut native = json!({
         "listen": cfg.get("listen").and_then(Value::as_str).unwrap_or(":7863"),
         "api_key": cfg.get("api_key").and_then(Value::as_str).unwrap_or(""),
         "auth_dir": auth_dir.to_string_lossy(),
@@ -2413,6 +2561,67 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
                 .filter(|n| *n > 0)
                 .unwrap_or(3)
                 .min(20),
+
+            // ---- Qoder / ZCode 的**权益自动领取**总开关（2026-09-22 接通）----
+            //
+            // # 为什么是这里、为什么是现在
+            //
+            // 在此之前**宿主从不写这个键** ⇒ 网关永远用它自己的默认值 `true`
+            // ⇒ 用户**无法关闭** Qoder/ZCode 的自动领取：
+            //
+            //   · 界面上没有开关（前端完全没暴露它）
+            //   · 就算手工改了 gateway_config.json 也不会被写进去
+            //
+            // 而所有者明确要求「平台配置要能配」，故接通。
+            //
+            // # 语义（缺省 true）
+            //
+            // 与 `checkin_enabled` / `keepalive_enabled` 同款：**老配置里没有
+            // 这个键时保持既有行为**（继续自动领），只有显式 false 才关。
+            // ⚠ 不能写成 `unwrap_or(false)` —— 那会让所有存量用户
+            // **静默停止领取**，而活动每天 10:00 重置、不领就过期作废。
+            //
+            // 2026-09-22 起它是**总闸**：下面两个分产品键优先，缺席时回落它。
+            "product_tasks_enabled": cfg
+                .get("product_tasks_enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+
+            // ---- Qoder / ZCode 分产品自动领取开关（2026-09-22 拆分）----
+            //
+            // 所有者原话：「权益自动领取 qoder zcode 拆分开,不要合成一个」。
+            //
+            // # ⚠ 键缺席时**必须不写**（而不是写 false）
+            //
+            // Go 侧用 `*bool` 区分「没配」与「显式 false」：
+            //	没配     → 回落总闸（老配置行为不变）
+            //	显式 false → 用户明确要关
+            //
+            // 若这里无脑写 `unwrap_or(false)`，就等于**替用户关掉了**
+            // 自动领取 —— 而活动不领就过期作废，用户不会收到任何提示。
+            //
+            // ⚠ 所以这两个键**不在 json! 里**，而是构造完 native 之后
+            // 按需 `insert`（见函数末尾那段）。json! 宏没有条件插入语法，
+            // 强行写进去就只能二选一：要么总是写（替用户关）、
+            // 要么总不写（开关失效）—— 都不对。
+            //
+            // ---- Qoder 领取时点（2026-09-22 所有者要求）----
+            //
+            //	「qoder改为 早十点,晚九点 两次触发,防止错漏」
+            //
+            // 缺省 [10, 21]（与 Go 侧 Default 一致）。
+            // ⚠ 空数组是**合法值**（= 用户要关掉时点制、只靠轮询），
+            // 故不能用 schedule_hours 那种"过滤 + 回落"——它会把用户手填的
+            // 空数组当成"没配"而回填默认值，用户就关不掉了。
+            "qoder_claim_hours": cfg
+                .get("qoder_claim_hours")
+                .cloned()
+                .unwrap_or_else(|| json!([10, 21])),
+            "qoder_claim_interval_minutes": cfg
+                .get("qoder_claim_interval_minutes")
+                .and_then(Value::as_i64)
+                .filter(|n| *n >= 0)
+                .unwrap_or(20),
         },
         "upstream": {
             "timeout_seconds": 120,
@@ -2453,6 +2662,37 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
         "proxy": upstream_proxy(),
         "proxy_scope": native_config_proxy_scope(),
         "pool": {
+            // 单账号最大在途请求数（0 = 不限）。**三个产品统一 3**
+            //（2026-09-22 所有者指定：「qoder workbuddy zcode 都一样」）。
+            //
+            // # ⚠ 为什么现在敢用 3（此前 3 曾导致"对话发不出去"）
+            //
+            // 关键前提：**名额满时不再直接拒绝，而是排队等待**
+            //（`server.Config.InFlightWait`，默认 3000ms；实现见
+            // `pool.AcquireWait`）。
+            //
+            // 当初 3 会失败，是因为满了就 `Acquire` 失败、立刻回 503 ——
+            // 而客户端会并发重试（DSH 的 pi-ai 默认 5 次），第 4、5 个
+            // 必然撞墙。现在它们会**等前一个完成**，通常几十毫秒就拿到名额。
+            //
+            // 所以 3 现在的含义是"每个账号同时最多跑 3 个"，
+            // **不是**"第 4 个请求就失败"。这个语义差别是本值能回到 3 的前提。
+            //
+            // # 值的历史（每次都是实测驱动，别凭感觉改）
+            //
+            //	3 → 32 → 8 → 16 → **3**
+            //
+            //	· 32：**恰好压在 qoder 上游的并发天花板（≈30）上**
+            //	  ⇒ 一重试就越界，报「上游服务异常（HTTP 503）」。
+            //	  **教训：上限不能设成"刚好等于上游能力"** —— 网关自己的
+            //	  巡检/保活也占在途名额，必须留余量。
+            //	· 8 / 16：都是加大余量的尝试；16 时并发 20 全通过。
+            //
+            // ⚠ 若又出现"并发重试成片 503"，先确认 `InFlightWait > 0`
+            //（0 表示关闭等待，等于退回旧行为），再考虑调这个值 ——
+            // **先查排队机制是否还在，再怀疑这个数字**。
+            //
+            // ⚠ 多账号产品不受影响：19 个 WorkBuddy 账号各自 3 ⇒ 总并发 57。
             "max_in_flight": 3,
             "breaker_threshold": 3,
             "breaker_cooldown": "30m",
@@ -2536,6 +2776,22 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
             // Go 侧已不据此开关（老配置留着 false 也不会再关掉功能）。
             "zcode_captcha_dir": captcha_solver_dir(),
             "zcode_captcha_enabled": captcha_solver_enabled(),
+            // 外部求解服务（宿主 WebView2）。
+            //
+            // # 为什么是这个方向（2026-09-21 所有者提出的方案）
+            //
+            // 本地求解要起 Node + happy-dom **模拟**浏览器，两个硬伤：
+            // 要求用户装 Node（为此外置 81MB node.exe）、模拟环境被风控盯上
+            //（实测成功率约 40%，调 stallMs 后 88%）。
+            //
+            // 而宿主自带**真实 WebView2**（Win10/11 预装，零体积），与官方
+            // ZCode 客户端同类环境。实测脚本化调用（无人工点击）
+            // `startTracelessVerification()` **929ms** 拿到 param。
+            //
+            // 地址由 `src-tauri` 启动求解服务后写入全局（见 `external_solver_slot`），
+            // 网关拿到后**外部优先**、本地 Node 作为回退。
+            "zcode_captcha_solver_url": external_solver_url(),
+            "zcode_captcha_solver_token": external_solver_token(),
         },
         "session_sticky": { "enabled": true, "ttl": "30m", "gc_interval": "5m" },
         // ---- 账号记录回写（养号任务的执行痕迹）----
@@ -2557,6 +2813,28 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
             "identities": gateway_account_identities(),
         }
     });
+
+    // ---- 分产品自动领取开关：**只在键真存在时插入** ----
+    //
+    // 见 native 里 "qoder_claim_enabled" 附近的说明：Go 侧用 `*bool`
+    // 区分「没配」（回落总闸）与「显式 false」（用户要关）。
+    // 若我们不假思索地写一个值，就等于替存量用户做了决定 ——
+    // 写 false 会让他们的自动领取**静默停止**，而活动不领就过期作废。
+    //
+    // 故：配置里有没有这个键，就决定 native 里有没有这个键。
+    // 用 `get` 而不是 `unwrap_or` —— 缺席时什么都不做。
+    if let Some(sched) = native.get_mut("schedule").and_then(Value::as_object_mut) {
+        for key in ["qoder_claim_enabled", "zcode_claim_enabled"] {
+            if let Some(v) = cfg.get(key) {
+                // 只接受真正的布尔；写了别的东西（如 null / 字符串）当"没配"，
+                // 避免把一个坏值透传给网关让它启动失败。
+                if v.is_boolean() {
+                    sched.insert(key.to_string(), v.clone());
+                }
+            }
+        }
+    }
+
     let path = dir.join("gateway_native_config.json");
     let text = serde_json::to_string_pretty(&native).map_err(|e| e.to_string())?;
     atomic_write(&path, &text).map_err(|e| e.to_string())?;
@@ -3026,7 +3304,41 @@ pub async fn gateway_status() -> Value {
     // 三次 `load_accounts()` 不仅多两次读盘，还可能落在**不同的写入时刻**上
     // —— 用户刚改完备注时，池里显示的是新备注、下拉里却是旧的，很难解释。
     let accounts = account::load_accounts();
-    let account_count = accounts.len();
+
+    // 账号库总数 = **三个平台之和**（2026-09-21 所有者反馈的缺陷）
+    //
+    // # 缺陷现象
+    //
+    // 所有者原话：
+    //
+    //	「兼容网关,这里显示20个账号只统计了 workbuddy的,没有统计zcode和qoder的」
+    //
+    // 实测本机：账号库实际 22 个（workbuddy 20 + qoder 1 + zcode 1），
+    // 而界面「账号库 N 个账号」显示 20。
+    //
+    // # 根因
+    //
+    // 旧实现只统计 `account::load_accounts()` —— 那是**WorkBuddy 专用**
+    // 的账号库（`~/.wb-switch/accounts.json`）。Qoder / ZCode 各有自己的
+    // 账号库与加载函数，从未被计入。
+    //
+    // # 为什么保留 `accounts` 不动、另算一个总数
+    //
+    // 上面的 `accounts` 在下面还有三处用途（备注合并 / 排除列表 / 指定账号
+    // 下拉），它们**确实只该看 WorkBuddy**（网关池的备注合并只针对
+    // WorkBuddy 凭证）。故只把"展示用的总数"改成三平台之和，
+    // 不动 `accounts` 本身 —— 那是两件事，混在一起会让备注合并去读
+    // Qoder 的账号，进而把无关的备注写进网关卡片的显示名。
+    //
+    // 读失败时该平台计 0：账号库文件不存在是**正常状态**（用户没添加过
+    // 那个平台的账号），不该让整个 /status 失败。
+    let qoder_count = crate::modules::qoder_account::load_accounts()
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let zcode_count = crate::modules::zcode_account::load_accounts()
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let account_count = accounts.len() + qoder_count + zcode_count;
 
     // 把宿主侧备注合并进网关账号池快照（为什么走宿主侧合并见 `merge_account_notes`）。
     // 放在最后一步：`pool` 此时已是网关 `/status` 的完整投影，只补 note 一个字段。
@@ -3132,9 +3444,8 @@ pub async fn sync_and_reload(restart_if_changed: bool) -> Value {
 
     let mut reloaded = false;
     if restart_if_changed && !changed.is_empty() && is_running() {
-        let cfg = load_gateway_config();
-        stop_gateway();
-        if start_gateway(&cfg).await.is_ok() {
+        // ⚠ 走串行化入口（见 GATEWAY_RESTART_LOCK 的注释）
+        if restart_gateway_serialized().await.is_ok() {
             reloaded = true;
         }
     }
@@ -3286,9 +3597,9 @@ pub async fn set_allowed_models(models: &[String]) -> Value {
     // 端口未释放就启动会因占用而失败。
     let mut reloaded = false;
     if is_running() {
-        stop_gateway();
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        match start_gateway(&cfg).await {
+        // ⚠ 走串行化入口（见 GATEWAY_RESTART_LOCK 的注释）：与用户手点的
+        // 「重启」、后台自动同步共用同一把锁，否则会互相插队。
+        match restart_gateway_serialized().await {
             Ok(_) => {
                 reloaded = true;
                 update_runtime_state("started", None);
@@ -3341,17 +3652,19 @@ pub async fn set_model_platforms(platforms: &Value) -> Value {
     let normalized = model_platforms_normalized(platforms);
 
     // 与 allowed_model 同一存放位置（gateway_config.json）
+    //
+    // ⚠ 不需要保留返回值：重启走 `restart_gateway_serialized()`，
+    // 它自己 `load_gateway_config()` 读**刚落盘**的这份（所以顺序不能反：
+    // 必须先 save 再 restart，否则新配置不会生效）。
     let patch = json!({ "model_platforms": normalized.clone() });
-    let cfg = match save_gateway_config(&patch) {
-        Ok(v) => v,
-        Err(e) => return json!({ "ok": false, "error": e }),
-    };
+    if let Err(e) = save_gateway_config(&patch) {
+        return json!({ "ok": false, "error": e });
+    }
 
     let mut reloaded = false;
     if is_running() {
-        stop_gateway();
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        match start_gateway(&cfg).await {
+        // ⚠ 走串行化入口（见 GATEWAY_RESTART_LOCK 的注释）
+        match restart_gateway_serialized().await {
             Ok(_) => {
                 reloaded = true;
                 update_runtime_state("started", None);
@@ -3472,11 +3785,9 @@ pub async fn switch_mode(mode: GatewayMode, uids: Vec<String>) -> Value {
 
     let mut reloaded = false;
     if is_running() {
-        stop_gateway();
-        // 停止后端口需要一点时间释放（TIME_WAIT / 子进程退出），
-        // 否则紧接着的 start 会因端口被占用而失败。
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        match start_gateway(&cfg).await {
+        // ⚠ 走串行化入口（见 GATEWAY_RESTART_LOCK 的注释）。它内部已包含
+        // 「停止后等 600ms 让端口释放」那一步（TIME_WAIT / 子进程退出）。
+        match restart_gateway_serialized().await {
             Ok(_) => {
                 reloaded = true;
                 update_runtime_state("started", None);
@@ -3875,9 +4186,193 @@ pub async fn growth_task(action: &str, account_id: &str, task_code: &str) -> Val
     }
 }
 
+/// 发送短信登录验证码（2026-09-22 新增）。
+///
+/// # ⚠ 这是一个**会真发短信**的操作
+///
+/// 它会消耗上游配额、并可能触发频控。故：
+///   · **不**持有 `TaskBusyGuard`：那会推迟自动同步重启，而发短信是秒级的
+///   · 超时 60s 而不是 600s：用户在界面上等，不该挂十分钟
+///   · **不自动重试**：上游对重复发送有频控，重试会让用户被锁更久
+pub async fn sms_send(phone: &str, region: &str) -> Value {
+    sms_login_call("/login/sms/send", json!({ "phone": phone, "region": region })).await
+}
+
+/// 用验证码换 token 并**登记账号**（2026-09-22 新增）。
+///
+/// 登记在网关侧完成（凭证目录归它管），宿主只转发。
+/// 失败时原样返回网关的 message —— 那里已把 `14704:invalid_sms_code`
+/// 这类业务码翻成了人话（见 go-gateway/internal/upstream/smslogin.go）。
+pub async fn sms_verify(phone: &str, sms_code: &str, region: &str) -> Value {
+    sms_login_call(
+        "/login/sms/verify",
+        json!({ "phone": phone, "smsCode": sms_code, "region": region }),
+    )
+    .await
+}
+
+/// 短信登录两个端点的公共转发实现。
+///
+/// 抽出来是因为两者的**错误处理与超时口径必须一致** ——
+/// 各写一遍迟早分叉（一处报"网关未启动"、另一处报"连接失败"），
+/// 而用户看到两种说法会以为是两个不同的问题。
+async fn sms_login_call(path: &str, body: Value) -> Value {
+    let cfg = load_gateway_config();
+    let port = cfg.get("port").and_then(Value::as_u64).unwrap_or(7863) as u16;
+    let api_key = cfg
+        .get("api_key")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return json!({ "ok": false, "error": format!("无法创建 HTTP 客户端: {e}") }),
+    };
+
+    let mut req = client.post(&url).json(&body);
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {api_key}"));
+    }
+
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let payload: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+            if !(200..300).contains(&status) {
+                // ⚠ 网关的 message 是**给用户看的**（Go 侧已翻成人话，
+                // 如「手机号无效或发送过于频繁…」），故原样透出，
+                // 不要包成"调用网关失败：…"把有用信息埋掉。
+                let detail = payload
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("网关返回 HTTP {status}"));
+                return json!({ "ok": false, "error": detail });
+            }
+            let mut out = payload;
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("ok".to_string(), json!(true));
+            }
+            out
+        }
+        Err(e) => json!({
+            "ok": false,
+            "error": if e.is_connect() {
+                "无法连接网关，请先启动网关".to_string()
+            } else if e.is_timeout() {
+                "请求超时。短信可能仍已发出，请稍候再试，避免频繁点击。".to_string()
+            } else {
+                format!("请求失败: {e}")
+            },
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 网关重启**必须**走带互斥的入口，不得各自写 stop+start。
+    ///
+    /// # 为什么用"读源码"这种笨办法（2026-09-22）
+    ///
+    /// 这个缺陷的表现是**端到端且时序相关**的：两个调用方交错时，
+    /// 用户的「重启」会撞上 `start_gateway` 开头的
+    /// `if is_running() { return Err("网关已在运行") }`，
+    /// 于是**重启静默失败**，用户以为重启了、其实熔断状态原封不动。
+    ///
+    /// 所有者现场：
+    ///
+    ///	「我点击重启，提示 网关已在运行」
+    ///	「重启后也还是在报错503」
+    ///
+    /// 而网关进程的启动时刻（07:54:00）**早于**那次熔断（07:56:35）——
+    /// 直接证实了"重启没生效"。
+    ///
+    /// 要真正复现这个竞态需要精确控制两个并发任务的交错，测试会又慢又脆。
+    /// 而**失败模式**很明确：有人加了新的重启调用点、又自己写了一份
+    /// `stop_gateway()` + `start_gateway()`。读源码能可靠地抓住这一点。
+    ///
+    /// ⚠ 这**不是**理想形态（它测"代码长什么样"而不是"行为"）。
+    /// 我把它定位成"防新增绕过口"的护栏，而不是竞态本身的验证 ——
+    /// 后者靠 `restart_gateway_serialized` 里那把锁的正确使用。
+    #[test]
+    fn gateway_restart_goes_through_serialized_entry() {
+        // ⚠ 运行时读文件而不是 `include_str!`：后者嵌进编译产物、
+        // 只靠 mtime 失效，我实测踩过"改完仍是旧的"的假绿。
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/modules/gateway.rs"
+        );
+        let src = std::fs::read_to_string(path).expect("读不到 gateway.rs");
+
+        // 逐行找"裸的 stop_gateway() 语句"（排除注释）
+        let mut offenders: Vec<(usize, String)> = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim();
+            // 只认独立的语句行；注释里提到的不算
+            if t.starts_with("//") {
+                continue;
+            }
+            if t == "stop_gateway();" {
+                offenders.push((i + 1, t.to_string()));
+            }
+        }
+
+        // 允许两处：
+        //   1. `stop_gateway` **自身的定义**里那一次（它自己不能调自己，
+        //      实际是定义体内没有；这里指 `stop_gateway` 这个 pub fn 的行号附近）
+        //   2. `restart_gateway_serialized` 内部持锁后调的那一次
+        //
+        // 判据不是"数到 2 就通过"，而是**精确核对行号归属** ——
+        // 否则将来有人再插一处、又恰好删掉别处，总数不变就漏过去了。
+        let expected: Vec<usize> = offenders
+            .iter()
+            .map(|(n, _)| *n)
+            .filter(|n| {
+                // 取该行往上找最近的 `pub fn` / `fn` 签名，看它属于谁
+                let idx = n - 1;
+                let mut owner = String::new();
+                for j in (0..idx).rev() {
+                    let l = src.lines().nth(j).unwrap_or("");
+                    if l.starts_with("pub fn ") || l.starts_with("fn ") || l.starts_with("pub async fn ") || l.starts_with("async fn ") {
+                        owner = l.to_string();
+                        break;
+                    }
+                }
+                owner.contains("restart_gateway_serialized")
+            })
+            .collect();
+
+        assert_eq!(
+            offenders.len(),
+            2,
+            "裸的 `stop_gateway()` 只应出现在两处（`restart_gateway_serialized` 内部\
+             与 `stop_gateway` 自身的定义/调用点），实际 {} 处：{:?}\n\n\
+             任何新的重启调用点都必须走 `restart_gateway_serialized()`，\
+             不要自己写 stop+start —— 两个调用方交错时，后到的那个会撞上\
+             `start_gateway` 的 `is_running()` 检查并返回「网关已在运行」，\
+             用户的「重启」就**静默失败**了（2026-09-22 所有者现场）。",
+            offenders.len(),
+            offenders
+        );
+        assert_eq!(
+            expected.len(),
+            1,
+            "`restart_gateway_serialized` 内部应当**恰好**有一处 `stop_gateway()`，\
+             实际 {} 处（行号 {:?}）。\n\
+             多了说明有别的函数也在裸调 stop；少了说明串行化入口被改坏了。",
+            expected.len(),
+            expected
+        );
+    }
 
     /// 求解器目录必须在 **NSIS 安装后的真实布局** 里能找到。
     ///
@@ -4616,14 +5111,169 @@ mod tests {
         assert_eq!(sched["checkin_scope"], json!("cn"), "{text}");
     }
 
+    /// Qoder / ZCode 权益自动领取开关必须落盘（2026-09-22 接通）。
+    ///
+    /// # 为什么必须有这条测试
+    ///
+    /// 在此之前宿主**从不写 `product_tasks_enabled`** ⇒ 网关永远用自己的
+    /// 默认值 `true` ⇒ 用户在界面上**关不掉**自动领取。
+    ///
+    /// 而且这个缺陷**完全静默**：不报错、不写日志，只是"配了没用"。
+    /// 单靠读代码很难发现（`write_native_config` 里少一个键，看起来
+    /// 与旁边二十个键一模一样），故用测试钉住。
+    #[test]
+    fn native_config_writes_product_tasks_switch() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-product-tasks");
+        let cfg = json!({
+            "port": 7863,
+            "listen": ":7863",
+            // 显式 false 才有区分度（true 是缺省）
+            "product_tasks_enabled": false,
+        });
+
+        let path = super::write_native_config(&cfg).expect("write native config");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let native: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(
+            native["schedule"]["product_tasks_enabled"],
+            json!(false),
+            "`product_tasks_enabled` 显式 false 必须落成 false，\
+             否则用户关不掉 Qoder/ZCode 的自动领取（此前正是这个缺陷）：\n{text}"
+        );
+    }
+
+    /// 分产品开关：配置里有就透传，**没有就绝不能凭空写入**。
+    ///
+    /// # 为什么这是本组测试里最容易写错的一条
+    ///
+    /// Go 侧用 `*bool` 区分「没配」与「显式 false」：
+    ///
+    ///	没配       → 回落总闸 `product_tasks_enabled`（老配置行为不变）
+    ///	显式 false → 用户明确要关
+    ///
+    /// 若宿主"顺手"写一个 `false` 进去，就等于**替所有存量用户关掉了**
+    /// 自动领取 —— 而活动每天 10:00 (UTC+8) 重置、单条时限约 22 小时，
+    /// 不领就**直接过期作废**，用户不会收到任何提示。
+    ///
+    /// 反过来若"永远不写"，则用户在界面上关掉 Qoder 领取也不生效
+    ///（配置写了但落不到网关）—— 那是本次要修的另一半。
+    ///
+    /// 两个方向都要钉住，故分两个断言：
+    ///   · 配置里有 → native 里必须有，且值一致
+    ///   · 配置里没有 → native 里**必须没有这个键**
+    #[test]
+    fn native_config_passes_split_switches_only_when_set() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-split-switches");
+
+        // 情形 A：配置里显式写了这两个键 ⇒ 必须原样透传
+        let cfg = json!({
+            "port": 7863,
+            "listen": ":7863",
+            "qoder_claim_enabled": false, // 只关 Qoder
+            "zcode_claim_enabled": true,  // 留着 ZCode
+        });
+        let path = super::write_native_config(&cfg).expect("write native config");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let native: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(
+            native["schedule"]["qoder_claim_enabled"],
+            json!(false),
+            "显式配的 qoder_claim_enabled=false 必须透传到网关，\
+             否则界面上关掉 Qoder 领取不生效：\n{text}"
+        );
+        assert_eq!(
+            native["schedule"]["zcode_claim_enabled"],
+            json!(true),
+            "显式配的 zcode_claim_enabled=true 必须透传（两个开关互相独立）：\n{text}"
+        );
+
+        // 情形 B：配置里**没有**这两个键 ⇒ native 里也必须没有
+        //（写任意值都算"替用户做决定"）
+        let cfg2 = json!({ "port": 7863, "listen": ":7863" });
+        let path2 = super::write_native_config(&cfg2).expect("write native config");
+        let text2 = std::fs::read_to_string(&path2).unwrap();
+        let native2: Value = serde_json::from_str(&text2).unwrap();
+        let sched2 = native2["schedule"]
+            .as_object()
+            .expect("schedule 必须是对象");
+
+        for key in ["qoder_claim_enabled", "zcode_claim_enabled"] {
+            assert!(
+                !sched2.contains_key(key),
+                "配置里没写 `{key}` 时，native 里**绝不能**出现它 —— \
+                 Go 侧靠'键缺席'来回落总闸；写任何值都等于替存量用户做了决定\
+                 （写 false 会让自动领取静默停止，而活动不领就过期作废）：\n{text2}"
+            );
+        }
+
+        // 情形 C：Qoder 领取时点缺省 [10, 21]（所有者要求早晚两次）
+        assert_eq!(
+            native2["schedule"]["qoder_claim_hours"],
+            json!([10, 21]),
+            "未配置时缺省应为早晚两次（10 点 / 21 点）：\n{text2}"
+        );
+    }
+
+    /// Qoder 领取时点的**空数组是合法值**，不能被回填成默认。
+    ///
+    /// ⚠ 这条针对一个很容易犯的错：`schedule_hours` 那个辅助函数会把
+    /// 空数组当成"没配"而回落到默认值 —— 对别的任务那样是对的，
+    /// 但对领取时点，空数组的语义是"用户要关掉时点制、只靠轮询"。
+    /// 回填默认值等于**用户关不掉它**。
+    #[test]
+    fn native_config_keeps_empty_qoder_claim_hours() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-claim-hours-empty");
+        let cfg = json!({
+            "port": 7863,
+            "listen": ":7863",
+            "qoder_claim_hours": [],
+        });
+        let path = super::write_native_config(&cfg).expect("write native config");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let native: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(
+            native["schedule"]["qoder_claim_hours"],
+            json!([]),
+            "显式空数组必须原样透传（用户要关掉时点制），\
+             被回填成 [10,21] 就等于用户关不掉它：\n{text}"
+        );
+    }
+
+    /// 老配置里没有这个键时，必须回落 **true**（继续自动领）。
+    ///
+    /// ⚠ 这条与上一条同样重要，方向相反：
+    ///
+    ///	`unwrap_or(false)` 会让**所有存量用户静默停止领取**，
+    ///	而活动每天 10:00 (UTC+8) 重置、单条时限约 22 小时 ——
+    ///	不领就**直接过期作废**，用户不会收到任何提示。
+    #[test]
+    fn native_config_product_tasks_defaults_to_true() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-product-tasks-def");
+        // 模拟老配置：完全没有这个键
+        let cfg = json!({ "port": 7863, "listen": ":7863" });
+
+        let path = super::write_native_config(&cfg).expect("write native config");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let native: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(
+            native["schedule"]["product_tasks_enabled"],
+            json!(true),
+            "键缺席时必须回落 true（保持既有行为）。\
+             写成 false 会让存量用户静默停止领取，而活动不领就过期：\n{text}"
+        );
+    }
+
     // 键缺席（老配置）时必须落上默认值 —— 且与 Go 侧 Default() 一致。
     //
     // 为什么要断言具体数值而不是「非空即可」：界面读的是宿主配置的默认值，
     // 网关读的是自己 Default() 的默认值；两边一旦漂移，用户「什么都没改直接保存」
     // 就会把排程改成另一套时刻，而界面上显示的还是原来那套。
     #[test]
-    fn native_config_fills_care_task_defaults() {
-        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-care-defaults");
+    fn native_config_fills_care_task_defaults() {        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-care-defaults");
         // 只给启动必需的字段，养号任务相关键全部缺席（模拟老配置）
         let cfg = json!({ "port": 7863, "listen": ":7863" });
 

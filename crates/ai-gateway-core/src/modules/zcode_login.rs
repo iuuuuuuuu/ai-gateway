@@ -18,7 +18,6 @@
 //! 把结果转成前端可用的 JSON。
 
 use std::path::PathBuf;
-use std::process::Command;
 
 use serde_json::{json, Value};
 
@@ -29,7 +28,11 @@ fn run_login_cmd(args: &[&str]) -> Result<Value, String> {
     let exe = gateway::resolve_gateway_exe()
         .ok_or_else(|| "找不到网关可执行文件，无法登录 ZCode（请先安装或配置网关）".to_string())?;
 
-    let out = Command::new(&exe)
+    // ⚠ 必须走 `cmd_builder`（含 `CREATE_NO_WINDOW`），理由见
+    // `qoder_login::run_login_cmd` 的长注释：网关是 Console 子系统，
+    // 裸 spawn 会弹出一个标题为数据目录的黑窗口 ——
+    // 而本函数会在开机与每 20 分钟巡检时被调用。
+    let out = crate::modules::process::cmd_builder(&exe)
         .arg("zcode-login")
         .args(args)
         .output()
@@ -645,8 +648,8 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
     //
     // 我第一版就是无条件覆盖，于是 3 个**不同**账号全被贴上了同一个
     // 昵称/头像/accountId（实测：三者 accountId 全变成
-    // `19331730795565300`，而它们真实身份分别是
-    // `7cb298d6-…` / `10d28204-…` / `19331730795565300`）。
+    // `12345678901234567`，而它们真实身份分别是
+    // `{uuid}` / `{uuid}` / `{19位数字}`）。
     //
     // 判据是**上游账号标识**：凭证自己的 account_id（上面从额度接口拿到，
     // 权威来源）与客户端身份里的 `id` 比对，一致才采用。
@@ -773,6 +776,38 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
     }
     if !plans.is_empty() {
         patch.insert("plans".into(), json!(plans));
+    }
+    // ---- 各模型桶的额度明细落库（2026-09-21，**与上面完全同一类缺陷**）----
+    //
+    // 所有者原话：
+    //
+    // > 「那八百万额度，是 glm5.3flash 五百万，三百万 glm5.3，zcode 账号
+    // >   flash 模型额度我用完了，你优化一下显示，那里应该拆分成两个模型的
+    // >   额度，而不是一个的」
+    //
+    // 上游 `billing/balance` 回的是**两个独立 balance**
+    //（`uitest/zcode-config-samples/billing-balance.json` 是抓到的真实样本）：
+    //
+    //	show_name="GLM-5.3"        total_units=3,000,000
+    //	show_name="GLM-5.3-Flash"  total_units=5,000,000
+    //
+    // 而界面只显示合计 8,000,000 ⇒「Flash 已用完」被另一个模型的剩余量
+    // **完全掩盖**。
+    //
+    // 根因与上面 `plans` 那段**一模一样**：Go 侧 `FetchQuota` 早就把每个
+    // balance 解析成独立 `QuotaEntry`、CLI 也输出了 `entries`、本函数的
+    // `quota_entries` 变量也收到了它 —— 但**写回账号库的 patch 里没提**。
+    //
+    // ⚠ 又一次"数据一路都有、最后一跳丢掉"。上面那段注释写的
+    // 「是最难查的一类缺陷 —— 每一段单看都对」在这里原样重演。
+    // 故**凡是 `quota` 子命令返回的字段，都要在这里逐项过一遍**，
+    // 否则它会静默地只活到函数结束。
+    //
+    // 空数组不放进 patch：那会把上一次的好明细抹掉，而"这次没查到明细"
+    // 与"这个账号真的没有明细"是两件事（后者由 apply_patch 允许空覆盖，
+    // 但写入端要负责不误传空）。
+    if !quota_entries.is_empty() {
+        patch.insert("quotaEntries".into(), json!(quota_entries));
     }
     let acc = zcode_account::upsert_account(uid, &Value::Object(patch))?;
 

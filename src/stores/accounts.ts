@@ -141,8 +141,27 @@ async function loadCredits(accountIds: string[], force: boolean, silent: boolean
     });
   }
 
-  await Promise.all(
-    toFetch.map(async (id) => {
+  // ⚠ 限流到 4 并发（2026-09-22 所有者的"打开后无响应"）。
+  //
+  // 这里原本是裸 `Promise.all`：19 个账号各发一次 IPC 查积分，
+  // 而调用它的 `useCreditAutoRefresh` 在**页面可见即触发**
+  // （见 `refreshOnShow`：lastCreditRefreshAt === 0 时立刻 ensureCredits）——
+  // 于是它与签到/旅行那 38 个请求叠在同一时刻，
+  // 打开界面瞬间有 **57 个并发 IPC** 涌向 WebView2 主线程。
+  //
+  // 4 与 AccountsPage 的 STARTUP_FETCH_CONCURRENCY 取同一个量级：
+  // 再高只是把压力推给上游（网关 max_in_flight=3）。
+  //
+  // ⚠ 不能用 `mapWithConcurrency`（那个在 AccountsPage 里、不导出）：
+  // 本文件是 store，不该依赖页面模块。就地写一份 5 行的游标法
+  // 比跨层 import 更干净 —— 两者的语义差异只在注释里，不在行为上。
+  const CONCURRENCY = 4;
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(CONCURRENCY, toFetch.length) }, async () => {
+    for (;;) {
+      const index = cursor++;
+      if (index >= toFetch.length) return;
+      const id = toFetch[index];
       const result = await fetchCreditExpiry(id);
       creditInflight.delete(id);
       useAccountsStore.setState((s) => ({
@@ -150,8 +169,9 @@ async function loadCredits(accountIds: string[], force: boolean, silent: boolean
         creditUpdatedAtMap: { ...s.creditUpdatedAtMap, [id]: Date.now() },
         creditLoadingMap: silent ? s.creditLoadingMap : { ...s.creditLoadingMap, [id]: false },
       }));
-    }),
-  );
+    }
+  });
+  await Promise.all(workers);
 
   useAccountsStore.setState((s) => ({
     lastCreditRefreshAt: Date.now(),

@@ -11,7 +11,7 @@ package main
 //
 // # 用法
 //
-//	go run ./cmd/zcode-live-probe -uid zcode-1b2941c020ef
+//	go run ./cmd/zcode-live-probe -uid zcode-abcdef123456
 //
 // 只发 **1 个**请求。不做循环、不重试 —— 上游风控是有记忆的。
 import (
@@ -28,7 +28,7 @@ import (
 )
 
 func main() {
-	uid := flag.String("uid", "", "凭证 uid（如 zcode-1b2941c020ef）")
+	uid := flag.String("uid", "", "凭证 uid（如 zcode-abcdef123456）")
 	model := flag.String("model", "GLM-5.3-Flash", "模型名")
 	stream := flag.Bool("stream", true, "是否流式")
 	prompt := flag.String("prompt", "只回答两个字：收到", "用户消息")
@@ -132,14 +132,23 @@ func main() {
 	// ---- 先验证追踪头的**稳定性**（这是本轮的关键修复） ----
 	{
 		fmt.Printf("\n%s\n", strings.Repeat("─", 86))
-		fmt.Println("  追踪头稳定性自检（同一账号连取两次，看哪些该变、哪些该定）")
+		fmt.Println("  追踪头自检（按**通道**决定发几个头 + 稳定性）")
 		fmt.Println(strings.Repeat("─", 86))
 		id := client.Identity
 		id.AccountID = firstNonEmpty(cred.AccountID, cred.UID)
+		// ⚠ 传 cred 的通道：start-plan 只发 3 个头（多发会触发 3012）。
+		startPlan := strings.TrimSpace(cred.JWT) != ""
+		fmt.Printf("  通道判定：%s（JWT 存在 = start-plan）\n",
+			map[bool]string{true: "start-plan（只发 3 个头）", false: "coding-plan（发 5 个头）"}[startPlan])
 		h1 := id.TraceHeaders()
 		h2 := id.TraceHeaders()
 		for _, k := range []string{"x-request-id", "x-query-id", "x-session-id", "x-zcode-trace-id"} {
 			a, b := h1[k], h2[k]
+			if a == "" && b == "" {
+				// start-plan 通道下这两个头**本来就不该发**
+				fmt.Printf("  %-20s 未发送（该通道正确行为）\n", k)
+				continue
+			}
 			same := a == b
 			want := "应稳定"
 			if k == "x-request-id" || k == "x-query-id" {

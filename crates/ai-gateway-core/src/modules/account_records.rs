@@ -421,8 +421,8 @@ fn strip_product_prefix(id: &str) -> &str {
 /// 历史上有**两种** accountId 写法落到同一个账号上：
 ///
 /// ```text
-/// zcode:zcode-1b2941c020ef   ← product_credit_snapshot 的 scoped_id 泄漏
-/// zcode-1b2941c020ef         ← 额度刷新直接写 uid
+/// zcode:zcode-abcdef123456   ← product_credit_snapshot 的 scoped_id 泄漏
+/// zcode-abcdef123456         ← 额度刷新直接写 uid
 /// ```
 ///
 /// 界面按**裸 uid** 过滤，精确比较会让带前缀的那一半**静默消失**
@@ -1027,8 +1027,8 @@ mod tests {
     //
     // 实测同一账号在记录里出现两种写法：
     //
-    //	zcode:zcode-1b2941c020ef   ← product_credit_snapshot 的 scoped_id 泄漏
-    //	zcode-1b2941c020ef         ← 额度刷新直接写 uid
+    //	zcode:zcode-abcdef123456   ← product_credit_snapshot 的 scoped_id 泄漏
+    //	zcode-abcdef123456         ← 额度刷新直接写 uid
     //
     // 界面按**裸 uid** 过滤，精确比较让带前缀的那一半**静默消失**。
     // -----------------------------------------------------------------------

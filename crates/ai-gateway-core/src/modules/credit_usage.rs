@@ -557,15 +557,15 @@ pub fn record_snapshot(
                         // # 为什么（2026-09-20 实测缺陷）
                         //
                         // `product_credit_snapshot` 为了隔离两个产品的 uid 命名空间，
-                        // 把 id 拼成 `zcode:zcode-1b2941c020ef` 再传给本函数
+                        // 把 id 拼成 `zcode:zcode-abcdef123456` 再传给本函数
                         //（那对**快照**是对的）。但本函数会把这个 id **写进用户可见
                         // 的记录**，而界面按账号的**裸 uid** 过滤
                         //（`ZcodePage` → `fixedAccountId={row.uid}`）。
                         //
                         // 于是同一个 ZCode 账号出现两种 accountId：
                         //
-                        //	zcode:zcode-1b2941c020ef   ← 走本函数（带前缀）
-                        //	zcode-1b2941c020ef         ← 走 zcode_login 的额度刷新
+                        //	zcode:zcode-abcdef123456   ← 走本函数（带前缀）
+                        //	zcode-abcdef123456         ← 走 zcode_login 的额度刷新
                         //
                         // 而 `query_records` 是**精确字符串比较** ⇒ 点开账号只能
                         // 看到不带前缀的那一半，**另一半静默消失**。

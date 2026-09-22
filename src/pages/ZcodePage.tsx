@@ -9,9 +9,14 @@ import {
   Loader2,
   RefreshCw,
   Search,
-  Upload,
 } from "lucide-react";
 import { ZcodeMark } from "@/components/product-marks";
+import {
+  PlatformConfigButton,
+  PlatformConfigDialog,
+} from "@/components/platform-config-dialog";
+import { ProductTasksConfigCard } from "@/components/product-tasks-config";
+import { ZcodeAutoClaimScheduleCard } from "@/components/zcode-schedule-info";
 import { ProductAccountCard, ProductAccountGrid } from "@/components/product-account-card";
 // 记录视图：任务执行记录 + 额度消耗明细（所有者 2026-09-20 要求）。
 import { AccountRecordsView } from "@/components/account-records-view";
@@ -156,6 +161,8 @@ export default function ZcodePage() {
   // 每秒渲染纯属浪费）。每分钟一次足够。
   const [now, setNow] = useState(() => Date.now());
   const [loading, setLoading] = useState(true);
+  /** ZCode 平台配置弹窗（2026-09-22 新增）。 */
+  const [configOpen, setConfigOpen] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -174,9 +181,6 @@ export default function ZcodePage() {
   const pollTimer = useRef<number | null>(null);
 
   // 目录导入
-  const [dirOpen, setDirOpen] = useState(false);
-  const [dirPath, setDirPath] = useState("");
-  const [dirResult, setDirResult] = useState<api.ZcodeImportDirResult | null>(null);
 
   // 编辑备注
   const [editTarget, setEditTarget] = useState<ZcodeAccountRow | null>(null);
@@ -287,28 +291,6 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
     }
   }, [pasteCredential, pasteProvider, pasteNickname, refresh]);
 
-  const doDirImport = useCallback(async () => {
-    if (!dirPath.trim()) {
-      toast.error("请填写凭证目录路径");
-      return;
-    }
-    setBusy("dir");
-    try {
-      const r = await api.zcodeImportFromDir(dirPath.trim());
-      setDirResult(r);
-      if (r.importedCount > 0) {
-        toast.success(`已导入 ${r.importedCount} 个账号`);
-        void refresh();
-      }
-      if (r.failedCount > 0) {
-        toast.error(`${r.failedCount} 个文件导入失败，详见下方`);
-      }
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(null);
-    }
-  }, [dirPath, refresh]);
 
   // ---- 扫描本机凭证 ----
 
@@ -550,6 +532,13 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
                 管理 ZCode（Z.AI / 智谱 GLM 编码套餐）账号，与 WorkBuddy、Qoder 一起参与网关路由。
               </p>
             </div>
+            {/* ZCode 平台配置入口（2026-09-22 新增）。 */}
+            <PlatformConfigButton
+              className="mt-1 shrink-0"
+              onClick={() => setConfigOpen(true)}
+            >
+              配置
+            </PlatformConfigButton>
           </div>
         </header>
 
@@ -652,10 +641,12 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
                   <RefreshCw className={cn("mr-2 h-4 w-4", loading && "animate-spin")} />
                   刷新
                 </Button>
-                <Button variant="outline" size="sm" onClick={() => setDirOpen(true)}>
-                  <Upload className="mr-2 h-4 w-4" />
-                  从目录导入
-                </Button>
+                {/* ⚠「从目录导入」已于 2026-09-22 **删除**（所有者要求）。
+                    原话：「zcode 从目录导入功能没用,删了吧」。
+
+                    它要用户手工填一个目录路径，而「扫描本机凭证」会自动
+                    遍历 ZCode 客户端落在本机的已知位置 —— 后者是前者的
+                    超集且不用用户知道路径。留着只会让人在两个入口之间犹豫。 */}
                 {/* 「扫描本机凭证」放在「粘贴凭证」旁边：两者都是"把已有凭证弄进来"，
                     而扫描更省事（ZCode 客户端已经把凭证明文落在本机了）。 */}
                 <Button
@@ -768,6 +759,31 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
                           row.creditsTotal > 0
                             ? `剩余 ${row.credits.toLocaleString()} / ${row.creditsTotal.toLocaleString()}`
                             : undefined,
+                        /*
+                         * 按模型拆开的额度明细（2026-09-21 所有者要求）。
+                         *
+                         * 所有者原话：
+                         *
+                         *   「那八百万额度，是 glm5.3flash 五百万，三百万 glm5.3，
+                         *     zcode 账号 flash 模型额度我用完了，你优化一下显示，
+                         *     那里应该拆分成两个模型的额度，而不是一个的」
+                         *
+                         * 上游按**模型**分桶，而上面那行 `usageText` 是**求和** ——
+                         * 于是"Flash 用完了"被 GLM-5.3 剩下的 300 万完全掩盖。
+                         *
+                         * ⚠ 只取**有总量**的桶：`total <= 0` 表示上游没给容量
+                         * （如按次计费），显示成「0 / 0」比不显示更误导。
+                         *
+                         * ⚠ 字段可能不存在（老账号记录）⇒ 可选链兜底成 undefined
+                         * ⇒ 卡片不渲染明细区块，回退到只显示求和值。
+                         */
+                        usageBuckets: (row.quotaEntries ?? [])
+                          .filter((e) => e.total > 0)
+                          .map((e) => ({
+                            name: e.showName,
+                            remaining: e.remaining,
+                            total: e.total,
+                          })),
                         // 临近到期转橙（同 WorkBuddy：额度的问题是"快过期用不完"）
                         usageWarn: exp.urgent,
                         models: row.models,
@@ -965,66 +981,6 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
           </DialogContent>
         </Dialog>
 
-        {/* 目录导入 */}
-        <Dialog open={dirOpen} onOpenChange={setDirOpen}>
-          <DialogContent className="sm:max-w-lg">
-            <DialogHeader>
-              <DialogTitle>从目录导入凭证</DialogTitle>
-              <DialogDescription>
-                填写凭证文件所在目录，会扫描其中的 zcode*.json 文件。
-              </DialogDescription>
-            </DialogHeader>
-            <div className="space-y-4 py-2">
-              <div className="space-y-2">
-                <Label htmlFor="zcode-dir">目录</Label>
-                <Input
-                  id="zcode-dir"
-                  placeholder="C:\Users\你\zcode-auths"
-                  value={dirPath}
-                  onChange={(e) => setDirPath(e.target.value)}
-                />
-              </div>
-              {dirResult && (
-                <>
-                  <Separator />
-                  {dirResult.imported.length > 0 && (
-                    <div className="space-y-1">
-                      <div className="text-sm font-medium text-emerald-600">
-                        成功 {dirResult.importedCount} 个
-                      </div>
-                      {dirResult.imported.map((x) => (
-                        <div key={x.file} className="font-mono text-xs text-muted-foreground">
-                          {x.file} → {providerLabel(x.provider)}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  {dirResult.failed.length > 0 && (
-                    <div className="space-y-1">
-                      <div className="text-sm font-medium text-destructive">
-                        失败 {dirResult.failedCount} 个
-                      </div>
-                      {dirResult.failed.map((x) => (
-                        <div key={x.file} className="text-xs text-muted-foreground">
-                          <span className="font-mono">{x.file}</span>：{x.error}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setDirOpen(false)}>
-                关闭
-              </Button>
-              <Button onClick={() => void doDirImport()} disabled={busy === "dir"}>
-                {busy === "dir" && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                开始导入
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
 
         {/* 扫描本机凭证 */}
         <Dialog open={scanOpen} onOpenChange={setScanOpen}>
@@ -1301,6 +1257,19 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
           </div>
         </DialogContent>
       </Dialog>
+        {/* ZCode 平台配置（2026-09-22 新增）。
+            使用与 WorkBuddy / Qoder 同一个外壳，三页形状一致。 */}
+        <PlatformConfigDialog
+          open={configOpen}
+          onOpenChange={setConfigOpen}
+          title="ZCode 配置"
+          description="套餐自动领取的开关与执行时机。自动领取与 Qoder 共用同一个开关。"
+        >
+          <div className="min-w-0 space-y-10">
+            <ZcodeAutoClaimScheduleCard />
+            <ProductTasksConfigCard />
+          </div>
+        </PlatformConfigDialog>
       </div>
     </TooltipProvider>
   );

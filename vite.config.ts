@@ -38,6 +38,15 @@ export default defineConfig(async () => ({
       : undefined,
     watch: {
       // 忽略 Rust 构建产物、后端源码与 Git 目录，避免 Windows 下文件锁冲突 (EBUSY)
+      //
+      // ⚠ 还必须忽略 **`**/.*tmpdir*/**`**（2026-09-22 实测踩到）：
+      // 编辑工具在写文件时会先建一个 `.<文件名>.<pid>.tmpdir` 临时目录
+      // 放中间产物，写完即删。Vite 的 watcher 恰好在这个极短窗口里
+      // 打开其中的 `.tmp` 文件 ⇒ `EBUSY: resource busy or locked`
+      // ⇒ **整个 dev server 直接退出**（不是警告，是崩掉）。
+      //
+      // 表现为"改一次代码开发服务器就没了"，且报错里只有 tmpdir 路径、
+      // 看不出与自己有关系。
       ignored: [
         "**/src-tauri/**",
         "**/target/**",
@@ -45,6 +54,8 @@ export default defineConfig(async () => ({
         "**/go-gateway/**",
         "**/.git/**",
         "**/scripts/**",
+        "**/.*tmpdir*/**",
+        "**/*.tmpdir/**",
       ],
     },
   },

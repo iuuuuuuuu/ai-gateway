@@ -13,7 +13,7 @@
 与 [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的 OpenAI 兼容网关，
 整合进同一个桌面应用：**一个安装包、一个界面、一个进程树**。
 
-[功能特性](#功能特性) · [本仓库的由来](#本仓库的由来) · [架构](#架构设计) · [快速开始](#快速开始) · [使用指南](#使用指南) · [常见问题](#常见问题) · [上游与许可](#上游来源与许可证)
+[本项目支持的功能](#本项目支持的功能) · [功能特性](#功能特性) · [本仓库的由来](#本仓库的由来) · [架构](#架构设计) · [快速开始](#快速开始) · [使用指南](#使用指南) · [常见问题](#常见问题) · [上游与许可](#上游来源与许可证)
 
 </div>
 
@@ -145,6 +145,139 @@ ai-gateway        (momo0410)      网关页面、账号同步、单文件内嵌�
 > 把 workbuddy-switch 与 workbuddy2api 整合为单一桌面应用的工作由
 > [momo0410](https://github.com/momo0410) 完成。本仓库在该整合版之上继续开发，
 > 详见 [本仓库的由来](#本仓库的由来) 与 [上游来源与许可证](#上游来源与许可证)。
+
+---
+
+## 本项目支持的功能
+
+> 这一节是**功能总览**：按「界面上的入口」组织，一眼看清这个应用到底能做什么。
+> 每一项后面括号里是主要实现位置，方便对照源码。
+> 更细的行为与取舍见 [功能特性](#功能特性) 各小节。
+
+应用左侧导航共 **11 个入口**，对应下面 11 组能力。
+
+### 1. WorkBuddy 账号
+
+| 功能 | 说明 |
+|---|---|
+| 扫码 / OAuth 登录添加 | 走官方设备码流程，**不用装客户端** |
+| **手机号 + 短信验证码登录** | 两步式（发码 → 验证），带倒计时防连点；失败只清验证码、保留手机号 |
+| 从本机客户端导入 | 客户端已登录时直接读它的凭证，一步到位 |
+| 导入 / 导出备份 | 整库备份与恢复，可跨机器迁移 |
+| 一键签到 | 批量签到所有国服账号，逐个汇报结果 |
+| **一键执行全部任务** | 针对**单个账号**跑完它能做的全部成长任务（菜单内） |
+| 任务执行记录 | 每个任务**逐条**留痕（含跳过原因），可按账号/时间查 |
+| 账号卡片操作 | 刷新 Token、手动签到、重新检查 Buddy、活跃上报、夜猫子、开学季、trial 加油包、活跃地图、校园日、猫猫旅行 |
+| 保活 / 自动签到 / 自动旅行 | 三个独立开关，可只对国服生效 |
+| 禁启用 / 备注 / 排序 | 禁用后不进池，但仍保留在库里 |
+
+> 卡片菜单会**动态拉取该账号的真实任务清单**（不是写死的几项），
+> 每一项显示状态、进度、以及为什么做不了（如「需在客户端手动完成」）。
+
+### 2. Qoder 账号
+
+| 功能 | 说明 |
+|---|---|
+| OAuth 登录（国服 / 国际版） | 两区**各用各的** `client_id` 与回调；国际版 `redirect_uri=qoder-app://`，国服按官方不传 |
+| 从客户端导入 | 主路径 —— 直接读官方客户端已登录的凭证 |
+| **权益活动自动领取** | 每天 10:00 重置的 100 Credits，**登录后立即领一次**，之后每 20 分钟巡检补领 |
+| 一键领取（全部账号） | 手动批量领取入口 |
+| 额度 / 套餐 / 模型展示 | 逐账号显示，含失败原因（不显示成「未知」） |
+| 禁启用 | 禁用后不参与网关选号 |
+
+> 活动领取与官方客户端**点那个按钮完全同构**（同 host、同头、同令牌），
+> 不需要验证码。
+
+### 3. ZCode 账号
+
+| 功能 | 说明 |
+|---|---|
+| 凭证导入（字符串 / 文件 / 目录） | 主路径；支持批量，导入前可勾选 |
+| 登录新账号 | 走官方流程 |
+| 额度按模型拆分显示 | 每个模型的剩余量单独一行 |
+| 账号名与手机号 | 从凭证里解析出来，便于辨认 |
+| 套餐申领 | `zcode-plan/billing/claim`（**要**验证码，与 Qoder 不同） |
+| 设备指纹稳定化 | 一个账号一个 `device_mid`，落盘固化 |
+
+### 4. Token 统计
+
+| 功能 | 说明 |
+|---|---|
+| 每日趋势 | 按天聚合请求数与 token 量 |
+| 模型分布 | 哪个模型用得最多 |
+| 账号消耗 | 每个账号贡献了多少 |
+| 请求明细 | 逐条可查 |
+
+### 5. 积分统计
+
+| 功能 | 说明 |
+|---|---|
+| 积分变动记录 | 领取、消耗、过期逐条留痕 |
+| 到期监控 | 7 天内到期的积分高亮并优先排序 |
+| 统一记录视图 | 签到日志 / 积分统计 / Token 统计三处口径一致 |
+
+### 6. 兼容网关
+
+| 功能 | 说明 |
+|---|---|
+| OpenAI 兼容接口 | `/v1/chat/completions`，任意客户端零改造接入 |
+| **四层路由前缀** | `平台:区域:模型名` / `平台:模型名` / `区域:模型名` / `模型名`，四种写法都支持 |
+| 三平台统一调度 | `workbuddy:` / `qoder:` / `zcode:` 前缀锁定产品 |
+| 按到期日分层选号 | 先烧快过期的额度，同一天到期的平均分摊 |
+| 上游风控熔断 | 识别 `3012 unusual activity` 后立即停止换号 |
+| 并发控制 | `max_in_flight` 每账号上限 + 超额排队而非失败 |
+| 端口 / 密钥 / 配置 | 界面内改，含端口占用检测 |
+| 用量归属标注 | 统计键为**裸模型名**，平台/区域只作后缀区分 |
+
+### 7. 智能体管理
+
+| 功能 | 说明 |
+|---|---|
+| 一键导入本机客户端 | 自动发现并接入 AI 客户端 |
+| 模型路由清单 | 与兼容网关**同一套**展示口径 |
+| 平台开关 chip | 控制哪些平台参与分发 |
+
+### 8. Trae 账号
+
+账号管理、切换、状态查看。详见 [Trae 账号管理](#trae-账号管理)。
+
+### 9. 豆包账号
+
+账号管理、切换、状态查看。详见 [豆包账号管理](#豆包账号管理)。
+
+### 10. 设置
+
+| 功能 | 说明 |
+|---|---|
+| 兼容网关配置 | 端口、密钥、并发、路由策略 |
+| 自动执行时机 | 各定时任务的时点配置（Qoder 默认 10:00 / 21:00） |
+| 代理设置 | 代理检测按钮（进程 / 端口 / 系统代理 / CA 证书四项自检） |
+| 数据目录 / 备份 | 版本拆分与迁移 |
+
+### 11. 桌面集成
+
+| 功能 | 说明 |
+|---|---|
+| 托盘常驻 | 关闭窗口不退出 |
+| 单实例 | 重复启动只唤起已有窗口 |
+| 开机自启 | 可选；**开机弹窗已修复**（不再弹 cmd 黑框） |
+| 应用内更新 | 指向本仓库，带签名校验 |
+| 无窗口子进程 | 所有子命令用不弹窗的构建器启动 |
+
+### 平台能力对照
+
+| 能力 | WorkBuddy | Qoder | ZCode | Trae | 豆包 |
+|---|:---:|:---:|:---:|:---:|:---:|
+| 多账号管理 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 扫码 / OAuth 登录 | ✅ | ✅ | ✅ | — | — |
+| 手机号短信登录 | ✅ | — | — | — | — |
+| 从客户端导入 | ✅ | ✅ | ✅ | — | — |
+| 接入网关 | ✅ | ✅ | ✅ | — | — |
+| 额度 / 积分查询 | ✅ | ✅ | ✅ | — | — |
+| 自动签到 | ✅ | — | — | — | — |
+| 权益自动领取 | ✅ | ✅ | ✅ | — | — |
+| 成长任务自动化 | ✅ | — | — | — | — |
+| 定时任务可配 | ✅ | ✅ | ✅ | — | — |
 
 ---
 
@@ -312,6 +445,8 @@ Pi / Grok Build / ZCode / Kimi Code / OpenClaw / Hermes Agent / MiniMax Code。
 - **账号池调度**：按积分到期日分层选号 —— 先烧快过期额度，同一天到期的账号平均分摊
 - **积分到期巡检**：每 15 分钟刷新余额与到期日，驱动上面的分层选号
 - **熔断与冷却**：429/404 软冷却、余额不足硬冷却至次日 04:00、连续失败指数退避熔断、在途租约限流
+- **上游风控熔断**：识别 ZCode 的 `3012 unusual activity` 后**立即停止换号**
+  （换号只会让上游看到更多凭证被打，放大风控），窗口内直接快速失败并说明原因
 - **模型级限流隔离**：识别上游 `429 code=6004`，只冷却**单个模型**（按账号+模型记），
   冷却时长取报错里的重置时间，并在账号池里与「余额欠费」分开显示
 - **会话粘性**：同一会话尽量绑定同一账号，TTL 滚动续期，失败自动解绑
@@ -678,13 +813,120 @@ sh scripts/make-dmg.sh <版本> <aarch64|x86_64> \
 > macOS 产物为 adhoc 签名（无 Apple 开发者证书），首次打开若提示「已损坏」，执行
 > `xattr -cr "/Applications/AI Gateway.app"` 放行。
 
+#### Windows 签名构建（一条命令）
+
+发布用的 Windows 安装包**必须**带 updater 签名（`tauri.conf.json` 里
+`createUpdaterArtifacts` 恒为 `true`），否则客户端会拒绝更新。仓库提供
+`scripts/build-signed.ps1` 把整条链路包干：
+
+```powershell
+# ⚠ 必须显式把 cargo 加进 PATH —— 新开的 shell 里没有它，
+#   而缺 PATH 的报错是 "failed to run 'cargo metadata'"，
+#   完全不提 PATH，极易误判成 Rust 环境坏了。
+$env:Path = "C:\Users\<你>\.cargo\bin;$env:Path"
+
+& ".\scripts\build-signed.ps1" `
+    -KeyFile      "<私钥路径>.key" `
+    -PasswordFile "<口令文件路径>.password"
+```
+
+脚本分四步，每步失败即中止：
+
+| 步骤 | 做什么 |
+|---|---|
+| `[1/4]` `[2/4]` | 检查私钥存在、**实际签一次**验证口令与密钥配对 |
+| `[3/4]` | **强制重建 Go 网关** 并做构建前后 SHA256 指纹比对 |
+| `[4/4]` | `tauri build --bundles nsis`，产出安装包与 `.sig` |
+
+仅校验密钥不构建：
+
+```powershell
+& ".\scripts\build-signed.ps1" -KeyFile <...> -PasswordFile <...> -CheckOnly
+```
+
+单独重建网关（不打包）：
+
+```powershell
+pwsh scripts/build-gateway.ps1            # 增量：源码没变则跳过
+pwsh scripts/build-gateway.ps1 -Force     # 强制重建
+pwsh scripts/build-gateway.ps1 -CheckOnly # 只校验新鲜度
+```
+
+> **请优先用 `pwsh`（PowerShell 7+）**。仓库的 `.ps1` 含中文注释且带 UTF-8 BOM，
+> Windows PowerShell 5.1 在**缺 BOM** 时会按 ANSI 解析，中文乱码后引号与花括号
+> 配对崩掉，报一堆位置看起来毫无道理的语法错。
+
+##### ⚠ 为什么必须用 `build-signed.ps1` 而不是直接 `tauri build`
+
+**症状**：新功能在开发机上好好的，装完却没有，而构建日志**没有任何异常**。
+
+**根因**：`crates/ai-gateway-core/build.rs` 会无条件内嵌
+`crates/ai-gateway-core/embedded/gateway.exe` 里**当时躺着的那一份**，
+而单纯的 `tauri build` **不会构建网关**。于是改了 `go-gateway/` 却没手动重建
+embedded 时，打出来的包内嵌的还是旧网关。这与前端是**同型**缺陷 ——
+`tauri-build` 的 `rerun-if-changed` 不包含 `../dist`，前端重建也不会触发重新嵌入。
+
+脚本里的两道 SHA256 闸就是为此加的。手工构建时**必须自己补这两道校验**。
+
+##### 交付前自检（解包比对，无需安装）
+
+内嵌网关是主程序里的一个 gzip 流。定位 `1F 8B 08` 魔数、解压后应以 `4D 5A`（`MZ`）
+开头且大于 1 MB，再比对 SHA256：
+
+```powershell
+$want = (Get-Content crates\ai-gateway-core\embedded\gateway.exe.sha256 -Raw).Trim()
+# 扫描 gzip 魔数 → 解压 → 哈希比对
+```
+
+内嵌**前端**的校验只能用**资源文件名**：
+
+```powershell
+# dist/index.html 写死了它引用哪个 assets/index-XXXX.js，
+# 那个名字是 Vite 按内容哈希生成的，且在 exe 里是明文
+$want = [regex]::Match((Get-Content dist\index.html -Raw), 'assets/index-[A-Za-z0-9_\-]+\.js').Value
+$got  = [regex]::Matches([System.Text.Encoding]::ASCII.GetString(
+    [System.IO.File]::ReadAllBytes('target\release\ai-gateway.exe')), 'assets/index-[A-Za-z0-9_\-]+\.js') |
+    ForEach-Object { $_.Value } | Sort-Object -Unique
+$got -contains $want    # True = 内嵌的是当前前端
+```
+
+> ⚠ **不要**用"在 exe 里搜前端代码里的字符串"作判据。Tauri 对 JS **内容**做了压缩，
+> 绝大多数标识**搜不到**（连早就存在的老标识也搜不到）。搜不到 ≠ 没打包。
+
+##### ⚠ 绝对不要运行安装包 / 卸载器做验证
+
+包括 `*_setup.exe` 与 `uninstall.exe`，**加 `/S` 更危险**。Tauri 的 NSIS 模板按
+**可执行文件名**匹配并结束进程，不比对路径：
+
+```nsis
+nsis_tauri_utils::FindProcessCurrentUser "${executableName}"
+nsis_tauri_utils::KillProcessCurrentUser "${executableName}"
+IfSilent kill_${UniqueID} 0        ; 静默模式下不询问，直接杀
+```
+
+主程序名与用户**正在运行的实例同名**，因此「装一次 / 卸一次」就会杀掉它 ——
+而它可能是网关进程的父进程，父进程一死，网关被系统连带回收。
+**验证安装包内容请用上面的解包比对。**
+
+##### ⚠ 验证要用独立实例：独立名 + 独立端口 + 独立数据目录
+
+不要拿正在运行的实例做测试。约定：避开 `7864`（网关）与 `43120`（DSH），
+用 `5789x` / `5799x` 段，配独立 `auth_dir` / `state_file`。
+
+清理只允许 **PID + 路径双条件**，禁止按进程名批量结束：
+
+```powershell
+$proc = Get-CimInstance Win32_Process -Filter "ProcessId=$pid" -ErrorAction SilentlyContinue
+if ($proc -and $proc.ExecutablePath -like "*test-bin*") { Stop-Process -Id $pid -Force }
+```
+
 开发调试命令：
 
 ```bash
 npm install
 npm run tauri dev        # 开发模式
 npm run build            # 前端类型检查与构建
-npm run tauri build      # 构建当前平台安装包
+npm run tauri build      # 构建当前平台安装包（不含签名；发布请用 build-signed.ps1）
 ```
 
 ### 发布新版本
@@ -715,6 +957,9 @@ scripts/             # 构建与发布脚本
 
 - 仓库不提交本地数据（`accounts.json`、认证文件、密钥、token 由 `.gitignore` 排除）
 - 发布前用 `git grep` 扫描 token 模式（`ghp_`/`npm_`/`gho_` 等）
+- **代码与注释里不写真实账号标识**：账号 UUID、deviceMid、上游账号 ID
+  一律用明显的占位值（`{uuid}`、`12345678901234567` 等）。
+  排查问题时容易顺手把真实值粘进注释 —— 本仓库是公开仓库，务必清理
 
 ---
 
@@ -1195,6 +1440,151 @@ cd path/to/workbuddy2api && go test ./...
   路由的普通选号、粘性命中、全冷却兜底三个入口**都**按模型过滤
 - 冷却**不喂熔断器**（配额信号≠账号故障），并**持久化进 `state.json`**
 - 前端账号行下方新增明细区，区分「余额欠费」与「模型冷却」并显示模型名 + 恢复时间
+
+**单账号产品的熔断兜底**（`internal/pool/pool.go`）
+
+`qoder:` 前缀只能选 qoder 账号。当该产品**只有一个**账号、而它因连续
+3 次上游 5xx 被熔断 30 分钟时，`pickStrict` 的"不兜底"会让整个产品
+**彻底不可用**（用户看到 `no_healthy_account` 503 并被迫干等）。
+
+- `PickForModelProductRegion` 在「该产品一个健康账号都没有」时，
+  退到**同产品内部**的冷却兜底
+- 不违反"不兜底"原则：那条原则是防**跨产品/跨区域**降级，
+  而这里排除集已锁死产品
+- 多账号产品的熔断保护**完全不受影响**
+
+**网关重启的串行化**（`crates/ai-gateway-core/src/modules/gateway.rs`）
+
+点「重启」提示**「网关已在运行」**、而实际没有重启 —— 因为三处调用方
+各自写 `stop_gateway()` + `start_gateway()`，交错时后到的那个会撞上
+`start_gateway` 的 `is_running()` 检查。
+
+- 新增 `restart_gateway_serialized()`：用 `tokio::sync::Mutex`
+  把「stop → 等端口释放 → start」整段串行化
+- **全部六处调用点**统一走它（Tauri 命令 / WebUI 端点 / 后台自动同步 /
+  `set_allowed_models` / `set_model_platforms` / `switch_mode`）
+- 有测试钉住"不得新增绕过锁的裸 `stop_gateway()`"
+
+**多平台重叠模型的选路**（`internal/pool/pool.go`）
+
+`GLM-5.3` / `Auto` 这类**多个平台都声明提供**的模型，曾被路由到其实没有
+它的平台并回 400 `model_not_in_region`（而只被 qoder 声明的
+`Qwen3.8-Flash` 正常 —— 差别就在"重叠"）。
+
+根因：宿主那份 `product_models` 可能缺 `workbuddy`（来自用户白名单，
+默认为空），网关于是用**内置静态表补一份兜底**，而那份兜底被当成了
+「声明」⇒ workbuddy 与 qoder 一起竞争 ⇒ 19:1 的账号数压倒 ⇒ 选到
+其实没有该模型的 WorkBuddy。
+
+- 清单分两份：`productModelSet`（宿主透传，**可信**）与
+  `productModelFallbackSet`（网关内置，**猜测**）
+- 可信清单参与「不排除」**与**「声明」；兜底清单**只**参与「不排除」
+- 即「不知道 WorkBuddy 提供什么 ⇒ 别排除它，但也别声称它提供」
+
+**裸名模型的路由清单**（`crates/ai-gateway-core/src/modules/multi_product_credit_patrol.rs`）
+
+发裸名 `Qwen3.8-Flash` 会被路由到 **WorkBuddy 账号**并回 400 `11101`
+（它不提供该模型），而 `qoder:Qwen3.8-Flash` 能成功。
+
+根因是**启动顺序**：`start_gateway` 写配置时，qoder / zcode 账号库里的
+`models` 还是空的（要靠巡检去上游查）⇒ 配置里的 `product_models`
+缺这两个键 ⇒ 网关认为"不知道它们提供什么" ⇒ 裸名请求的候选集里
+混进 WorkBuddy 账号。
+
+- 巡检刷新账号后调用 `gateway::resync_native_config()` 重写配置
+- 幂等；只写文件、不重启网关（不掐断进行中的对话）
+- 写配置失败不影响巡检结果
+
+> ⚠ 对**已在运行**的网关要等重启才生效 —— 网关是启动时读配置的。
+
+**ZCode 额度按模型拆开显示**（`crates/ai-gateway-core/src/modules/zcode_account.rs`、`src/pages/ZcodePage.tsx`）
+
+上游 `billing/balance` 按**模型**分桶（GLM-5.3 三百万、GLM-5.3-Flash 五百万），
+而界面只显示求和八百万 —— 「Flash 已用完」被另一个模型的剩余量完全掩盖。
+
+- `ZcodeAccount` 新增 `quota_entries` 字段，落库并透出为 `quotaEntries`
+- `apply_patch` 支持该键；**老账号记录**（无此字段）解析成空数组，
+  不会让升级前的账号消失
+- 前端按数组**动态渲染**，每个模型一行「模型名 · 剩余/总量」+ **自己的进度条**，
+  `remaining <= 0` 的行标橙
+- 整体求和**保留**（两个视角缺一不可：一个答"整体还剩多少"，
+  一个答"哪个模型快没了"）
+
+> 这与本项目此前修过的「套餐到期时间」缺陷是**同一类**：Go 侧算了、
+> CLI 输出了、Rust 也收到了，但写回账号库时**没有这个字段** ——
+> 数据一路都有，最后一跳静默丢掉。改动额度相关代码时，
+> 记得检查「`quota` 子命令返回的字段是否都进了 patch」。
+
+**ZCode 账号名与手机号**（`crates/ai-gateway-core/src/modules/zcode_credstore.rs`）
+
+账号名**一直没显示**，因为字段名全读错了。
+
+实测解密官方 `oauth:zai:user_info`：
+
+```json
+{"user_id":"{uuid}","email":"{手机号}@phone.local",
+ "avatar":"https://chat.z.ai/user.png","name":"旅行者5800"}
+```
+
+而旧实现读的是 `username` / `displayName` / `id` / `avatarUrl` ——
+**四个字段名全部不存在** ⇒ 恒为空。原因：这段代码照着**参考实现的示例**写，
+从没对着真实解密结果核对过。
+
+- 每个字段给多个候选键，按优先级取第一个非空
+- **手机号从 email 提取**：手机号登录时上游构造假邮箱
+  `{手机号}@phone.local`，只显示号码才是用户认得的
+- 名字优先级：名字 → **手机号** → id（id 是 UUID，对用户没有辨识意义）
+
+**ZCode 设备指纹稳定化**（`internal/zcode/cred.go`，2026-09-21）
+
+修复「官方客户端不触发 3012、网关却触发」的根因：**设备标识每次重启都变**。
+
+- `officialDeviceMid()` / `officialAccountUUID()`：只读地读取官方客户端的
+  `~/.zcode/v2/telemetry-state.json` 与 `~/.zcode/v2/credentials.json`
+  （后者只读**键名**里的账号 uuid —— 值是加密的，键名是明文）
+- `mintDeviceMid()`：**一个账号一个设备标识**
+  - 仅当「凭证账号 == 官方客户端登录账号」时才借用官方 deviceMid
+    （同账号同设备，共享才真实）
+  - 其余账号各自独立生成
+  - 规则：凭证里的 `device_mid` > 官方那个（同账号时）> 随机
+- **落盘固化**：首次确定后写回凭证，此后与官方文件无关
+  （官方重装 / 换机器都不再影响我们）
+- 并发去重 `persistDeviceMidOnce()`：`LoadFile` 在**每个请求路径**上都会被调用，
+  故每路径只固化一次
+
+> **为什么不能所有账号共用一个设备标识**：上游看到的是
+> 「**一台设备并发一批账号**」—— 那是号商 / 脚本的典型形状。
+> 共享公网 IP（同一局域网）上游能理解（NAT 后面本来就有很多人），
+> 但共享**设备**标识不能理解。官方客户端就是「一设备一账号」。
+
+**ZCode 3012 熔断**（`internal/server/unusual.go`，本项目新增）
+
+3012 的 HTTP 载体是 **405**，而 `Classify` 把它归进通用 `ErrClient`，
+`applyErrorPolicy` 对该类别的策略是「只换号不罚」⇒ 网关会把池里**所有账号
+挨个打一遍**，每个都吃一次 3012 —— 对上游风控而言是最坏形状。
+
+- `isUnusualActivity()`：按 `"code":3012`（**解析 JSON**，不做子串匹配 ——
+  子串会把 `30120` 误判成 `3012`）或 `unusual activity` 文案识别
+- `unusualBreaker`：命中即停止换号；窗口 90 秒，连续命中翻倍（上限 30 分钟），
+  上游成功立即复位
+- **不罚账号**：3012 与账号无关，罚号会把「上游临时风控」变成
+  「我们自己造成的持续故障」
+- 新增错误码 `unusual_activity`（不再包装成误导性的 `no_healthy_account`）
+
+实测对比：一次请求打上游的次数从 **3 次降到 1 次**。
+
+**用量平台归属持久化与回填**（`internal/usage/usage.go`）
+
+- `fileState` 新增 `Billed` / `BillingMeta` —— 此前计费归属**只在内存里**，
+  网关一重启就清零，导致历史用量全部没有平台信息
+- 装载时归一旧键（`国服:xxx` → `xxx`），按裸模型名累加
+- `productFromUID()`：由账号 uid 的**形态**反推平台
+  （`zcode-*` → zcode、`qoder-*` → qoder、裸 UUID → workbuddy），
+  用于**回填历史**用量
+- `backfillBillingLocked()`：只补 `product`，**不编造** region 与倍率 ——
+  历史数据里没有区域，而倍率依赖区域，填默认值会让用户看到错误的计费数字
+- 前端：用量行的标签改为「模型 · 平台 区域」，此前只用区域，
+  导致「有平台、无区域」的回填行看不出平台
 ## 上游来源与许可证
 
 本项目基于以下项目整合改造，**绝大部分代码来自上游**：

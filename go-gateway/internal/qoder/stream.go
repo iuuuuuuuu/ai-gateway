@@ -54,6 +54,26 @@ type openAIStream struct {
 	created int64
 	// roleSent 是否已产出过带 role 的首帧。
 	roleSent bool
+	// finishSent 是否**已经**转发过上游给的 finish_reason。
+	//
+	// # 为什么需要它（2026-09-22，所有者报告的真实缺陷）
+	//
+	// 修复前，收尾逻辑（`fill` 的 io.EOF 分支）**无条件**补一个
+	// `finish_reason: "stop"` 的收尾帧。而上游 qoder 自己**也会**在最后一个
+	// 内容分片里给出 `finish_reason`（第 143 行会原样转发）。
+	//
+	// 于是**同一条流里 `finish_reason: "stop"` 出现两次**。实测对比：
+	//
+	//	qoder:Qwen3.8-Flash → 2 次   ← 客户端解析异常、报错重试
+	//	zcode:GLM-5.3-Flash → 1 次   ← 正常
+	//
+	// 这解释了所有者的现场「**zcode 没问题、qoder 有问题**」，
+	// 以及他截图里「内容已经出来了（`已思考 > 2`）却还在转圈 + 报 503」。
+	//
+	// OpenAI 规范里 `finish_reason` 是「本轮结束」的信号，
+	// **只该出现一次**（在最后一个 chunk）。重复会让严格的状态机
+	// 提前判定流已结束，而后面的帧（usage / 收尾）就成了"多余的字节"。
+	finishSent bool
 }
 
 // NewOpenAIStream 包装 Qoder 的嵌套流，产出标准 OpenAI SSE。
@@ -90,7 +110,21 @@ func (s *openAIStream) fill() error {
 			s.pending = []byte("data: [DONE]\n\n")
 			return nil
 		}
-		s.pending = []byte(s.finishFrame() + "data: [DONE]\n\n")
+		// ⚠ 只有上游**没给过** finish_reason 时才补收尾帧（2026-09-22 修复）。
+		//
+		// qoder 上游会自己在最后一个内容分片里给 `finish_reason`（上面
+		// 第 143 行已原样转发）。无条件再补一次会让同一条流里
+		// `finish_reason: "stop"` 出现**两次** —— 实测 qoder 2 次 / zcode 1 次，
+		// 而客户端会因为流的结束信号重复而报错重试
+		//（所有者现场：「zcode 没问题、qoder 有问题」）。
+		//
+		// 仍要补的场景：上游只发了内容、**始终没给** finish_reason ——
+		// 那时不补会让客户端一直等（原始注释的教训，必须保留）。
+		if s.finishSent {
+			s.pending = []byte("data: [DONE]\n\n")
+		} else {
+			s.pending = []byte(s.finishFrame() + "data: [DONE]\n\n")
+		}
 		return nil
 	}
 	if err != nil {
@@ -142,6 +176,12 @@ func (s *openAIStream) fill() error {
 	choice := map[string]any{"index": 0, "delta": delta}
 	if ch.FinishReason != "" {
 		choice["finish_reason"] = ch.FinishReason
+		// 记下"上游已经给过结束信号" —— 收尾时据此决定**是否还要补**
+		// 一个 finish 帧（见 `finishSent` 字段的注释）。
+		//
+		// ⚠ 只有**非空**才算给过：上游偶尔发一个 `finish_reason: ""` 的空帧，
+		// 那不是结束信号，不能因此跳过收尾补帧（否则客户端一直等）。
+		s.finishSent = true
 	}
 	model := s.modelOf(ch)
 	contentFrame := frame("chat.completion.chunk", s.created, model, choice)

@@ -476,7 +476,9 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(body, &req)
 
 	stat := newChatStat(nowFunc(), body, true)
-	stat.model = req.Model
+	// 用 setModel 而不是 `stat.model = ...`：它会**同时**算好统计用的裸名
+	//（去掉 `国服:` / `zcode:` 这类路由前缀），见 setModel 的注释。
+	stat.setModel(req.Model)
 	stat.mode = "messages"
 	defer func() {
 		stat.done()

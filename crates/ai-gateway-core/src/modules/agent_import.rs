@@ -1164,7 +1164,7 @@ pub fn build_dsh_settings(
             json!({
                 "id": m,
                 "name": m,
-                // 必须声明 input：DSH 的 llm-pi-ai 判据是 model.input 数组
+                // 必须声明 input：DSH 的 llm-ai 判据是 model.input 数组
                 // （catalog.ts：`input: declaredInput(entry.input) ?? base?.input ?? [...request.defaultInput]`），
                 // 缺省 defaultInput 是 ["text"]，于是图片被
                 // `MODEL_DOES_NOT_SUPPORT_IMAGES` 拦下。
@@ -1175,7 +1175,41 @@ pub fn build_dsh_settings(
                 // 上游 /v3/config 的 agents[cli].models 实测全部
                 // supportsImages=true（2026-09-16），故声明 text+image。
                 "input": ["text", "image"],
-                "reasoningEfforts": { "off": null, "high": "high", "max": "max" }
+                "reasoningEfforts": { "off": null, "high": "high", "max": "max" },
+                // ⚠⚠ `cost` 是**必填**，缺了会让客户端在算成本时崩溃（2026-09-22）。
+                //
+                // # 所有者现场
+                //
+                // 装好后发对话**每次都失败**（503 外观），而模型其实**答对了**。
+                // 用 DSH 自己的 pi-ai 复现（`stream()` 直调）拿到真实错误：
+                //
+                //	errorMessage: "Cannot read properties of undefined (reading 'tiers')"
+                //	text: "1 + 1 = 2"      ← 模型回答完全正确
+                //
+                // # 根因：pi-ai 的 calculateCost 假定 `model.cost` 一定存在
+                //
+                // `@earendil-works/pi-ai` 的 `dist/models.js:530`：
+                //
+                //	export function calculateCost(model, usage) {
+                //	  let rates = model.cost;                     // ← undefined
+                //	  for (const tier of model.cost.tiers ?? []) // ← ★ 崩在这里
+                //
+                // 注意 `?? []` 只兜住了 `tiers`，**没有兜住 `model.cost` 本身**。
+                // 即"`cost` 缺失"这个输入它会直接抛 TypeError。
+                //
+                // # 为什么网关侧要修（而不是让用户去配客户端）
+                //
+                // `settings.yaml` 是**本程序生成的**（见本函数的文档注释），
+                // 生成器漏了必填字段，就该由生成器补上 ——
+                // 让用户"自己去客户端加 cost"是把我们的缺陷转嫁给他。
+                //
+                // # 为什么是 0
+                //
+                // 网关对客户端是**透明转售**：额度由上游按账号计，客户端这侧
+                // 用不到美元计价。全 0 既满足 pi-ai 的必填契约，
+                // 又不会在界面上凭空显示一个**编造的**花费数字
+                //（显示假数字比显示 0 更糟 —— 用户会当真）。
+                "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
             })
         })
         .collect();
@@ -2030,6 +2064,84 @@ mod tests {
         let arr = input.as_array().expect("每个模型都应有 input 数组");
         assert!(!arr.is_empty(), "input 不能为空数组（declaredInput 会当作未声明而回退）：{out}");
         assert!(arr.iter().any(|m| m == "image"), "应声明 image：{out}");
+    }
+
+    /// 每个模型条目**必须**带 `cost`，否则客户端会在算成本时崩（2026-09-22）。
+    ///
+    /// # 所有者现场（这个字段缺了会怎样）
+    ///
+    /// 装好后发对话**每次都失败**（外观像 503），而模型其实**答对了**。
+    /// 用 DSH 自己的 pi-ai 复现（直调 `stream()`）拿到的真实错误是：
+    ///
+    ///	errorMessage: "Cannot read properties of undefined (reading 'tiers')"
+    ///	text: "1 + 1 = 2"      ← 模型回答完全正确
+    ///
+    /// # 为什么会崩（pi-ai 的 `dist/models.js:530`）
+    ///
+    ///	export function calculateCost(model, usage) {
+    ///	  let rates = model.cost;                     // ← undefined
+    ///	  for (const tier of model.cost.tiers ?? []) // ← ★ TypeError
+    ///
+    /// `?? []` 只兜住了 `tiers`，**没兜住 `model.cost` 本身** ——
+    /// 即"cost 缺失"这个输入它会直接抛。故 `cost` 是**必填**。
+    ///
+    /// ⚠ 注意本测试**不能**只断言"cost 存在"：那样的测试在"写了个空
+    /// object"时也会通过，而 pi-ai 读的是 `cost.input/output/cacheRead/
+    /// cacheWrite` 四个数值（见 models.js:543-547，任一缺失会算出 NaN）。
+    /// 故逐个断言**四个字段都是数值**。
+    #[test]
+    fn dsh_settings_declares_cost_to_avoid_client_crash() {
+        let out = build_dsh_settings(None, "http://127.0.0.1:7863", &["glm-5.2".into()]).unwrap();
+        let map = crate::modules::yaml_lite::parse_mapping(&out).expect("DSH 配置必须是合法 YAML");
+        let v = Value::Object(map);
+        let cost = &v["llm-pi-ai"]["providers"]["workbuddy"]["models"][0]["cost"];
+
+        assert!(
+            cost.is_object(),
+            "每个模型条目都必须带 `cost` —— 缺了会让 pi-ai 的 \
+             calculateCost 抛 \"Cannot read properties of undefined \
+             (reading 'tiers')\"，表现为「对话每次都失败」而模型其实答对了。\n\
+             产物：{out}"
+        );
+        // 四个字段都要是数值（pi-ai 会拿它们做除法，缺失会算出 NaN）
+        for k in ["input", "output", "cacheRead", "cacheWrite"] {
+            assert!(
+                cost[k].is_number(),
+                "cost.{k} 必须是数值（pi-ai 会用它算 cost），实际 {:?}\n产物：{out}",
+                cost[k]
+            );
+        }
+    }
+
+    /// 已存在的配置里缺 `cost` 时，重新接入要能补上。
+    ///
+    /// 这是"修复既有用户"的路径 —— 光改生成器只能救新导入，
+    /// 而已装用户跑一次「重新接入」就该被修好。
+    #[test]
+    fn dsh_settings_backfills_missing_cost() {
+        // 模拟一份"旧生成器产出 / 手工编辑"的配置：有模型但没有 cost
+        let existing = r#"
+llm-pi-ai:
+  providers:
+    workbuddy:
+      api: openai-completions
+      baseURL: http://127.0.0.1:7863/v1
+      models:
+        - id: glm-5.2
+          name: glm-5.2
+          input:
+            - text
+            - image
+"#;
+        let out = build_dsh_settings(Some(existing), "http://127.0.0.1:7863", &["glm-5.2".into()])
+            .unwrap();
+        let map = crate::modules::yaml_lite::parse_mapping(&out).expect("合法 YAML");
+        let v = Value::Object(map);
+        let cost = &v["llm-pi-ai"]["providers"]["workbuddy"]["models"][0]["cost"];
+        assert!(
+            cost.is_object() && cost["input"].is_number(),
+            "重新接入时应当为缺失 `cost` 的模型补上它（否则老用户仍然崩）：\n{out}"
+        );
     }
 
     /// 已存在的配置里被写成纯文本时，重新接入要能纠正过来。

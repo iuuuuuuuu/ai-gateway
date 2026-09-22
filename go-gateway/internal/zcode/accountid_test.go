@@ -38,10 +38,10 @@ func TestAccountIDFromJWT(t *testing.T) {
 		token  string
 		expect string
 	}{
-		{"正常 user_id", makeJWT(t, map[string]any{"user_id": "19331730795565300"}), "19331730795565300"},
+		{"正常 user_id", makeJWT(t, map[string]any{"user_id": "12345678901234567"}), "12345678901234567"},
 		{"只有 sub", makeJWT(t, map[string]any{"sub": "only-sub"}), "only-sub"},
 		{"user_id 优先于 sub", makeJWT(t, map[string]any{"user_id": "u", "sub": "s"}), "u"},
-		{"UUID 形态", makeJWT(t, map[string]any{"user_id": "7cb298d6-7d2a-4f6f-bf1b-5b2ad52df7bd"}), "7cb298d6-7d2a-4f6f-bf1b-5b2ad52df7bd"},
+		{"UUID 形态", makeJWT(t, map[string]any{"user_id": "00000000-0000-4000-8000-000000000001"}), "00000000-0000-4000-8000-000000000001"},
 		{"无相关字段", makeJWT(t, map[string]any{"iat": 123}), ""},
 		{"空串", "", ""},
 		{"不是 JWT（两段）", "aaa.bbb", ""},

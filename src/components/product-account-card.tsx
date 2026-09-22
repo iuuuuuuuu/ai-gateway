@@ -31,7 +31,7 @@
  *
  * 这样两个产品页与 WorkBuddy 账号页放在一起时，用户不必重新学一遍。
  */
-import { Loader2, RefreshCw, Trash2, Pencil, AlertTriangle, CheckCircle2, Clock3, ListChecks, PlayCircle, ScrollText } from "lucide-react";
+import { Loader2, RefreshCw, Trash2, Pencil, AlertTriangle, CheckCircle2, Clock3, Ellipsis, PlayCircle, ScrollText } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -63,9 +63,27 @@ export interface ProductAccountCardData {
    * 还是次数。各产品传自己的口径（如 ZCode 是 token，Qoder 是 Credits）。
    */
   creditsLabel?: string;
-  /** 到期显示文本。 */
+  /**
+   * 时钟图标旁那行文字的**语义**，决定 tooltip 怎么解释它。
+   *
+   * 为什么需要它：同一个位置在两个产品上含义**不同** ——
+   *
+   *	`quota-cycle`（ZCode）该时刻额度桶会**重置**，是"还剩多久"
+   *	`last-updated`（Qoder）数据**上次刷新的时刻**，是"有多新"
+   *
+   * Qoder 改成后者是所有者要求的（2026-09-21）：
+   *
+   *	「qoder那个改成上次更新时间吧,你那个过期时间根本不准确」
+   *
+   * 实测印证了他的判断：该账号 `expire_at = 0`、`nextResetAt` 已过期
+   * 68 天，任何"到期"推算都不准；而 `lastSeenAt` 是我们自己写的时间。
+   *
+   * 缺省按 `quota-cycle`（ZCode 的既有行为不变）。
+   */
+  expiryKind?: "quota-cycle" | "last-updated";
+  /** 到期/更新时间显示文本。 */
   expiryText?: string;
-  /** 到是否紧急（7 天内），用于着色。 */
+  /** 是否需要注意（过期/陈旧），用于着色。 */
   expiryUrgent?: boolean;
   /** 该账号可用模型数；undefined = 没查过（与 0 个区分）。 */
   modelCount?: number;
@@ -136,6 +154,29 @@ export interface ProductAccountCardData {
    */
   usageWarn?: boolean;
   /**
+   * **按模型拆开**的额度明细（ZCode 专用，2026-09-21 所有者要求）。
+   *
+   * # 为什么需要它
+   *
+   * 所有者原话：
+   *
+   * > 「那八百万额度，是 glm5.3flash 五百万，三百万 glm5.3，zcode 账号
+   * >   flash 模型额度我用完了，你优化一下显示，那里应该拆分成两个模型的
+   * >   额度，而不是一个的」
+   *
+   * 上游把额度按**模型**分桶，而 `creditsText` 显示的是它们的**求和**。
+   * 求和会把「某个模型已用完」掩盖掉 —— 他遇到的正是这种情况：
+   * Flash 用光了，卡片上却还剩 300 万（那是 GLM-5.3 的），看不出问题。
+   *
+   * 每一项渲染成「模型名 · 剩余/总量」一行。
+   * 空数组/undefined = 没有明细 ⇒ 不渲染这个区块（回退到只显示求和值）。
+   */
+  usageBuckets?: Array<{
+    /** 模型名（上游 `show_name`）。 */
+    name: string;
+    remaining: number;
+    total: number;
+  }>;  /**
    * 本账号可执行的任务（渲染成右上角「任务」菜单）。
    *
    * # 为什么任务要挂在**账号卡片**上（所有者 2026-09-20）
@@ -239,9 +280,30 @@ export function ProductAccountCard({
           compact ? "min-h-[52px] px-3.5 py-2" : "px-4 py-3",
         )}
       >
-        {/* 产品图标置于右上角做水印（同 WorkBuddy 的 WorkBuddyMark） */}
+        {/* 产品图标置于右上角做水印（同 WorkBuddy 的 WorkBuddyMark）。
+            ⚠ 2026-09-22 两次调整，最终取值见下：
+
+            # 第一次：`opacity-[0.075]` 直接套在自绘 mark 上
+            自绘的 `QoderMark` 是「渐变实心方块 + 白色图形」，实心底色
+            占满整个面积 ⇒ 0.075 叠出来仍是**一整块可见色斑**，
+            像"来历不明的图标"（所有者反馈：「有水印不知道是从哪里来的icon」）。
+
+            # 第二次：换成官方 app icon 后重新定标
+            官方图标是「圆角底 + 品牌图形」（与 WorkBuddy 官方图标同构），
+            整块都是实色 ⇒ 比自绘 mark 更"重"。实测 `0.075` 会明显压过
+            账号名，故取 **0.05** 并叠 `saturate-0` 去色：
+            让它是"一层淡淡的印记"，而不是一个看不清的按钮。
+
+            ⚠ 右侧留出 `⋯` 按钮的位置（约 48px），否则水印会被按钮压住；
+            这也是此处不用 `right-4` 的原因。 */}
         {mark && (
-          <div className="pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 opacity-[0.075]">
+          <div
+            className={cn(
+              "pointer-events-none absolute top-1/2 -translate-y-1/2 opacity-[0.05] saturate-0",
+              compact ? "right-12" : "right-14",
+            )}
+            aria-hidden
+          >
             {mark(compact ? 40 : 56)}
           </div>
         )}
@@ -277,6 +339,145 @@ export function ProductAccountCard({
           <p className="mt-0.5 truncate font-mono text-xs leading-5 text-muted-foreground" title={data.uid}>
             {data.uid}
           </p>
+        </div>
+
+        {/* ── 右上角操作菜单（2026-09-22 改）──
+            与 WorkBuddy 账号卡片统一：一个 `⋯` 按钮，点开是所有操作。
+            此前是底部一排图标按钮，所有者要求改成与 WorkBuddy 一致的形态
+            （原话：「操作按钮都还在下面,应该跟workbuddy一样保持统一,
+            在右上角有个操作按钮,点击下拉出来操作菜单才对」）。
+
+            ⚠ 位置用 `absolute` 而非 flex 子项：头部高度随 compact／宽松
+            两档变化，绝对定位才能让菜单在两种档位下都贴住右上角，
+            且不会把「名字 + uid」挤窄。
+
+            ⚠ 菜单**始终渲染**（即使个别操作不可用）：WorkBuddy 卡片也是
+            如此 —— 有的账号没有可跑任务，但"刷新/记录/备注/停用/删除"
+            仍然在，藏掉整个入口会让用户以为功能没了。 */}
+        <div className="absolute right-2 top-2 z-20">
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className={cn("rounded-lg text-muted-foreground hover:text-foreground", compact ? "size-7" : "size-8")}
+                aria-label={`管理账号 ${name}`}
+                title="更多账号操作"
+              >
+                <Ellipsis />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-60">
+              {/* 任务组：只在有任务时出现（无任务时整组隐藏，
+                  而不是显示一个空的"任务"标题） */}
+              {tasks.length > 0 && onRunTask && (
+                <>
+                  <DropdownMenuLabel className="text-xs">
+                    本账号任务{runnable > 0 ? `（还有 ${runnable} 个可执行）` : "（今日已完成）"}
+                  </DropdownMenuLabel>
+                  {tasks.map((t) => (
+                    <DropdownMenuItem
+                      key={t.id}
+                      data-slot="product-task-item"
+                      data-task={t.id}
+                      data-state={t.state}
+                      // 已完成 / 不可用都置灰但**仍然显示**：用户需要知道
+                      // "这个任务存在且今天已经做过了"。隐藏会让他以为功能没了。
+                      disabled={t.state !== "ready"}
+                      onSelect={() => {
+                        if (t.state === "ready") onRunTask(t.id);
+                      }}
+                      title={t.reason}
+                      className="gap-2 text-xs"
+                    >
+                      {t.state === "done" ? (
+                        <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-600" />
+                      ) : t.state === "blocked" ? (
+                        <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                      ) : (
+                        <PlayCircle className="h-3.5 w-3.5 shrink-0" />
+                      )}
+                      <span className="min-w-0 flex-1 truncate">{t.label}</span>
+                      {t.state === "done" && (
+                        <span className="shrink-0 text-[10px] text-muted-foreground">已完成</span>
+                      )}
+                      {t.state === "blocked" && (
+                        <span className="shrink-0 text-[10px] text-muted-foreground">不可用</span>
+                      )}
+                    </DropdownMenuItem>
+                  ))}
+                  <DropdownMenuSeparator />
+                </>
+              )}
+
+              {onRefresh && (
+                <DropdownMenuItem
+                  disabled={refreshing}
+                  onSelect={() => onRefresh()}
+                  className="gap-2 text-xs"
+                >
+                  <RefreshCw className={cn("h-3.5 w-3.5", refreshing && "animate-spin")} />
+                  刷新额度与模型
+                </DropdownMenuItem>
+              )}
+
+              {/* 「记录」入口 —— 任务执行记录 + 积分/额度消耗明细。
+                  所有者 2026-09-20：「zcode和qoder都无法查看任务执行记录,
+                  和积分消耗明细,都一起修复了」。
+
+                  ⚠ 用 `onViewRecords` 可选 prop 而不是内置开关：
+                  卡片本身不该知道"记录数据从哪来"（那是各页面的职责）。
+                  `data-slot` 保留 —— 既有测试靠它定位这个入口。 */}
+              {onViewRecords && (
+                <DropdownMenuItem
+                  data-slot="product-records-open"
+                  onSelect={() => onViewRecords()}
+                  className="gap-2 text-xs"
+                >
+                  <ScrollText className="h-3.5 w-3.5" />
+                  任务记录 · 消耗明细
+                </DropdownMenuItem>
+              )}
+
+              {onEditNote && (
+                <DropdownMenuItem onSelect={() => onEditNote()} className="gap-2 text-xs">
+                  <Pencil className="h-3.5 w-3.5" />
+                  编辑备注
+                </DropdownMenuItem>
+              )}
+
+              {onToggleDisabled && (
+                <DropdownMenuItem
+                  disabled={toggling}
+                  onSelect={() => onToggleDisabled()}
+                  className="gap-2 text-xs"
+                >
+                  {toggling ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : data.disabled ? (
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                  ) : (
+                    <AlertTriangle className="h-3.5 w-3.5" />
+                  )}
+                  {data.disabled ? "恢复参与路由" : "停止接流量"}
+                </DropdownMenuItem>
+              )}
+
+              {onDelete && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    disabled={deleting}
+                    onSelect={() => onDelete()}
+                    className="gap-2 text-xs text-destructive focus:bg-destructive/5 focus:text-destructive"
+                  >
+                    {deleting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                    删除账号
+                  </DropdownMenuItem>
+                </>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </header>
 
@@ -350,12 +551,16 @@ export function ProductAccountCard({
             </strong>
           </span>
           {/*
-            「额度周期」—— 措辞必须说清它**不是**套餐到期。
+            「额度周期 / 上次更新」—— 两种语义共用这一处，措辞按 `expiryKind` 分。
 
             ZCode 有两个完全不同的时间：额度桶的每日重置点，与套餐整体到期。
             此前这里只写「0 天后（日期）」，所有者反馈「看不懂，是 token
             到期时间吗」—— 因为「0 天后」听起来像"快没了"，而实际含义是
             "今晚重置、明天还有"，**方向完全相反**。
+
+            Qoder 那边则连一个可靠的时间都没有（实测 `expire_at = 0`、
+            `nextResetAt` 早已过期），故按所有者要求改显示**上次更新时间**
+            —— 那是我们自己写入的真实时刻，不会过期。
           */}
           <Tooltip>
             <TooltipTrigger asChild>
@@ -367,11 +572,23 @@ export function ProductAccountCard({
               </div>
             </TooltipTrigger>
             <TooltipContent className="max-w-xs">
-              <div className="font-medium">额度周期</div>
-              <div className="mt-1 text-xs">
-                每日额度会在该时刻**重置**，不是"额度到期作废"。
-                套餐整体到期另有标注（见下方橙色文字）。
-              </div>
+              {data.expiryKind === "last-updated" ? (
+                <>
+                  <div className="font-medium">数据更新时间</div>
+                  <div className="mt-1 text-xs">
+                    这是**上次刷新该账号数据**的时刻，不是额度到期时间。
+                    点卡片上的「刷新」可重新采集。
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="font-medium">额度周期</div>
+                  <div className="mt-1 text-xs">
+                    每日额度会在该时刻**重置**，不是"额度到期作废"。
+                    套餐整体到期另有标注（见下方橙色文字）。
+                  </div>
+                </>
+              )}
             </TooltipContent>
           </Tooltip>
         </div>
@@ -431,187 +648,94 @@ export function ProductAccountCard({
             )}
           </div>
         )}
+        {/*
+          按模型拆开的额度明细（2026-09-21 所有者要求）。
+
+          # 为什么放在进度条**下面**而不是替代它
+
+          进度条答的是「整体还剩多少」，明细答的是「哪个模型快没了」——
+          两个问题都要回答，缺一个就会误判：
+
+            · 只有进度条 ⇒ 看到还剩 300 万，以为没事，
+              而实际 Flash 已经用光（正是所有者遇到的情况）
+            · 只有明细 ⇒ 看不到整体比例
+
+          # 每行显示「模型 · 剩余/总量」
+
+          ⚠ 剩余**已耗尽时标橙**（remaining <= 0）：那是这个区块存在的
+          全部意义 —— 让"某个模型用完了"一眼可见，而不是被别的模型的
+          剩余量掩盖。
+
+          ⚠ 只在**有明细**时渲染：老账号记录里没有 `quotaEntries`
+          （字段是本次新增的），此时不渲染，回退到只显示求和值 ——
+          不会显示成空或 0。
+        */}
+        {data.usageBuckets && data.usageBuckets.length > 0 && (
+          <div className="mt-2 space-y-1.5" data-slot="product-usage-buckets">
+            {data.usageBuckets.map((b) => {
+              const exhausted = b.remaining <= 0;
+              /*
+               * 每个模型**自己**的剩余比例。
+               *
+               * 所有者原话：
+               *
+               *   「上面有一个总量，下面是区分开的，下面的也要有进度条，
+               *     不然不知道有多少 用多少」
+               *
+               * 只给数字看不出"还剩几成" —— 尤其额度是百万量级时，
+               * `0 / 5,000,000` 与 `12,345 / 67,890` 哪个更紧张，
+               * 光看数字要心算。进度条一眼可见。
+               *
+               * ⚠ 与顶部总条同款：传的是**剩余**占比（用掉越多条越短），
+               * 且只在 total > 0 时画（total 为 0 表示上游没给容量，
+               * 画成 0% 会被误读成"已耗尽"）。
+               */
+              const ratio =
+                b.total > 0 ? Math.min(1, Math.max(0, b.remaining / b.total)) : undefined;
+              return (
+                <div
+                  key={b.name}
+                  data-slot="product-usage-bucket"
+                  data-bucket-name={b.name}
+                  data-bucket-exhausted={exhausted ? "true" : undefined}
+                  className="space-y-1"
+                >
+                  <div className="flex items-baseline gap-2 text-[11px] leading-4">
+                    <span className="truncate font-medium text-muted-foreground">{b.name}</span>
+                    <span
+                      className={cn(
+                        "ml-auto shrink-0 tabular-nums",
+                        // 耗尽 ⇒ 橙色：这是"某模型用完"的唯一视觉信号
+                        exhausted ? "font-medium text-orange-600" : "text-muted-foreground",
+                      )}
+                    >
+                      {b.remaining.toLocaleString()} / {b.total.toLocaleString()}
+                    </span>
+                  </div>
+                  {typeof ratio === "number" && (
+                    <div
+                      className="h-1 overflow-hidden rounded-full bg-muted"
+                      data-slot="product-usage-bucket-bar"
+                    >
+                      <div
+                        data-slot="product-usage-bucket-fill"
+                        style={{ width: `${ratio * 100}%` }}
+                        className={cn(
+                          "h-full rounded-full transition-all",
+                          // 耗尽用橙色；其余用主色的**浅色变体** ——
+                          // 与顶部总条区分开，避免"两条一样重"抢注意力。
+                          exhausted ? "bg-orange-500" : "bg-primary/60",
+                        )}
+                      />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </section>
 
-      {/* ── 底部操作栏（同 WorkBuddy 卡片：右对齐） ── */}
-      <footer className="flex items-center justify-end gap-1 border-t border-border/60 px-3 py-2">
-        {/*
-          任务菜单 —— 与 WorkBuddy 账号卡同款交互（所有者要求
-          「也没有跟 workbuddy 有个菜单按钮，点击后进行执行 qoder 还支持的任务」）。
-
-          ⚠ 只在确实有任务时渲染：`tasks` 为空说明该账号当前没有可执行任务，
-          渲染一个空的"任务"按钮会让用户以为点了没反应。
-        */}
-        {tasks.length > 0 && onRunTask && (
-          <DropdownMenu>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    data-slot="product-task-menu"
-                    aria-label={`任务：${name}`}
-                    className="h-7 gap-1 px-2 text-[11px]"
-                  >
-                    <ListChecks className="h-3.5 w-3.5" />
-                    任务
-                    {/* 还有几个可跑 —— 一眼看出"这个号还有事没做" */}
-                    {runnable > 0 && (
-                      <Badge
-                        variant="secondary"
-                        className="h-4 min-w-4 justify-center px-1 text-[9.5px] font-normal"
-                      >
-                        {runnable}
-                      </Badge>
-                    )}
-                  </Button>
-                </DropdownMenuTrigger>
-              </TooltipTrigger>
-              <TooltipContent>
-                {runnable > 0
-                  ? `还有 ${runnable} 个任务可执行`
-                  : "本账号今日任务都已完成"}
-              </TooltipContent>
-            </Tooltip>
-            <DropdownMenuContent align="end" className="w-56">
-              <DropdownMenuLabel className="text-xs">
-                {data.nickname || "本账号"}的任务
-              </DropdownMenuLabel>
-              <DropdownMenuSeparator />
-              {tasks.map((t) => (
-                <DropdownMenuItem
-                  key={t.id}
-                  data-slot="product-task-item"
-                  data-task={t.id}
-                  data-state={t.state}
-                  // 已完成 / 不可用都置灰但**仍然显示**：用户需要知道
-                  // "这个任务存在且今天已经做过了"。隐藏会让他以为功能没了。
-                  disabled={t.state !== "ready"}
-                  onSelect={() => {
-                    if (t.state === "ready") onRunTask(t.id);
-                  }}
-                  title={t.reason}
-                  className="gap-2 text-xs"
-                >
-                  {t.state === "done" ? (
-                    <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-600" />
-                  ) : t.state === "blocked" ? (
-                    <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                  ) : (
-                    <PlayCircle className="h-3.5 w-3.5 shrink-0" />
-                  )}
-                  <span className="min-w-0 flex-1 truncate">{t.label}</span>
-                  {t.state === "done" && (
-                    <span className="shrink-0 text-[10px] text-muted-foreground">已完成</span>
-                  )}
-                  {t.state === "blocked" && (
-                    <span className="shrink-0 text-[10px] text-muted-foreground">不可用</span>
-                  )}
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        )}
-        {onRefresh && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                disabled={refreshing}
-                // 图标按钮**必须**有可访问名：Tooltip 内容要悬停才进 DOM，
-                // 屏幕阅读器与自动化测试都拿不到。
-                aria-label={`刷新额度与模型：${name}`}
-                onClick={onRefresh}
-              >
-                <RefreshCw className={cn("h-4 w-4", refreshing && "animate-spin")} />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>刷新额度、到期与支持模型</TooltipContent>
-          </Tooltip>
-        )}
-        {/*
-          「记录」入口 —— 任务执行记录 + 积分/额度消耗明细。
-
-          所有者 2026-09-20：「zcode和qoder都无法查看任务执行记录,和积分消耗明细,
-          都一起修复了」。
-
-          # 为什么放在这张共用卡片上
-
-          这个组件被 WorkBuddy / Qoder / ZCode 三个页面共用，而三个产品都需要
-          记录入口。做成卡片的可选按钮 ⇒ 一处实现三处受益，也保证三者的
-          交互完全一致（弹窗形态、筛选、措辞都同一份代码）。
-
-          ⚠ 用 `onViewRecords` 可选 prop 而不是内置一个固定开关：
-          卡片本身不该知道"记录数据从哪来"（那是各页面的职责）。
-        */}
-        {onViewRecords && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                data-slot="product-records-open"
-                aria-label={`查看记录与消耗明细：${name}`}
-                onClick={onViewRecords}
-              >
-                <ScrollText className="h-4 w-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>任务执行记录 · 额度消耗明细</TooltipContent>
-          </Tooltip>
-        )}
-        {onEditNote && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon" aria-label={`编辑备注：${name}`} onClick={onEditNote}>
-                <Pencil className="h-4 w-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>编辑备注</TooltipContent>
-          </Tooltip>
-        )}
-        {onToggleDisabled && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                disabled={toggling}
-                aria-label={`${data.disabled ? "恢复参与路由" : "停止接流量"}：${name}`}
-                onClick={onToggleDisabled}
-              >
-                {toggling ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : data.disabled ? (
-                  <CheckCircle2 className="h-4 w-4" />
-                ) : (
-                  <AlertTriangle className="h-4 w-4" />
-                )}
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>{data.disabled ? "恢复参与路由" : "停止接流量"}</TooltipContent>
-          </Tooltip>
-        )}
-        {onDelete && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                disabled={deleting}
-                aria-label={`删除账号：${name}`}
-                className="text-destructive hover:text-destructive"
-                onClick={onDelete}
-              >
-                <Trash2 className="h-4 w-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>删除账号</TooltipContent>
-          </Tooltip>
-        )}
-      </footer>
     </article>
   );
 }

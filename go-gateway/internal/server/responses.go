@@ -490,7 +490,9 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 
 	var req responsesRequest
 	_ = json.Unmarshal(body, &req)
-	stat.model = req.Model
+	// 用 setModel 而不是 `stat.model = ...`：它会**同时**算好统计用的裸名
+	//（去掉 `国服:` / `zcode:` 这类路由前缀），见 setModel 的注释。
+	stat.setModel(req.Model)
 	stat.mode = "responses"
 
 	// 传 r.Context()：客户端断开后换号退避立即中止（见 backoff.go）。

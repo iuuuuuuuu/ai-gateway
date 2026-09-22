@@ -1578,7 +1578,34 @@ async function main() {
   global.__browserFrame = null;
 
   const timeoutMs = 30_000;
-  const stallMs = Number(process.env.CAPTCHA_STALL_MS || 6_000);
+  // ⚠⚠ 默认值从 6_000 提到 20_000（2026-09-21 实测修正）
+  //
+  // # 旧值 6 秒导致约 60% 的求解误判为"失速"
+  //
+  // 实测对照（同一台机器、同一个求解器，各连跑 5 次）：
+  //
+  //	CAPTCHA_STALL_MS=6000   成功 2 / 失败 3   ← 失败**全是** STALL
+  //	CAPTCHA_STALL_MS=20000  成功 4 / 失败 1
+  //
+  // 失败的机器可读原因是 `captcha solve stall pe=...`，不是任何上游限流错误。
+  //
+  // # 为什么 6 秒不够
+  //
+  // 下面 stallTimer 的判据是「**距上一次 XHR 超过 stallMs**」—— 而 SDK 在
+  // 启动阶段（拉 pe 字节码、解析、建 VM）本来就有静默期，不一定是匀速发请求。
+  // 机器慢一点、CDN 慢一点，这个静默期就超过 6 秒 ⇒ 被判"失速"⇒ 直接失败。
+  //
+  // 而**总超时是 30 秒**（上面 timeoutMs）—— 6 秒的失速判定等于把总预算
+  // 砍掉了 80%，名不副实：它宣称"30 秒内解决即可"，实际 6 秒没动静就放弃。
+  //
+  // # 这一条曾经误导过排查方向
+  //
+  // 网关侧（`go-gateway/internal/zcode/captcha.go`）据此写了「求解会被上游限流，
+  // 需冷却 2 分钟」—— 那是把"我这边等不及"当成了"上游限制我"。
+  // 于是每次失败都要进 2 分钟冷却，用户看到的是"验证码一直不可用"。
+  //
+  // 保留环境变量覆盖：不同机器速度差异大，出问题时可现场调大而不必重新打包。
+  const stallMs = Number(process.env.CAPTCHA_STALL_MS || 20_000);
 
   const dom = await createDom(REGION, PREFIX);
   const w = dom.window;

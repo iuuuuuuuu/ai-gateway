@@ -19,7 +19,7 @@ import (
 // 我修的时候**只改了 `preferRegion` 这个局部变量**，而选号读的是
 // `route.Region` —— 于是**缺陷依旧**。实测确认：
 //
-//	`global:deepseek-v4.1-flash` → 选中 uid=4ea736d4（**国服**）
+//	`global:deepseek-v4.1-flash` → 选中 uid={wb-uid}（**国服**）
 //
 // 第二次修才是对的：把 `preferRegion` 写回 `route.Region`。
 //

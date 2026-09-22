@@ -69,6 +69,22 @@ const DEMO_READ_COMMANDS = new Set([
   "get_github_config", "check_update", "get_launch_at_login_enabled", "switch_progress",
   "get_travel_status", "get_auto_travel_config",
   "get_gateway_usage",
+  // ⚠ Qoder / ZCode 的页面数据（2026-09-22 补登记）。
+  //
+  // `screenshot-demo.ts` 里**早就写好**了这些命令的假数据（11 个 case），
+  // 但白名单里一个都没登记 —— 于是演示模式下打开这两页，
+  // `call()` 在 `!DEMO_READ_COMMANDS.has(cmd)` 那一行直接抛
+  // 「演示模式下不可操作」⇒ **页面空白、看不到卡片样式**。
+  //
+  // 所有者反馈：「你这个演示模式,没加zcode和qoder账号,我看不到样式」。
+  //
+  // 教训：新增 demo 数据时**两处都要改**（数据 + 白名单）。
+  // 漏登记是静默的 —— 数据在、但永远读不到，看起来像"数据没写"。
+  "qoder_list_accounts", "qoder_summary", "qoder_campaigns", "qoder_campaigns_all",
+  "zcode_list_accounts", "zcode_summary",
+  "zcode_scan_local",
+  // 网关配置（Qoder/ZCode 的「配置」弹窗要读它才显示自动领取开关）
+  "get_gateway_config", "get_gateway_status",
 ]);
 
 export function isDemoMode(): boolean {
@@ -178,6 +194,13 @@ const ROUTES: Record<string, Route> = {
   get_gateway_usage: { method: "GET", path: "/api/gateway/usage" },
   run_gateway_task: { method: "POST", path: "/api/gateway/task-run" },
   run_growth_task: { method: "POST", path: "/api/gateway/growth-task" },
+  // 手机号 + 短信验证码登录（2026-09-22 新增）。
+  //
+  // ⚠ 路径与网关侧的 `/login/sms/*` 不同：这里多一层 `/api/gateway/`
+  // 前缀，那是**宿主 WebUI** 的命名空间（它再转发给网关）。
+  // 直接抄 `/login/sms/send` 在 webui 模式下会 404。
+  sms_send: { method: "POST", path: "/api/gateway/sms/send" },
+  sms_verify: { method: "POST", path: "/api/gateway/sms/verify" },
   // ---- 一键导入：接入本机 AI 客户端 ----
   detect_agent_clients: { method: "GET", path: "/api/gateway/agents" },
   import_agent_client: { method: "POST", path: "/api/gateway/agents/import" },
@@ -884,6 +907,31 @@ export function runGrowthTask(
 }
 
 /**
+ * 发送短信登录验证码（2026-09-22 新增）。
+ *
+ * ⚠ 这是**真实发短信**的写操作：会消耗上游配额、触发频控。
+ * 界面必须做倒计时与防连点（见 sms-login-dialog.tsx）。
+ */
+export function smsSend(
+  phone: string,
+  region: "cn" | "intl",
+): Promise<{ ok: boolean; expiresIn: number }> {
+  return call<{ ok: boolean; expiresIn: number }>("sms_send", { phone, region });
+}
+
+/** 用验证码换 token 并登记账号。成功返回账号摘要（形状由宿主决定）。 */
+export function smsVerify(
+  phone: string,
+  smsCode: string,
+  region: "cn" | "intl",
+): Promise<{ ok: boolean; account?: { uid?: string; phone?: string; region?: string } }> {
+  return call<{ ok: boolean; account?: { uid?: string; phone?: string; region?: string } }>(
+    "sms_verify",
+    { phone, smsCode, region },
+  );
+}
+
+/**
  * 保存网关配置。
  *
  * 显式把 snake_case 字段转成 camelCase：Tauri 的 `invoke` 按
@@ -915,6 +963,31 @@ export function saveGatewayConfig(config: Partial<GatewayConfig>): Promise<{ con
   //（表现为「配了自定义提示词却总被重置」，且看不出是传参被丢）。
   if (config.prompt_mode !== undefined) args.promptMode = config.prompt_mode;
   if (config.prompt_file !== undefined) args.promptFile = config.prompt_file;
+  // Qoder / ZCode 权益自动领取（2026-09-22 拆分）。
+  // ⚠ 同样必须显式转 camelCase —— 桌面版 Tauri 只认 camelCase，
+  // 写 snake_case 会被**静默丢弃**，表现为「关掉了却还在自动领」。
+  //
+  // ⚠ 三个键都只在**非 undefined** 时才传：
+  // `product_tasks_enabled` 是老配置的兜底总闸，两个分产品键是三态
+  //（undefined = 没配 ⇒ 回落总闸）。传一个 `false` 进去就等于替用户
+  // 做了决定，而活动不领就过期作废。
+  if (config.product_tasks_enabled !== undefined) {
+    args.productTasksEnabled = config.product_tasks_enabled;
+  }
+  if (config.qoder_claim_enabled !== undefined) {
+    args.qoderClaimEnabled = config.qoder_claim_enabled;
+  }
+  if (config.zcode_claim_enabled !== undefined) {
+    args.zcodeClaimEnabled = config.zcode_claim_enabled;
+  }
+  // Qoder 领取时点：空数组是合法值（关掉时点制），故不能用 `?.length`
+  // 之类判断"有没有值"—— 只判 undefined。
+  if (config.qoder_claim_hours !== undefined) {
+    args.qoderClaimHours = config.qoder_claim_hours;
+  }
+  if (config.qoder_claim_interval_minutes !== undefined) {
+    args.qoderClaimIntervalMinutes = config.qoder_claim_interval_minutes;
+  }
   return call<{ config: GatewayConfig }>("save_gateway_config", args);
 }
 
@@ -1698,7 +1771,7 @@ export interface ZcodeAccount {
   /** 头像 URL（来自客户端登录态 `credentials.json`）；空 = 没有。 */
   avatarUrl?: string;
   /**
-   * 上游**账号**标识（如 `19331730795565300`）；空 = 未知。
+   * 上游**账号**标识（如 `12345678901234567`）；空 = 未知。
    *
    * 用途：识别「同一账号的多把 API key」—— 它们的 `uid` 不同
    *（uid 是凭证哈希），但 `accountId` 相同，在用户看来就是重复。
@@ -1729,6 +1802,41 @@ export interface ZcodeAccount {
    * 没有硬编码数字（那 300 万/500 万是运营参数，上游随时可改）。
    */
   planKind?: string;
+  /**
+   * **各模型桶**的额度明细（上游 `billing/balance` 的 `balances[]`）。
+   *
+   * # ⚠⚠ 为什么必须有它（2026-09-21 所有者报的缺陷）
+   *
+   * 所有者原话：
+   *
+   * > 「那八百万额度，是 glm5.3flash 五百万，三百万 glm5.3，zcode 账号
+   * >   flash 模型额度我用完了，你优化一下显示，那里应该拆分成两个模型的
+   * >   额度，而不是一个的」
+   *
+   * 上游把额度按**模型**分成独立的桶（实测样本见
+   * `uitest/zcode-config-samples/billing-balance.json`）：
+   *
+   * ```text
+   * showName = "GLM-5.3"        total = 3,000,000
+   * showName = "GLM-5.3-Flash"  total = 5,000,000
+   * ```
+   *
+   * 而 `credits` / `creditsTotal` 是它们的**求和**（800 万）。
+   * 只看求和会把「某个模型已用完」完全掩盖 —— 这正是所有者遇到的情况：
+   * Flash 用光了，但卡片上还剩 300 万（那是 GLM-5.3 的），看不出问题。
+   *
+   * 空数组 = 没有明细（老账号记录、或上游没给）⇒ 界面回退到显示求和值。
+   */
+  quotaEntries?: Array<{
+    /** 模型名（上游 `show_name`），如 `GLM-5.3-Flash`。 */
+    showName: string;
+    remaining: number;
+    total: number;
+    used: number;
+    unitType: string;
+    /** **每日周期**结束（Unix 秒）；不是套餐到期。 */
+    expiresAt?: number;
+  }>;
   /** 生效中的套餐（含名称、说明、各模型每日赠送量）。 */
   plans?: Array<{
     planId: string;
@@ -2329,6 +2437,28 @@ export function proxyConfig(): Promise<ProxyConfigView> {
 /** 代理运行状态。 */
 export function proxyStatus(): Promise<{ running: boolean; port: number | null; captured: number }> {
   return call<{ running: boolean; port: number | null; captured: number }>("proxy_status");
+}
+
+/**
+ * **检测代理是否真的能用**（2026-09-22 所有者要求：
+ * 「本地代理,配置之后再加上检测按钮」）。
+ *
+ * 与 `proxyStatus` 的区别：后者只回答"进程在不在跑"，
+ * 而"能不能用"还要看端口真在监听、系统代理真指向它、CA 证书已生成 ——
+ * 这三件任何一件不成立，用户都会觉得"代理坏了"，而 `running: true` 一个都答不了。
+ */
+export function proxyCheck(): Promise<{
+  /** 所有检查项都通过才为 true（界面据此显示绿/红）。 */
+  ok: boolean;
+  checks: { name: string; ok: boolean; detail: string }[];
+  /** 检测时刻（Unix 毫秒），界面显示"上次检测于 …"。 */
+  checkedAt: number;
+}> {
+  return call<{
+    ok: boolean;
+    checks: { name: string; ok: boolean; detail: string }[];
+    checkedAt: number;
+  }>("proxy_check");
 }
 
 /**

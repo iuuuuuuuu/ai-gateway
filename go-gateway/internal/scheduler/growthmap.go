@@ -24,6 +24,7 @@ import (
 	"context"
 	"log"
 	"strconv"
+	"strings"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -77,7 +78,11 @@ func (s *Scheduler) runGrowthMap(ctx context.Context) {
 		}
 		// 区域过滤与活跃上报共用：本闭环的地基是 growth 连登，
 		// 只有被点亮过连登的账号才有兑换/补签可言。
-		if !s.checkinScopeAllows(a) {
+		// ⚠ 产品 + 区域闸门，统一走 accountScopeSkip（**单一真相来源**）。
+		// 此前这里只调 checkinScopeAllows（只判区域），于是 Qoder/ZCode
+		// 账号会被当成 WorkBuddy 跑这些任务 —— 打 WorkBuddy 端点吃 401、
+		// 还在账号记录里写下不属于它的任务（见 accountScopeSkip 的长注释）。
+		if _, ok := s.accountScopeSkip(TaskNameGrowthMap, a); !ok {
 			continue
 		}
 		if !first {
@@ -129,6 +134,55 @@ func (s *Scheduler) growthMapRound(a *auth.Auth, state *upstream.GrowthStreakSta
 	}
 	s.redeemGrowthTier(a, state)
 	s.drawGrowthLottery(a)
+	s.openBlindboxes(a)
+}
+
+// openBlindboxes 开盲盒：能量足够就开，每轮最多 MaxBlindboxOpens 个。
+//
+// # 为什么补它（2026-09-20，对照参考脚本 workbuddyv3）
+//
+// 所有者给的参考脚本里有一项我们**完全没实现**的互动玩法（`t_blindbox`）。
+// 逐项对照后，它的 23 项任务里我们只缺这一个。
+//
+// # 为什么放在最后
+//
+// 开盒**吃能量**（每次固定消耗），而抽奖与兑换也用同一份能量。
+// 放在最后 + 限次，保证前面的必得收益先拿到，剩下的才拿去开盒。
+func (s *Scheduler) openBlindboxes(a *auth.Auth) {
+	q, err := s.cfg.Upstream.GrowthBlindboxQuota(a)
+	if err != nil {
+		// 与其它成长任务同一口径：业务性失败静默，真故障记日志。
+		logGrowthErr("growth", a.UID, "blindbox-quota", err)
+		return
+	}
+	if q.Affordable <= 0 {
+		// 能量不足是**常态**（每天都可能不够），不值得留痕。
+		return
+	}
+	n := q.Affordable
+	if n > upstream.MaxBlindboxOpens {
+		n = upstream.MaxBlindboxOpens
+	}
+	items, err := s.cfg.Upstream.GrowthBlindboxOpen(a, int(n))
+	if err != nil {
+		logGrowthErr("growth", a.UID, "blindbox-open", err)
+		return
+	}
+	if len(items) == 0 {
+		return
+	}
+	// 只在**真的开出来**时留痕（与签到/礼包同一原则）。
+	names := make([]string, 0, len(items))
+	for _, it := range items {
+		if it.Rarity != "" {
+			names = append(names, it.Name+"("+it.Rarity+")")
+		} else {
+			names = append(names, it.Name)
+		}
+	}
+	detail := "开出 " + strconv.Itoa(len(items)) + " 个：" + strings.Join(names, "、")
+	log.Printf("growth %s: blindbox ok (%d 个)", uid8(a.UID), len(items))
+	s.cfg.Records.Task(a.UID, growthTaskTitle, records.ResultSuccess, detail)
 }
 
 // claimGrowthBenefits 新手礼包 + 活动补偿。
