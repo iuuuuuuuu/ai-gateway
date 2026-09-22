@@ -461,6 +461,10 @@ mod tests {
 
     #[test]
     fn 两个应用的分组互相隔离() {
+        // 必须持有 `Isolated`（见本模块顶部注释）：它既把存储指到临时目录，
+        // 又是全局锁。漏掉它就会与其他用例并发读写同一份分组表，
+        // 表现为「刚建好的组突然不存在」—— v1.1.0 前 CI 就是这样挂的。
+        let _iso = Isolated::new("groups");
         reset("Trae");
         reset("Doubao");
         let t = create_group("Trae", "Trae 专用组", "blue").unwrap();
