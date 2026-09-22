@@ -85,7 +85,7 @@ __pycache__/
 # 打成的**单文件** `solver.bundle.cjs`（928KB），node_modules 不再入库、
 # 也不再进安装包。
 #
-# 重建方法见 assets/zcode-captcha/README-打包说明.md。
+# 重建方法见 assets/zcode-captcha/README-PACKAGING.md。
 
 # 本地隔离测试实例的 Tauri 配置（独立 identifier + 数据目录，仅供开发调试）
 src-tauri/tauri.dev-sandbox.conf.json

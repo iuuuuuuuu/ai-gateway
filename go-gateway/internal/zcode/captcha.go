@@ -385,7 +385,7 @@ const DefaultCaptchaCooldown = 2 * time.Minute
 //
 // 现在用 esbuild 打成**单个文件**（`solver.bundle.cjs`，928KB），
 // 安装时的文件写入从 3353 次降到 1 次。
-// 打包方法与坑见 `assets/zcode-captcha/README-打包说明.md`。
+// 打包方法与坑见 `assets/zcode-captcha/README-PACKAGING.md`。
 //
 // ⚠ 保留 `solver.js` 作为**回退**：万一某台机器上 bundle 出问题
 //（如 node 版本过旧不支持某个语法），源码目录还在就能原地诊断。
