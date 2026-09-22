@@ -1,6 +1,6 @@
 {
   "name": "ai-gateway-linux-x64",
-  "version": "1.0.7",
+  "version": "1.1.0",
   "description": "ai-gateway platform binary (linux-x64)",
   "os": [
     "linux"

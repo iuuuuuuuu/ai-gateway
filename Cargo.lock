@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "ai-gateway"
-version = "1.0.7"
+version = "1.1.0"
 dependencies = [
  "ai-gateway-core",
  "axum",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "ai-gateway-core"
-version = "1.0.7"
+version = "1.1.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "ai-gateway-router"
-version = "1.0.7"
+version = "1.1.0"
 dependencies = [
  "ai-gateway-core",
  "async-stream",
@@ -150,7 +150,7 @@ dependencies = [
 
 [[package]]
 name = "ai-gateway-server"
-version = "1.0.7"
+version = "1.1.0"
 dependencies = [
  "ai-gateway-core",
  "axum",
