@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "gateway",
+      "runtimeExecutable": "pwsh",
+      "runtimeArgs": ["-NoProfile", "-File", "scripts/tmp-preview-gateway.ps1"],
+      "port": 57890,
+      "autoPort": false
+    }
+  ]
+}

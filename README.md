@@ -68,10 +68,16 @@ VS Code fork，**共用同一份账号库**，但登录态快照互相独立 —
 
 | 模块 | 能力 |
 |---|---|
-| 账号入库 | 粘贴 Cloud-IDE-JWT、本机使用痕迹自动发现（双应用合并） |
+| 账号入库 | 粘贴 Cloud-IDE-JWT、OAuth 授权码登录、本机使用痕迹自动发现（双应用合并） |
 | 账号切换 | 备份现场 → 关闭客户端 → 恢复目标快照 → 启动；保留一代备份可回退 |
-| 一键签到 | `status` 预检 → `claim`（仅网络异常重试）→ 错误分类 → 冷却落盘 |
+| 一键签到 | `status` 预检 → `claim`（仅网络异常重试）→ 错误分类 → 冷却落盘；失败账号再按 30s/90s 重试两轮 |
+| 签到趋势 | 按日落库、同 uid 覆盖为最终态、90 天裁剪；成功率把「已签到」算作成功 |
 | 积分归属 | 三层兜底：claim 奖励字段 → 复查余额差值 → 旧行为 |
+| 积分趋势 | 每日快照累积，按天补齐、缺天断线；充值不计入消耗 |
+| 官方消耗明细 | 直连会话级用量接口取**真实扣费**（不受签到补发干扰），可按模型排行 |
+| JWT 续期 | `ExchangeToken` 自动换新，48h 懒刷新阈值 + 60s 冷却，拒绝与瞬时故障分流 |
+| 账号分组 | 分组只用于筛选与统计，删组不删号 |
+| 导出 / 导入 | 带 `kind` 标记防串库；同 uid 覆盖、无 JWT 记录跳过 |
 | 设备指纹 | 按 uid 确定性派生 `device_id` / `session_id` / `market_user_id`，实现账号间设备隔离 |
 | 设备重置 | 6 层机器标识重置（`machineid` / 遥测 / aha 设备 / TinyStorage / 注册表 MachineGuid / webview 追踪） |
 
@@ -101,8 +107,10 @@ VS Code fork，**共用同一份账号库**，但登录态快照互相独立 —
 | 账号入库 | 手动录入、本地代理抓包自动回写 |
 | 登录态切换 | 多 Profile 快照（Chromium 布局），含版本校验、单代回滚、防误覆盖守卫 |
 | 会话保活 | 启动客户端 → 等待落盘 → 优雅关闭，触发服务端 30 天滑动续期 |
-| 会话探活 | 两段式：权威探活（会员额度接口）+ 保活探活（回收服务端下发的新凭证） |
+| 会话探活 | 两段式：权威探活（会员额度接口）+ 保活探活（回收服务端下发的新凭证）；全失败时自动回退保活 |
 | 会员额度 | 精确解析 + 宽容兜底两段式；支持单账号查询与全量巡检 |
+| 运维健康史 | 保活 / 续期 / 额度三类事件 + 14 天额度趋势 + 7 天健康卡；25 天未保活告警 |
+| 快照管理 | 体积 / 文件数 / 修改时间直出列表，孤儿快照可见可删，一键以账号打开 |
 | 对话备份 | 客户端状态备份/恢复（IndexedDB + DoubaoStorage） |
 | 对话导出 | 官方 IM API 拉取正文，输出 markdown + json |
 
@@ -129,6 +137,31 @@ VS Code fork，**共用同一份账号库**，但登录态快照互相独立 —
 > **对话正文存在豆包云端**，按账号归属。本地备份的是客户端状态（会话列表缓存、
 > 技能配置）；恢复并重新登录后完整历史会从云端重新同步。需要把对话带走时用
 > 「导出对话」，它直接调官方接口拉取正文。
+
+### CLI 额度
+
+把**本机已登录**的 AI CLI 额度汇总到一页（独立页面），不必逐个 CLI 去翻。
+
+| Provider | 查询的额度 |
+|---|---|
+| Claude | Claude Code 订阅额度（5 小时 / 7 天窗口） |
+| Codex | ChatGPT 订阅的 Codex 额度（5 小时 / 每周窗口） |
+| Antigravity | Google Antigravity 的 Cloud Code 额度 |
+| Grok | xAI Grok 的账单周期用量 |
+| Kimi | Kimi Code 的用量窗口 |
+
+凭证来源是**本机 CLI 自己的登录态**（`~/.codex/auth.json`、Windows 凭据管理器等），
+不要求往本工具里再登录一次。三条硬规则：
+
+- **token 不出进程**：对外返回的结构里没有任何 token 字段，完整 token 只在拼请求头时
+  出现，日志只记长度。
+- **未登录不是错误**：本机没登录某个 CLI 是常态，显示中性的「未登录」+ 去哪登录的指引，
+  而不是红色失败。
+- **未知不等于用尽**：拿不到百分比时显示「—」而不是 0 —— 显示 0 会让用户以为额度
+  耗尽而去干等重置。
+
+首屏不打上游（先用本地登录态渲染，额度由缓存或手动「查询」填充），之后每 30 分钟
+自动刷新一次；access token 过期时用 refresh token 换新并**原子回写**凭证文件。
 
 ### 智能体管理
 
@@ -505,31 +538,47 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 ```bash
 # 1) 构建网关（Rust）—— 产物落到 crates/ai-gateway-core/embedded/，
 #    cargo build 时由 build.rs 压缩内嵌进主程序
-sh scripts/build-gateway.sh                              # 当前平台
-CARGO_BUILD_TARGET=x86_64-pc-windows-msvc sh scripts/build-gateway.sh  # 交叉编译
-pwsh scripts/build-gateway.ps1                           # Windows 等价脚本
+pwsh scripts/build-gateway.ps1                           # Windows（本仓库主环境）
+sh scripts/build-gateway.sh                              # macOS / Linux
+CARGO_BUILD_TARGET=x86_64-pc-windows-msvc sh scripts/build-gateway.sh  # macOS 上交叉编译 Windows
 
 # 2) 前端 + 桌面应用
 npm ci
-npm run tauri -- build --bundles app                     # macOS（产出 .app）
 npm run tauri -- build --bundles nsis,msi                # Windows
+npm run tauri -- build --bundles app                     # macOS（产出 .app）
 
 # 3) macOS 额外产出 dmg（无头环境也能打，不依赖 Finder）
 sh scripts/make-dmg.sh <版本> <aarch64|x86_64> \
   "target/release/bundle/macos/AI Gateway.app"
 ```
 
+> 第 3 步与 `scripts/*.sh` 仅在 macOS / Linux 下使用；Windows 侧一律走
+> `scripts/*.ps1`（见 `AGENTS.md` Shell Policy）。
+
 > macOS 产物为 adhoc 签名（无 Apple 开发者证书），首次打开若提示「已损坏」，执行
 > `xattr -cr "/Applications/AI Gateway.app"` 放行。
 
 开发调试命令：
 
-```bash
+```powershell
 npm install
 npm run tauri dev        # 开发模式
 npm run build            # 前端类型检查与构建
 npm run tauri build      # 构建当前平台安装包
 ```
+
+演示 / 截图模式（**不读真实账号数据**，只读内容全部由本地假数据提供）：
+
+```powershell
+npm run dev:demo         # 浏览器里跑演示前端
+npm run build:demo       # 构建 GitHub Pages 用的公开演示（子路径 + hash 路由）
+npm run tauri:dev:screenshot   # 桌面端截图模式（转发到 scripts/dev-screenshot.ps1）
+```
+
+> `npm run build` 会先跑 `scripts/check-demo-coverage.mjs` 校验演示模式覆盖：
+> `DEMO_READ_COMMANDS` 里每条命令都必须在 `screenshotDemoResponse` 里有实现，
+> 否则构建直接失败。两处清单只靠人工同步时漏掉过 12 条，表现为演示模式打开对应
+> 页面整块空白。
 
 ### 发布新版本
 
@@ -671,12 +720,24 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 #### Trae
 
 1. 进入「Trae 账号」页面，用顶部标签切换 **Trae Work** / **Trae**
-2. 添加账号二选一：
+2. 添加账号三选一：
+   - **OAuth 登录**：点「OAuth 登录」在浏览器完成授权，回调由本机 17388 端口接收；
+     端口被占用时可手动复制回调地址粘回弹窗
    - **粘贴 JWT**：从客户端登录态里取出 `Cloud-IDE-JWT` 贴进去，账号 id 自动解析
    - **发现本机账号**：从客户端使用痕迹推导。标记为「无法确认」的候选**不会**入池
      （它的编号属于账户中心体系，与账号库不是同一套编号）
-3. 账号列表里可执行：**切换**、**保存登录态**、**重置设备指纹**、**清除冷却**
-4. 点「一键签到」跑一轮；失败的账号按错误类型落冷却，不会反复撞限流
+3. 账号列表里可执行：**切换**、**保存登录态**、**重置设备指纹**、**清除冷却**、
+   **编辑**（改备注名 / 换 JWT / 补 refresh token）、**查看 JWT**、**刷新 JWT**、**归组**
+4. 顶部还有：**打开客户端**、**分组管理**、**导出 / 导入**、**清除全部冷却**
+5. 快照区会标出「当前登录」账号。若你**直接在客户端里换过号**（没走本应用的切换），
+   记录会落后于现场，这里会给出提示 —— 点一次「保存登录态」或「切换」即可让记录追上
+5. 勾选若干账号后点「签到选中 N 个」只签这些；一个都不勾等同于全签。
+   失败账号会按 30 秒 / 90 秒各重试一轮，卡片上会显示实时进度
+6. 页面底部「积分趋势」按天累积余额曲线；缺数据的天**断线**显示，
+   不会把相隔多天的两点连成一条看似平缓的直线。下方「官方消耗明细」是另一套口径：
+   直连官方接口拿**真实扣费**，签到补发不会混进来，还能看模型排行
+7. 签到卡片下方是**签到成功率趋势**：同一天同一账号只记最终状态 ——
+   失败后重试成功算一次成功，不会因重试拉低成功率
 
 > **保存登录态** = 把客户端当前的登录状态存进该账号的快照槽。
 > **切换** = 先备份现场、再恢复目标账号的快照，并保留一代备份可回退。
@@ -689,9 +750,13 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
      然后用豆包客户端访问一次，凭证会自动抓取并回写（页面每 20 秒轮询一次）
    - **手动录入**：点「编辑」填写 `sessionid` / `sid_guard` / `ttwid`
 3. 账号列表里可执行：**探活**、**查询额度**、**备份/恢复对话状态**、
-   **导出对话**（markdown + json，输出到 `~/.wb-switch/exports/`）
-4. 顶部按钮：「保活」（启动客户端触发会话续期）、「探活续期」（HTTP 探测）、
-   「额度巡检」（批量查询）、「诊断」（排查为什么读不到凭证）
+   **导出对话**（markdown + json，输出到 `~/.wb-switch/exports/`）、
+   **以该账号打开**、**删除**（可勾选连快照一起删）
+4. 顶部按钮：「保活」（启动客户端触发会话续期）、「探活续期」（HTTP 探测，
+   全失败时自动回退到保活）、「额度巡检」（批量查询）、「诊断」（排查为什么读不到凭证）、
+   「打开客户端」（零副作用，不切账号）
+5. 「运维健康史」区块展示 14 天额度趋势与 7 天保活 / 续期 / 额度事件；
+   超过 25 天没保活会告警（会话约 30 天到期，留 5 天补救窗口）
 
 > 抓包回写**只认抓包文件自己的 uid**，且**绝不自动创建账号** ——
 > 浏览器网页版与其他字节系应用也会产生豆包 cookie，无差别建号会污染账号池。
@@ -704,6 +769,18 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 - **CA 证书**需安装到「受信任的根证书颁发机构」，否则 HTTPS 拦截会因证书不受信而失败
 - 代理**意外崩溃**时会立刻还原系统代理（否则应用还在但系统代理指向死端口，本机断网）
 - 未命中的域名透明转发，不影响其他应用上网
+
+#### 抓包日志
+
+「设置 → 抓包日志」可以直接查看代理记录的每次请求与响应 ——
+不必再去文件夹里翻 `logs/proxy_req_*.log`：
+
+- 按 URL、主机名或响应内容**搜索**，也可按**时间区间**过滤
+- 点任意一行看完整正文（请求头、请求体、响应头、响应体，**凭证已脱敏**）
+- 流式请求额外显示**模型名**与 token 用量摘要
+- 支持分页与一键清空（也可只清超过 N 天的）
+
+> 操作日志（代理自身的启动/停止/错误）仍写在 `logs/proxy.log`，与抓包日志分开。
 
 #### 计划任务
 
@@ -731,6 +808,7 @@ export ANTHROPIC_AUTH_TOKEN=<你设置的 api_key>
 | 内嵌网关副本 | `~/.wb-switch/gateway/bin/` | 按内容指纹命名，版本升级后自动更新 |
 | 登录态快照 | `~/.wb-switch/profiles*/` | Trae 系与豆包各一套，含一代 `.bak` 回退 |
 | 豆包对话备份 | `~/.wb-switch/doubao_chats/` | 客户端状态（对话正文在云端） |
+| 抓包日志 | `~/.wb-switch/logs/proxy_req_YYYY-MM-DD.log` | 单日超 100MB 滚动分片；可在「设置 → 抓包日志」查看或清理 |
 | 对话导出 | `~/.wb-switch/exports/` | markdown + json |
 | 代理抓包日志 | `~/.wb-switch/logs/` | 凭证已脱敏，但可能含其他请求信息 |
 | CA 证书 | `~/.wb-switch/certs/` | 自签 CA，安装后请妥善保管私钥 |
@@ -863,10 +941,19 @@ crates/ai-gateway-core/        核心逻辑（不依赖 Tauri，可被桌面端�
   src/modules/trae_device.rs    Trae 账号级设备指纹确定性派生（多应用扩展）
   src/modules/trae_checkin.rs   Trae 签到（错误分类、冷却、积分三层兜底）
   src/modules/trae_discover.rs  双应用本机账号发现（两套 uid 体系）
+  src/modules/trae_refresh.rs   Trae JWT 自动续期（ExchangeToken、懒刷新、冷却分流）
+  src/modules/trae_credits.rs   Trae 积分总额 / 明细 / 套餐身份 + 每日快照
+  src/modules/trae_usage_history.rs Trae 积分消耗历史（官方会话级用量、模型排行）
+  src/modules/trae_checkin_results.rs Trae 签到结果按日落库（成功率趋势、90 天裁剪）
+  src/modules/trae_oauth.rs     Trae OAuth 授权码登录（PKCE + state + 回环回调）
+  src/modules/proxy_logs.rs     抓包日志查看（分块解析、过滤分页、SSE 摘要）
+  src/modules/cli_quota/        本机 AI CLI 额度查询（Claude / Codex / Antigravity / Grok / Kimi）
   src/modules/doubao_account.rs 豆包账号池与凭证（含抓包回写）（多应用扩展）
   src/modules/doubao_session.rs 豆包保活与两段式探活（多应用扩展）
   src/modules/doubao_quota.rs   豆包会员额度（精确解析 + 宽容兜底）
   src/modules/doubao_chats.rs   豆包对话备份与官方 IM API 导出
+  src/modules/doubao_health.rs  豆包运维健康史（保活 / 续期 / 额度事件 + 趋势）
+  src/modules/account_groups.rs 账号分组（Trae / 豆包分域，分组不删账号）
   src/modules/device_proxy/     MITM 设备代理（多应用扩展）
     mod.rs                       代理生命周期 + 事件 trait
     handler.rs                   请求拦截、JWT 与豆包凭证捕获
@@ -899,12 +986,13 @@ scripts/build-single.ps1      构建单一可执行文件（本项目新增）
 
 ### 测试
 
-```bash
+```powershell
 cargo test --workspace          # 核心逻辑 + 网关 + 桌面端单元测试
-npm run build                   # 前端类型检查与构建
+npm run build                   # 前端类型检查、演示模式覆盖校验与构建
 ```
 
-> Windows x64 上实测 `cargo test --workspace` 全部通过（474 个核心用例 + 262 个网关用例）。
+> 当前实测：核心 **772** 个用例、网关 **284** 个用例全部通过；
+> `npm run build`（`tsc` + 演示覆盖校验 + `vite build`）通过。
 > 构建需要 **MSVC 工具链**（`stable-x86_64-pc-windows-msvc`，Tauri 依赖它链接
 > WebView2）；若需安装，可用
 > `winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`。
@@ -915,6 +1003,13 @@ npm run build                   # 前端类型检查与构建
 ---
 
 ## 对上游的改动
+
+> **Trae / 豆包 功能面与 [`smart-open/TraeWorkAssistant`](https://github.com/smart-open/TraeWorkAssistant)
+> 的对齐情况**（含有意不对齐项及其理由、移植时避开的陷阱）见
+> [`docs/trae-doubao-parity-report.md`](docs/trae-doubao-parity-report.md)。
+>
+> **账号管理与额度 / 用量架构**（分层约定、新功能该落在哪一层的落点说明，含源码行号引用）见
+> [`docs/account-quota-architecture-report.md`](docs/account-quota-architecture-report.md)。
 
 网关已由 Go **移植为 Rust 实现**（`crates/ai-gateway-router/`），下列行为在移植时
 **逐条保留**并沿用同一套用例矩阵做对照。上游 Go 源码不再随本仓库分发
