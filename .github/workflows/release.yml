@@ -554,9 +554,38 @@ jobs:
       # 产物本身已有足够防护，不需要靠 draft 兜底：build 任务对每个平台的
       # 产物做了数量断言、对 .sig 存在性做了硬校验，release 任务又用
       # needs + !cancelled() 保证「某平台失败不影响其余平台照常发布」。
+      # ⚠⚠ 重跑同一个 tag 时，**必须**先删掉已有的 Release（2026-09-22）。
+      #
+      # 实测：`softprops/action-gh-release@v2` 对**已存在**的 Release
+      # **不会覆盖正文** —— 它的文档写着
+      # 「When the release info keys are not explicitly set and there is already
+      #   an existing release, the release will retain its original info.」
+      # 于是「改了 RELEASE_NOTES_*.md → 重打 tag → 修复说明」这条自救路径
+      # **静默失效**：workflow 全绿、日志没有任何异常，而 Release 页面上
+      # 挂的还是上一次的正文。我第一次重打 tag 就撞上了这个。
+      #
+      # 先删后建是让它用新正文的唯一可靠办法。删掉的只是 Release 记录，
+      # **tag 本身不受影响**（下一个 tag 仍能正常创建），资产随后重建。
+      - name: 删除该 tag 已有的 Release（让正文能被重新写入）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "已存在 $GITHUB_REF_NAME 的 Release，先删除以便重写正文"
+            gh release delete "$GITHUB_REF_NAME" --yes --cleanup-tag=false
+          else
+            echo "$GITHUB_REF_NAME 尚无 Release，直接创建"
+          fi
+
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
           draft: false
           body_path: ${{ steps.notes.outputs.path }}
-          generate_release_notes: true
+          # 有手写说明时**不要**再 prepend 自动生成的提交列表 ——
+          # 那会把 "What's Changed" 堆在正文顶部，与手写内容重复
+          #（v1.0.7 的正文就只有那段自动摘要，83 字符）。
+          # 只在**没有**手写说明（path 为空）时才用它兜底。
+          generate_release_notes: ${{ steps.notes.outputs.path == '' }}
