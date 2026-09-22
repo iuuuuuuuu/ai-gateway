@@ -863,6 +863,57 @@ pub async fn get_gateway_usage(days: Option<i64>) -> Result<Value, String> {
     Ok(ai_gateway_core::modules::gateway::fetch_usage(days).await)
 }
 
+// ---------------------------------------------------------------------------
+// 本机 AI CLI 登录额度查询（Codex / Claude / Antigravity / Grok / Kimi）
+// ---------------------------------------------------------------------------
+
+/// 查询全部 provider 的本机账号额度。
+///
+/// `refresh = true` 强制重查；缺省返回上次结果（含磁盘缓存），避免每次打开
+/// 页面都打上游。**未登录的 provider 也会出现在结果里**（`loggedIn: false` +
+/// 可操作提示），界面据此按 provider 分组展示，而不是整块消失。
+#[tauri::command]
+pub async fn get_cli_quotas(refresh: Option<bool>) -> Result<Value, String> {
+    let views = ai_gateway_core::modules::cli_quota::fetch_all(refresh.unwrap_or(false)).await;
+    Ok(json!({ "accounts": views }))
+}
+
+/// 只刷新一个 provider 的额度（界面上的单卡片刷新）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn refresh_cli_quota(provider: String) -> Result<Value, String> {
+    let provider = ai_gateway_core::modules::cli_quota::CliProvider::parse(&provider)
+        .ok_or_else(|| format!("未知的 provider: {provider}"))?;
+    match ai_gateway_core::modules::cli_quota::fetch_provider(provider, true).await {
+        Some(view) => Ok(json!({ "ok": true, "account": view })),
+        None => Ok(json!({
+            "ok": false,
+            "error": format!("未检测到本机登录态：{}", provider.login_hint()),
+        })),
+    }
+}
+
+/// 探测本机各 CLI 的登录态（不触网、不查额度）。
+///
+/// 与 [`get_cli_quotas`] 分开：登录态是本地文件/凭据读取（毫秒级），额度查询
+/// 要打上游（秒级）。界面先用它把「已登录 / 未登录」渲染出来，再让用户决定
+/// 要不要真正查询 —— 否则首屏会被 5 次网络往返拖住。
+#[tauri::command]
+pub async fn get_cli_quota_status() -> Result<Value, String> {
+    let statuses: Vec<Value> =
+        ai_gateway_core::modules::cli_quota::credentials::discover_all()
+            .into_iter()
+            .map(|(provider, credential)| {
+                json!({
+                    "provider": provider.id(),
+                    "label": provider.label(),
+                    "loggedIn": credential.is_some(),
+                    "loginHint": provider.login_hint(),
+                })
+            })
+            .collect();
+    Ok(json!({ "providers": statuses }))
+}
+
 /// 解析前端传入的模型列表，兼容两种格式：
 ///
 /// - 新格式（推荐）：`[{ "id": "glm-5.2", "contextWindow": 1000000 }, ...]`

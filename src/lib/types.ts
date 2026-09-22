@@ -846,3 +846,66 @@ export interface AgentBackupItem {
   path: string;
 }
 
+// ---------------------------------------------------------------------------
+// 本机 AI CLI 登录额度查询（Codex / Claude / Antigravity / Grok / Kimi）
+// ---------------------------------------------------------------------------
+
+/** 支持的 CLI provider 标识；与后端 `CliProvider::id()` 对齐。 */
+export type CliQuotaProvider = "codex" | "claude" | "antigravity" | "xai" | "kimi";
+
+/** 单个额度窗口。 */
+export interface CliQuotaWindow {
+  /** 窗口展示名，如「5 小时」「每周」。 */
+  label: string;
+  /**
+   * 剩余百分比（0..100）。
+   *
+   * `null` = 上游没给出可比口径，界面必须显示「—」而**不是 0** ——
+   * 0 代表「已用尽」，把未知渲染成用尽会误导用户去等重置。
+   */
+  remainingPercent: number | null;
+  /** 重置时刻（Unix 毫秒）。 */
+  resetAtMs: number | null;
+  /** 附注（如「$25.00 / $100.00」）。 */
+  detail: string | null;
+}
+
+/** Codex 的手动重置次数。 */
+export interface CliResetCredit {
+  available: number | null;
+  applicable: number | null;
+  earliestExpiryMs: number | null;
+}
+
+/** 单个 provider 账号的额度视图（不含任何 token）。 */
+export interface CliQuotaAccount {
+  /** 稳定账号 id：`<provider>:<凭证来源>`。 */
+  id: string;
+  provider: CliQuotaProvider;
+  /** provider 展示名。 */
+  providerLabel: string;
+  /** 账号展示名（邮箱 / 用户名）。 */
+  label: string;
+  /** 本机是否已有登录态。 */
+  loggedIn: boolean;
+  /** 凭证来源说明（排查用，不含 token）。 */
+  source: string;
+  plan: string | null;
+  windows: CliQuotaWindow[];
+  /** 失败原因；成功时为 null。 */
+  error: string | null;
+  /** 本次查询时间（Unix 毫秒）。 */
+  fetchedAt: number;
+  resetCredits: CliResetCredit | null;
+  subscriptionActiveUntil: string | null;
+}
+
+/** 单个 provider 的登录态（不触网）。 */
+export interface CliQuotaStatusItem {
+  provider: CliQuotaProvider;
+  label: string;
+  loggedIn: boolean;
+  /** 未登录时引导用户去哪里登录。 */
+  loginHint: string;
+}
+

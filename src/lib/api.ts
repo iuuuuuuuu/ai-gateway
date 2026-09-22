@@ -12,6 +12,9 @@ import type {
   CheckinConfig,
   CheckinLog,
   CheckinResult,
+  CliQuotaAccount,
+  CliQuotaProvider,
+  CliQuotaStatusItem,
   CreditExpiry,
   CreditStatistics,
   TokenStatistics,
@@ -67,6 +70,7 @@ const DEMO_READ_COMMANDS = new Set([
   "get_travel_status", "get_auto_travel_config",
   "get_gateway_usage",
   "get_gateway_status", "get_gateway_models", "detect_agent_clients", "list_agent_backups",
+  "get_cli_quotas", "get_cli_quota_status",
 ]);
 
 export function isDemoMode(): boolean {
@@ -155,6 +159,10 @@ const ROUTES: Record<string, Route> = {
   sync_gateway_accounts: { method: "POST", path: "/api/gateway/sync" },
   get_gateway_models: { method: "GET", path: "/api/gateway/models" },
   get_gateway_usage: { method: "GET", path: "/api/gateway/usage" },
+  // ---- 本机 AI CLI 登录额度查询 ----
+  get_cli_quotas: { method: "GET", path: "/api/cli-quota" },
+  refresh_cli_quota: { method: "POST", path: "/api/cli-quota/refresh" },
+  get_cli_quota_status: { method: "GET", path: "/api/cli-quota/status" },
   // ---- 一键导入：接入本机 AI 客户端 ----
   detect_agent_clients: { method: "GET", path: "/api/gateway/agents" },
   import_agent_client: { method: "POST", path: "/api/gateway/agents/import" },
@@ -762,6 +770,34 @@ export async function getGatewayModels(): Promise<GatewayModelsResult> {
  */
 export function getGatewayUsage(days?: number): Promise<GatewayUsageResult> {
   return call<GatewayUsageResult>("get_gateway_usage", days && days > 0 ? { days } : undefined);
+}
+
+// ---------------------------------------------------------------------------
+// 本机 AI CLI 登录额度查询
+// ---------------------------------------------------------------------------
+
+/**
+ * 查询全部 provider 的本机账号额度。
+ *
+ * `refresh` 缺省为 false：返回上次结果（含磁盘缓存），避免每次打开页面都打
+ * 上游（5 个 provider 就是 5 次网络往返）。用户点「刷新」时才传 true。
+ */
+export function getCliQuotas(refresh = false): Promise<{ accounts: CliQuotaAccount[] }> {
+  return call<{ accounts: CliQuotaAccount[] }>("get_cli_quotas", { refresh });
+}
+
+/** 刷新单个 provider 的额度；未登录时返回 `{ok:false, error}` 而不是抛错。 */
+export function refreshCliQuota(
+  provider: CliQuotaProvider,
+): Promise<{ ok: boolean; account?: CliQuotaAccount; error?: string }> {
+  return call<{ ok: boolean; account?: CliQuotaAccount; error?: string }>("refresh_cli_quota", {
+    provider,
+  });
+}
+
+/** 探测本机各 CLI 的登录态（不触网，毫秒级）。 */
+export function getCliQuotaStatus(): Promise<{ providers: CliQuotaStatusItem[] }> {
+  return call<{ providers: CliQuotaStatusItem[] }>("get_cli_quota_status");
 }
 
 /** 探测本机 AI 客户端（全部 12 类智能体）的安装与配置状态。 */

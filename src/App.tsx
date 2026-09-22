@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
-import { ArrowUp, Bot, MessageCircle, MessagesSquare, Server, Settings, Sparkles, Terminal, User } from "lucide-react";
+import { ArrowUp, Bot, Gauge, MessageCircle, MessagesSquare, Server, Settings, Sparkles, Terminal, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import type { UpdateInfo } from "@/lib/types";
 import AccountsPage from "@/pages/AccountsPage";
 import CreditStatsPage from "@/pages/CreditStatsPage";
+import CliQuotaPage from "@/pages/CliQuotaPage";
 import TokenStatsPage from "@/pages/TokenStatsPage";
 import GatewayPage from "@/pages/GatewayPage";
 import AgentsPage from "@/pages/AgentsPage";
@@ -166,6 +167,20 @@ function Layout() {
             积分统计
           </NavLink>
           <NavLink
+            to="/cli-quota"
+            className={({ isActive }) =>
+              cn(
+                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+                isActive
+                  ? "bg-foreground/[0.06] font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+              )
+            }
+          >
+            <Gauge className="size-4" />
+            额度查询
+          </NavLink>
+          <NavLink
             to="/gateway"
             className={({ isActive }) =>
               cn(
@@ -260,6 +275,7 @@ export default function App() {
           <Route element={<Layout />}>
             <Route path="/" element={<AccountsPage />} />
             <Route path="/credit-stats" element={<CreditStatsPage />} />
+            <Route path="/cli-quota" element={<CliQuotaPage />} />
             <Route path="/token-stats" element={<TokenStatsPage />} />
             <Route path="/gateway" element={<GatewayPage />} />
             <Route path="/agents" element={<AgentsPage />} />

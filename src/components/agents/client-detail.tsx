@@ -6,6 +6,7 @@ import {
   iconOf,
   metaOf,
 } from "@/components/agents/client-meta";
+import { ClientDetailQuota } from "@/components/agents/client-detail-quota";
 import { ListItemRow } from "@/components/common/list-item-row";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -124,6 +125,11 @@ export function ClientDetail({
           <p className="text-[10.5px] leading-relaxed text-muted-foreground">{target.note}</p>
         ) : null}
       </Card>
+
+      {/* 登录额度：仅对确实有本机登录凭证的客户端显示（Codex / Claude Code /
+          Grok / Kimi）。用户在「智能体管理」里点开某个客户端时，最自然的
+          问题就是「这个客户端还剩多少额度」。 */}
+      <ClientDetailQuota targetId={target.id} />
 
       {/* 模型槽位分配 */}
       <Card className="gap-3 rounded-xl border border-border/70 p-4 shadow-none">

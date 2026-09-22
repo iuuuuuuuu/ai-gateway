@@ -8,6 +8,8 @@ pub mod auth_file;
 pub mod checkin;
 // CLI 任务模式（--task-run <key>，刻意不启动 Tauri）
 pub mod cli_task;
+// 本机 AI CLI（Codex/Claude/Antigravity/Grok/Kimi）的登录额度查询
+pub mod cli_quota;
 pub mod codebuddy_cli;
 pub mod codebuddy_cn_ide;
 pub mod config;

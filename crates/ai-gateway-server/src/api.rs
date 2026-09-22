@@ -122,6 +122,10 @@ pub fn router() -> Router {
         .route("/api/gateway/restart", post(api_gateway_restart))
         .route("/api/gateway/models", get(api_gateway_models))
         .route("/api/gateway/usage", get(api_gateway_usage))
+        // ---- 本机 AI CLI 登录额度查询（Codex/Claude/Antigravity/Grok/Kimi）----
+        .route("/api/cli-quota", get(api_cli_quota))
+        .route("/api/cli-quota/refresh", post(api_cli_quota_refresh))
+        .route("/api/cli-quota/status", get(api_cli_quota_status))
         // ---- 一键导入：接入本机 AI 客户端 ----
         .route("/api/gateway/agents", get(api_agents_detect))
         .route("/api/gateway/agents/import", post(api_agents_import))
@@ -1104,6 +1108,60 @@ async fn api_gateway_usage(Query(params): Query<HashMap<String, String>>) -> Res
         .and_then(|v| v.parse::<i64>().ok())
         .filter(|d| *d > 0);
     json_ok(ai_gateway_core::modules::gateway::fetch_usage(days).await)
+}
+
+/// GET /api/cli-quota?refresh=1 —— 本机 AI CLI（Codex/Claude/Antigravity/
+/// Grok/Kimi）的登录额度。
+///
+/// 缺省读上次结果（含磁盘缓存）；`refresh=1` 强制重查。未登录的 provider
+/// 也会出现在 `accounts` 里（`loggedIn: false` + 可操作提示）。
+async fn api_cli_quota(Query(params): Query<HashMap<String, String>>) -> Response {
+    let refresh = params
+        .get("refresh")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let accounts = ai_gateway_core::modules::cli_quota::fetch_all(refresh).await;
+    json_ok(json!({ "accounts": accounts }))
+}
+
+/// POST /api/cli-quota/refresh —— 刷新单个 provider 的额度。
+///
+/// body 兼容 `{"provider": "codex"}` / `{"provider":"CODEX"}`；
+/// 未登录时**不是** HTTP 错误，而是 `{"ok": false, "error": <可操作提示>}`。
+async fn api_cli_quota_refresh(Json(body): Json<Value>) -> Response {
+    let raw = body
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let Some(provider) = ai_gateway_core::modules::cli_quota::CliProvider::parse(&raw) else {
+        return json_err(format!("未知的 provider: {raw}"), StatusCode::BAD_REQUEST);
+    };
+    match ai_gateway_core::modules::cli_quota::fetch_provider(provider, true).await {
+        Some(account) => json_ok(json!({ "ok": true, "account": account })),
+        None => json_ok(json!({
+            "ok": false,
+            "error": format!("未检测到本机登录态：{}", provider.login_hint()),
+        })),
+    }
+}
+
+/// GET /api/cli-quota/status —— 本机各 CLI 的登录态（不触网）。
+async fn api_cli_quota_status() -> Response {
+    let providers: Vec<Value> =
+        ai_gateway_core::modules::cli_quota::credentials::discover_all()
+            .into_iter()
+            .map(|(provider, credential)| {
+                json!({
+                    "provider": provider.id(),
+                    "label": provider.label(),
+                    "loggedIn": credential.is_some(),
+                    "loginHint": provider.login_hint(),
+                })
+            })
+            .collect();
+    json_ok(json!({ "providers": providers }))
 }
 
 /// GET /api/gateway/agents —— 探测全部客户端的安装与配置状态。

@@ -253,6 +253,10 @@ pub fn run() {
             commands::restart_gateway,
             commands::sync_gateway_accounts,
             commands::get_gateway_usage,
+            // ---- 本机 AI CLI 登录额度查询（Codex/Claude/Antigravity/Grok/Kimi）----
+            commands::get_cli_quotas,
+            commands::refresh_cli_quota,
+            commands::get_cli_quota_status,
             // 一键导入：接入本机 AI 客户端
             commands::detect_agent_clients,
             commands::get_gateway_models,
