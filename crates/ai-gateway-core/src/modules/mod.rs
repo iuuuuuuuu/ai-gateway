@@ -1,4 +1,6 @@
 pub mod account;
+// 账号分组（Trae / 豆包 分域，各自独立存储）
+pub mod account_groups;
 pub mod agent_import;
 // 多应用档案表（5 应用 × 3 快照布局）：切换流程的表驱动参数源。
 pub mod app_profile;
@@ -21,6 +23,8 @@ pub mod device_proxy;
 // 豆包：账号池与凭证 / 会话保活 / 会员额度 / 对话备份导出
 pub mod doubao_account;
 pub mod doubao_chats;
+// 豆包运维健康史（保活/续期/额度事件，供趋势图与健康卡）
+pub mod doubao_health;
 pub mod doubao_quota;
 pub mod doubao_session;
 pub mod export_import;
@@ -31,6 +35,7 @@ pub mod migrate_store;
 pub mod oauth;
 pub mod official_usage;
 pub mod process;
+pub mod proxy_logs;
 pub mod refresh;
 pub mod rotate;
 // Windows 计划任务（Trae 签到 / 豆包保活 / 额度巡检）
@@ -40,11 +45,16 @@ pub mod switch;
 // 登录态切换器（Trae 系 icube 布局 / 豆包 chromium 布局）
 pub mod switcher;
 pub mod token_stats;
-// Trae：账号库 / JWT 解析 / 设备指纹 / 签到 / 本机发现
+// Trae：账号库 / JWT 解析 / 设备指纹 / 签到 / 本机发现 / 登录态凭证续期
 pub mod trae_account;
 pub mod trae_checkin;
+pub mod trae_checkin_results;
+pub mod trae_credits;
+pub mod trae_usage_history;
 pub mod trae_device;
 pub mod trae_discover;
+pub mod trae_oauth;
+pub mod trae_refresh;
 pub mod travel;
 pub mod update;
 pub mod vscode_cn_inject;

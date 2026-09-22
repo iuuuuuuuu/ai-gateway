@@ -270,9 +270,11 @@ pub fn set_name_if_placeholder(uid: &str, name: &str) -> bool {
 
 /// 删除账号。
 pub fn delete_account(uid: &str) -> Result<(), String> {
+    config::ensure_uid_safe(uid)?;
+    let uid = uid.trim();
     let mut accounts = load_accounts();
     let before = accounts.len();
-    accounts.retain(|a| a.get("user_id").and_then(Value::as_str) != Some(uid.trim()));
+    accounts.retain(|a| a.get("user_id").and_then(Value::as_str) != Some(uid));
     if accounts.len() == before {
         return Err("账号不存在".to_string());
     }
@@ -281,10 +283,12 @@ pub fn delete_account(uid: &str) -> Result<(), String> {
 
 /// 更新账号的 JWT（刷新流程用）。
 pub fn update_jwt(uid: &str, jwt: &str) -> Result<(), String> {
+    config::ensure_uid_safe(uid)?;
+    let uid = uid.trim();
     let mut accounts = load_accounts();
     let acc = accounts
         .iter_mut()
-        .find(|a| a.get("user_id").and_then(Value::as_str) == Some(uid.trim()))
+        .find(|a| a.get("user_id").and_then(Value::as_str) == Some(uid))
         .ok_or_else(|| "账号不存在".to_string())?;
     let obj = acc
         .as_object_mut()
@@ -294,26 +298,134 @@ pub fn update_jwt(uid: &str, jwt: &str) -> Result<(), String> {
     save_accounts(&accounts).map_err(|e| e.to_string())
 }
 
+/// 重命名账号（只改昵称，不动凭证与设备指纹）。
+///
+/// 与 [`update_jwt`] 分开：界面上的「编辑」既可能只改昵称，也可能连 JWT 一起换。
+/// 合在一个函数里的话，只改昵称的调用也不得不传 JWT，容易把空串写进去覆盖掉
+/// 现有登录态。
+pub fn rename_account(uid: &str, name: &str) -> Result<(), String> {
+    config::ensure_uid_safe(uid)?;
+    let uid = uid.trim();
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("昵称不能为空".to_string());
+    }
+    let mut accounts = load_accounts();
+    let acc = accounts
+        .iter_mut()
+        .find(|a| a.get("user_id").and_then(Value::as_str) == Some(uid))
+        .ok_or_else(|| "账号不存在".to_string())?;
+    let obj = acc
+        .as_object_mut()
+        .ok_or_else(|| "账号记录格式异常".to_string())?;
+    obj.insert("name".to_string(), json!(name));
+    obj.insert("updated_at".to_string(), json!(config::utc_iso()));
+    save_accounts(&accounts).map_err(|e| e.to_string())
+}
+
+/// 单独更新账号的 `refresh_token`（编辑弹窗里手填续期凭证）。
+pub fn set_refresh_token(uid: &str, refresh_token: &str) -> Result<(), String> {
+    config::ensure_uid_safe(uid)?;
+    let uid = uid.trim();
+    let rt = refresh_token.trim();
+    if rt.is_empty() {
+        return Err("refresh_token 不能为空".to_string());
+    }
+    let mut accounts = load_accounts();
+    let acc = accounts
+        .iter_mut()
+        .find(|a| a.get("user_id").and_then(Value::as_str) == Some(uid))
+        .ok_or_else(|| "账号不存在".to_string())?;
+    let obj = acc
+        .as_object_mut()
+        .ok_or_else(|| "账号记录格式异常".to_string())?;
+    obj.insert("refresh_token".to_string(), json!(rt));
+    // 手填意味着用户认为它是好的：清掉失效标记，否则「可续期」永远显示为假
+    obj.insert("refresh_token_invalid".to_string(), json!(false));
+    obj.insert("refresh_token_fails".to_string(), json!(0));
+    obj.insert("updated_at".to_string(), json!(config::utc_iso()));
+    save_accounts(&accounts).map_err(|e| e.to_string())
+}
+
+/// 读取账号的**完整** JWT（仅供单账号查看/编辑弹窗回填）。
+///
+/// 与 [`account_meta`] 的区别：列表视图一律脱敏，只有用户主动点「查看」时才
+/// 返回明文。两者必须分开，否则脱敏就成了摆设。
+pub fn account_jwt(uid: &str) -> Result<String, String> {
+    config::ensure_uid_safe(uid)?;
+    find_account(uid.trim())
+        .and_then(|a| a.get("jwt").and_then(Value::as_str).map(str::to_string))
+        .filter(|j| !j.trim().is_empty())
+        .ok_or_else(|| "账号不存在或没有 JWT".to_string())
+}
+
 /// 标记 refresh_token 连续刷新失败（达到阈值时判定失效）。
-pub fn note_refresh_failure(uid: &str, invalid: bool) {
+///
+/// 返回 `(连续失败次数, 是否已判定失效)`。
+///
+/// **只有 `invalid=true`（服务端明确拒绝）才立即置失效**；瞬时失败（网络抖动、
+/// 代理未启动）只递增计数，由 [`crate::modules::trae_refresh`] 在连续 3 次后兜底。
+/// 早期版本把两类混为一谈，一次网络异常就能把整批账号永久标成失效并移出账号池。
+pub fn note_refresh_failure(uid: &str, invalid: bool) -> (i64, bool) {
     let mut accounts = load_accounts();
     let Some(acc) = accounts
         .iter_mut()
         .find(|a| a.get("user_id").and_then(Value::as_str) == Some(uid.trim()))
     else {
-        return;
+        return (0, false);
     };
-    let Some(obj) = acc.as_object_mut() else { return };
+    let Some(obj) = acc.as_object_mut() else {
+        return (0, false);
+    };
     let fails = obj
         .get("refresh_token_fails")
         .and_then(Value::as_i64)
         .unwrap_or(0)
         + 1;
     obj.insert("refresh_token_fails".to_string(), json!(fails));
-    if invalid {
+    // 连续 3 次瞬时失败也兜底置失效：账号确实已经换不回来了，
+    // 继续留在池里只会每次保活都白打一次网络请求。
+    let invalid_now = invalid || fails >= REFRESH_FAILS_TO_INVALID;
+    if invalid_now {
         obj.insert("refresh_token_invalid".to_string(), json!(true));
     }
     let _ = save_accounts(&accounts);
+    (fails, invalid_now)
+}
+
+/// 瞬时刷新失败达到该次数后兜底判定 `refresh_token` 失效。
+pub const REFRESH_FAILS_TO_INVALID: i64 = 3;
+
+/// 刷新成功的收尾：写入新 access token（与轮换后的 refresh_token），
+/// 清零失败计数并解除失效标记。
+///
+/// **成功必须解冻**：只写 token 不清标记的话，账号仍带着 `refresh_token_invalid=true`，
+/// 调度层会继续跳过它 —— 表现为「刷新成功了但账号还是不用」，排查成本极高。
+pub fn mark_refresh_success(
+    uid: &str,
+    new_refresh_token: Option<&str>,
+    rt_expires_at: Option<i64>,
+) -> Result<Value, String> {
+    let mut accounts = load_accounts();
+    let acc = accounts
+        .iter_mut()
+        .find(|a| a.get("user_id").and_then(Value::as_str) == Some(uid.trim()))
+        .ok_or_else(|| "账号不存在".to_string())?;
+    let obj = acc
+        .as_object_mut()
+        .ok_or_else(|| "账号记录格式异常".to_string())?;
+    obj.insert("refresh_token_fails".to_string(), json!(0));
+    obj.insert("refresh_token_invalid".to_string(), json!(false));
+    if let Some(rt) = new_refresh_token.map(str::trim).filter(|s| !s.is_empty()) {
+        obj.insert("refresh_token".to_string(), json!(rt));
+    }
+    if let Some(exp) = rt_expires_at {
+        obj.insert("refresh_token_expires_at".to_string(), json!(exp));
+    }
+    obj.insert("refreshed_at".to_string(), json!(config::utc_iso()));
+    let updated = acc.clone();
+    save_accounts(&accounts).map_err(|e| e.to_string())?;
+    Ok(updated)
 }
 
 /// 账号的展示元数据（**不泄露 JWT**）。
@@ -349,8 +461,29 @@ pub fn account_meta(acc: &Value) -> Value {
             .get("refresh_token_fails")
             .and_then(Value::as_i64)
             .unwrap_or(0),
+        "refreshTokenExpiresAt": acc
+            .get("refresh_token_expires_at")
+            .and_then(Value::as_i64),
+        "refreshedAt": acc.get("refreshed_at"),
+        "canRefresh": acc
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+            && !acc
+                .get("refresh_token_invalid")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         // 设备指纹脱敏展示：完整值只在后端注入请求头时使用
         "deviceIdMasked": mask_tail(&device.device_id, 4),
+        // 套餐身份与积分缓存：来自 `trae_credits` 的付费身份缓存。
+        // 缺失时给 null 而**不是 0** —— 「不知道」与「确实是 0 积分」必须能区分，
+        // 否则界面会把没查过的账号显示成「0 积分」，用户以为积分被清零了。
+        "payIdentity": acc.get("pay_identity").cloned().unwrap_or(Value::Null),
+        "payExpireAt": acc.get("pay_expire_at").cloned().unwrap_or(Value::Null),
+        "creditsTotal": acc.get("credits_total").cloned().unwrap_or(Value::Null),
+        "creditsUpdatedAt": acc.get("credits_updated_at").cloned().unwrap_or(Value::Null),
+        "group": acc.get("group_id").cloned().unwrap_or(Value::Null),
     })
 }
 

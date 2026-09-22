@@ -19,7 +19,7 @@
 
 use serde_json::{json, Value};
 
-use ai_gateway_core::modules::{apps_ops, config, switcher};
+use ai_gateway_core::modules::{apps_ops, config, proxy_logs, switcher};
 
 /// 把 `apps_ops` 的进度转发成 Tauri 事件。
 struct EventSink<E: Fn(&str, &str) + Send + Sync> {
@@ -176,6 +176,66 @@ pub async fn trae_delete_account(user_id: String) -> Result<Value, String> {
         .map_err(|e| format!("删除 Trae 账号失败: {e}"))?
 }
 
+/// 编辑 Trae 账号（昵称，可选同时替换 JWT / refresh_token）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_update_account(
+    user_id: String,
+    name: Option<String>,
+    jwt: Option<String>,
+    refresh_token: Option<String>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        apps_ops::trae_update_account(
+            &user_id,
+            name.as_deref(),
+            jwt.as_deref(),
+            refresh_token.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| format!("编辑 Trae 账号失败: {e}"))?
+}
+
+/// 读取账号的完整 JWT（仅供查看/编辑弹窗回填）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_account_jwt(user_id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || apps_ops::trae_account_jwt(&user_id))
+        .await
+        .map_err(|e| format!("读取 JWT 失败: {e}"))?
+}
+
+/// 解析一段 JWT（编辑弹窗实时预览，不落库）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_jwt_parse(jwt: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || apps_ops::trae_jwt_parse(&jwt))
+        .await
+        .map_err(|e| format!("解析 JWT 失败: {e}"))
+}
+
+/// 清空全部账号的签到冷却。
+#[tauri::command]
+pub async fn trae_clear_all_cooldowns() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(apps_ops::trae_clear_all_cooldowns)
+        .await
+        .map_err(|e| format!("清除全部冷却失败: {e}"))
+}
+
+/// 读取豆包设置。
+#[tauri::command]
+pub async fn doubao_settings() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(apps_ops::doubao_settings)
+        .await
+        .map_err(|e| format!("读取豆包设置失败: {e}"))
+}
+
+/// 写入一项豆包设置。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn doubao_set_setting(key: String, value: bool) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || apps_ops::doubao_set_setting(&key, value))
+        .await
+        .map_err(|e| format!("写入豆包设置失败: {e}"))?
+}
+
 /// 发现本机登录过的 Trae 账号（双应用）。
 #[tauri::command]
 pub async fn trae_discover_accounts() -> Result<Value, String> {
@@ -255,6 +315,104 @@ pub async fn trae_clear_cooldown(user_id: String) -> Result<Value, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Trae 凭证续期（ExchangeToken 刷新 JWT）
+// ---------------------------------------------------------------------------
+
+/// 刷新某账号的 Trae JWT（`force=true` 跳过惰性门强制刷新）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_refresh_account(user_id: String, force: Option<bool>) -> Result<Value, String> {
+    apps_ops::trae_refresh_account(&user_id, force.unwrap_or(false)).await
+}
+
+/// 批量刷新全部 Trae 账号的 JWT。
+#[tauri::command]
+pub async fn trae_refresh_all() -> Result<Value, String> {
+    Ok(apps_ops::trae_refresh_all().await)
+}
+
+// ---------------------------------------------------------------------------
+// Trae 积分与套餐身份
+// ---------------------------------------------------------------------------
+
+/// 读取某账号的三条积分账（IDE 积分 / 权益包 / 付费身份）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_credit_detail(user_id: String) -> Result<Value, String> {
+    Ok(apps_ops::trae_credit_detail(&user_id).await)
+}
+
+/// 刷新全部账号的付费身份缓存（批量调用服务端）。
+#[tauri::command]
+pub async fn trae_refresh_pay_status() -> Result<Value, String> {
+    Ok(apps_ops::trae_refresh_pay_status().await)
+}
+
+/// 读取付费身份缓存（不发网络请求）。
+#[tauri::command]
+pub async fn trae_pay_status_cache() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(apps_ops::trae_pay_status_cache)
+        .await
+        .map_err(|e| format!("读取套餐身份缓存失败: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// 账号分组（Trae / 豆包 分域）
+// ---------------------------------------------------------------------------
+
+/// 某应用的分组列表（定义 + 成员 + 计数）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn groups_list(app: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || apps_ops::groups_list(&app))
+        .await
+        .map_err(|e| format!("读取分组失败: {e}"))
+}
+
+/// 新建分组。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn group_create(app: String, name: String, color: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || apps_ops::group_create(&app, &name, &color))
+        .await
+        .map_err(|e| format!("新建分组失败: {e}"))?
+}
+
+/// 更新分组（只改传入的字段）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn group_update(
+    app: String,
+    id: String,
+    name: Option<String>,
+    color: Option<String>,
+    order: Option<i32>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        apps_ops::group_update(&app, &id, name.as_deref(), color.as_deref(), order)
+    })
+    .await
+    .map_err(|e| format!("更新分组失败: {e}"))?
+}
+
+/// 删除分组（连带清掉成员映射）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn group_delete(app: String, id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || apps_ops::group_delete(&app, &id))
+        .await
+        .map_err(|e| format!("删除分组失败: {e}"))?
+}
+
+/// 把账号移入/移出分组（`group_id` 为空 = 移出）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn group_move(
+    app: String,
+    user_id: String,
+    group_id: Option<String>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        apps_ops::group_move(&app, &user_id, group_id.as_deref())
+    })
+    .await
+    .map_err(|e| format!("移动账号分组失败: {e}"))?
+}
+
+// ---------------------------------------------------------------------------
 // 豆包
 // ---------------------------------------------------------------------------
 
@@ -280,12 +438,65 @@ pub async fn doubao_save_account(
     .map_err(|e| format!("保存豆包账号失败: {e}"))?
 }
 
-/// 删除豆包账号。
+/// 删除豆包账号（默认连带删除其登录态快照）。
 #[tauri::command(rename_all = "camelCase")]
-pub async fn doubao_delete_account(user_id: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || apps_ops::doubao_delete_account(&user_id))
+pub async fn doubao_delete_account(
+    user_id: String,
+    delete_snapshot: Option<bool>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        apps_ops::doubao_delete_account(&user_id, delete_snapshot.unwrap_or(true))
+    })
+    .await
+    .map_err(|e| format!("删除豆包账号失败: {e}"))?
+}
+
+/// 探测当前登录的豆包 uid（供「保存当前登录态」预填）。
+#[tauri::command]
+pub async fn doubao_detect_uid() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(apps_ops::doubao_detect_uid)
         .await
-        .map_err(|e| format!("删除豆包账号失败: {e}"))?
+        .map_err(|e| format!("探测当前 uid 失败: {e}"))
+}
+
+/// 读取账号快照的版本元数据。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn doubao_snapshot_meta(user_id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || apps_ops::doubao_snapshot_meta(&user_id))
+        .await
+        .map_err(|e| format!("读取快照元数据失败: {e}"))?
+}
+
+/// 一键以该账号打开豆包客户端（恢复快照 → 拉起客户端）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn doubao_open_as_account(
+    app: tauri::AppHandle,
+    user_id: String,
+    proxy_port: Option<u16>,
+) -> Result<Value, String> {
+    use tauri::Emitter;
+
+    let sink = EventSink {
+        emit: move |stage: &str, message: &str| {
+            let _ = app.emit(
+                "switch-progress",
+                json!({ "stage": stage, "data": message }),
+            );
+        },
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        apps_ops::doubao_open_as_account(&user_id, proxy_port, &sink)
+    })
+    .await
+    .map_err(|e| format!("以账号打开豆包失败: {e}"))?
+}
+
+/// 豆包运维健康史（事件 + 14 天额度趋势 + 7 天健康计数）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn doubao_history(days: Option<i64>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || apps_ops::doubao_history(days))
+        .await
+        .map_err(|e| format!("读取豆包运维历史失败: {e}"))
 }
 
 /// 读取账号的**明文**凭证（仅供编辑弹窗回填；界面需自行脱敏展示）。
@@ -360,8 +571,15 @@ pub async fn doubao_keepalive(app: tauri::AppHandle) -> Result<Value, String> {
 
 /// HTTP 续期探活（诊断/续期；`syncOnly` 为真时只做诊断）。
 #[tauri::command(rename_all = "camelCase")]
-pub async fn doubao_renew(sync_only: Option<bool>) -> Result<Value, String> {
-    Ok(apps_ops::doubao_renew(sync_only.unwrap_or(false)).await)
+pub async fn doubao_renew(
+    sync_only: Option<bool>,
+    fallback_to_keepalive: Option<bool>,
+) -> Result<Value, String> {
+    Ok(apps_ops::doubao_renew_with(
+        sync_only.unwrap_or(false),
+        fallback_to_keepalive.unwrap_or(false),
+    )
+    .await)
 }
 
 /// 会话与凭证诊断。
@@ -474,4 +692,140 @@ pub async fn task_run_now(kind: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || apps_ops::task_run_now(&kind))
         .await
         .map_err(|e| format!("执行任务失败: {e}"))?
+}
+
+/// 应用内调度的任务清单（哪些任务会在应用运行期间自动执行）。
+#[tauri::command]
+pub async fn in_app_schedule_view() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(apps_ops::in_app_schedule_view)
+        .await
+        .map_err(|e| format!("读取应用内调度失败: {e}"))
+}
+
+/// 导出 Trae 账号（含明文凭证，界面须提示用户）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_export_accounts(user_ids: Option<Vec<String>>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || apps_ops::trae_export_accounts(user_ids))
+        .await
+        .map_err(|e| format!("导出 Trae 账号失败: {e}"))?
+}
+
+/// 预览 Trae 账号导入文件（不落库）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_preview_import(file_text: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || apps_ops::trae_preview_import(&file_text))
+        .await
+        .map_err(|e| format!("解析导入文件失败: {e}"))?
+}
+
+/// 导入 Trae 账号（同 uid 覆盖）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_import_accounts(file_text: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || apps_ops::trae_import_accounts(&file_text))
+        .await
+        .map_err(|e| format!("导入 Trae 账号失败: {e}"))?
+}
+
+/// 签到成功率趋势（最近 N 天）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_checkin_trends(days: Option<u32>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || apps_ops::trae_checkin_trends(days))
+        .await
+        .map_err(|e| format!("读取签到趋势失败: {e}"))
+}
+
+/// 列抓包日志条目（时间倒序）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn proxy_logs_list(
+    keyword: Option<String>,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Value, String> {
+    let opts = proxy_logs::ProxyLogQueryOpts {
+        keyword,
+        start_time,
+        end_time,
+        offset,
+        limit,
+    };
+    proxy_logs::list_logs_json(&opts)
+}
+
+/// 取单条抓包日志的完整正文。
+///
+/// 与 HTTP 侧一致地返回 `{ content }`：两端同形，前端不需要按宿主分支取值。
+#[tauri::command(rename_all = "camelCase")]
+pub fn proxy_log_detail(id: String) -> Result<Value, String> {
+    proxy_logs::log_detail(&id).map(|content| json!({ "content": content }))
+}
+
+/// 抓包日志目录概况（文件数 / 体积 / 日期范围）。
+#[tauri::command]
+pub fn proxy_logs_overview() -> Value {
+    proxy_logs::logs_overview()
+}
+
+/// 删除抓包日志；`keep_days` 有值时只删该天数以前的。
+#[tauri::command(rename_all = "camelCase")]
+pub fn proxy_logs_clear(keep_days: Option<u32>) -> Result<Value, String> {
+    let removed = proxy_logs::clear_logs(keep_days)?;
+    Ok(json!({ "removed": removed }))
+}
+
+/// 拉起客户端（不切账号、不备份、不关进程）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn app_launch(
+    app: tauri::AppHandle,
+    target_app: String,
+    proxy_port: Option<u16>,
+) -> Result<Value, String> {
+    use tauri::Emitter;
+
+    let sink = EventSink {
+        emit: move |stage: &str, message: &str| {
+            let _ = app.emit(
+                "switch-progress",
+                json!({ "stage": stage, "message": message }),
+            );
+        },
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        apps_ops::app_launch(&target_app, proxy_port, &sink)
+    })
+    .await
+    .map_err(|e| format!("启动客户端失败: {e}"))?
+}
+
+/// Trae 积分消耗历史（官方会话级用量）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_usage_history(fresh: Option<bool>) -> Result<Value, String> {
+    Ok(apps_ops::trae_usage_history(fresh.unwrap_or(true)).await)
+}
+
+/// Trae 积分趋势统计。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trae_credits_stats(days: Option<i64>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || apps_ops::trae_credits_stats(days))
+        .await
+        .map_err(|e| format!("读取积分统计失败: {e}"))
+}
+
+/// 立即采样一次积分快照（不必等计划任务）。
+#[tauri::command]
+pub async fn trae_credits_snapshot() -> Result<Value, String> {
+    apps_ops::trae_credits_snapshot()
+        .await
+        .map_err(|e| format!("积分采样失败: {e}"))
+}
+
+/// 手动触发一轮应用内调度（把到点且今天未跑的任务跑掉）。
+///
+/// 界面上「立即检查」用它 —— 不必等到下一个整分钟。
+#[tauri::command]
+pub async fn run_in_app_due_tasks() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(apps_ops::run_in_app_due_tasks)
+        .await
+        .map_err(|e| format!("应用内调度执行失败: {e}"))
 }

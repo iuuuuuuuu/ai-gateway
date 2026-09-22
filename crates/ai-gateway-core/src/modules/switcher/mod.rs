@@ -22,6 +22,8 @@ pub mod icube;
 pub mod locate;
 pub mod machine;
 pub mod proc;
+// F-68：icube 布局 state.vscdb 全局键（项目列表 / 最近打开）跨账号保留
+pub mod vscdb;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +46,12 @@ pub enum Action {
     ResetDeviceIds,
     /// 保活：启动客户端 → 等待落盘 → 优雅关闭（触发服务端会话滑动续期）。
     KeepAlive,
+    /// 只拉起客户端（不切账号、不备份、不关进程）。
+    ///
+    /// 与 [`Action::Switch`] 的区别是**零副作用**：不动任何快照槽，只把进程开起来。
+    /// 用途是「我就想打开客户端看看」，或保活之外的日常启动 —— 走 Switch 会顺带
+    /// 备份现场并恢复目标快照，用户并不想要那个。
+    LaunchOnly,
 }
 
 impl Action {
@@ -55,7 +63,18 @@ impl Action {
             Action::RestoreOnly => "RestoreOnly",
             Action::ResetDeviceIds => "ResetDeviceIds",
             Action::KeepAlive => "KeepAlive",
+            Action::LaunchOnly => "LaunchOnly",
         }
+    }
+}
+
+/// 会写盘的动作（`LaunchOnly` 不在其中）。
+///
+/// 供上层判断「这个动作要不要提醒用户先备份」——
+/// 把它当成会写盘的动作会让「打开客户端」这种无害操作也弹备份提示。
+impl Action {
+    pub fn mutates_state(self) -> bool {
+        !matches!(self, Action::LaunchOnly)
     }
 }
 
@@ -233,15 +252,134 @@ pub fn get_current_account(sess: &Session) -> String {
 }
 
 /// 写 `current_account.txt`（无 BOM，UTF-8）。
+///
+/// 先过 [`config::ensure_uid_safe`]：uid 来自抓包 / 客户端存储，
+/// 含 `..` 或分隔符时会越出快照目录（这个标记文件随后还会被用作 slot 名去
+/// 定位快照目录，路径穿越的后果不止写一个文件）。
 pub fn set_current_account(sess: &Session, uid: &str) -> Result<(), String> {
+    config::ensure_uid_safe(uid)?;
     std::fs::create_dir_all(&sess.prof.profiles_dir)
         .map_err(|e| format!("创建快照目录失败: {e}"))?;
     std::fs::write(sess.prof.current_account_file(), uid.trim())
-        .map_err(|e| format!("写入当前账号标记失败: {e}"))
+        .map_err(|e| format!("写入当前账号标记失败: {e}"))?;
+    // 同时写时间戳边车：单看标记文件无法判断「这个标记和客户端现场谁更新」。
+    // 用户在客户端里直接换号（没走本应用的切换）时，标记就过期了，
+    // 只信标记会把「当前登录」标在错误的账号上。
+    let stamp = current_account_meta_file(sess);
+    let _ = std::fs::write(
+        &stamp,
+        serde_json::json!({ "switchedAtMs": now_ms() }).to_string(),
+    );
+    Ok(())
 }
 
-/// 把档案里的 **Windows 相对路径**（`User\globalStorage\storage.json`）拼到根目录上。
+/// 当前账号标记的时间戳边车文件。
+pub fn current_account_meta_file(sess: &Session) -> PathBuf {
+    sess.prof.profiles_dir.join("current_account.meta.json")
+}
+
+/// 当前 Unix 毫秒。
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 标记文件的写入时刻（毫秒；文件缺失或损坏返回 `None`）。
+pub fn current_account_marker_ms(sess: &Session) -> Option<i64> {
+    let raw = std::fs::read_to_string(current_account_meta_file(sess)).ok()?;
+    serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}'))
+        .ok()?
+        .get("switchedAtMs")
+        .and_then(serde_json::Value::as_i64)
+}
+
+/// 标记文件（`current_account.txt`）的最后修改时刻（毫秒）。
 ///
+/// 边车缺失时用它兜底：比没有时间信息好，比直接信任标记差。
+pub fn current_account_mtime_ms(sess: &Session) -> Option<i64> {
+    let meta = std::fs::metadata(sess.prof.current_account_file()).ok()?;
+    let t = meta.modified().ok()?;
+    t.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as i64)
+}
+
+/// 现场登录态的「证据」时间：客户端数据目录里最近被改动的时刻。
+///
+/// 用户在客户端里换号会改写 `storage.json`（icube）或 `Local State`（Chromium），
+/// 因此这些关键文件的改动时间近似等于「现场登录态的最后变更时刻」。
+/// 与标记时间比较即可判断标记是否过期（见 [`resolve_current_uid`]）。
+pub fn live_login_evidence_ms(sess: &Session) -> Option<i64> {
+    // 只取真正承载登录态的那几个文件：整个目录取最大改动时间会被
+    // 缓存、日志、崩溃转储等无关写入顶高，导致标记被误判成过期。
+    let candidates: &[&str] = match sess.prof.layout {
+        Layout::Icube => &[
+            "User\\globalStorage\\storage.json",
+            "User\\globalStorage\\state.vscdb",
+            "User\\globalStorage\\state.vscdb-wal",
+        ],
+        Layout::Chromium => &[
+            "Local State",
+            "Default\\Cookies",
+            "Default\\Network\\Cookies",
+        ],
+        Layout::Authfile => &[],
+    };
+
+    let mut newest: Option<i64> = None;
+    for rel in candidates {
+        let path = join_windows_rel(&sess.prof.data_dir, rel);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let Ok(t) = meta.modified() else { continue };
+        let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) else {
+            continue;
+        };
+        let ms = d.as_millis() as i64;
+        newest = Some(newest.map_or(ms, |n: i64| n.max(ms)));
+    }
+    newest
+}
+
+/// 当前账号 uid（**混合判定**）：标记与现场证据谁更新就信谁。
+///
+/// ## 为什么不能只信标记
+///
+/// `current_account.txt` 只在本应用执行「切换 / 保存登录态」时写入。用户完全可能
+/// 直接打开客户端换一个账号登录 —— 此时现场已经是新账号，标记还停在上一个。
+/// 只信标记会让界面把「当前登录」徽章打在**错的**账号上，用户据此判断
+/// 「现在用的是哪个号」就会得出相反结论。
+///
+/// ## 为什么不能只信证据
+///
+/// 证据只是文件改动时间，无法从中读出 uid；而且在快照刚恢复、客户端还没落盘的
+/// 窗口里，证据时间是旧的甚至不存在。所以标记仍然是 uid 的唯一来源，
+/// 这里只是用时间比较决定**标记是否还值得相信**。
+///
+/// 返回 `(uid, 标记是否过期)`。过期时 uid 仍返回标记值 —— 上层若无法从现场推导
+/// 出新 uid，至少还能显示「上一次已知的账号」，但可以据此提示「现场可能已变更」。
+pub fn resolve_current_uid(sess: &Session) -> (String, bool) {
+    let marked = get_current_account(sess);
+    if marked.is_empty() {
+        return (String::new(), false);
+    }
+    let marker_ms = current_account_marker_ms(sess).or_else(|| current_account_mtime_ms(sess));
+    let Some(marker_ms) = marker_ms else {
+        // 标记存在但拿不到任何时间信息：无法判断新旧，按「不过期」处理
+        return (marked, false);
+    };
+    match live_login_evidence_ms(sess) {
+        // 留 2 秒容差：切换流程里「写标记」与「客户端落盘」几乎同时发生，
+        // 不加容差会把刚做完的切换误判成过期
+        Some(evidence) if evidence > marker_ms + 2000 => (marked, true),
+        _ => (marked, false),
+    }
+}
+
+/// 把档案里的 **Windows 相对路径**（`User\globalStorage\storage.json`）拼到根目录上。///
 /// 为什么不能直接 `root.join(rel)`：`Path::join` 在非 Windows 平台上**不把 `\`
 /// 当分隔符**，于是 `root/User\globalStorage\storage.json` 会被当成一个文件名 ——
 /// 快照会写出一个名为 `User\globalStorage\storage.json` 的**单层文件**，
@@ -294,9 +432,12 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
         Action::Switch => switch_flow(&mut sess, &args, sink),
         Action::ResetDeviceIds => machine::reset_device_ids_only(&sess, sink),
         Action::KeepAlive => keepalive_flow(&sess, sink),
+        Action::LaunchOnly => {
+            proc::start_app(&sess, sink)?;
+            Ok(format!("已启动 {}", sess.prof.app_name))
+        }
     }
 }
-
 /// 按布局备份当前登录态到指定槽位。
 fn backup_current(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Result<String, String> {
     match sess.prof.layout {
@@ -312,14 +453,49 @@ fn backup_current(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Result
 }
 
 /// 按布局把指定槽位恢复到现场。
+///
+/// icube 布局额外做「项目列表 / 最近打开跨账号保留」：
+/// `state.vscdb` 里这两个键是**全局**语义，随槽位快照整体回滚后只剩目标账号自己
+/// 那一份，用户感知为「项目列表消失了」。因此在恢复**前**抽出、恢复**后**按条目
+/// 合并回写（账号分区键零改动，见 [`vscdb`] 模块头注释）。
 fn restore_profile(sess: &mut Session, slot: &str, sink: &dyn ProgressSink) -> Result<(), String> {
+    sess.last_restored_count = -1;
+    let keep_keys = if sess.prof.layout == Layout::Icube {
+        let path = vscdb::vscdb_path(&sess.prof.data_dir);
+        let snap = vscdb::snapshot_global_keys(&path);
+        if snap.is_empty() {
+            None
+        } else {
+            Some((path, snap))
+        }
+    } else {
+        None
+    };
+
     match sess.prof.layout {
-        Layout::Icube => icube::restore_icube(sess, slot, sink),
-        Layout::Chromium => chromium::restore_chromium(sess, slot, sink),
+        Layout::Icube => icube::restore_icube(sess, slot, sink)?,
+        Layout::Chromium => chromium::restore_chromium(sess, slot, sink)?,
         Layout::Authfile => {
-            Err("WorkBuddy / CodeBuddy 的登录态由账号管理页的「切换」处理".to_string())
+            return Err("WorkBuddy / CodeBuddy 的登录态由账号管理页的「切换」处理".to_string())
         }
     }
+
+    if let Some((path, snap)) = keep_keys {
+        match vscdb::merge_global_keys(&path, &snap) {
+            Ok(Some(summary)) => sink.step(
+                "restore",
+                StepStatus::Ok,
+                &format!("项目列表/最近打开已跨账号保留（{summary}）"),
+            ),
+            Ok(None) => {}
+            Err(e) => sink.step(
+                "restore",
+                StepStatus::Warn,
+                &format!("项目列表/最近打开保留失败（不影响登录态）: {e}"),
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// 「保存当前登录态」：关进程 → 备份到账号槽 → 标记当前账号 → 启进程。
@@ -519,16 +695,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 等到动作闸门空出来再拿（cargo 默认并行跑用例，别的用例可能正持有它）。
+    ///
+    /// 用等待而不是直接断言「立刻拿到」：后者测的不是闸门语义，而是**用例调度顺序**，
+    /// 会随无关用例的新增随机变红（本文件就踩过一次）。
+    fn acquire_gate_when_free() -> ActionGate {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(gate) = ActionGate::try_acquire() {
+                return gate;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "等待动作闸门释放超时：要么有用例泄漏了闸门，要么闸门本身有问题"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn 动作闸门互斥且释放后可再次获取() {
-        let first = ActionGate::try_acquire();
-        assert!(first.is_some());
+        let first = acquire_gate_when_free();
+
+        // 本测试持有闸门期间，任何线程都不可能拿到 —— 这段是真正的被测语义，
+        // 且不受并行调度影响（别人拿不到才能走到这里）。
         assert!(
             ActionGate::try_acquire().is_none(),
             "并发动作必须被拒绝，否则会互相掐进程、互相覆盖登录态"
         );
+
         drop(first);
-        assert!(ActionGate::try_acquire().is_some(), "释放后应可再次获取");
+        // 释放后应可再次获取。别的用例可能抢先拿到，所以这里同样等到空闲为止 ——
+        // 「别人能拿到」本身就证明了释放生效。
+        let again = acquire_gate_when_free();
+        // 再确认互斥语义在第二轮仍然成立
+        assert!(ActionGate::try_acquire().is_none());
+        drop(again);
     }
 
     #[test]
@@ -560,5 +762,173 @@ mod tests {
             err.contains("没有可用快照"),
             "WorkBuddy 切换应由既有模块处理，这里应报错：{err}"
         );
+    }
+
+    /// 造一个独立的 store 目录与会话（这些用例都要真写文件）。
+    fn temp_session(tag: &str, app: TargetApp) -> (PathBuf, Session) {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-gateway-hybrid-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let args = RunArgs {
+            action: Action::BackupCurrent,
+            target_app: app,
+            user_id: None,
+            proxy_port: None,
+            include_indexeddb: false,
+            expected_current_uid: String::new(),
+            store_dir: dir.clone(),
+        };
+        let sess = Session::new(&args);
+        (dir, sess)
+    }
+
+    #[test]
+    fn 写标记同时写时间戳边车() {
+        let (dir, sess) = temp_session("meta", TargetApp::TraeWork);
+        set_current_account(&sess, "u1").unwrap();
+
+        let ms = current_account_marker_ms(&sess).expect("应写出时间戳边车");
+        assert!(ms > 0, "时间戳应是有效毫秒值：{ms}");
+
+        let raw = std::fs::read_to_string(current_account_meta_file(&sess)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            parsed.get("switchedAtMs").is_some(),
+            "边车字段名不能改，否则旧版本读不到：{raw}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 无标记时当前账号为空且不算过期() {
+        let (dir, sess) = temp_session("none", TargetApp::TraeWork);
+        let (uid, stale) = resolve_current_uid(&sess);
+        assert_eq!(uid, "");
+        assert!(!stale, "没有标记就谈不上「过期」");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 标记比现场新时不算过期() {
+        let (dir, sess) = temp_session("fresh", TargetApp::TraeWork);
+        // 先造现场文件（旧），再写标记（新）—— 模拟刚做完一次切换
+        let storage = sess
+            .prof
+            .data_dir
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json");
+        std::fs::create_dir_all(storage.parent().unwrap()).unwrap();
+        std::fs::write(&storage, "{}").unwrap();
+        set_current_account(&sess, "u-fresh").unwrap();
+
+        let (uid, stale) = resolve_current_uid(&sess);
+        assert_eq!(uid, "u-fresh");
+        assert!(!stale, "标记比现场新，不该判成过期");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 现场比标记新时判为过期() {
+        let (dir, sess) = temp_session("stale", TargetApp::TraeWork);
+        // 先写标记，再把现场改成「刚刚」——模拟用户直接在客户端里换号
+        set_current_account(&sess, "u-old").unwrap();
+        let storage = sess
+            .prof
+            .data_dir
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json");
+        std::fs::create_dir_all(storage.parent().unwrap()).unwrap();
+        std::fs::write(&storage, "{}").unwrap();
+
+        // 把标记边车的时间戳改到 1 小时前，制造「现场更新」的局面
+        let stale_ms = now_ms() - 3_600_000;
+        std::fs::write(
+            current_account_meta_file(&sess),
+            serde_json::json!({ "switchedAtMs": stale_ms }).to_string(),
+        )
+        .unwrap();
+
+        let (uid, stale) = resolve_current_uid(&sess);
+        assert_eq!(uid, "u-old", "uid 仍来自标记（现场读不出 uid）");
+        assert!(stale, "现场更新时应提示标记可能已过期");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 边车缺失时回退用标记文件的修改时间() {
+        let (dir, sess) = temp_session("mtime", TargetApp::TraeWork);
+        set_current_account(&sess, "u-mtime").unwrap();
+        // 删掉边车，只剩 current_account.txt
+        std::fs::remove_file(current_account_meta_file(&sess)).unwrap();
+
+        assert!(current_account_marker_ms(&sess).is_none());
+        let mtime = current_account_mtime_ms(&sess).expect("应能读到标记文件修改时间");
+        assert!(mtime > 0);
+
+        // 没有现场文件 → 无从比较 → 不算过期
+        let (uid, stale) = resolve_current_uid(&sess);
+        assert_eq!(uid, "u-mtime");
+        assert!(!stale);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 边车损坏时不崩溃且按不过期处理() {
+        let (dir, sess) = temp_session("broken", TargetApp::TraeWork);
+        set_current_account(&sess, "u-broken").unwrap();
+        std::fs::write(current_account_meta_file(&sess), "{ 不是 json").unwrap();
+
+        // 坏边车 → 回退到 mtime，仍然可以判断
+        assert!(current_account_marker_ms(&sess).is_none());
+        assert!(current_account_mtime_ms(&sess).is_some());
+        let (uid, _) = resolve_current_uid(&sess);
+        assert_eq!(uid, "u-broken", "坏边车不该让 uid 丢失");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 仅拉起客户端不改动任何快照槽() {
+        let (dir, sess) = temp_session("launch", TargetApp::TraeWork);
+        set_current_account(&sess, "u-keep").unwrap();
+
+        // LaunchOnly 找不到 exe 会失败，但**绝不能**动快照槽或标记
+        let args = RunArgs {
+            action: Action::LaunchOnly,
+            target_app: TargetApp::TraeWork,
+            user_id: None,
+            proxy_port: None,
+            include_indexeddb: false,
+            expected_current_uid: String::new(),
+            store_dir: dir.clone(),
+        };
+        let _ = run_action(args, &NullSink);
+
+        assert_eq!(get_current_account(&sess), "u-keep", "标记必须原样保留");
+        let slots: Vec<String> = std::fs::read_dir(&sess.prof.profiles_dir)
+            .map(|it| {
+                it.flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !slots.iter().any(|s| s == "last"),
+            "LaunchOnly 不该产生备份槽：{slots:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

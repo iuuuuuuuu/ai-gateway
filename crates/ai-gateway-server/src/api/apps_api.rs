@@ -24,11 +24,11 @@ use std::sync::Mutex;
 
 use axum::extract::{Json, Query};
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
 use ai_gateway_core::modules::switcher::StepStatus;
-use ai_gateway_core::modules::{apps_ops, config};
+use ai_gateway_core::modules::{apps_ops, config, proxy_logs, trae_account, trae_oauth};
 
 use super::{json_err, json_ok};
 
@@ -202,6 +202,285 @@ pub async fn api_trae_delete_account(Json(body): Json<Value>) -> Response {
     )
 }
 
+/// POST /api/trae/accounts/update —— 编辑账号（昵称 / JWT / refresh_token）。
+pub async fn api_trae_update_account(Json(body): Json<Value>) -> Response {
+    let user_id = match require_str(&body, "userId") {
+        Ok(v) => v,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    let name = opt_str(&body, "name");
+    let jwt = opt_str(&body, "jwt");
+    let refresh_token = opt_str(&body, "refreshToken");
+    blocking_response(
+        tokio::task::spawn_blocking(move || {
+            apps_ops::trae_update_account(
+                &user_id,
+                name.as_deref(),
+                jwt.as_deref(),
+                refresh_token.as_deref(),
+            )
+        })
+        .await,
+    )
+}
+
+/// GET /api/trae/accounts/jwt?userId=... —— 读取完整 JWT（仅查看/编辑用）。
+pub async fn api_trae_account_jwt(Query(params): Query<HashMap<String, String>>) -> Response {
+    let user_id = match params
+        .get("userId")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(v) => v,
+        None => return json_err("缺少 userId".to_string(), StatusCode::BAD_REQUEST),
+    };
+    blocking_response(
+        tokio::task::spawn_blocking(move || apps_ops::trae_account_jwt(&user_id)).await,
+    )
+}
+
+/// POST /api/trae/jwt/parse —— 解析 JWT（不落库，供编辑弹窗预览）。
+pub async fn api_trae_jwt_parse(Json(body): Json<Value>) -> Response {
+    let jwt = body
+        .get("jwt")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    blocking_plain(tokio::task::spawn_blocking(move || apps_ops::trae_jwt_parse(&jwt)).await)
+}
+
+/// POST /api/trae/cooldown/clear-all —— 清空全部账号冷却。
+pub async fn api_trae_clear_all_cooldowns() -> Response {
+    blocking_plain(tokio::task::spawn_blocking(apps_ops::trae_clear_all_cooldowns).await)
+}
+
+/// GET /api/doubao/settings —— 读取豆包设置。
+pub async fn api_doubao_settings() -> Response {
+    blocking_plain(tokio::task::spawn_blocking(apps_ops::doubao_settings).await)
+}
+
+/// POST /api/doubao/settings —— 写入一项豆包设置。
+pub async fn api_doubao_set_setting(Json(body): Json<Value>) -> Response {
+    let key = match require_str(&body, "key") {
+        Ok(v) => v,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    let Some(value) = body.get("value").and_then(Value::as_bool) else {
+        return json_err("value 必须是布尔值".to_string(), StatusCode::BAD_REQUEST);
+    };
+    blocking_response(
+        tokio::task::spawn_blocking(move || apps_ops::doubao_set_setting(&key, value)).await,
+    )
+}
+
+/// POST /api/trae/oauth/login-url —— 签发授权 URL。
+pub async fn api_trae_oauth_login_url(Json(body): Json<Value>) -> Response {
+    let name = opt_str(&body, "accountName");
+    blocking_response(
+        tokio::task::spawn_blocking(move || trae_oauth::login_url(name.as_deref())).await,
+    )
+}
+
+/// POST /api/trae/oauth/callback —— 手动提交回调 URL 完成登录（兜底路径）。
+pub async fn api_trae_oauth_callback(Json(body): Json<Value>) -> Response {
+    let url = match require_str(&body, "callbackUrl") {
+        Ok(v) => v,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    let name = opt_str(&body, "accountName");
+
+    // 解析回调是纯逻辑，能在 server 侧完成；但「换 token 落库」需要一个运行时。
+    // 这里直接在 axum 的运行时上驱动，不再自建 —— 自建会与当前 worker 抢线程。
+    let code = match trae_oauth::parse_callback(&url) {
+        Ok(c) => c,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    let (access, refresh) = match trae_oauth::exchange_auth_code(&code).await {
+        Ok(v) => v,
+        Err(e) => return json_err(e, StatusCode::BAD_GATEWAY),
+    };
+    let info = trae_oauth::fetch_user_info(&access).await;
+    let (fetched_name, uid_from_info) = info.unwrap_or((None, None));
+
+    let jwt = format!("Cloud-IDE-JWT {access}");
+    let Some(uid) = trae_account::parse_jwt(&jwt).user_id.or(uid_from_info) else {
+        return json_err(
+            "登录成功但无法确定账号 id，请检查粘贴的回调地址是否完整".to_string(),
+            StatusCode::BAD_REQUEST,
+        );
+    };
+    let display = name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or(fetched_name);
+    let result = tokio::task::spawn_blocking(move || {
+        trae_account::upsert_account(&uid, display.as_deref(), &jwt, refresh.as_deref())
+    })
+    .await;
+    trae_oauth::clear_pending();
+    match result {
+        Ok(Ok(acc)) => {
+            let name = acc
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Json(json!({ "ok": true, "account": trae_account::account_meta(&acc), "message": format!("账号 [{name}] 登录成功") })).into_response()
+        }
+        Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => json_err(format!("登录落库失败：{e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/trae/oauth/cancel —— 放弃当前登录会话。
+pub async fn api_trae_oauth_cancel() -> Response {
+    trae_oauth::clear_pending();
+    Json(json!({ "ok": true })).into_response()
+}
+
+/// GET /api/in-app-schedule —— 应用内调度的任务清单。
+pub async fn api_in_app_schedule() -> Response {
+    blocking_plain(tokio::task::spawn_blocking(apps_ops::in_app_schedule_view).await)
+}
+
+/// POST /api/in-app-schedule/run —— 手动触发一轮应用内调度。
+pub async fn api_run_in_app_due_tasks() -> Response {
+    blocking_plain(tokio::task::spawn_blocking(apps_ops::run_in_app_due_tasks).await)
+}
+
+/// POST /api/trae/export —— 导出 Trae 账号（含明文凭证）。
+pub async fn api_trae_export_accounts(Json(body): Json<Value>) -> Response {
+    let user_ids: Option<Vec<String>> = body.get("userIds").and_then(Value::as_array).map(|a| {
+        a.iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    });
+    blocking_response(
+        tokio::task::spawn_blocking(move || apps_ops::trae_export_accounts(user_ids)).await,
+    )
+}
+
+/// POST /api/trae/import/preview —— 预览导入文件。
+pub async fn api_trae_preview_import(Json(body): Json<Value>) -> Response {
+    let text = match require_str(&body, "fileText") {
+        Ok(v) => v,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    blocking_response(
+        tokio::task::spawn_blocking(move || apps_ops::trae_preview_import(&text)).await,
+    )
+}
+
+/// POST /api/trae/import —— 导入 Trae 账号。
+pub async fn api_trae_import_accounts(Json(body): Json<Value>) -> Response {
+    let text = match require_str(&body, "fileText") {
+        Ok(v) => v,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    blocking_response(
+        tokio::task::spawn_blocking(move || apps_ops::trae_import_accounts(&text)).await,
+    )
+}
+
+/// GET /api/proxy/logs —— 列抓包日志条目（时间倒序）。
+pub async fn api_proxy_logs_list(Query(params): Query<HashMap<String, String>>) -> Response {
+    let opts = proxy_logs::ProxyLogQueryOpts {
+        keyword: params.get("keyword").cloned(),
+        start_time: params.get("startTime").cloned(),
+        end_time: params.get("endTime").cloned(),
+        offset: params.get("offset").and_then(|s| s.parse().ok()),
+        limit: params.get("limit").and_then(|s| s.parse().ok()),
+    };
+    blocking_response(
+        tokio::task::spawn_blocking(move || proxy_logs::list_logs_json(&opts)).await,
+    )
+}
+
+/// GET /api/proxy/logs/detail?id=文件:序号 —— 单条日志正文。
+///
+/// 正文包在 JSON 的 `content` 字段里而不是裸文本：本 API 全部返回 JSON，
+/// 裸文本会让前端在错误时拿到一段 HTML/纯文本，解析出与预期完全不同的结果。
+pub async fn api_proxy_log_detail(Query(params): Query<HashMap<String, String>>) -> Response {
+    let Some(id) = params.get("id").cloned() else {
+        return json_err("缺少 id 参数".to_string(), StatusCode::BAD_REQUEST);
+    };
+    blocking_response(
+        tokio::task::spawn_blocking(move || {
+            proxy_logs::log_detail(&id).map(|content| json!({ "content": content }))
+        })
+        .await,
+    )
+}
+
+/// GET /api/proxy/logs/overview —— 日志目录概况。
+pub async fn api_proxy_logs_overview() -> Response {
+    blocking_response(tokio::task::spawn_blocking(|| Ok(proxy_logs::logs_overview())).await)
+}
+
+/// POST /api/proxy/logs/clear —— 删除抓包日志。
+pub async fn api_proxy_logs_clear(Json(body): Json<Value>) -> Response {
+    let keep_days = body
+        .get("keepDays")
+        .and_then(Value::as_u64)
+        .map(|d| d.min(u32::MAX as u64) as u32);
+    blocking_response(
+        tokio::task::spawn_blocking(move || {
+            proxy_logs::clear_logs(keep_days).map(|removed| json!({ "removed": removed }))
+        })
+        .await,
+    )
+}
+
+/// POST /api/apps/launch —— 拉起客户端（不切账号）。
+pub async fn api_app_launch(Json(body): Json<Value>) -> Response {
+    let target = match require_str(&body, "targetApp") {
+        Ok(v) => v,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    let port = body
+        .get("proxyPort")
+        .and_then(Value::as_u64)
+        .map(|p| p as u16);
+    let result = tokio::task::spawn_blocking({
+        let target = target.clone();
+        move || apps_ops::app_launch(&target, port, &ProgressToCache)
+    })
+    .await;
+    blocking_response(result)
+}
+
+/// GET /api/trae/checkin/trends?days=N —— 签到成功率趋势。
+pub async fn api_trae_checkin_trends(Query(params): Query<HashMap<String, String>>) -> Response {
+    let days = params.get("days").and_then(|s| s.parse::<u32>().ok());
+    blocking_plain(
+        tokio::task::spawn_blocking(move || apps_ops::trae_checkin_trends(days)).await,
+    )
+}
+
+/// GET /api/trae/usage-history?fresh=1 —— 积分消耗历史（官方会话级用量）。
+pub async fn api_trae_usage_history(Query(params): Query<HashMap<String, String>>) -> Response {
+    let fresh = params
+        .get("fresh")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true);
+    json_ok(apps_ops::trae_usage_history(fresh).await)
+}
+
+/// GET /api/trae/credits/stats?days=N —— 积分趋势统计。
+pub async fn api_trae_credits_stats(Query(params): Query<HashMap<String, String>>) -> Response {
+    let days = params.get("days").and_then(|s| s.parse::<i64>().ok());
+    blocking_plain(tokio::task::spawn_blocking(move || apps_ops::trae_credits_stats(days)).await)
+}
+
+/// POST /api/trae/credits/snapshot —— 立即采样一次积分快照。
+pub async fn api_trae_credits_snapshot() -> Response {
+    match apps_ops::trae_credits_snapshot().await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
 /// GET /api/trae/discover —— 发现本机登录过的 Trae 账号。
 pub async fn api_trae_discover_accounts() -> Response {
     blocking_plain(tokio::task::spawn_blocking(apps_ops::trae_discover_accounts).await)
@@ -269,6 +548,121 @@ pub async fn api_trae_clear_cooldown(Json(body): Json<Value>) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// Trae 凭证续期 / 积分 / 分组
+// ---------------------------------------------------------------------------
+
+/// POST /api/trae/refresh —— 刷新某账号 JWT。
+pub async fn api_trae_refresh_account(Json(body): Json<Value>) -> Response {
+    let user_id = match require_str(&body, "userId") {
+        Ok(v) => v,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    let force = body.get("force").and_then(Value::as_bool).unwrap_or(false);
+    match apps_ops::trae_refresh_account(&user_id, force).await {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/trae/refresh-all —— 批量刷新全部账号 JWT。
+pub async fn api_trae_refresh_all() -> Response {
+    json_ok(apps_ops::trae_refresh_all().await)
+}
+
+/// GET /api/trae/credits/detail?userId=... —— 三条积分账。
+pub async fn api_trae_credit_detail(Query(params): Query<HashMap<String, String>>) -> Response {
+    let user_id = match params
+        .get("userId")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(v) => v,
+        None => return json_err("缺少 userId".to_string(), StatusCode::BAD_REQUEST),
+    };
+    json_ok(apps_ops::trae_credit_detail(&user_id).await)
+}
+
+/// POST /api/trae/pay-status/refresh —— 刷新全部账号付费身份。
+pub async fn api_trae_refresh_pay_status() -> Response {
+    json_ok(apps_ops::trae_refresh_pay_status().await)
+}
+
+/// GET /api/trae/pay-status —— 读取付费身份缓存。
+pub async fn api_trae_pay_status_cache() -> Response {
+    blocking_plain(tokio::task::spawn_blocking(apps_ops::trae_pay_status_cache).await)
+}
+
+/// GET /api/groups?app=Trae —— 分组列表。
+pub async fn api_groups_list(Query(params): Query<HashMap<String, String>>) -> Response {
+    let app = params.get("app").cloned().unwrap_or_else(|| "Trae".to_string());
+    blocking_plain(tokio::task::spawn_blocking(move || apps_ops::groups_list(&app)).await)
+}
+
+/// POST /api/groups/create —— 新建分组。
+pub async fn api_group_create(Json(body): Json<Value>) -> Response {
+    let app = body.get("app").and_then(Value::as_str).unwrap_or("Trae").to_string();
+    let name = match require_str(&body, "name") {
+        Ok(v) => v,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    let color = opt_str(&body, "color").unwrap_or_else(|| "slate".to_string());
+    blocking_response(
+        tokio::task::spawn_blocking(move || apps_ops::group_create(&app, &name, &color)).await,
+    )
+}
+
+/// POST /api/groups/update —— 更新分组。
+pub async fn api_group_update(Json(body): Json<Value>) -> Response {
+    let app = body.get("app").and_then(Value::as_str).unwrap_or("Trae").to_string();
+    let id = match require_str(&body, "id") {
+        Ok(v) => v,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    let name = opt_str(&body, "name");
+    let color = opt_str(&body, "color");
+    let order = body.get("order").and_then(Value::as_i64).map(|v| v as i32);
+    blocking_response(
+        tokio::task::spawn_blocking(move || {
+            apps_ops::group_update(&app, &id, name.as_deref(), color.as_deref(), order)
+        })
+        .await,
+    )
+}
+
+/// POST /api/groups/delete —— 删除分组（连带清成员映射）。
+pub async fn api_group_delete(Json(body): Json<Value>) -> Response {
+    let app = body.get("app").and_then(Value::as_str).unwrap_or("Trae").to_string();
+    let id = match require_str(&body, "id") {
+        Ok(v) => v,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    blocking_response(
+        tokio::task::spawn_blocking(move || apps_ops::group_delete(&app, &id)).await,
+    )
+}
+
+/// POST /api/groups/move —— 把账号移入/移出分组。
+pub async fn api_group_move(Json(body): Json<Value>) -> Response {
+    let app = body.get("app").and_then(Value::as_str).unwrap_or("Trae").to_string();
+    let user_id = match require_str(&body, "userId") {
+        Ok(v) => v,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    // groupId 显式传 null 表示移出分组，缺字段同样视为移出
+    let group_id = body
+        .get("groupId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+    blocking_response(
+        tokio::task::spawn_blocking(move || {
+            apps_ops::group_move(&app, &user_id, group_id.as_deref())
+        })
+        .await,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // 豆包账号与凭证
 // ---------------------------------------------------------------------------
 
@@ -294,14 +688,73 @@ pub async fn api_doubao_save_account(Json(body): Json<Value>) -> Response {
     )
 }
 
-/// POST /api/doubao/accounts/delete —— 删除账号。
+/// POST /api/doubao/accounts/delete —— 删除账号（可选连带删快照）。
 pub async fn api_doubao_delete_account(Json(body): Json<Value>) -> Response {
     let user_id = match require_str(&body, "userId") {
         Ok(v) => v,
         Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
     };
+    // 默认 true：只删账号不删快照会留下孤儿快照
+    let delete_snapshot = body
+        .get("deleteSnapshot")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     blocking_response(
-        tokio::task::spawn_blocking(move || apps_ops::doubao_delete_account(&user_id)).await,
+        tokio::task::spawn_blocking(move || {
+            apps_ops::doubao_delete_account(&user_id, delete_snapshot)
+        })
+        .await,
+    )
+}
+
+/// GET /api/doubao/detect-uid —— 探测当前登录 uid。
+pub async fn api_doubao_detect_uid() -> Response {
+    blocking_plain(tokio::task::spawn_blocking(apps_ops::doubao_detect_uid).await)
+}
+
+/// GET /api/doubao/snapshot-meta?userId=... —— 快照版本元数据。
+pub async fn api_doubao_snapshot_meta(
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let user_id = match params
+        .get("userId")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(v) => v,
+        None => return json_err("缺少 userId".to_string(), StatusCode::BAD_REQUEST),
+    };
+    blocking_response(
+        tokio::task::spawn_blocking(move || apps_ops::doubao_snapshot_meta(&user_id)).await,
+    )
+}
+
+/// POST /api/doubao/open-as-account —— 一键以该账号打开豆包。
+pub async fn api_doubao_open_as_account(Json(body): Json<Value>) -> Response {
+    let user_id = match require_str(&body, "userId") {
+        Ok(v) => v,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    let proxy_port = body
+        .get("proxyPort")
+        .and_then(Value::as_u64)
+        .map(|v| v as u16);
+    // 复用切换进度缓存：webui 通过 /api/apps/progress 轮询展示步骤
+    clear_progress();
+    let sink = ProgressToCache;
+    blocking_response(
+        tokio::task::spawn_blocking(move || {
+            apps_ops::doubao_open_as_account(&user_id, proxy_port, &sink)
+        })
+        .await,
+    )
+}
+
+/// GET /api/doubao/history —— 运维健康史 + 趋势 + 健康计数。
+pub async fn api_doubao_history(Query(params): Query<HashMap<String, String>>) -> Response {
+    let days = params.get("days").and_then(|s| s.trim().parse::<i64>().ok());
+    blocking_plain(
+        tokio::task::spawn_blocking(move || apps_ops::doubao_history(days)).await,
     )
 }
 
@@ -363,13 +816,19 @@ pub async fn api_doubao_keepalive() -> Response {
     blocking_response(result)
 }
 
-/// POST /api/doubao/renew —— HTTP 续期探活（body.syncOnly 为真时只诊断）。
+/// POST /api/doubao/renew —— HTTP 续期探活。
+///
+/// `syncOnly` 为真时只诊断；`fallbackToKeepalive` 为真时在全部失败后回退到客户端保活。
 pub async fn api_doubao_renew(Json(body): Json<Value>) -> Response {
     let sync_only = body
         .get("syncOnly")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    json_ok(apps_ops::doubao_renew(sync_only).await)
+    let fallback = body
+        .get("fallbackToKeepalive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    json_ok(apps_ops::doubao_renew_with(sync_only, fallback).await)
 }
 
 /// GET /api/doubao/diagnose —— 会话与凭证诊断。

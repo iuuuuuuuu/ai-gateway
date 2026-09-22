@@ -25,6 +25,7 @@ import { GITHUB_RELEASE_URL, GITHUB_REPOSITORY_URL, openReleaseUrl } from "@/lib
 import { cn } from "@/lib/utils";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { DemoAction } from "@/components/demo-action";
+import { ProxyLogsPanel } from "@/components/proxy-logs-panel";
 import { useAccountsStore } from "@/stores/accounts";
 
 interface SettingsGroupProps {
@@ -1412,8 +1413,102 @@ function ScheduledTaskCard() {
             正在读取计划任务状态…
           </p>
         )}
+        <InAppSchedulePanel />
       </CardContent>
     </SettingsGroup>
+  );
+}
+
+/**
+ * 应用内调度面板。
+ *
+ * 与上面的 schtasks 列表的区别必须让用户看懂：计划任务在应用**没开**时也会跑，
+ * 应用内调度只在应用运行期间生效。两个列表都展示「最后一次成功是哪天」，
+ * 用户才能判断自动运维到底有没有真的发生 —— 只显示开关状态等于没说。
+ */
+function InAppSchedulePanel() {
+  const [tasks, setTasks] = useState<api.InAppScheduleTask[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await api.inAppScheduleView();
+      setTasks(res.tasks);
+    } catch {
+      // 读不到就不渲染这块：它只是补充信息，不该让整个设置页报错
+      setTasks([]);
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const runNow = async () => {
+    setBusy(true);
+    try {
+      const res = await api.runInAppDueTasks();
+      if (res.ran.length === 0) {
+        toast.info("当前没有到点且今天未执行的任务");
+      } else {
+        const ok = res.ran.filter((t) => t.ok).length;
+        const failed = res.ran.length - ok;
+        if (failed > 0) {
+          toast.warning(`执行 ${res.ran.length} 项：成功 ${ok} · 失败 ${failed}`);
+        } else {
+          toast.success(`执行 ${res.ran.length} 项：成功 ${ok}`);
+        }
+      }
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!loaded || tasks.length === 0) return null;
+
+  const today = new Date().toISOString().slice(0, 10);
+
+  return (
+    <div className="border-t border-border/60 px-4 py-4 sm:px-5">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <span className="text-sm font-medium">应用内调度</span>
+        <Badge variant="outline">应用运行时生效</Badge>
+        <Button size="sm" variant="ghost" className="ml-auto" disabled={busy} onClick={() => void runNow()}>
+          {busy ? <Loader2 className="size-3.5 animate-spin" /> : "立即检查"}
+        </Button>
+      </div>
+      <p className="mb-3 text-xs text-muted-foreground">
+        应用运行期间，到点且当天未执行的动作会自动跑一次。
+        与计划任务互补：应用没开时只有计划任务会执行。
+      </p>
+      <div className="space-y-1.5">
+        {tasks.map((t) => {
+          const doneToday = t.lastRunDay === today;
+          return (
+            <div key={t.kind} className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="font-medium">{t.label}</span>
+              <span className="text-muted-foreground">{t.at}</span>
+              <Badge
+                variant={doneToday ? "secondary" : "outline"}
+                className="text-[10px]"
+              >
+                {t.lastRunDay
+                  ? doneToday
+                    ? "今天已执行"
+                    : `上次 ${t.lastRunDay}`
+                  : "尚未执行"}
+              </Badge>
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -1422,8 +1517,14 @@ function defaultTimeFor(kind: string): string {
   switch (kind) {
     case "trae_checkin":
       return "09:00";
+    case "trae_credits_snapshot":
+      // 快照任务放在一天末尾：日差（今天 vs 昨天）最干净，
+      // 早上跑会把「昨夜消耗」算到新的一天
+      return "23:40";
     case "doubao_renew":
       return "09:00";
+    case "doubao_renew_http":
+      return "09:10";
     case "doubao_quota":
       return "09:30";
     default:
@@ -1444,6 +1545,7 @@ export default function SettingsPage() {
         <AppearanceCard />
         <AppEnvCard />
         <ProxyCard />
+        <ProxyLogsPanel />
         <ScheduledTaskCard />
         <PermissionCheckCard />
         <AutoCheckinCard />

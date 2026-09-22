@@ -536,7 +536,10 @@ fn write_accounts(_ctx: &ProxyCtx, accounts: &[serde_json::Value]) -> Result<(),
 ///
 /// 本仓库的冷却表在 [`crate::modules::trae_checkin`]（`trae_cooldowns.json`）。
 fn clear_cooldown(ctx: &ProxyCtx, user_id: &str) {
-    if crate::modules::trae_checkin::cooldown_until(user_id).is_some() {
+    // 也覆盖「只计数未落冷却」的残留记录：清掉后下一次瞬时失败从 1 重新数
+    let had = crate::modules::trae_checkin::cooldown_until(user_id).is_some()
+        || crate::modules::trae_checkin::error_count(user_id) > 0;
+    if had {
         crate::modules::trae_checkin::clear_cooldown(user_id);
         ctx.log.log(&format!(
             "  [冷却解除] uid={user_id}（新 JWT 捕获成功，自动解除登录失效标记）"

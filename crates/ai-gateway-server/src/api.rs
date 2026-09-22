@@ -169,6 +169,73 @@ pub fn router() -> Router {
             "/api/trae/accounts/delete",
             post(apps_api::api_trae_delete_account),
         )
+        .route(
+            "/api/trae/accounts/update",
+            post(apps_api::api_trae_update_account),
+        )
+        .route(
+            "/api/trae/accounts/jwt",
+            get(apps_api::api_trae_account_jwt),
+        )
+        .route("/api/trae/jwt/parse", post(apps_api::api_trae_jwt_parse))
+        .route(
+            "/api/trae/cooldown/clear-all",
+            post(apps_api::api_trae_clear_all_cooldowns),
+        )
+        .route(
+            "/api/doubao/settings",
+            get(apps_api::api_doubao_settings).post(apps_api::api_doubao_set_setting),
+        )
+        .route(
+            "/api/trae/oauth/login-url",
+            post(apps_api::api_trae_oauth_login_url),
+        )
+        .route(
+            "/api/trae/oauth/callback",
+            post(apps_api::api_trae_oauth_callback),
+        )
+        .route(
+            "/api/trae/oauth/cancel",
+            post(apps_api::api_trae_oauth_cancel),
+        )
+        .route("/api/in-app-schedule", get(apps_api::api_in_app_schedule))
+        .route(
+            "/api/in-app-schedule/run",
+            post(apps_api::api_run_in_app_due_tasks),
+        )
+        .route("/api/trae/export", post(apps_api::api_trae_export_accounts))
+        .route(
+            "/api/trae/import/preview",
+            post(apps_api::api_trae_preview_import),
+        )
+        .route("/api/trae/import", post(apps_api::api_trae_import_accounts))
+        .route(
+            "/api/trae/checkin/trends",
+            get(apps_api::api_trae_checkin_trends),
+        )
+        .route("/api/apps/launch", post(apps_api::api_app_launch))
+        .route("/api/proxy/logs", get(apps_api::api_proxy_logs_list))
+        .route(
+            "/api/proxy/logs/detail",
+            get(apps_api::api_proxy_log_detail),
+        )
+        .route(
+            "/api/proxy/logs/overview",
+            get(apps_api::api_proxy_logs_overview),
+        )
+        .route(
+            "/api/proxy/logs/clear",
+            post(apps_api::api_proxy_logs_clear),
+        )
+        .route("/api/trae/credits/stats", get(apps_api::api_trae_credits_stats))
+        .route(
+            "/api/trae/usage-history",
+            get(apps_api::api_trae_usage_history),
+        )
+        .route(
+            "/api/trae/credits/snapshot",
+            post(apps_api::api_trae_credits_snapshot),
+        )
         .route("/api/trae/discover", get(apps_api::api_trae_discover_accounts))
         .route(
             "/api/trae/discover/import",
@@ -189,6 +256,33 @@ pub fn router() -> Router {
             "/api/trae/cooldown/clear",
             post(apps_api::api_trae_clear_cooldown),
         )
+        // ---- Trae 凭证续期 / 积分 / 套餐身份 ----
+        .route(
+            "/api/trae/refresh",
+            post(apps_api::api_trae_refresh_account),
+        )
+        .route(
+            "/api/trae/refresh-all",
+            post(apps_api::api_trae_refresh_all),
+        )
+        .route(
+            "/api/trae/credits/detail",
+            get(apps_api::api_trae_credit_detail),
+        )
+        .route(
+            "/api/trae/pay-status",
+            get(apps_api::api_trae_pay_status_cache),
+        )
+        .route(
+            "/api/trae/pay-status/refresh",
+            post(apps_api::api_trae_refresh_pay_status),
+        )
+        // ---- 账号分组（Trae / 豆包 分域） ----
+        .route("/api/groups", get(apps_api::api_groups_list))
+        .route("/api/groups/create", post(apps_api::api_group_create))
+        .route("/api/groups/update", post(apps_api::api_group_update))
+        .route("/api/groups/delete", post(apps_api::api_group_delete))
+        .route("/api/groups/move", post(apps_api::api_group_move))
         // ---- 豆包账号与凭证 ----
         .route(
             "/api/doubao/accounts",
@@ -202,6 +296,20 @@ pub fn router() -> Router {
             "/api/doubao/accounts/delete",
             post(apps_api::api_doubao_delete_account),
         )
+        // ---- 豆包：uid 探测 / 快照元数据 / 一键打开 / 运维历史 ----
+        .route(
+            "/api/doubao/detect-uid",
+            get(apps_api::api_doubao_detect_uid),
+        )
+        .route(
+            "/api/doubao/snapshot-meta",
+            get(apps_api::api_doubao_snapshot_meta),
+        )
+        .route(
+            "/api/doubao/open-as-account",
+            post(apps_api::api_doubao_open_as_account),
+        )
+        .route("/api/doubao/history", get(apps_api::api_doubao_history))
         .route(
             "/api/doubao/credential",
             get(apps_api::api_doubao_get_credential).post(apps_api::api_doubao_set_credential),

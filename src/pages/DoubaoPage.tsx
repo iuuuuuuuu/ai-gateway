@@ -8,19 +8,23 @@ import {
   KeyRound,
   Loader2,
   MessageSquare,
+  Play,
   Power,
   RefreshCw,
+  Rocket,
   Stethoscope,
   Trash2,
   Upload,
   UserPlus,
 } from "lucide-react";
 
+import { DoubaoInsights } from "@/components/doubao-insights";
 import { DoubaoMark } from "@/components/product-marks";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -33,10 +37,69 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
 import type { AppEnvStatus, DoubaoAccountView, DoubaoQuotaView } from "@/lib/api";
 import { cn } from "@/lib/utils";
+
+/** 人类可读的文件体积。 */
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+/** 距今多少天（解析 `YYYY-MM-DD` 或 ISO 串；解析不出返回 null）。 */
+function daysSince(iso: string): number | null {
+  const parts = iso.slice(0, 10).split("-").map(Number);
+  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return null;
+  return Math.floor((Date.now() - Date.UTC(parts[0], parts[1] - 1, parts[2])) / 86_400_000);
+}
+
+/**
+ * 到期分层徽标。
+ *
+ * 后端已经算好 `expiryTier`/`daysLeft`，这里只负责呈现。分层而不是二值
+ * （有效/失效）是为了让用户在「还能救」的时候收到提醒 —— 等到失效才发现
+ * 就只能重新登录了。
+ */
+function expiryBadge(account: DoubaoAccountView) {
+  const tier = account.expiryTier;
+  if (!tier || tier === "unknown" || tier === "fresh") return null;
+  const days = account.daysLeft;
+  if (tier === "expired") {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Badge variant="destructive" className="cursor-help text-[10px]">
+            凭证已过期
+          </Badge>
+        </TooltipTrigger>
+        <TooltipContent side="top" className="max-w-xs">
+          该账号的 sessionid 已过服务端到期时间，需要重新登录豆包。
+          开启本地代理后访问豆包即可自动抓取新凭证。
+        </TooltipContent>
+      </Tooltip>
+    );
+  }
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge
+          variant="outline"
+          className="cursor-help border-amber-500/40 bg-amber-500/10 text-[10px] text-amber-700 dark:text-amber-300"
+        >
+          {typeof days === "number" && days > 0 ? `${days} 天后到期` : "即将到期"}
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-xs">
+        会话临近到期，建议跑一次保活触发服务端滑动续期。
+      </TooltipContent>
+    </Tooltip>
+  );
+}
 
 /** 会话状态展示。 */
 function sessionBadge(account: DoubaoAccountView) {
@@ -219,15 +282,31 @@ export default function DoubaoPage() {
   // 后发起的写入权更高：每次发起前自增，回来时序号不匹配就丢弃。
   const editFillSeqRef = useRef(0);
 
+  // 到期/未保活提醒只弹一次（否则每次轮询都会重新弹）
+  const expiryWarnedRef = useRef("");
+  const staleKeepaliveWarnedRef = useRef(false);
+  // 运维健康史（趋势 + 健康卡）
+  const [history, setHistory] = useState<api.DoubaoHistory | null>(null);
+  // 删除确认（含「是否同时删除快照」选项）
+  const [deleteTarget, setDeleteTarget] = useState<DoubaoAccountView | null>(null);
+  const [deleteSnapshotToo, setDeleteSnapshotToo] = useState(true);
+  // 豆包应用设置
+  const [settings, setSettings] = useState<api.DoubaoAppSettings | null>(null);
+
   const load = useCallback(async () => {
     try {
-      const [list, envStatus] = await Promise.all([
+      const [list, envStatus, history] = await Promise.all([
         api.doubaoListAccounts(),
         api.appEnvCheck("Doubao"),
+        // 健康史读失败不该让整页报错：它只是概览区，账号列表才是主体
+        api.doubaoHistory().catch(() => null),
       ]);
       setAccounts(list.accounts);
       setLastKeepaliveAt(list.lastKeepaliveAt);
       setEnv(envStatus);
+      if (history) setHistory(history);
+      // 设置单独读：读不到就用默认值渲染，不该拦住账号列表
+      api.doubaoGetSettings().then(setSettings).catch(() => setSettings(null));
     } catch (e) {
       toast.error(api.asError(e));
     } finally {
@@ -238,6 +317,47 @@ export default function DoubaoPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // 到期提醒：进页面时对临期/过期/长期未保活各提示一次。
+  // 用 ref 记录已提示过的 key，避免每次轮询都重新弹一遍。
+  useEffect(() => {
+    if (loading || accounts.length === 0) return;
+    const soon = accounts.filter((a) => a.expiryTier === "soon");
+    const expired = accounts.filter(
+      (a) => a.expiryTier === "expired" || a.sessionState === "expired",
+    );
+    const key = `${expired.length}-${soon.length}`;
+    if (expiryWarnedRef.current === key) return;
+    expiryWarnedRef.current = key;
+
+    if (expired.length > 0) {
+      toast.error(
+        `${expired.length} 个账号的会话已到期，需要重新登录豆包并抓取新凭证`,
+        { duration: 8000 },
+      );
+    }
+    if (soon.length > 0) {
+      const minDays = Math.min(
+        ...soon.map((a) => (typeof a.daysLeft === "number" ? a.daysLeft : 7)),
+      );
+      toast.warning(
+        `${soon.length} 个账号的会话将在 ${minDays} 天内到期，建议先跑一次保活`,
+        { duration: 8000 },
+      );
+    }
+  }, [accounts, loading]);
+
+  // 超过 25 天未保活单独提醒：会话约 30 天到期，这是最后的补救窗口
+  useEffect(() => {
+    if (loading || !lastKeepaliveAt || staleKeepaliveWarnedRef.current) return;
+    const days = daysSince(lastKeepaliveAt);
+    if (days !== null && days > 25) {
+      staleKeepaliveWarnedRef.current = true;
+      toast.warning(`已 ${days} 天没有保活，豆包会话约 30 天到期，建议现在跑一次`, {
+        duration: 10000,
+      });
+    }
+  }, [lastKeepaliveAt, loading]);
 
   // 抓包凭证自动回写：每 20 秒轮询一次。
   // 后端只在「内容确实变了」时返回 applied=true，因此这里不会反复刷屏。
@@ -366,12 +486,47 @@ export default function DoubaoPage() {
     }
   };
 
-  const doDelete = async (account: DoubaoAccountView) => {
-    if (!window.confirm(`确认删除账号 ${account.name ?? account.userId}？`)) return;
+  const doDelete = async (account: DoubaoAccountView, deleteSnapshot: boolean) => {
     setBusy(true);
     try {
-      await api.doubaoDeleteAccount(account.userId);
-      toast.success("已删除");
+      const res = await api.doubaoDeleteAccount(account.userId, deleteSnapshot);
+      toast.success(
+        res.snapshotRemoved ? "已删除账号及其登录态快照" : "已删除账号",
+      );
+      setDeleteTarget(null);
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * 写入一项豆包设置。
+   *
+   * 乐观更新 + 失败回滚：开关必须在点击瞬间就动，否则用户会以为没点到而连点。
+   */
+  const saveSetting = async <K extends keyof api.DoubaoAppSettings>(
+    key: K,
+    value: api.DoubaoAppSettings[K],
+  ) => {
+    const previous = settings;
+    setSettings((s) => (s ? { ...s, [key]: value } : s));
+    try {
+      setSettings(await api.doubaoSetSetting(key, value));
+      toast.success("设置已保存");
+    } catch (e) {
+      setSettings(previous);
+      toast.error(api.asError(e));
+    }
+  };
+
+  const doOpenAsAccount = async (account: DoubaoAccountView) => {    setBusy(true);
+    try {
+      const res = await api.doubaoOpenAsAccount(account.userId);
+      if (res.ok) toast.success(res.message || `已以 ${account.name ?? account.userId} 打开豆包`);
+      else toast.error(res.error || "打开失败");
       await load();
     } catch (e) {
       toast.error(api.asError(e));
@@ -396,14 +551,37 @@ export default function DoubaoPage() {
   const doRenew = async () => {
     setBusy(true);
     try {
-      const res = await api.doubaoRenew(false);
+      // 带上自动回退：HTTP 路径全失败时后端会拉起客户端保活，
+      // 这比让用户自己想到「那试试保活」有用得多
+      const res = await api.doubaoRenew(false, true);
       const parts = [`成功 ${res.ok}`];
       if (res.expired) parts.push(`失效 ${res.expired}`);
       if (res.skipped) parts.push(`跳过 ${res.skipped}`);
       if (res.errors) parts.push(`错误 ${res.errors}`);
-      if (res.expired > 0 || res.errors > 0) toast.warning(`探活完成：${parts.join(" · ")}`);
-      else toast.success(`探活完成：${parts.join(" · ")}`);
+      if (res.fallbackUsed) {
+        // 回退成功也算「救回来了」，但要让用户知道走的不是常规路径
+        toast.info(res.fallbackMessage ?? "HTTP 续期失败，已回退到客户端保活", {
+          duration: 8000,
+        });
+      } else if (res.expired > 0 || res.errors > 0) {
+        toast.warning(`探活完成：${parts.join(" · ")}`);
+      } else {
+        toast.success(`探活完成：${parts.join(" · ")}`);
+      }
       await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doLaunch = async () => {
+    setBusy(true);
+    try {
+      // 零副作用：不切账号、不改快照，只是打开客户端
+      const res = await api.appLaunch("doubao");
+      toast.success(res.message || "已启动豆包客户端");
     } catch (e) {
       toast.error(api.asError(e));
     } finally {
@@ -543,6 +721,10 @@ export default function DoubaoPage() {
               <Power className="size-3.5" />
               保活
             </Button>
+            <Button variant="outline" size="sm" disabled={busy} onClick={() => void doLaunch()}>
+              <Play className="size-3.5" />
+              打开客户端
+            </Button>
           </div>
         </header>
 
@@ -565,6 +747,54 @@ export default function DoubaoPage() {
               <span className="font-mono text-muted-foreground">{env.dataDir}</span>
             </CardContent>
           </Card>
+        )}
+
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base">快照与端点</CardTitle>
+            <CardDescription>
+              控制切换账号时保存哪些数据。快照在切换前保存、切换时恢复。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <label className="flex items-start gap-3">
+              <Switch
+                checked={settings?.doubao_snapshot_include_idb ?? false}
+                disabled={busy || settings === null}
+                onCheckedChange={(v) => void saveSetting("doubao_snapshot_include_idb", v)}
+                className="mt-0.5"
+              />
+              <div className="space-y-0.5 text-sm">
+                <div>快照包含 IndexedDB</div>
+                <p className="text-xs text-muted-foreground">
+                  豆包的会话与草稿主要存在 IndexedDB 里。开启后快照更完整、切换后
+                  页面状态几乎无损，但体积会大一个量级、保存与恢复都明显变慢。
+                  只在意登录态时保持关闭即可。
+                </p>
+              </div>
+            </label>
+            <Separator />
+            <div className="space-y-1 text-xs text-muted-foreground">
+              <div className="flex items-center gap-2">
+                <span>数据目录</span>
+                <span className="font-mono">{env?.dataDir ?? "（未检测）"}</span>
+              </div>
+              <p>
+                客户端安装路径在设置页配置；此处展示的是实际读取到的用户数据目录，
+                账号快照即保存在该目录下的备份区。
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* 运维概览：额度趋势 + 健康卡 + 最近记录 */}
+        {history && (
+          <DoubaoInsights
+            trend={history.trend}
+            health={history.health}
+            events={history.events}
+            lastKeepaliveAt={history.health.lastKeepaliveAt ?? lastKeepaliveAt}
+          />
         )}
 
         <section className="space-y-3">
@@ -608,9 +838,30 @@ export default function DoubaoPage() {
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="truncate text-sm font-medium">
                         {account.name ?? account.userId}
+                        {account.orphanSnapshot && (
+                          <span className="ml-1 text-xs font-normal text-muted-foreground">
+                            （仅剩快照）
+                          </span>
+                        )}
                       </span>
                       {sessionBadge(account)}
+                      {expiryBadge(account)}
                       {quotaBadge(account)}
+                      {account.hasSnapshot && typeof account.sizeBytes === "number" && (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Badge variant="outline" className="cursor-help text-[10px]">
+                              {formatSize(account.sizeBytes)} · {account.fileCount ?? 0} 文件
+                            </Badge>
+                          </TooltipTrigger>
+                          <TooltipContent side="top">
+                            登录态快照
+                            {account.lastModified
+                              ? ` · 最后修改 ${new Date(account.lastModified * 1000).toLocaleString()}`
+                              : ""}
+                          </TooltipContent>
+                        </Tooltip>
+                      )}
                       {!account.hasTtwid && (
                         <Tooltip>
                           <TooltipTrigger asChild>
@@ -692,10 +943,36 @@ export default function DoubaoPage() {
                       </TooltipTrigger>
                       <TooltipContent side="top">导出对话（markdown + json）</TooltipContent>
                     </Tooltip>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={busy || !account.hasSnapshot}
+                          onClick={() => void doOpenAsAccount(account)}
+                        >
+                          <Rocket className="size-3.5" />
+                          打开
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent side="top">
+                        {account.hasSnapshot
+                          ? "以该账号打开豆包（恢复快照后拉起客户端）"
+                          : "该账号还没有登录态快照，请先保存当前登录态"}
+                      </TooltipContent>
+                    </Tooltip>
                     <Button size="sm" variant="outline" disabled={busy} onClick={() => void openEdit(account)}>
                       编辑
                     </Button>
-                    <Button size="sm" variant="ghost" disabled={busy} onClick={() => void doDelete(account)}>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={busy}
+                      onClick={() => {
+                        setDeleteSnapshotToo(true);
+                        setDeleteTarget(account);
+                      }}
+                    >
                       <Trash2 className="size-3.5 text-destructive" />
                     </Button>
                   </div>
@@ -844,6 +1121,60 @@ export default function DoubaoPage() {
         </Dialog>
 
         <QuotaDialog quota={quota} onClose={() => setQuota(null)} />
+
+        {/*
+          删除确认用 Dialog 而不是 window.confirm：
+          这里有一个必须让用户看到的选项（是否连快照一起删），
+          原生 confirm 只能展示一行纯文本、无法承载复选框。
+        */}
+        <Dialog open={deleteTarget !== null} onOpenChange={(o) => !o && setDeleteTarget(null)}>
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle>
+                删除账号 {deleteTarget?.name ?? deleteTarget?.userId}？
+              </DialogTitle>
+              <DialogDescription>
+                删除后该账号的凭证会从账号库移除，此操作无法撤销。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3">
+              <label className="flex items-start gap-3 rounded-lg border border-border/60 px-3 py-2.5">
+                <Checkbox
+                  checked={deleteSnapshotToo}
+                  disabled={!deleteTarget?.hasSnapshot}
+                  onCheckedChange={(v) => setDeleteSnapshotToo(v === true)}
+                  className="mt-0.5"
+                />
+                <div className="space-y-0.5 text-sm">
+                  <div>
+                    同时删除登录态快照
+                    {deleteTarget?.hasSnapshot && typeof deleteTarget.sizeBytes === "number"
+                      ? `（${formatSize(deleteTarget.sizeBytes)}）`
+                      : ""}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {deleteTarget?.hasSnapshot
+                      ? "不勾选则保留快照，之后仍可「以该账号打开」。"
+                      : "该账号没有快照，此项不可选。"}
+                  </p>
+                </div>
+              </label>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setDeleteTarget(null)}>
+                取消
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={busy}
+                onClick={() => deleteTarget && void doDelete(deleteTarget, deleteSnapshotToo)}
+              >
+                {busy && <Loader2 className="size-3.5 animate-spin" />}
+                删除
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </div>
     </TooltipProvider>
   );

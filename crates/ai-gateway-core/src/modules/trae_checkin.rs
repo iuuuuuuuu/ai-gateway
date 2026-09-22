@@ -153,6 +153,24 @@ pub struct RoundSummary {
 }
 
 impl RoundSummary {
+    /// 按当前 `outcomes` 的最终状态重算四个计数。
+    ///
+    /// 重试轮会用新结果覆盖旧结果，覆盖后必须重算 —— 否则计数会与逐条结果
+    /// 对不上（界面上出现「失败 3 / 成功 2」但列表里只有 4 条）。
+    pub fn recount(&mut self) {        self.ok = 0;
+        self.already = 0;
+        self.failed = 0;
+        self.skipped = 0;
+        for o in &self.outcomes {
+            match o.status {
+                "success" => self.ok += 1,
+                "already" => self.already += 1,
+                "skip" => self.skipped += 1,
+                _ => self.failed += 1,
+            }
+        }
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "ok": self.ok,
@@ -338,10 +356,78 @@ async fn status_check(jwt: &str, dev: &DeviceEntry) -> StatusOutcome {
     }
 }
 
-/// 从 claim 响应解析本次奖励积分。
+/// JWT 探活结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JwtLiveness {
+    /// 服务端明确接受该 JWT
+    Alive,
+    /// 服务端明确拒绝（401 / 业务码 1001）—— 需要重新登录
+    Dead(String),
+    /// 探不出来（网络异常 / 代理未启动 / 响应无法解析）
+    ///
+    /// **必须与 `Dead` 区分**：把网络问题当成失效会把一批好账号标成需要重登，
+    /// 用户按提示去重登却发现账号本来是好的。
+    Unknown(String),
+}
+
+impl JwtLiveness {
+    pub fn is_dead(&self) -> bool {
+        matches!(self, JwtLiveness::Dead(_))
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            JwtLiveness::Alive => "JWT 有效",
+            JwtLiveness::Dead(m) | JwtLiveness::Unknown(m) => m,
+        }
+    }
+}
+
+/// 服务端「JWT 已失效」的业务码（抓包固化）。
+const CODE_SESSION_DEAD: i64 = 1001;
+
+/// 探一次 JWT 是否还能用（切换账号前的预检）。
 ///
-/// 只接受**正数**：零值占位字段（很多响应会带 `reward: 0`）会遮蔽后面真正的字段，
-/// 若允许 0 通过就会把「签到得了 50 分」记成 0 分。
+/// 复用签到 status 接口：它是唯一一个「无副作用且必然校验登录态」的端点，
+/// 单独为此发明一个探测请求既没必要也更容易被风控注意到。
+///
+/// **失败放行**（返回 `Unknown` 而不是 `Dead`）：调用方据此只给警告、不阻断切换。
+/// 硬阻断会锁死「需要重新登录才能修好的账号」—— 而重新登录的入口恰恰就在切换
+/// 流程里，形成死锁。
+pub async fn probe_jwt_alive(jwt: &str, dev: &DeviceEntry) -> JwtLiveness {
+    let jwt = jwt.trim();
+    if jwt.is_empty() {
+        return JwtLiveness::Dead("JWT 为空".to_string());
+    }
+    let (status, body, raw) = http_post(jwt, dev, STATUS_URL).await;
+    if status == 0 {
+        return JwtLiveness::Unknown(if raw.is_empty() {
+            "探活失败：网络异常".to_string()
+        } else {
+            format!("探活失败：{raw}")
+        });
+    }
+    if status == 401 {
+        return JwtLiveness::Dead("JWT 已失效（HTTP 401），需要重新登录".to_string());
+    }
+    let Some(data) = body.filter(|b| b.is_object()) else {
+        let head: String = raw.chars().take(200).collect();
+        return JwtLiveness::Unknown(format!("探活失败：非 JSON 响应 {head}"));
+    };
+    match data.get("code").and_then(Value::as_i64) {
+        Some(CODE_SESSION_DEAD) => {
+            let detail = find_payload_field(&data, "message")
+                .and_then(Value::as_str)
+                .unwrap_or("登录态失效");
+            JwtLiveness::Dead(format!("JWT 已失效（业务码 {CODE_SESSION_DEAD}：{detail}）"))
+        }
+        // 其他非 0 业务码（如套餐用尽 1005）说明**登录态本身有效**，只是业务受限
+        Some(c) if c != 0 => JwtLiveness::Alive,
+        _ => JwtLiveness::Alive,
+    }
+}
+
+/// 从 claim 响应解析本次奖励积分。
 fn parse_claim_reward(data: &Value) -> Option<i64> {
     let scopes = unwrap_scopes(data);
     // 内层优先：越深越接近真实业务数据
@@ -490,10 +576,7 @@ pub async fn checkin_account(
     outcome.message = format!("{}{}", outcome.message, message);
     outcome.error_type = Some(kind.as_str().to_string());
     let now = config::now_secs();
-    if let Some(until) = kind.cooldown_until(now) {
-        save_cooldown(uid, kind.as_str(), until, &message);
-        outcome.cooldown_until = Some(until);
-    }
+    outcome.cooldown_until = register_failure(uid, &kind, now, &message);
     outcome
 }
 
@@ -562,23 +645,52 @@ fn save_cooldowns(map: &serde_json::Map<String, Value>) {
     let _ = config::atomic_write(&path, &content);
 }
 
+/// 需要「连续失败若干次」才真正落冷却的失败类型（瞬时故障）。
+///
+/// 为什么这两类要特殊对待：5xx 与普通 4xx 通常是服务端抖动或网关瞬时拒绝，
+/// 单次失败就给账号坐 10 分钟冷板凳，会让整批签到里偶发的一次抖动直接吞掉该账号
+/// 当天的签到机会（而且用户看到的是「冷却中」，看不出只是抖动）。上游的实测结论
+/// 是连续 3 次才算真故障。
+pub const TRANSIENT_TRIP_KINDS: [&str; 2] = ["Server", "Client"];
+
+/// 瞬时故障连续几次才落冷却。
+pub const TRANSIENT_FAILS_TO_TRIP: i64 = 3;
+
+/// 只计数、不落冷却时的 `until` 占位值。
+///
+/// 用 0 而不是「不写记录」：`error_count` 需要跨轮次保留才能数到 3。
+/// 同时 [`cooldown_until`] 会把 `<= 0` 视作「无冷却」，
+/// 于是 `run_round` / 抓包代理都不会误跳过一个只是在计数的账号。
+const COUNT_ONLY_UNTIL: i64 = 0;
+
 /// 账号当前冷却截止时间（无冷却返回 `None`）。
+///
+/// `until <= 0` 是「只计数未落冷却」的占位记录，必须返回 `None`，
+/// 否则调用方（`run_round`、抓包代理）会把账号当成冷却中而跳过。
 pub fn cooldown_until(uid: &str) -> Option<i64> {
-    load_cooldowns()
+    let until = load_cooldowns()
         .get(uid)?
         .get("until")
-        .and_then(Value::as_i64)
+        .and_then(Value::as_i64)?;
+    if until <= COUNT_ONLY_UNTIL {
+        None
+    } else {
+        Some(until)
+    }
 }
 
-/// 记录冷却。
-pub fn save_cooldown(uid: &str, kind: &str, until: i64, reason: &str) {
-    let mut map = load_cooldowns();
-    let error_count = map
+/// 当前连续失败次数（供界面展示与判断是否即将落冷却）。
+pub fn error_count(uid: &str) -> i64 {
+    load_cooldowns()
         .get(uid)
         .and_then(|v| v.get("error_count"))
         .and_then(Value::as_i64)
         .unwrap_or(0)
-        + 1;
+}
+
+/// 写一条冷却/计数记录。
+fn write_cooldown(uid: &str, kind: &str, until: i64, reason: &str, error_count: i64) {
+    let mut map = load_cooldowns();
     map.insert(
         uid.to_string(),
         json!({
@@ -591,12 +703,67 @@ pub fn save_cooldown(uid: &str, kind: &str, until: i64, reason: &str) {
     save_cooldowns(&map);
 }
 
-/// 清除冷却（签到成功后调用）。
-pub fn clear_cooldown(uid: &str) {
+/// 记录一次失败，并决定是否真的落冷却。
+///
+/// 返回**生效**的冷却截止时间；`None` 表示「只计数、不落冷却」
+/// （瞬时故障尚未达到 [`TRANSIENT_FAILS_TO_TRIP`]）。
+pub fn register_failure(uid: &str, kind: &ErrorKind, now: i64, reason: &str) -> Option<i64> {
+    let planned = kind.cooldown_until(now)?;
+    let kind_str = kind.as_str();
+
+    if !TRANSIENT_TRIP_KINDS.contains(&kind_str) {
+        // 非瞬时故障（会话失效 / 套餐限制 / 限流 / 接口不存在 / 业务错误）：
+        // 语义明确，立刻落冷却。保留累计次数供排查。
+        let next = error_count(uid) + 1;
+        write_cooldown(uid, kind_str, planned, reason, next);
+        return Some(planned);
+    }
+
+    let count = error_count(uid) + 1;
+    if count < TRANSIENT_FAILS_TO_TRIP {
+        // 只计数：until 占位 0，cooldown_until 会返回 None，下一个账号继续跑
+        write_cooldown(uid, kind_str, COUNT_ONLY_UNTIL, reason, count);
+        return None;
+    }
+    // 连续到阈值：落冷却并把计数清零，避免恢复后一次抖动又立刻冷板凳
+    write_cooldown(uid, kind_str, planned, reason, 0);
+    Some(planned)
+}
+
+/// 记录冷却（**低层写入**，不参与「连续失败计数」判定）。
+///
+/// 业务判定请用 [`register_failure`]；此函数保留给需要无条件写入冷板凳的场景
+/// （以及既有测试），它会无条件累加 `error_count`。
+pub fn save_cooldown(uid: &str, kind: &str, until: i64, reason: &str) {
+    let next = error_count(uid) + 1;
+    write_cooldown(uid, kind, until, reason, next);
+}
+
+/// 清除冷却（签到成功后调用）。返回是否真的移除了记录。
+///
+/// 返回值让调用方能在「确实清掉了一条」时才打日志；同时**无条件移除**整条记录，
+/// 避免只计数（`until == 0`）的残留记录被漏清 —— 那种记录虽然不阻塞签到，
+/// 但会让下一次瞬时失败直接数到阈值。
+pub fn clear_cooldown(uid: &str) -> bool {
     let mut map = load_cooldowns();
     if map.remove(uid).is_some() {
         save_cooldowns(&map);
+        true
+    } else {
+        false
     }
+}
+
+/// 清除**全部**账号的冷却记录，返回清掉的条数。
+///
+/// 界面上的「全部清除冷却」用于一键恢复：比如换网络环境后整批账号都被限流，
+/// 逐条点太慢。返回条数让界面能如实说「已清除 N 条」而不是笼统的「操作成功」。
+pub fn clear_all_cooldowns() -> usize {
+    let count = load_cooldowns().len();
+    if count > 0 {
+        save_cooldowns(&serde_json::Map::new());
+    }
+    count
 }
 
 /// 全部冷却记录（供界面展示）。
@@ -754,6 +921,135 @@ mod tests {
         assert_eq!(cooldown_until(uid), None);
     }
 
+    /// G5 核心回归：单次 5xx 不得让账号坐 10 分钟冷板凳。
+    #[test]
+    fn 瞬时故障连续三次才落冷却() {
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae-trip");
+        let uid = "u-trip";
+        let now = 1_700_000_000;
+
+        // 第 1、2 次：只计数，不落冷却
+        for expected in 1..TRANSIENT_FAILS_TO_TRIP {
+            let until = register_failure(uid, &ErrorKind::Server, now, "500");
+            assert_eq!(until, None, "第 {expected} 次瞬时失败不应落冷却");
+            assert_eq!(error_count(uid), expected);
+            assert_eq!(
+                cooldown_until(uid),
+                None,
+                "只计数状态不得被当成冷却中，否则 run_round 会跳过该账号"
+            );
+        }
+
+        // 第 3 次：落冷却并清零计数
+        let until = register_failure(uid, &ErrorKind::Server, now, "500").unwrap();
+        assert_eq!(until, now + 600);
+        assert_eq!(cooldown_until(uid), Some(now + 600));
+        assert_eq!(
+            error_count(uid),
+            0,
+            "落冷却后计数清零，避免恢复后一次抖动立刻再次冷板凳"
+        );
+    }
+
+    #[test]
+    fn 瞬时故障中途成功会重新计数() {
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae-trip-reset");
+        let uid = "u-reset";
+        let now = 1_700_000_000;
+
+        register_failure(uid, &ErrorKind::Server, now, "500");
+        register_failure(uid, &ErrorKind::Client, now, "400");
+        assert_eq!(error_count(uid), 2);
+        // 签到成功 → 清记录
+        assert!(clear_cooldown(uid));
+        assert_eq!(error_count(uid), 0);
+        // 再次失败从 1 重新数，不会一次就落冷却
+        assert_eq!(register_failure(uid, &ErrorKind::Server, now, "500"), None);
+        assert_eq!(error_count(uid), 1);
+    }
+
+    /// 非瞬时故障语义不变：一次就落冷却。
+    #[test]
+    fn 非瞬时故障一次即落冷却() {
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae-trip-direct");
+        let now = 1_700_000_000;
+
+        for (uid, kind, want) in [
+            ("u-dead", ErrorKind::SessionDead, 9_999_999_999),
+            ("u-plan", ErrorKind::PlanLimit, now + 43_200),
+            ("u-rate", ErrorKind::SoftRate, now + 60),
+            ("u-404", ErrorKind::NotFound, now + 60),
+            ("u-biz", ErrorKind::BusinessError, now + 300),
+        ] {
+            assert_eq!(
+                register_failure(uid, &kind, now, "x"),
+                Some(want),
+                "{uid} 应一次即落冷却"
+            );
+            assert_eq!(cooldown_until(uid), Some(want));
+        }
+
+        // Unknown 不落冷却
+        assert_eq!(register_failure("u-unk", &ErrorKind::Unknown, now, "x"), None);
+        assert_eq!(cooldown_until("u-unk"), None);
+    }
+
+    #[test]
+    fn 冷却中的账号在计数状态下不被跳过() {
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae-skip");
+        let uid = "u-skip";
+        let now = config::now_secs();
+
+        // 计数状态：cooldown_until 返回 None → run_round 不会跳过
+        register_failure(uid, &ErrorKind::Server, now, "500");
+        assert_eq!(cooldown_until(uid), None);
+
+        // 真冷却：返回 Some 且在未来 → run_round 会跳过
+        register_failure(uid, &ErrorKind::Server, now, "500");
+        register_failure(uid, &ErrorKind::Server, now, "500");
+        let until = cooldown_until(uid).expect("第三次应落冷却");
+        assert!(until > now);
+    }
+
+    /// 网络异常必须归到 `Unknown`（放行）而不是 `Dead`（判失效）：
+    /// 代理没启动时把整批账号标成「需要重登」，用户按提示重登会发现账号本来是好的。
+    #[test]
+    fn 探活分类区分失效与探不出来() {
+        let dead = JwtLiveness::Dead("401".into());
+        let unknown = JwtLiveness::Unknown("网络异常".into());
+        assert!(dead.is_dead());
+        assert!(!unknown.is_dead(), "探不出来不得当作失效");
+        assert_eq!(JwtLiveness::Alive.message(), "JWT 有效");
+        assert!(!JwtLiveness::Alive.is_dead());
+    }
+
+    /// 空 JWT 无需发请求即可判定失效。
+    #[tokio::test]
+    async fn 空_jwt_探活直接判失效() {
+        let dev = trae_device::derive_device("u-probe");
+        let r = probe_jwt_alive("   ", &dev).await;
+        assert!(r.is_dead());
+        assert!(r.message().contains("为空"), "{}", r.message());
+    }
+
+    #[test]
+    fn 清除计数残留记录() {        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae-clear-count");
+        let uid = "u-count";
+        register_failure(uid, &ErrorKind::Server, config::now_secs(), "500");
+        assert_eq!(error_count(uid), 1);
+        assert!(
+            clear_cooldown(uid),
+            "只计数记录也必须能被清掉，否则会累积到阈值"
+        );
+        assert_eq!(error_count(uid), 0);
+        assert!(!clear_cooldown(uid), "无记录时返回 false");
+    }
+
     #[test]
     fn 汇总计数与_json_形态() {
         let mut s = RoundSummary::default();
@@ -806,5 +1102,71 @@ mod tests {
         assert_eq!(random_hex(32).len(), 32);
         assert_eq!(random_hex(16).len(), 16);
         assert!(random_hex(32).chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// 造一条指定状态的结果（只为测计数，其余字段给占位值）。
+    fn outcome(uid: &str, status: &'static str) -> AccountOutcome {
+        AccountOutcome {
+            user_id: uid.to_string(),
+            name: uid.to_string(),
+            status,
+            code: None,
+            message: String::new(),
+            credits: None,
+            delta: None,
+            error_type: None,
+            cooldown_until: None,
+        }
+    }
+
+    #[test]
+    fn 重算计数与逐条结果一致() {
+        let mut summary = RoundSummary {
+            outcomes: vec![
+                outcome("a", "success"),
+                outcome("b", "already"),
+                outcome("c", "fail"),
+                outcome("d", "skip"),
+                outcome("e", "fail"),
+            ],
+            // 故意给一组错计数：recount 必须把它们纠正过来
+            ok: 99,
+            already: 99,
+            failed: 99,
+            skipped: 99,
+        };
+        summary.recount();
+        assert_eq!(summary.ok, 1);
+        assert_eq!(summary.already, 1);
+        assert_eq!(summary.failed, 2);
+        assert_eq!(summary.skipped, 1);
+        // 总数必须等于逐条结果数，否则界面会出现「失败 3 但只有 4 条」
+        assert_eq!(summary.ok + summary.already + summary.failed + summary.skipped, 5);
+    }
+
+    #[test]
+    fn 重试覆盖后计数不会重复累加() {
+        // 场景：首轮 a 失败、b 成功；重试轮 a 成功。
+        // 覆盖式替换后必须是「成功 2 / 失败 0」，而不是「成功 1 / 失败 1」。
+        let mut summary = RoundSummary {
+            outcomes: vec![outcome("a", "fail"), outcome("b", "success")],
+            ok: 1,
+            already: 0,
+            failed: 1,
+            skipped: 0,
+        };
+        let slot = summary.outcomes.iter_mut().find(|o| o.user_id == "a").unwrap();
+        *slot = outcome("a", "success");
+        summary.recount();
+        assert_eq!(summary.ok, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.to_json()["total"], json!(2));
+    }
+
+    #[test]
+    fn 重算空结果全为零() {
+        let mut summary = RoundSummary::default();
+        summary.recount();
+        assert_eq!(summary.ok + summary.already + summary.failed + summary.skipped, 0);
     }
 }

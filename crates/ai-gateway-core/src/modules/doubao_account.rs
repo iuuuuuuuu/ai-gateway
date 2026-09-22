@@ -66,24 +66,11 @@ pub fn find_account(user_id: &str) -> Option<Value> {
 ///
 /// **每个** uid → 路径的入口都必须先过这一关：uid 来自抓包/本地存储，
 /// 属于外部输入，含 `..` 或分隔符时可以越出数据目录。
+///
+/// 实现已上移到 [`crate::modules::config::ensure_uid_safe`]（Trae 路径也要用），
+/// 这里保留同名包装以免已有的 20 余处调用点与测试全部改名。
 pub fn ensure_uid_safe(uid: &str) -> Result<(), String> {
-    let uid = uid.trim();
-    if uid.is_empty() {
-        return Err("缺少账号标识（userId）".to_string());
-    }
-    if uid.len() > 64 {
-        return Err("账号标识过长（超过 64 字符）".to_string());
-    }
-    if uid.contains("..") {
-        return Err("账号标识含非法片段 `..`".to_string());
-    }
-    if !uid
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err("账号标识只能包含字母、数字、下划线与连字符".to_string());
-    }
-    Ok(())
+    config::ensure_uid_safe(uid)
 }
 
 /// 脱敏：保留末 `keep` 位。
@@ -119,11 +106,83 @@ pub fn session_state(acc: &Value) -> &'static str {
     }
 }
 
+/// 凭证到期分层（界面按此上色：正常 / 临期黄 / 已过期红）。
+///
+/// 为什么要分层而不是只给一个布尔：豆包 `sid_guard` 有效期 30 天且服务端滑动续期，
+/// 用户只有在「快到期」时才有必要去保活。只告诉「有效/失效」的话，用户要么
+/// 每天白跑一次保活，要么等到失效才发现 —— 临期提醒才是这条链路的实际价值。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExpiryTier {
+    /// 无 `sid_guard` 或解析不出 → 未知，界面不显示到期信息
+    Unknown,
+    /// 30 天以上
+    Fresh,
+    /// 7 天内到期（含今天）
+    ExpiringSoon,
+    /// 已过到期日
+    Expired,
+}
+
+impl ExpiryTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExpiryTier::Unknown => "unknown",
+            ExpiryTier::Fresh => "fresh",
+            ExpiryTier::ExpiringSoon => "soon",
+            ExpiryTier::Expired => "expired",
+        }
+    }
+}
+
+/// 临期阈值（天）。
+pub const EXPIRY_SOON_DAYS: i64 = 7;
+
+/// 解析到期时间字符串为 Unix 秒（支持 `%Y-%m-%d %H:%M:%S` 与纯日期两种形态）。
+fn parse_expire_ts(value: &str) -> Option<i64> {
+    let v = value.trim();
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(v, fmt) {
+            return Some(dt.and_utc().timestamp());
+        }
+    }
+    chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc().timestamp())
+}
+
+/// 计算到期分层与剩余天数。
+pub fn expiry_tier(expire_at: Option<&str>, now_ts: i64) -> (ExpiryTier, Option<i64>) {
+    let Some(raw) = expire_at.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (ExpiryTier::Unknown, None);
+    };
+    let Some(ts) = parse_expire_ts(raw) else {
+        return (ExpiryTier::Unknown, None);
+    };
+    // 向上取整到天：剩 12 小时应显示「1 天后到期」而不是「0 天后」
+    let seconds_left = ts - now_ts;
+    let days_left = if seconds_left <= 0 {
+        seconds_left / 86_400
+    } else {
+        (seconds_left + 86_399) / 86_400
+    };
+    let tier = if seconds_left < 0 {
+        ExpiryTier::Expired
+    } else if days_left <= EXPIRY_SOON_DAYS {
+        ExpiryTier::ExpiringSoon
+    } else {
+        ExpiryTier::Fresh
+    };
+    (tier, Some(days_left))
+}
+
 /// 账号的展示视图（**凭证脱敏**）。
 pub fn account_view(acc: &Value) -> Value {
     let session_id = acc.get("session_id").and_then(Value::as_str).unwrap_or("");
     let sid_guard = acc.get("sid_guard").and_then(Value::as_str).unwrap_or("");
     let ttwid = acc.get("ttwid").and_then(Value::as_str).unwrap_or("");
+    let expire_at = acc.get("session_expire_at").and_then(Value::as_str);
+    let (tier, days_left) = expiry_tier(expire_at, chrono::Utc::now().timestamp());
     json!({
         "userId": acc.get("user_id"),
         "name": acc.get("name"),
@@ -136,9 +195,12 @@ pub fn account_view(acc: &Value) -> Value {
         "ttwidMasked": mask_secret(ttwid, 4),
         "hasSessionId": !session_id.is_empty(),
         "hasTtwid": !ttwid.is_empty(),
-        "sessionExpireAt": acc.get("session_expire_at"),
+        "sessionExpireAt": expire_at,
         "expired": acc.get("expired"),
         "sessionState": session_state(acc),
+        // 到期分层：界面据此上色（fresh 常态 / soon 黄 / expired 红）
+        "expiryTier": tier.as_str(),
+        "daysLeft": days_left,
         "sessionSource": acc.get("session_source"),
         "cookiesSyncedAt": acc.get("cookies_synced_at"),
         "lastRenewAt": acc.get("last_renew_at"),
@@ -147,6 +209,7 @@ pub fn account_view(acc: &Value) -> Value {
         "quotaExpireAt": acc.get("quota_expire_at"),
         "quotaSummary": acc.get("quota_summary"),
         "quotaCheckedAt": acc.get("quota_checked_at"),
+        "quotaUsedPercent": acc.get("quota_used_percent"),
     })
 }
 
@@ -607,6 +670,91 @@ mod tests {
         assert_eq!(session_state(&json!({"session_id": "x"})), "unknown");
         assert_eq!(session_state(&json!({"session_id": "x", "expired": false})), "ok");
         assert_eq!(session_state(&json!({"session_id": "x", "expired": true})), "expired");
+    }
+
+    #[test]
+    fn 到期分层_无凭证为未知() {
+        assert_eq!(expiry_tier(None, 0), (ExpiryTier::Unknown, None));
+        assert_eq!(expiry_tier(Some(""), 0), (ExpiryTier::Unknown, None));
+        assert_eq!(expiry_tier(Some("不是日期"), 0), (ExpiryTier::Unknown, None));
+    }
+
+    #[test]
+    fn 到期分层_远期为_fresh() {
+        let now = 1_700_000_000;
+        let expire = chrono::DateTime::from_timestamp(now + 20 * 86_400, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let (tier, days) = expiry_tier(Some(&expire), now);
+        assert_eq!(tier, ExpiryTier::Fresh);
+        assert_eq!(days, Some(20));
+    }
+
+    #[test]
+    fn 到期分层_七天内为_soon() {
+        let now = 1_700_000_000;
+        for d in [0i64, 1, 7] {
+            let expire = chrono::DateTime::from_timestamp(now + d * 86_400, 0)
+                .unwrap()
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            let (tier, days) = expiry_tier(Some(&expire), now);
+            assert_eq!(tier, ExpiryTier::ExpiringSoon, "{d} 天后应为临期");
+            assert_eq!(days, Some(d));
+        }
+    }
+
+    /// 关键：剩 12 小时必须显示「1 天后」而不是「0 天后」——
+    /// 显示 0 会让用户以为今天就到期而白跑一次保活。
+    #[test]
+    fn 到期分层_不足一天向上取整为一天() {
+        let now = 1_700_000_000;
+        let expire = chrono::DateTime::from_timestamp(now + 12 * 3600, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let (tier, days) = expiry_tier(Some(&expire), now);
+        assert_eq!(tier, ExpiryTier::ExpiringSoon);
+        assert_eq!(days, Some(1));
+    }
+
+    #[test]
+    fn 到期分层_过期时为_expired_且天数为负() {
+        let now = 1_700_000_000;
+        let expire = chrono::DateTime::from_timestamp(now - 3 * 86_400, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let (tier, days) = expiry_tier(Some(&expire), now);
+        assert_eq!(tier, ExpiryTier::Expired);
+        assert_eq!(days, Some(-3));
+    }
+
+    #[test]
+    fn 到期分层_接受纯日期格式() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let (tier, days) = expiry_tier(Some("2026-01-11"), now);
+        assert_eq!(tier, ExpiryTier::Fresh);
+        assert_eq!(days, Some(10));
+    }
+
+    #[test]
+    fn 账号视图带到期分层字段() {
+        let acc = json!({
+            "user_id": "123",
+            "session_id": "x",
+            "expired": false,
+            "session_expire_at": "2026-01-01 00:00:00",
+        });
+        let view = account_view(&acc);
+        assert!(view["expiryTier"].is_string(), "界面需要 expiryTier 上色");
+        assert!(view.get("daysLeft").is_some());
     }
 
     #[test]

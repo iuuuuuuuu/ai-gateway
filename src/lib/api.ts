@@ -71,6 +71,16 @@ const DEMO_READ_COMMANDS = new Set([
   "get_gateway_usage",
   "get_gateway_status", "get_gateway_models", "detect_agent_clients", "list_agent_backups",
   "get_cli_quotas", "get_cli_quota_status",
+  // Trae / 豆包 只读查询：演示模式下允许展示，写操作一律拒绝
+  "trae_list_accounts", "trae_credits_stats", "trae_credits_history",
+  "trae_pay_status_cache", "groups_list", "in_app_schedule_view",
+  "doubao_list_accounts", "doubao_history", "doubao_settings",
+  "proxy_logs_list", "proxy_logs_overview",
+  // 点击即读（详情弹窗 / 查看凭证）：不进演示模式会让点击直接报错
+  "proxy_log_detail", "trae_credit_detail", "trae_account_jwt",
+  // 挂载即读的命令：页面/组件一进入就调用，缺一个就会让整块数据空白
+  "app_env_check", "trae_checkin_trends", "trae_usage_history",
+  "proxy_config", "proxy_status", "proxy_cert_status", "task_status",
 ]);
 
 export function isDemoMode(): boolean {
@@ -179,6 +189,32 @@ const ROUTES: Record<string, Route> = {
   trae_list_accounts: { method: "GET", path: "/api/trae/accounts" },
   trae_add_account: { method: "POST", path: "/api/trae/accounts/add" },
   trae_delete_account: { method: "POST", path: "/api/trae/accounts/delete" },
+  trae_update_account: { method: "POST", path: "/api/trae/accounts/update" },
+  trae_account_jwt: { method: "GET", path: "/api/trae/accounts/jwt" },
+  trae_jwt_parse: { method: "POST", path: "/api/trae/jwt/parse" },
+  trae_clear_all_cooldowns: { method: "POST", path: "/api/trae/cooldown/clear-all" },
+  doubao_settings: { method: "GET", path: "/api/doubao/settings" },
+  doubao_set_setting: { method: "POST", path: "/api/doubao/settings" },
+  oauth_login_url: { method: "POST", path: "/api/trae/oauth/login-url" },
+  oauth_submit_callback: { method: "POST", path: "/api/trae/oauth/callback" },
+  oauth_cancel: { method: "POST", path: "/api/trae/oauth/cancel" },
+  in_app_schedule_view: { method: "GET", path: "/api/in-app-schedule" },
+  run_in_app_due_tasks: { method: "POST", path: "/api/in-app-schedule/run" },
+  trae_export_accounts: { method: "POST", path: "/api/trae/export" },
+  trae_preview_import: { method: "POST", path: "/api/trae/import/preview" },
+  trae_import_accounts: { method: "POST", path: "/api/trae/import" },
+  trae_credits_stats: { method: "GET", path: "/api/trae/credits/stats" },
+  trae_checkin_trends: { method: "GET", path: "/api/trae/checkin/trends" },
+  app_launch: { method: "POST", path: "/api/apps/launch" },
+  proxy_logs_list: { method: "GET", path: "/api/proxy/logs" },
+  proxy_log_detail: { method: "GET", path: "/api/proxy/logs/detail" },
+  proxy_logs_overview: { method: "GET", path: "/api/proxy/logs/overview" },
+  proxy_logs_clear: { method: "POST", path: "/api/proxy/logs/clear" },
+  trae_usage_history: { method: "GET", path: "/api/trae/usage-history" },
+  trae_credits_snapshot: { method: "POST", path: "/api/trae/credits/snapshot" },
+  // 回环监听器（17388 端口）只存在于桌面宿主：webui 模式下没有本地进程监听该端口，
+  // 因此**故意不登记路由** —— 前端据 isDesktop() 决定是走自动回环还是手动粘贴兜底，
+  // 真走到这里会得到「webui 模式暂不支持该操作」而不是一个假的成功。
   trae_discover_accounts: { method: "GET", path: "/api/trae/discover" },
   trae_import_local: { method: "POST", path: "/api/trae/import-local" },
   trae_discover_and_import: { method: "POST", path: "/api/trae/discover/import" },
@@ -187,9 +223,25 @@ const ROUTES: Record<string, Route> = {
   trae_checkin_run: { method: "POST", path: "/api/trae/checkin" },
   trae_credits_history: { method: "GET", path: "/api/trae/credits/history" },
   trae_clear_cooldown: { method: "POST", path: "/api/trae/cooldown/clear" },
+  // ---- Trae 凭证续期 / 积分 / 套餐身份 ----
+  trae_refresh_account: { method: "POST", path: "/api/trae/refresh" },
+  trae_refresh_all: { method: "POST", path: "/api/trae/refresh-all" },
+  trae_credit_detail: { method: "GET", path: "/api/trae/credits/detail" },
+  trae_refresh_pay_status: { method: "POST", path: "/api/trae/pay-status/refresh" },
+  trae_pay_status_cache: { method: "GET", path: "/api/trae/pay-status" },
+  // ---- 账号分组（Trae / 豆包 分域） ----
+  groups_list: { method: "GET", path: "/api/groups" },
+  group_create: { method: "POST", path: "/api/groups/create" },
+  group_update: { method: "POST", path: "/api/groups/update" },
+  group_delete: { method: "POST", path: "/api/groups/delete" },
+  group_move: { method: "POST", path: "/api/groups/move" },
   doubao_list_accounts: { method: "GET", path: "/api/doubao/accounts" },
   doubao_save_account: { method: "POST", path: "/api/doubao/accounts/save" },
   doubao_delete_account: { method: "POST", path: "/api/doubao/accounts/delete" },
+  doubao_detect_uid: { method: "GET", path: "/api/doubao/detect-uid" },
+  doubao_snapshot_meta: { method: "GET", path: "/api/doubao/snapshot-meta" },
+  doubao_open_as_account: { method: "POST", path: "/api/doubao/open-as-account" },
+  doubao_history: { method: "GET", path: "/api/doubao/history" },
   doubao_get_credential: { method: "GET", path: "/api/doubao/credential" },
   doubao_set_credential: { method: "POST", path: "/api/doubao/credential" },
   doubao_captured_credential: { method: "GET", path: "/api/doubao/credential/captured" },
@@ -885,6 +937,12 @@ export interface AppEnvStatus {
   manualPath: string | null;
   settingsPathKey: string;
   running: boolean;
+  /** 客户端版本号（探测不到为 null，不回退成本应用版本）。 */
+  version?: string | null;
+  /** 版本号的读取来源路径（排障用）。 */
+  versionSource?: string | null;
+  /** 应用设置的落盘路径。 */
+  settingsFile?: string;
 }
 
 /** 探测某个应用的安装、数据目录与快照状态。 */
@@ -953,13 +1011,30 @@ export interface SnapshotItem {
   isCurrent: boolean;
   modifiedAt: number | null;
   hasMeta: boolean;
+  /** 快照占用的总字节数（递归统计）。 */
+  sizeBytes: number;
+  /** 快照内的文件数。 */
+  fileCount: number;
 }
 
 /** 列出某应用的登录态快照。 */
-export function listSnapshots(
-  targetApp: string,
-): Promise<{ snapshots: SnapshotItem[]; currentUserId: string }> {
-  return call<{ snapshots: SnapshotItem[]; currentUserId: string }>("list_snapshots", {
+export function listSnapshots(targetApp: string): Promise<{
+  snapshots: SnapshotItem[];
+  currentUserId: string;
+  /**
+   * 标记是否可能已过期 —— 现场文件比标记更新，说明用户可能直接在客户端里换过号。
+   * 为真时界面应提示「当前登录」徽章可能不准。
+   */
+  markerStale: boolean;
+  /** 解析出的当前 uid（无标记时为空串）。 */
+  resolvedUserId: string;
+}> {
+  return call<{
+    snapshots: SnapshotItem[];
+    currentUserId: string;
+    markerStale: boolean;
+    resolvedUserId: string;
+  }>("list_snapshots", {
     targetApp,
   });
 }
@@ -984,8 +1059,23 @@ export interface TraeAccountMeta {
   hasRefreshToken: boolean;
   refreshTokenInvalid: boolean;
   refreshTokenFails: number;
+  /** refresh token 过期时间（Unix 秒）。 */
+  refreshTokenExpiresAt?: number | null;
+  /** 上次刷新成功时间。 */
+  refreshedAt?: string | null;
+  /** 是否具备自动续期条件（有 refresh token 且未失效）。 */
+  canRefresh?: boolean;
   deviceIdMasked: string;
   cooldown?: { type?: string; until?: number; reason?: string; error_count?: number };
+  /** 套餐身份展示名（付费缓存命中时才有）。 */
+  payIdentity?: string | null;
+  /** 套餐到期时间。 */
+  payExpireAt?: string | null;
+  /** 积分总额缓存（`null` = 未查询过，不等同于 0）。 */
+  creditsTotal?: number | null;
+  creditsUpdatedAt?: string | null;
+  /** 所属分组 id（未分组为 null）。 */
+  group?: string | null;
 }
 
 /** Trae 账号列表。 */
@@ -1009,6 +1099,55 @@ export function traeAddAccount(args: {
 /** 删除 Trae 账号。 */
 export function traeDeleteAccount(userId: string): Promise<{ ok: boolean }> {
   return call<{ ok: boolean }>("trae_delete_account", { userId });
+}
+
+/** Trae 账号的编辑入参（只填要改的字段）。 */
+export interface TraeAccountPatch {
+  userId: string;
+  name?: string;
+  jwt?: string;
+  refreshToken?: string;
+}
+
+/**
+ * 编辑 Trae 账号。
+ *
+ * 只改昵称时不要传 `jwt` —— 传空串会被后端忽略，但传错账号的 JWT 会被拒绝，
+ * 两者都不该发生；干净的做法是让调用方只传真正要改的字段。
+ */
+export function traeUpdateAccount(
+  patch: TraeAccountPatch,
+): Promise<{ ok: boolean; account: TraeAccountMeta }> {
+  return call<{ ok: boolean; account: TraeAccountMeta }>("trae_update_account", {
+    userId: patch.userId,
+    name: patch.name ?? null,
+    jwt: patch.jwt ?? null,
+    refreshToken: patch.refreshToken ?? null,
+  });
+}
+
+/** 读取账号的完整 JWT（仅查看/编辑弹窗回填用）。 */
+export function traeAccountJwt(userId: string): Promise<{ userId: string; jwt: string }> {
+  return call<{ userId: string; jwt: string }>("trae_account_jwt", { userId });
+}
+
+/** JWT 解析结果（`valid: false` 时其余字段为 null，不抛错）。 */
+export interface TraeJwtInfo {
+  valid: boolean;
+  userId: string | null;
+  expHours: number | null;
+  expTimestamp: number | null;
+  status: string;
+}
+
+/** 解析一段 JWT（编辑弹窗实时预览，不落库）。 */
+export function traeJwtParse(jwt: string): Promise<TraeJwtInfo> {
+  return call<TraeJwtInfo>("trae_jwt_parse", { jwt });
+}
+
+/** 清空全部账号的签到冷却。 */
+export function traeClearAllCooldowns(): Promise<{ ok: boolean; cleared: number }> {
+  return call<{ ok: boolean; cleared: number }>("trae_clear_all_cooldowns");
 }
 
 /** 本机发现到的 Trae 账号候选。 */
@@ -1139,6 +1278,151 @@ export function traeClearCooldown(userId: string): Promise<{ ok: boolean }> {
   return call<{ ok: boolean }>("trae_clear_cooldown", { userId });
 }
 
+/** 单账号 JWT 刷新结果。 */
+export interface TraeRefreshResult {
+  userId: string;
+  ok: boolean;
+  message: string;
+  /** 刷新后 JWT 的剩余有效小时数（`-1` 表示解析不出）。 */
+  expHours?: number;
+}
+
+/** 刷新某账号的 Trae JWT（`force` 跳过惰性门强制刷新）。 */
+export function traeRefreshAccount(
+  userId: string,
+  force = false,
+): Promise<TraeRefreshResult> {
+  return call<TraeRefreshResult>("trae_refresh_account", { userId, force });
+}
+
+/** 批量刷新全部 Trae 账号的 JWT。 */
+export function traeRefreshAll(): Promise<{
+  ok: number;
+  failed: number;
+  total: number;
+  results: TraeRefreshResult[];
+}> {
+  return call<{ ok: number; failed: number; total: number; results: TraeRefreshResult[] }>(
+    "trae_refresh_all",
+  );
+}
+
+/** 单个权益包。 */
+export interface TraeCreditPack {
+  name: string;
+  remaining: number;
+  total: number;
+  expireAt: string | null;
+}
+
+/** 三条积分账（IDE 积分 / 权益包 / 付费身份）。 */
+export interface TraeCreditDetail {
+  userId: string;
+  /** IDE 侧可用积分总数。 */
+  total: number | null;
+  packs: TraeCreditPack[];
+  payIdentity: string | null;
+  payExpireAt: string | null;
+  /** 逐来源错误（部分失败时仍返回已拿到的数据）。 */
+  errors: string[];
+}
+
+/** 读取某账号的三条积分账。 */
+export function traeCreditDetail(userId: string): Promise<TraeCreditDetail> {
+  return call<TraeCreditDetail>("trae_credit_detail", { userId });
+}
+
+/** 刷新全部账号的付费身份缓存。 */
+export function traeRefreshPayStatus(): Promise<{ ok: number; cache: unknown }> {
+  return call<{ ok: number; cache: unknown }>("trae_refresh_pay_status");
+}
+
+/** 读取付费身份缓存（不发网络请求）。 */
+export function traePayStatusCache(): Promise<unknown> {
+  return call<unknown>("trae_pay_status_cache");
+}
+
+// ---------------------------------------------------------------------------
+// 账号分组（Trae / 豆包 分域）
+// ---------------------------------------------------------------------------
+
+/** 分组所属应用。 */
+export type GroupApp = "Trae" | "Doubao";
+
+/** 一个分组及其成员。 */
+export interface AccountGroup {
+  id: string;
+  name: string;
+  color: string;
+  order: number;
+  count: number;
+  uids: string[];
+}
+
+/** 分组视图。 */
+export interface GroupsView {
+  app: GroupApp;
+  groups: AccountGroup[];
+  /** uid → groupId（只含仍然存在的分组）。 */
+  membership: Record<string, string>;
+}
+
+/** 某应用的分组列表。 */
+export function groupsList(app: GroupApp): Promise<GroupsView> {
+  return call<GroupsView>("groups_list", { app });
+}
+
+/** 新建分组。 */
+export function groupCreate(
+  app: GroupApp,
+  name: string,
+  color = "slate",
+): Promise<{ ok: boolean; id: string; groups: GroupsView }> {
+  return call<{ ok: boolean; id: string; groups: GroupsView }>("group_create", {
+    app,
+    name,
+    color,
+  });
+}
+
+/** 更新分组（只改传入的字段）。 */
+export function groupUpdate(args: {
+  app: GroupApp;
+  id: string;
+  name?: string;
+  color?: string;
+  order?: number;
+}): Promise<{ ok: boolean; groups: GroupsView }> {
+  return call<{ ok: boolean; groups: GroupsView }>("group_update", {
+    app: args.app,
+    id: args.id,
+    name: args.name ?? null,
+    color: args.color ?? null,
+    order: args.order ?? null,
+  });
+}
+
+/** 删除分组（连带清掉成员映射）。 */
+export function groupDelete(
+  app: GroupApp,
+  id: string,
+): Promise<{ ok: boolean; groups: GroupsView }> {
+  return call<{ ok: boolean; groups: GroupsView }>("group_delete", { app, id });
+}
+
+/** 把账号移入/移出分组（`groupId` 为空 = 移出）。 */
+export function groupMove(
+  app: GroupApp,
+  userId: string,
+  groupId: string | null,
+): Promise<{ ok: boolean; groups: GroupsView }> {
+  return call<{ ok: boolean; groups: GroupsView }>("group_move", {
+    app,
+    userId,
+    groupId,
+  });
+}
+
 /** 豆包账号视图（凭证已脱敏）。 */
 export interface DoubaoAccountView {
   userId: string;
@@ -1154,6 +1438,10 @@ export interface DoubaoAccountView {
   sessionExpireAt: string | null;
   expired: boolean | null;
   sessionState: "ok" | "expired" | "unknown" | "none";
+  /** 到期分层：界面据此上色（fresh 常态 / soon 黄 / expired 红）。 */
+  expiryTier?: "unknown" | "fresh" | "soon" | "expired";
+  /** 距到期天数（向上取整；已过期为负数；无凭证为 null）。 */
+  daysLeft?: number | null;
   sessionSource: string | null;
   cookiesSyncedAt: string | null;
   lastRenewAt: string | null;
@@ -1161,16 +1449,31 @@ export interface DoubaoAccountView {
   quotaExpireAt: string | null;
   quotaSummary: string | null;
   quotaCheckedAt: string | null;
+  /** 当前时段额度已用百分比（无缓存/无该窗口时为 null）。 */
+  quotaUsedPercent?: number | null;
+  // ---- 快照统计（由 doubao_list_accounts 合并） ----
+  hasSnapshot?: boolean;
+  sizeBytes?: number;
+  fileCount?: number;
+  /** Unix 秒；无快照为 null。 */
+  lastModified?: number | null;
+  /** 是否为当前登录账号。 */
+  isCurrent?: boolean;
+  /** 只有快照、账号池里已无该条目。 */
+  orphanSnapshot?: boolean;
 }
 
 /** 豆包账号列表。 */
 export function doubaoListAccounts(): Promise<{
   accounts: DoubaoAccountView[];
   lastKeepaliveAt: string | null;
+  currentUserId?: string;
 }> {
-  return call<{ accounts: DoubaoAccountView[]; lastKeepaliveAt: string | null }>(
-    "doubao_list_accounts",
-  );
+  return call<{
+    accounts: DoubaoAccountView[];
+    lastKeepaliveAt: string | null;
+    currentUserId?: string;
+  }>("doubao_list_accounts");
 }
 
 /** 新增/更新豆包账号。 */
@@ -1186,9 +1489,486 @@ export function doubaoPublishAccount(args: {
   });
 }
 
-/** 删除豆包账号。 */
-export function doubaoDeleteAccount(userId: string): Promise<{ ok: boolean }> {
-  return call<{ ok: boolean }>("doubao_delete_account", { userId });
+/** 删除豆包账号（`deleteSnapshot` 默认 true，避免留下孤儿快照）。 */
+export function doubaoDeleteAccount(
+  userId: string,
+  deleteSnapshot = true,
+): Promise<{ ok: boolean; snapshotRemoved?: boolean }> {
+  return call<{ ok: boolean; snapshotRemoved?: boolean }>("doubao_delete_account", {
+    userId,
+    deleteSnapshot,
+  });
+}
+
+/** 当前登录 uid 的探测结果（含各来源明细，便于排查为什么探测不到）。 */
+export function doubaoDetectUid(): Promise<{
+  uid: string | null;
+  sources: { source: string; uid: string }[];
+}> {
+  return call<{ uid: string | null; sources: { source: string; uid: string }[] }>(
+    "doubao_detect_uid",
+  );
+}
+
+/** 快照版本元数据（`schemaVersion: 0` 表示无 meta 文件的旧快照）。 */
+export interface DoubaoSnapshotMeta {
+  userId: string;
+  schemaVersion: number;
+  createdAt: string | null;
+  chromiumVersion: string | null;
+  includeIndexedDB: boolean;
+  hasMeta: boolean;
+}
+
+/** 读取账号快照的版本元数据。 */
+export function doubaoSnapshotMeta(userId: string): Promise<DoubaoSnapshotMeta> {
+  return call<DoubaoSnapshotMeta>("doubao_snapshot_meta", { userId });
+}
+
+/** 一键以该账号打开豆包客户端（恢复快照 → 拉起客户端）。 */
+export function doubaoOpenAsAccount(
+  userId: string,
+  proxyPort?: number,
+): Promise<{ ok: boolean; message: string; error: string; steps: unknown[] }> {
+  return call<{ ok: boolean; message: string; error: string; steps: unknown[] }>(
+    "doubao_open_as_account",
+    { userId, proxyPort: proxyPort ?? null },
+  );
+}
+
+/** 豆包运维历史事件。 */
+export interface DoubaoHealthEvent {
+  at: string;
+  kind: "keepalive" | "renew" | "quota";
+  ok: boolean;
+  uid?: string | null;
+  level?: string | null;
+  summary?: string;
+  windows?: { name?: string; usedPercent?: number; exhausted?: boolean; resetAt?: string }[];
+}
+
+/** 豆包运维健康史的完整返回体。 */
+export interface DoubaoHistory {
+  events: DoubaoHealthEvent[];
+  trend: { date: string; usedPercent: number; level: string | null; uid: string | null }[];
+  health: {
+    days: number;
+    keepalive: number;
+    renew: number;
+    quota: number;
+    ok: number;
+    failed: number;
+    lastKeepaliveAt: string | null;
+  };
+  requestedDays: number;
+}
+
+/** 豆包运维健康史（事件 + 14 天额度趋势 + 7 天健康计数）。 */
+export function doubaoHistory(days = 30): Promise<DoubaoHistory> {
+  return call<DoubaoHistory>("doubao_history", { days });
+}
+
+/** 豆包设置。 */
+export interface DoubaoAppSettings {
+  /** 快照是否纳入 IndexedDB（体积大一个量级，默认关）。 */
+  doubao_snapshot_include_idb: boolean;
+}
+
+/** 读取豆包设置。 */
+export function doubaoGetSettings(): Promise<DoubaoAppSettings> {
+  return call<DoubaoAppSettings>("doubao_settings");
+}
+
+/** 写入一项豆包设置。 */
+export function doubaoSetSetting<K extends keyof DoubaoAppSettings>(
+  key: K,
+  value: DoubaoAppSettings[K],
+): Promise<DoubaoAppSettings> {
+  return call<DoubaoAppSettings>("doubao_set_setting", { key, value });
+}
+
+// ---------------------------------------------------------------------------
+// Trae OAuth 授权码登录
+// ---------------------------------------------------------------------------
+
+/** 授权 URL 响应。 */
+export interface TraeOAuthLoginUrl {
+  url: string;
+  state: string;
+  redirectUri: string;
+  port: number;
+}
+
+/** 登录完成事件负载（桌面宿主通过 `oauth-login-done` 推送）。 */
+export interface TraeOAuthDoneEvent {
+  ok: boolean;
+  message: string;
+  userId: string | null;
+}
+
+/**
+ * 签发 OAuth 授权 URL。
+ *
+ * 调用后应立刻在浏览器打开 `url`（桌面宿主还会先启动 17388 回环监听）。
+ */
+export function oauthLoginUrl(accountName?: string): Promise<TraeOAuthLoginUrl> {
+  return call<TraeOAuthLoginUrl>("oauth_login_url", { accountName: accountName ?? null });
+}
+
+/**
+ * 启动本机回环监听器（桌面专属）。
+ *
+ * 端口被占用时抛错 —— 此时界面应降级为「手动粘贴回调地址」，
+ * 而不是让用户对着一个永远等不到回调的弹窗发呆。
+ */
+export function oauthStartLoopback(accountName?: string): Promise<{
+  ok: boolean;
+  port: number;
+  redirectUri: string;
+  idleTimeoutSecs: number;
+}> {
+  return call("oauth_start_loopback", { accountName: accountName ?? null });
+}
+
+/** 停止本机回环监听器（桌面专属；未启动时幂等成功）。 */
+export function oauthStopLoopback(): Promise<{ ok: boolean }> {
+  return call("oauth_stop_loopback");
+}
+
+/** 放弃当前登录会话。 */
+export function oauthCancel(): Promise<{ ok: boolean }> {
+  return call("oauth_cancel");
+}
+
+/**
+ * 当前是否仍在等待 OAuth 回调（桌面专属）。
+ *
+ * 界面重开弹窗时用它判断「后端是否还有一个未完成的会话」——
+ * 直接假定没有会让用户重开后拿到一个 state 已经对不上的登录。
+ */
+export function oauthPending(): Promise<{ pending: boolean }> {
+  return call("oauth_pending");
+}
+
+/**
+ * 手动提交浏览器回调 URL（兜底路径）。
+ *
+ * 端口被占用、自动收尾失败、或用户在别的浏览器里完成授权时都靠这条路径。
+ */
+export function oauthSubmitCallback(
+  callbackUrl: string,
+  accountName?: string,
+): Promise<{ ok: boolean; userId: string; message: string }> {
+  return call("oauth_submit_callback", { callbackUrl, accountName: accountName ?? null });
+}
+
+// ---------------------------------------------------------------------------
+// 应用内调度
+// ---------------------------------------------------------------------------
+
+/** 应用内调度的一项任务。 */
+export interface InAppScheduleTask {
+  kind: string;
+  label: string;
+  /** 触发时间 `HH:MM`。 */
+  at: string;
+  /** 最近一次成功执行的日期（`YYYY-MM-DD`），从未跑过为 null。 */
+  lastRunDay: string | null;
+}
+
+/** 应用内调度的任务清单。 */
+export function inAppScheduleView(): Promise<{ tasks: InAppScheduleTask[] }> {
+  return call<{ tasks: InAppScheduleTask[] }>("in_app_schedule_view");
+}
+
+/** 手动触发一轮应用内调度。 */
+export function runInAppDueTasks(): Promise<{
+  ran: { kind: string; label: string; scheduledAt: string; ok: boolean; exitCode: number }[];
+  checkedAt: string;
+}> {
+  return call("run_in_app_due_tasks");
+}
+
+// ---------------------------------------------------------------------------
+// Trae 账号导出 / 导入
+// ---------------------------------------------------------------------------
+
+/** Trae 账号导出结果（`text` 含明文 JWT 与 refresh_token）。 */
+export interface TraeExportResult {
+  ok: boolean;
+  count: number;
+  text: string;
+}
+
+/**
+ * 导出 Trae 账号。
+ *
+ * 不传 `userIds` 即导出全部。返回的 `text` 含**明文凭证**，
+ * 界面必须明确提示用户妥善保管。
+ */
+export function traeExportAccounts(userIds?: string[]): Promise<TraeExportResult> {
+  return call<TraeExportResult>("trae_export_accounts", { userIds: userIds ?? null });
+}
+
+/** 导入预览里的一项账号。 */
+export interface TraeImportPreviewItem {
+  userId: string;
+  name: string;
+  hasRefreshToken: boolean;
+  /** 账号库里已有同 uid —— 导入会覆盖它。 */
+  willOverwrite: boolean;
+}
+
+/** 预览 Trae 账号导入文件（不落库）。 */
+export function traePreviewImport(fileText: string): Promise<{
+  ok: boolean;
+  count: number;
+  exportedAt: string | null;
+  accounts: TraeImportPreviewItem[];
+}> {
+  return call("trae_preview_import", { fileText });
+}
+
+/** 导入 Trae 账号（同 uid 覆盖，其余追加）。 */
+export function traeImportAccounts(fileText: string): Promise<{
+  ok: boolean;
+  added: number;
+  updated: number;
+  skipped: number;
+}> {
+  return call("trae_import_accounts", { fileText });
+}
+
+// ---------------------------------------------------------------------------
+// Trae 积分趋势
+// ---------------------------------------------------------------------------
+
+/** 一天的积分汇总（`null` = 这天没有采到数据，与「积分归零」不同）。 */
+export interface TraeCreditsDay {
+  date: string;
+  total: number | null;
+  consumed: number | null;
+}
+
+/** 单个账号的最新积分快照。 */
+export interface TraeCreditsAccount {
+  userId: string;
+  name: string;
+  credits: number | null;
+  updatedAt: string | null;
+}
+
+/** 积分趋势统计。 */
+export interface TraeCreditsStats {
+  days: number;
+  daily: TraeCreditsDay[];
+  summary: {
+    latestTotal: number | null;
+    firstTotal: number | null;
+    /** 区间内消耗合计（仅统计有数据的天）。 */
+    consumed: number | null;
+    /** 实际采到数据的天数 —— 据此判断趋势可不可信。 */
+    observedDays: number;
+    /** 首末总量差（`null` = 数据不足）。 */
+    change: number | null;
+  };
+  accounts: TraeCreditsAccount[];
+}
+
+/** 积分趋势统计（`daily` 按天补齐，缺天为 null）。 */
+export function traeCreditsStats(days = 30): Promise<TraeCreditsStats> {
+  return call<TraeCreditsStats>("trae_credits_stats", { days });
+}
+
+// ---------------------------------------------------------------------------
+// 客户端启动
+// ---------------------------------------------------------------------------
+
+/**
+ * 拉起客户端（**不**切账号、不备份、不关进程）。
+ *
+ * 与 `switchAccount` 的区别是零副作用：不动任何快照槽。
+ * 用户说「打开 Trae」时该走这里，而不是走切换。
+ */
+export function appLaunch(
+  targetApp: string,
+  proxyPort?: number,
+): Promise<{ ok: boolean; message: string }> {
+  return call<{ ok: boolean; message: string }>("app_launch", {
+    targetApp,
+    proxyPort: proxyPort ?? null,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 抓包日志查看
+// ---------------------------------------------------------------------------
+
+/** 抓包日志的一条摘要（列表用，不含正文）。 */
+export interface ProxyLogEntry {
+  /** `文件名:条目序号`，详情接口按它定位。 */
+  id: string;
+  timestamp: string;
+  /** `HTTP GET` / `WebSocket` 这类展示用形态。 */
+  method: string;
+  host: string;
+  path: string;
+  /** 响应状态；取不到时为 `-`。 */
+  status: string;
+  size: number;
+  /** SSE 汇总里的模型名（非流式请求没有这个字段）。 */
+  sseModel?: string;
+  /** SSE token 用量摘要，形如 `p:120 c:340 t:460`。 */
+  sseTokens?: string;
+}
+
+export interface ProxyLogList {
+  entries: ProxyLogEntry[];
+  /** 过滤后的**总数**（不是本页条数），用于分页。 */
+  total: number;
+}
+
+/** 抓包日志目录概况。 */
+export interface ProxyLogsOverview {
+  dir: string;
+  fileCount: number;
+  totalBytes: number;
+  oldest: string | null;
+  newest: string | null;
+}
+
+export interface ProxyLogQuery {
+  keyword?: string;
+  /** `YYYY-MM-DD HH:MM:SS`，含端点。 */
+  startTime?: string;
+  endTime?: string;
+  offset?: number;
+  limit?: number;
+}
+
+/** 列出抓包日志条目（时间倒序，新的在前）。 */
+export function proxyLogsList(query: ProxyLogQuery = {}): Promise<ProxyLogList> {
+  return call<ProxyLogList>("proxy_logs_list", {
+    keyword: query.keyword ?? null,
+    startTime: query.startTime ?? null,
+    endTime: query.endTime ?? null,
+    offset: query.offset ?? 0,
+    limit: query.limit ?? 50,
+  });
+}
+
+/** 取单条日志的完整正文。 */
+export async function proxyLogDetail(id: string): Promise<string> {
+  const res = await call<{ content: string }>("proxy_log_detail", { id });
+  return res.content;
+}
+
+/** 日志目录概况（文件数 / 体积 / 日期范围）。 */
+export function proxyLogsOverview(): Promise<ProxyLogsOverview> {
+  return call<ProxyLogsOverview>("proxy_logs_overview");
+}
+
+/**
+ * 删除抓包日志。
+ *
+ * `keepDays` 有值时只删该天数以前的；不传则全删。
+ */
+export function proxyLogsClear(keepDays?: number): Promise<{ removed: number }> {
+  return call<{ removed: number }>("proxy_logs_clear", {
+    keepDays: keepDays ?? null,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Trae 签到趋势
+// ---------------------------------------------------------------------------
+
+/** 一天的签到汇总。 */
+export interface TraeCheckinTrendPoint {
+  date: string;
+  ok: number;
+  already: number;
+  failed: number;
+  total: number;
+  /** 成功率百分比；「已签到」算成功。 */
+  successRate: number | null;
+}
+
+/** 签到成功率趋势。 */
+export interface TraeCheckinTrends {
+  days: number;
+  /** 只含实际有记录的日期（不补 0 高度的柱子）。 */
+  points: TraeCheckinTrendPoint[];
+  summary: {
+    ok: number;
+    already: number;
+    failed: number;
+    total: number;
+    observedDays: number;
+    /** 区间成功率；无样本时为 `null`（不是 0）。 */
+    successRate: number | null;
+  };
+}
+
+/** 签到成功率趋势（同 uid 同天只记最终态）。 */
+export function traeCheckinTrends(days = 30): Promise<TraeCheckinTrends> {
+  return call<TraeCheckinTrends>("trae_checkin_trends", { days });
+}
+
+/** 单日积分消耗（官方会话级用量聚合）。 */
+export interface TraeUsageDay {
+  date: string;
+  credits: number;
+  sessions: number;
+  /** 模型 → 当日扣费。 */
+  models: Record<string, number>;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+}
+
+/** 单个账号的消耗历史。 */
+export interface TraeUsageAccount {
+  userId: string;
+  name: string;
+  ok: boolean;
+  /** 拉取失败时的说明（有缓存时为「展示的是缓存」）。 */
+  error: string | null;
+  daily: TraeUsageDay[];
+  totalCredits: number;
+  sessions: number;
+  /** 模型消耗排行（按扣费降序）。 */
+  models: { model: string; credits: number }[];
+}
+
+/** 积分消耗历史。 */
+export interface TraeUsageHistory {
+  fetchedAt: number;
+  /** true = 纯缓存读取，本次没有发起网络请求。 */
+  cached: boolean;
+  accounts: TraeUsageAccount[];
+}
+
+/**
+ * 积分消耗历史（官方会话级用量）。
+ *
+ * 与 `traeCreditsStats` 的口径不同：那个是**余额差值**推算，会被签到补发干扰；
+ * 这个是接口返回的**真实扣费**，能按模型拆分。两个都看才能分清「消耗」与「补发」。
+ *
+ * `fresh = false` 时零网络请求，只回缓存。
+ */
+export function traeUsageHistory(fresh = true): Promise<TraeUsageHistory> {
+  return call<TraeUsageHistory>("trae_usage_history", { fresh });
+}
+
+/** 立即采样一次积分快照。 */
+export function traeCreditsSnapshot(): Promise<{
+  ok: boolean;
+  sampled: number;
+  failed: number;
+  errors: string[];
+}> {
+  return call("trae_credits_snapshot");
 }
 
 /** 读取账号的明文凭证（仅编辑弹窗回填用）。 */
@@ -1257,23 +2037,31 @@ export function doubaoKeepalive(): Promise<{ ok: boolean; message: string }> {
   return call<{ ok: boolean; message: string }>("doubao_keepalive");
 }
 
-/** HTTP 续期探活。 */
-export function doubaoRenew(syncOnly = false): Promise<{
+/** HTTP 续期探活的结果。 */
+export interface DoubaoRenewResult {
   ok: number;
   expired: number;
   skipped: number;
   errors: number;
   total: number;
   results: { userId: string; name: string; status: string; message: string }[];
-}> {
-  return call<{
-    ok: number;
-    expired: number;
-    skipped: number;
-    errors: number;
-    total: number;
-    results: { userId: string; name: string; status: string; message: string }[];
-  }>("doubao_renew", { syncOnly });
+  /** HTTP 全部失败时是否已回退到客户端保活。 */
+  fallbackUsed?: boolean;
+  /** 回退的说明文案（`fallbackUsed` 为真时才有）。 */
+  fallbackMessage?: string;
+}
+
+/**
+ * HTTP 续期探活。
+ *
+ * `fallbackToKeepalive` 为真时，若 HTTP 路径**全部**失败则自动回退到拉起客户端保活
+ * —— 凭证池里的 sessionid 被客户端刷新过时，这是唯一还能救回会话的路子。
+ */
+export function doubaoRenew(
+  syncOnly = false,
+  fallbackToKeepalive = false,
+): Promise<DoubaoRenewResult> {
+  return call<DoubaoRenewResult>("doubao_renew", { syncOnly, fallbackToKeepalive });
 }
 
 /** 会话与凭证诊断。 */

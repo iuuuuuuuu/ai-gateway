@@ -4,6 +4,8 @@ mod commands;
 mod commands_apps;
 // 本地 MITM 代理的命令层（系统代理编排 + 事件转发）
 mod commands_proxy;
+// Trae OAuth 回环监听器：redirect_uri 落在 127.0.0.1:17388，需宿主起 HTTP 服务
+mod oauth_loopback;
 #[cfg(desktop)]
 mod tray;
 
@@ -96,6 +98,43 @@ fn spawn_background_loops() {
             eprintln!("[account] 已清理 {purged} 条无凭据的残留账号记录");
         }
         modules::gateway::run_auto_sync_loop(30).await;
+    });
+
+    // 应用内调度：应用运行期间把到点的豆包/Trae 日常运维动作跑掉。
+    //
+    // 与 schtasks 路线并存：schtasks 在应用没开时也能跑，但注册要管理员权限、
+    // 改设置要等下次注册才生效；应用内调度让「今天该做的事」立刻生效。
+    // 两条路都调同一个 `cli_task`，执行语义一致。
+    tauri::async_runtime::spawn(async move {
+        // 启动先等 60 秒：让网关同步、窗口渲染先跑完，避免开机瞬间抢资源
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        loop {
+            // 任务内部有网络请求与进程启停，必须放进 blocking 线程
+            let outcome =
+                tauri::async_runtime::spawn_blocking(modules::apps_ops::run_in_app_due_tasks).await;
+            match outcome {
+                Ok(v) => {
+                    let ran = v.get("ran").and_then(|r| r.as_array());
+                    if let Some(list) = ran.filter(|l| !l.is_empty()) {
+                        for item in list {
+                            eprintln!(
+                                "[in-app-schedule] 已执行 {}（{}）：{}",
+                                item.get("label").and_then(|s| s.as_str()).unwrap_or(""),
+                                item.get("kind").and_then(|s| s.as_str()).unwrap_or(""),
+                                if item.get("ok").and_then(|b| b.as_bool()) == Some(true) {
+                                    "成功"
+                                } else {
+                                    "失败"
+                                }
+                            );
+                        }
+                    }
+                }
+                Err(e) => eprintln!("[in-app-schedule] 调度轮次异常: {e}"),
+            }
+            // 每分钟巡检一次：到点判断本身很轻，接口调用由 run_in_app_due_tasks 兜住
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
     });
 }
 
@@ -274,6 +313,21 @@ pub fn run() {
             commands_apps::trae_list_accounts,
             commands_apps::trae_add_account,
             commands_apps::trae_delete_account,
+            // ---- Trae 账号编辑 / JWT 查看与解析 ----
+            commands_apps::trae_update_account,
+            commands_apps::trae_account_jwt,
+            commands_apps::trae_jwt_parse,
+            commands_apps::trae_clear_all_cooldowns,
+            // ---- Trae OAuth 授权码登录（含本机回环回调）----
+            oauth_loopback::oauth_start_loopback,
+            oauth_loopback::oauth_stop_loopback,
+            oauth_loopback::oauth_login_url,
+            oauth_loopback::oauth_submit_callback,
+            oauth_loopback::oauth_pending,
+            oauth_loopback::oauth_cancel,
+            // ---- 豆包设置 ----
+            commands_apps::doubao_settings,
+            commands_apps::doubao_set_setting,
             commands_apps::trae_discover_accounts,
             commands_apps::trae_import_local,
             commands_apps::trae_discover_and_import,
@@ -282,9 +336,27 @@ pub fn run() {
             commands_apps::trae_checkin_run,
             commands_apps::trae_credits_history,
             commands_apps::trae_clear_cooldown,
+            // ---- Trae 凭证续期（ExchangeToken 刷新 JWT） ----
+            commands_apps::trae_refresh_account,
+            commands_apps::trae_refresh_all,
+            // ---- Trae 积分与套餐身份 ----
+            commands_apps::trae_credit_detail,
+            commands_apps::trae_refresh_pay_status,
+            commands_apps::trae_pay_status_cache,
+            // ---- 账号分组（Trae / 豆包 分域） ----
+            commands_apps::groups_list,
+            commands_apps::group_create,
+            commands_apps::group_update,
+            commands_apps::group_delete,
+            commands_apps::group_move,
             commands_apps::doubao_list_accounts,
             commands_apps::doubao_save_account,
             commands_apps::doubao_delete_account,
+            // ---- 豆包：uid 探测 / 快照元数据 / 一键打开 / 运维历史 ----
+            commands_apps::doubao_detect_uid,
+            commands_apps::doubao_snapshot_meta,
+            commands_apps::doubao_open_as_account,
+            commands_apps::doubao_history,
             commands_apps::doubao_get_credential,
             commands_apps::doubao_set_credential,
             commands_apps::doubao_captured_credential,
@@ -306,6 +378,26 @@ pub fn run() {
             commands_apps::task_register,
             commands_apps::task_unregister,
             commands_apps::task_run_now,
+            // ---- 应用内调度（应用运行期间的到点运维动作）----
+            commands_apps::in_app_schedule_view,
+            commands_apps::run_in_app_due_tasks,
+            // ---- Trae 账号导出 / 导入 ----
+            commands_apps::trae_export_accounts,
+            commands_apps::trae_preview_import,
+            commands_apps::trae_import_accounts,
+            // ---- 客户端启动 ----
+            commands_apps::app_launch,
+            // ---- 抓包日志查看 ----
+            commands_apps::proxy_logs_list,
+            commands_apps::proxy_log_detail,
+            commands_apps::proxy_logs_overview,
+            commands_apps::proxy_logs_clear,
+            // ---- Trae 签到趋势 ----
+            commands_apps::trae_checkin_trends,
+            // ---- Trae 积分趋势 ----
+            commands_apps::trae_usage_history,
+            commands_apps::trae_credits_stats,
+            commands_apps::trae_credits_snapshot,
             // ---- 本地 MITM 代理（设备身份隔离 + 凭证抓取） ----
             commands_proxy::proxy_config,
             commands_proxy::proxy_status,

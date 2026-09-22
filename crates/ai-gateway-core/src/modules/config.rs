@@ -211,6 +211,35 @@ pub fn store_dir() -> PathBuf {
     home_dir().join(".wb-switch")
 }
 
+/// uid 是否可安全用作路径片段。
+///
+/// uid 来自抓包、客户端 `storage.json`、`Local State` 等**外部输入**，
+/// 含 `..` 或路径分隔符时可以越出数据目录（如 `..\..\..\Windows\System32`）。
+/// 因此每个 uid → 路径的入口都必须先过这一关。
+///
+/// 放在 `config` 而不是某个账号模块：这是**路径策略**，Trae / 豆包 / 快照槽位
+/// 都要用；挂在豆包模块下会让人觉得只有豆包需要校验（这正是之前 Trae 路径
+/// 漏掉校验的原因）。
+pub fn ensure_uid_safe(uid: &str) -> Result<(), String> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        return Err("缺少账号标识（userId）".to_string());
+    }
+    if uid.len() > 64 {
+        return Err("账号标识过长（超过 64 字符）".to_string());
+    }
+    if uid.contains("..") {
+        return Err("账号标识含非法片段 `..`".to_string());
+    }
+    if !uid
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("账号标识只能包含字母、数字、下划线与连字符".to_string());
+    }
+    Ok(())
+}
+
 pub fn accounts_file() -> PathBuf {
     store_dir().join("accounts.json")
 }
@@ -1076,9 +1105,59 @@ pub async fn http_request(
     http_request_with_proxy(url, method, body, headers, None).await
 }
 
-/// 通用 HTTP 请求，可为单次请求显式指定 HTTP/HTTPS 代理。
-pub async fn http_request_with_proxy(
+/// 强制**直连**的 HTTP 请求（忽略设置里的代理）。
+///
+/// 专供 OAuth 交换链路：本地 MITM 代理解密浏览器 OAuth 流量会让授权页报
+/// `ERR_CERT_AUTHORITY_INVALID`，而且 ExchangeToken 走代理时一旦 CA 未信任就
+/// 直接失败。这条链路必须绕开代理 —— 参考实现为此单独做了代理豁免白名单，
+/// 这里用「不挂代理的独立客户端」达到同样效果且不依赖系统代理配置。
+pub async fn http_request_direct(
     url: &str,
+    method: &str,
+    body: Option<Value>,
+    headers: Option<&HashMap<String, String>>,
+) -> Value {
+    static DIRECT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = DIRECT.get_or_init(|| {
+        // 有意不调用 apply_proxy：这就是「直连」的定义
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .user_agent(DEFAULT_HTTP_USER_AGENT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+    let mut req = client.request(method, url);
+    req = req.header("Content-Type", "application/json");
+    if let Some(h) = headers {
+        for (k, v) in h {
+            req = req.header(k, v);
+        }
+    }
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                serde_json::from_str(&text).unwrap_or(Value::Null)
+            } else {
+                serde_json::from_str(&text).unwrap_or_else(|_| {
+                    json!({
+                        "code": status.as_u16(),
+                        "message": text.chars().take(500).collect::<String>(),
+                    })
+                })
+            }
+        }
+        Err(e) => json!({"code": -1, "message": e.to_string()}),
+    }
+}
+
+/// 通用 HTTP 请求，可为单次请求显式指定 HTTP/HTTPS 代理。
+pub async fn http_request_with_proxy(    url: &str,
     method: &str,
     body: Option<Value>,
     headers: Option<&HashMap<String, String>>,

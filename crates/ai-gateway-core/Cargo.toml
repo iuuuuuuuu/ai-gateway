@@ -68,6 +68,8 @@ regex = "1"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # 读取本机 AI CLI 的登录凭证（凭据管理器 `gemini:antigravity`）
+    "Win32_Security_Credentials",
     "Win32_Security_Cryptography",
     "Win32_System_JobObjects",
     "Win32_System_Threading",

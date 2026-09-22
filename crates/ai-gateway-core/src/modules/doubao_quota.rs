@@ -382,15 +382,14 @@ pub async fn run_batch() -> Value {
                     exhausted.push(name.clone());
                 }
                 // 写回额度缓存（供账号列表直接展示，无需每次重新查询）
-                let level = parsed.level.clone();
-                let expire = parsed.expire_at.clone();
-                let summary_clone = summary.clone();
-                let _ = doubao_account::mutate_account(uid, |obj| {
-                    obj.insert("quota_level".to_string(), json!(level));
-                    obj.insert("quota_expire_at".to_string(), json!(expire));
-                    obj.insert("quota_summary".to_string(), json!(summary_clone));
-                    obj.insert("quota_checked_at".to_string(), json!(config::utc_iso()));
-                });
+                crate::modules::apps_ops::write_quota_cache(uid, &parsed);
+                let _ = crate::modules::doubao_health::record_quota(
+                    true,
+                    uid,
+                    &parsed.level.clone().unwrap_or_default(),
+                    &summary,
+                    &parsed.windows,
+                );
                 results.push(json!({
                     "userId": uid, "name": name, "ok": true, "summary": summary,
                     "level": parsed.level, "expireAt": parsed.expire_at,

@@ -69,6 +69,7 @@ name = "ai-gateway"
 version = "1.0.7"
 dependencies = [
  "ai-gateway-core",
+ "axum",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
