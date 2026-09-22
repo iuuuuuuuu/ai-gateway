@@ -314,13 +314,18 @@ jobs:
           RELEASE_DIR="target/${{ matrix.target }}/release"
           [ -d "$RELEASE_DIR" ] || RELEASE_DIR="src-tauri/target/${{ matrix.target }}/release"
 
-          COUNT=$(find "$RELEASE_DIR" -maxdepth 1 -type f -name '*.exe' | wc -l | tr -d ' ')
-          if [ "$COUNT" != "1" ]; then
-            echo "预期 release 目录下有 1 个主程序 exe，实际 $COUNT 个:" >&2
-            find "$RELEASE_DIR" -maxdepth 1 -type f -name '*.exe' >&2 || true
+          # 主程序固定是 ai-gateway.exe。release 目录里还会有上一步「构建内嵌网关」
+          # 落下的 gateway.exe —— CARGO_BUILD_TARGET 是 job 级 env，内嵌网关与主程序
+          # 落进同一个 target/<triple>/release/。v1.0.7 就是被「数目录里所有 exe
+          # 必须恰好 1 个」的断言拦死（实际 2 个），Windows 产物全缺，
+          # 发布任务没有 latest-*.json 可合并而失败，Release 没发出去。
+          # 这里改为按名字取主程序，断言只保证它存在。
+          EXE="$RELEASE_DIR/ai-gateway.exe"
+          if [ ! -f "$EXE" ]; then
+            echo "未找到主程序 $EXE；release 目录内容:" >&2
+            find "$RELEASE_DIR" -maxdepth 1 -type f >&2 || true
             exit 1
           fi
-          EXE=$(find "$RELEASE_DIR" -maxdepth 1 -type f -name '*.exe')
 
           mkdir -p dist-bin
           STAGE=$(mktemp -d)
