@@ -494,6 +494,9 @@ mod tests {
 
     #[test]
     fn 授权_url_带齐_native_ide_参数() {
+        // `login_url` 会写进程级全局 `PENDING`，必须与其他用例共用同一把锁，
+        // 否则会把别人刚种下的 state 覆盖掉（表现为 parse_callback 报 CSRF 不匹配）。
+        let _iso = config::test_isolation::Isolated::new("trae_oauth");
         let out = login_url(Some("我的主号")).expect("应能签发");
         let url = out["url"].as_str().unwrap();
         assert!(url.starts_with(OAUTH_AUTHORIZE_URL));
@@ -509,6 +512,8 @@ mod tests {
 
     #[test]
     fn 备注名里的特殊字符不会破坏_url() {
+        // 同上：login_url 写全局 PENDING，需持锁。
+        let _iso = config::test_isolation::Isolated::new("trae_oauth");
         // 备注名带 & 和空格时必须被编码，否则会多出伪造的 query 参数
         let out = login_url(Some("A&B = C")).expect("应能签发");
         let url = out["url"].as_str().unwrap();
