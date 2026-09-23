@@ -79,7 +79,7 @@ func loadLiveMapAccount(t *testing.T, uid8 string) *auth.Auth {
 			}
 			continue
 		}
-		if !strings.HasSuffix(strings.ToLower(a.Domain), ".ai") {
+		if !a.IsIntl() {
 			pick = a
 			break
 		}

@@ -152,18 +152,49 @@ func (a *growthTaskAdapter) runAll() (any, error) {
 	}, nil
 }
 
-// poolAuths 取出池里全部未禁用的账号。
+// poolAuths 取出池里可跑**成长任务**的账号。
 //
-// 跳过禁用账号：禁用语义是「不进账号池」，而成长任务要在池里跑才有凭据。
+// 两个过滤条件，各有明确理由：
+//
+//	① 跳过禁用账号 —— 禁用语义是「不进账号池」，而成长任务要在池里跑才有凭据。
+//	② 只取 **WorkBuddy** 账号 —— 成长任务是 WorkBuddy 专属的
+//	   （动作全打在 www.workbuddy.ai / copilot.tencent.com 上）。
+//
+// # ⚠ 为什么必须显式按产品过滤（2026-09-22 修，我引入的回归）
+//
+// 原实现只靠 `growtask.runAccount` 里的 `a.IsIntl()` 跳过"国际版账号"，
+// 隐含假设是「国际版 = 非 WorkBuddy」。那个假设**在区域判据改成
+// 完整域名白名单之后破了**：
+//
+//	改之前 IsIntl 只认 `.ai` 后缀 ⇒ Qoder 的 `qoder.sh` 判成国服
+//	                          ⇒ 它**不被跳过**（但那时也没人注意）
+//	改之后 qoder.sh 正确判成国际版 ⇒ 它**被跳过**了
+//
+// 方向上是"修好了"，但**依据是错的** —— 判据该是「是不是 WorkBuddy 账号」，
+// 而不是「是不是国际版账号」。否则：
+//
+//	· Qoder 国服账号（qoder.com.cn）在**改之前和之后**都会参与进来，
+//	  拿 Qoder 的令牌去打 WorkBuddy 的端点 —— 一直是错的，只是没人报
+//	· 将来若某产品增设国服成长任务，这条区域判据会把它一并挡掉
+//
+// 故这里按 `ProductOf()` 过滤（它把老账号的空 product 归一成 workbuddy，
+// 与池里其它地方同一口径），区域过滤保留在 growtask 内部作为**第二道**闸。
 func (a *growthTaskAdapter) poolAuths() []*auth.Auth {
 	out := make([]*auth.Auth, 0, 16)
 	for _, st := range a.p.List() {
 		if st.Disabled {
 			continue
 		}
-		if acc := a.p.AuthByUID(st.UID); acc != nil {
-			out = append(out, acc)
+		acc := a.p.AuthByUID(st.UID)
+		if acc == nil {
+			continue
 		}
+		if acc.ProductOf() != auth.ProductWorkBuddy {
+			// 非 WorkBuddy 账号（Qoder / ZCode）不该跑本包的动作 ——
+			// 它们有各自的令牌与端点，硬塞进来会拿错凭据、打到错的域名。
+			continue
+		}
+		out = append(out, acc)
 	}
 	return out
 }

@@ -85,7 +85,7 @@ func loadLiveAccount(t *testing.T, uid8 string) *auth.Auth {
 			}
 			continue
 		}
-		if !strings.HasSuffix(strings.ToLower(a.Domain), ".ai") {
+		if !a.IsIntl() {
 			pick = a
 			break
 		}
@@ -438,7 +438,7 @@ func TestLiveRealmInventory(t *testing.T) {
 	byRealm := map[string]int{}
 	for i := range all {
 		realm := "cn"
-		if strings.HasSuffix(strings.ToLower(all[i].Domain), ".ai") {
+		if all[i].IsIntl() {
 			realm = "global"
 		}
 		byRealm[realm]++
@@ -456,7 +456,7 @@ func TestLiveRealmInventory(t *testing.T) {
 	for _, realm := range realms {
 		var probe *liveAccount
 		for i := range all {
-			isIntl := strings.HasSuffix(strings.ToLower(all[i].Domain), ".ai")
+			isIntl := all[i].IsIntl()
 			if (realm == "global") == isIntl {
 				probe = &all[i]
 				break

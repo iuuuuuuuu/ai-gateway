@@ -251,6 +251,13 @@ const ROUTES: Record<string, Route> = {
   proxy_capture_local: { method: "POST", path: "/api/proxy/capture-local" },
   proxy_cleanup_stale: { method: "POST", path: "/api/proxy/cleanup" },
   proxy_parse_upstream: { method: "POST", path: "/api/proxy/parse-upstream" },
+  // 上游代理连通性自检（2026-09-22 新增）。
+  // 所有者：「设置里面的配置代理，也没有测试按钮 可以用来测试是否连通」
+  proxy_test_upstream: { method: "POST", path: "/api/proxy/test-upstream" },
+  // 本机代理**节点**探测（2026-09-23 新增）。
+  // 所有者：「探测本机配置的代理的速度那个更快更好」
+  // ⚠ 仅桌面端可用：要读本机代理软件的控制接口（命名管道 / unix socket）。
+  proxy_probe_nodes: { method: "POST", path: "/api/proxy/probe-nodes" },
   task_status: { method: "GET", path: "/api/tasks/status" },
   task_register: { method: "POST", path: "/api/tasks/register" },
   task_unregister: { method: "POST", path: "/api/tasks/unregister" },
@@ -2533,6 +2540,108 @@ export function proxyParseUpstream(
   spec: string,
 ): Promise<{ ok: boolean; addr?: string; error?: string }> {
   return call<{ ok: boolean; addr?: string; error?: string }>("proxy_parse_upstream", { spec });
+}
+
+/** 上游代理连通性自检的单项结果。 */
+export interface ProxyProbeItem {
+  name: string;
+  ok: boolean;
+  /** 只有成功时才有：HTTP 状态码（任何状态码都算"到达了"）。 */
+  status?: number;
+  elapsedMs?: number;
+  /**
+   * 这个域名是干什么的（如「WorkBuddy 国际版对话与任务」）。
+   *
+   * 用户看到某一项不通时，需要立刻知道**影响哪个功能** ——
+   * 否则他不知道要不要管它（`api3.qoder.sh` 不通意味着 Qoder 用不了，
+   * 而他可能根本不用 Qoder）。
+   */
+  purpose?: string;
+  detail: string;
+}
+
+/** 上游代理连通性自检的完整结果。 */
+export interface ProxyProbeResult {
+  /**
+   * **全部**域名都通过才为 true。
+   *
+   * ⚠ 不要把它当"至少通一个"用（2026-09-23 修）：这份清单里每一项都对应
+   * 一个真实功能，任一不通就是那个功能坏了。曾按"任一通过即 true"汇总，
+   * 结果 github 挂了却显示「可以连通外网」—— 而自动更新恰恰依赖 github。
+   */
+  ok: boolean;
+  /** 是否**至少有一个**通过。用于区分"全坏"与"坏了一项"。 */
+  anyOk?: boolean;
+  /** 不通的域名清单（空 = 全通）。界面据此指出具体哪一项坏了。 */
+  failed?: string[];
+  /** `github.com` 是否不通 —— 它单独坏了会让「检查更新」失败。 */
+  githubBlocked?: boolean;
+  /** 解析出的代理地址（如 `127.0.0.1:7890`）。 */
+  addr?: string;
+  /** 地址为空/无法解析时的原因。 */
+  error?: string;
+  /** 逐项探测结果；地址非法时不存在。 */
+  results?: ProxyProbeItem[];
+  /** 代理全不通时，直连的结论 —— 用来区分"网络问题"还是"代理问题"。 */
+  directNote?: string | null;
+}
+
+/**
+ * 测试上游代理能否连通外网（**只读**，不改任何配置）。
+ *
+ * 会真的发请求，逐个探测**本应用实际用到的国外域名**：
+ * `github.com` / `www.workbuddy.ai` / `openapi.qoder.sh` / `api3.qoder.sh` /
+ * `zcode.z.ai` / `api.z.ai`。每一项都对应一个功能，故 `ok` 要求**全部通过**。
+ */
+export function proxyTestUpstream(spec: string): Promise<ProxyProbeResult> {
+  return call<ProxyProbeResult>("proxy_test_upstream", { spec });
+}
+
+/** 一个代理节点的探测结果。 */
+export interface ProxyNodeItem {
+  /** 节点名（原样保留，可能含 emoji/中文）。 */
+  name: string;
+  /** 所属分组名。 */
+  group: string;
+  /** 延迟毫秒；`null` = 不通/超时。 */
+  delayMs: number | null;
+  /** 是否连通。 */
+  ok: boolean;
+  /** 是否当前正在使用。 */
+  current: boolean;
+}
+
+/** 本机代理节点探测的完整结果。 */
+export interface ProxyNodesResult {
+  ok: boolean;
+  /** 找不到/连不上控制接口时的原因（**可操作**的说明，不是空泛一句话）。 */
+  error?: string;
+  /** 用到的控制接口（如「命名管道 MihomoParty\…」），便于确认探测的是哪个软件。 */
+  endpoint?: string;
+  /** 探测用的目标域名（本应用真实依赖的那个）。 */
+  testUrl?: string;
+  nodes?: ProxyNodeItem[];
+  total?: number;
+  usable?: number;
+}
+
+/**
+ * 探测**本机代理软件里的所有节点**，找出哪个对 `workbuddy.ai` 最快。
+ *
+ * # 为什么这个功能有用（实测根因）
+ *
+ * 国际版走代理而首字节要 4–8 秒；但同一代理打 `api.z.ai` 只要 0.34 秒
+ * —— 即"代理不慢，是走错了节点"。本函数据此排序，直接告诉你换哪个。
+ *
+ * ⚠ **只在桌面端可用**：它要读本机代理软件的控制接口
+ *（Windows 命名管道 / macOS·Linux unix socket / 常见 TCP 端口），
+ * 浏览器模式没有这个能力。
+ *
+ * ⚠ 支持 Clash / mihomo 系（Clash Verge、mihomo-party、ClashX、FlClash…）。
+ * v2rayN / Shadowsocks 等没有同级控制接口，会返回**说明原因**的错误而不是空列表。
+ */
+export function proxyProbeNodes(): Promise<ProxyNodesResult> {
+  return call<ProxyNodesResult>("proxy_probe_nodes");
 }
 
 // ---------------------------------------------------------------------------

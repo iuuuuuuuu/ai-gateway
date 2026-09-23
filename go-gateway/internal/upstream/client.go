@@ -801,11 +801,45 @@ func newDirectTransport() *http.Transport {
 // 抽出来是为了让 env / 显式代理 / 真直连三条路径**只差 Proxy 一个字段**：
 // 各写一份迟早会漂移（例如只给显式代理那套设了 ResponseHeaderTimeout），
 // 而漂移的表现是「某一路的聊天首字节超时按 120s 干等」，从日志上看不出来。
+//
+// # ⚠ 为什么要显式开 HTTP/2（2026-09-22）
+//
+// Go 的 `http.Transport` 有个反直觉的默认：**一旦碰到「非零值」的
+// DialContext / DialTLS / TLSClientConfig，就保守地关掉 HTTP/2**，
+// 除非显式设 `ForceAttemptHTTP2`。
+//
+// 本函数三个路径全都自己 new 了 Transport（且下游会挂 TLSClientConfig），
+// 因此**都在 HTTP/1.1 上跑**。HTTP/1.1 下一条连接同一时刻只能有一个在途
+// 请求，没有多路复用 —— 连续发消息时要么排队、要么不停新建连接。
+//
+// 实测（走代理打 www.workbuddy.ai，同一进程连发 3 次）：
+//
+//	第 1 次  TLS 0.78s  总 2.08s   ← 新建连接，付一次完整握手
+//	第 2 次  TLS 0     总 1.15s   ← 复用，快 45%
+//	第 3 次  TLS 0     总 1.25s
+//
+// 「能不能复用」直接决定快慢，而每次新建都要重付 ~0.8 秒握手
+//（跨境链路，握手本身就慢）。
+//
+// ⚠ 上游不支持 h2 时该字段**无副作用**：ALPN 协商回 h1.1，行为与现在完全一致。
+// 故这是一个「支持就赚、不支持不亏」的开关。
 func newTransportSkeleton() *http.Transport {
 	return &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
+		// 空闲连接保留 5 分钟（原来 90 秒）。
+		//
+		// 90 秒意味着「隔一分半再发下一条」就要重付那 0.8 秒握手 ——
+		// 而「想一会儿再问」正是对话的常态。5 分钟覆盖绝大多数停顿场景。
+		//
+		// ⚠ 代价可忽略：最多留 100 条空闲连接（跨主机合计），
+		// 对桌面应用来说这点内存远小于它省下的握手时间。
+		IdleConnTimeout: 5 * time.Minute,
+		// 显式开启 h2（原因见上方说明）。
+		//
+		// ⚠ 只对 **https** 生效。刻意不开 `AllowHTTP`（那是明文 h2c 用的），
+		// 我们所有上游都是 https，开了只会多一条无用的分支。
+		ForceAttemptHTTP2: true,
 		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
 		ResponseHeaderTimeout: 120 * time.Second,
 	}

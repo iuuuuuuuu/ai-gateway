@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
-import { ArrowUpCircle, ExternalLink, Loader2, RefreshCw, Save, ShieldCheck } from "lucide-react";
+import { ArrowUpCircle, ExternalLink, Gauge, Loader2, PlugZap, RefreshCw, Save, ShieldCheck } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -57,6 +57,14 @@ function NetworkProxyCard() {
   // 是开着的）—— 一帧的假象也足以让人误判成「我的开关被重置了」。
   const [proxyScope, setProxyScope] = useState<ProxyScope>(DEFAULT_PROXY_SCOPE);
   const [proxySaving, setProxySaving] = useState(false);
+  /** 「测试连接」进行中。与 proxySaving 分开：测试是只读的，不该禁用保存。 */
+  const [proxyTesting, setProxyTesting] = useState(false);
+  /** 上一次连通性测试的结果，null = 还没测过。 */
+  const [probeResult, setProbeResult] = useState<api.ProxyProbeResult | null>(null);
+  /** 「节点测速」进行中。 */
+  const [nodesProbing, setNodesProbing] = useState(false);
+  /** 节点测速结果，null = 还没测过。 */
+  const [nodesResult, setNodesResult] = useState<api.ProxyNodesResult | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -119,6 +127,47 @@ function NetworkProxyCard() {
       setMsg({ type: "err", text: api.asError(e) });
     } finally {
       setProxySaving(false);
+    }
+  }
+
+  /**
+   * 测试**输入框里当前**的代理地址能否连通外网（只读，不改配置）。
+   *
+   * 为什么要测未保存的值：用户的自然顺序是"先试试行不行，行再保存"。
+   * 强制先保存再测会让他多一次写入 —— 而且若地址是错的，
+   * 那次写入还会短暂影响后续请求。
+   */
+  async function testProxy() {
+    setProxyTesting(true);
+    setProbeResult(null);
+    try {
+      setProbeResult(await api.proxyTestUpstream(proxyUrl.trim()));
+    } catch (e) {
+      // 测试本身失败也要如实显示 —— 静默什么都不做会让用户以为按钮坏了。
+      setProbeResult({ ok: false, error: api.asError(e) });
+    } finally {
+      setProxyTesting(false);
+    }
+  }
+
+  /**
+   * 探测本机代理软件里的**所有节点**，按对 `workbuddy.ai` 的延迟排序。
+   *
+   * 只读：只调代理软件的控制接口查延迟，不改任何配置、不切换节点 ——
+   * 「换哪个节点」由用户自己在代理软件里决定（自动化切换会超出本应用的职责，
+   * 而且用户的代理软件可能正被其它程序使用）。
+   */
+  async function probeNodes() {
+    setNodesProbing(true);
+    setNodesResult(null);
+    try {
+      setNodesResult(await api.proxyProbeNodes());
+    } catch (e) {
+      // 失败要如实显示，且**带上可操作的原因**（后端已给出）——
+      // 静默什么都不做会让用户以为按钮坏了。
+      setNodesResult({ ok: false, error: api.asError(e) });
+    } finally {
+      setNodesProbing(false);
     }
   }
 
@@ -190,7 +239,184 @@ function NetworkProxyCard() {
             {proxySaving ? <Loader2 className="animate-spin" /> : <Save />}
             保存代理
           </Button></DemoAction>
+          {/* 「测试连接」按钮（2026-09-22 所有者要求：
+              「设置里面的配置代理，也没有测试按钮 可以用来测试是否连通」）。
+
+              ⚠ 它测的是**输入框里当前的地址**，不是已保存的值 ——
+              用户想"先试试这个地址行不行，行再保存"，那是更自然的顺序。
+              保存与否不影响测试结果。
+
+              与「本地代理」那张卡的「检测」按钮的区别：
+              那个查本地代理进程/端口/系统代理/证书四项；
+              这个只回答一个问题：**通过它能不能访问外网**。 */}
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={proxyTesting}
+            onClick={() => void testProxy()}
+          >
+            {proxyTesting ? <Loader2 className="animate-spin" /> : <PlugZap />}
+            测试连接
+          </Button>
+          {/* 「节点测速」按钮（2026-09-23 所有者要求：
+              「探测本机配置的代理的速度那个更快更好」）。
+
+              为什么需要：实测国际版带真实 token 首字节要 3.98~8.05s，
+              而**同一代理打 api.z.ai 只要 0.34s** —— 即"代理不慢，
+              是 workbuddy.ai 走的那个节点有问题"。这个按钮直接排序告诉
+              用户该换成哪个节点。
+
+              ⚠ 只在桌面端可用（要读本机代理软件的控制接口）。
+              与「测试连接」的区别：那个回答"这台代理通不通"，
+              这个回答"这台代理里**哪个节点最快**"。 */}
+          {api.isDesktop() && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={nodesProbing}
+              onClick={() => void probeNodes()}
+            >
+              {nodesProbing ? <Loader2 className="animate-spin" /> : <Gauge />}
+              节点测速
+            </Button>
+          )}
         </div>
+
+        {/* 测试结果：逐项列出**本应用真正依赖的国外域名**，而不是只给一句"通/不通"。
+            
+            所有者要求「加上所用到的国外的域名,就比如 workbuddy.ai 这个」——
+            列真实用到的域名有两个好处：
+              · 某一项不通时直接指向该改什么（"workbuddy.ai 不通"⇒ 给国际版配代理）
+              · 不会像 google 那样"通了也不代表本应用能用"（代理常按域名分流） */}
+        {probeResult && (
+          <div className="px-4 pb-4 sm:px-5">
+            <Alert variant={probeResult.ok ? "default" : "destructive"} className="!w-auto">
+              <PlugZap />
+              <AlertTitle>
+                {/* ⚠ 标题**必须**区分"全通"与"通了一部分"（2026-09-23 所有者截图现场）。
+                    他截图时标题写「代理可以连通外网」，而 github.com 那行是
+                    ✗ 连接被拒绝 —— 他那台机器的自动更新恰恰依赖 github，
+                    界面等于在骗他。根因是后端曾按"任一通过即 true"汇总。 */}
+                {probeResult.error
+                  ? "代理测试未完成"
+                  : probeResult.ok
+                    ? "全部可用"
+                    : probeResult.anyOk
+                      ? "部分不可用"
+                      : "代理不可用"}
+              </AlertTitle>
+              <AlertDescription>
+                {probeResult.error ? (
+                  <p className="mt-1 text-xs leading-5">{probeResult.error}</p>
+                ) : (
+                  <>
+                    <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                      下列域名是本应用**实际会用到的**，每一项都对应一个功能。
+                    </p>
+                    {/* ⚠ 自动更新依赖 github，它单独坏了最容易被用户当场感知
+                        （点检查更新就失败），故单独点出来，而不是埋在列表里。 */}
+                    {probeResult.githubBlocked && (
+                      <p className="mt-1 text-xs leading-5 font-medium text-destructive">
+                        github.com 不通 ⇒ 软件内的「检查更新」与下载安装包会失败。
+                      </p>
+                    )}
+                    <ul className="mt-2 space-y-1.5">
+                      {(probeResult.results ?? []).map((r) => (
+                        <li key={r.name} className="flex flex-wrap items-baseline gap-x-2 text-xs leading-5">
+                          <span className={cn("shrink-0", r.ok ? "text-emerald-600" : "text-destructive")}>
+                            {r.ok ? "✓" : "✗"}
+                          </span>
+                          <span className="shrink-0 font-medium">{r.name}</span>
+                          {/* purpose 让用户知道"这一项影响什么功能" —— 
+                              否则他不知道要不要管它（不用 Qoder 的人
+                              看到 api3.qoder.sh 不通会白紧张）。 */}
+                          {r.purpose && (
+                            <span className="shrink-0 text-muted-foreground/70">（{r.purpose}）</span>
+                          )}
+                          <span className="min-w-0 flex-1 text-right text-muted-foreground">
+                            {r.detail}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+                {/* 全失败时给出"是网络还是代理"的结论 —— 这一条能省掉
+                    用户一轮来回排查（改代理没用 vs 改代理有用）。 */}
+                {probeResult.directNote && (
+                  <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                    {probeResult.directNote}
+                  </p>
+                )}
+              </AlertDescription>
+            </Alert>
+          </div>
+        )}
+
+        {/* 节点测速结果（2026-09-23 新增）。
+            
+            排序由后端完成（延迟升序，不通的在后），这里只负责展示 ——
+            排序逻辑放后端是为了让它可被单元测试钉住。
+            
+            ⚠ 界面**不提供**"切换到最快节点"按钮：切节点会改变用户代理软件的
+            全局状态（他可能正用着别的程序），那超出本应用的职责。
+            这里只回答"哪个最快"，换不换由他自己决定。 */}
+        {nodesResult && (
+          <div className="px-4 pb-4 sm:px-5">
+            <Alert variant={nodesResult.ok ? "default" : "destructive"} className="!w-auto">
+              <Gauge />
+              <AlertTitle>
+                {nodesResult.ok
+                  ? `本机代理共 ${nodesResult.total ?? 0} 个节点，${nodesResult.usable ?? 0} 个可用`
+                  : "节点测速未完成"}
+              </AlertTitle>
+              <AlertDescription>
+                {nodesResult.error ? (
+                  <p className="mt-1 text-xs leading-5">{nodesResult.error}</p>
+                ) : (
+                  <>
+                    <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                      按对 <span className="font-medium">{nodesResult.testUrl}</span> 的延迟排序
+                      {nodesResult.endpoint ? `（经 ${nodesResult.endpoint}）` : ""}。
+                      换节点请在代理软件里操作。
+                    </p>
+                    <ul className="mt-2 space-y-1">
+                      {(nodesResult.nodes ?? []).map((n) => (
+                        <li
+                          key={n.name}
+                          className="flex flex-wrap items-baseline gap-x-2 text-xs leading-5"
+                        >
+                          <span
+                            className={cn(
+                              "shrink-0 tabular-nums",
+                              n.ok
+                                ? n.delayMs !== null && n.delayMs < 200
+                                  ? "font-medium text-emerald-600"
+                                  : "text-foreground"
+                                : "text-destructive",
+                            )}
+                          >
+                            {n.ok ? `${n.delayMs}ms` : "不通"}
+                          </span>
+                          <span className="min-w-0 flex-1 truncate" title={n.name}>
+                            {n.name}
+                          </span>
+                          {/* 「当前使用」要突出 —— 用户最想知道的是
+                              "我现在用的这个排第几"。 */}
+                          {n.current && (
+                            <span className="shrink-0 rounded bg-primary/10 px-1 text-[10px] text-primary">
+                              当前使用
+                            </span>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+              </AlertDescription>
+            </Alert>
+          </div>
+        )}
 
         {msg && (
           <Alert

@@ -129,9 +129,8 @@ func (r Region) String() string {
 
 // Region 返回账号所属区域。
 //
-// 判据与 upstream.IsIntl 完全一致（依据凭证里的 domain 字段）：
-// 以 .ai 结尾为国际版，其余（含 domain 缺失）按国服处理 —— 历史上只存在
-// 国服账号，缺失时按国服保持向后兼容。
+// 判据与 upstream.IsIntl 完全一致（依据凭证里的 domain 字段），
+// 两者都走下面的 regionOfDomain —— **只此一处**，见其注释。
 func (a *Auth) Region() Region {
 	if a.IsIntl() {
 		return RegionIntl
@@ -144,7 +143,92 @@ func (a *Auth) IsIntl() bool {
 	if a == nil {
 		return false
 	}
-	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(a.Domain)), ".ai")
+	return regionOfDomain(a.Domain) == RegionIntl
+}
+
+// 各区域的**完整域名**清单。
+//
+// # ⚠⚠ 为什么必须是完整域名，不能再用 `HasSuffix(".ai")`（2026-09-22 修）
+//
+// 原判据是 `strings.HasSuffix(domain, ".ai")`。它同时**过宽**又**过窄**：
+//
+//	过窄（真缺陷）：Qoder 国际版的域名是 `qoder.sh`（`.sh` 不是 `.ai`）
+//	    ⇒ 被判成**国服** ⇒ `proxy_scope.intl` 对它**不生效** ⇒ 永远走直连。
+//	    实测 `openapi.qoder.sh`：直连 10.3s，走代理 1.2s（**慢 8.7 倍**）。
+//	    而 `qoderAuthOf` 的注释写着「域名用于区域判定（qoder.sh = 国际版）」
+//	    —— 写那段代码时以为判据认得出它，实际认不出。两处口径分叉。
+//
+//	过宽：任何以 `.ai` 结尾的域名都算国际版。今天恰好没有反例，
+//	    但那是巧合 —— 判据不该依赖"恰好没人用别的 .ai 域名"。
+//
+// 故改为**白名单精确匹配**：列出每个产品真实使用的域名，
+// 未列出的按国服处理（与「历史只有国服账号」的向后兼容口径一致）。
+//
+// ⚠ 新增产品/域名时**必须同步这里**，否则它的国际版账号会静默走直连 ——
+// 表现是「某个产品的国际版特别慢/连不上」，而其它产品正常。
+const (
+	// workbuddyIntl 是 WorkBuddy 国际版（也是短信登录用的那个域）。
+	workbuddyIntl = "www.workbuddy.ai"
+	// qoderIntl 是 Qoder 国际版的凭证域名（qoder.Region.Domain() 写的就是它），
+	// 另有 API 域 openapi.qoder.sh / api3.qoder.sh 与授权页 qoder.com。
+	qoderIntl = "qoder.sh"
+	// zcodeIntl 是 ZCode（Z.AI）的 API 域（zcode.DomainOfProvider 写的就是它）。
+	zcodeIntl = "api.z.ai"
+)
+
+// intlDomains 国际版域名白名单（**完整域名**）。
+//
+// 匹配规则见 regionOfDomain：等于清单项，或以 `.<清单项>` 结尾。
+// 故这里只需列到「能覆盖同族子域」的那一层。
+//
+// ⚠ 每一项都要有依据，不能凭"看起来像"加：
+//
+//	workbuddy.ai —— 真实凭证域名 www.workbuddy.ai（5 个国际版账号在用）
+//	codebuddy.ai —— **未在任何真实凭证中观察到**，但本仓库多处注释
+//	    （config.rs / update.rs / types.ts / client.go）都把
+//	    「*.workbuddy.ai / *.codebuddy.ai」并列为国际版。
+//	    保留它：真出现时能正确走代理，不出现时零成本。
+//	    （旧的后缀判据 `HasSuffix(".ai")` 也是顺带覆盖它的。）
+//	qoder.sh     —— 真实凭证域名（Qoder 国际版），**本次修复的主角**
+//	qoder.com    —— Qoder 国际版授权页（qoder.RegionFromDomain 判为 intl）
+//	z.ai         —— 真实凭证域名 api.z.ai（ZCode）
+var intlDomains = []string{
+	"workbuddy.ai",
+	"codebuddy.ai",
+	qoderIntl,
+	"qoder.com",
+	"z.ai",
+}
+
+// regionOfDomain 按**完整域名**判定区域。
+//
+// 匹配规则：域名等于清单项，或以 `.<清单项>` 结尾（覆盖子域）。
+// 例如清单里有 `qoder.sh` 时，`api3.qoder.sh` 与 `qoder.sh` 都命中，
+// 而 `notqoder.sh` / `qoder.sh.evil.com` 都不命中。
+//
+// 空域名按国服（历史行为，见 Region 的注释）。
+func regionOfDomain(domain string) Region {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	if d == "" {
+		return RegionCN
+	}
+	// 去掉可能的协议前缀与路径，容忍凭证里写成 URL 的情况。
+	if i := strings.Index(d, "://"); i >= 0 {
+		d = d[i+3:]
+	}
+	if i := strings.IndexAny(d, "/?#"); i >= 0 {
+		d = d[:i]
+	}
+	// 去掉端口。
+	if i := strings.LastIndex(d, ":"); i >= 0 {
+		d = d[:i]
+	}
+	for _, base := range intlDomains {
+		if d == base || strings.HasSuffix(d, "."+base) {
+			return RegionIntl
+		}
+	}
+	return RegionCN
 }
 
 // Parse 兼容两种磁盘形态：

@@ -21,6 +21,8 @@
 pub mod bypass;
 pub mod ca;
 pub mod handler;
+pub mod node_probe;
+pub mod proxy_probe;
 pub mod local_capture;
 pub mod logger;
 pub mod sys_proxy;

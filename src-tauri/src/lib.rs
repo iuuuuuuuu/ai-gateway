@@ -452,6 +452,8 @@ pub fn run() {
             commands_proxy::proxy_capture_local,
             commands_proxy::proxy_cleanup_stale,
             commands_proxy::proxy_parse_upstream,
+        commands_proxy::proxy_test_upstream,
+        commands_proxy::proxy_probe_nodes,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

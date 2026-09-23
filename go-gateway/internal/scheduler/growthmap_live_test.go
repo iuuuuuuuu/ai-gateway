@@ -80,7 +80,7 @@ func loadLiveMapAuth(t *testing.T, uid8 string) *auth.Auth {
 			pick = a
 			break
 		}
-		if uid8 == "" && !strings.HasSuffix(strings.ToLower(a.Domain), ".ai") {
+		if uid8 == "" && !a.IsIntl() {
 			pick = a
 			break
 		}
@@ -230,7 +230,7 @@ func TestLiveGrowthMapSchedulerManyAccounts(t *testing.T) {
 		}
 		acct := &all[i]
 		// 只跑国服：默认区域范围内国际版不参与（与 checkin_scope=cn 一致）。
-		if strings.HasSuffix(strings.ToLower(acct.Domain), ".ai") {
+		if acct.IsIntl() {
 			continue
 		}
 		if strings.TrimSpace(acct.UID) == "" {

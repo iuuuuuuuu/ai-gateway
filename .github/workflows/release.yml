@@ -125,22 +125,31 @@ jobs:
             goos: darwin
             goarch: arm64
             arch_label: aarch64
-          # Intel Mac（x86_64-apple-darwin）这一腿**已移除**。
+          # Intel Mac（x86_64-apple-darwin）—— 2026-09-22 **加回**。
           #
-          # 原因：它是整个发布的关键路径。实测 macos-x64 跑 892s（14m52s），而
-          # windows-x64 707s、linux-x64 576s、macos-arm64 只剩 299s —— 四腿并行，
-          # 另外三个平台全程空等 Intel，发布墙钟被它单独拖到 15m21s。去掉后墙钟
-          # 由 windows-x64 决定，约 12m10s，一次省 185s。
+          # 移除时的理由是墙钟：它是关键路径（892s），四腿并行时另外三个平台
+          # 全程空等它，发布被拖到 15m21s。当时也**不影响自动更新**，因为
+          # 那份清单只处理 Windows。
           #
-          # 它的编译门控**没有丢**：已搬进 ci.yml 的「Intel Mac 编译校验」一步
-          # （cargo check --workspace --all-targets --target x86_64-apple-darwin，
-          # 跑在 macos-14 上），每次 push/PR 都会跑，比原来只在 tag 时跑还早。
+          # 现在两条前提都变了：
+          #   1. 所有者要求 mac 的 **Intel 与 M1 都能收到自动更新** ——
+          #      而 updater 的清单键是按 arch 分的（darwin-x86_64 vs
+          #      darwin-aarch64），没有这一腿就**必然**缺 Intel 的键，
+          #      Intel 机器点「检查更新」会报错。
+          #   2. 墙钟不再是问题：release 任务用 needs + !cancelled()，
+          #      某一腿慢只是让总时长等于最慢那腿，不会让其它平台白等
+          #      产物发布（各腿各自 upload-artifact，最后统一发布）。
           #
-          # 也不影响自动更新：gen-update-json.sh 与 merge-update-manifests.py 都
-          # 只处理 Windows 清单，macOS 两腿本来就不产出 latest-<os>-<arch>.json。
-          #
-          # 代价（明确记账）：不再分发 Intel Mac 的 .dmg。若日后需要，加回这一腿即可，
-          # label 必须是 macos-15-intel（macos-13 已下线，macos-14 现在是 arm64）。
+          # ⚠ runner label 必须是 **macos-15-intel**：macos-13 已下线，
+          # 而 macos-14 现在是 arm64 —— 写错会静默跑到 arm64 上，
+          # 编出 aarch64 的产物冒充 Intel 包（比构建失败更糟）。
+          - name: macos-x64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: app
+            goos: darwin
+            goarch: amd64
+            arch_label: x86_64
           - name: linux-x64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
@@ -319,6 +328,27 @@ jobs:
           sh scripts/make-dmg.sh "$APP_VERSION" "${{ matrix.arch_label }}" "$APP"
           mkdir -p dist-bin
           cp "ai-gateway_${APP_VERSION}_${{ matrix.arch_label }}.dmg" dist-bin/
+          # ⚠ 自动更新需要 **.app.tar.gz + .sig**（不是 .dmg）。
+          #
+          # `createUpdaterArtifacts=true` 会让 tauri 额外产出一个
+          # `*.app.tar.gz` 与其 `.sig` —— 那是 updater 真正下载并替换的东西；
+          # .dmg 只供用户手动安装，updater **不认识**它。
+          #
+          # 此前只收集 .dmg，于是 macOS 客户端「检查更新」必然失败：
+          # 清单里没有 darwin-* 条目，也没有可供下载的包。
+          APP_TGZ=$(find "$BUNDLE_ROOT/macos" -maxdepth 1 -type f -name '*.app.tar.gz' | head -1)
+          if [ -z "$APP_TGZ" ]; then
+            echo "未找到 .app.tar.gz（updater 包）—— macOS 自动更新会失效" >&2
+            ls -la "$BUNDLE_ROOT/macos" >&2 || true
+            exit 1
+          fi
+          if [ ! -f "$APP_TGZ.sig" ]; then
+            echo "未找到 $APP_TGZ.sig —— 签名未生效，updater 会拒绝该包" >&2
+            exit 1
+          fi
+          echo "updater 包: $APP_TGZ"
+          cp "$APP_TGZ" dist-bin/
+          cp "$APP_TGZ.sig" dist-bin/
 
       - name: 打包 Windows（portable.zip）
         if: runner.os == 'Windows'
@@ -402,6 +432,29 @@ jobs:
             \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) \
             -exec cp {} dist-bin/ \;
 
+          # ⚠ 自动更新需要 **AppImage 的 .tar.gz + .sig**（不是裸 .AppImage）。
+          #
+          # tauri 在 createUpdaterArtifacts=true 时额外产出
+          # `*.AppImage.tar.gz` 与其 `.sig` —— updater 下载并替换的是它。
+          # 裸 .AppImage 只供手动安装。
+          #
+          # 此前只收集裸 AppImage，于是 Linux 客户端「检查更新」必然失败。
+          # ⚠ 用 `-name '*.AppImage.tar.gz'` 精确匹配：`*.tar.gz` 会把
+          # 别的 tarball 也扫进来。
+          APPIMG_TGZ=$(find "$BUNDLE_ROOT" -type f -name '*.AppImage.tar.gz' | head -1)
+          if [ -z "$APPIMG_TGZ" ]; then
+            echo "未找到 AppImage 的 .tar.gz（updater 包）—— Linux 自动更新会失效" >&2
+            find "$BUNDLE_ROOT" -type f -name '*.AppImage*' >&2 || true
+            exit 1
+          fi
+          if [ ! -f "$APPIMG_TGZ.sig" ]; then
+            echo "未找到 $APPIMG_TGZ.sig —— 签名未生效，updater 会拒绝该包" >&2
+            exit 1
+          fi
+          echo "updater 包: $APPIMG_TGZ"
+          cp "$APPIMG_TGZ" dist-bin/
+          cp "$APPIMG_TGZ.sig" dist-bin/
+
       # 按平台断言应有的产物，而不是只看「非空」——
       # 只看非空的话，Windows 漏掉 exe/msi 只剩 portable.zip 也能混过去。
       #
@@ -414,9 +467,13 @@ jobs:
           set -euo pipefail
           ls -la dist-bin
           case "${{ runner.os }}" in
-            Windows) expect="*-setup.exe *.msi *_portable.zip" ;;
-            macOS)   expect="*.dmg" ;;
-            Linux)   expect="*.deb *.AppImage" ;;
+            # ⚠ 每条都要求 **updater 包**（.sig / .tar.gz）在场 ——
+            # 只断言"有安装包"是不够的：那正是本仓库此前的状态
+            #（Windows 有 .sig、macOS/Linux 没有 updater 包），
+            # 表现为"只有 Windows 能自动更新"，而 CI 全绿。
+            Windows) expect="*-setup.exe *.msi *_portable.zip *-setup.exe.sig" ;;
+            macOS)   expect="*.dmg *.app.tar.gz *.app.tar.gz.sig" ;;
+            Linux)   expect="*.deb *.AppImage *.AppImage.tar.gz *.AppImage.tar.gz.sig" ;;
           esac
           for glob in $expect; do
             n=$(find dist-bin -maxdepth 1 -type f -name "$glob" | wc -l | tr -d ' ')
@@ -465,6 +522,87 @@ jobs:
           cp "$MANIFEST" dist-bin/
           # 断言清单里的 URL 与签名都已写入，避免生成出空壳清单。
           # 不用 grep -q：它静默失败会让人看不出是"清单不对"还是"步骤本身挂了"。
+          if ! grep -q "$UPDATE_ARCHIVE_NAME" "$MANIFEST"; then
+            echo "错误：清单里没有指向 $UPDATE_ARCHIVE_NAME 的 URL" >&2
+            cat "$MANIFEST" >&2
+            exit 1
+          fi
+          if ! grep -q '"signature"' "$MANIFEST"; then
+            echo "错误：清单里缺少 signature 字段" >&2
+            cat "$MANIFEST" >&2
+            exit 1
+          fi
+          echo "updater 清单已生成："
+          cat "$MANIFEST"
+
+      # ---- macOS / Linux 的 updater 清单（2026-09-22 新增）----
+      #
+      # 此前只有 Windows 会生成 `latest-<os>-<arch>.json`，于是
+      # `latest.json` 里**只有 windows-* 两个键**，mac / linux 客户端
+      # 「检查更新」时找不到自己平台的条目 → 报错。
+      #
+      # ⚠ 各平台的 updater 包**不是**安装包本身：
+      #   macOS → `*.app.tar.gz`（.dmg 只是手动安装用）
+      #   Linux → `*.AppImage.tar.gz`（裸 .AppImage 只是手动安装用）
+      # 清单必须指向那个 tar.gz，否则客户端下到了也替换不了。
+      #
+      # URL 用 `releases/latest/download/<固定名>`：自动更新要求 URL 固定，
+      # 而产物名里带版本号，所以先复制一份固定名再生成清单。
+      - name: 生成 updater 清单（macOS）
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          UPDATE_OS: darwin
+          UPDATE_ARCH: ${{ matrix.arch_label }}
+          UPDATE_ARCHIVE_NAME: ai-gateway-macos-${{ matrix.arch_label }}.app.tar.gz
+        run: |
+          set -euo pipefail
+          SRC=$(find "$BUNDLE_ROOT/macos" -maxdepth 1 -type f -name '*.app.tar.gz' | head -1)
+          if [ -z "$SRC" ]; then
+            echo "错误：未找到 .app.tar.gz" >&2
+            ls -la "$BUNDLE_ROOT/macos" >&2 || true
+            exit 1
+          fi
+          cp "$SRC" "dist-bin/$UPDATE_ARCHIVE_NAME"
+          cp "$SRC.sig" "dist-bin/$UPDATE_ARCHIVE_NAME.sig"
+          UPDATE_VERSION="$APP_VERSION" BUNDLE_DIR="$BUNDLE_ROOT/macos" sh scripts/gen-update-json.sh
+          MANIFEST="$BUNDLE_ROOT/macos/latest-${UPDATE_OS}-${UPDATE_ARCH}.json"
+          test -f "$MANIFEST"
+          cp "$MANIFEST" dist-bin/
+          if ! grep -q "$UPDATE_ARCHIVE_NAME" "$MANIFEST"; then
+            echo "错误：清单里没有指向 $UPDATE_ARCHIVE_NAME 的 URL" >&2
+            cat "$MANIFEST" >&2
+            exit 1
+          fi
+          if ! grep -q '"signature"' "$MANIFEST"; then
+            echo "错误：清单里缺少 signature 字段" >&2
+            cat "$MANIFEST" >&2
+            exit 1
+          fi
+          echo "updater 清单已生成："
+          cat "$MANIFEST"
+
+      - name: 生成 updater 清单（Linux）
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          UPDATE_OS: linux
+          UPDATE_ARCH: x86_64
+          UPDATE_ARCHIVE_NAME: ai-gateway-linux-x86_64.AppImage.tar.gz
+        run: |
+          set -euo pipefail
+          SRC=$(find "$BUNDLE_ROOT" -type f -name '*.AppImage.tar.gz' | head -1)
+          if [ -z "$SRC" ]; then
+            echo "错误：未找到 AppImage 的 .tar.gz" >&2
+            find "$BUNDLE_ROOT" -type f -name '*.AppImage*' >&2 || true
+            exit 1
+          fi
+          cp "$SRC" "dist-bin/$UPDATE_ARCHIVE_NAME"
+          cp "$SRC.sig" "dist-bin/$UPDATE_ARCHIVE_NAME.sig"
+          UPDATE_VERSION="$APP_VERSION" BUNDLE_DIR="$(dirname "$SRC")" sh scripts/gen-update-json.sh
+          MANIFEST="$(dirname "$SRC")/latest-${UPDATE_OS}-${UPDATE_ARCH}.json"
+          test -f "$MANIFEST"
+          cp "$MANIFEST" dist-bin/
           if ! grep -q "$UPDATE_ARCHIVE_NAME" "$MANIFEST"; then
             echo "错误：清单里没有指向 $UPDATE_ARCHIVE_NAME 的 URL" >&2
             cat "$MANIFEST" >&2
@@ -579,10 +717,45 @@ jobs:
             echo "$GITHUB_REF_NAME 尚无 Release，直接创建"
           fi
 
+      # ⚠⚠ 判别是不是**预发布测试版**（2026-09-23 新增）。
+      #
+      # # 为什么这一步很关键
+      #
+      # 客户端的 updater 端点是
+      # `.../releases/latest/download/latest.json`，而 GitHub 的
+      # `releases/latest` **会跳过 prerelease**（它只指向最新的非预发布版）。
+      #
+      # 所以：**只要把测试版标成 prerelease，正式版用户就不会被自动推到它上面**；
+      # 反之若标成普通 Release，测试版会立刻成为 `latest` ——
+      # 所有装了 1.0.8 的人下次启动就会被更新到一个 beta。
+      #
+      # 判据用**版本号里有没有连字符**（语义化版本的预发布段就是
+      # `1.0.9-beta.1` 这种形式）。这也与 npm / Go 模块的通行约定一致。
+      - name: 判断是否为预发布（版本号含连字符）
+        id: prerelease
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          # 去掉前缀 v，只看版本号部分
+          ver="${tag#v}"
+          # 只取第一个连字符之前的"核心版本"，后面有内容即为预发布
+          core="${ver%%-*}"
+          if [ "$core" != "$ver" ]; then
+            echo "is=true" >> "$GITHUB_OUTPUT"
+            echo "检测到预发布版本（$tag）：将标记为 prerelease，不进入 latest 通道"
+          else
+            echo "is=false" >> "$GITHUB_OUTPUT"
+            echo "正式版本（$tag）：正常发布，进入 latest 通道"
+          fi
+
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
           draft: false
+          # ⚠ 见上一步：预发布**必须**标记，否则它会变成 releases/latest
+          # 而把正式版用户推到测试版上。
+          prerelease: ${{ steps.prerelease.outputs.is == 'true' }}
           body_path: ${{ steps.notes.outputs.path }}
           # 有手写说明时**不要**再 prepend 自动生成的提交列表 ——
           # 那会把 "What's Changed" 堆在正文顶部，与手写内容重复

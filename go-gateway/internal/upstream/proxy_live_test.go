@@ -74,7 +74,7 @@ func loadLiveAccts(t *testing.T) (cn, intl *auth.Auth) {
 		if p.AccessToken == "" || p.UID == "" {
 			continue
 		}
-		if strings.HasSuffix(strings.ToLower(strings.TrimSpace(p.Domain)), ".ai") {
+		if p.IsIntl() {
 			if pickIntl == nil {
 				pickIntl = p
 			}

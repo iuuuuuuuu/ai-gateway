@@ -967,6 +967,13 @@ func describeProxyScope(addr string, cn, intl bool) string {
 		}
 		return "真直连（连 HTTPS_PROXY 等环境变量代理也不用）"
 	}
-	return fmt.Sprintf("国服账号（*.cn / copilot.tencent.com）%s；国际版账号（*.ai）%s",
+	// ⚠ 举例必须如实，否则这条日志会把人引向错误结论（2026-09-22 修）：
+	// 原文写「国际版账号（*.ai）」—— 那在判据改成完整域名白名单之前还算对，
+	// 之后就不准了：Qoder 国际版是 `qoder.sh`（**不是** .ai），
+	// 而它恰恰是本次修复的主角。照着旧文案排查会以为"Qoder 不走代理是正常的"。
+	//
+	// 故这里把三个真实域名都列出来（每个都有凭证依据），并指明清单出处 ——
+	// 域名真相只有一处（auth.intlDomains），别在这里再抄一份完整清单。
+	return fmt.Sprintf("国服账号（.cn / .com 等）%s；国际版账号（workbuddy.ai / qoder.sh / z.ai，见 auth.intlDomains）%s",
 		state(cn), state(intl))
 }

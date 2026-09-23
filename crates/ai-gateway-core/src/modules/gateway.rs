@@ -3132,18 +3132,34 @@ pub fn stop_gateway() -> Value {
             // 空 Job，而真正的网关仍在跑 —— 它会占着端口，
             // 用户看到的是"程序说停了但服务还在"。
             // 那种情况下宁可承担弹出错误框的风险，也不能停不掉。
+            //
+            // ⚠⚠ 非 Windows 必须走 `kill`（2026-09-22 修，所有者现场：
+            //     「mac点击右键退出会卡死」）
+            //
+            // # 根因
+            //
+            // 原实现**无条件**跑 `taskkill` —— 那是 Windows 专有命令，
+            // macOS / Linux 上 `spawn` 直接失败（`No such file or directory`），
+            // 于是网关进程**根本没被杀掉**，紧接着的 `child.wait()`
+            // 就**永久阻塞**。
+            //
+            // 而 `app.exit(0)` 的 `RunEvent::Exit` 是在**主线程**上同步跑的
+            // ⇒ 主线程被 `wait()` 卡死 ⇒ 表现为「点退出就卡住」。
+            // （Windows 上因为 Job Object 生效、进程真的退了，所以不卡。）
+            //
+            // # 修法
+            //
+            // 按平台选正确的终止方式，并且**给 wait 加超时** ——
+            // 即便将来某平台的终止方式失效，也只是慢一点，不会卡死。
             if !terminate_gateway_job() {
-                // 回退路径。加 CREATE_NO_WINDOW 避免闪出 taskkill 控制台窗口。
-                let _ = crate::modules::process::cmd_builder("taskkill")
-                    .args(["/F", "/T", "/PID", &pid.to_string()])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                let _ = child.wait();
+                kill_child_process(&pid);
             }
             // Job 路径下也要 wait：等句柄真正可回收，避免立刻重启时
             // 新进程抢不到端口（TerminateJobObject 是异步生效的）。
-            let _ = child.wait();
+            //
+            // ⚠ 用**带超时**的 wait：进程若因任何原因没退，
+            // 这里绝不能无限等下去（那正是 mac 卡死的直接原因）。
+            wait_child_with_timeout(child, STOP_WAIT_TIMEOUT);
             true
         }
         None => false,
@@ -3153,6 +3169,114 @@ pub fn stop_gateway() -> Value {
     *slot = None;
     GATEWAY_RUNNING.store(false, Ordering::SeqCst);
     json!({ "stopped": stopped })
+}
+
+/// 停止网关时等待子进程退出的上限。
+///
+/// 取 5 秒：正常情况子进程在几十毫秒内就退了；5 秒足够覆盖慢机器上的
+/// 进程拆除。超过就**放弃等待**继续往下走 —— 退出流程宁可留下一个
+/// 待回收的僵尸句柄，也**绝不能**让主线程无限阻塞（那正是 mac 卡死的成因）。
+const STOP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 按平台强制结束网关子进程。
+///
+/// # 为什么不能只写 `taskkill`（2026-09-22 修）
+///
+/// `taskkill` 是 **Windows 专有**命令。macOS / Linux 上 spawn 它必然失败，
+/// 而失败是**静默**的（`.status()` 的返回值被丢弃）—— 于是网关进程继续跑，
+/// 调用方却在下一个 `child.wait()` 上永久阻塞。
+///
+/// 这个缺陷在 Windows 上看不出来（那里优先走 Job Object），
+/// 只在 macOS / Linux 上表现为「点退出就卡死」。
+fn kill_child_process(pid: &u32) {
+    #[cfg(target_os = "windows")]
+    {
+        // 加 CREATE_NO_WINDOW 避免闪出 taskkill 控制台窗口。
+        let _ = crate::modules::process::cmd_builder("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Unix：先 TERM 再 KILL，给网关一个清理端口/子进程的机会。
+        //
+        // ⚠ 只发 `kill -TERM` 是不够的：网关可能卡在某个不可中断的调用里，
+        // 那时 TERM 无效。故 TERM 之后若进程仍在，补一发 KILL。
+        let pid_s = pid.to_string();
+        let _ = crate::modules::process::cmd_builder("kill")
+            .args(["-TERM", &pid_s])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        // 短暂等待，让正常退出的进程有机会走完。
+        for _ in 0..10 {
+            if !process_alive(*pid) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // 还在 ⇒ 强杀。
+        let _ = crate::modules::process::cmd_builder("kill")
+            .args(["-KILL", &pid_s])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(target_os = "windows")]
+    let _ = pid;
+}
+
+/// 进程是否仍存活（Unix 用 `kill -0`，Windows 用 `tasklist`）。
+///
+/// ⚠ 返回 `true` 是**保守**取值：查不出来时按"还活着"处理，
+/// 让调用方继续尝试终止 —— 宁可多重试一次，也不要因为查不到就
+/// 以为已经退干净了。
+#[cfg(not(target_os = "windows"))]
+fn process_alive(pid: u32) -> bool {
+    // `kill -0` 不发信号，只做存在性与权限检查。
+    match crate::modules::process::cmd_builder("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(st) => st.success(),
+        // 命令本身跑不起来（如 kill 不在 PATH）⇒ 保守当作还活着。
+        Err(_) => true,
+    }
+}
+
+/// 等待子进程退出，但**最多等 `timeout`**。
+///
+/// `Child::wait()` 没有超时版本，而它一旦阻塞就是无限期 ——
+/// 那正是 macOS 上「点退出卡死」的直接原因（见 `kill_child_process`）。
+///
+/// 做法：轮询 `try_wait()`。它不阻塞，返回 `Ok(Some(_))` 表示已退出。
+/// 轮询间隔 50ms：退出路径上这点开销可忽略，而它换来的是
+/// **不可能卡死**。
+fn wait_child_with_timeout(child: &mut std::process::Child, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            // 已退出（拿到退出状态）——正常路径。
+            Ok(Some(_)) => return,
+            // 仍在运行：到点就放弃等待。
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // 不 kill 子进程：调用方可能还想让它跑完（如重启路径）。
+                    // 这里只保证**我们自己**不阻塞。
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            // 查询失败（如已被回收）：没有什么可等的了。
+            Err(_) => return,
+        }
+    }
 }
 
 /// 「指定账号」下拉里的单个账号条目。

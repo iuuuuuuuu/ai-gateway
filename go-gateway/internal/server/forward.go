@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -220,8 +221,11 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 	//
 	// 实测确认（uitest/diag-region-prefix2.cjs，8 轮）：
 	//
-	//	`cn:deepseek-v4.1-flash`  → 选中 e889fe8a（www.workbuddy.ai，**国际版**）
-	//	`global:...`              → 选中 6b0c77ab（国际版）
+	//	`cn:deepseek-v4.1-flash`  → 选中 {intl-uid-A}（www.workbuddy.ai，**国际版**）
+	//	`global:...`              → 选中 {intl-uid-B}（国际版）
+	//
+	// ⚠ uid 用占位值：本仓库是公开仓库，真实账号标识不得入库
+	//（原文档里写的是实测时的真实 uid，已按隐私约定替换）。
 	//
 	// 即带 `cn:` 前缀却选中了国际版账号 —— 前缀无效。所有者要的
 	// 「平台:国际版:模型名」正依赖这个机制，故必须修。
@@ -395,7 +399,46 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 						Message: imageRegionUnavailableMessage(route.Region),
 					}
 			}
+			// ⚠ 池里选不出号时，要说清**为什么**，不能一律回
+			// 「all accounts unavailable (cooling/disabled)」（2026-09-22 修）。
+			//
+			// # 现场
+			//
+			// 所有者发 `intl:deepseek-v4.1-flash`，得到：
+			//
+			//	503 {"code":"no_healthy_account",
+			//	     "message":"all accounts unavailable (cooling/disabled)"}
+			//
+			// 但 5 个国际版账号实测的 `cooling=false disabled=false` ——
+			// **它们健康得很**。真实原因是这些账号被他设了 `no_route`
+			//（用户意图「别把流量给它」）。
+			//
+			// 后果很具体：他会去等"冷却恢复"，而实际只要在界面上把路由
+			// 开关打开。这与本仓库已修过的几处（11102 被包成「账号不可用」、
+			// 上下文超长被当成账号故障）是**同一类**问题：
+			// 错误文案把排查方向引偏。
+			//
+			// 故这里在落进通用文案之前，先问池子一句"是不是**全**被你自己
+			// 设成不接流量了"，是的话给一条能直接行动的信息。
+			//
+			// ⚠⚠ 判据必须是 `noRoute == total && total > 0`，**不能**写成
+			// `noRoute > 0` —— 我第一版就是后者，实测立刻打脸（见
+			// pool.NoRouteExcludesAll 的注释）：Qoder 有 2 个账号，
+			// 1 个 no_route、1 个本来可用但请求失败，我的文案却说
+			// 「1 个账号都被设为 no_route，所以没有账号可用了」——
+			// 把真正的原因（那个账号失败了）盖掉了。
 			lastStatus = http.StatusServiceUnavailable
+			if nr, total := h.cfg.Pool.NoRouteExcludesAll(product, model, route.Region); total > 0 && nr == total {
+				return &chatResult{Model: model}, http.StatusServiceUnavailable,
+					&forwardFailure{
+						Kind:   FailureAllNoRoute,
+						Status: http.StatusServiceUnavailable,
+						Message: fmt.Sprintf(
+							"该产品下的可用账号（共 %d 个）都被设为「不参与选号」(no_route)，"+
+								"所以你这边没有账号可用了。这不是故障 —— 在账号列表里"+
+								"重新打开它们的路由开关即可。", total),
+					}
+			}
 			break
 		}
 		tried[acct.UID] = true
@@ -937,6 +980,9 @@ const (
 	//	  实测 3012 与账号无关（同一账号一分钟后即可用、官方客户端也吃它）。
 	//	· 它要传达的是「等一会儿，别换号」—— 与「账号池耗尽」的处置相反。
 	FailureUnusualActivity
+	// FailureAllNoRoute 池里的账号**全部**被用户设为不参与选号（no_route）
+	// （2026-09-22）。不是故障，是配置 —— 文案必须说清这一点。
+	FailureAllNoRoute
 )
 
 // imageRegionUnavailableMessage 生成「带图片请求缺少该区域账号」的说明。

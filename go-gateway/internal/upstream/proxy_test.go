@@ -783,6 +783,56 @@ func TestClientSelectorPairsWithRegionBases(t *testing.T) {
 	}
 }
 
+// TestQoderIntlGoesThroughProxy **Qoder 国际版账号必须走代理**（2026-09-22 修）。
+//
+// # 为什么单独写一条（上面那张表已经覆盖 workbuddy 了）
+//
+// 因为上面那张表的域名是**照着 `.ai` 后缀挑的**，而 Qoder 国际版的域名是
+// `qoder.sh` —— 它在旧判据 `HasSuffix(".ai")` 下被判成**国服**，
+// 于是 `proxy_scope.intl` 对它**不生效**、永远直连。实测 `openapi.qoder.sh`：
+//
+//	直连         10.3s
+//	走 7890 代理  1.2s    （慢 8.7 倍）
+//
+// 而所有既有测试都只用 `*.ai` 域名，所以**没有一条会红** ——
+// 这就是这个缺陷能活到现在的原因。
+//
+// 本用例走的是 Production 路径：`httpFor` 按账号选 client（它内部用 IsIntl），
+// 计数由假代理完成。新增产品/域名时若忘了同步 intlDomains，这条会红。
+func TestQoderIntlGoesThroughProxy(t *testing.T) {
+	c := New()
+	if err := c.SetProxy("http://127.0.0.1:7890"); err != nil {
+		t.Fatalf("SetProxy: %v", err)
+	}
+	if err := c.SetProxyScope(false, true); err != nil {
+		t.Fatalf("SetProxyScope: %v", err)
+	}
+
+	// 用真实凭证里的域名（不是编的）。
+	qoderIntl := &auth.Auth{Domain: "qoder.sh", Product: auth.ProductQoder}
+	qoderCN := &auth.Auth{Domain: "qoder.com.cn", Product: auth.ProductQoder}
+
+	if !IsIntl(qoderIntl) {
+		t.Fatal("qoder.sh 必须被判为国际版 —— 否则 proxy_scope.intl 对它不生效，" +
+			"实测会导致 openapi.qoder.sh 直连 10.3s（走代理 1.2s）")
+	}
+	if IsIntl(qoderCN) {
+		t.Fatal("qoder.com.cn 是国服，不该被判为国际版")
+	}
+
+	// 国际版必须拿到**国际版专用** client（挂显式代理那一对）。
+	if got := c.httpFor(qoderIntl); got != c.intlHTTP {
+		t.Error("qoder.sh 的 RPC 应走 intlHTTP（挂显式代理）")
+	}
+	if got := c.chatClientFor(qoderIntl); got != c.intlChatHTTP {
+		t.Error("qoder.sh 的对话应走 intlChatHTTP（挂显式代理）")
+	}
+	// 国服必须落到国服 client（不是国际版那对）。
+	if got := c.httpFor(qoderCN); got == c.intlHTTP {
+		t.Error("qoder.com.cn 不该走国际版 client（那会把国服无谓地绕进代理）")
+	}
+}
+
 // TestDefaultBasesUnchanged 默认基址不得因本次改动而变（回归护栏）。
 func TestDefaultBasesUnchanged(t *testing.T) {
 	c := New()

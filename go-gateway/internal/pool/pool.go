@@ -1187,17 +1187,74 @@ func (p *Pool) PickForModelProductRegion(
 	return p.pickEarliestExpiryLocked(scoped, time.Now(), model)
 }
 
-// pickForModelAny 原有行为：不做区域过滤。
+// NoRouteExcludesAll 判断「该产品/区域下**本来能用的账号，是否全部**被 no_route 排除了」。
 //
-// # ⚠ 2026-09-20：加了"该产品是否提供该模型"的过滤（修实测缺陷）
+// # 用于把「无账号可用」的错误文案说准（2026-09-22 所有者现场）
 //
-// 用户用 `deepseek-v4.1-flash`（WorkBuddy 的模型）发请求，却被路由到
-// **Qoder 账号**上并失败两次 —— 因为这里只按"账号当前可用"挑，
-// **不问"这个产品有没有这个模型"**。Qoder 账号当时恰好可用就被选中。
+// 他发 `intl:deepseek-v4.1-flash` 得到：
 //
-// 故这里排除"不提供该模型的产品"的账号（见 productMayServe）。
-// ⚠ 只在多产品开启 + 宿主透传了清单时生效；两者任一不满足即保持既有行为，
-// 否则会因"不知道清单"而把所有账号排掉。
+//	503 {"code":"no_healthy_account",
+//	     "message":"all accounts unavailable (cooling/disabled)"}
+//
+// 而那 5 个国际版账号实测 `cooling=false disabled=false` —— 健康得很。
+// 真实原因是它们**全被设了 `no_route`**（用户意图「别把流量给它」）。
+// 文案说"冷却/禁用"会让他去等"恢复"，而实际只要把路由开关打开。
+//
+// # ⚠⚠ 为什么判据必须是"全部"而不是"有几个"（我第一版就写错了）
+//
+// 第一版写成 `NoRouteOnlyCount(...) > 0` 就报「N 个账号都被设为 no_route，
+// 所以没有账号可用了」。**实测立刻打脸**：
+//
+//	Qoder 有 2 个账号 —— qoder.com.cn(no_route) + qoder.sh(本来可用)
+//	请求选中 qoder.sh → 它自己请求失败 → 轮转耗尽 → acct == nil
+//	我的文案却说「1 个账号都被设为 no_route，所以没有账号可用了」
+//
+// 而**真实原因是 qoder.sh 失败了**，no_route 只是让候选少了一个。
+// 那正是"错误文案把排查方向引偏"—— 与我要修的缺陷同一类，只是换了个方向。
+//
+// 故判据收紧成：**本来能用的账号里，一个非 no_route 的都没有**。
+// 只有这时"no_route 是唯一原因"才成立，文案才敢那么说。
+//
+// 返回 (被 no_route 排除的数, 本来能用的总数)。
+// total == 0 表示该产品/区域压根没有账号（与 no_route 无关，别归因到它）；
+// noRoute == total 才表示"全被 no_route 挡了"。
+func (p *Pool) NoRouteExcludesAll(product, model string, prefer auth.Region) (noRoute, total int) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	now := time.Now()
+	for _, e := range p.byUID {
+		a := e.a
+		if a == nil {
+			continue
+		}
+		if product != "" && a.ProductOf() != product {
+			continue
+		}
+		if prefer != auth.RegionAny && a.Region() != prefer {
+			continue
+		}
+		// 先判"本来能不能用" —— 冷却中/已禁用的账号本来就不参与，
+		// 不该把它们算进分母（否则一个产品若有 1 个 no_route + 4 个冷却，
+		// 我们会说成"5 个都被你设成不接流量了"，那是另一句假话）。
+		if e.disabled {
+			continue
+		}
+		if !e.until.IsZero() && e.until.After(now) {
+			continue
+		}
+		total++
+		if a.NoRoute {
+			noRoute++
+		}
+	}
+	// ⚠ `model` 当前不参与判定：no_route 是**账号级**设置，与模型无关
+	//（不像额度是按模型分桶的）。保留这个参数是为了将来若引入
+	//「按模型排除」时不必再改调用方签名，也让调用处读起来更清楚。
+	_ = model
+	return noRoute, total
+}
+
 // pickForModelAny 原有行为：不做区域过滤。
 //
 // # ⚠ 2026-09-20：加了"该产品是否提供该模型"的过滤（修实测缺陷）

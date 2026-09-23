@@ -408,3 +408,52 @@ pub fn proxy_parse_upstream(spec: String) -> Value {
         None => json!({ "ok": false, "error": "无法解析代理地址，应形如 http://127.0.0.1:7890" }),
     }
 }
+
+/// 测试一个上游代理地址**是否真的能连通外网**（2026-09-22 所有者要求：
+/// 「设置里面的配置代理，也没有测试按钮 可以用来测试是否连通」）。
+///
+/// 实现在 core 的 `device_proxy::upstream::test_upstream` ——
+/// `reqwest` 是 core 的依赖（src-tauri 没有直接依赖它），
+/// 而且放 core 里可以写单元测试。这一层只做转发。
+#[tauri::command]
+pub async fn proxy_test_upstream(spec: String) -> Value {
+    ai_gateway_core::modules::device_proxy::proxy_probe::test_upstream(&spec).await
+}
+
+/// 探测**本机代理软件里的所有节点**，找出哪个对目标域名最快
+/// （2026-09-23 所有者要求：「探测本机配置的代理的速度那个更快更好」）。
+///
+/// # 为什么需要它（实测根因）
+///
+/// 国际版走代理，而实测那条链路极慢：带真实 token 首字节 3.98~8.05s。
+/// 但**同一代理打 `api.z.ai` 只要 0.34s** —— 即"代理不慢，
+/// 是 `workbuddy.ai` 走的那个节点有问题"。换节点即可，但前提是
+/// **先能量化哪个节点对哪个域名快**。
+///
+/// 探测目标固定用**本应用真正依赖的域名**，不让调用方随便传 ——
+/// 传通用目标（`gstatic.com/generate_204`）会得出错误结论：
+/// 实测同一代理打 `api.z.ai` 0.34s 而打 `workbuddy.ai` 6.9s，
+/// **节点是按目标域名分流的**。
+///
+/// # 通用性
+///
+/// 实现在 core 的 `device_proxy::node_probe`，发现逻辑**只认结构**
+///（管道名关键词 / 约定 socket 路径 / 常见 TCP 端口），
+/// **不写死任何用户名、PID 或进程编号** —— 见那个模块的头注释。
+///
+/// 返回 `{"ok":true, ...}` 或 `{"ok":false, "error":"..."}`；
+/// `error` 里会说明"是控制接口没找到"还是"找到了但连不上"。
+#[tauri::command]
+pub async fn proxy_probe_nodes() -> Value {
+    use ai_gateway_core::modules::device_proxy::node_probe;
+    match node_probe::probe_nodes("https://www.workbuddy.ai").await {
+        Ok(outcome) => {
+            let mut v = node_probe::probe_nodes_json(&outcome);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("ok".into(), json!(true));
+            }
+            v
+        }
+        Err(e) => json!({ "ok": false, "error": e }),
+    }
+}

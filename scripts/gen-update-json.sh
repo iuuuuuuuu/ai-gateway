@@ -34,8 +34,23 @@ case "$UPDATE_OS" in
     SIG_GLOB="*_${VERSION}_x64-setup.exe.sig"
     PLATFORM_KEYS="windows-$UPDATE_ARCH-nsis windows-$UPDATE_ARCH"
     ;;
+  darwin)
+    # ⚠ macOS 的更新包是 **.app.tar.gz**，不是 .dmg ——
+    # Tauri 的 updater 只能替换 .app bundle，dmg 是给用户手动安装用的。
+    # 签名由 `tauri build --bundles app` 产出（签的是那个 tar.gz）。
+    DEFAULT_BUNDLE="macos"
+    SIG_GLOB="*.app.tar.gz.sig"
+    # bundle 后缀是 `app`（见 tauri-plugin-updater 的 bundle_type）。
+    PLATFORM_KEYS="darwin-$UPDATE_ARCH-app darwin-$UPDATE_ARCH"
+    ;;
+  linux)
+    # Linux 用 AppImage（自更新友好）。签名文件是 *.AppImage.tar.gz.sig。
+    DEFAULT_BUNDLE="appimage"
+    SIG_GLOB="*.AppImage.tar.gz.sig"
+    PLATFORM_KEYS="linux-$UPDATE_ARCH-appimage linux-$UPDATE_ARCH"
+    ;;
   *)
-    echo "gen-update-json: 不支持的系统：$UPDATE_OS（只支持 windows）" >&2
+    echo "gen-update-json: 不支持的系统：$UPDATE_OS（支持 windows / darwin / linux）" >&2
     exit 1
     ;;
 esac
