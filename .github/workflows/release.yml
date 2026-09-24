@@ -287,9 +287,16 @@ jobs:
           # `windows-x86_64-nsis` 键，见 gen-update-json.sh 的 PLATFORM_KEYS）。
           #
           # ⚠ 为什么在 run 里算、而不是把表达式写进 matrix：
-          # matrix 值里能否用 `${{ }}` 没有把握（一旦不求值，`--bundles` 会收到
-          # 一整个 `${{ ... }}` 字面量而直接失败）。run 步骤里的表达式求值则是
-          # 本仓库已在用的确定路径。
+          # matrix 值里能否用 GitHub 的表达式语法（dollar 紧跟两个花括号）
+          # 没有把握 —— 一旦不求值，--bundles 会收到那一串字面量而直接失败。
+          # 而 run 步骤里的表达式求值是本仓库已在用的确定路径。
+          #
+          # ⚠ 这段注释里**绝不能**写出那个花括号字面量：
+          # 本块是 YAML 的 run 块标量，其中的 # 是 **shell 注释而非 YAML 注释**，
+          # 所以块内任何花括号表达式都会被 GitHub 真的当表达式去求值 ——
+          # 空表达式会让整份 workflow 在解析阶段被拒绝，表现为
+          # 「run 创建即失败、零 job、workflow 名字回退成文件路径」，
+          # 而 PyYAML / 编辑器都不会报错。本地用 actionlint 可复现。
           #
           # 判据与 release 任务的 prerelease 标记**同源**（版本号含连字符），
           # 避免两处口径不一致。
