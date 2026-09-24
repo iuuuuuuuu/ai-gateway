@@ -35,6 +35,10 @@ type Chunk struct {
 	ReasoningContent string
 	// FinishReason 结束原因（通常最后一个分片才有）。
 	FinishReason string
+	// ToolCalls 工具调用增量。Qoder 上游在 finish_reason=tool_calls
+	// 前会分多帧发送 function.name/id/arguments；不能丢掉，否则 DSH
+	// 会看到“工具调用结束”但没有任何工具名，无法继续下一轮。
+	ToolCalls []map[string]any
 	// Model 模型名（上游回显）。
 	Model string
 	// Usage 用量汇总（**通常只在最后一个分片里**）。
@@ -390,12 +394,14 @@ func parseOpenAIShaped(data []byte, raw string) (*Chunk, error) {
 		Model   string `json:"model"`
 		Choices []struct {
 			Delta struct {
-				Content          string `json:"content"`
-				ReasoningContent string `json:"reasoning_content"`
+				Content          string           `json:"content"`
+				ReasoningContent string           `json:"reasoning_content"`
+				ToolCalls        []map[string]any `json:"tool_calls"`
 			} `json:"delta"`
 			Message struct {
-				Content          string `json:"content"`
-				ReasoningContent string `json:"reasoning_content"`
+				Content          string           `json:"content"`
+				ReasoningContent string           `json:"reasoning_content"`
+				ToolCalls        []map[string]any `json:"tool_calls"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -422,6 +428,10 @@ func parseOpenAIShaped(data []byte, raw string) (*Chunk, error) {
 		// delta 用于流式增量；message 用于非流式（有些实现两者都给）。
 		ch.Content = firstNonEmpty(c.Delta.Content, c.Message.Content)
 		ch.ReasoningContent = firstNonEmpty(c.Delta.ReasoningContent, c.Message.ReasoningContent)
+		ch.ToolCalls = c.Delta.ToolCalls
+		if len(ch.ToolCalls) == 0 {
+			ch.ToolCalls = c.Message.ToolCalls
+		}
 		ch.FinishReason = c.FinishReason
 	}
 	return ch, nil

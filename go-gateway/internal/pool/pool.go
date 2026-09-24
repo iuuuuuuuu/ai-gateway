@@ -57,15 +57,15 @@ func (k CoolKind) String() string {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID             string    `json:"uid"`
-	Nickname        string    `json:"nickname,omitempty"`
-	Credits         int64     `json:"credits"`
-	Cooling         bool      `json:"cooling"`
-	CoolKind        string    `json:"cool_kind,omitempty"`
-	CoolRemaining   int64     `json:"cool_remaining_sec,omitempty"`
-	Until           time.Time `json:"until,omitempty"`
-	Reason          string    `json:"reason,omitempty"`
-	Disabled        bool      `json:"disabled"`
+	UID           string    `json:"uid"`
+	Nickname      string    `json:"nickname,omitempty"`
+	Credits       int64     `json:"credits"`
+	Cooling       bool      `json:"cooling"`
+	CoolKind      string    `json:"cool_kind,omitempty"`
+	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
+	Until         time.Time `json:"until,omitempty"`
+	Reason        string    `json:"reason,omitempty"`
+	Disabled      bool      `json:"disabled"`
 	// NoRoute 用户手动禁用：**只不接流量**，养号任务照跑。
 	//
 	// 与 Disabled 分开下发，界面才能如实区分两种「不接流量」：
@@ -73,7 +73,7 @@ type Status struct {
 	//   Disabled → 网关判定该号已死（session 死 / 额度冻结），任务也会跳过
 	// 两者在界面上若都写成「禁用」，用户就无法判断「这个号还在不在养」——
 	// 而「禁用了但仍在养号」正是本功能的语义。
-	NoRoute         bool      `json:"no_route,omitempty"`
+	NoRoute bool `json:"no_route,omitempty"`
 
 	// Product 该账号属于**哪个客户端产品**（`workbuddy` / `qoder` / `zcode`）。
 	//
@@ -187,22 +187,34 @@ type entry struct {
 	// 立刻重新撞同一批 6004，用户看到的仍是「频繁不可用」。
 	modelCools map[string]modelCool
 
-	// costRate 该账号当前请求模型的「单位额度消耗率」；0 = 未声明。
+	// costRate 该账号当前请求模型的「单位额度消耗率」。
 	//
 	// 跨产品可比性的载体：两产品的额度单位不同（WorkBuddy 积分 ≠ Qoder 积分），
 	// 绝对值不可比，但"这个模型在这份额度上消耗得多快"是可比的。
 	//
-	// 语义（三态，与全仓库口径一致）：
-	//	> 0  已声明：值越大越贵，权重越小
-	//	= 0  **未声明** → 中性（不猜测、不惩罚）
+	// ⚠⚠ **必须与 costKnown 配对读**（2026-09-23 修正）。
 	//
-	// ⚠ 为什么不复用 credits：现有 tierWeightOf **刻意不含 credits**
-	//（pool.go 的注释说明了原因：同档内按积分分配会让高积分账号长期吃掉流量）。
-	// 所以"按成本路由"必须另立维度，塞回 credits 是无效的 —— 只要有任何账号
-	// 带到期信息就会走 tiered 分支，credits 会被整个丢掉。
+	// 原实现让 0 同时表示"免费"和"未声明"，那是**错误的** ——
+	// 上游 `credit_multiplier` 的三态是：
+	//
+	//	0    免费（**已声明**，实测 deepseek-v4.1-flash 国际版 x0.00）
+	//	> 0  计费
+	//	未给 未声明
+	//
+	// 而池这边若把 0 当"未声明"，免费账号就享不到任何优先 ——
+	// 「免费额度绝对优先」这条需求会**静默失效**（看起来在工作，实际一次都没生效）。
+	// 故拆成两个字段：costKnown 为 true 时 costRate 才可信（0 就是真免费）。
+	//
+	// 为什么不用 *float64：这个字段在**选号热路径**上被反复读，
+	// 指针会带来 nil 检查与额外的间接寻址；bool + float64 更直白也更快。
 	//
 	// 运行态，不持久化：它取决于**当前请求的模型**，跨请求无意义。
 	costRate float64
+
+	// costKnown 报告 costRate 是否**已声明**（见上）。
+	//
+	// false = 不知道这个账号对这个模型收不收费 → 中性，不猜测、不惩罚。
+	costKnown bool
 }
 
 // expiryDayKey 返回账号「最近到期积分」的到期日（本地时区，YYYY-MM-DD）。
@@ -706,18 +718,58 @@ func (p *Pool) productMayServe(product, model string) bool {
 	return offers
 }
 
-// SetCostRate 设置某账号对**当前模型**的单位额度消耗率（0 = 未声明）。
+// AccountKey 是「账号身份」的轻量投影，专供**热路径**上按区域注入成本率用。
+//
+// 为什么不复用 Status：`Status` 要算排队档位、模型冷却、成功率等一堆东西
+//（见 List 的实现），在每次 chat 请求的关键路径上调它是浪费。
+// 这里只要"这个账号是哪个产品的、属于哪个区域"两个字段。
+type AccountKey struct {
+	UID     string
+	Product string
+	Region  auth.Region
+}
+
+// AccountKeys 返回全部账号的轻量身份投影（uid 升序，便于测试断言）。
+//
+// 调用方（server 的 injectCostRates）据此把倍率按**账号所在区域**注入池子。
+func (p *Pool) AccountKeys() []AccountKey {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]AccountKey, 0, len(p.byUID))
+	for uid, e := range p.byUID {
+		k := AccountKey{UID: uid}
+		if e.a != nil {
+			k.Product = e.a.ProductOf()
+			k.Region = e.a.Region()
+		}
+		out = append(out, k)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].UID < out[j].UID })
+	return out
+}
+
+// SetCostRate 设置某账号对**当前模型**的单位额度消耗率。
+//
+// `known=false` 表示"未声明"（中性）；`known=true` 时 `rate` 才可信，
+// 且 **rate=0 是"免费"而不是"未声明"** —— 这个区分至关重要，
+// 见 entry.costRate 的注释（差一点就让「免费优先」静默失效）。
 //
 // 调用方（server 的派发层）在每次请求前按"该模型在该产品的成本倍率"
-// 计算好并注入。传 0 表示未声明 → 权重中性。
+// 计算好并注入。
 //
 // 为什么不在这里按模型查倍率：倍率表来自上游（WorkBuddy 的 /v3/config、
 // Qoder 的 model/list），pool 不该依赖 upstream（会循环依赖）。
 func (p *Pool) SetCostRate(uid string, rate float64) {
+	p.SetCostRateKnown(uid, rate, true)
+}
+
+// SetCostRateKnown 是 SetCostRate 的三态版本（见上）。
+func (p *Pool) SetCostRateKnown(uid string, rate float64, known bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.costRate = rate
+		e.costKnown = known
 	}
 }
 
@@ -727,7 +779,16 @@ func (p *Pool) ClearCostRates() {
 	defer p.mu.Unlock()
 	for _, e := range p.byUID {
 		e.costRate = 0
+		e.costKnown = false
 	}
+}
+
+// costIsFreeLocked 报告该账号对当前模型是否**已声明免费**（倍率 = 0）。
+//
+// 必须是「已声明 且 等于 0」两个条件同时成立：
+// 只有已声明才谈得上免费，未声明是"不知道"，不能当成免费。
+func (e *entry) costIsFreeLocked() bool {
+	return e.costKnown && e.costRate <= 0
 }
 
 // SetStore 注入池状态快照镜像（redisstore.Store）。nil 表示不镜像（纯本地恢复）。
@@ -861,7 +922,8 @@ func (p *Pool) AcquireWait(ctx context.Context, uid string, wait time.Duration) 
 }
 
 // Release 释放一个在途名额。幂等减到 0 为止（防重复释放扣成负数）。
-func (p *Pool) Release(uid string) {	p.mu.RLock()
+func (p *Pool) Release(uid string) {
+	p.mu.RLock()
 	e, ok := p.byUID[uid]
 	p.mu.RUnlock()
 	if !ok {
@@ -1345,9 +1407,12 @@ func (p *Pool) pickForModelAny(model string, tried map[string]bool) *auth.Auth {
 		if acct := pick(pref); acct != nil {
 			return acct
 		}
-		// 声明过的产品里挑不到（都在冷却/在途占满）——**不能直接放弃**，
-		// 否则"声明了但暂时不可用"会让请求 503，而兜底候选明明能用。
-		// 故继续往下走，用完整候选集（含未知）再挑一次。
+		// 声明过的产品里暂时挑不到时，**不能跨到未知产品**。
+		// 未知只表示网关没有可信能力清单，绝不等于它能服务这个模型；
+		// 对 Qwen3.8-Flash 这种只有 Qoder 声明的模型，放行 WorkBuddy
+		// 会把请求打到根本没有该模型的上游，并把失败计入错误平台。
+		// 因此这里宁可返回 nil，让调用方明确报告没有该产品的可用账号。
+		return nil
 	}
 
 	return pick(scoped)
@@ -1525,6 +1590,14 @@ func (p *Pool) pickBestFrom(cands []*entry, tried map[string]bool, now time.Time
 	if len(usable) == 0 {
 		return nil
 	}
+
+	// ⚠ 顺序至关重要：**免费优先于到期**（2026-09-23 所有者要求）。
+	//
+	//	「优先路由国际账号,因为他是free,其次才是积分快到期的账号」
+	//
+	// 先按"已声明免费"收窄，再在剩下的里面做到期分层 ——
+	// 反过来写的话，免费账号会被到期分层挡在候选集外，永远轮不到。
+	usable, _ = p.freeTierLocked(usable)
 
 	usable, tiered := p.earliestExpiryTierLocked(usable)
 
@@ -1842,10 +1915,16 @@ func (p *Pool) pickLocked(tried map[string]bool, model string, allowFallback boo
 		return p.pickEarliestExpiryLocked(tried, now, model)
 	}
 
+	// ⚠ 顺序至关重要：**免费优先于到期**（见 freeTierLocked 的注释）。
+	cands, _ = p.freeTierLocked(cands)
+
 	// 到期分层：只保留最早到期的一档。
 	//
 	// 分档而非加权，是为了让「先烧快过期额度」成为确定性行为：加权随机下
 	// 即将过期的额度仍会被分走一部分流量，而额度一旦过期就是净损失。
+	//
+	// 免费分支下这一步同样要做：免费账号之间也该先烧快过期的
+	//（两个都免费时，当然先把快作废的那份用掉）。
 	cands, tiered := p.earliestExpiryTierLocked(cands)
 
 	// top5 短名单按权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
@@ -1970,6 +2049,73 @@ func olderLastUsed(a, b *entry) bool {
 // 之所以不改成"未知档也保留"：那会推翻 WorkBuddy 那条刻意的设计决定
 //（`TestPickUnknownExpiryGoesLast` 明确要求未知档在还有别的账号时不被选中）。
 // 这里要修的是**跨产品误用**，不是那条决定本身。
+// freeTierLocked 是「免费额度绝对优先」的实现：只保留**已声明免费**的候选。
+//
+// # 为什么需要一个**独立于到期分层**的更高优先级
+//
+// 所有者原话（2026-09-23）：
+//
+//	「模型路由不但要考虑积分到期,积分总量,还要考虑 实际消耗积分,这些因素
+//	  比如 deepseek-v4.1-flash 在国际版是free 0倍率,国内是0.03 ……
+//	  这时候就应该优先路由国际账号,因为他是free 其次才是积分快到期的账号」
+//
+// 关键在最后半句：免费是**第一优先级**，到期日是**第二**。
+// 而当时的实现把到期分层放在最外层 —— 只要免费账号不在"最早到期那一档"里，
+// 它**根本进不了候选集**，成本维度再准也轮不到它。
+//
+// # 实测数据（2026-09-23，拉自己的账号）
+//
+//	WorkBuddy  deepseek-v4.1-flash  国服 x0.03  国际版 x0.00（免费）
+//	Qoder      Qwen3.8-Flash        priceFactor 0（免费）
+//
+// 即同名模型在两区差价是**100%** —— 免费的那一侧应当承接全部流量，
+// 直到它不可用（冷却/在途占满）为止。
+//
+// # 与「到期分层」的优先级关系（两者不冲突）
+//
+//	· 有免费候选    → **只用免费的**（到期分层在它们内部继续生效）
+//	· 没有免费候选  → 完全退回原行为（到期分层优先，成本仅档内微调）
+//
+// 所以既有契约 TestCostDoesNotOverrideExpiryTier（两个**付费**账号之间，
+// 必须仍先烧快过期的那个）**逐字不变** —— 那条测试的两方 rate 是 50.0 与 0.01，
+// 都不是免费，走不到本分支。
+//
+// # 为什么"未声明"不算免费
+//
+// 未声明（costKnown=false）是"不知道收不收费"。把它当免费会让
+// **某个还没查到倍率的平台**抢走全部流量 —— 而那些平台的倍率表
+// 恰恰是最后才补齐的。故只有 `costKnown && rate<=0` 才算免费。
+//
+// 返回的第二个值报告"是否真的按免费收窄了候选"，供调用方决定
+// 后续要不要跳过到期分层（收窄后仍要走分层：免费账号之间也该先烧快过期的）。
+func (p *Pool) freeTierLocked(cands []*entry) ([]*entry, bool) {
+	if !p.multiProductOn || p.costWeight <= 0 {
+		// 多产品/成本维度关闭时**完全不介入**，保证"不新增行为"。
+		return cands, false
+	}
+	var free []*entry
+	for _, e := range cands {
+		if e.costIsFreeLocked() {
+			free = append(free, e)
+		}
+	}
+	// 一个都没有 ⇒ 不改变候选（退回原行为）。
+	if len(free) == 0 {
+		return cands, false
+	}
+	// ⚠ 全部候选都免费时也返回「未收窄」，让调用方走原路径 ——
+	// 否则后续几处 `len(cands)<=1` 之类的短路判断会因"我们动过 slice"
+	// 而产生不必要的行为差异。
+	if len(free) == len(cands) {
+		return cands, false
+	}
+	return free, true
+}
+
+// earliestExpiryTierLocked 按「最近到期积分」分层，只保留最早的一档。
+//
+// 调用方必须**先**跑 freeTierLocked（免费优先高于到期优先），
+// 见那个函数的注释。
 func (p *Pool) earliestExpiryTierLocked(cands []*entry) ([]*entry, bool) {
 	if len(cands) <= 1 {
 		return cands, false

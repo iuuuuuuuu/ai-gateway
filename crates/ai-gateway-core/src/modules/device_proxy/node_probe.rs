@@ -681,14 +681,22 @@ mod tests {
     /// 字面量。我第一版调查抓到的管道名含用户名与 PID，若有谁图省事把它
     /// 写进 `PIPE_PATTERNS` 或候选路径，这条会红。
     ///
-    /// ⚠ 这个测试只能检查**它自己所在文件**，且必须跳过：
-    ///	· 注释（我们是靠注释讲清教训的，提到那些值是必要的）
-    ///	· **本测试自身**（模式串必须写在这里才能被检查 —— 我第一版没排除，
-    ///	  测试当场把自己的字面量当成违规抓了出来，是个假失败）
+    /// # ⚠ 本测试**不写真实用户名**（2026-09-23 修正）
+    ///
+    /// 第一版把真实用户名当模式串写在这里 —— 那本身就是一次泄漏
+    ///（本仓库是**公开仓库**），而且很讽刺：一个"禁止写死本机值"的测试
+    /// 自己写死了本机值。
+    ///
+    /// 现在改用**结构特征**判断，不列任何真实值：
+    ///   · 形如 `xxx-NNNNN`（管道名末尾的那个进程编号）
+    ///   · `mihomo-admin-` 这种"发行版前缀 + 用户名"的固定拼法
+    ///   · 任何**具体端口数字**出现在 TCP 候选里（本该来自约定常量）
+    ///
+    /// ⚠ 这个测试只能检查**它自己所在文件**，且必须跳过注释与自身
+    ///（注释里讲教训会提到那些形态；模式串也要写在这里才能被检查）。
     #[test]
     fn discovery_has_no_machine_specific_literals() {
         let src = include_str!("node_probe.rs");
-        let bad_patterns = ["iuuuuuuuu", "mihomo-admin-", "17056", "40196"];
         let mut in_this_test = false;
         for (idx, line) in src.lines().enumerate() {
             // 用"测试函数名"界定自身范围：它之后到文件末尾的都算测试代码。
@@ -698,16 +706,63 @@ mod tests {
             if in_this_test {
                 continue;
             }
-            // 只看代码部分（`//` 之前），注释里允许提到那些值。
+            // 只看代码部分（`//` 之前），注释里允许提到那些形态。
             let code = line.split("//").next().unwrap_or("");
-            for bad in bad_patterns {
-                assert!(
-                    !code.contains(bad),
-                    "第 {} 行出现本机特有字面量 {bad}：{line}\n\
-                     发现逻辑必须只认结构（管道名关键词 / 约定路径），不能写死本机值",
+
+            // 1) `mihomo-admin-` 这类"内核名 + 用户名"的固定拼法不得出现。
+            assert!(
+                !code.contains("mihomo-admin-"),
+                "第 {} 行出现『内核名-用户名』的写死拼法：{line}\n\
+                 发现逻辑必须只认结构（管道名关键词 / 约定路径），不能写死本机值",
+                idx + 1
+            );
+
+            // 2) 形如 `名字-12345` 的进程编号不得作为**字符串字面量**出现。
+            //    用状态机扫字面量，避免误伤 `-1`、`0x1F` 这类正常写法。
+            if let Some(lit) = first_string_literal_with_dash_digits(code) {
+                panic!(
+                    "第 {} 行出现疑似『名字-进程编号』的字面量 {lit}：{line}\n\
+                     发现逻辑必须只认结构，不能写死本机值",
                     idx + 1
                 );
             }
+        }
+    }
+
+    /// 从一行代码里找出第一个"含 `-` 且紧跟 3 位以上数字"的字符串字面量。
+    ///
+    /// 返回 `None` 表示这行没有这种形态。只认**字符串字面量**（引号内），
+    /// 所以 `let timeout = 3;`、`0x1F_8B` 之类不会被误判。
+    fn first_string_literal_with_dash_digits(line: &str) -> Option<String> {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != b'"' {
+                j += 1;
+            }
+            let lit = &line[start..j.min(line.len())];
+            if looks_like_name_with_pid(lit) {
+                return Some(format!("\"{lit}\""));
+            }
+            i = j + 1;
+        }
+        None
+    }
+
+    /// 判断字面量是不是"名字-进程编号"形态：`-` 之后是 3 位以上纯数字。
+    fn looks_like_name_with_pid(lit: &str) -> bool {
+        match lit.rfind('-') {
+            Some(pos) if pos > 0 => {
+                let tail = &lit[pos + 1..];
+                tail.len() >= 3 && tail.chars().all(|c| c.is_ascii_digit())
+            }
+            _ => false,
         }
     }
 

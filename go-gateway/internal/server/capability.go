@@ -27,8 +27,8 @@ package server
 // 会把「能读图」谎报成事实，客户端据此发出必然被静默降级的请求。
 
 import (
-	"sort"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -291,7 +291,7 @@ func (h *Handler) fetchModelsForRegion(region auth.Region) []upstream.ModelInfo 
 //	重试：一个账号失败就**试下一个** —— 一个坏账号不该让整个区域变未知
 //
 // 第 2 点尤其重要：即使筛选修好了，凭证目录里仍可能有异常账号
-//（用户手动放的、旧版本残留的）。让"一个坏账号拖垮整个区域"不可能发生，
+// （用户手动放的、旧版本残留的）。让"一个坏账号拖垮整个区域"不可能发生，
 // 才是真正的健壮性。
 func (h *Handler) probeAccountsInRegion(region auth.Region) []*auth.Auth {
 	var anyIntl []*auth.Auth
@@ -668,6 +668,7 @@ func (i *capabilityIndex) lookupRegion(id string, region auth.Region) (regionCap
 //     区域」的真值，另一个区域独有模型靠静态表补 —— 于是同名模型的能力标注
 //     取决于这次探测抽到哪个区，客户端两次启动可能看到不同能力；
 //   - 补进来的静态条目与动态条目在同一个数组里，客户端无法区分。
+//
 // productChannel 一个「模型来自哪个平台」的记录。
 //
 // 使用者的需求：
@@ -1073,6 +1074,7 @@ func (h *Handler) mergedModelList() []map[string]any {
 	}
 
 	out := make([]map[string]any, 0, len(order))
+	bareEntries := make(map[string]map[string]any, len(order))
 	for _, id := range order {
 		e := map[string]any{
 			"id":       id,
@@ -1096,7 +1098,15 @@ func (h *Handler) mergedModelList() []map[string]any {
 			}
 		}
 		if _, ok := e["context_length"]; !ok {
-			e["context_length"] = int64(131072) // 兜底
+			e["context_length"] = int64(131072) // 通用兜底
+		}
+		// Qoder 的模型清单来自宿主 product_models，只携带模型名，
+		// 没有 WorkBuddy /v3/config 那种 context_window 元数据。
+		// 官方 Qoder 客户端明确把 Qwen3.8-Flash 配成 1M；如果继续使用
+		// 通用 131072，DSH 会提前把会话当成 128K 模型，或在压缩阈值计算
+		// 上与官方客户端冲突。这里保留平台真实元数据覆盖通用兜底。
+		if strings.EqualFold(id, "Qwen3.8-Flash") {
+			e["context_length"] = int64(1000000)
 		}
 		for k, v := range idx.capabilityFieldsFor(id) {
 			e[k] = v
@@ -1114,7 +1124,55 @@ func (h *Handler) mergedModelList() []map[string]any {
 		if al := aliasesOf[id]; len(al) > 0 {
 			e["aliases"] = al
 		}
+		bareEntries[id] = e
 		out = append(out, e)
+	}
+
+	// aliases 只是兼容扩展字段，很多 OpenAI 客户端只读取 data[].id，
+	// 所以组合名必须同时作为独立条目返回。之前只挂 aliases，导致用户看到
+	// 的 /v1/models 只有裸名，无法从模型选择器直接复制 `zcode:glm-5.3`。
+	// 独立条目复用裸模型的能力/渠道元数据，但 id 是可直接提交给网关的组合名。
+	for _, bare := range order {
+		baseEntry := bareEntries[bare]
+		for _, alias := range aliasesOf[bare] {
+			if alias == "" {
+				continue
+			}
+			aliasEntry := make(map[string]any, len(baseEntry)+1)
+			for k, v := range baseEntry {
+				if k == "aliases" {
+					continue
+				}
+				aliasEntry[k] = v
+			}
+			aliasEntry["id"] = alias
+			aliasEntry["owned_by"] = "gateway-route"
+			aliasEntry["route_for"] = bare
+			// 组合名本身已经指定平台/区域，不能继续展示裸名的全部渠道；
+			// 否则 `zcode:glm-5.3` 的模型项仍会显示 WorkBuddy，造成用户
+			// 以为这个明确路由还可能落到其它平台。
+			product, realm, _ := resolveModel(alias)
+			if raw, ok := aliasEntry["channels"].([]map[string]any); ok && (product != "" || realm != "") {
+				wantRegion := ""
+				if r := realmToRegion(realm); r != auth.RegionAny {
+					wantRegion = r.String()
+				}
+				filtered := make([]map[string]any, 0, len(raw))
+				for _, channel := range raw {
+					p, _ := channel["product"].(string)
+					r, _ := channel["region"].(string)
+					if product != "" && p != product {
+						continue
+					}
+					if wantRegion != "" && r != wantRegion {
+						continue
+					}
+					filtered = append(filtered, channel)
+				}
+				aliasEntry["channels"] = filtered
+			}
+			out = append(out, aliasEntry)
+		}
 	}
 	return out
 }
@@ -1206,7 +1264,7 @@ type productModel struct {
 // realmLabelOf 把 `auth.Region` 映射成**用户在前缀里会写**的区域名。
 //
 // 为什么要这一步：内部标识是 `cn` / `intl`，而所有者习惯写「国服」/「国际版」
-//（`resolve_model.go` 里 `realmIntlCN = "国际版"` 就是为此加的别名）。
+// （`resolve_model.go` 里 `realmIntlCN = "国际版"` 就是为此加的别名）。
 // 模型清单里给出的组合名必须与用户会输入的写法一致，否则"给了名字但用不了"。
 //
 // RegionAny 返回空串：它表示"不限区域"，不是一个可写进前缀的区域名。
@@ -1390,9 +1448,9 @@ func (idx *capabilityIndex) regionFields(id string) map[string]any {
 			}
 		}
 		return map[string]any{
-			"supported_regions": []string{supported[0]},
+			"supported_regions":  []string{supported[0]},
 			"unverified_regions": []string{other},
-			"region_note":       unverifiedNote(supported[0], other, gap),
+			"region_note":        unverifiedNote(supported[0], other, gap),
 		}
 	}
 	// B 情形：另一侧有真值且清单里确实没有它 —— 可以断言。

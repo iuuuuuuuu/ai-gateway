@@ -1,6 +1,7 @@
 package server
 
-// unusual.go 上游 3012「unusual activity」的**熔断**：识别出来就别再换号了。
+// unusual.go 上游 3012「unusual activity」的**产品级熔断**：识别出来就别再换号了。
+// 不同产品的熔断状态严格隔离：ZCode 的 3012 不得阻断 Qoder/WorkBuddy。
 //
 // # 要解决的问题（所有者 2026-09-21 明确要求）
 //
@@ -85,11 +86,11 @@ const (
 	unusualMaxWindow = 30 * time.Minute
 )
 
-// unusualBreaker 3012 的进程级熔断状态。
+// unusualBreaker 单一产品的 3012 熔断状态。
 //
-// 包级变量而不是 Handler 字段：3012 是**账号/出口层面**的属性
-//（已确认与单个账号无关），跨请求、跨 handler 共享才是正确语义。
-// 本包已有同类先例（wafip.go 的 wafIP、capability.go 的 regionModelCache）。
+// 3012 是上游产品接口返回的业务风控码，**不能跨产品传播**：
+// zcode 的 3012 只说明 ZCode 上游当前拒绝请求，不能阻断 Qoder/WorkBuddy。
+// 同一产品内仍跨账号共享，因为换号会放大同一个上游/出口的风控。
 type unusualBreaker struct {
 	mu sync.Mutex
 	// until 熔断截止；零值或已过 = 不熔断。
@@ -102,7 +103,44 @@ type unusualBreaker struct {
 	hits int
 }
 
-var unusual = newUnusualBreaker()
+// unusualBreakers 按产品隔离 3012 熔断：zcode / qoder / workbuddy。
+//
+// 空产品归一为 workbuddy，兼容历史 WorkBuddy 凭证。
+type unusualBreakers struct {
+	mu        sync.Mutex
+	byProduct map[string]*unusualBreaker
+}
+
+func newUnusualBreakers() *unusualBreakers {
+	return &unusualBreakers{byProduct: map[string]*unusualBreaker{}}
+}
+
+func (r *unusualBreakers) forProduct(product string) *unusualBreaker {
+	if product == "" {
+		product = "workbuddy"
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if b := r.byProduct[product]; b != nil {
+		return b
+	}
+	b := newUnusualBreaker()
+	r.byProduct[product] = b
+	return b
+}
+
+func (r *unusualBreakers) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.byProduct = map[string]*unusualBreaker{}
+}
+
+// 以下兼容旧测试/调用约定：未指定产品时按 WorkBuddy 处理。
+func (r *unusualBreakers) tripped() (bool, time.Duration) { return r.forProduct("workbuddy").tripped() }
+func (r *unusualBreakers) note3012() time.Time            { return r.forProduct("workbuddy").note3012() }
+func (r *unusualBreakers) noteSuccess()                   { r.forProduct("workbuddy").noteSuccess() }
+
+var unusual = newUnusualBreakers()
 
 func newUnusualBreaker() *unusualBreaker {
 	return &unusualBreaker{window: unusualWindow, now: time.Now}
@@ -131,7 +169,7 @@ func (b *unusualBreaker) tripped() (bool, time.Duration) {
 // 与 wafip.go 的 noteWaf 不同：那个判据是"不同账号数"，同一账号重复命中
 // 不该增加计数（那是账号问题）。而 3012 的判据是"上游正在风控"——
 // 每一次命中都说明**此刻仍在风控中**，故重复命中应当把窗口往后推
-//（并以翻倍方式退让，见 unusualCooldownAfterBreaker）。
+// （并以翻倍方式退让，见 unusualCooldownAfterBreaker）。
 func (b *unusualBreaker) note3012() time.Time {
 	now := b.now()
 	b.mu.Lock()
@@ -197,7 +235,7 @@ var unusualActivityMarkers = []string{
 // ⚠ 为什么还要看状态码：3012 的载体实测是 **405**（不是 4xx 里常见的
 // 403/429），而 405 在网关里还有别的可能来源（方法不允许）。故要求
 // 状态码是 4xx 或 5xx —— 一个 HTTP 200 的正常回复里恰好含这些词
-//（比如用户在聊风控）不该触发熔断。
+// （比如用户在聊风控）不该触发熔断。
 func isUnusualActivity(status int, body string) bool {
 	if status < 400 {
 		return false
@@ -231,7 +269,7 @@ func isUnusualActivity(status int, body string) bool {
 // 那本身就是"用字符串凑 JSON"的征兆。
 //
 // 兜底：JSON 解析失败时（上游偶尔回非标准体）退回**带引号的精确匹配**
-//（`"code":"3012"` 或 `"code":3012` 后必须跟非数字字符），
+// （`"code":"3012"` 或 `"code":3012` 后必须跟非数字字符），
 // 但绝不用裸子串 —— 那正是 30120 误判的来源。
 func hasBareCode(body, code string) bool {
 	t := strings.TrimSpace(body)
@@ -288,7 +326,7 @@ func rawCodeEquals(raw json.RawMessage, want string) bool {
 //
 // ⚠ 刻意不说"账号被封"：实测同一账号一分钟后就成功，且官方客户端也吃它。
 // 说成封号会把用户引向"去换账号"这个**完全无效**的方向
-//（历史上正是这么误导过所有者）。
+// （历史上正是这么误导过所有者）。
 func unusualActivityMessage(wait time.Duration) string {
 	secs := int(wait.Round(time.Second) / time.Second)
 	if secs < 1 {

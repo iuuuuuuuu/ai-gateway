@@ -758,8 +758,8 @@ func TestRunGrowthMapNowBypassesDailyGate(t *testing.T) {
 	}
 }
 
-// TestGrowthMapSkipsDisabledAccounts 禁用账号不参与。
-func TestGrowthMapSkipsDisabledAccounts(t *testing.T) {
+// TestGrowthMapRunsForDisabledAccounts 禁用只影响对话选号，任务仍执行。
+func TestGrowthMapRunsForDisabledAccounts(t *testing.T) {
 	resetGrowthDelay(t)
 	g := &growthStub{streakDays: 30}
 	s := newGrowthScheduler(t, g,
@@ -770,11 +770,11 @@ func TestGrowthMapSkipsDisabledAccounts(t *testing.T) {
 
 	s.RunGrowthMapNow()
 
-	// 只应有一个账号跑（每号一次礼包调用）。
+	// 两个账号都应跑（每号一次礼包调用）。
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.giftCalls != 1 {
-		t.Errorf("禁用账号不应参与，礼包调用应为 1 次，实际 %d 次", g.giftCalls)
+	if g.giftCalls != 2 {
+		t.Errorf("禁用账号也应参与，礼包调用应为 2 次，实际 %d 次", g.giftCalls)
 	}
 }
 

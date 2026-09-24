@@ -68,6 +68,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"workbuddy2api/internal/qoderclient"
 )
 
 // CampaignHost 活动接口的 host。
@@ -104,8 +106,8 @@ type Campaign struct {
 	StartAt     int64  `json:"startAt"`
 	EndAt       int64  `json:"endAt"`
 	Benefit     *struct {
-		Kind   string  `json:"kind"`   // "CREDITS"
-		Amount float64 `json:"amount"` // 100
+		Kind     string  `json:"kind"`   // "CREDITS"
+		Amount   float64 `json:"amount"` // 100
 		Validity *struct {
 			Mode string `json:"mode"` // "RELATIVE_DAYS"
 			Days int    `json:"days"` // 30
@@ -147,8 +149,45 @@ func campaignHostOf(cr *Cred) string {
 
 // buildCampaignRequest 构造活动查询请求。
 //
-// 抽出来是为了让测试能**直接断言三个头都带上了** —— 那正是本功能
-// 最容易静默出错的地方（少一个头 → 上游回空清单且不报错）。
+// 抽出来是为了让测试能**直接断言这些头都带上了** —— 那正是本功能
+// 最容易静默出错的地方（少一个头 → 上游回**看似正常**的残缺清单）。
+//
+// # ⚠⚠ 2026-09-23 实测修正：还缺两个头，且它们缺一不可
+//
+// 原实现只发 `Authorization` / `Accept` / `User-Agent` / `Cosy-ClientType`，
+// 并注释说"三件套缺一不可"。**那个判断不完整** —— 所有者报
+// 「国内的有这个领取任务，国际版怎么只剩下一个活动了，这是bug吧?」，
+// 而他用**官方国际版客户端**打开时明明有两个活动。
+//
+// 逐个头部做二分实测（`openapi.qoder.sh`，同一个国际版令牌）：
+//
+//	只 Cosy-ClientType                 → 1 条 [VIEW_DETAILS]      ← 我们原来的做法
+//	+ Cosy-MachineOs                  → 1 条
+//	+ Cosy-MachineToken               → 1 条
+//	+ Cosy-MachineType                → 1 条
+//	+ Cosy-MachineCode/Hostname/Id    → 1 条
+//	Cosy-MachineToken + Cosy-MachineType → **2 条 [CLAIM_BENEFIT(CLAIMABLE), VIEW_DETAILS]**
+//
+// 即 **`Cosy-MachineToken` 与 `Cosy-MachineType` 必须同时在场**，
+// 少任何一个都退回残缺清单。而且上游对残缺请求回的是 **HTTP 200 +
+// 结构合法的 JSON**，只是活动列表少了一条 —— 不报错、不告警，
+// 从响应本身完全看不出异常（这正是它藏了这么久的原因）。
+//
+// 对照官方客户端抓包（`Qoder CN.exe`，Reqable id=6）确认它发的头里有：
+//
+//	cosy-clienttype / cosy-machinecode / cosy-machinehostname /
+//	cosy-machineid / cosy-machineos / cosy-machinetoken / cosy-machinetype /
+//	cosy-version
+//
+// 我们只补**实测证明必需的那两个**：其余几个是客户端身份元数据，
+// 实测加了不改变结果，补它们只会引入需要维护的假值。
+//
+// 数据来源：`Cred.MachineToken` / `Cred.MachineType`（登录时上游下发，
+// 已持久化在凭证文件的 `machine.token` / `machine.type`）。
+// 见 cred.go 里那三个字段的注释 —— 它们本来就是为 COSY 签名存的。
+//
+// ⚠ 空值时不发该头（而不是发空串）：上游对 `Cosy-MachineType: `（空值）
+// 的判定未实测，发空串可能被当成"提供了但非法"，比不提供更糟。
 func (c *Client) buildCampaignRequest(ctx context.Context, cr *Cred, host string) (*http.Request, error) {
 	if host == "" {
 		host = campaignHostOf(cr)
@@ -157,12 +196,54 @@ func (c *Client) buildCampaignRequest(ctx context.Context, cr *Cred, host string
 	if err != nil {
 		return nil, err
 	}
-	// 三件套缺一不可，见文件头的说明。
 	req.Header.Set("Authorization", "Bearer "+cr.DT)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "Qoder/1.0")
+	// ① 缺了它 → 上游回空清单（见文件头第一段教训）
 	req.Header.Set("Cosy-ClientType", campaignClientType)
+	// ②③ 缺任一 → 上游回**残缺清单**（少掉可领取的那条），200 且不报错。
+	setMachineHeaders(ctx, req, cr)
 	return req, nil
+}
+
+// setMachineHeaders 补上活动接口必需的**机器指纹**头。
+//
+// # 实测结论（2026-09-23，二分定位）
+//
+// `Cosy-MachineToken` 与 `Cosy-MachineType` **必须同时在场且值真实**：
+//
+//	只 Cosy-ClientType                          → 1 条活动
+//	+ 伪造的 Cosy-MachineToken/Cosy-MachineType  → 1 条活动
+//	+ **真实的** 那两个头                        → 2 条活动（含「每天领 100 Credits」）
+//
+// ⚠ 上游对残缺/伪造的请求回的是 **HTTP 200 + 结构合法的 JSON**，
+// 只是少一条活动 —— 不报错、不告警。这是本功能最隐蔽的失败模式。
+//
+// # 真实值从哪来
+//
+// 由客户端自带的阿里云风控 SDK（`runtime-info.exe`）产出，见
+// `qoderclient.MachineIdentityOf`。**不再用 `Cred.MachineToken`** ——
+// 那个字段是 `EnsureFingerprint` 本地编造的（`hexShort(32)` + 固定 `"5"`），
+// 国服 host 不校验所以一直没暴露，而国际版 host 严格校验三元组。
+//
+// 抽成函数是为了让查询与领取两条路径**共用同一组头** ——
+// 分别手写必然会漂移（本文件历史上已经因为"三件套"写漏过头）。
+func setMachineHeaders(ctx context.Context, req *http.Request, cr *Cred) {
+	if cr == nil {
+		return
+	}
+	id := qoderclient.MachineIdentityOf(ctx)
+	if !id.Usable() {
+		// 拿不到就**不发**（而不是发空串或假值）：
+		// 空串可能被上游当成"提供了但非法"，假值则确定无效。
+		// 退回"降级但可用"的老行为，至少不会更坏。
+		return
+	}
+	req.Header.Set("Cosy-MachineToken", id.MachineToken)
+	req.Header.Set("Cosy-MachineType", id.MachineType)
+	// Code 实测不是必需（二分时只补 Token+Type 就够），
+	// 但官方客户端发了它，且它是同一组身份的一部分 —— 一并带上。
+	req.Header.Set("Cosy-MachineCode", id.MachineCode)
 }
 
 // FetchCampaigns 查询该账号的权益活动（**只读**）。
@@ -199,8 +280,8 @@ func (c *Client) FetchCampaigns(ctx context.Context, cr *Cred) (*CampaignStatus,
 
 // ClaimResult 领取结果。
 type ClaimResult struct {
-	GrantID  string `json:"grantId"`
-	Status   string `json:"status"` // "CLAIMED"
+	GrantID string `json:"grantId"`
+	Status  string `json:"status"` // "CLAIMED"
 	// Replayed true = 这次是**重放**（之前已领过），不是新领到。
 	//
 	// ⚠ 必须把它透出给用户：否则重复点"领取"会让人以为又领了一份。
@@ -239,6 +320,18 @@ func (c *Client) ClaimCampaign(ctx context.Context, cr *Cred, campaignID string)
 	if cr == nil || cr.DT == "" {
 		return nil, fmt.Errorf("账号没有可用令牌")
 	}
+	return c.claimCampaignAt(ctx, cr, campaignHostOf(cr), campaignID)
+}
+
+// claimCampaignAt 是 ClaimCampaign 的可注入 host 版本（供测试用 httptest 拦截）。
+//
+// 抽出来的唯一目的是**让测试能断言请求头真的发出去了** —— 本功能的历史缺陷
+// 全是"头写漏了但响应仍 200"（见 buildCampaignRequest 的注释），
+// 而那种缺陷只有把请求拦下来看头才能测到。
+func (c *Client) claimCampaignAt(ctx context.Context, cr *Cred, host, campaignID string) (*ClaimResult, error) {
+	if cr == nil || cr.DT == "" {
+		return nil, fmt.Errorf("账号没有可用令牌")
+	}
 	campaignID = strings.TrimSpace(campaignID)
 	if campaignID == "" {
 		return nil, fmt.Errorf("活动 ID 不能为空")
@@ -247,7 +340,10 @@ func (c *Client) ClaimCampaign(ctx context.Context, cr *Cred, campaignID string)
 	ctx, cancel := context.WithTimeout(ctx, c.timeout())
 	defer cancel()
 
-	url := campaignHostOf(cr) + "/sash/api/v1/me/campaigns/" + url.PathEscape(campaignID) + "/claim"
+	if host == "" {
+		host = campaignHostOf(cr)
+	}
+	url := host + "/sash/api/v1/me/campaigns/" + url.PathEscape(campaignID) + "/claim"
 	// 官方请求是 POST + 空 body（Content-Length: 0）。
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
@@ -257,9 +353,13 @@ func (c *Client) ClaimCampaign(ctx context.Context, cr *Cred, campaignID string)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "Qoder/1.0")
 	req.Header.Set("Cosy-ClientType", campaignClientType)
-	req.Header.Set("Origin", campaignHostOf(cr))
+	req.Header.Set("Origin", host)
 	// 官方带 referer 指向活动页；服务端未必校验，但照抄更安全。
-	req.Header.Set("Referer", campaignHostOf(cr)+"/growth-page/activity-iframe")
+	req.Header.Set("Referer", host+"/growth-page/activity-iframe")
+	// ⚠ 领取请求同样要补这两个头（与查询同源，见 buildCampaignRequest 的注释）：
+	// 查询少了它们会拿到**残缺清单**（看不到那条可领的活动），
+	// 而领取少了它们同样有被上游降级的风险 —— 两条路径用同一组头才不会分叉。
+	setMachineHeaders(ctx, req, cr)
 
 	resp, err := c.http().Do(req)
 	if err != nil {

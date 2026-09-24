@@ -16,6 +16,17 @@ import (
 	"workbuddy2api/internal/upstream"
 )
 
+func TestStartupCatchUpWindow(t *testing.T) {
+	now := time.Date(2026, 9, 24, 10, 20, 0, 0, time.Local)
+	if !withinCatchUp(now, lastScheduledAt(now, []int{10})) {
+		t.Fatal("10:20 启动应补跑 10:00 任务")
+	}
+	now = time.Date(2026, 9, 24, 10, 31, 0, 0, time.Local)
+	if withinCatchUp(now, lastScheduledAt(now, []int{10})) {
+		t.Fatal("超过 30 分钟不应补跑上一轮")
+	}
+}
+
 func TestNextFire(t *testing.T) {
 	loc := time.Local
 	now := time.Date(2026, 7, 27, 10, 0, 0, 0, loc)
@@ -44,6 +55,22 @@ func TestNextFireMergesSchedules(t *testing.T) {
 }
 
 // TestNextWakeKeepaliveOnly 签到已过点时按保活整点唤醒。
+func TestNextWakeIncludesGrowthMapWithActivity(t *testing.T) {
+	s := New(Config{
+		ActivityHours:   []int{10},
+		CheckinDisabled: true, KeepaliveDisabled: true,
+		NightOwlDisabled: true, SchoolDisabled: true, TrialDisabled: true,
+		QoderClaimDisabled: true,
+	})
+	at, kinds := s.nextWake(time.Date(2026, 9, 11, 9, 0, 0, 0, time.Local))
+	if want := time.Date(2026, 9, 11, 10, 0, 0, 0, time.Local); !at.Equal(want) {
+		t.Fatalf("next=%v want %v", at, want)
+	}
+	if !hasKind(kinds, taskActivity) || !hasKind(kinds, taskGrowthMap) {
+		t.Fatalf("活跃上报到点时应同时调度成长地图，kinds=%v", kinds)
+	}
+}
+
 func TestNextWakeKeepaliveOnly(t *testing.T) {
 	s := New(Config{CheckinHours: []int{9}, KeepaliveHours: []int{22},
 		ActivityDisabled: true, NightOwlDisabled: true, SchoolDisabled: true, TrialDisabled: true})
@@ -64,8 +91,8 @@ func TestNextWakeSameInstantFiresAll(t *testing.T) {
 		KeepaliveHours:   []int{22},
 		ActivityDisabled: true,
 		NightOwlDisabled: true,
-		SchoolDisabled: true,
-		TrialDisabled: true,
+		SchoolDisabled:   true,
+		TrialDisabled:    true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -127,8 +154,8 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 		KeepaliveDisabled: true,
 		ActivityDisabled:  true,
 		NightOwlDisabled:  true,
-		SchoolDisabled:  true,
-		TrialDisabled:  true,
+		SchoolDisabled:    true,
+		TrialDisabled:     true,
 		CheckinHours:      []int{9, 21},
 		KeepaliveHours:    []int{22},
 		ActivityHours:     []int{10},

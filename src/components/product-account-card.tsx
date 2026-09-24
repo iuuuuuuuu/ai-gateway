@@ -31,7 +31,7 @@
  *
  * 这样两个产品页与 WorkBuddy 账号页放在一起时，用户不必重新学一遍。
  */
-import { Loader2, RefreshCw, Trash2, Pencil, AlertTriangle, CheckCircle2, Clock3, Ellipsis, PlayCircle, ScrollText } from "lucide-react";
+import { Loader2, RefreshCw, Trash2, Pencil, AlertTriangle, CheckCircle2, Clock3, Ellipsis, Info, PlayCircle, ScrollText } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -206,12 +206,28 @@ export interface ProductAccountTask {
    *	done    —— 今天已完成（幂等命中），菜单项置灰并标注"已完成"
    *	ready   —— 可以执行
    *	blocked —— 当前不满足条件（如不在活动期），附 reason
+   *	detail  —— **只有详情、没有可领的东西**（上游 `VIEW_DETAILS`）。
+   *	          置灰显示并标注"仅详情"。
    *
-   * ⚠ `done` 的项**仍要显示**（置灰）而不是隐藏：用户需要知道
-   * "这个任务存在且今天已经做过了"。隐藏会让他以为功能没了。
+   * ⚠ `done` / `blocked` / `detail` 的项**仍要显示**（置灰）而不是隐藏：
+   * 用户需要知道"这个任务存在且今天已经做过了"。隐藏会让他以为功能没了。
+   *
+   * # ⚠ `detail` 是 2026-09-23 补的状态（所有者报的真实缺陷）
+   *
+   * 原实现把这类活动**整条滤掉**，于是当某账号只有 `VIEW_DETAILS` 活动时
+   * `tasks` 为空 ⇒ 卡片里 `tasks.length > 0` 不成立 ⇒ **整个「本账号任务」
+   * 菜单组都不渲染**。
+   *
+   * 所有者现场（Qoder 国际版）：菜单里只有「刷新/记录/备注/停用/删除」，
+   * 他说「qoder国际版账号怎么还是没有本账号任务?明明是有的」——
+   * 而那条活动**确实存在**（实测 `showCampaign:true`、活动进行中）。
+   *
+   * 讽刺的是上面那句"隐藏会让他以为功能没了"的注释**早就写着**，
+   * 但过滤发生在更上游，把 `tasks` 变成空数组，等于绕过了这条设计。
+   * 故补一个显式状态，而不是继续用"过滤掉"来表达"不可领"。
    */
-  state: "done" | "ready" | "blocked";
-  /** state=blocked 时的原因（悬浮可见）。 */
+  state: "done" | "ready" | "blocked" | "detail";
+  /** state=blocked / detail 时的原因（悬浮可见）。 */
   reason?: string;
 }
 
@@ -261,6 +277,26 @@ export function ProductAccountCard({
   const tasks = data.tasks || [];
   /** 还有几个任务可跑（用于菜单按钮上的计数徽标）。 */
   const runnable = tasks.filter((t) => t.state === "ready").length;
+  /**
+   * 菜单组标题里的状态后缀。
+   *
+   * ⚠ 不能一律写「今日已完成」：`detail`（仅详情）与 `blocked`（不可用）
+   * 都**不是**"已完成"。写错会让用户以为今天领过了 —— 而其实没有可领的。
+   * 实测现场（Qoder 国际版）：唯一那条活动是 `VIEW_DETAILS`，
+   * 若标题写「今日已完成」，用户会误以为已经领到东西了。
+   *
+   * ⚠ 也别对 `detail` 写「暂无任务」：那条活动**是存在的**（实测
+   * `showCampaign:true`、活动期内），只是它没有可领的东西。
+   * 写"暂无任务"会与下面那行「仅详情」自相矛盾。
+   */
+  const taskGroupSuffix =
+    runnable > 0
+      ? `（还有 ${runnable} 个可执行）`
+      : tasks.some((t) => t.state === "done")
+        ? "（今日已完成）"
+        : tasks.some((t) => t.state === "detail")
+          ? "（无可领取项）"
+          : "（当前不可执行）";
 
   return (
     <article
@@ -373,7 +409,7 @@ export function ProductAccountCard({
               {tasks.length > 0 && onRunTask && (
                 <>
                   <DropdownMenuLabel className="text-xs">
-                    本账号任务{runnable > 0 ? `（还有 ${runnable} 个可执行）` : "（今日已完成）"}
+                    本账号任务{taskGroupSuffix}
                   </DropdownMenuLabel>
                   {tasks.map((t) => (
                     <DropdownMenuItem
@@ -381,8 +417,9 @@ export function ProductAccountCard({
                       data-slot="product-task-item"
                       data-task={t.id}
                       data-state={t.state}
-                      // 已完成 / 不可用都置灰但**仍然显示**：用户需要知道
-                      // "这个任务存在且今天已经做过了"。隐藏会让他以为功能没了。
+                      // 已完成 / 不可用 / 仅详情都置灰但**仍然显示**：
+                      // 用户需要知道"这个任务存在"以及"它为什么不能点"。
+                      // 隐藏会让他以为功能没了（所有者的真实反馈）。
                       disabled={t.state !== "ready"}
                       onSelect={() => {
                         if (t.state === "ready") onRunTask(t.id);
@@ -394,6 +431,10 @@ export function ProductAccountCard({
                         <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-600" />
                       ) : t.state === "blocked" ? (
                         <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                      ) : t.state === "detail" ? (
+                        // 「仅详情」用 Info 而不是三角警告：它不是"出问题了"，
+                        // 只是这条活动本身没有可领的东西。
+                        <Info className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                       ) : (
                         <PlayCircle className="h-3.5 w-3.5 shrink-0" />
                       )}
@@ -403,6 +444,9 @@ export function ProductAccountCard({
                       )}
                       {t.state === "blocked" && (
                         <span className="shrink-0 text-[10px] text-muted-foreground">不可用</span>
+                      )}
+                      {t.state === "detail" && (
+                        <span className="shrink-0 text-[10px] text-muted-foreground">仅详情</span>
                       )}
                     </DropdownMenuItem>
                   ))}

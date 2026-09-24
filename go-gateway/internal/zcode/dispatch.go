@@ -30,6 +30,11 @@ import (
 type Dispatch struct {
 	client *Client
 
+	// quotaMu/quotaCache：ZCode 额度预检缓存，避免每次对话都打控制面。
+	// 只对 JWT 账号启用；纯 API key 账号没有可靠的额度查询凭证。
+	quotaMu    sync.Mutex
+	quotaCache map[string]quotaProbe
+
 	// authDir 凭证目录（由 main.go 通过 SetAuthDir 告知）。
 	//
 	// 供排程的自动领取遍历凭证用。空串 = 用 DefaultAuthDir()。
@@ -42,6 +47,23 @@ type Dispatch struct {
 	mu       sync.RWMutex
 	modelMap map[Provider]modelCache
 }
+
+type quotaProbe struct {
+	checkedAt time.Time
+	expiresAt int64
+	remaining int64
+	total     int64
+	err       error
+}
+
+const quotaProbeTTL = 2 * time.Minute
+
+// QuotaUnavailableError 表示 ZCode 账号没有可用资源包。
+// server 层通过小接口识别它，避免 server 反向依赖 zcode 包。
+type QuotaUnavailableError struct{ Message string }
+
+func (e *QuotaUnavailableError) Error() string        { return e.Message }
+func (e *QuotaUnavailableError) QuotaExhausted() bool { return true }
 
 type modelCache struct {
 	// keys 客户端模型名（小写）→ 上游模型 id（本包用 id 直接作请求体里的 model）
@@ -57,7 +79,7 @@ func NewDispatch(c *Client) *Dispatch {
 	if c == nil {
 		c = New()
 	}
-	return &Dispatch{client: c, modelMap: map[Provider]modelCache{}}
+	return &Dispatch{client: c, modelMap: map[Provider]modelCache{}, quotaCache: map[string]quotaProbe{}}
 }
 
 // SetAuthDir 记录凭证目录（供产品日常任务读凭证）。
@@ -65,7 +87,7 @@ func NewDispatch(c *Client) *Dispatch {
 // # 为什么需要它（所有者 2026-09-20 要求"自动领取"）
 //
 // 排程的自动领取要遍历凭证并调 claim —— 而凭证目录是**部署期配置**
-//（`pool.zcode_auth_dir`，见 cmd/server/main.go 的加载逻辑）。
+// （`pool.zcode_auth_dir`，见 cmd/server/main.go 的加载逻辑）。
 //
 // 不在 Dispatch 里硬编码默认值（那会让"配置指向别处"的部署读错目录，
 // 而且错得静默），而是由 main.go 在接线时显式告知。
@@ -79,7 +101,7 @@ func (d *Dispatch) SetAuthDir(dir string) {
 // LoadCreds 读取全部 ZCode 凭证（供产品日常任务用）。
 //
 // 目录为空时返回 `("", nil)` 的默认目录 —— 与 main.go 的加载口径一致
-//（那里的 `if zcodeDir == "" { zcodeDir = zcode.DefaultAuthDir() }`）。
+// （那里的 `if zcodeDir == "" { zcodeDir = zcode.DefaultAuthDir() }`）。
 func (d *Dispatch) LoadCreds() (creds []*Cred, failed []string, err error) {
 	if d == nil {
 		return nil, nil, fmt.Errorf("zcode dispatch 未初始化")
@@ -111,6 +133,9 @@ func (d *Dispatch) ChatStream(ctx context.Context, a *auth.Auth, openAIBody []by
 	cr := credOf(a)
 	if cr == nil {
 		return nil, 0, nil, fmt.Errorf("账号缺少 ZCode 凭证（Product=zcode 但凭证为空）")
+	}
+	if err := d.preflightQuota(ctx, cr, modelNameOf(openAIBody)); err != nil {
+		return nil, 402, []byte(err.Error()), err
 	}
 
 	// 模型名规范化（把客户端名映射成上游 id）。
@@ -272,6 +297,45 @@ func (d *Dispatch) ModelKeys(provider Provider) []string {
 // ---------------------------------------------------------------------------
 // auth.Auth ↔ zcode.Cred 的桥接
 // ---------------------------------------------------------------------------
+
+// preflightQuota 在真正建立流式对话前快速判断账号是否已经没有可用额度。
+//
+// ZCode 过期套餐的对话端点可能返回 HTTP 200 但长期不产出任何帧，
+// 这会让用户等到客户端超时。额度查询是控制面，响应明确且可缓存，
+// 因此只对 JWT 账号每 2 分钟预检一次；API key-only 账号保持原路径。
+func (d *Dispatch) preflightQuota(ctx context.Context, cr *Cred, model string) error {
+	if d == nil || d.client == nil || cr == nil || cr.JWT == "" {
+		return nil
+	}
+	key := cr.UID + "|" + strings.ToLower(strings.TrimSpace(model))
+	now := time.Now()
+	d.quotaMu.Lock()
+	cached, ok := d.quotaCache[key]
+	d.quotaMu.Unlock()
+	if ok && now.Sub(cached.checkedAt) < quotaProbeTTL {
+		return cached.err
+	}
+	q, err := d.client.FetchQuota(ctx, cr)
+	// 控制面查询失败不应阻断对话：网络抖动 / JWT 暂时不可用时，
+	// 仍让上游对话接口自己给出权威结果。只有明确查到过期/耗尽才拦截。
+	probe := quotaProbe{checkedAt: now}
+	if err == nil && q != nil {
+		probe.expiresAt = q.PlanExpiry()
+		probe.remaining = q.Remaining
+		probe.total = q.Total
+		if probe.expiresAt > 0 && probe.expiresAt <= now.Unix() {
+			probe.err = &QuotaUnavailableError{Message: fmt.Sprintf("ZCode 账号额度套餐已过期（模型 %s），请刷新额度、重新登录或更换 ZCode 账号", model)}
+		} else if probe.total > 0 && probe.remaining <= 0 {
+			probe.err = &QuotaUnavailableError{Message: fmt.Sprintf("ZCode 账号额度已耗尽（模型 %s），请更换 ZCode 账号或等待额度重置", model)}
+		} else if len(q.Entries) == 0 && len(q.Plans) == 0 && q.Total <= 0 {
+			probe.err = &QuotaUnavailableError{Message: fmt.Sprintf("ZCode 账号没有可用额度或资源包（模型 %s），请刷新额度、重新登录或更换 ZCode 账号", model)}
+		}
+	}
+	d.quotaMu.Lock()
+	d.quotaCache[key] = probe
+	d.quotaMu.Unlock()
+	return probe.err
+}
 
 // credOf 从 auth.Auth 构造 ZCode 凭证。
 //

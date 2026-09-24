@@ -148,7 +148,7 @@ func (s *openAIStream) fill() error {
 	// 顺序很重要：先发内容帧（含 finish_reason），再发独立的 usage 帧。
 	// 反过来的话，客户端可能在收到 finish_reason 时就结束读取，
 	// usage 帧就白发了。
-	if ch.Content == "" && ch.ReasoningContent == "" && ch.FinishReason == "" {
+	if ch.Content == "" && ch.ReasoningContent == "" && len(ch.ToolCalls) == 0 && ch.FinishReason == "" {
 		// 纯 usage 分片（choices 为空的那种）：直接产出 usage 帧
 		if len(ch.Usage) > 0 {
 			s.pending = []byte(usageFrame(s.created, s.modelOf(ch), ch.Usage))
@@ -171,6 +171,11 @@ func (s *openAIStream) fill() error {
 	}
 	if ch.Content != "" {
 		delta["content"] = ch.Content
+	}
+	if len(ch.ToolCalls) > 0 {
+		// Qoder 已经按 OpenAI 增量格式给出 tool_calls，原样转发
+		//（保留 index/id/type/function.arguments 的分片语义）。
+		delta["tool_calls"] = ch.ToolCalls
 	}
 
 	choice := map[string]any{"index": 0, "delta": delta}
@@ -205,6 +210,51 @@ func (s *openAIStream) modelOf(ch *Chunk) string {
 		return ch.Model
 	}
 	return s.model
+}
+
+// mergeToolCallDeltas 合并同一 tool call 的增量字段，供非流式响应使用。
+func mergeToolCallDeltas(parts []map[string]any) []map[string]any {
+	byIndex := make(map[int]map[string]any)
+	order := make([]int, 0)
+	for _, part := range parts {
+		idx := 0
+		switch v := part["index"].(type) {
+		case float64:
+			idx = int(v)
+		case int:
+			idx = v
+		}
+		call := byIndex[idx]
+		if call == nil {
+			call = map[string]any{"index": idx}
+			byIndex[idx] = call
+			order = append(order, idx)
+		}
+		for k, v := range part {
+			if k == "function" {
+				fn, _ := call["function"].(map[string]any)
+				if fn == nil {
+					fn = map[string]any{}
+					call["function"] = fn
+				}
+				incoming, _ := v.(map[string]any)
+				for fk, fv := range incoming {
+					old, _ := fn[fk].(string)
+					add, _ := fv.(string)
+					fn[fk] = old + add
+				}
+			} else if k != "index" {
+				if _, exists := call[k]; !exists || call[k] == "" {
+					call[k] = v
+				}
+			}
+		}
+	}
+	out := make([]map[string]any, 0, len(order))
+	for _, idx := range order {
+		out = append(out, byIndex[idx])
+	}
+	return out
 }
 
 // usageFrame 产出一帧**独立的** usage 上报（`choices` 为空数组）。
@@ -311,6 +361,7 @@ func AggregateQoder(r io.Reader, model string) (map[string]any, error) {
 	reader := NewSSEReader(r)
 	var content, reasoning strings.Builder
 	finish := ""
+	toolCalls := make([]map[string]any, 0)
 
 	for {
 		ch, err := reader.Next()
@@ -322,6 +373,9 @@ func AggregateQoder(r io.Reader, model string) (map[string]any, error) {
 		}
 		content.WriteString(ch.Content)
 		reasoning.WriteString(ch.ReasoningContent)
+		if len(ch.ToolCalls) > 0 {
+			toolCalls = append(toolCalls, ch.ToolCalls...)
+		}
 		if ch.FinishReason != "" {
 			finish = ch.FinishReason
 		}
@@ -331,6 +385,9 @@ func AggregateQoder(r io.Reader, model string) (map[string]any, error) {
 	}
 
 	msg := map[string]any{"role": "assistant", "content": content.String()}
+	if len(toolCalls) > 0 {
+		msg["tool_calls"] = mergeToolCallDeltas(toolCalls)
+	}
 	// reasoning_content 只在非空时给：空字符串会让部分客户端显示一个空的思考块。
 	if reasoning.Len() > 0 {
 		msg["reasoning_content"] = reasoning.String()

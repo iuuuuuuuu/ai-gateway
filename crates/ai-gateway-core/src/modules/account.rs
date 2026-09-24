@@ -5,6 +5,7 @@
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use base64::Engine as _;
 use std::path::Path;
 
 use crate::modules::auth_file::{self, CredentialFreshness};
@@ -53,7 +54,8 @@ fn delete_account_from_path(path: &Path, account_id: &str) -> Result<(), String>
 /// uid/email 都缺失的账号每采集一次就多一条，只修写入路径清不掉已有数据。
 pub fn load_accounts() -> Vec<Value> {
     let mut accounts = load_accounts_from_path(&accounts_file());
-    if dedupe_by_id(&mut accounts) {
+    let uid_repaired = repair_missing_uids(&mut accounts);
+    if uid_repaired || dedupe_by_id(&mut accounts) {
         // 只有真的合并过才落盘 —— 避免每次读取都写文件（那是无谓 IO，
         // 也会让「文件 mtime」失去参考价值）。
         if let Err(error) = save_accounts_to_path(&accounts_file(), &accounts) {
@@ -63,6 +65,50 @@ pub fn load_accounts() -> Vec<Value> {
         }
     }
     accounts
+}
+
+/// 从 access_token JWT 的 `sub` 修复历史账号中缺失的 uid。
+///
+/// 旧版/异常导入可能留下只有 `id + access_token` 的账号：界面仍显示卡片，
+/// 但网关无法生成凭证文件，任务执行时自然提示「账号不在网关账号池」。
+/// JWT 的 sub 是账号稳定 uid，只填充缺失字段，不覆盖已有 uid，也不打印 token。
+fn repair_missing_uids(accounts: &mut [Value]) -> bool {
+    let mut changed = false;
+    for account in accounts {
+        let missing = account
+            .get("uid")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .map(str::is_empty)
+            .unwrap_or(true);
+        if !missing {
+            continue;
+        }
+        let Some(token) = account.get("access_token").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut parts = token.split('.');
+        let _header = parts.next();
+        let Some(payload) = parts.next() else { continue };
+        let payload = payload.trim_end_matches('=');
+        let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else { continue };
+        let uid = doc
+            .get("sub")
+            .and_then(Value::as_str)
+            .or_else(|| doc.get("user_id").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(uid) = uid {
+            if let Some(obj) = account.as_object_mut() {
+                obj.insert("uid".to_string(), Value::String(uid.to_string()));
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// 按 `id` 合并重复条目，返回「是否发生过合并」。
@@ -1023,6 +1069,18 @@ mod tests {
         let saved = upsert_collected_account(&mut store, again_input);
         assert_eq!(store.len(), 1, "反复采集必须幂等");
         assert_eq!(saved["access_token"], "AT-2", "token 应更新为最新");
+    }
+
+    #[test]
+    fn repair_missing_uid_from_access_token_sub() {
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"sub":"derived-uid"}"#);
+        let token = format!("header.{payload}.signature");
+        let mut accounts = vec![json!({"id":"host-id","access_token":token})];
+        assert!(repair_missing_uids(&mut accounts));
+        assert_eq!(accounts[0]["uid"], json!("derived-uid"));
+        assert!(!repair_missing_uids(&mut accounts), "已有 uid 时不应重复修改");
     }
 
     /// `load_accounts` 会把已有重复条目**收敛成一条**并写回。

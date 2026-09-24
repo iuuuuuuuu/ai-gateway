@@ -55,7 +55,6 @@ type Config struct {
 	// 依赖方向仍是 main 组装、server 消费。nil = 该能力不可用（如单测）。
 	RunTaskFor func(name, accountUID string) (scheduler.TaskRunResult, error)
 
-
 	// GrowthTasks 成长任务「一键完成」能力的回调。
 	//
 	// 与 RunTask 同样的依赖倒置理由：server 包不该依赖 growtask 的内部结构
@@ -1057,6 +1056,9 @@ func openAIFailure(err error) (code, msg string) {
 		// 503 会让客户端去重试，而这里等多久都不会出现（要换模型/加区域前缀）。
 		return "model_not_in_region", f.Message
 	}
+	if f := failureOf(err); f != nil && f.Kind == FailureQuotaExhausted {
+		return "quota_exhausted", f.Message
+	}
 	if f := failureOf(err); f != nil && f.Kind == FailureUnusualActivity {
 		// 上游 3012 风控、网关已主动熔断（见 unusual.go）。
 		//
@@ -1091,6 +1093,10 @@ func anthropicFailure(err error) (code, msg string) {
 	if f := failureOf(err); f != nil && f.Kind == FailureEgressIPBlocked {
 		return "api_error", f.Message
 	}
+	// ZCode 额度/套餐已过期：账号级错误，客户端不应继续重试空流。
+	if f := failureOf(err); f != nil && f.Kind == FailureQuotaExhausted {
+		return "invalid_request_error", f.Message
+	}
 	// 模型在该通道不存在：请求侧问题（要改模型名或加区域前缀），
 	// 与上面两类「重试无用」的错误同一取向 —— 报 api_error 会让客户端重试。
 	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInRegion {
@@ -1122,6 +1128,10 @@ func responsesFailure(err error) (code, msg string) {
 	// 它不是「你的请求写错了」，故不能走 invalid_request_error。
 	if f := failureOf(err); f != nil && f.Kind == FailureEgressIPBlocked {
 		return "upstream_error", f.Message
+	}
+	// ZCode 额度/套餐已过期：不应让 Responses 客户端继续重试空流。
+	if f := failureOf(err); f != nil && f.Kind == FailureQuotaExhausted {
+		return "invalid_request_error", f.Message
 	}
 	// 模型在该通道不存在：Responses 词汇表里最贴近的是 invalid_request_error
 	//（用户的请求需要改：换模型或加区域前缀），不是 upstream_error ——

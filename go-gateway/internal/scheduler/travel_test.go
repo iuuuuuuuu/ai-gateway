@@ -371,8 +371,8 @@ func TestRunTravelAdoptTriedExpiresNextDay(t *testing.T) {
 	}
 }
 
-// TestRunTravelSkipsDisabledAndFailedAccounts 禁用账号不查；单账号出错不影响后续账号。
-func TestRunTravelSkipsDisabledAndFailedAccounts(t *testing.T) {
+// TestRunTravelRunsDisabledAndContinuesFailures 禁用账号仍查询；单账号出错不影响后续账号。
+func TestRunTravelRunsDisabledAndContinuesFailures(t *testing.T) {
 	fastTravel(t)
 	var deadCalls, okDepart, disabledCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -405,8 +405,8 @@ func TestRunTravelSkipsDisabledAndFailedAccounts(t *testing.T) {
 	if n := deadCalls.Load(); n != 1 {
 		t.Errorf("dead account calls=%d want 1（401 跳过本轮，不强刷 token）", n)
 	}
-	if n := disabledCalls.Load(); n != 0 {
-		t.Errorf("disabled account calls=%d want 0", n)
+	if n := disabledCalls.Load(); n != 1 {
+		t.Errorf("disabled account should still be queried, calls=%d want 1", n)
 	}
 	// 前列账号失败不应中断遍历：末位 ok 账号照常完成派出。
 	if n := okDepart.Load(); n != 1 {
@@ -421,8 +421,8 @@ func TestRunTravelSkipsDisabledAndFailedAccounts(t *testing.T) {
 	}
 }
 
-// TestRunTravelDisabledAccountSkipsAllCalls 禁用账号一个请求都不发。
-func TestRunTravelDisabledAccountSkipsAllCalls(t *testing.T) {
+// TestRunTravelDisabledAccountStillCalls 禁用账号仍应执行任务请求。
+func TestRunTravelDisabledAccountStillCalls(t *testing.T) {
 	fastTravel(t)
 	stub := &travelStub{buddy: "null"}
 	srv := stub.server()
@@ -432,8 +432,8 @@ func TestRunTravelDisabledAccountSkipsAllCalls(t *testing.T) {
 	p.Disable("u1", "test")
 	s.RunTravelNow()
 
-	if n := stub.infoCalls.Load(); n != 0 {
-		t.Errorf("info calls=%d want 0（禁用账号应跳过）", n)
+	if n := stub.infoCalls.Load(); n == 0 {
+		t.Error("禁用账号仍应发起任务查询")
 	}
 }
 

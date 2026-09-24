@@ -86,7 +86,6 @@ type Config struct {
 	// `schedule.product_tasks_enabled=false`（两级回落见 Config.QoderClaimOn）。
 	QoderClaimDisabled bool
 
-
 	// RunProductTasks 产品日常任务的**执行体**，由网关自己实现（见 main.go）。
 	//
 	// # ⚠ 为什么不是"宿主注入"（我第一版设计错了，此处记录以免再犯）
@@ -176,7 +175,8 @@ const (
 	//
 	//	· 每天固定时点跑一次（与签到/活跃上报同一套排程机制）
 	//	· **串行**：同一时刻只跑一个产品，避免并发指纹
-	//	· **零重试**：失败就等下一个时点，不做退避重试
+	//	· **有界重试**：失败不在同一轮紧密重试；若配置了早晚两个时点，
+	//	  下一时点自动补跑，避免一次网络抖动让当天任务永久漏掉
 	//	· 两个端点都是幂等的（Qoder `replayed:true` / ZCode `1003`），
 	//	  故"重复执行"本身不产生副作用
 	//
@@ -202,9 +202,9 @@ type Scheduler struct {
 	// growthClaimed 同一把锁下的「活跃地图当日已跑」标记（uid → 自然日 CST）。
 	// 两类任务都是「每日一轮」的养号动作，用同一把锁即可：它们只在写各自 map 时短暂持有，
 	// 不跨网络请求，不会把排程拖慢。
-	mu             sync.Mutex
-	adoptTried     map[string]string
-	growthClaimed  map[string]string
+	mu            sync.Mutex
+	adoptTried    map[string]string
+	growthClaimed map[string]string
 
 	// taskMu/taskBusy 手动触发的在跑标记。与 mu 分开：排程循环会自动跑同一批任务，
 	// 共用一把锁会让「手动触发」与「到点执行」互相阻塞，把定时任务拖慢。
@@ -268,7 +268,7 @@ func (s *Scheduler) RunTaskByName(name string) (TaskRunResult, error) {
 // 为什么需要按账号跑（所有者明确要求）：
 // 「养号任务」原先只能作用于全部账号 —— 用户在某个账号的菜单里点
 // 「活跃上报」，跑的却是整池。那与菜单的位置所暗示的语义相反
-//（他在那张卡片上操作，期望影响那张卡片）。
+// （他在那张卡片上操作，期望影响那张卡片）。
 // 现在账号菜单走本入口（单账号），右上角「一键操作」走 RunTaskByName（全账号）。
 //
 // 区域不符时**提前回报原因**而不是静默跑空：单账号触发时用户盯着结果，
@@ -467,7 +467,6 @@ func accountScopeUID(ctx context.Context) string {
 	return scoped
 }
 
-
 // runCareTask 到点执行一个养号任务，并与手动触发互斥。
 //
 // 与手动触发的唯一区别：排程这轮被占用时**记一行日志就走**，不排队。
@@ -539,12 +538,9 @@ const (
 	taskSchool
 	taskTrial
 	// taskQoderClaim Qoder 权益活动领取（2026-09-22 新增）。
-	//
-	// ⚠ 它与 `taskTrial`/`taskCheckin` 等**不是**同一类：那些跑 WorkBuddy
-	// 的账号任务，这个跑的是 Qoder 的活动领取。放在同一个 slot 列表里
-	// 是因为**排程机制**（时点 → nextFire）完全一样，复用它最省事，
-	// 也保证"到点该跑什么"只有一个真相来源。
 	taskQoderClaim
+	// taskGrowthMap 活跃地图闭环，与每日活跃上报同一时点触发。
+	taskGrowthMap
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -582,6 +578,11 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	if !s.cfg.QoderClaimDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.QoderClaimHours), taskQoderClaim})
 	}
+	// 成长地图是 WorkBuddy 成长任务的一部分，必须随活跃上报自动运行。
+	// 之前只有手动入口，没有 slot，因此用户不点按钮就永远不会执行。
+	if !s.cfg.ActivityDisabled {
+		slots = append(slots, slot{nextFire(now, s.cfg.ActivityHours), taskGrowthMap})
+	}
 	var earliest time.Time
 	for _, sl := range slots {
 		if sl.at.IsZero() {
@@ -603,8 +604,56 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	return earliest, kinds
 }
 
+// startupCatchUpGrace 启动后补跑最近错过的时点，避免网关在计划时刻前后
+// 重启/机器唤醒后直接等到第二天。只补最近一轮，不会把多天任务堆成风暴。
+const startupCatchUpGrace = 30 * time.Minute
+
+func lastScheduledAt(now time.Time, hours []int) time.Time {
+	var latest time.Time
+	for _, hour := range hours {
+		if hour < 0 || hour > 23 {
+			continue
+		}
+		t := time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, now.Location())
+		if t.After(now) {
+			t = t.Add(-24 * time.Hour)
+		}
+		if latest.IsZero() || t.After(latest) {
+			latest = t
+		}
+	}
+	return latest
+}
+
+func withinCatchUp(now, scheduled time.Time) bool {
+	return !scheduled.IsZero() && !scheduled.After(now) && now.Sub(scheduled) <= startupCatchUpGrace
+}
+
+// runStartupCatchUp 补跑启动前最近错过的任务时点。
+func (s *Scheduler) runStartupCatchUp(ctx context.Context, now time.Time) {
+	if !s.cfg.ActivityDisabled {
+		if withinCatchUp(now, lastScheduledAt(now, s.cfg.ActivityHours)) {
+			s.runCareTask(TaskNameActivity, func() { s.runActivity(ctx) })
+			s.runCareTask(TaskNameGrowthMap, func() { s.runGrowthMap(ctx) })
+		}
+	}
+	if !s.cfg.SchoolDisabled && withinCatchUp(now, lastScheduledAt(now, s.cfg.SchoolHours)) {
+		s.runCareTask(TaskNameSchool, func() { s.runSchool(ctx) })
+	}
+	if !s.cfg.NightOwlDisabled && withinCatchUp(now, lastScheduledAt(now, s.cfg.NightOwlHours)) {
+		s.runCareTask(TaskNameNightOwl, func() { s.runNightOwl(ctx) })
+	}
+	if !s.cfg.TrialDisabled && withinCatchUp(now, lastScheduledAt(now, s.cfg.TrialHours)) {
+		s.runCareTask(TaskNameTrial, func() { s.runTrial(ctx) })
+	}
+	if !s.cfg.QoderClaimDisabled && withinCatchUp(now, lastScheduledAt(now, s.cfg.QoderClaimHours)) {
+		s.runCareTask(TaskNameProductTasks, func() { s.runProductTasks(ctx) })
+	}
+}
+
 // Run 主循环，阻塞直到 ctx 取消。
 func (s *Scheduler) Run(ctx context.Context) {
+	s.runStartupCatchUp(ctx, time.Now())
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
@@ -635,15 +684,11 @@ func (s *Scheduler) Run(ctx context.Context) {
 					s.runCareTask(TaskNameTrial, func() { s.runTrial(ctx) })
 				case taskQoderClaim:
 					// Qoder 权益领取（2026-09-22 新增）。
-					//
-					// 复用 `runProductTasks`（那条路径本来就在，只是此前
-					// 没有任何排程时点指向它）—— 它内部走 `RunProductTasks`
-					// 执行体，会同时处理 Qoder 与 ZCode，且自带
-					// claimTask/releaseTask 去重与「任务留痕」。
-					//
-					// ⚠ 不新建执行体：两条路径各写一份领取逻辑必然分叉
-					//（"手动能领、自动领不到"这类问题就是这么来的）。
 					s.runCareTask(TaskNameProductTasks, func() { s.runProductTasks(ctx) })
+				case taskGrowthMap:
+					// 成长地图与活跃上报同一时点，但使用独立锁，
+					// 避免任一任务被手动触发时静默吞掉另一项。
+					s.runCareTask(TaskNameGrowthMap, func() { s.runGrowthMap(ctx) })
 				}
 			}
 		}
@@ -689,9 +734,6 @@ func (s *Scheduler) refreshCreditsWithGap(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if st.Disabled {
-			continue
-		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
 			continue
@@ -732,9 +774,6 @@ func (s *Scheduler) refreshCreditsWithGap(ctx context.Context) {
 // 注意顺序：先签到解冻，旅行才能覆盖到本轮刚恢复的账号。
 func (s *Scheduler) RunCheckinNow() {
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
 			continue
@@ -773,13 +812,10 @@ func (s *Scheduler) RunCheckinNow() {
 // 它的最近到期日会跳到下一档，此时就应让出流量给更紧迫的账号）。
 func (s *Scheduler) RunCreditRefreshNow() {
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
-	continue
-}
+			continue
+		}
 		// ⚠ 产品闸门（2026-09-22）：下面这条出站请求打的是 **WorkBuddy** 端点。
 		// 不判产品时，Qoder/ZCode 账号会被带着自己的凭证打过去 ⇒ 401，
 		// 并在账号记录里留下不属于它的错误（所有者现场：
@@ -809,9 +845,6 @@ func (s *Scheduler) RunCreditRefreshNow() {
 // 因此被误判的账号有复活路径。
 func (s *Scheduler) RunKeepaliveNow() {
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
 			continue
@@ -847,7 +880,6 @@ func (s *Scheduler) RunKeepaliveNow() {
 		}
 	}
 }
-
 
 // ---------------------------------------------------------------------------
 // 产品日常任务（Qoder 活动 / ZCode claim）
@@ -914,7 +946,6 @@ func (s *Scheduler) runProductTasks(_ context.Context) {
 	}
 	s.cfg.Records.TaskAllDaily("产品日常任务", records.ResultSuccess, detail)
 }
-
 
 // SetProductTasksRunner 注入产品日常任务的执行体。
 //

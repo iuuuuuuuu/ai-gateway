@@ -153,6 +153,35 @@ function planExpiryTextOf(row: ZcodeAccountRow, now: number): string | undefined
   return `体验额度 ${stamp} 到期（剩 ${days} 天），到期后未用完的会失效`;
 }
 
+/**
+ * ZCode 顶部汇总额度的唯一口径：优先使用账号级 credits，
+ * 账号级额度未知时从已经成功读取的模型桶求和。
+ *
+ * 上游可以同时返回 quotaEntries 和 credits=0（JWT/账号级 summary 未取到，
+ * 但 billing/balance 已有 GLM-5.3 与 GLM-5.3-Flash 明细）。这种情况下
+ * 继续显示「未知」会与下方明细矛盾，且把已知额度误算成 0。
+ */
+function quotaTotalsOf(row: ZcodeAccountRow): { remaining: number; total: number } | null {
+  const entries = (row.quotaEntries ?? []).filter(
+    (entry) => Number.isFinite(entry.remaining) && Number.isFinite(entry.total) && entry.total > 0,
+  );
+  if (entries.length === 0) return null;
+  return entries.reduce(
+    (sum, entry) => ({
+      remaining: sum.remaining + Math.max(0, entry.remaining),
+      total: sum.total + entry.total,
+    }),
+    { remaining: 0, total: 0 },
+  );
+}
+
+function displayQuotaOf(row: ZcodeAccountRow): { remaining: number; total: number } | null {
+  if (row.creditsTotal > 0) {
+    return { remaining: Math.max(0, row.credits), total: row.creditsTotal };
+  }
+  return quotaTotalsOf(row);
+}
+
 export default function ZcodePage() {
   const [rows, setRows] = useState<ZcodeAccountRow[]>([]);
   const [orphans, setOrphans] = useState<string[]>([]);
@@ -514,8 +543,10 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
     const disabled = rows.filter((r) => r.disabled).length;
     const missing = rows.filter((r) => !r.hasCredential).length;
     // 只统计**已知**额度：未知的账号不参与合计（否则会显示成 0 拉低总数）
-    const known = rows.filter((r) => r.credits > 0);
-    const credits = known.reduce((s, r) => s + r.credits, 0);
+    const known = rows
+      .map((row) => displayQuotaOf(row))
+      .filter((quota): quota is { remaining: number; total: number } => quota !== null);
+    const credits = known.reduce((s, quota) => s + quota.remaining, 0);
     const unknownCredits = rows.length - known.length;
     return { total, disabled, missing, credits, unknownCredits };
   }, [rows]);
@@ -705,12 +736,12 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
               <ProductAccountGrid>
                 {rows.map((row) => {
                   const exp = expiryText(row.expireAt);
-                  const creditsText =
-                    row.credits > 0
-                      ? row.creditsTotal > 0
-                        ? `${row.credits.toLocaleString()} / ${row.creditsTotal.toLocaleString()}`
-                        : row.credits.toLocaleString()
-                      : undefined;
+                  const quota = displayQuotaOf(row);
+                  const creditsText = quota
+                    ? quota.total > 0
+                      ? `${quota.remaining.toLocaleString()} / ${quota.total.toLocaleString()}`
+                      : quota.remaining.toLocaleString()
+                    : undefined;
                   return (
                     <ProductAccountCard
                       key={row.uid}
@@ -752,12 +783,12 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
                         // 表示上游没给容量（如按次计费的套餐），此时传 undefined
                         // ⇒ 卡片不画进度条（不能当成 0%：那会误导成"已耗尽"）。
                         usageRatio:
-                          row.creditsTotal > 0
-                            ? Math.min(1, Math.max(0, row.credits / row.creditsTotal))
+                          quota && quota.total > 0
+                            ? Math.min(1, Math.max(0, quota.remaining / quota.total))
                             : undefined,
                         usageText:
-                          row.creditsTotal > 0
-                            ? `剩余 ${row.credits.toLocaleString()} / ${row.creditsTotal.toLocaleString()}`
+                          quota && quota.total > 0
+                            ? `剩余 ${quota.remaining.toLocaleString()} / ${quota.total.toLocaleString()}`
                             : undefined,
                         /*
                          * 按模型拆开的额度明细（2026-09-21 所有者要求）。

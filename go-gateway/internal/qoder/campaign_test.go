@@ -17,8 +17,13 @@ package qoder
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
+
+	"workbuddy2api/internal/qoderclient"
 )
 
 // parseCampaignsForTest 解析活动响应（避免为纯解析测试起 HTTP 服务）。
@@ -63,6 +68,128 @@ func TestCampaignsSendsAllThreeRequiredParts(t *testing.T) {
 	}
 	if got := req.Header.Get("Accept"); got != "application/json" {
 		t.Errorf("Accept 应为 application/json，实际 %q", got)
+	}
+}
+
+// TestCampaignsSendsMachineFingerprintHeaders 活动查询必须带**机器指纹**头。
+//
+// # 这是一个真实缺陷的回归测试（2026-09-23）
+//
+// 所有者报：「国内的有这个领取任务，国际版怎么只剩下一个活动了，这是bug吧?」
+// 而他用官方国际版客户端打开时**明明有两个活动**（含「每天领 100 Credits」）。
+//
+// 根因：`buildCampaignRequest` 只发了 Authorization/Accept/User-Agent/
+// Cosy-ClientType，**缺 `Cosy-MachineToken` / `Cosy-MachineType` / `Cosy-MachineCode`**。
+//
+// 二分实测（openapi.qoder.sh，同一个国际版令牌）：
+//
+//	只 Cosy-ClientType                     → 1 条 [VIEW_DETAILS]
+//	真实的 MachineToken + MachineType      → 2 条 [CLAIM_BENEFIT(CLAIMABLE), VIEW_DETAILS]
+//
+// ⚠ 上游对残缺请求回的是 **HTTP 200 + 结构合法的 JSON**，只是少一条活动 ——
+// 不报错、不告警。所以**只有断言"头发出去了"才能拦住它**：
+// 断言"解析没报错"或"拿到了活动"都拦不住（残缺响应同样满足）。
+//
+// # ⚠⚠ 本测试依赖本机装了 Qoder 客户端
+//
+// 指纹来自客户端自带的 `runtime-info.exe`（见 qoderclient.MachineIdentityOf）。
+// 没装客户端时拿不到值 ⇒ 本测试**跳过**（而不是失败）：
+// 那是一个**已知且可接受**的降级，不是回归。
+func TestCampaignsSendsMachineFingerprintHeaders(t *testing.T) {
+	id := qoderclient.MachineIdentityOf(context.Background())
+	if !id.Usable() {
+		t.Skip("本机没有 Qoder 客户端的 runtime-info.exe ⇒ 拿不到真实指纹（已知降级，非回归）")
+	}
+
+	c := New()
+	cr := &Cred{UID: "u1", DT: "dt-token", Region: RegionIntl}
+
+	req, err := c.buildCampaignRequest(context.Background(), cr, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := req.Header.Get("Cosy-MachineToken"); got != id.MachineToken {
+		t.Errorf("缺/错了 Cosy-MachineToken：期望 %q，实际 %q\n"+
+			"缺它时上游回**残缺清单**（少掉可领取的那条），HTTP 200 且不报错",
+			id.MachineToken, got)
+	}
+	if got := req.Header.Get("Cosy-MachineType"); got != id.MachineType {
+		t.Errorf("缺/错了 Cosy-MachineType：期望 %q，实际 %q\n"+
+			"它与 Cosy-MachineToken **必须同时在场**，少任一个都会退回残缺清单",
+			id.MachineType, got)
+	}
+	if got := req.Header.Get("Cosy-MachineCode"); got != id.MachineCode {
+		t.Errorf("缺/错了 Cosy-MachineCode：期望 %q，实际 %q", id.MachineCode, got)
+	}
+}
+
+// TestClaimCampaignAlsoSendsMachineHeaders 领取请求与查询请求**共用同一组头**。
+//
+// 两条路径分别手写头必然会漂移 —— 本文件历史上就因为"三件套"写漏过一次。
+// 这里用 httptest 把请求拦下来，钉住领取路径也走 `setMachineHeaders`。
+func TestClaimCampaignAlsoSendsMachineHeaders(t *testing.T) {
+	id := qoderclient.MachineIdentityOf(context.Background())
+	if !id.Usable() {
+		t.Skip("本机没有 Qoder 客户端的 runtime-info.exe ⇒ 拿不到真实指纹（已知降级，非回归）")
+	}
+
+	c := New()
+	cr := &Cred{UID: "u1", DT: "dt-token", Region: RegionIntl}
+
+	var got *http.Request
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r
+		_, _ = w.Write([]byte(`{"grantId":"g1","status":"CLAIMED","replayed":false}`))
+	}))
+	defer srv.Close()
+
+	if _, err := c.claimCampaignAt(context.Background(), cr, srv.URL, "camp-1"); err != nil {
+		t.Fatalf("领取失败：%v", err)
+	}
+	if got == nil {
+		t.Fatal("请求没发出去")
+	}
+	if v := got.Header.Get("Cosy-MachineToken"); v != id.MachineToken {
+		t.Errorf("领取请求缺 Cosy-MachineToken：期望 %q，实际 %q", id.MachineToken, v)
+	}
+	if v := got.Header.Get("Cosy-MachineType"); v != id.MachineType {
+		t.Errorf("领取请求缺 Cosy-MachineType：期望 %q，实际 %q", id.MachineType, v)
+	}
+	if v := got.Header.Get("Cosy-ClientType"); v != campaignClientType {
+		t.Errorf("领取请求缺 Cosy-ClientType：期望 %q，实际 %q", campaignClientType, v)
+	}
+}
+
+// TestMachineHeadersAreNeverFabricated 拿不到真实指纹时**不发**（而不是编一个）。
+//
+// # 这是本缺陷的核心教训
+//
+// 原实现用 `Cred.MachineToken` —— 那是 `EnsureFingerprint` 本地编造的
+// `hexShort(32)` + 固定 `"5"`。国服 host 不校验所以一直没暴露，
+// 而国际版 host 严格校验 ⇒ 编造的值**确定无效**，且会让排查方向跑偏
+// （看起来"头发了"，实际发的是垃圾）。
+//
+// 本测试钉住：`setMachineHeaders` 的值只能来自 `MachineIdentityOf`，
+// **不得**读 `Cred.MachineToken/MachineType`。
+//
+// 用源码级断言：行为断言需要伪造"拿不到指纹"的环境，
+// 而进程级缓存（sync.Once）在测试里不好重置。
+func TestMachineHeadersAreNeverFabricated(t *testing.T) {
+	src, err := os.ReadFile("campaign.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+
+	if strings.Contains(s, "cr.MachineToken") || strings.Contains(s, "cr.MachineType") {
+		t.Error("setMachineHeaders 不得读 Cred.MachineToken/MachineType ——\n" +
+			"那两个字段是 EnsureFingerprint 本地编造的（hexShort(32) + 固定 \"5\"），\n" +
+			"对严格校验的 host（国际版）确定无效。真实值只能来自\n" +
+			"qoderclient.MachineIdentityOf（客户端自带的 runtime-info.exe）")
+	}
+	if !strings.Contains(s, "qoderclient.MachineIdentityOf") {
+		t.Error("setMachineHeaders 应调用 qoderclient.MachineIdentityOf 取真实指纹")
 	}
 }
 

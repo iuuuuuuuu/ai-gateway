@@ -495,19 +495,63 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
       return { total: 1, enabled: 1, healthy: 1, cooling: 0 };
     case "qoder_campaigns":
     case "qoder_campaigns_all":
-      // 演示模式给"有可领活动"的样子，方便走查那张卡片
+      // 演示数据**照抄上游真实字段名**（`campaignId` / `actionType` /
+      // `claimStatus`），不要用 `id`/`name`/`status` 那套自造 schema。
+      //
+      // ⚠⚠ 这正是我踩过的坑：原演示数据用的是自造字段名，于是它
+      // **永远走不到真实的判据分支**（`isClaimedCampaign` 读 `claimStatus`、
+      // `isBenefitCampaign` 读 `actionType`，两个都取不到值）
+      // ⇒ 演示模式下无论怎么改逻辑，界面都长一个样，
+      // 拿它当"实测"等于自欺。
+      //
+      // 现在三条覆盖全部状态（与所有者账号的真实组合一致）：
+      //   ready   —— 可领
+      //   done    —— 已领（实测国际版就是这种）
+      //   detail  —— 仅详情（实测国际版唯一那条就是它）
       return {
         accounts: [{
           uid: demoQoderAccount().uid,
           nickname: demoQoderAccount().nickname,
           ok: true,
-          campaigns: [{
-            id: "demo-campaign-1",
-            name: "每日签到奖励",
-            status: "claimable",
-            claimable: true,
-            campaignUrl: "https://qoder.com.cn/activities",
-          }],
+          campaigns: [
+            {
+              campaignId: "demo-claimable",
+              campaignKey: "act-20260923-001",
+              actionType: "CLAIM_BENEFIT",
+              claimStatus: "CLAIMABLE",
+              benefit: { kind: "CREDITS", amount: 100 },
+              placements: [{
+                type: "POPUP",
+                content: { zh: { title: "每天领 100 Credits", description: "每日可领一次" } },
+              }],
+            },
+            {
+              campaignId: "demo-claimed",
+              campaignKey: "act-20260923-002",
+              actionType: "CLAIM_BENEFIT",
+              claimStatus: "CLAIMED",
+              benefit: { kind: "CREDITS", amount: 100 },
+              placements: [{
+                type: "POPUP",
+                content: { zh: { title: "每日签到奖励（已领）" } },
+              }],
+            },
+            {
+              campaignId: "demo-view-only",
+              campaignKey: "act-20260901-493",
+              actionType: "VIEW_DETAILS",
+              claimStatus: "CLAIMED",
+              placements: [{
+                type: "POPUP",
+                content: {
+                  zh: {
+                    title: "9月限时福利，Pro/Pro+ 首月订阅 Credits 翻倍",
+                    description: "首购 Pro 得 4,000，Pro+ 得 12,000。续费、升级加赠 1,000。",
+                  },
+                },
+              }],
+            },
+          ],
           claimable: 1,
         }],
         totalClaimable: 1,

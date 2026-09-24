@@ -85,33 +85,28 @@ func TestBareModelPrefersDeclaringProduct(t *testing.T) {
 	}
 }
 
-// TestBareModelFallsBackToUnknownWhenDeclaredBusy 声明的产品都不可用时，
-// **仍要**回退到清单未知的产品（而不是直接失败）。
-//
-// 与上一条成对：只测"优先声明"会让"声明了但暂时不可用 ⇒ 直接失败"也算通过，
-// 而那是一个新缺陷（把"暂时不可用"变成"不可用"）。
+// TestBareModelDoesNotCrossToUnknownWhenDeclaredBusy 已声明该模型的平台不可用时，
+// 不能回退到清单未知的产品。未知不是能力承诺：Qoder 独有的 Qwen3.8-Flash
+// 不能因为 Qoder 账号被禁用就误派给不提供此模型的 WorkBuddy。
 //
 // # 为什么用 Disable 而不是 Cooldown（我第一版写错了，记下来）
 //
 // 第一版用 `p.Cooldown("qd-1", CoolSoft, time.Hour, ...)`，结果红了：
 // 拾到的仍是 qoder。**那不是缺陷** —— 池子有"全冷却兜底"
-//（pickRotation / pickEarliestExpiryLocked），设计就是"宁可给一个冷却中的
+// （pickRotation / pickEarliestExpiryLocked），设计就是"宁可给一个冷却中的
 // 账号，也不要 503"。所以冷却**拦不住**选号，拿它构造"不可用"是错的，
 // 测出来的是我的误解而不是代码行为。
 //
 // `Disabled` 是硬条件（见 entry.healthy），任何选号路径都不该越过它。
-func TestBareModelFallsBackToUnknownWhenDeclaredBusy(t *testing.T) {
+func TestBareModelDoesNotCrossToUnknownWhenDeclaredBusy(t *testing.T) {
 	p := qwenFixture(t)
 
-	// 让 qoder 账号不可用（硬禁用 —— 与"冷却"不同，它不该被任何兜底绕过）
+	// 让 qoder 账号不可用。WorkBuddy 清单未知，但并不代表它有 Qwen。
 	p.Disable("qd-1", "测试：模拟声明的产品不可用")
 
 	got := p.PickForModel("Qwen3.8-Flash", map[string]bool{})
-	if got == nil {
-		t.Fatal("声明的产品不可用时应回退到兜底候选，而不是挑不到")
-	}
-	if got.Product != auth.ProductWorkBuddy {
-		t.Errorf("应回退到 WorkBuddy（唯一的兜底候选），实际 %s", got.Product)
+	if got != nil {
+		t.Fatalf("声明平台不可用时不应误派到未知产品，实际 %s/%s", got.Product, got.UID)
 	}
 }
 
@@ -223,10 +218,10 @@ func TestDeclaresDiffersFromMayServe(t *testing.T) {
 //
 // `New(stateFp)` 在 stateFp **非空**时会 `p.load()` + `startFlusher()`：
 //
-//   · load() 会读磁盘上那个同名 state 文件 —— 我的测试因此**不是自足的**，
-//     结果取决于机器上有没有残留文件（实测在完整跑 `go test ./...` 时红了，
-//     单独跑也红，因为文件被上一次运行写下了）
-//   · startFlusher() 起了后台 goroutine，测试结束也不停
+//	· load() 会读磁盘上那个同名 state 文件 —— 我的测试因此**不是自足的**，
+//	  结果取决于机器上有没有残留文件（实测在完整跑 `go test ./...` 时红了，
+//	  单独跑也红，因为文件被上一次运行写下了）
+//	· startFlusher() 起了后台 goroutine，测试结束也不停
 //
 // 既有测试（expiry_test / bench_test / multiproduct_test）一律用 `New("")`，
 // 照它们来。另外把 `minPickGap` 置 0：否则同一账号在节流窗口内不会被再次

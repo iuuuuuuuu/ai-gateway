@@ -65,9 +65,6 @@ func (s *Scheduler) RunGrowthMapNow() {
 func (s *Scheduler) runGrowthMap(ctx context.Context) {
 	first := true
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
 		// 账号作用域：只在「作用于该账号」的手动触发时收窄（排程路径恒为 true）。
 		if !inAccountScope(ctx, st.UID) {
 			continue
@@ -111,10 +108,6 @@ func (s *Scheduler) growthMapRound(a *auth.Auth, state *upstream.GrowthStreakSta
 	if !force && s.growthClaimedToday(a.UID) {
 		return
 	}
-	// 无论后续是否成功都标记当日已处理：领取类各状态当日不再重试，
-	// 避免同日多趟对上游重复写（次日 CST 自然日重置，且上游本身幂等兜底）。
-	s.markGrowthClaimed(a.UID)
-
 	s.claimGrowthBenefits(a)
 
 	if state == nil {
@@ -135,6 +128,11 @@ func (s *Scheduler) growthMapRound(a *auth.Auth, state *upstream.GrowthStreakSta
 	s.redeemGrowthTier(a, state)
 	s.drawGrowthLottery(a)
 	s.openBlindboxes(a)
+	// 只有完成有效 streak 读取与本轮动作后才标记当天已处理。
+	// 旧代码一进函数就标记：网络失败/上游异常后当天永不重试，
+	// 用户看到「失败后不会再尝试」。本轮动作都是幂等的，失败后由
+	// 下一个调度时点补跑不会造成重复奖励。
+	s.markGrowthClaimed(a.UID)
 }
 
 // openBlindboxes 开盲盒：能量足够就开，每轮最多 MaxBlindboxOpens 个。

@@ -118,7 +118,7 @@ type chatResult struct {
 	//
 	// 调用方据此决定**怎么读这个流**：WorkBuddy 已是 OpenAI 形状，直接透传；
 	// Qoder 是嵌套形状，必须先翻译。搞混会得到空回答（HTTP 仍 200）。
-	Product  string
+	Product string
 	// Region 本次结果来自哪个区域（"cn" / "intl"；空 = 该平台不分区）。
 	//
 	// 用途：/usage 的计费归属要按区域拆开显示（所有者 2026-09-21 要求
@@ -139,7 +139,7 @@ func (r *chatResult) IsQoder() bool { return r != nil && r.Product == auth.Produ
 // ⚠ 本函数是 forwardChatCtx 的便捷包装（ctx = context.Background()），
 // **仅供既有调用点与单测**使用 —— 它们不关心取消。生产路径必须用
 // forwardChatCtx(ctx, ...) 传 r.Context()，否则换号退避无法被客户端断开取消
-//（见 backoff.go 的 sleepCtx）。
+// （见 backoff.go 的 sleepCtx）。
 func (h *Handler) forwardChat(body []byte, stream bool, sessKey string) (*chatResult, int, error) {
 	return h.forwardChatCtx(context.Background(), body, stream, sessKey)
 }
@@ -369,6 +369,20 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 		return sleepCtx(ctx, d)
 	}
 
+	// ⚠⚠ **必须在选号之前**把成本率灌进池子（2026-09-23 接线）。
+	//
+	// 池里的成本维度（costRate / freeTierLocked / costMultiplierLocked）
+	// 早就写好了，但此前**没有任何生产代码调用 SetCostRate** ——
+	// 于是 costRate 恒为 0、成本维度完全没生效。
+	// 这次接线后，「免费额度绝对优先」才会真正起作用。
+	//
+	// 放在循环**外面**而不是里面：倍率只取决于 (账号区域, 模型名)，
+	// 与第几次换号无关，每次重试都重算是纯浪费。
+	//
+	// tried 里的账号也照常注入 —— 它们是"本次已试过"，不是"不该有成本"，
+	// 注入它们不影响选号（pick 会按 tried 排除），但能避免多一条特例分支。
+	h.injectCostRates(model, tried)
+
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 
 		var acct *auth.Auth
@@ -463,9 +477,12 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 		//
 		// 熔断期就是要**一个请求都不发**；用户看到的是一条说清原因
 		//（与账号无关、多久恢复）的错误，而不是一次注定失败的尝试。
-		if tripped, wait := unusual.tripped(); tripped {
-			log.Printf("chat: 3012 熔断中（还需 %s），不发请求（本请求已试 %d 个账号）",
-				wait.Round(time.Second), i)
+		// 3012 熔断按**选中账号所属产品**隔离：ZCode 的风控不能阻断
+		// Qoder/WorkBuddy；同产品内仍共享，避免换号继续放大同一上游风控。
+		productBreaker := unusual.forProduct(acct.ProductOf())
+		if tripped, wait := productBreaker.tripped(); tripped {
+			log.Printf("chat: %s 3012 熔断中（还需 %s），不发请求（本请求已试 %d 个账号）",
+				acct.ProductOf(), wait.Round(time.Second), i)
 			uid := lastUID
 			if heldUID != "" {
 				h.cfg.Pool.Release(heldUID)
@@ -579,6 +596,14 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 			rc, status, respBody, terr = h.cfg.Upstream.ChatStream(acct, body)
 		}
 		if terr != nil {
+			var quotaErr interface{ QuotaExhausted() bool }
+			if errors.As(terr, &quotaErr) && quotaErr.QuotaExhausted() {
+				uid := acct.UID
+				h.applyErrorPolicy(uid, model, upstream.ErrHardCredit, terr.Error())
+				releaseHeld()
+				return &chatResult{UID: uid, Model: model}, http.StatusPaymentRequired,
+					&forwardFailure{Kind: FailureQuotaExhausted, Status: http.StatusPaymentRequired, Message: terr.Error()}
+			}
 			lastStatus = http.StatusServiceUnavailable
 			lastErr = terr
 			// 传输层失败（超时/连接被拒/DNS）没有上游业务体，Classify 不适用；
@@ -613,7 +638,7 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 			// 3012 与账号无关，罚号会让好账号在风控过去后仍被冷却，
 			// 把"上游临时风控"变成"我们自己造成的持续故障"。
 			if isUnusualActivity(status, string(respBody)) {
-				until := unusual.note3012()
+				until := unusual.forProduct(acct.ProductOf()).note3012()
 				uid := acct.UID
 				releaseHeld()
 				log.Printf("chat uid=%s product=%s: 上游 3012 unusual activity，"+
@@ -778,6 +803,18 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 				probeMsg = "上游首帧即错误：" + reason
 			}
 			if probeMsg != "" {
+				// ZCode 过期额度常见表现是 HTTP 200 后长期空流。它不是
+				// Qoder 的正常长推理：ZCode 先查额度即可确认，但转发层
+				// 仍需给出快速、明确的失败，不能让用户等到客户端超时。
+				if acct.ProductOf() == auth.ProductZcode {
+					uid := acct.UID
+					releaseHeld()
+					h.applyErrorPolicy(uid, model, upstream.ErrHardCredit, probeMsg)
+					fail(uid)
+					return &chatResult{UID: uid, Model: model}, http.StatusPaymentRequired,
+						&forwardFailure{Kind: FailureQuotaExhausted, Status: http.StatusPaymentRequired,
+							Message: "ZCode 账号额度/套餐已过期或无可用资源包，请刷新额度、重新登录或更换 ZCode 账号。"}
+				}
 				log.Printf("chat uid=%s product=%s: %s — 冷却换号",
 					acct.UID, acct.ProductOf(), probeMsg)
 				// 用 503 让 applyErrorPolicy 走"服务端/上游故障"分类
@@ -805,7 +842,7 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 		// 为什么成功要清：它证明上游此刻不再风控。继续熔断会让用户在一次
 		// 短暂抖动之后仍然被**我们自己的网关**挡在门外 —— 那是我们制造的故障，
 		// 而 3012 本身是上游临时的、会自己过期的限制。
-		unusual.noteSuccess()
+		unusual.forProduct(acct.ProductOf()).noteSuccess()
 		// 粘性跟随最终成功号。
 		if sessKey != "" && h.cfg.Session != nil {
 			h.cfg.Session.Bind(sessKey, acct.UID)
@@ -888,7 +925,7 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 //	if (status === 401 || status === 403) return "AUTH";
 //
 // 而 `AUTH` 在界面上被渲染成 **「API 密钥无效」**
-//（`dsh-client-ui-chat/lib/client.js:2696` 的 `message.failure.auth`）。
+// （`dsh-client-ui-chat/lib/client.js:2696` 的 `message.failure.auth`）。
 //
 // 于是完整因果是：
 //
@@ -980,6 +1017,9 @@ const (
 	//	  实测 3012 与账号无关（同一账号一分钟后即可用、官方客户端也吃它）。
 	//	· 它要传达的是「等一会儿，别换号」—— 与「账号池耗尽」的处置相反。
 	FailureUnusualActivity
+	// FailureQuotaExhausted ZCode 额度/套餐已过期或无可用资源包。
+	// 这是账号级失败：立即冷却该账号并返回明确错误，不等待空流超时。
+	FailureQuotaExhausted
 	// FailureAllNoRoute 池里的账号**全部**被用户设为不参与选号（no_route）
 	// （2026-09-22）。不是故障，是配置 —— 文案必须说清这一点。
 	FailureAllNoRoute
@@ -1022,6 +1062,106 @@ func (e *forwardFailure) Error() string { return e.Message }
 //	Required=true  → 强制：只在该区域挑，挑不到返回 nil，由调用方报错。
 //	                 此时跨区降级**不是**「能用就行」—— 后端会静默丢弃图片，
 //	                 用户拿到的是「模型说它看不见图片」，无从排查。
+//
+// injectCostRates 把一个「账号 × 当前模型」的成本率灌进池子。
+//
+// # 为什么需要它（2026-09-23 所有者需求）
+//
+// 所有者原话：
+//
+//	「模型路由不但要考虑积分到期,积分总量,还要考虑 实际消耗积分,这些因素
+//	  比如 deepseek-v4.1-flash 在国际版是free 0倍率,国内是0.03 …
+//	  这时候就应该优先路由国际账号,因为他是free 其次才是积分快到期的账号」
+//
+// 池里的成本维度（`entry.costRate` / `costMultiplierLocked` / `freeTierLocked`）
+// **早就写好了，但一直没有任何生产代码往它塞值** —— 实测全仓库
+// `SetCostRate` 只在测试里被调用过。于是 costRate 恒为 0、
+// 乘子恒为 1.0，成本维度**完全没生效**。本函数就是那次"接线"。
+//
+// # 数据来源：只读缓存，绝不触发拉取
+//
+// 倍率来自 `regionModelCache`（由 `fetchModelsForRegion` 填充，
+// 带 1h TTL）。**这里绝不能调 `buildCapabilityIndex()`** ——
+// 它在缓存未命中时会真的去打上游，而本函数在**每次 chat 请求的关键路径**上：
+//
+//	· 冷启动后第一个请求要白等一次模型拉取
+//	· 测试里那次拉取会被计成一次「上游调用」，让计数断言无故失败
+//
+// 这个取舍与 `effortsForModel` 完全一致（那里也踩过同一个坑）。
+// 缓存空 = 还没有倍率数据 ⇒ 全部 `known=false` ⇒ 中性，
+// 行为与「本特性引入之前」逐字相同。
+//
+// # 三态：为什么必须传 known
+//
+// 上游 `credit_multiplier` 的 **0 是"免费"而不是"未声明"**，
+// 而池里的 0 历史上表示"未声明"。直接接线的话免费账号会被当成未声明，
+// **「免费优先」会静默失效**（看起来在工作，实际一次都没生效）。
+// 故这里按区域查表，查到就 known=true（哪怕值是 0），查不到才 known=false。
+//
+// # 为什么按"账号所在区域"而不是"请求指定区域"
+//
+// 倍率是**上游按区域声明的**（同名模型两区计费不同）。账号属于某个区域，
+// 它在哪个区就按哪个区的倍率算 —— 这正是"国际版免费、国服计费"能被区分的原因。
+func (h *Handler) injectCostRates(model string, skip map[string]bool) {
+	if model == "" || h.cfg.Pool == nil {
+		return
+	}
+	// 先清空上一轮的残留：costRate 是**按当前模型**算的运行态，
+	// 不复用会让"上一个请求的模型倍率"渗进这一个请求
+	//（有测试 TestCostRateClearedBetweenRequests 钉住这一点）。
+	h.cfg.Pool.ClearCostRates()
+
+	// ⚠ 只读缓存。绝不能在这里触发拉取（见上）。
+	regionModelCache.Lock()
+	byRegion := make(map[auth.Region]map[string]float64, 2)
+	for _, region := range []auth.Region{auth.RegionCN, auth.RegionIntl} {
+		rm := regionModelCache.byRegion[region]
+		if rm == nil {
+			continue
+		}
+		m := make(map[string]float64, len(rm.infos))
+		for _, mi := range rm.infos {
+			if mi.ID == "" || mi.CreditMultiplier == nil {
+				// nil = 上游**未声明**该字段（不是免费）⇒ 不留条目 ⇒ known=false
+				continue
+			}
+			// 一律按小写归一：模型名大小写在上游与客户端之间不一致
+			//（实测 `DeepSeek-V4.1-Flash` 与 `deepseek-v4.1-flash` 都出现过）。
+			m[strings.ToLower(strings.TrimSpace(mi.ID))] = *mi.CreditMultiplier
+		}
+		if len(m) > 0 {
+			byRegion[region] = m
+		}
+	}
+	regionModelCache.Unlock()
+
+	if len(byRegion) == 0 {
+		// 一份倍率都没有（缓存冷）⇒ 全部中性。不打印日志：这在启动初期
+		// 每个请求都会发生，刷日志没有价值。
+		return
+	}
+
+	key := strings.ToLower(strings.TrimSpace(model))
+	// 按账号所在区域逐个注入。产品维度不需要单独处理 —— 倍率是
+	// 「(区域, 模型名) → 倍率」，而 Qoder / ZCode 的模型名与 WorkBuddy
+	// 不重叠（实测 Qoder 侧是 DeepSeek-Flash，没有 deepseek-v4.1-flash），
+	// 故模型名本身已经隐含了产品。
+	for _, acct := range h.cfg.Pool.AccountKeys() {
+		if skip[acct.UID] {
+			continue
+		}
+		m := byRegion[acct.Region]
+		if m == nil {
+			continue
+		}
+		if rate, ok := m[key]; ok {
+			// ⚠ 传 known=true：**哪怕 rate 是 0**（0 = 免费，是已声明的一种）。
+			// 这正是「免费优先」能否生效的关键 —— 见 SetCostRateKnown 的注释。
+			h.cfg.Pool.SetCostRateKnown(acct.UID, rate, true)
+		}
+	}
+}
+
 // pickAccountFor 按**产品 + 区域**选号（product 为空时与 pickAccount 等价）。
 //
 // # 为什么单独一个函数而不是给 pickAccount 加参数
@@ -1091,7 +1231,7 @@ func modelOf(body []byte) string {
 // 返回 `any` 而不是 `string`：要区分「没带这个字段」与「带了但值不是字符串」。
 // 前者是「用默认档」（放行），后者该由上游去报类型错，网关不替它判。
 // 用两个指针字段实现，避免 `map[string]any` 解一遍整个请求体
-//（请求体可能很大，含图片 base64）。
+// （请求体可能很大，含图片 base64）。
 func effortOf(body []byte) any {
 	var probe struct {
 		Snake *string `json:"reasoning_effort"`
@@ -1122,7 +1262,7 @@ func effortOf(body []byte) any {
 //
 // **只读缓存，绝不触发拉取**：本函数在每次 chat 请求的关键路径上，
 // 若在这里调 buildCapabilityIndex()，缓存未命中时它会真的去打上游
-//（fetchModelsForRegion → FetchModels），后果有两个且都严重：
+// （fetchModelsForRegion → FetchModels），后果有两个且都严重：
 //   - 每次冷启动后的第一个请求都要先等一次模型拉取；
 //   - 测试里那次拉取会被计成一次「上游调用」，让「上下文超长只打上游 1 次」
 //     这类计数断言无故失败（实测踩到：TestContextTooLongDoesNotRotateAccounts

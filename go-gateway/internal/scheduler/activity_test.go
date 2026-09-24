@@ -202,12 +202,8 @@ func TestActivityStreakZeroWarns(t *testing.T) {
 	}
 }
 
-// TestActivitySkipsDisabledAccounts 禁用账号不参与上报。
-//
-// 注意这里的「禁用」是 `Pool.Disable` —— 即**网关自己判定**的禁用
-//（连续 3 次 12153 session 死 / 额度冻结）。那种账号跑了也白跑，该跳过。
-// 与之相对的是用户手动禁用（auth.NoRoute），那个**仍要跑**，见下一个用例。
-func TestActivitySkipsDisabledAccounts(t *testing.T) {
+// TestActivityRunsForDisabledAccounts 禁用只影响对话选号，不影响养号上报。
+func TestActivityRunsForDisabledAccounts(t *testing.T) {
 	rec := &activityRecorder{streak: 1}
 	s := newActivityScheduler(t, rec, 1,
 		&auth.Auth{UID: "u1", AccessToken: "tok"},
@@ -217,10 +213,14 @@ func TestActivitySkipsDisabledAccounts(t *testing.T) {
 
 	s.RunActivityNow()
 
+	seen := map[string]bool{}
 	for _, ev := range rec.snapshot() {
-		if ev["userId"] == "u2" {
-			t.Error("被禁用的账号不应参与活跃上报")
+		if uid, ok := ev["userId"].(string); ok {
+			seen[uid] = true
 		}
+	}
+	if !seen["u1"] || !seen["u2"] {
+		t.Errorf("禁用账号也应参与活跃上报，实际=%v", seen)
 	}
 }
 

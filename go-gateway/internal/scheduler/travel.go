@@ -39,9 +39,6 @@ func travelDay(t time.Time) string {
 func (s *Scheduler) RunTravelNow() {
 	first := true
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
 			continue

@@ -632,8 +632,8 @@ func TestActivitySkipsIntlNoRecords(t *testing.T) {
 	}
 }
 
-// TestDisabledAccountsNoRecords 被禁用的账号不参与，也不写记录。
-func TestDisabledAccountsNoRecords(t *testing.T) {
+// TestDisabledAccountsStillRecordTasks 禁用账号仍执行并写记录。
+func TestDisabledAccountsStillRecordTasks(t *testing.T) {
 	rec := &schoolRecorder{inPeriod: true, tasks: []map[string]any{task("chat_3_times", "finished", 50)}}
 	srv := httptest.NewServer(rec.handler())
 	t.Cleanup(srv.Close)
@@ -648,8 +648,8 @@ func TestDisabledAccountsNoRecords(t *testing.T) {
 
 	s.RunSchoolNow()
 
-	if got := len(recordsOf(t, path)); got != 0 {
-		t.Errorf("被禁用的账号不参与，不应产生记录，实际 %d 条", got)
+	if got := len(recordsOf(t, path)); got == 0 {
+		t.Error("禁用账号仍执行任务，应产生账号记录")
 	}
 }
 

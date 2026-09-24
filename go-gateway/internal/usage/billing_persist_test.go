@@ -187,7 +187,10 @@ func TestBackfillAttributesHistoricalUsage(t *testing.T) {
 					"2026-09-21": map[string]any{"input": 100, "output": 20, "records": 1},
 				},
 			},
-			"e94c5d4f-17ac-47db-8d31-b80d139e8bfb": map[string]any{ // 裸 UUID → workbuddy
+			// ⚠ 这里原本写的是一个**真实账号 UUID**（从线上数据抄来的）。
+			// 本仓库是**公开仓库**，真实标识不得入库 —— 换成一眼看出是假的
+			// 占位值。该用例只验证"裸 UUID 归一成 workbuddy"，与具体取值无关。
+			"12345678-1234-4123-8123-123456789012": map[string]any{ // 裸 UUID（占位值）→ workbuddy
 				"deepseek-v4.1-flash": map[string]any{
 					"2026-09-21": map[string]any{"input": 10, "output": 2, "records": 1},
 				},

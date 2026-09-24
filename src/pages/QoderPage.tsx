@@ -277,13 +277,13 @@ function isClaimedCampaign(c: api.QoderCampaign): boolean {
 }
 
 /**
- * 该活动**是不是"能领东西"的真活动**（而不是广告位）。
+ * 该活动**是不是"能领东西"的真活动**（而不是纯展示位）。
  *
  * # 为什么单独一个函数
  *
- * 这条判据要在**三处**用同一份：任务清单、可领计数、单账号领取的目标筛选。
- * 各写一遍必然分叉 —— 那正是我第一版的错误来源（后端与前端各写了一份
- * `claimStatus` 判据，两份都漏了 `actionType`）。
+ * 这条判据要在**三处**用同一份：可领计数、单账号领取的目标筛选、
+ * 以及界面上的"能不能点"。各写一遍必然分叉 —— 那正是我第一版的错误来源
+ *（后端与前端各写了一份 `claimStatus` 判据，两份都漏了 `actionType`）。
  *
  * 判据：`actionType === "CLAIM_BENEFIT"` 或有 `benefit`。
  *
@@ -291,9 +291,10 @@ function isClaimedCampaign(c: api.QoderCampaign): boolean {
  *	（`CLAIM_BENEFIT` + `benefit{100 CREDITS}`），但上游字段名历史上变过，
  *	任一条成立就足以说明"这条能领到东西"。
  *
- * `VIEW_DETAILS` 是**广告位**：它也带 placements、也回 CLAIMED，
- * 但它上面那个「已领取」是**整个活动页**的状态，不是"你领到了这个"。
- * 故它既不该进任务清单，也不该显示为"已完成"。
+ * ⚠⚠ **这个函数不再用于"要不要显示成任务"**（2026-09-23 修正）。
+ *
+ * 它现在的用途只剩一个：判断**能不能点**（`isClaimableCampaign`）。
+ * 「要不要显示」改由 `qoderTasksOf` 直接收全部上游活动 —— 见那里的注释。
  */
 function isBenefitCampaign(c: api.QoderCampaign): boolean {
   if (Boolean(c.benefit)) return true;
@@ -304,14 +305,17 @@ function isBenefitCampaign(c: api.QoderCampaign): boolean {
  * 该活动**能不能领**。
  *
  *	· 已领（CLAIMED）/ 已过期（EXPIRED）→ 不能领
- *	· **不是领取类**（`VIEW_DETAILS` 等广告位）→ 不能领
- *	  （见 `isBenefitCampaign`：那类条目根本没有 benefit）
+ *	· **不是领取类**（`VIEW_DETAILS` 等纯展示位）→ 不能领
+ *	  （见 `isBenefitCampaign`：那类条目没有 benefit）
  *	· 状态为空 → **仍按可领处理**，与后端 `count_claimable` 同一取向
  *	  （"上游没给状态时不预设为已领取，否则用户明明能领却看不到按钮"）
  *
  * ⚠ 判据必须与后端 `is_claimable_campaign`（`qoder_login.rs`）**逐条一致**。
  * 两边分叉的后果很具体：界面说"2 个可领取"而实际只领到 1 个 ——
  * 用户会认为这个按钮在骗他。此前两边**都**漏了 actionType 这一条。
+ *
+ * ⚠ 本函数只回答"**能不能点**"，不回答"要不要显示"。
+ * 显示与否见 `qoderTasksOf`（全部活动都显示，用状态区分）。
  */
 function isClaimableCampaign(c: api.QoderCampaign): boolean {
   if (isClaimedCampaign(c) || c.claimStatus === "EXPIRED") return false;
@@ -360,19 +364,56 @@ function campaignEntriesFor(acc: api.QoderAccountCampaigns): api.QoderCampaign[]
  *
  * 故这里直接用活动清单做任务清单：**活动有多少，任务就有多少**。
  *
- * # 三个状态的判定
+ * # 四个状态的判定
  *
  *	done    —— 上游明确说已领（`isClaimedCampaign`）
- *	blocked —— 已过期或不是"查看类"动作（`!isClaimableCampaign` 且未领）
- *	ready   —— 其余（可领）
+ *	ready   —— 可领（`isClaimableCampaign`）
+ *	detail  —— **只有详情、没有可领的东西**（非领取类，且未领）
+ *	blocked —— 其余不可领（如已过期）
  *
- * ⚠ `blocked` 与 `done` 都置灰但**都显示**：用户需要知道"这个任务存在"。
- * 隐藏会让他以为功能没了（见 ProductAccountTask 的注释）。
+ * ⚠ 四个状态**都要显示**（后三个置灰）：用户需要知道"这个任务存在"
+ * 以及"它为什么不能点"。隐藏会让他以为功能没了。
+ *
+ * # ⚠ `detail` 是 2026-09-23 补的（所有者报的真实缺陷）
+ *
+ * 原实现把非领取类活动在 `qoderTasksOf` 里用 `.filter(isBenefitCampaign)`
+ * **整条滤掉**，于是只有 `VIEW_DETAILS` 活动的账号 `tasks` 为空 ⇒
+ * 卡片里 `tasks.length > 0` 不成立 ⇒ **整个「本账号任务」菜单组都不渲染**。
+ *
+ * 所有者现场（Qoder 国际版，实测 `showCampaign:true` 且活动进行中）：
+ * 菜单里只有「刷新/记录/备注/停用/删除」，他说
+ * 「qoder国际版账号怎么还是没有本账号任务?明明是有的」。
+ *
+ * ⚠ **判据顺序不能换**：先判"是不是领取类"，再判已领/可领。
+ *
+ * # 为什么 `detail` 必须排在 `done` 前面（2026-09-23 实测纠正）
+ *
+ * 国际版的唯一那条活动是 `VIEW_DETAILS` + `claimStatus=CLAIMED`。
+ * 若先判已领，它会显示成**「已完成」** —— 那是在骗用户：他今天
+ * **没有**领到这个活动（它压根不是领取类）。
+ *
+ * 本文件更早的注释早就写明了这一点：
+ *
+ *	「`VIEW_DETAILS` 也带 placements、也回 CLAIMED，但它上面那个
+ *	  「已领取」是**整个活动页**的状态，不是"你领到了这个"」
+ *
+ * 即：对非领取类活动，`claimStatus` **没有"我领到了"的语义**，
+ * 不能拿它当"已完成"。故 actionType 的判定必须优先。
  */
-function qoderTaskStateOf(c: api.QoderCampaign): "done" | "ready" | "blocked" {
+function qoderTaskStateOf(c: api.QoderCampaign): "done" | "ready" | "detail" | "blocked" {
+  // ① 非领取类（VIEW_DETAILS 等）：它只有详情，**不管 claimStatus 是什么**。
+  //    这条必须最先判 —— 见上面的说明。
+  if (!isBenefitCampaign(c)) {
+    // 已过期的纯展示位也算"仅详情"：它本来就没有可领的东西，
+    // 过期与否不改变这个事实。
+    return "detail";
+  }
+  // ② 领取类且已领 → 已完成
   if (isClaimedCampaign(c)) return "done";
-  if (!isClaimableCampaign(c)) return "blocked";
-  return "ready";
+  // ③ 领取类且可领 → 可点
+  if (isClaimableCampaign(c)) return "ready";
+  // ④ 领取类但不可领（如已过期）→ 不可用
+  return "blocked";
 }
 
 /** 该账号当前有哪些任务、各自什么状态。
@@ -396,19 +437,27 @@ function qoderTaskStateOf(c: api.QoderCampaign): "done" | "ready" | "blocked" {
  *	VIEW_DETAILS  → **只是"查看详情"**，配的是优惠说明文案
  *	                （实测那条：「专业版 4,000 Qwen Credits，高级版 12,000…」）
  *
- * # 我第一版错在哪（值得记下来）
+ * # 判据演进（三个版本，最后一个是现在）
  *
- * 我写的过滤是 `Boolean(c.benefit) || isClaimedCampaign(c)` ——
- * 那个 `|| isClaimedCampaign(c)` 是致命的：**两条都是 CLAIMED**，
- * 于是宣传那条照样被放行，界面上仍然是"两个任务"。
+ *	v1  `Boolean(c.benefit) || isClaimedCampaign(c)` —— 错：两条都是 CLAIMED，
+ *	    于是宣传那条也被放行，界面仍是"两个任务"。
+ *	v2  `.filter(isBenefitCampaign)` —— 能区分了，但**过度**：把非领取类
+ *	    整条滤掉 ⇒ 只带 `VIEW_DETAILS` 的账号 `tasks=[]` ⇒
+ *	    **整个「本账号任务」菜单组消失**（所有者 2026-09-23 报的缺陷）。
+ *	v3  **不过滤**，全部上游活动都进菜单，用 `state` 如实表达能不能点。
  *
- * 我当时加那个或条件，理由是"用户需要看到自己领过什么"。但那是**错位**的
- * 关心：`VIEW_DETAILS` 本来就不是"领过的活动"，它是**广告位** ——
- * 它上面显示的那个「已领取」是上游给整个活动页的状态，不是"你领到了这个"。
- * 所以它既不该显示为任务，也不该显示为已完成。
+ * # 为什么 v3 才是对的
  *
- * 判据只看 `actionType === "CLAIM_BENEFIT"`（与后端
- * `is_claimable_campaign` 的取向一致：benefit 或 actionType 二者之一）。
+ * ① 所有者 2026-09-20 的原话是「应该**能做出区分**」——
+ *    他要的是**区分**，不是**隐藏**。v2 把"区分"实现成了"删掉"。
+ * ② 卡片自己早就写明了这条设计（`ProductAccountTask.state` 的注释）：
+ *    「隐藏会让他以为功能没了」。v2 的过滤发生在更上游，
+ *    **绕过了那条设计** —— 所有者随后正好就说了「明明是有的」。
+ * ③ `VIEW_DETAILS` 的活动是**真实存在**的（实测 `showCampaign:true`、
+ *    活动期内），把它显示成「仅详情」信息量严格大于"什么都不显示"。
+ *
+ * ⚠ 唯一的例外是 `id` 为空的条目（连 campaignId 与 campaignKey 都没有）：
+ * 那种条目无法定位、也无法领取，显示出来只会是噪音。
  */
 function qoderTasksOf(
   acc: api.QoderAccountCampaigns | undefined,
@@ -416,18 +465,19 @@ function qoderTasksOf(
 ): ProductAccountTask[] {
   if (!acc) return [];
   return campaignEntriesFor(acc)
-    // 只保留"领取类"动作。`VIEW_DETAILS` 是广告位 —— 显示成任务会让用户
-    // 以为还有第二个活动可领（那正是他反馈的问题）。
-    .filter(isBenefitCampaign)
     .map((c) => {
       const state = qoderTaskStateOf(c);
       // 失败原因只在**可领**（ready）的任务上提示 —— 那才是用户刚点过的那条。
-      // done/blocked 的原因另有来源（已领/不可领），不该被覆盖。
+      // done 的原因另有来源（已领）。
+      //
+      // `detail` / `blocked` 用活动自身的副标题（那里有**真实的有效期/时间窗**，
+      // 比写死的一句话信息量大）；实在没有副标题时才回落到说明文案。
       const reason =
         state === "ready" && failReason
           ? failReason
-          : state === "blocked"
-            ? campaignSubtitleOf(c) || "当前不可领取"
+          : state === "detail" || state === "blocked"
+            ? campaignSubtitleOf(c) ||
+              (state === "detail" ? "该活动只能查看详情，没有可领取的奖励" : "当前不可领取")
             : undefined;
       return {
         // id 用 campaignId：领取接口要的就是它（campaignKey 只是好看的名字）

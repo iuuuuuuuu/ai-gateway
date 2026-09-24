@@ -302,7 +302,31 @@ func TestUnusualActivityStopsRotation(t *testing.T) {
 // TestUnusualActivityBreakerBlocksNextRequest 熔断期间**下一个请求**不再打上游。
 //
 // 与上一条互补：那条证明"一次请求内不换号"，这条证明"后续请求也不打"
-//（否则用户重试一次就又把账号打一遍，放大依旧）。
+// （否则用户重试一次就又把账号打一遍，放大依旧）。
+// TestUnusualActivityIsolatedByProduct 3012 只熔断命中产品，不得阻断其它产品。
+//
+// 这是本次用户现场的核心回归：zcode:glm-5.3 失败后，Qoder/WorkBuddy
+// 仍应可以发起请求，不能因为包级全局 breaker 一起进入风控等待。
+func TestUnusualActivityIsolatedByProduct(t *testing.T) {
+	resetUnusual(t)
+	z := unusual.forProduct(auth.ProductZcode)
+	q := unusual.forProduct(auth.ProductQoder)
+	w := unusual.forProduct(auth.ProductWorkBuddy)
+	z.note3012()
+	if tripped, _ := z.tripped(); !tripped {
+		t.Fatal("ZCode 命中 3012 后应熔断")
+	}
+	for name, b := range map[string]*unusualBreaker{"qoder": q, "workbuddy": w} {
+		if tripped, _ := b.tripped(); tripped {
+			t.Errorf("%s 不应被 ZCode 的 3012 熔断影响", name)
+		}
+	}
+	q.note3012()
+	if tripped, _ := w.tripped(); tripped {
+		t.Error("WorkBuddy 不应被 Qoder 的 3012 熔断影响")
+	}
+}
+
 func TestUnusualActivityBreakerBlocksNextRequest(t *testing.T) {
 	resetUnusual(t)
 	withRotateRand(t, func(n int64) int64 { return 0 })

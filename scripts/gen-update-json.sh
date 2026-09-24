@@ -44,9 +44,32 @@ case "$UPDATE_OS" in
     PLATFORM_KEYS="darwin-$UPDATE_ARCH-app darwin-$UPDATE_ARCH"
     ;;
   linux)
-    # Linux 用 AppImage（自更新友好）。签名文件是 *.AppImage.tar.gz.sig。
+    # Linux 用 AppImage（自更新友好）。
+    #
+    # ⚠⚠ 签名文件名是 **`*.AppImage.sig`**，不是 `*.AppImage.tar.gz.sig`
+    #（2026-09-23 更正）。
+    #
+    # 原因：`.AppImage.tar.gz` **只在 `createUpdaterArtifacts: "v1Compatible"`
+    # （v1 兼容模式）下才生成**。本项目是 `true`（v2 模式），Tauri 只为
+    # **裸 .AppImage** 签名 —— 见 `crates/tauri-bundler/src/bundle.rs`：
+    #
+    #	if updater.v1_compatible {
+    #	    matches!(package_type, AppImage | MacOsBundle | Nsis | Msi | Deb)
+    #	} else {
+    #	    matches!(package_type, MacOsBundle)   // ← v2 只对 macOS 打包
+    #	}
+    #
+    # updater 侧也支持裸包：`install_appimage` 对非 gzip 输入直接
+    # `std::fs::write` 覆盖当前 AppImage（AppImage 是 ELF，
+    # `infer::archive::is_gz()` 判 false ⇒ 走的就是这条）。
+    # 官方文档（v2.tauri.app/plugin/updater 的 v2 页签）与官方 tauri-action
+    # 的 `signaturePriority()` 都把裸 `.AppImage.sig` 当**首选**。
+    #
+    # ⚠ 这里**两种都匹配**（`*.AppImage*.sig` 同时覆盖裸包与 v1 的 tar.gz 包）：
+    # 若将来切到 v1Compatible，脚本不用再改；而两种若同时存在，
+    # 下面「恰好 1 个」的断言会立刻报错，而不是静默取错那一个。
     DEFAULT_BUNDLE="appimage"
-    SIG_GLOB="*.AppImage.tar.gz.sig"
+    SIG_GLOB="*.AppImage*.sig"
     PLATFORM_KEYS="linux-$UPDATE_ARCH-appimage linux-$UPDATE_ARCH"
     ;;
   *)

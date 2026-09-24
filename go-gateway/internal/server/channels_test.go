@@ -59,7 +59,56 @@ func TestProductModelsReadsConfigFromConfig(t *testing.T) {
 // TestProductModelsEmptyConfigIsSafe 缺配置时不报错、返回空。
 //
 // 这是**降级路径**：没有 product_models 时 /v1/models 仍要能正常返回
-//（只是模型不带 Qoder/ZCode 的渠道）。缺一份可选配置不该让整个接口失败。
+// （只是模型不带 Qoder/ZCode 的渠道）。缺一份可选配置不该让整个接口失败。
+// TestMergedModelListExposesAliasesAsIDs 组合路由名既要在 aliases 中保留，
+// 也要作为独立 data[].id 返回，兼容只读取 id 的 OpenAI 客户端。
+func TestMergedModelListExposesAliasesAsIDs(t *testing.T) {
+	h := newTestHandlerForChannels(map[string][]string{
+		"zcode": {"glm-5.3"},
+	})
+	items := h.mergedModelList()
+	want := map[string]bool{"glm-5.3": false, "zcode:glm-5.3": false}
+	for _, item := range items {
+		id, _ := item["id"].(string)
+		if _, ok := want[id]; ok {
+			want[id] = true
+		}
+	}
+	for id, ok := range want {
+		if !ok {
+			t.Errorf("/v1/models 应返回独立模型 id %q，实际未找到", id)
+		}
+	}
+}
+
+func TestQwen38FlashContextMatchesOfficialQoder(t *testing.T) {
+	h := newTestHandlerForChannels(map[string][]string{"qoder": {"Qwen3.8-Flash"}})
+	for _, item := range h.mergedModelList() {
+		if item["id"] == "Qwen3.8-Flash" {
+			if got, _ := item["context_length"].(int64); got != 1000000 {
+				t.Fatalf("Qwen3.8-Flash context_length 应为官方 1M，实际 %#v", item["context_length"])
+			}
+			return
+		}
+	}
+	t.Fatal("未找到 Qwen3.8-Flash 模型项")
+}
+
+func TestMergedAliasChannelsRespectExplicitRoute(t *testing.T) {
+	h := newTestHandlerForChannels(map[string][]string{"zcode": {"glm-5.3"}})
+	for _, item := range h.mergedModelList() {
+		if item["id"] != "zcode:glm-5.3" {
+			continue
+		}
+		channels, _ := item["channels"].([]map[string]any)
+		if len(channels) != 1 || channels[0]["product"] != "zcode" {
+			t.Fatalf("zcode 组合项只能显示 zcode 渠道，实际 %#v", item["channels"])
+		}
+		return
+	}
+	t.Fatal("未找到 zcode:glm-5.3 独立模型项")
+}
+
 func TestProductModelsEmptyConfigIsSafe(t *testing.T) {
 	for name, cfg := range map[string]map[string][]string{
 		"nil":   nil,

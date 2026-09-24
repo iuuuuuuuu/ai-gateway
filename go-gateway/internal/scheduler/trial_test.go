@@ -157,8 +157,8 @@ func TestTrialRejectsCNInClient(t *testing.T) {
 	}
 }
 
-// TestTrialSkipsDisabledAccounts 禁用账号不参与。
-func TestTrialSkipsDisabledAccounts(t *testing.T) {
+// TestTrialRunsForDisabledAccounts 禁用账号仍参与任务。
+func TestTrialRunsForDisabledAccounts(t *testing.T) {
 	rec := &trialRecorder{}
 	s := newTrialScheduler(t, rec, &auth.Auth{
 		UID: "intl", AccessToken: "tok", Domain: "www.workbuddy.ai",
@@ -167,8 +167,8 @@ func TestTrialSkipsDisabledAccounts(t *testing.T) {
 
 	s.RunTrialNow()
 
-	if n := rec.count(); n != 0 {
-		t.Errorf("被禁用的账号不应参与，实际 %d 次调用", n)
+	if n := rec.count(); n != 1 {
+		t.Errorf("禁用账号仍应参与，实际 %d 次调用", n)
 	}
 }
 

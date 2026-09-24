@@ -208,16 +208,16 @@ func TestSchoolIncludesIntlWhenScopeAll(t *testing.T) {
 	}
 }
 
-// TestSchoolSkipsDisabledAccounts 禁用账号不参与。
-func TestSchoolSkipsDisabledAccounts(t *testing.T) {
+// TestSchoolRunsForDisabledAccounts 禁用账号仍参与任务。
+func TestSchoolRunsForDisabledAccounts(t *testing.T) {
 	rec := &schoolRecorder{inPeriod: true, tasks: []map[string]any{task("chat_3_times", "finished", 50)}}
 	s := newSchoolScheduler(t, rec, &auth.Auth{UID: "u1", AccessToken: "tok"})
 	s.cfg.Pool.Disable("u1", "测试禁用")
 
 	s.RunSchoolNow()
 
-	if got := rec.claimed(); len(got) != 0 {
-		t.Errorf("被禁用的账号不应参与，实际 %v", got)
+	if got := rec.claimed(); len(got) != 1 {
+		t.Errorf("禁用账号仍应参与，实际 %v", got)
 	}
 }
 
