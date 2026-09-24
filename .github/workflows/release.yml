@@ -472,6 +472,13 @@ jobs:
               exit 1
             fi
             find "$BUNDLE_ROOT/$sub" -maxdepth 1 -type f -name "$glob" -exec cp {} dist-bin/ \;
+            # ⚠ 配套的 .sig 必须**在这里**一起收进来，不能等后面的
+            # 「生成 updater 清单」步去拷：那一步在「检查产物齐全」断言**之后**，
+            # 而断言要求 dist-bin 下恰好 1 个 *-setup.exe.sig。
+            # 于是正式版 Windows 腿会稳定挂在断言上（v1.0.9 实测踩到），
+            # 并连带把 upload-artifact 整步 skip 掉 —— Release 里一个 Windows
+            # 资产都没有，比构建失败更隐蔽。
+            find "$BUNDLE_ROOT/$sub" -maxdepth 1 -type f -name "$glob.sig" -exec cp {} dist-bin/ \;
           done
 
       - name: 收集 Linux 产物
