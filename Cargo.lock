@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "ai-gateway-router"
-version = "1.0.8"
+version = "1.0.10"
 dependencies = [
  "ai-gateway-core",
  "axum",
@@ -150,7 +150,7 @@ dependencies = [
 
 [[package]]
 name = "ai-gateway-server"
-version = "1.0.8"
+version = "1.0.10"
 dependencies = [
  "ai-gateway-core",
  "axum",
