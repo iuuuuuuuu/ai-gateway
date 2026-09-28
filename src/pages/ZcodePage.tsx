@@ -16,6 +16,8 @@ import {
   PlatformConfigDialog,
 } from "@/components/platform-config-dialog";
 import { ProductTasksConfigCard } from "@/components/product-tasks-config";
+// 「自定义平台支持的模型」入口暂时隐藏（用户要求）—— 组件保留，恢复时取消注释即可。
+// import { PlatformModelsConfigCard } from "@/components/platform-models-config";
 import { ZcodeAutoClaimScheduleCard } from "@/components/zcode-schedule-info";
 import { ProductAccountCard, ProductAccountGrid } from "@/components/product-account-card";
 // 记录视图：任务执行记录 + 额度消耗明细（所有者 2026-09-20 要求）。
@@ -41,7 +43,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
 import type { ZcodeAccountRow, ZcodeProvider, ZcodeSummary } from "@/lib/api";
-import { cn } from "@/lib/utils";
+import { cn, firstVisibleText } from "@/lib/utils";
 
 /**
  * ZCode 账号页（Z5）。
@@ -524,7 +526,7 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
   }, [editNote, editTarget]);
 
   const remove = useCallback(async (row: ZcodeAccountRow) => {
-    const name = row.nickname || row.uid.slice(0, 12);
+    const name = firstVisibleText(row.nickname) || row.uid.slice(0, 12);
     if (!window.confirm(`确定删除账号「${name}」吗？\n\n这会同时删除它的凭证文件。`)) return;
     setBusy(row.uid);
     try {
@@ -1071,7 +1073,7 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
               {!scanning && scanResult && scanResult.count > 0 && (
                 <>
                   {/* 已登录的账号 —— 这条信息解决一个真实的困惑：
-                      "我明明登录了 wish，为什么导入的账号叫别的名字"。
+                      "我明明登录了 acct-a，为什么导入的账号叫别的名字"。
                       名字取自客户端登录态，不是套餐名。 */}
                   {scanResult.identity && (
                     <div className="flex items-center gap-3 rounded-lg border bg-muted/40 px-4 py-3">
@@ -1243,7 +1245,9 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
           <DialogContent className="sm:max-w-md">
             <DialogHeader>
               <DialogTitle>编辑备注</DialogTitle>
-              <DialogDescription>{editTarget?.nickname || editTarget?.uid.slice(0, 16)}</DialogDescription>
+              <DialogDescription>
+                {firstVisibleText(editTarget?.nickname) || editTarget?.uid.slice(0, 16)}
+              </DialogDescription>
             </DialogHeader>
             <div className="space-y-2 py-2">
               <Label htmlFor="zcode-note">备注</Label>
@@ -1275,7 +1279,10 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
           <DialogHeader>
             <DialogTitle>账号记录</DialogTitle>
             <DialogDescription>
-              {recordsFor ? recordsFor.note || recordsFor.nickname || recordsFor.uid : ""}
+              {recordsFor
+                ? firstVisibleText(recordsFor.note, recordsFor.nickname, recordsFor.uid) ||
+                  recordsFor.uid
+                : ""}
               的套餐领取、额度周期与任务记录；可按日期区间筛选。
             </DialogDescription>
           </DialogHeader>
@@ -1297,6 +1304,7 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
           description="套餐自动领取的开关与执行时机。自动领取与 Qoder 共用同一个开关。"
         >
           <div className="min-w-0 space-y-10">
+            {/* 暂时隐藏（用户要求）： <PlatformModelsConfigCard product="zcode" /> */}
             <ZcodeAutoClaimScheduleCard />
             <ProductTasksConfigCard />
           </div>

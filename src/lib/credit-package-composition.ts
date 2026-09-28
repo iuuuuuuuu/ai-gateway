@@ -418,15 +418,36 @@ export function uidPrefix(uid: string, length = 10): string {
 }
 
 /**
+ * 整串**只由不可见字符**组成时的匹配式（空白 / 控制 / 格式 / 代理 / 私有区 /
+ * Unicode 标签字符 U+E0000–U+E007F）。
+ *
+ * ⚠ 与 `@/lib/utils` 的 `INVISIBLE_ONLY` 是**同一判据的两份副本**，必须同步修改。
+ * 之所以不直接 import 那份：本文件刻意不导入任何模块（见文件头），
+ * 以便被单独编译成 JS 后用 node 跑校验脚本。
+ */
+const INVISIBLE_ONLY = /^[\s\p{Cc}\p{Cf}\p{Cs}\p{Co}\u{E0000}-\u{E007F}]*$/u;
+
+/** 取第一个**有可见内容**的候选（各自先 trim）；全不可见时返回空串。 */
+function visibleOrEmpty(value: string | null | undefined): string {
+  const trimmed = (value ?? "").trim();
+  if (!trimmed) return "";
+  return INVISIBLE_ONLY.test(trimmed) ? "" : trimmed;
+}
+
+/**
  * 账号展示名，回退顺序：`nickname` → `note` → `uid` 前缀 → 账号 id 前缀。
  *
  * 为什么这么排：昵称是上游给的「真名」，备注是用户自己写的「这是谁的号」，
  * 两者都比一串哈希 uid 可读；都没有时才退回 uid。
+ *
+ * 「有没有」的判据是 `visibleOrEmpty`，**不是** `trim()`：上游昵称存在整串
+ * 不可见的真实案例（单个 U+E0000 标签字符），`"\u{E0000}".trim()` 返回原串
+ * —— 只判 trim 会让这一档输出空白名字，界面上一行看不见字。
  */
 export function accountDisplayName(account: PackageAccountView): string {
-  const nickname = (account.nickname ?? "").trim();
+  const nickname = visibleOrEmpty(account.nickname);
   if (nickname) return nickname;
-  const note = (account.note ?? "").trim();
+  const note = visibleOrEmpty(account.note);
   if (note) return note;
   const uid = (account.uid ?? "").trim();
   if (uid) return uidPrefix(uid);

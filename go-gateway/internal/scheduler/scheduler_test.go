@@ -169,6 +169,23 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 
 // TestRunAllDisabledNoSpinNoCalls 两类任务全禁用：Run 不空转（只等退出信号），
 // 且不能触发任何上游请求——签到禁用同时意味着搭便车的猫猫旅行也停。
+//
+// # ⚠ 本用例此前**一直失败**（2026-09-28 核实为既有问题，非新引入）
+//
+// 原写法只禁了 `CheckinDisabled` / `KeepaliveDisabled`，却断言
+// `upstream calls == 0`。但**其他任务（开学季 / trial / 活跃上报）仍会跑** ——
+// 这是各任务既有的、且被各自的用例明确锁定的语义：
+//
+//	TestActivityRunsForDisabledAccounts   禁用账号仍参与活跃上报
+//	TestSchoolRunsForDisabledAccounts     同上
+//	TestTrialRunsForDisabledAccounts      同上
+//	TestGrowthMapRunsForDisabledAccounts  同上
+//
+// 即"禁用开关"关的是**排程**，不是"该任务永不执行"（手动触发路径也会跑，
+// 见 TestRunTaskByNameIgnoresDisabledSwitch）。
+//
+// 故本用例要表达"一个上游请求都不发"时，必须把**所有**任务的排程开关都关掉。
+// 原断言与实现不符，不是实现错了 —— 改断言，并在注释里记明原因。
 func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -189,6 +206,12 @@ func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 		Upstream:          up,
 		CheckinDisabled:   true,
 		KeepaliveDisabled: true,
+		// ⚠ 必须把**全部**排程关掉，否则开学季 / trial / 活跃上报会照跑
+		//（那是它们的既有语义，见上面的注释）。
+		ActivityDisabled: true,
+		NightOwlDisabled: true,
+		SchoolDisabled:   true,
+		TrialDisabled:    true,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
@@ -198,7 +221,7 @@ func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 	elapsed := time.Since(start)
 
 	if calls.Load() != 0 {
-		t.Errorf("upstream calls=%d want 0（签到禁用 → 旅行也不跑）", calls.Load())
+		t.Errorf("upstream calls=%d want 0（全部排程开关都关掉时不该发任何请求）", calls.Load())
 	}
 	if elapsed < 200*time.Millisecond {
 		t.Errorf("Run returned after %v, before ctx done（不应提前返回）", elapsed)

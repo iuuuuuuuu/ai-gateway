@@ -45,7 +45,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { cn } from "@/lib/utils";
+import { cn, firstVisibleText } from "@/lib/utils";
 
 /** 卡片要展示的账号数据（两个产品归一到这里）。 */
 export interface ProductAccountCardData {
@@ -270,7 +270,7 @@ export function ProductAccountCard({
   onViewRecords,
   compact = false,
 }: Props) {
-  const name = data.nickname || "（未命名）";
+  const name = firstVisibleText(data.nickname) || "（未命名）";
   const refreshing = busyKey === "refresh";
   const toggling = busyKey === "toggle";
   const deleting = busyKey === "delete";

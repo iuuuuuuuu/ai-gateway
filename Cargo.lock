@@ -66,9 +66,10 @@ dependencies = [
 
 [[package]]
 name = "ai-gateway"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "ai-gateway-core",
+ "bytes",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -92,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "ai-gateway-core"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "aes",
  "aes-gcm",

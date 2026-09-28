@@ -468,7 +468,7 @@ pub fn scan_result_view(found: &[(FoundCredential, Vec<String>)]) -> Value {
             .map(|p| p.to_string_lossy().to_string())
             .collect::<Vec<_>>(),
         "existingAccountCount": known_accounts.len(),
-        // 登录态信息（界面用它显示"已登录为 wish"）
+        // 登录态信息（界面用它显示"已登录为 demo-user"）
         "identity": identity.as_ref().map(|i| json!({
             "username": i.username,
             "displayName": i.display_name,

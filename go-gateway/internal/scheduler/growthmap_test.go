@@ -66,11 +66,11 @@ type growthStub struct {
 
 	// 盲盒（2026-09-20 新增任务）。默认 affordable=0 = 能量不足 ⇒ 不开盒，
 	// 这样既有测试（只关心礼包/补偿/兑换/抽奖）不受影响。
-	blindboxEnergy      int64
-	blindboxAffordable  int64
-	blindboxReject      int
-	blindboxQuotaCalls  int
-	blindboxBodies      []string
+	blindboxEnergy     int64
+	blindboxAffordable int64
+	blindboxReject     int
+	blindboxQuotaCalls int
+	blindboxBodies     []string
 }
 
 func (g *growthStub) handler() http.HandlerFunc {

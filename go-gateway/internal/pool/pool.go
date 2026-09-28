@@ -15,10 +15,10 @@
 //
 // 短名单（Top5）的公平性保证（见 shuffleTiesWs）：当截断边界上存在等权重平局时
 // 随机打散，避免同权重账号因 UID 字典序而固定霸占短名单、其余账号永远拿不到流量
-//（issue #5：14 个账号只被路由到 5 个）。
+// （issue #5：14 个账号只被路由到 5 个）。
 //
 // 当所有账号都没有到期信息时，自动退回原三因子口径
-//（credits 占比 ×10 + 闲置补偿 + 成功率 ×3），行为与引入分层前一致。
+// （credits 占比 ×10 + 闲置补偿 + 成功率 ×3），行为与引入分层前一致。
 package pool
 
 import (
@@ -82,7 +82,7 @@ type Status struct {
 	// 原话：「在兼容网关哪里的账号池,也要标记上进入池子的账号属于那个客户端」。
 	//
 	// 三个产品的账号混在**同一个池**里（多产品路由开启时），而界面上
-	// 只有昵称/备注 —— 用户看到 `wish`、`aliyun-…` 这样的名字，
+	// 只有昵称/备注 —— 用户看到 `acct-a`、`acct-b-…` 这样的名字，
 	// **不知道它来自哪个客户端**。于是：
 	//
 	//	· 排查"为什么 zcode: 前缀选不出号"时，看不出池里到底有几个 ZCode 号
@@ -92,6 +92,26 @@ type Status struct {
 	// 老账号的 Product 是空串，若原样下发，界面会显示空、或前端各自
 	// 拿空串去猜 —— 那正是"同一个号在不同页面显示不同产品"的成因。
 	Product string `json:"product,omitempty"`
+
+	// Region 该账号所属区域（`cn` / `intl`）。
+	//
+	// # 为什么必须下发
+	//
+	// 与 Product 同因：三个产品的账号混在同一个池里，而**区域决定了用户
+	// 最关心的几件事** —— 该模型能不能用（区域白名单）、走不走代理、
+	// 以及这个号是否适用签到/旅行这类养号任务。界面上不标，用户看到
+	// 两个同名账号就只能靠猜。
+	//
+	// ⚠ 值走 `e.a.Region().String()`，判据由账号自身的域名决定
+	//（`auth.regionOfDomain` 的**完整域名白名单**，不在清单里的按国服）：
+	//
+	//	workbuddy.ai / codebuddy.ai / qoder.sh / qoder.com / z.ai → intl
+	//	其余（含全部 `.cn`）                                        → cn
+	//
+	// 与 `auth.Region()` 是**同一个口径**，不要在这里另写判断 ——
+	// 两处一旦分叉，界面显示的区域会与实际路由的区域不一致。
+	// `Region()` 永不返回 `any`，故有账号就一定有区域。
+	Region string `json:"region,omitempty"`
 
 	SuccessCount    int64     `json:"success_count,omitempty"`
 	ErrTotal        int64     `json:"err_total,omitempty"`
@@ -231,15 +251,32 @@ func (e *entry) expiryDayKey() string {
 // productOf 取账号所属产品，**nil 安全**且把空串归一成 workbuddy。
 //
 // 为什么要两层兜底而不是直接 `e.a.ProductOf()`：
-//   · `e.a` 可能是 nil（池里曾经有过 nil 账号的路径），直接调会 panic
-//   · 空串归一由 `auth.ProductOf()` 负责，这里只是复用它的口径 ——
-//     **不要**在这里另写一份判断，否则两条路径迟早分叉
-//      （界面显示 workbuddy、选号却按别的产品过滤，那是极难查的一类缺陷）
+//
+//	· `e.a` 可能是 nil（池里曾经有过 nil 账号的路径），直接调会 panic
+//	· 空串归一由 `auth.ProductOf()` 负责，这里只是复用它的口径 ——
+//	  **不要**在这里另写一份判断，否则两条路径迟早分叉
+//	   （界面显示 workbuddy、选号却按别的产品过滤，那是极难查的一类缺陷）
 func productOf(a *auth.Auth) string {
 	if a == nil {
 		return ""
 	}
 	return a.ProductOf()
+}
+
+// regionOf 取账号所属区域（`cn` / `intl`），**nil 安全**。
+//
+// 与 productOf 同理：`e.a` 可能是 nil，而 `Status.Region` 是
+// `omitempty` —— nil 时留空串，前端按「老网关不下发」处理（不渲染徽标），
+// 好过 panic 或猜一个区域。
+//
+// ⚠ 判据**只此一处**：复用 `auth.Region()`（内部走 `regionOfDomain` 的
+// 完整域名白名单）。**勿在别处另写判断** —— 界面显示的区域与实际路由
+// 的区域必须同源，分叉的表现是「标着国服、请求却走了国际版线路」。
+func regionOf(a *auth.Auth) string {
+	if a == nil {
+		return ""
+	}
+	return a.Region().String()
 }
 
 // healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期、未被用户标记不接流量）。
@@ -462,6 +499,68 @@ type Pool struct {
 	// ⚠ 旧注释曾写「多列几个不会让任何账号失去资格，所以宁可补全」——
 	// 那句话在引入 `declared` 优先逻辑之后就**失效了**，见上。
 	productModelFallbackSet map[string]map[string]bool
+
+	// platformModels 用户配置的「平台 × 区域 → 允许的模型」白名单。
+	//
+	// # 与 productModelSet 的区别（关键，别混用）
+	//
+	//	productModelSet    路由**提示**：来自上游查询，用于"无前缀时优先选
+	//	                   声明提供该模型的产品"。未知 = 不排除。
+	//	platformModels     准入**白名单**：来自用户配置，用于"显式指定平台时
+	//	                   只放行他允许的模型"。未知 = 不拦（向后兼容）。
+	//
+	// # 为什么需要它（2026-09-28 所有者要求）
+	//
+	// 他原话：
+	//
+	//	「qoder 的 deepseek-v4.1-flash 不应该不拦截，而是给每个平台
+	//	  手动配置支持的模型，而且要区分国内外版本」
+	//
+	// 背景：qoder 上游**实际上能服务**很多没列在清单里的模型
+	//（实测 `qoder:deepseek-v4.1-flash` 10/10 全 200），但那是**上游能力**，
+	// 不等于**用户想让它跑**。两者必须分开：
+	//
+	//	· 上游能力（超集）→ 不该由网关替用户判断
+	//	· 用户白名单      → 由用户在界面上配，网关严格执行
+	//
+	// 形状（JSON，键为平台名，二级键为区域）：
+	//
+	//	{
+	//	  "qoder":     {"cn": ["Qwen3.8-Flash"], "intl": ["Qwen3.8-Max"]},
+	//	  "zcode":     {"cn": ["glm-5.3"],       "intl": ["glm-5.3-flash"]},
+	//	  "workbuddy": {"cn": [...],             "intl": [...]}
+	//	}
+	//
+	// ⚠ 区域键用 `cn` / `intl` 两个短名（与 `pool.proxy_scope` 的键一致），
+	// 空串键 `""` 表示"该平台不分区域"（向后兼容用）。
+	//
+	// ⚠ **平台不在 map 里 = 不约束该平台**（保持既有行为）：用户没配时
+	// 不能因为"没白名单"就把账号排掉 —— 那会让所有人不可用。
+	platformModels map[string]map[string]map[string]bool
+
+	// platformModelsDisabled 用户显式**禁用**的「平台 × 区域 → 模型」。
+	//
+	// # 它是否决项（veto），先于 platformModels 的并集判定
+	//
+	// 形状与 `platformModels` **完全相同**（含区域键 `cn` / `intl` / `""`），
+	// 但语义相反且**更强**：命中即拦，不参与并集。
+	//
+	// # 为什么不能只靠"从 platformModels 里删掉"
+	//
+	// 因为放行判据是**并集**（见 `platformAllowsModelLocked` 的注释）：
+	//
+	//	放行 = 手动配置 ∪ 接口返回 ∪ 网关兜底
+	//
+	// 于是把一个模型从手动清单里删掉**是删不掉的** —— 它可能仍由
+	// "接口返回"那个来源放行。实测 `qoder:deepseek-v4.1-flash` 正是如此：
+	// 它不在 qoder 的查询清单里，但用户手动加过，删掉手动那份之后
+	// 依旧会被放行（并集里另一支命中）。
+	//
+	// 用户要的"禁用"是一个**独立于并集的否决项** —— 语义是
+	// 「不管哪个来源说它能用，我就是不许它跑」。故它必须在并集**之前**判。
+	//
+	// ⚠ 未配置（nil）⇒ 不否决，行为与引入前逐字不变。
+	platformModelsDisabled map[string]map[string]map[string]bool
 
 	// costWeight 成本乘子的强度（0 = 成本不参与，1 = 满强度）。
 	//
@@ -691,9 +790,328 @@ func (p *Pool) ProductOffersModel(product, model string) (bool, bool) {
 	return set[strings.ToLower(strings.TrimSpace(model))], true
 }
 
+// SetPlatformModels 注入「平台 × 区域 → 允许的模型」白名单（宿主透传）。
+//
+// 形状见 `platformModels` 字段的注释。传空 map 等于**清空白名单**
+// （= 不约束任何平台，回到既有行为）。
+//
+// # 归一化规则
+//
+//	· 平台名、区域名、模型名一律**小写去空白**（上游大小写混乱）
+//	· 空平台名 / 空模型名跳过（不产生"空即全禁"的意外）
+//	· 某平台某区域的清单为空 ⇒ **不写入** ⇒ 该组合视为"未配置"（不拦）
+//
+// 最后一条是有意的：界面里把某平台的模型全删光，语义应是"没配白名单"
+// 而不是"该平台一个模型都不许用" —— 后者会让该平台彻底不可用，
+// 而用户的本意通常只是"还没配"。
+func (p *Pool) SetPlatformModels(raw map[string]map[string][]string) {
+	p.mu.Lock()
+	p.platformModels = normalizePlatformModels(raw)
+	p.mu.Unlock()
+}
+
+// SetPlatformModelsDisabled 注入「平台 × 区域 → **禁用**的模型」否决项（宿主透传）。
+//
+// 形状与 `SetPlatformModels` 完全相同，但语义相反：命中即**拦**，
+// 且**先于**并集判定（理由见 `platformModelsDisabled` 字段的注释）。
+//
+// # 归一化规则
+//
+// 与 `SetPlatformModels` **逐条一致**（两者共用 `normalizePlatformModels`，
+// 刻意不各写一套 —— 契约冻结为"形状完全相同"，分叉会让 Rust 侧下发的
+// 键在两侧得到不同的解释）。
+//
+// 其中最后一条对否决项同样重要：某平台某区域的清单为空 ⇒ **不写入**
+// ⇒ 该组合视为"未配置"（**不否决**）。界面里把禁用列表清空，
+// 语义应是"没有禁用任何模型"，而不是"该平台所有模型都禁用" ——
+// 后者会让该平台彻底不可用。
+func (p *Pool) SetPlatformModelsDisabled(raw map[string]map[string][]string) {
+	p.mu.Lock()
+	p.platformModelsDisabled = normalizePlatformModels(raw)
+	p.mu.Unlock()
+}
+
+// normalizePlatformModels 是「平台 × 区域 → 模型集合」的**唯一**归一化实现，
+// 供白名单（`SetPlatformModels`）与否决项（`SetPlatformModelsDisabled`）共用。
+//
+// # 归一化规则
+//
+//	· 平台名、区域名、模型名一律**小写去空白**（上游大小写混乱）
+//	· 空平台名 / 空模型名跳过（不产生"空即全禁"的意外）
+//	· 某平台某区域的清单为空 ⇒ **不写入** ⇒ 该组合视为"未配置"
+//
+// 最后一条是有意的：界面里把某平台的模型全删光，语义应是"没配"
+// 而不是"该平台一个模型都不许用" —— 后者会让该平台彻底不可用，
+// 而用户的本意通常只是"还没配"。
+//
+// ⚠ 抽成 helper 是为了**避免将来分叉**：两个 map 的键名与形状是
+// 跨语言冻结契约（Rust 侧的 `platform_models_normalized` 与之逐条对应），
+// 两套实现各自演化会让同一份配置在两侧得到不同解释。
+func normalizePlatformModels(raw map[string]map[string][]string) map[string]map[string]map[string]bool {
+	out := make(map[string]map[string]map[string]bool, len(raw))
+	for plat, byRegion := range raw {
+		plat = strings.ToLower(strings.TrimSpace(plat))
+		if plat == "" {
+			continue
+		}
+		regions := make(map[string]map[string]bool, len(byRegion))
+		for region, models := range byRegion {
+			region = strings.ToLower(strings.TrimSpace(region))
+			m := make(map[string]bool, len(models))
+			for _, id := range models {
+				if id = strings.ToLower(strings.TrimSpace(id)); id != "" {
+					m[id] = true
+				}
+			}
+			if len(m) > 0 {
+				regions[region] = m
+			}
+		}
+		if len(regions) > 0 {
+			out[plat] = regions
+		}
+	}
+	return out
+}
+
+// PlatformAllowsModel 报告用户白名单是否允许「该平台的该区域」跑这个模型。
+//
+// 返回 (是否允许, 是否配了白名单)。第二个返回值让调用方区分
+// "用户明确禁止"与"用户没配" —— 后者**不该**拦（向后兼容）。
+//
+// # 查找顺序（从具体到宽松）
+//
+//  1. 平台 + 区域 都命中 → 按它判
+//  2. 只有平台的「不分区域」清单（`""` 键）→ 按它判
+//  3. 平台在 map 里但两个区域都没配 → 该平台视为"未配置"→ 不拦
+//  4. 平台不在 map 里 → 不拦
+//
+// 第 2 条是为兼容"只想配一份、不区分区域"的简单用法；
+// 用户一旦按区域配了，就走区域那份（更具体者优先）。
+func (p *Pool) PlatformAllowsModel(product string, region auth.Region, model string) (bool, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.platformAllowsModelLocked(product, region, model)
+}
+
+// platformAllowsModelLocked 是 PlatformAllowsModel 的**持锁**版本。
+//
+// # 判据是**并集**，不是"以手动配置为准"（所有者 2026-09-28 明确）
+//
+// 他原话：
+//
+//	「手动配置的+接口返回的,可不是以手动配置的为准」
+//
+// 即三个来源取**并集**，任一命中即放行：
+//
+//  1. `platformModels`          用户手动配的（**按平台 × 区域**）
+//  2. `productModelSet`         接口/刷新账号返回的（不区分区域）
+//  3. `productModelFallbackSet` 网关内置兜底（只用于"别拦我们以为能用的"）
+//
+// 但并集**之前**还有一个**否决项**（来源 0）：
+//
+//  0. `platformModelsDisabled`  用户显式禁用的 → **拦**，压过上面三个的并集
+//
+// 来源 0 不是"第四个并集成员"，而是**前置否决** —— 它存在的理由正是
+// 并集本身：从手动清单里删掉一个模型删不掉（另两个来源仍会放行它），
+// 故"不许它跑"必须是一个独立于并集的判据。详见该字段的注释。
+//
+// 为什么必须取并集而不是"手动为准"：
+//
+//	· 用户手动配的通常**只补几个**（如 qoder 的 `deepseek-v4.1-flash`），
+//	  若以它为准，接口返回的另外 18 个会被全部挡掉 —— 那是灾难。
+//	· 反过来只认接口返回的，用户就没法用那些"上游能服务但没报出来"的模型
+//	  （实测 qoder 能服务 `deepseek-v4.1-flash` 但清单里没有）。
+//
+// # 三态返回（第二个返回值 = 是否**配了**任何来源）
+//
+//	配了 + 命中并集   → (true,  true)   放行
+//	配了 + 不在并集   → (false, true)   **拦**
+//	一个来源都没配    → (true,  false)  不拦（向后兼容）
+//
+// 第三态很重要：老配置没有 `platform_models`、账号也没刷新过（清单空）时
+// 必须放行 —— 否则升级后所有平台都会变成"没有可用账号"。
+//
+// ⚠ 区域只作用于第 0/1 个来源（两者都是用户配置的，有区域维度）。
+// 第 2/3 个来源没有区域维度，取的是跨区域超集 —— 方向是"宁可放行"，
+// 不会误拦。用户若确实要按区域区分，用手动配置即可（它更具体，同时判）。
+func (p *Pool) platformAllowsModelLocked(product string, region auth.Region, model string) (bool, bool) {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return true, false
+	}
+	plat := strings.ToLower(strings.TrimSpace(product))
+	if plat == "" {
+		return true, false
+	}
+
+	// ---- 来源 0：用户显式禁用（否决项，压过下面三个来源的并集）----
+	//
+	// ⚠⚠ 必须放在**任何来源之前**。放到后面（或把它并进 `configured` 那套
+	// 三态逻辑里）就失去意义了：并集的语义是"任一来源命中即放行"，
+	// 而禁用的语义是"不管哪个来源说它能用，都不许跑" —— 后者必须**先**判。
+	//
+	// 这就是本字段存在的理由：从手动清单里删掉一个模型是删不掉的，
+	// 它可能仍由"接口返回"那一支放行（见 `platformModelsDisabled` 的注释）。
+	//
+	// 返回 `configured=true` 是**有意**的：它与"用户没表态"必须区分开 ——
+	// 调用方（如 `PickForModelProductRegion`）据此知道"这是拦，不是不知道"。
+	if byRegion, ok := p.platformModelsDisabled[plat]; ok && len(byRegion) > 0 {
+		key := "cn"
+		if region == auth.RegionIntl {
+			key = "intl"
+		}
+		// 该区域那份与"不分区域"那份**都判**（与来源 1 同一查找口径）：
+		// 用户在 `""` 里禁用的模型，两个区域都不许跑。
+		for _, k := range []string{key, ""} {
+			if set, ok := byRegion[k]; ok && set[model] {
+				return false, true // 显式禁用 → 拦（configured=true，与"没表态"区分）
+			}
+		}
+	}
+
+	configured := false
+
+	// ---- 来源 1：用户手动配的（按平台 × 区域，最具体）----
+	if byRegion, ok := p.platformModels[plat]; ok && len(byRegion) > 0 {
+		key := "cn"
+		if region == auth.RegionIntl {
+			key = "intl"
+		}
+		// 该区域那份与"不分区域"那份**都判**（而不是"有区域就只看区域"）：
+		// 用户可能同时配了通用清单与某区域的补充清单，只认后者会漏掉前者。
+		for _, k := range []string{key, ""} {
+			if set, ok := byRegion[k]; ok && len(set) > 0 {
+				configured = true
+				if set[model] {
+					return true, true
+				}
+			}
+		}
+	}
+
+	// ---- 来源 2：接口/刷新账号返回的（不区分区域）----
+	if set, ok := p.productModelSet[plat]; ok && len(set) > 0 {
+		configured = true
+		if set[model] {
+			return true, true
+		}
+	}
+
+	// ---- 来源 3：网关内置兜底（猜测，只用于放宽）----
+	if set, ok := p.productModelFallbackSet[plat]; ok && len(set) > 0 {
+		configured = true
+		if set[model] {
+			return true, true
+		}
+	}
+
+	// ⚠⚠ 这里必须按 `configured` 分流，**不能**直接 `return false, configured`。
+	//
+	// 后者会让"一个来源都没配"（configured=false）时返回 allowed=false ——
+	// 即**把"用户没表态"当成了"用户禁止"**。
+	//
+	// 后果是灾难性的：老配置没有 `platform_models` 键、账号也没刷新过
+	//（清单为空）时，所有平台的**所有**模型都会被拦 ——
+	// 用户升级后会发现"全部模型都报平台不支持"。
+	//
+	// 这个 bug 被 `TestPlatformWhitelistUnconfiguredDoesNotBlock` 抓到了
+	//（我第一版就是这么写的）。
+	if !configured {
+		return true, false // 没配任何来源 → 不拦（向后兼容）
+	}
+	return false, true // 配了但都不含 → 拦
+}
+
+// PlatformAllowedModels 返回「该平台该区域」**允许的模型并集**（已排序）。
+//
+// 供错误文案展示（"该平台允许哪些"）。未配置时返回 nil —— 调用方据此
+// **不要**列清单，而不是列一个空的。
+//
+// # 必须是并集（与 platformAllowsModelLocked 的判据一致）
+//
+// 文案里列的清单必须**就是**判据用的那份，否则会出现
+// "它说允许 X，我发 X 却被挡"这种自相矛盾。故三个来源取并集：
+//
+//  1. `platformModels`          手动配的（按区域；该区域那份 + 不分区域那份）
+//  2. `productModelSet`         接口返回的
+//  3. `productModelFallbackSet` 网关兜底
+//
+// # 并集之后还要**扣除**被禁用的（来源 0）
+//
+// 否决项（`platformModelsDisabled`）压过并集，故它命中的模型**必须**从
+// 这里扣除。不扣的话文案会列出"我允许 X"，而实际发 X 会被拦 ——
+// 那正是本函数注释开头明确要避免的自相矛盾，只是换了个来源。
+//
+// ⚠ 手动配置是**跨区域**可能不同，但接口返回的那份没有区域维度 ——
+// 故并集结果可能比"该区域实际允许的"稍多。这是**有意**的偏向：
+// 文案列多了最多让用户试一次，列少了会让他以为某模型不可用。
+//
+// ⚠ 这个"宁可列多"的偏向**不适用于扣除**：扣多了会把其实允许的模型
+// 从文案里抹掉。故扣除只认**该区域那份 + 不分区域那份**（与
+// `platformAllowsModelLocked` 的来源 0 同一查找口径，逐字对应）。
+func (p *Pool) PlatformAllowedModels(product string, region auth.Region) []string {
+	plat := strings.ToLower(strings.TrimSpace(product))
+	if plat == "" {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	merged := map[string]bool{}
+
+	// 来源 1：手动配置（该区域 + 不分区域）
+	if byRegion, ok := p.platformModels[plat]; ok {
+		key := "cn"
+		if region == auth.RegionIntl {
+			key = "intl"
+		}
+		for _, k := range []string{key, ""} {
+			for m := range byRegion[k] {
+				merged[m] = true
+			}
+		}
+	}
+	// 来源 2/3：接口返回 + 网关兜底（都无区域维度）
+	for _, src := range []map[string]map[string]bool{
+		p.productModelSet, p.productModelFallbackSet,
+	} {
+		for m := range src[plat] {
+			merged[m] = true
+		}
+	}
+
+	// 来源 0（否决项）：从并集里**扣除**被显式禁用的。
+	//
+	// 查找口径必须与 `platformAllowsModelLocked` 的来源 0 **逐字一致** ——
+	// 两边不一致会重新制造"文案与判据分叉"（本函数存在的意义就是防这个）。
+	if byRegion, ok := p.platformModelsDisabled[plat]; ok && len(byRegion) > 0 {
+		key := "cn"
+		if region == auth.RegionIntl {
+			key = "intl"
+		}
+		for _, k := range []string{key, ""} {
+			for m := range byRegion[k] {
+				delete(merged, m)
+			}
+		}
+	}
+
+	if len(merged) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(merged))
+	for m := range merged {
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // productMayServe 判断某账号是否**可能**服务该模型（无前缀时的额外过滤）。
 //
 // 规则：
+//
 //	· 模型名为空        → 放行（让上游自己报错，比我们猜好）
 //	· 该产品没有清单    → 放行（"不知道"不等于"不提供"）
 //	· 该产品清单里有它  → 放行
@@ -721,7 +1139,7 @@ func (p *Pool) productMayServe(product, model string) bool {
 // AccountKey 是「账号身份」的轻量投影，专供**热路径**上按区域注入成本率用。
 //
 // 为什么不复用 Status：`Status` 要算排队档位、模型冷却、成功率等一堆东西
-//（见 List 的实现），在每次 chat 请求的关键路径上调它是浪费。
+// （见 List 的实现），在每次 chat 请求的关键路径上调它是浪费。
 // 这里只要"这个账号是哪个产品的、属于哪个区域"两个字段。
 type AccountKey struct {
 	UID     string
@@ -879,14 +1297,14 @@ func (p *Pool) Acquire(uid string) bool {
 //	并发 5 → 3×200 + 2×503
 //
 // 把 `max_in_flight` 提到 100 后，并发 5/10/15/20 **全部 200**
-//（qoder 上游实测能扛 20 并发，网关的 3 是过度保守）。
+// （qoder 上游实测能扛 20 并发，网关的 3 是过度保守）。
 //
 // # 为什么"等待"比"直接失败"正确
 //
 // 在途名额是**瞬时**资源：一个请求几秒就结束并释放名额。
 // 名额暂时满 ≠ 账号不可用。旧行为把两者混为一谈 ——
 // 用户看到「所有账号不可用（冷却/禁用）」，而去查一个**完全健康**的账号
-//（实测该账号 `cooling=false`、`disabled=false`、`in_flight=0`）。
+// （实测该账号 `cooling=false`、`disabled=false`、`in_flight=0`）。
 //
 // ⚠ 等待有上限（`wait`），且尊重 `ctx` 取消 —— 不能因为等名额
 // 把请求无限挂住（客户端已放弃的请求不该继续占着 goroutine）。
@@ -1180,11 +1598,55 @@ func (p *Pool) PickForModelProductRegion(
 	for uid := range tried {
 		scoped[uid] = true
 	}
-	// 排除两类账号：
+	// 排除三类账号：
 	//  1. 产品不符（用 ProductOf() —— 老账号的 Product 是空串，
 	//     语义上等价于 workbuddy；裸读会让它们全部被排除，
 	//     表现为"指定 workbuddy 却一个号都选不出"）
 	//  2. 区域不符（与 pickForModelInRegion 同一判据；prefer 为 Any 时跳过）
+	//  3. ⚠ **用户白名单不允许「该平台 × 该区域」跑这个模型**（2026-09-28）
+	//
+	// =====================================================================
+	// 关于第 3 类：为什么用 platformModels 而不是 productModelSet
+	// =====================================================================
+	//
+	// # 两轮实测的经过（别再翻回去）
+	//
+	// 起因：所有者截图里 `deepseek-v4.1-flash · Qoder` 看起来像幽灵数据
+	//（qoder 的清单里没有它）。他说「在选号侧就是要挡请求」。
+	//
+	// 我第一版用 `productModelSet`（上游查询来的清单）拦，然后实测发现
+	// **qoder 上游明明能服务它**（清空清单后直发，10/10 全 200、
+	// `id=chatcmpl-qoder`、`model=deepseek-v4.1-flash`），于是撤了。
+	//
+	// 所有者纠正：
+	//
+	//	「不是让你回退，是让你手动加一个平台的支持，
+	//	  我手动加了，才能路由上去」
+	//	「qoder 的 deepseek-v4.1-flash 不应该不拦截，而是给每个平台
+	//	  手动配置支持的模型，而且要区分国内外版本」
+	//
+	// # 关键区分：上游能力 ≠ 用户许可
+	//
+	//	上游能服务什么（超集，qoder 实际能跑很多没列出的模型）
+	//	    → **不该**由网关替用户判断，也不该据它拦
+	//	用户允许跑什么（白名单，界面上手动配）
+	//	    → **该**严格执行，这就是第 3 类拦的东西
+	//
+	// 我上一轮把两者混为一谈，才误判成"拦错了"。
+	//
+	// # 判据：platformModels（用户白名单，区分平台 × 区域）
+	//
+	//	白名单配了 + 含该模型   → 放行
+	//	白名单配了 + 不含       → **拦**（并告知该平台允许哪些）
+	//	白名单**没配**          → 放行（向后兼容：老配置没有这个键）
+	//
+	// 第三态同样重要：用户没配白名单时不能拦，否则升级后所有平台
+	// 都会变成"没有可用账号"。
+	//
+	// ⚠ 区域也要区分：同一个平台在国内/国际版能用的模型可能不同
+	//（所有者明确要求"要区分国内外版本"）。判据用**账号自己的区域**
+	//（`e.a.Region()`），而不是请求偏好的区域 —— 后者可能是 Any。
+	modelGiven := strings.TrimSpace(model) != ""
 	for uid, e := range p.byUID {
 		if e.a == nil {
 			scoped[uid] = true
@@ -1196,6 +1658,14 @@ func (p *Pool) PickForModelProductRegion(
 		}
 		if prefer != auth.RegionAny && e.a.Region() != prefer {
 			scoped[uid] = true
+			continue
+		}
+		if modelGiven {
+			if allowed, configured := p.platformAllowsModelLocked(
+				product, e.a.Region(), model,
+			); configured && !allowed {
+				scoped[uid] = true
+			}
 		}
 	}
 	p.mu.RUnlock()
@@ -1483,7 +1953,7 @@ func (p *Pool) productMayServeLocked(product, model string) bool {
 //	发 `qoder:Qwen3.8-Flash`   → 成功
 //
 // 根因：`product_models` 里**只有 qoder / zcode，没有 workbuddy**
-//（宿主侧那份来自用户白名单，默认为空 ⇒ 不写 workbuddy）。
+// （宿主侧那份来自用户白名单，默认为空 ⇒ 不写 workbuddy）。
 // 于是"workbuddy 清单未知" ⇒ `productMayServeLocked` 返回 true ⇒
 // **不排除 WorkBuddy 账号**。而 WorkBuddy 没有 Qwen3.8-Flash ⇒ 上游回 11102，
 // 请求在**撞上第一个 WorkBuddy 账号**时就失败了，压根没轮到 qoder 账号。
@@ -2043,11 +2513,12 @@ func olderLastUsed(a, b *entry) bool {
 //
 // 非 WorkBuddy 产品（Qoder / ZCode）不参与积分分层，原样进入候选集。
 // 这样：
-//   · WorkBuddy 的「先烧快过期」与「未知排最后」**逐字不变**（既有测试仍过）
-//   · 其它产品不会被积分维度的规则误伤
+//
+//	· WorkBuddy 的「先烧快过期」与「未知排最后」**逐字不变**（既有测试仍过）
+//	· 其它产品不会被积分维度的规则误伤
 //
 // 之所以不改成"未知档也保留"：那会推翻 WorkBuddy 那条刻意的设计决定
-//（`TestPickUnknownExpiryGoesLast` 明确要求未知档在还有别的账号时不被选中）。
+// （`TestPickUnknownExpiryGoesLast` 明确要求未知档在还有别的账号时不被选中）。
 // 这里要修的是**跨产品误用**，不是那条决定本身。
 // freeTierLocked 是「免费额度绝对优先」的实现：只保留**已声明免费**的候选。
 //
@@ -2402,11 +2873,12 @@ func (p *Pool) tierWeightOf(e *entry, now time.Time) float64 {
 // costMultiplierLocked 把「消耗率」映射成权重乘子。
 //
 // 设计取舍（见 design.md §2.3）：
-//   · 消耗率越低（越便宜）→ 乘子越接近上限 1 + costWeight
-//   · 消耗率越高（越贵）  → 乘子越接近下限 1 - costWeight
+//
+//	· 消耗率越低（越便宜）→ 乘子越接近上限 1 + costWeight
+//	· 消耗率越高（越贵）  → 乘子越接近下限 1 - costWeight
 //
 // 用 costRate/(1+costRate) 做归一化而不是线性：消耗率的量纲不确定
-//（各产品自定义），线性映射会让某个产品的大数值把乘子压到 0 附近、
+// （各产品自定义），线性映射会让某个产品的大数值把乘子压到 0 附近、
 // 等于永久冷落它。这个映射天然落在 [0,1)，不会产生极端值。
 //
 // costWeight 取 0.3 左右时，最便宜与最贵之间的权重差异约 60% ——
@@ -2655,7 +3127,7 @@ func nextDay4AM(now time.Time) time.Time {
 }
 
 // Disable 禁用（session 死亡），需人工重登后**显式复活**才回到选号池
-//（见 ReviveDisabled 与 /debug/accounts/{uid}/revive）。
+// （见 ReviveDisabled 与 /debug/accounts/{uid}/revive）。
 //
 // ⚠ 重新导入凭证**不会**解开禁用：upsertLocked 对已存在账号只换凭证、不动
 // disabled。这曾是一个真实缺陷（自动禁用的账号在网关内没有任何恢复路径），
@@ -2897,7 +3369,7 @@ func (p *Pool) AvailableUIDs() []string {
 // 实测踩过的坑：`pickProbeAccountInRegion` 原先用 AvailableUIDs，而我把 NoRoute
 // 加进 healthy() 之后，被禁用的国际版账号**既不接流量、也拿不到区域真值了** ——
 // 表现为「deepseek-v4.1-flash 明明两区都有，界面却标『仅国服』」
-//（因为国际版拉不到清单，于是被当成「该区没有这个模型」）。
+// （因为国际版拉不到清单，于是被当成「该区没有这个模型」）。
 // 这正是「把不接流量与不作为混为一谈」的第二次犯法，与导出侧那个 bug 同源。
 //
 // 仍**排除** e.disabled（网关判定 session 死 / 额度冻结）：那种账号连
@@ -2998,7 +3470,7 @@ func (p *Pool) PickByUIDForModelRegion(uid, model string, prefer auth.Region) *a
 // 绑定的账号 —— 哪怕它是 WorkBuddy 的。实测确认（
 // `uitest/verify-model-prefix-live.cjs`）：
 //
-//	`zcode:glm-5.3` → 选中 e2891116（**workbuddy**）→ 报"额度已耗尽"
+//	`zcode:glm-5.3` → 选中 acct-c（**workbuddy**）→ 报"额度已耗尽"
 //
 // 用户看到的是"我明明指定了 zcode，却报了 WorkBuddy 账号的错"。
 //
@@ -3033,7 +3505,7 @@ func (p *Pool) PickByUIDForModelProductRegion(
 //
 // 计数口径与 healthy 的分支**必须对齐**，否则界面上的数字会互相矛盾：
 // 用户标记「不接流量」的账号（no_route）既不是 disabled（没死），也不是 cooling
-//（没在冷却）—— 它在 healthy() 里为 false，若不单独分一支就会被算进 cooling，
+// （没在冷却）—— 它在 healthy() 里为 false，若不单独分一支就会被算进 cooling，
 // 于是界面上「冷却 N 个」凭空多出几个根本没冷却的号。
 // 单独归入 disabled 这一支：两者对**可用性**的含义相同（都不接流量），
 // 界面再按 NoRoute 标记分别显示不同文案。
@@ -3151,6 +3623,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Disabled:        e.disabled,
 		NoRoute:         e.a != nil && e.a.NoRoute,
 		Product:         productOf(e.a),
+		Region:          regionOf(e.a),
 		SuccessCount:    e.successCount,
 		ErrTotal:        e.errTotal,
 		LastSuccessTime: e.lastSuccess,
@@ -3198,6 +3671,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 //     所以真正恢复的时刻是较晚者。expiry() 取的是较早者（供全冷却兜底挑
 //     "最快有可能恢复"的账号去试），语义不同。
 //   - 状态画像要回答用户"还要等多久"，必须用本函数。
+//
 // 不在冷却期时返回零值。
 func (e *entry) recoveryAt(now time.Time) time.Time {
 	var t time.Time

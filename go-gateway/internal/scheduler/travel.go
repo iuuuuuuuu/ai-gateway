@@ -38,7 +38,7 @@ func travelDay(t time.Time) string {
 //（不强刷 token，交 22:00 keepalive）；账号间限速 travelAccountDelay。
 func (s *Scheduler) RunTravelNow() {
 	first := true
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range s.poolList() {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
 			continue

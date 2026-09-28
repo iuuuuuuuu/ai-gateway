@@ -1,4 +1,4 @@
-import { ArrowRight, Ban, CalendarCheck, CalendarHeart, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Gift, Globe, GraduationCap, History, Info, ListChecks, Loader2, MapPin, Moon, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2, Zap } from "lucide-react";
+import { ArrowRight, Ban, Boxes, CalendarCheck, CalendarHeart, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Gift, Globe, GraduationCap, History, Info, ListChecks, Loader2, MapPin, Moon, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2, Zap } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
@@ -19,7 +19,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
 import * as api from "@/lib/api";
 import { accountReloginAlarm } from "@/lib/account-expiry";
-import { cn } from "@/lib/utils";
+import { cn, firstVisibleText } from "@/lib/utils";
 import { AccountRecordsView } from "@/components/account-records-view";
 import { demoModeEnabled } from "@/lib/demo-mode";
 import type { AccountMeta, AccountRunningTask, CreditExpiry, CreditResource, GatewayTaskName, GrowthTaskView, TravelStatus } from "@/lib/types";
@@ -263,24 +263,113 @@ function travelChip(status: TravelStatus | undefined) {
   }
 }
 
-/** 国际版（workbuddy.ai）账号标注；国服账号不显示，避免噪音。 */
+/**
+ * 区域标注（**国服也显示**）。
+ *
+ * # ⚠ 为什么改成两个区域都显示（所有者 2026-09-28）
+ *
+ * 原实现只标国际版：
+ *
+ *	「国际版（workbuddy.ai）账号标注；国服账号不显示，避免噪音。」
+ *
+ * 所有者反馈「账号池 平台和国内外 区分不明显」—— 那个"避免噪音"的取舍
+ * 在**账号池里同时有国内外账号**时就变成了信息缺失：
+ *
+ *	· 国服账号完全没有区域标记 ⇒ 用户看不出它和别的有什么区别
+ *	· 而"哪个是国服/国际版"直接决定：签到与旅行是否适用、
+ *	  该模型能不能用（区域白名单）、走不走代理
+ *
+ * 故改为两个区域都显示，只是**配色不同**（国际版天蓝、国服石板灰）：
+ * 既区分开，又不会让国服账号显得像"异常状态"。
+ */
 function regionChip(account: AccountMeta) {
-  if (account.regionKey !== "intl") return null;
-  const label = account.region || "国际版";
+  const key = account.regionKey ?? (account.region === "国际版" ? "intl" : "cn");
+  const isIntl = key === "intl";
+  const label = account.region || (isIntl ? "国际版" : "国服");
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <Badge
           variant="outline"
-          className={cn(chipClass, "gap-1 border-sky-500/30 bg-sky-500/10 text-sky-700")}
+          className={cn(
+            chipClass,
+            "gap-1",
+            isIntl
+              ? "border-sky-500/30 bg-sky-500/10 text-sky-700"
+              : "border-slate-400/30 bg-slate-500/10 text-slate-700",
+          )}
           aria-label={`${label}账号`}
         >
           <Globe className="size-3" />
           {label}
         </Badge>
       </TooltipTrigger>
-      <TooltipContent side="top">
-        国际版账号（{account.regionKey === "intl" ? "workbuddy.ai" : ""}）· 不参与自动签到与自动旅行
+      <TooltipContent side="top" className="max-w-[16rem]">
+        {isIntl
+          ? "国际版账号（workbuddy.ai / *.ai）· 不参与自动签到与自动旅行 · 可用模型按「国际版」白名单"
+          : "国服账号（workbuddy.cn / codebuddy.cn）· 参与签到与旅行 · 可用模型按「国服」白名单"}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+/**
+ * 平台标注（WorkBuddy / Qoder / ZCode）。
+ *
+ * # 为什么需要它（所有者 2026-09-28：「平台…区分不明显」）
+ *
+ * 账号池里现在有**三个平台**的账号，而卡片此前只靠**小图标**区分 ——
+ * 图标在紧凑布局下只有 18px，且 Qoder/ZCode 的官方图标都是深色圆角方块，
+ * 远看几乎一样。后果很具体：
+ *
+ *	· 用户以为某账号是 WorkBuddy 的，实际是 Qoder（凭证、端点、模型全不同）
+ *	· 平台白名单配错对象（"我给 qoder 加了模型，怎么没生效"——
+ *	  其实那个账号是 workbuddy）
+ *
+ * 故在区域旁边补一个**文字**平台标。三个平台各有配色，扫一眼就能分辨。
+ *
+ * ⚠ 只显示文字、不重复图标：图标已在卡片头部（`WorkBuddyMark` 等），
+ * 再画一个只会挤占宽度（紧凑布局的头部宽度本来就紧张，见 `compact` 注释）。
+ */
+function platformChip(account: AccountMeta) {
+  const raw = (account.product ?? "").trim().toLowerCase();
+  if (!raw) return null; // 老账号没有 product 字段 ⇒ 语义上是 workbuddy，但**不猜**
+  const meta: Record<string, { label: string; cls: string; tip: string }> = {
+    workbuddy: {
+      label: "WorkBuddy",
+      cls: "border-emerald-500/30 bg-emerald-500/10 text-emerald-700",
+      tip: "WorkBuddy 平台：使用 workbuddy 的凭证与模型清单",
+    },
+    qoder: {
+      label: "Qoder",
+      cls: "border-violet-500/30 bg-violet-500/10 text-violet-700",
+      tip: "Qoder 平台：使用 Qoder 的凭证与模型清单（与 WorkBuddy 不通用）",
+    },
+    zcode: {
+      label: "ZCode",
+      cls: "border-amber-500/30 bg-amber-500/10 text-amber-700",
+      tip: "ZCode 平台：使用 ZCode 的凭证与模型清单（与 WorkBuddy 不通用）",
+    },
+  };
+  const m = meta[raw] ?? {
+    label: raw,
+    cls: "border-muted-foreground/30 bg-muted/40 text-muted-foreground",
+    tip: `平台：${raw}`,
+  };
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge
+          variant="outline"
+          className={cn(chipClass, "gap-1", m.cls)}
+          aria-label={`${m.label} 平台`}
+        >
+          <Boxes className="size-3" />
+          {m.label}
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-[16rem]">
+        {m.tip}
       </TooltipContent>
     </Tooltip>
   );
@@ -821,7 +910,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
    */
   const [menuOpen, setMenuOpen] = useState(false);
   const { tasks: growthTasks } = useGrowthTasks(account.id, menuOpen);
-  const name = account.nickname || account.uid || "未命名账号";
+  const name = firstVisibleText(account.nickname) || account.uid || "未命名账号";
   /** 需重新登录时的报警内容；账号仍能自愈（access token 过期）时为 null。
    *  判定口径集中在 `@/lib/account-expiry`，与兼容网关页共用同一套。 */
   const reloginAlarm = accountReloginAlarm(account);
@@ -911,6 +1000,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
           <span className="truncate">{account.note}</span>
         </Badge>
       ) : null}
+      {platformChip(account)}
       {regionChip(account)}
       {todayCheckedIn !== undefined && (
         <Badge variant={todayCheckedIn ? "success" : "secondary"} className={cn(chipClass, !todayCheckedIn && "text-muted-foreground")}><CircleCheck /> {todayCheckedIn ? "已签到" : "未签到"}</Badge>

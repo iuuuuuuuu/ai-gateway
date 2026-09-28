@@ -32,10 +32,13 @@ func (s *Scheduler) RunTrialNow() {
 // 区域过滤与其它任务相反：这里只要国际版（国服无此端点）。
 // 不复用 checkinScopeAllows —— 那个是「默认只跑国服」，语义正好相反。
 func (s *Scheduler) runTrial(ctx context.Context) {
+	if s.cfg.Pool == nil {
+		return // 空池或测试夹具下直接返回
+	}
 	first := true
 	newly, already := 0, 0
 
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range s.poolList() {
 		// 账号作用域：只在「作用于该账号」的手动触发时收窄（排程路径恒为 true）。
 		if !inAccountScope(ctx, st.UID) {
 			continue

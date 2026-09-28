@@ -342,7 +342,38 @@ pub fn account_meta(acc: &Value) -> Value {
             .and_then(|p| p.get("type"))
             .cloned()
             .unwrap_or(Value::Null),
+        // 所属平台（workbuddy / qoder / zcode）。
+        //
+        // # 为什么必须透出（所有者 2026-09-28：「平台…区分不明显」）
+        //
+        // 账号池里现在有三个平台的账号，而卡片此前只靠 18px 的小图标区分 ——
+        // Qoder/ZCode 的官方图标都是深色圆角方块，远看几乎一样。后果很具体：
+        //
+        //   · 用户以为某账号是 WorkBuddy 的，实际是 Qoder（凭证、端点、
+        //     模型清单**全不通用**）
+        //   · 平台白名单配错对象（"我给 qoder 加了模型，怎么没生效"）
+        //
+        // ⚠ 口径必须与**网关侧** `auth.Auth.ProductOf()` 一致：
+        // 空串/缺失一律算 `workbuddy`（老账号没有这个字段）。
+        // 若这里返回空串而网关按 workbuddy 处理，界面与行为就会不一致 ——
+        // 那正是本仓库反复踩过的"两侧口径分叉"。
+        "product": product_of(acc),
     })
+}
+
+/// 账号所属平台；空/缺失一律归一成 `workbuddy`。
+///
+/// 与网关侧 `auth.Auth.ProductOf()` **逐字同义**（老账号的 `product`
+/// 是空串，语义上等价于 workbuddy）—— 两侧口径分叉会让界面显示的
+/// 平台与实际路由的平台不一致。
+pub fn product_of(acc: &Value) -> String {
+    let raw = get_str(acc, "product").unwrap_or_default();
+    let t = raw.trim().to_lowercase();
+    if t.is_empty() {
+        "workbuddy".to_string()
+    } else {
+        t
+    }
 }
 
 /// 取非空字符串字段；空/缺失返回 None。

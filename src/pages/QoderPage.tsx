@@ -19,6 +19,8 @@ import {
   ProductClaimNowCard,
   ProductTasksConfigCard,
 } from "@/components/product-tasks-config";
+// 「自定义平台支持的模型」入口暂时隐藏（用户要求）—— 组件保留，恢复时取消注释即可。
+// import { PlatformModelsConfigCard } from "@/components/platform-models-config";
 import { ProductAccountCard, ProductAccountGrid } from "@/components/product-account-card";
 // 记录视图：任务执行记录 + 额度消耗明细（所有者 2026-09-20 要求）。
 // 与 WorkBuddy 账号卡共用同一个组件 —— 三处的筛选与措辞必须一致。
@@ -43,7 +45,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
 import type { QoderAccountRow, QoderRegion, QoderSummary } from "@/lib/api";
-import { cn } from "@/lib/utils";
+import { cn, firstVisibleText } from "@/lib/utils";
 
 /**
  * Qoder 账号页（C4）。
@@ -187,7 +189,7 @@ function placementContentOf(
  *	actionType=VIEW_DETAILS → `活动详情`            ← **写死**
  *	benefit.validity 缺失   → `限时活动`            ← **写死**
  *
- * 而接口**明明给了真实文案**（实测 wish 账号的原始返回）：
+ * 而接口**明明给了真实文案**（实测 示例账号的原始返回）：
  *
  *	placements[0].content.zh.description
  *	  = "每日 10:00（UTC+8）刷新，领取后 30 天有效"
@@ -498,9 +500,13 @@ function qoderTasksOf(
  *
  * 注：`QoderAccountCampaigns` 里**没有备注**（活动接口只回 uid + 昵称），
  * 故调用方需要从账号列表补一个 `note` 进来，否则备注这一档永远取不到。
+ *
+ * 「缺」的判据是 `firstVisibleText`（见 `@/lib/utils`），**不是** `trim()`：
+ * 昵称若整串由不可见字符组成（如单个 U+E0000 标签字符），`trim()` 不会剥掉，
+ * 界面就会出现一行看不见字的条目。
  */
 function accountLabel(input: { uid: string; nickname?: string; note?: string }): string {
-  return input.note?.trim() || input.nickname?.trim() || input.uid.slice(0, 8);
+  return firstVisibleText(input.note, input.nickname) || input.uid.slice(0, 8);
 }
 
 
@@ -698,12 +704,14 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
       //（所有者的反馈：「导入后也不自动更新状态,也不自动更新这些信息」
       //  「明明是有套餐容量的」）。
       if (r.enriched === false) {
-        toast.success(`已从客户端导入：${r.nickname || r.uid.slice(0, 12)}`, {
+        toast.success(`已从客户端导入：${firstVisibleText(r.nickname) || r.uid.slice(0, 12)}`, {
           description: `额度/模型没查到：${r.enrichError || "上游未返回数据"}`,
           duration: 8000,
         });
       } else {
-        toast.success(`已从客户端导入：${r.nickname || r.uid.slice(0, 12)}（含额度与模型）`);
+        toast.success(
+          `已从客户端导入：${firstVisibleText(r.nickname) || r.uid.slice(0, 12)}（含额度与模型）`,
+        );
       }
       void refresh();
     } catch (e) {
@@ -1192,7 +1200,7 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
 
   const remove = useCallback(
     async (row: QoderAccountRow) => {
-      const name = row.nickname || row.uid.slice(0, 8);
+      const name = firstVisibleText(row.nickname) || row.uid.slice(0, 8);
       if (!window.confirm(`确定删除账号「${name}」吗？\n\n这会同时删除它的凭证文件。`)) return;
       setBusy(row.uid);
       try {
@@ -1692,7 +1700,7 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
             <DialogHeader>
               <DialogTitle>编辑备注</DialogTitle>
               <DialogDescription>
-                {editTarget?.nickname || editTarget?.uid.slice(0, 12)}
+                {firstVisibleText(editTarget?.nickname) || editTarget?.uid.slice(0, 12)}
               </DialogDescription>
             </DialogHeader>
             <div className="space-y-2 py-2">
@@ -1729,7 +1737,10 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
           <DialogHeader>
             <DialogTitle>账号记录</DialogTitle>
             <DialogDescription>
-              {recordsFor ? recordsFor.note || recordsFor.nickname || recordsFor.uid : ""}
+              {recordsFor
+                ? firstVisibleText(recordsFor.note, recordsFor.nickname, recordsFor.uid) ||
+                  recordsFor.uid
+                : ""}
               的任务执行、额度消耗与领取记录；可按日期区间筛选。
             </DialogDescription>
           </DialogHeader>
@@ -1752,6 +1763,7 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
           description="权益活动的自动领取与手动领取。这些配置只对 Qoder 与 ZCode 生效。"
         >
           <div className="min-w-0 space-y-10">
+            {/* 暂时隐藏（用户要求）： <PlatformModelsConfigCard product="qoder" /> */}
             <ProductTasksConfigCard />
             <ProductClaimNowCard />
           </div>

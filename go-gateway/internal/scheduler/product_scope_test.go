@@ -115,7 +115,7 @@ func newProductScopedScheduler(t *testing.T, p *productProbe, accounts ...*auth.
 //
 // ⚠ 显式设 Product —— 这是本测试的自变量。
 // 同时给 Domain 一个**看起来像国服**的值：这正是真实故障成立的条件
-//（若 Domain 是 workbuddy.ai，区域过滤会顺手挡掉，问题就不会暴露）。
+// （若 Domain 是 workbuddy.ai，区域过滤会顺手挡掉，问题就不会暴露）。
 func qoderAccount(uid string) *auth.Auth {
 	return &auth.Auth{
 		UID: uid, AccessToken: "qoder-tok", RefreshToken: "qoder-rt",

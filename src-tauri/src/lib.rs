@@ -10,6 +10,7 @@ mod commands_proxy;
 // 而此前靠 Node + happy-dom **模拟**浏览器求解（成功率约 40%，且要求用户装 Node）。
 // WebView2 是真实浏览器环境（Win10/11 预装、零体积），实测 0.9 秒拿到 param。
 mod captcha_webview;
+mod device_token_server;
 #[cfg(desktop)]
 mod tray;
 
@@ -221,6 +222,25 @@ pub fn run() {
                 // scene/region/prefix，且无谓的验证请求本身是风控关注点。
                 captcha_webview::warmup_prefetch(app.handle().clone());
             }
+
+            // WorkBuddy 设备 token 服务（TuringShield，Node 桥接）。
+            //
+            // # 为什么也在 setup 里尽早启动
+            //
+            // 与上面的求解服务同理：网关启动时就要从配置里读到服务地址
+            //（见 `wb_device_token_url` 的透传）。晚注册会让本次启动的网关
+            // 拿不到地址，从而整段运行期都不带 `X-Device-Token`。
+            //
+            // # 与求解服务的关键差别：**它不是准入条件**
+            //
+            // 拿不到 token 时网关会静默降级（不发该头，请求照常）——
+            // 故这里即使组件不全（未装官方客户端 / 没有 node）也**不该失败**，
+            // 服务照常起，请求时如实回 ok:false 即可。
+            {
+                let token = random_token();
+                let state = std::sync::Arc::new(device_token_server::DeviceTokenState::new(token));
+                device_token_server::spawn_device_token_server(state);
+            }
             #[cfg(desktop)]
             {
                 tray::setup(app)?;
@@ -351,7 +371,11 @@ pub fn run() {
             commands::switch_gateway_mode,
             // 多值「限制使用的模型」；单值入口保留给旧前端（向后兼容）。
             commands::set_allowed_models,
-        commands::set_model_platforms,
+            commands::set_model_platforms,
+            // 「平台 × 区域 → 允许的模型」白名单（与上面方向相反，见命令注释）。
+            commands::set_platform_models,
+            // 同一份白名单的只读快照（含逐条禁用清单），供界面初始化。
+            commands::get_platform_models,
             commands::set_allowed_model,
             commands::start_gateway,
             commands::stop_gateway,

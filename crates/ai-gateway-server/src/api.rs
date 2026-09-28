@@ -127,6 +127,12 @@ pub fn router() -> Router {
         // 「模型 → 允许的平台」白名单（所有者的需求：
         // 「平台区分使用哪个平台的模型」）。
         .route("/api/gateway/model-platforms", post(api_set_model_platforms))
+        // 「平台 × 区域 → 允许的模型」白名单 + 逐条禁用清单（与上面方向相反）。
+        // GET 供界面初始化，POST 保存；两者共用同一个配置键组。
+        .route(
+            "/api/gateway/platform-models",
+            get(api_get_platform_models).post(api_set_platform_models),
+        )
         .route("/api/gateway/start", post(api_gateway_start))
         .route("/api/gateway/port-check", post(api_gateway_port_check))
         .route("/api/gateway/port-holder", post(api_gateway_port_holder))
@@ -1591,6 +1597,84 @@ async fn api_set_model_platforms(Json(body): Json<Value>) -> Response {
     json_ok(result)
 }
 
+/// POST /api/gateway/platform-models —— 设置「平台 × 区域 → 允许的模型」
+/// 白名单，以及**逐条禁用**清单。
+///
+/// body：
+///
+///	{
+///	  "platforms": { "qoder": { "cn": ["Qwen3.8-Flash"] } },
+///	  "disabled":  { "qoder": { "cn": ["deepseek-v4.1-flash"] } }
+///	}
+///
+/// - `platforms`（兼容 `modelPlatforms`）＝ 允许清单；空对象 = 恢复不限制
+/// - `disabled` 可选：**形状与 platforms 完全相同**，落在独立配置键
+///   `platform_models_disabled` 上，语义是**独立于并集的否决**。
+///   **不传该字段 = 不动已有的禁用项**（不是清空）—— 只改白名单的
+///   调用方（含旧界面）不会因此丢掉用户配好的禁用项。
+///
+/// 网关运行时自动重启以生效（白名单由网关启动时读取，光落盘不会改变
+/// 正在运行的进程）。
+async fn api_set_platform_models(Json(body): Json<Value>) -> Response {
+    let (raw, disabled) = platform_models_body_parts(&body);
+    let result =
+        ai_gateway_core::modules::gateway::set_platform_models(&raw, disabled.as_ref()).await;
+    if result.get("ok").and_then(Value::as_bool) == Some(false) {
+        let msg = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("设置平台模型白名单失败")
+            .to_string();
+        return json_err(msg, StatusCode::BAD_REQUEST);
+    }
+    json_ok(result)
+}
+
+/// 从请求体里读出「允许清单」与「禁用清单」。
+///
+/// 返回 `(platforms, disabled)`：
+///
+/// - `platforms` —— 兼容 `platforms` / `modelPlatforms`；缺失 ⇒ 空对象
+///   （= 恢复不限制，与旧路由 `model-platforms` 同款）
+/// - `disabled` —— 兼容 `disabled` / `platformModelsDisabled` /
+///   `platform_models_disabled`（后两个是为了让界面「读回来 → 改 → 提交」
+///   的往返写法直接可用）；**缺失 ⇒ `None`**，而显式传空对象 ⇒ `Some({})`
+///
+/// ⚠ 「缺失」与「空对象」在这里**语义不同**，必须区分开 —— 这正是本函数
+/// 存在的理由：缺失 = 不动磁盘上已有的禁用项（只改白名单的调用方，含旧
+/// 界面，不会**静默清掉**用户的禁用项）；`Some({})` 才是"清空全部禁用"。
+/// 若像 `platforms` 那样统一 `unwrap_or(json!({}))`，一次"只改白名单"的
+/// 保存就会顺手抹掉用户配好的禁用项，且界面上看不出是谁清的。
+///
+/// 抽成独立纯函数（而不是内联在 handler 里）与 `allowed_models_from_body`
+/// 同理：这是本路由契约的全部依据，内联后只能靠起 HTTP 服务才能验证。
+fn platform_models_body_parts(body: &Value) -> (Value, Option<Value>) {
+    let platforms = body
+        .get("platforms")
+        .or_else(|| body.get("modelPlatforms"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let disabled = body
+        .get("disabled")
+        .or_else(|| body.get("platformModelsDisabled"))
+        .or_else(|| body.get("platform_models_disabled"))
+        .cloned();
+    (platforms, disabled)
+}
+
+/// GET /api/gateway/platform-models —— 读取白名单与禁用清单的**同一份快照**。
+///
+/// 返回：
+///
+///	{"platform_models":{...},"platform_models_disabled":{...}}
+///
+/// 一次读盘返回两份：界面初始化时若分两次请求，中间可能夹着一次保存，
+/// 渲染出的就是**现实中从未存在过**的组合（例如新白名单配旧禁用项）。
+/// 只读，不写配置、不重启网关。
+async fn api_get_platform_models() -> Response {
+    json_ok(ai_gateway_core::modules::gateway::platform_models_state())
+}
+
 /// 从请求体里读出模型名单，兼容「多值数组」与「单值字符串」两种写法。
 ///
 /// 抽成独立函数（而不是内联在 handler 里）是为了能单测这段兼容逻辑：
@@ -2106,6 +2190,105 @@ mod allowed_models_body_tests {
         assert!(allowed_models_from_body(&json!({"models": 123})).is_empty());
         assert!(allowed_models_from_body(&json!({"model": 42})).is_empty());
         assert!(allowed_models_from_body(&json!({"models": [1, 2, 3]})).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod platform_models_body_tests {
+    use super::platform_models_body_parts;
+    use serde_json::json;
+
+    /// `platforms` 的两种键名都要认（与旧路由 `model-platforms` 同款）。
+    #[test]
+    fn reads_platforms_from_both_key_names() {
+        let (p, _) = platform_models_body_parts(&json!({
+            "platforms": { "qoder": { "cn": ["a"] } }
+        }));
+        assert_eq!(p, json!({ "qoder": { "cn": ["a"] } }));
+
+        let (p, _) = platform_models_body_parts(&json!({
+            "modelPlatforms": { "qoder": { "cn": ["a"] } }
+        }));
+        assert_eq!(p, json!({ "qoder": { "cn": ["a"] } }));
+    }
+
+    /// `platforms` 缺失 ⇒ 空对象（= 恢复不限制），与旧路由行为一致。
+    #[test]
+    fn missing_platforms_is_empty_object() {
+        let (p, _) = platform_models_body_parts(&json!({}));
+        assert_eq!(p, json!({}));
+    }
+
+    /// ⚠ 本路由最关键的一条：`disabled` **缺失** ⇒ `None`（不动已有禁用项）。
+    ///
+    /// 这是"只改白名单"的调用方（老界面 / WebUI）不会**静默清掉**用户
+    /// 禁用项的全部依据。若这里退化成 `Some({})`，用户配好的禁用项会在
+    /// 一次无关的保存里消失，且接口返回 200 毫无报错。
+    #[test]
+    fn missing_disabled_is_none_not_empty_object() {
+        let (_, d) = platform_models_body_parts(&json!({
+            "platforms": { "qoder": { "cn": ["a"] } }
+        }));
+        assert_eq!(
+            d, None,
+            "缺失 `disabled` 必须是 None（不动禁用项），而不是 Some({{}})（清空）"
+        );
+    }
+
+    /// 显式传空对象 ⇒ `Some({})`（= 清空全部禁用）。
+    ///
+    /// 与上一条构成一对：**缺失**与**空对象**语义不同，不能合并。
+    #[test]
+    fn explicit_empty_object_disabled_means_clear() {
+        let (_, d) = platform_models_body_parts(&json!({ "disabled": {} }));
+        assert_eq!(
+            d,
+            Some(json!({})),
+            "显式传空对象才是「清空全部禁用」——与「没传」必须区分开"
+        );
+    }
+
+    /// 禁用清单的三种键名都认：`disabled`（Tauri 侧同名参数）+
+    /// `platformModelsDisabled` / `platform_models_disabled`
+    ///（后两个让界面「读回来 → 改 → 提交」的往返写法直接可用）。
+    #[test]
+    fn reads_disabled_from_all_key_names() {
+        for key in ["disabled", "platformModelsDisabled", "platform_models_disabled"] {
+            let (_, d) = platform_models_body_parts(&json!({
+                key: { "qoder": { "cn": ["deepseek-v4.1-flash"] } }
+            }));
+            assert_eq!(
+                d,
+                Some(json!({ "qoder": { "cn": ["deepseek-v4.1-flash"] } })),
+                "键名 `{key}` 应被识别为禁用清单"
+            );
+        }
+    }
+
+    /// 两份清单互不干扰：只传一份时另一份仍走各自的默认值。
+    #[test]
+    fn the_two_lists_do_not_leak_into_each_other() {
+        let (p, d) = platform_models_body_parts(&json!({
+            "platforms": { "qoder": { "cn": ["a"] } }
+        }));
+        assert_eq!(p, json!({ "qoder": { "cn": ["a"] } }));
+        assert_eq!(d, None, "禁用清单不该被允许清单「顶」出一个值来");
+
+        let (p, d) = platform_models_body_parts(&json!({
+            "disabled": { "qoder": { "cn": ["b"] } }
+        }));
+        assert_eq!(p, json!({}), "允许清单缺失 ⇒ 空对象");
+        assert_eq!(d, Some(json!({ "qoder": { "cn": ["b"] } })));
+    }
+
+    /// 类型不对不应 panic（接口是公开的），原样透传交给 core 归一化。
+    #[test]
+    fn wrong_types_pass_through_without_panic() {
+        let (p, d) = platform_models_body_parts(&json!({
+            "platforms": 123, "disabled": "nope"
+        }));
+        assert_eq!(p, json!(123));
+        assert_eq!(d, Some(json!("nope")));
     }
 }
 

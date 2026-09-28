@@ -629,6 +629,31 @@ func withinCatchUp(now, scheduled time.Time) bool {
 	return !scheduled.IsZero() && !scheduled.After(now) && now.Sub(scheduled) <= startupCatchUpGrace
 }
 
+// poolList 返回账号池快照；**池为 nil 时返回空切片**。
+//
+// # 为什么必须收口在这里（2026-09-27 实测崩溃）
+//
+// 启动补跑（runStartupCatchUp）让 `Run()` 在启动瞬间就可能执行任务，
+// 而各 run* 任务此前都直接写 `s.cfg.Pool.List()`。
+// 单测里普遍用 `New(Config{...})` 构造调度器**不给 Pool**
+// （那种用例只关心排程时点，不跑真实任务），于是：
+//
+//	TestRunTravelLoopStopsOnCancel → Run → 补跑 trial（默认 TrialHours=[9,21]，
+//	当前时刻恰在 21:00 后 30 分钟内）→ s.cfg.Pool 为 nil → panic
+//
+// 这类用例的行为是**正确**的（它们断言「ctx 取消后 Run 能返回」），
+// 不该为了新特性去给每个用例补 Pool。故在**读池这一个点**上收口：
+// 池不存在 = 没有账号可跑 = 空列表，语义诚实且与空池一致。
+//
+// 注意不是"吞掉错误"：生产路径的 Pool 恒非 nil（main.go 必注入），
+// 这里只让"没有池"退化成"没有账号"，而不是崩溃。
+func (s *Scheduler) poolList() []pool.Status {
+	if s.cfg.Pool == nil {
+		return nil
+	}
+	return s.cfg.Pool.List()
+}
+
 // runStartupCatchUp 补跑启动前最近错过的任务时点。
 func (s *Scheduler) runStartupCatchUp(ctx context.Context, now time.Time) {
 	if !s.cfg.ActivityDisabled {
@@ -730,7 +755,7 @@ func (s *Scheduler) RunCreditRefreshLoop(ctx context.Context, interval time.Dura
 
 // refreshCreditsWithGap 跑一轮积分巡检，账号之间留出间隔；ctx 取消时提前退出。
 func (s *Scheduler) refreshCreditsWithGap(ctx context.Context) {
-	for i, st := range s.cfg.Pool.List() {
+	for i, st := range s.poolList() {
 		if ctx.Err() != nil {
 			return
 		}
@@ -773,7 +798,7 @@ func (s *Scheduler) refreshCreditsWithGap(ctx context.Context) {
 // 晚领不丢分，故分钟粒度巡检无增益，与签到时点（09/21 点）合并执行即可。
 // 注意顺序：先签到解冻，旅行才能覆盖到本轮刚恢复的账号。
 func (s *Scheduler) RunCheckinNow() {
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range s.poolList() {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
 			continue
@@ -811,7 +836,7 @@ func (s *Scheduler) RunCheckinNow() {
 // 需要更高频地刷新才能让分层选号跟上（某账号把快过期额度烧完后，
 // 它的最近到期日会跳到下一档，此时就应让出流量给更紧迫的账号）。
 func (s *Scheduler) RunCreditRefreshNow() {
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range s.poolList() {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
 			continue
@@ -844,7 +869,7 @@ func (s *Scheduler) RunCreditRefreshNow() {
 // 连续 pool.SessionDeadThreshold() 次才禁用；刷新成功则清零计数，
 // 因此被误判的账号有复活路径。
 func (s *Scheduler) RunKeepaliveNow() {
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range s.poolList() {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
 			continue

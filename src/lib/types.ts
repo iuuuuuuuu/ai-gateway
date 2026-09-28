@@ -9,6 +9,20 @@ export interface AccountMeta {
   region?: string;
   /** 区域键（"cn" / "intl"），便于样式与筛选。 */
   regionKey?: AccountRegionKey;
+  /**
+   * 所属平台（"workbuddy" / "qoder" / "zcode"）。
+   *
+   * # 为什么需要（所有者 2026-09-28：「平台…区分不明显」）
+   *
+   * 账号池里有三个平台的账号，而卡片此前只靠 18px 的小图标区分 ——
+   * Qoder/ZCode 的官方图标都是深色圆角方块，远看几乎一样。
+   * 平台不同意味着**凭证、端点、模型清单全不通用**，认错代价很实在
+   * （例如把平台白名单配到了错的账号上）。
+   *
+   * ⚠ 后端已把空/缺失归一成 `"workbuddy"`（与网关侧 `ProductOf()` 同义），
+   * 故这里拿到的一定是非空平台名；老账号不会显示成空白。
+   */
+  product?: string;
   uid: string | null;
   email: string | null;
   nickname: string | null;
@@ -1008,7 +1022,7 @@ export interface GatewayPoolAccount {
    * 原话：「在兼容网关哪里的账号池,也要标记上进入池子的账号属于那个客户端」。
    *
    * 三个产品的账号混在**同一个池**里（多产品路由开启时），而池表上
-   * 只有昵称/备注 —— 用户看到 `wish`、`aliyun-…` 这样的名字，
+   * 只有昵称/备注 —— 用户看到 `acct-a`、`acct-b-…` 这样的名字，
    * **判断不出它来自哪个客户端**。于是：
    *
    *   · 排查「`zcode:` 前缀为什么选不出号」时，看不出池里有几个 ZCode 号
@@ -1019,6 +1033,18 @@ export interface GatewayPoolAccount {
    * 界面应显示"未知"而不是错标成 WorkBuddy —— 错标比不标更误导）。
    */
   product?: string;
+  /**
+   * 账号所属区域（Go 侧 `pool.Status.Region`）：`"cn"` | `"intl"`。
+   *
+   * 与 `product` 是**两个正交的维度**：产品回答"这个号来自哪个客户端"，
+   * 区域回答"它走的是国服还是国际版线路"。后者直接决定该模型能不能用
+   * （区域白名单）、走不走代理 —— 池里同时有国内外账号时，不标就只能靠猜。
+   *
+   * ⚠ 老网关不下发该字段 ⇒ `undefined`。**此时不要猜**（不要按域名或
+   * 按产品推断）：错标比不标更误导，界面应直接不渲染区域徽标。
+   * 这与 `product` 的处理口径一致。
+   */
+  region?: string;
 }
 
 /** 网关 /status 响应。 */
@@ -1188,6 +1214,35 @@ export interface GatewayModeSwitchResult {
   reloaded?: boolean;
   config?: GatewayConfig;
   error?: string;
+}
+
+/**
+ * 「平台 × 区域 → 模型」清单。
+ *
+ * 外层键 = 平台稳定标识（`workbuddy` / `qoder` / `zcode`），
+ * 内层键 = 区域码，取值 `cn` / `intl` / `""`（`""` = 不分区域，两个区域都适用）。
+ *
+ * ⚠ 某平台某区域的清单为空数组 = **未配置**（不限制），
+ * 而不是"一个模型都不许用"。宿主侧归一化时会把空清单整个丢掉，
+ * 所以正常情况下读回来的内层不会有空数组。
+ */
+export type PlatformModelMap = Record<string, Record<string, string[]>>;
+
+/**
+ * `get_platform_models` 的返回：允许清单 + 逐条禁用清单。
+ *
+ * # 为什么两者必须分开（别想着用一个 map 表达）
+ *
+ * 放行判据是**并集**：手动配置 ∪ 接口返回 ∪ 兜底，命中任一即放行。
+ * 所以"从允许清单里删掉一个模型"是**删不掉**的 —— 它可能仍由
+ * 「接口返回」那个来源放行（`qoder:deepseek-v4.1-flash` 正是如此）。
+ *
+ * 禁用是一个**独立于并集的否决项**，在网关侧**先于**并集判定，
+ * 故它必须有自己的配置键 `platform_models_disabled`。
+ */
+export interface PlatformModelsState {
+  platform_models: PlatformModelMap;
+  platform_models_disabled: PlatformModelMap;
 }
 
 /** POST /api/gateway/port-check 响应。 */

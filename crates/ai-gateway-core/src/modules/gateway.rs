@@ -147,6 +147,19 @@ pub fn default_gateway_config() -> Value {
         // 默认成任何非空名单都会让既有用户升级后被静默限制住。
         // 三个工作模式共用同一份名单（见 write_native_config）。
         "allowed_model": [],
+        // 「平台 × 区域 → 允许的模型」白名单（手动配置那份）。
+        //
+        // 形状恒定：缺键时界面要自己处理 `undefined`，而 `{}` 才是
+        // "未配置" 的规范表示（= 不拦）。写进默认值后，界面与网关
+        // 都不必区分「键缺席」与「空配置」这两种本就不该有差别的情况。
+        "platform_models": {},
+        // 「平台 × 区域 → **禁用**的模型」否决项（与上面形状完全相同）。
+        //
+        // ⚠ 它与 `platform_models` 不是同一件事，别合并：
+        // 放行判据是「手动配置 ∪ 接口返回 ∪ 兜底」的**并集**，故从手动清单里
+        // 删掉一个模型**删不掉**它（仍可能被接口返回那份放行）。用户要的
+        // "禁用" 是一个独立于并集的**否决项**，网关侧先于并集判定。
+        "platform_models_disabled": {},
         "last_status": null,
         "last_error": null,
         // ---- 4 个自动养号任务的排程（写进网关的 schedule 块，见 write_native_config）----
@@ -2361,8 +2374,7 @@ fn model_platforms_for_gateway() -> Value {
     Value::Object(out)
 }
 
-/// 把多份模型清单并成一份去重、排序后的列表；全空时返回 None。
-///
+/// 把多份模型清单并成一份去重、排序后的列表；全空时返回 None。///
 /// 返回 None 而不是空数组：调用方据此**不写**该产品的键，
 /// 于是网关那边也不会给出一个空的渠道标签（"这个模型来自 ZCode，
 /// 但 ZCode 一个模型都没有"是自相矛盾的）。
@@ -2496,6 +2508,38 @@ fn external_solver_url() -> String {
 /// 外部求解服务的共享令牌（未设置时为空串）。
 fn external_solver_token() -> String {
     EXTERNAL_SOLVER
+        .get()
+        .map(|(_, t)| t.clone())
+        .unwrap_or_default()
+}
+
+/// WorkBuddy 设备 token 服务地址（宿主侧，见 `src-tauri/src/device_token_server.rs`）。
+///
+/// # 为什么用全局槽（与 EXTERNAL_SOLVER 同款理由）
+///
+/// 服务住在 `src-tauri`（那里能起 Node 子进程），而网关配置由本 crate 生成。
+/// 下层不能反向依赖上层，故用进程级单例桥接 —— 一个宿主进程只有一个该服务。
+///
+/// ⚠ 未设置时返回空串：网关据此**不发** `X-Device-Token`，
+/// 行为与本特性引入前逐字相同（绝不因缺设备凭证而让对话失败）。
+static DEVICE_TOKEN_SERVICE: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+/// 注册设备 token 服务地址（由宿主在服务启动后调用）。
+pub fn set_device_token_service(url: String, token: String) {
+    let _ = DEVICE_TOKEN_SERVICE.set((url, token));
+}
+
+/// 设备 token 服务地址（未设置时为空串）。
+fn device_token_service_url() -> String {
+    DEVICE_TOKEN_SERVICE
+        .get()
+        .map(|(u, _)| u.clone())
+        .unwrap_or_default()
+}
+
+/// 设备 token 服务的共享令牌（未设置时为空串）。
+fn device_token_service_token() -> String {
+    DEVICE_TOKEN_SERVICE
         .get()
         .map(|(_, t)| t.clone())
         .unwrap_or_default()
@@ -2756,6 +2800,26 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
             //
             // 空对象 = 不限制，行为与加该功能之前逐字相同（回滚点）。
             "model_platforms": model_platforms_for_gateway(),
+            // 「平台 × 区域 → 允许的模型」白名单（方向与上面相反）。
+            //
+            // 所有者 2026-09-28 原话：
+            //   「qoder 的 deepseek-v4.1-flash 不应该不拦截，而是给每个平台
+            //     手动配置支持的模型，而且要区分国内外版本」
+            //
+            // ⚠ 网关侧判据是「手动配置 ∪ 接口返回」的**并集**，
+            // 故这里只写用户配的那份 —— 接口返回的那份走 `product_models`。
+            //
+            // 空对象 = 不限制（老配置没有这个键，升级后行为必须逐字不变）。
+            "platform_models": platform_models_for_gateway(),
+            // 「平台 × 区域 → **禁用**的模型」否决项（形状与上面完全相同）。
+            //
+            // ⚠ 必须下发到网关，**不能**只在宿主侧留着：
+            // 放行判据是并集，从 `platform_models` 里删掉一个模型删不掉它
+            //（仍可能被「接口返回」那份放行）。这个键是独立于并集的否决项，
+            // 由 Go 侧 `pool.platformAllowsModelLocked` 在**任何来源之前**判定。
+            //
+            // 空对象 = 没有禁用项（老配置缺这个键，升级后行为逐字不变）。
+            "platform_models_disabled": platform_models_disabled_for_gateway(),
             // ZCode 验证码求解器。
             //
             // 求解器（solver.js + happy-dom）由 Tauri 作为**资源**随包分发，
@@ -2792,6 +2856,10 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
             // 网关拿到后**外部优先**、本地 Node 作为回退。
             "zcode_captcha_solver_url": external_solver_url(),
             "zcode_captcha_solver_token": external_solver_token(),
+            // WorkBuddy 设备 token 服务（宿主侧 Node 桥接，见 device_token_server.rs）。
+            // 空串 = 未启用：网关不发 X-Device-Token，行为与引入前一致。
+            "wb_device_token_url": device_token_service_url(),
+            "wb_device_token_token": device_token_service_token(),
         },
         "session_sticky": { "enabled": true, "ttl": "30m", "gc_interval": "5m" },
         // ---- 账号记录回写（养号任务的执行痕迹）----
@@ -3854,6 +3922,199 @@ pub async fn set_allowed_model(model: &str) -> Value {
         vec![trimmed.to_string()]
     };
     set_allowed_models(&list).await
+}
+
+/// 「平台 × 区域 → 允许的模型」白名单（用户手动配置）。
+///
+/// # 与 `model_platforms` 的区别（方向相反，别混用）
+///
+///	model_platforms   模型 → 允许的平台    （"这个模型可以在哪些平台跑"）
+///	platform_models   平台(+区域) → 模型   （"这个平台允许跑哪些模型"）
+///
+/// 两者**都**是用户白名单，网关侧取**并集**判断（见 Go 侧
+/// `pool.platformAllowsModelLocked` 的注释）。
+///
+/// # 形状（二级键为区域）
+///
+///	{
+///	  "qoder":     {"cn": ["Qwen3.8-Flash"], "intl": ["Qwen3.8-Max"]},
+///	  "zcode":     {"cn": ["glm-5.3"],       "intl": ["glm-5.3"]},
+///	  "workbuddy": {"cn": [...],             "intl": [...]}
+///	}
+///
+/// 区域键 `""` 表示"该平台不分区域"。
+///
+/// # 为什么需要它（所有者 2026-09-28）
+///
+/// 他原话：
+///
+///	「qoder 的 deepseek-v4.1-flash 不应该不拦截，而是给每个平台
+///	  手动配置支持的模型，而且要区分国内外版本」
+///	「手动配置的+接口返回的,可不是以手动配置的为准」
+///
+/// 即：手动配置是**补充**（补上接口没报的），不是**取代**。
+/// 网关侧判据取两者并集，故这里只写用户配的那份。
+fn platform_models_for_gateway() -> Value {
+    let cfg = load_gateway_config();
+    let Some(raw) = cfg.get("platform_models") else {
+        return json!({});
+    };
+    platform_models_normalized(raw)
+}
+
+/// 「平台 × 区域 → **禁用**的模型」否决项（读配置 → 归一化）。
+///
+/// # 为什么需要它（与 `platform_models` 的区别）
+///
+/// 放行判据是「手动配置 ∪ 接口返回 ∪ 兜底」的**并集**（见 Go 侧
+/// `pool.platformAllowsModelLocked`）—— 只要命中任一来源就放行。
+/// 因此**从手动清单里删掉一个模型是删不掉的**：它可能仍由「接口返回」
+/// 那个来源放行。实测 `qoder:deepseek-v4.1-flash` 就是这样。
+///
+/// 用户要的「禁用」是一个**独立于并集的否决项**，必须在网关侧
+/// **先于并集**判定。故这里单独一份清单，形状与 `platform_models`
+/// 完全相同，只是语义相反（放行 vs 否决）。
+///
+/// 归一化规则与 `platform_models` 共用同一个函数 —— 两边一旦分叉，
+/// 会出现"界面禁用了、网关却放行"这类极难排查的两侧不一致。
+fn platform_models_disabled_for_gateway() -> Value {
+    let cfg = load_gateway_config();
+    let Some(raw) = cfg.get("platform_models_disabled") else {
+        return json!({});
+    };
+    platform_models_normalized(raw)
+}
+
+/// 只读导出：当前「平台 × 区域 → **禁用**的模型」清单（已归一化）。
+///
+/// 供界面初始化表单使用；复用 `platform_models_disabled_for_gateway`，
+/// 避免多一条读取路径将来各自演化。
+pub fn platform_models_disabled() -> Value {
+    platform_models_disabled_for_gateway()
+}
+
+/// 只读导出：一次性返回「允许」与「禁用」两份清单（均已归一化）。
+///
+/// 界面初始化表单时要**同时**拿两份：分两次读会经过两个 `load_gateway_config()`
+/// 快照，中间若有一次保存落盘，界面就会渲染出"允许清单是新的、禁用清单是旧的"
+/// 这种现实中从未存在过的组合。
+///
+/// 返回：`{"platform_models": {...}, "platform_models_disabled": {...}}`
+pub fn platform_models_state() -> Value {
+    json!({
+        "platform_models": platform_models_for_gateway(),
+        "platform_models_disabled": platform_models_disabled_for_gateway(),
+    })
+}
+
+/// 归一化「平台 × 区域 → 模型」白名单（抽成纯函数便于测试）。
+///
+/// 规则与 Go 侧 `SetPlatformModels` **必须一致**（否则会出现
+/// "宿主说配了、网关说没配"这类两侧不一致）：
+///
+///	· 平台名 / 区域名 / 模型名一律去空白；模型名另做小写归一
+///	· 空平台名、空模型名跳过
+///	· 某平台某区域的清单为空 ⇒ **不写**该键 ⇒ 视为"未配置"（不拦）
+pub fn platform_models_normalized(raw: &Value) -> Value {
+    let Some(outer) = raw.as_object() else {
+        return json!({});
+    };
+    let mut out = serde_json::Map::new();
+    for (plat, by_region) in outer {
+        let plat = plat.trim().to_lowercase();
+        if plat.is_empty() {
+            continue;
+        }
+        let Some(regions) = by_region.as_object() else {
+            continue;
+        };
+        let mut region_out = serde_json::Map::new();
+        for (region, models) in regions {
+            let region = region.trim().to_lowercase();
+            let Some(arr) = models.as_array() else { continue };
+            let mut seen: Vec<String> = Vec::new();
+            for v in arr {
+                let Some(s) = v.as_str() else { continue };
+                let s = s.trim().to_lowercase();
+                if s.is_empty() {
+                    continue;
+                }
+                if !seen.iter().any(|x| x == &s) {
+                    seen.push(s);
+                }
+            }
+            // 空清单 = 未配置 → 不写该键（与 Go 侧 SetPlatformModels 一致）
+            if !seen.is_empty() {
+                region_out.insert(region, json!(seen));
+            }
+        }
+        if !region_out.is_empty() {
+            out.insert(plat, Value::Object(region_out));
+        }
+    }
+    Value::Object(out)
+}
+
+/// 保存「平台 × 区域 → 允许的模型」白名单并**立即生效**。
+///
+/// 与 `set_model_platforms` 同款：写配置 → 重启网关（走串行化入口）。
+/// 白名单在**网关启动时**读入，故必须重启才生效。
+///
+/// # `disabled` 的三态语义（别把它当成"可选参数"随手传 None）
+///
+///	Some(d) —— 连同 `platform_models_disabled` 一起写（d 会被归一化）
+///	None    —— **不触碰**磁盘上已有的 `platform_models_disabled`
+///
+/// 为什么 None 是"不触碰"而不是"清空"：`save_gateway_config` 是**浅合并**
+/// （只覆盖 patch 里出现的键），故不把该键放进 patch 即可保留原值。
+/// 这条语义让"只改白名单"的旧调用方（老界面、WebUI）不会**静默清掉**
+/// 用户的禁用项 —— 那正是本功能最不该出现的失败模式。
+/// 清空禁用项要显式传 `Some(&json!({}))`。
+pub async fn set_platform_models(raw: &Value, disabled: Option<&Value>) -> Value {
+    let normalized = platform_models_normalized(raw);
+
+    // 先构造 patch，再把 disabled 追加进去 —— 而不是分成两次
+    // save_gateway_config：两次写盘之间有窗口期，中途崩溃会留下
+    // "白名单换了、禁用项没换"的半截状态。
+    let mut patch = json!({ "platform_models": normalized.clone() });
+    let disabled_normalized = disabled.map(platform_models_normalized);
+    if let Some(d) = &disabled_normalized {
+        patch["platform_models_disabled"] = d.clone();
+    }
+
+    if let Err(e) = save_gateway_config(&patch) {
+        return json!({ "ok": false, "error": e });
+    }
+
+    let mut reloaded = false;
+    if is_running() {
+        // ⚠ 走串行化入口（见 GATEWAY_RESTART_LOCK 的注释）
+        match restart_gateway_serialized().await {
+            Ok(_) => {
+                reloaded = true;
+                update_runtime_state("started", None);
+            }
+            Err(e) => {
+                update_runtime_state("failed", Some(e.clone()));
+                return json!({
+                    "ok": false,
+                    "error": format!("网关重启失败，新配置未生效：{e}"),
+                });
+            }
+        }
+    }
+
+    json!({
+        "ok": true,
+        "reloaded": reloaded,
+        "platformModels": normalized,
+        // 回显归一化后的禁用项（None 时回读磁盘上的现值）。
+        // 界面据此确认"我提交的禁用项确实被落盘了"，而不是只信本地 state。
+        "platformModelsDisabled": match disabled_normalized {
+            Some(d) => d,
+            None => platform_models_disabled_for_gateway(),
+        },
+    })
 }
 
 /// 切换工作模式（自动 / 手动 / 轮转）并**立即生效**。
@@ -7431,5 +7692,398 @@ p42\ncjava\nf9\nn*:8080\n";
 
         // 收尾复位，避免影响同进程内的其它测试
         super::GATEWAY_IN_JOB.store(false, Ordering::SeqCst);
+    }
+
+    // ------------------------------------------------------------------
+    // platform_models：「平台 × 区域 → 允许的模型」白名单的归一化
+    //
+    // ⚠ 归一化规则必须与 Go 侧 `pool.SetPlatformModels` **逐条一致** ——
+    // 否则会出现"宿主说配了、网关说没配"这类两侧不一致，
+    // 而症状（某个模型时而被拦时而不拦）极难排查。
+    // ------------------------------------------------------------------
+
+    /// 形状原样保留：平台 → 区域 → 模型。
+    #[test]
+    fn platform_models_normalizes_shape() {
+        let out = super::platform_models_normalized(&json!({
+            "qoder": { "cn": ["Qwen3.8-Flash"], "intl": ["Qwen3.8-Max"] }
+        }));
+        assert_eq!(
+            out,
+            json!({ "qoder": { "cn": ["qwen3.8-flash"], "intl": ["qwen3.8-max"] } }),
+            "平台/区域名小写，模型名也小写（与 Go 侧归一化一致）"
+        );
+    }
+
+    /// 平台名与区域名做小写 + 去空白。
+    #[test]
+    fn platform_models_lowercases_platform_and_region() {
+        let out = super::platform_models_normalized(&json!({
+            "  QoDer  ": { "  CN  ": ["m"] }
+        }));
+        assert_eq!(out, json!({ "qoder": { "cn": ["m"] } }));
+    }
+
+    /// 模型名去空白 + 去重，且保序。
+    #[test]
+    fn platform_models_dedupes_models() {
+        let out = super::platform_models_normalized(&json!({
+            "qoder": { "cn": ["  A  ", "a", "B"] }
+        }));
+        assert_eq!(out, json!({ "qoder": { "cn": ["a", "b"] } }));
+    }
+
+    /// ⚠ 空清单 = **未配置**（不写该键），不是"该区域一个模型都不许用"。
+    ///
+    /// 这条与 Go 侧 `SetPlatformModels` 的语义必须一致：用户把模型全删光
+    /// 的语义是"还没配"，不是"全禁" —— 后者会让该平台彻底不可用。
+    #[test]
+    fn platform_models_empty_list_means_unconfigured() {
+        let out = super::platform_models_normalized(&json!({
+            "qoder": { "cn": [], "intl": ["x"] }
+        }));
+        assert_eq!(
+            out,
+            json!({ "qoder": { "intl": ["x"] } }),
+            "空清单不该产生一个空数组键（那会被读成「全禁」）"
+        );
+    }
+
+    /// 某平台所有区域都空 ⇒ 整个平台不写。
+    #[test]
+    fn platform_models_all_empty_drops_platform() {
+        let out = super::platform_models_normalized(&json!({
+            "qoder": { "cn": [], "intl": [] }
+        }));
+        assert_eq!(out, json!({}), "全空的平台不该出现在配置里");
+    }
+
+    /// 空平台名 / 非数组 / 非对象一律跳过（不让畸形输入产生怪配置）。
+    #[test]
+    fn platform_models_ignores_malformed() {
+        let out = super::platform_models_normalized(&json!({
+            "": { "cn": ["x"] },
+            "qoder": "not-an-object",
+            "zcode": { "cn": "not-an-array" },
+            "ok": { "cn": ["y"] }
+        }));
+        assert_eq!(
+            out,
+            json!({ "ok": { "cn": ["y"] } }),
+            "畸形输入应被跳过，而不是产生空键或 panic"
+        );
+    }
+
+    /// 非对象输入 ⇒ 空对象（而不是 panic）。
+    #[test]
+    fn platform_models_non_object_is_empty() {
+        for bad in [json!(null), json!([]), json!("x"), json!(42)] {
+            assert_eq!(
+                super::platform_models_normalized(&bad),
+                json!({}),
+                "非对象输入应返回空对象"
+            );
+        }
+    }
+
+    /// 空对象 = 不限制（回滚点）：清空白名单必须回到"不拦"。
+    #[test]
+    fn platform_models_empty_clears_restriction() {
+        assert_eq!(super::platform_models_normalized(&json!({})), json!({}));
+    }
+
+    /// `""` 区域键（不分区域）要原样保留 —— 它是"通用清单"的表示。
+    #[test]
+    fn platform_models_keeps_region_agnostic_key() {
+        let out = super::platform_models_normalized(&json!({
+            "qoder": { "": ["a"] }
+        }));
+        assert_eq!(
+            out,
+            json!({ "qoder": { "": ["a"] } }),
+            "`\"\"` 键表示「不分区域」，必须保留（Go 侧据此同时适用于两个区域）"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // platform_models_disabled：「平台 × 区域 → **禁用**的模型」否决项
+    //
+    // ⚠ 它与 platform_models 不是同一件事，别把测试合并：
+    // 放行判据是「手动配置 ∪ 接口返回 ∪ 兜底」的**并集**，故从手动清单里
+    // 删掉一个模型**删不掉**它（仍可能被接口返回那份放行）。用户要的
+    // "禁用" 是独立于并集的否决项，必须单独持久化并下发到网关。
+    // ------------------------------------------------------------------
+
+    /// 建一个 current-thread runtime（与既有 async 测试同款）。
+    fn test_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    /// 同时传 platforms + disabled ⇒ **两个键都写入**且都已归一化。
+    #[test]
+    fn set_platform_models_writes_both_keys_when_disabled_given() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-pm-disabled-both");
+        let rt = test_rt();
+
+        let out = rt.block_on(super::set_platform_models(
+            &json!({ "  QoDer  ": { "  CN  ": ["  Qwen3.8-Flash  "] } }),
+            Some(&json!({ "  QoDer  ": { "  CN  ": ["  deepseek-v4.1-flash  "] } })),
+        ));
+        assert_eq!(out.get("ok").and_then(Value::as_bool), Some(true), "{out}");
+
+        // 落盘的两份都要在（`load_gateway_config` 读的是磁盘）
+        let cfg = super::load_gateway_config();
+        assert_eq!(
+            cfg.pointer("/platform_models"),
+            Some(&json!({ "qoder": { "cn": ["qwen3.8-flash"] } })),
+            "允许清单必须落盘并归一化"
+        );
+        assert_eq!(
+            cfg.pointer("/platform_models_disabled"),
+            Some(&json!({ "qoder": { "cn": ["deepseek-v4.1-flash"] } })),
+            "禁用清单必须**同时**落盘并归一化 —— 少写这一个键，\
+             用户的禁用就会静默失效（并集里的接口返回那份照样放行）"
+        );
+    }
+
+    /// 只传 platforms（`disabled = None`）⇒ 磁盘上原有的
+    /// `platform_models_disabled` **原样保留**。
+    ///
+    /// 为什么这条必须钉住：`save_gateway_config` 是**浅合并**，"不触碰"
+    /// 这件事靠的是"不把该键放进 patch"。将来若有人图省事写成
+    /// `patch["platform_models_disabled"] = json!({})`（或改成深合并 / 全量重写），
+    /// 老界面与 WebUI 的"只改白名单"调用就会**静默清掉用户的禁用项** ——
+    /// 那正是本功能最不该出现的失败模式，且从界面上看不出是谁清的。
+    #[test]
+    fn set_platform_models_without_disabled_keeps_existing() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-pm-disabled-keep");
+        let rt = test_rt();
+
+        // 先在磁盘上建立"用户已配禁用项"的状态
+        super::save_gateway_config(&json!({
+            "platform_models_disabled": { "qoder": { "cn": ["deepseek-v4.1-flash"] } }
+        }))
+        .expect("save initial disabled");
+
+        // 只改允许清单，不传 disabled
+        let out = rt.block_on(super::set_platform_models(
+            &json!({ "qoder": { "cn": ["qwen3.8-flash"] } }),
+            None,
+        ));
+        assert_eq!(out.get("ok").and_then(Value::as_bool), Some(true), "{out}");
+
+        let cfg = super::load_gateway_config();
+        assert_eq!(
+            cfg.pointer("/platform_models"),
+            Some(&json!({ "qoder": { "cn": ["qwen3.8-flash"] } })),
+            "允许清单应被更新"
+        );
+        assert_eq!(
+            cfg.pointer("/platform_models_disabled"),
+            Some(&json!({ "qoder": { "cn": ["deepseek-v4.1-flash"] } })),
+            "disabled=None 时**不得**触碰磁盘上已有的禁用项（浅合并语义）"
+        );
+    }
+
+    /// `platform_models_disabled` 必须出现在 `write_native_config` 的输出里
+    /// —— 这是「下发到网关」的全部依据。
+    ///
+    /// 缺陷背景与 allowed_model / prompt / proxy_scope 那几个块同源：
+    /// `write_native_config` 每次启动网关都**全量重写** native config。
+    /// 漏写这个键 ⇒ Go 侧读到的是「缺键 = 没有禁用项」⇒ 用户的禁用
+    /// 在**下一次重启网关后**静默消失，而界面上还显示着已禁用。
+    #[test]
+    fn native_config_carries_platform_models_disabled() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-pm-disabled-native");
+
+        // native config 的 platform_models* 由 `*_for_gateway()` 从**磁盘**读，
+        // 故必须先把配置落盘（直接传 cfg 给 write_native_config 不生效）
+        super::save_gateway_config(&json!({
+            "platform_models": { "qoder": { "cn": ["qwen3.8-flash"] } },
+            "platform_models_disabled": { "qoder": { "cn": ["deepseek-v4.1-flash"] } },
+        }))
+        .expect("save config");
+
+        let path = super::write_native_config(&json!({ "mode": "balance" })).expect("write native");
+        let native: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+
+        assert_eq!(
+            native.pointer("/pool/platform_models_disabled"),
+            Some(&json!({ "qoder": { "cn": ["deepseek-v4.1-flash"] } })),
+            "禁用项必须写进 native config 的 pool 块下发给网关，\
+             否则 Go 侧的否决项永远是空的（并集删不掉的问题依旧）"
+        );
+        // 允许清单照旧（确认新增没有把邻居挤掉）
+        assert_eq!(
+            native.pointer("/pool/platform_models"),
+            Some(&json!({ "qoder": { "cn": ["qwen3.8-flash"] } })),
+            "platform_models 必须与新增的键并存"
+        );
+    }
+
+    /// 空清单语义：`{"qoder":{"cn":[]}}` ⇒ 对应键里**没有** qoder。
+    ///
+    /// 对禁用清单尤其重要：空数组若被写成 `"cn": []`，Go 侧读到的是一个
+    /// **存在但为空**的集合，语义会漂到"该区域全禁"——那是灾难性的
+    /// （用户清空禁用项的本意是"什么都不禁"）。
+    #[test]
+    fn platform_models_disabled_empty_list_means_unconfigured() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-pm-disabled-empty");
+        let rt = test_rt();
+
+        let out = rt.block_on(super::set_platform_models(
+            &json!({}),
+            Some(&json!({ "qoder": { "cn": [] } })),
+        ));
+        assert_eq!(out.get("ok").and_then(Value::as_bool), Some(true), "{out}");
+
+        let cfg = super::load_gateway_config();
+        assert_eq!(
+            cfg.pointer("/platform_models_disabled"),
+            Some(&json!({})),
+            "空清单 = 未配置：不得产生 `{{\"qoder\":{{\"cn\":[]}}}}` 这种形状\
+             （那会被读成「该区域全禁」，而用户的本意是「什么都不禁」）"
+        );
+    }
+
+    /// `platform_models_disabled` 的归一化与 `platform_models` **完全一致**
+    /// —— 同一份输入，两边输出逐字相同。
+    ///
+    /// 为什么必须钉住：两侧一旦分叉，用户看到的禁用项与网关实际比对的那个
+    /// 字符串就不是同一个（大小写 / 空白差异），表现为"界面明明禁用了、
+    /// 网关照样放行"，且从任何一侧单看都完全正常。
+    #[test]
+    fn platform_models_disabled_normalizes_identically() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-pm-disabled-same");
+        let rt = test_rt();
+
+        // 故意用带空白、大小写不一、重复项、空串、非数组、空平台的畸形输入
+        let messy = json!({
+            "  QoDer  ": { "  CN  ": ["  DeepSeek-V4.1-Flash  ", "deepseek-v4.1-flash", "", 42] },
+            "zcode": { "intl": ["GLM-5.3"], "": ["  x  "] },
+            "": { "cn": ["should-be-dropped"] },
+            "empty": { "cn": [] },
+            "notobj": "nope",
+        });
+
+        let out = rt.block_on(super::set_platform_models(&messy, Some(&messy)));
+        assert_eq!(out.get("ok").and_then(Value::as_bool), Some(true), "{out}");
+
+        let cfg = super::load_gateway_config();
+        let allowed = cfg.pointer("/platform_models").expect("platform_models");
+        let disabled = cfg
+            .pointer("/platform_models_disabled")
+            .expect("platform_models_disabled");
+
+        // 与纯函数对照（三方一致：纯函数 / 允许键 / 禁用键）
+        let expected = super::platform_models_normalized(&messy);
+        assert_eq!(
+            allowed, &expected,
+            "允许清单的归一化结果应与纯函数一致"
+        );
+        assert_eq!(
+            disabled, &expected,
+            "禁用清单的归一化必须与允许清单**逐字相同**（共用同一个纯函数）"
+        );
+        assert_eq!(
+            disabled,
+            &json!({
+                "qoder": { "cn": ["deepseek-v4.1-flash"] },
+                "zcode": { "intl": ["glm-5.3"], "": ["x"] },
+            }),
+            "具体期望：去空白 + 小写 + 去重 + 丢空串/非字符串 + 丢空平台/空区域键"
+        );
+    }
+
+    /// 只读导出 `platform_models_state()` 一次返回两份清单（界面初始化用）。
+    #[test]
+    fn platform_models_state_returns_both_snapshots() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-pm-state");
+
+        super::save_gateway_config(&json!({
+            "platform_models": { "qoder": { "cn": ["qwen3.8-flash"] } },
+            "platform_models_disabled": { "zcode": { "intl": ["glm-5.3"] } },
+        }))
+        .expect("save config");
+
+        assert_eq!(
+            super::platform_models_state(),
+            json!({
+                "platform_models": { "qoder": { "cn": ["qwen3.8-flash"] } },
+                "platform_models_disabled": { "zcode": { "intl": ["glm-5.3"] } },
+            }),
+            "界面一次拿到两份，避免两次读之间夹着一次保存而渲染出\
+             现实中从未存在过的组合"
+        );
+        assert_eq!(
+            super::platform_models_disabled(),
+            json!({ "zcode": { "intl": ["glm-5.3"] } }),
+            "只读导出应复用同一条读取路径"
+        );
+    }
+
+    /// 老配置（没有 `platform_models_disabled` 键）⇒ 空对象，行为不变。
+    #[test]
+    fn platform_models_disabled_absent_is_empty() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-pm-disabled-absent");
+
+        // 只写允许清单，模拟升级前的老配置
+        super::save_gateway_config(&json!({
+            "platform_models": { "qoder": { "cn": ["qwen3.8-flash"] } },
+        }))
+        .expect("save config");
+
+        assert_eq!(
+            super::platform_models_disabled(),
+            json!({}),
+            "老配置缺这个键 ⇒ 空对象（= 没有禁用项），不得 panic 或返回 null"
+        );
+    }
+
+    /// 端到端链路（进程内）：**真实的** `set_platform_models` → 落盘 →
+    /// `resync_native_config()` → native config 里出现禁用项。
+    ///
+    /// 为什么需要这条：上面几个测试分别只覆盖"保存对了"和"写 native 对了"，
+    /// 中间那一跳（保存后**谁**把配置下发下去）没有被任何测试连起来。
+    /// 而实测（独立 server 实例 + 真实 HTTP）够不到这一跳 ——
+    /// 调 `resync_native_config` 的额度巡检只在 GUI 里起
+    /// （`src-tauri/src/lib.rs`），server 的 `spawn_background_loops()`
+    /// 不含它，故 server 侧只有 `start_gateway` 会写 native config，
+    /// 而它要求账号库非空（独立实例里没有账号）。
+    ///
+    /// 这条测试走的是与 GUI 巡检 / 刷新账号**同一条**函数，
+    /// 因此能覆盖"用户在界面上禁用 → 网关拿到禁用项"的最后一段。
+    #[test]
+    fn disabled_list_reaches_native_config_through_real_setter() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-pm-disabled-chain");
+        let rt = test_rt();
+
+        // 走真实入口（与 HTTP / Tauri 命令同一函数），故意混入大小写与空白
+        let out = rt.block_on(super::set_platform_models(
+            &json!({ "qoder": { "cn": ["Qwen3.8-Flash"] } }),
+            Some(&json!({ "qoder": { "cn": ["  DeepSeek-V4.1-Flash  "] } })),
+        ));
+        assert_eq!(out.get("ok").and_then(Value::as_bool), Some(true), "{out}");
+
+        // 走真实的 resync 路径（GUI 的巡检 / 刷新账号调的就是它）
+        let path = super::resync_native_config().expect("resync native config");
+        let native: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+
+        assert_eq!(
+            native.pointer("/pool/platform_models_disabled"),
+            Some(&json!({ "qoder": { "cn": ["deepseek-v4.1-flash"] } })),
+            "保存 → 下发的整条链路上，禁用项必须一路归一化后抵达 native config；\
+             中间任何一跳漏掉它，Go 侧的否决项就是空的（并集删不掉的问题原样复现）"
+        );
+        assert_eq!(
+            native.pointer("/pool/platform_models"),
+            Some(&json!({ "qoder": { "cn": ["qwen3.8-flash"] } })),
+            "同一份 native config 里允许清单也要在（两键并存）"
+        );
     }
 }

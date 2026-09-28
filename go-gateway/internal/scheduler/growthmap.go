@@ -64,7 +64,7 @@ func (s *Scheduler) RunGrowthMapNow() {
 // 作用域通过 ctx 传递，排程与「全部账号」路径不带作用域，行为逐字不变。
 func (s *Scheduler) runGrowthMap(ctx context.Context) {
 	first := true
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range s.poolList() {
 		// 账号作用域：只在「作用于该账号」的手动触发时收窄（排程路径恒为 true）。
 		if !inAccountScope(ctx, st.UID) {
 			continue

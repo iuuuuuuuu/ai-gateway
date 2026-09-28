@@ -87,7 +87,7 @@ import type {
   GatewayUsageResult,
   GatewayUsageSnapshot,
 } from "@/lib/types";
-import { cn } from "@/lib/utils";
+import { cn, firstVisibleText } from "@/lib/utils";
 import { toast } from "sonner";
 
 interface SectionProps {
@@ -263,31 +263,54 @@ function normalizeAllowedModels(raw: string[] | string | null | undefined): stri
 }
 
 /**
- * 账号池里产品徽标的**短标签**。
+ * 账号池里的**区域徽标**（国服 / 国际版）。
  *
- * # 为什么不用 `PRODUCT_LABELS` 的全名
+ * # 为什么需要它（所有者反馈）
  *
- * 账号列只有 `max-w-[168px]`，而它已经要放「名字 + uid 前 8 位」。
- * 塞进 `WorkBuddy`（9 字符）会把名字挤到只剩下两三个字 —— 而**名字**
- * 才是用户用来认账号的东西，产品只是**辅助判断**。
+ * 原话：「账号池这里 平台 国内国外 区分不明显,你改的明显一点」。
  *
- * 故用首字母缩写：`WB` / `QD` / `ZC`。
- * 完整名放在 `title` 悬浮里（用户能随时看到，信息不丢）。
+ * 此前这一列只有一个 9.5px 的平台缩写 chip，**区域完全没有标识** ——
+ * 而区域恰恰决定了用户最关心的几件事：该模型能不能用（区域白名单）、
+ * 走不走代理。池里同时有国内外账号时，不标就只能靠猜。
  *
- * ⚠ 未知产品**原样返回**而不是编一个缩写：环境里出现第四种产品时，
- * 显示它本来的名字比显示一个我们猜的缩写更有用。
+ * ⚠ 视觉口径与账号卡片（`account-card.tsx` 的 `regionChip`）**保持一致**：
+ * 同一个语义在两个地方配色不同，用户会以为是两回事。
+ * 与那里的唯一差别是**文案**：那边写的是 WorkBuddy 专属的
+ * 「不参与自动签到与自动旅行」—— Qoder / ZCode 账号没有签到与旅行，
+ * 照抄会把一件不存在的事说成事实。故这里只说区域与线路。
+ *
+ * ⚠ `account.region` 缺失（**老网关不下发**）时调用方**不渲染**本徽标，
+ * 不猜区域：错标比不标更误导。与平台徽标对空 `product` 的处理口径一致。
  */
-function productShortLabelOf(product: string): string {
-  switch (product) {
-    case "workbuddy":
-      return "WB";
-    case "qoder":
-      return "QD";
-    case "zcode":
-      return "ZC";
-    default:
-      return product;
-  }
+function poolRegionChip(region: string) {
+  const isIntl = region === "intl";
+  // 未知取值原样显示（不编造）：与平台徽标同一策略。
+  const label = REGION_LABEL[region] || region;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          data-slot="pool-account-region"
+          data-region={region}
+          aria-label={`${label}账号`}
+          className={cn(
+            "shrink-0 inline-flex items-center gap-0.5 rounded border px-1 py-px text-[10.5px] font-medium leading-3",
+            isIntl
+              ? "border-sky-500/30 bg-sky-500/10 text-sky-700"
+              : "border-slate-400/30 bg-slate-500/10 text-slate-700",
+          )}
+        >
+          <Globe className="size-3" />
+          {label}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-[16rem]">
+        {isIntl
+          ? "国际版账号 · 该账号走国际版线路（域名 *.ai / *.sh 等）"
+          : "国服账号 · 该账号走国服线路（域名 .cn 等）"}
+      </TooltipContent>
+    </Tooltip>
+  );
 }
 
 
@@ -1398,7 +1421,10 @@ function modelCoolingTitle(acc: GatewayPoolAccount): string {
  * （如「公司号」「备用」），正是为这个场景准备的，所以排在最前。
  * 两者都缺时才退到 uid 前缀，保证任何账号都有一个稳定、可点选的显示名。
  *
- * `trim()` 顺带挡掉纯空白的备注，避免下拉出现一项看不见字的条目。
+ * 「缺」的判据是 `hasVisibleText`（见 `@/lib/utils`），**不是** `trim()`：
+ * 线上有一个号的上游昵称是单个 U+E0000（Unicode 标签字符，肉眼不可见），
+ * 而 `"\u{E0000}".trim()` 返回原串 —— 只靠 trim 会让它冒充成有效名字，
+ * 该行名字实测渲染宽度 0px，用户在池表格里完全看不出这是哪个号。
  *
  * **本函数是全站唯一口径**：账号池表格、指定账号勾选列表、用量列表、
  * 排序比较器都走它。此前账号池另有一个 `poolAccountName` 的同义实现
@@ -1411,7 +1437,7 @@ function modelCoolingTitle(acc: GatewayPoolAccount): string {
  * `merge_account_notes` 的方案论证），所以这里能和其它地方共用同一口径。
  */
 function accountLabel(account: { uid: string; nickname?: string; note?: string }): string {
-  return account.note?.trim() || account.nickname?.trim() || account.uid.slice(0, 8);
+  return firstVisibleText(account.note, account.nickname) || account.uid.slice(0, 8);
 }
 
 /**
@@ -1584,7 +1610,13 @@ function PoolAccountRow({
             {rankLabel}
           </span>
         </td>
-        <td className="max-w-[168px] px-2.5 py-0.5">
+        {/* 列宽 `max-w-[300px]`：这一行现在要放下**两个**徽标（平台全名
+            WorkBuddy / Qoder / ZCode + 区域「国服 / 国际版」）加账号名。
+            原值 168px 是按「平台缩写 WB/QD/ZC + 名字」定的 —— 平台改成全名、
+            再加一个区域徽标后，168px 会把名字挤到只剩两三个字，
+            而**名字**才是用户用来认账号的东西。表格本身 `min-w-[860px]` 且
+            未用 `table-fixed`，放宽这一列不会挤压其它列。 */}
+        <td className="max-w-[300px] px-2.5 py-0.5">
           {/* 行高刻意钉在「一行名字 + 一行 uid 前缀」≈ 28px（leading-4 + leading-3）：
               草稿要求概览行约 30px/行、一屏十几个账号。不给显式 leading 的话
               Tailwind 的默认行高（1.5×）会把两行撑到 34px，行高直接多出 20%。 */}
@@ -1613,28 +1645,37 @@ function PoolAccountRow({
                   「在兼容网关哪里的账号池,也要标记上进入池子的账号属于那个客户端」
 
                 三个产品的账号混在同一个池里，而名字只有昵称/备注 ——
-                `wish`、`aliyun-…` 这样的名字**看不出是哪家的**。于是排查
+                `acct-a`、`aliyun-…` 这样的名字**看不出是哪家的**。于是排查
                 「`zcode:` 前缀为什么选不出号」时看不出池里有几个 ZCode 号，
                 想单独给某个号停流量也得先去别的页面确认。
 
                 ⚠ 与「模型路由清单」的平台徽标**共用同一份配色**
                 （`productAccentOf`）—— 同一个产品在两个地方颜色不同，
-                用户会以为是两回事。 */}
+                用户会以为是两回事。
+
+                ⚠ 文案用**全名**（`PRODUCT_LABELS`）而不是缩写 WB/QD/ZC：
+                缩写此前是因为账号列只有 168px 才退让的（见本列宽注释），
+                而所有者的反馈是「区分不明显」—— 缩写恰恰是"不明显"的一部分。
+                列宽已放宽到 300px，故改回全名。 */}
             {acc.product && (
               <span
                 data-slot="pool-account-product"
                 data-product={acc.product}
                 title={`该账号属于 ${PRODUCT_LABELS[acc.product] || acc.product}`}
                 className={cn(
-                  "shrink-0 rounded border px-1 py-px text-[9.5px] font-medium leading-3",
+                  "shrink-0 rounded border px-1.5 py-0.5 text-[10.5px] font-medium leading-3",
                   productAccentOf(acc.product).border,
                   productAccentOf(acc.product).bg,
                   productAccentOf(acc.product).text,
                 )}
               >
-                {productShortLabelOf(acc.product)}
+                {PRODUCT_LABELS[acc.product] || acc.product}
               </span>
             )}
+            {/* 区域徽标：紧随平台徽标之后。
+                `acc.region` 缺失（**老网关不下发**）时不渲染 —— 不猜区域，
+                与上面平台徽标对空 `product` 的处理口径一致。 */}
+            {acc.region && poolRegionChip(acc.region)}
             <span className="truncate">{poolAccountName(acc)}</span>
           </div>
           {/* uid 在概览行给短前缀（完整值在二级行「积分」块里，信息不丢），

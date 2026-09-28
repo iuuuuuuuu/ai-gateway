@@ -32,6 +32,8 @@ import {
   PlatformConfigButton,
   PlatformConfigDialog,
 } from "@/components/platform-config-dialog";
+// 「自定义平台支持的模型」入口暂时隐藏（用户要求）—— 组件保留，恢复时取消注释即可。
+// import { PlatformModelsConfigCard } from "@/components/platform-models-config";
 import { DemoAction } from "@/components/demo-action";
 import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -66,7 +68,7 @@ import { TaskQueuePanel } from "@/components/task-queue-panel";
 import * as api from "@/lib/api";
 import { useVisibilityInterval } from "@/lib/use-visibility-interval";
 import type { AccountMeta, AccountRunningTask, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, GatewayTaskName, GatewayTaskRuntime, TravelConfig, TravelStatus } from "@/lib/types";
-import { cn } from "@/lib/utils";
+import { cn, firstVisibleText } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
 /**
@@ -592,7 +594,7 @@ export default function AccountsPage() {
           : res.result === "already"
             ? "今天已签到"
             : "签到失败";
-      const description = `${a.nickname || a.email || a.id}${res.error ? `：${res.error}` : ""}`;
+      const description = `${firstVisibleText(a.nickname, a.email, a.id) || a.id}${res.error ? `：${res.error}` : ""}`;
       if (res.result === "error") toast.error(label, { description });
       else toast.success(label, { description });
       // 刷新该账号的今日签到状态
@@ -617,7 +619,7 @@ export default function AccountsPage() {
    * 不该报成失败，否则用户会以为功能坏了。
    */
   async function onAdopt(a: AccountMeta) {
-    const who = a.nickname || a.email || a.id;
+    const who = firstVisibleText(a.nickname, a.email, a.id) || a.id;
     const toastId = toast.loading("正在领养 Buddy…", { description: who });
     try {
       const res = await api.travelAdopt(a.id);
@@ -652,7 +654,7 @@ export default function AccountsPage() {
   async function onRefresh(a: AccountMeta) {
     try {
       const res = await api.refreshAccountToken(a.id);
-      const label = a.nickname || a.email || a.id;
+      const label = firstVisibleText(a.nickname, a.email, a.id) || a.id;
       if (res.needsRelogin) {
         toast.error("Token 刷新失败", { description: `${label}：需重新登录${res.needsReloginReason ? `（${res.needsReloginReason}）` : ""}` });
       } else {
@@ -903,14 +905,14 @@ export default function AccountsPage() {
     if (codebuddyCliSwitchingId !== null) return;
     setCodebuddyCliSwitchingId(account.id);
     const toastId = toast.loading("正在切换 CodeBuddy CLI…", {
-      description: `正在将默认账号设为 ${account.nickname || account.email || account.id}`,
+      description: `正在将默认账号设为 ${firstVisibleText(account.nickname, account.email, account.id) || account.id}`,
     });
     try {
       const result = await api.switchCodebuddyCliAccount(account.id);
       await refreshCodebuddyCliStatus();
       toast.success("CodeBuddy CLI 默认账号已更新", {
         id: toastId,
-        description: `${account.nickname || account.email || account.id}：${result.message || "配置已更新"}`,
+        description: `${firstVisibleText(account.nickname, account.email, account.id) || account.id}：${result.message || "配置已更新"}`,
       });
     } catch (error) {
       toast.error("CodeBuddy CLI 切换失败", {
@@ -1018,7 +1020,7 @@ export default function AccountsPage() {
   }
   const cliCurrentAccountId = codebuddyCli?.activeAccountId;
   const workbuddyCurrentName = current
-    ? current.nickname || current.email || current.uid || "未知账号"
+    ? firstVisibleText(current.nickname, current.email, current.uid) || current.uid || "未知账号"
     : "未登录";
   const codebuddyCurrentName = codebuddyCli?.configured
     ? codebuddyCli.activeAccountName || "未检测到"
@@ -1446,7 +1448,7 @@ export default function AccountsPage() {
                 // 因此这里刷新账号列表让界面立刻反映新状态。
                 onToggleDisabled={async (target) => {
                   const next = !target.disabled;
-                  const label = target.nickname || target.uid || "该账号";
+                  const label = firstVisibleText(target.nickname, target.uid) || target.uid || "该账号";
                   try {
                     await api.setAccountDisabled(target.id, next);
                     toast.success(
@@ -1509,9 +1511,10 @@ export default function AccountsPage() {
         open={workbuddyConfigOpen}
         onOpenChange={setWorkbuddyConfigOpen}
         title="WorkBuddy 配置"
-        description="自动签到、养号任务、CodeBuddy CLI 轮换与认证目录权限。这些配置只对 WorkBuddy 生效。"
+        description="自动签到、养号任务、CodeBuddy CLI 轮换、认证目录权限。这些配置只对 WorkBuddy 生效。"
       >
         <div className="min-w-0 space-y-12">
+          {/* 暂时隐藏（用户要求）： <PlatformModelsConfigCard product="workbuddy" /> */}
           <AutoCheckinCard />
           <AutoCareTasksCard />
           <AutoRotateCard />
@@ -1601,8 +1604,10 @@ export default function AccountsPage() {
           <DialogHeader>
             <DialogTitle>删除账号</DialogTitle>
             <DialogDescription>
-              确定删除账号「{deleteTarget?.nickname || deleteTarget?.email || deleteTarget?.id}」？
-              此操作不可撤销。
+              确定删除账号「
+              {firstVisibleText(deleteTarget?.nickname, deleteTarget?.email, deleteTarget?.id) ||
+                deleteTarget?.id}
+              」？ 此操作不可撤销。
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

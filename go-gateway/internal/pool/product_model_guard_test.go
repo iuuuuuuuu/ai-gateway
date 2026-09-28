@@ -116,7 +116,7 @@ func TestUnknownProductIsNotExcluded(t *testing.T) {
 func TestEmptyProductListIsIgnored(t *testing.T) {
 	p := newProductGuardPool(t)
 	p.SetProductModels(map[string][]string{
-		"workbuddy": {},              // 空
+		"workbuddy": {},                // 空
 		"qoder":     {"qwen3.8-flash"}, // 非空
 	})
 	// workbuddy 清单为空 ⇒ 不约束 workbuddy 账号
@@ -144,37 +144,98 @@ func TestSingleProductModeUnchanged(t *testing.T) {
 	}
 }
 
-// TestProductPrefixedModelStillWorks 带前缀时**用户显式指定了产品**，
-// 故产品约束优先于"该产品是否提供该模型"。
+// TestProductPrefixedModelStillWorks 带前缀时选号要**同时**满足两件事：
+// 产品对得上，且该产品**确实提供**这个模型。
 //
-// # ⚠ 我第一版写错了这条断言（记录以免再犯）
+// # ⚠⚠ 这条用例被反转过两次，最终结论以**所有者 2026-09-28 的原话**为准
 //
-// 我原本断言"显式指定 qoder 而 qoder 不提供该模型 → 应选不出账号"。
-// 实测返回了 qd-1 —— 而**那才是对的**：
+// 第一版（我写的）：断言"显式指定 qoder 而 qoder 不提供该模型 → 选不出账号"。
+// 实测返回了 qd-1，我误以为是自己写错了，于是改成"显式指定即尊重"，
+// 并写下了一句看起来很有道理的注释：
 //
-//	用户写 `qoder:deepseek-v4.1-flash` 的意思就是"用 qoder 跑它"。
-//	产品清单是用来防止**无前缀时误路由**的，不是用来否决用户显式指令的。
+//	「用户写 `qoder:deepseek-v4.1-flash` 的意思就是'用 qoder 跑它'。
+//	  产品清单是用来防止**无前缀时误路由**的，不是用来否决用户显式指令的。」
 //
-// 若真按我原来的断言实现，"用户显式指定却被我们静默拒绝"会变成更难懂的行为。
-// 故改断言为"显式指定即尊重"。
+// **那句话不是所有者的意图。** 他 2026-09-28 明确纠正：
+//
+//	「那个意图不是我的，在选号侧就是要挡请求，你修复一下吧」
+//
+// 现场是他发 `qoder:deepseek-v4.1-flash` —— 而 qoder 的 18 个模型里
+// **根本没有**它，上游却回了内容，于是用量统计里出现
+// 「deepseek-v4.1-flash · Qoder」这一行幽灵数据；
+// 而 qoder 收到 WorkBuddy 风格的参数后由模型提供商拒绝、回 400 11133，
+// 用户看到「参数不符合当前模型要求」，完全想不到是**平台选错了**。
+//
+// ⇒ 现在的契约：**清单里有才放行**（不知道时不拦，见下面的
+// TestProductUnknownListDoesNotBlock 与 productMayServeLocked 的注释）。
 func TestProductPrefixedModelStillWorks(t *testing.T) {
 	p := newProductGuardPool(t)
 	p.SetProductModels(map[string][]string{
 		"workbuddy": {"deepseek-v4.1-flash"},
 		"qoder":     {"qwen3.8-flash"},
 	})
-	// 显式指定 qoder：即便该模型不在 qoder 清单里，也**尊重用户指令**
+	// 显式指定 qoder，但 qoder 清单里**没有**该模型 → 必须选不出
+	got := p.PickForModelProductRegion("deepseek-v4.1-flash", nil, auth.RegionAny, "qoder")
+	if got != nil {
+		t.Fatalf("qoder 清单里没有该模型，不该选出账号（否则会发出去被上游以"+
+			"11133 拒绝，并在统计里记成「该模型 · Qoder」的幽灵数据）；实际选中 %s", got.UID)
+	}
+	// 指定 workbuddy（清单里**有**）→ 正常选出
+	got2 := p.PickForModelProductRegion("deepseek-v4.1-flash", nil, auth.RegionAny, "workbuddy")
+	if got2 == nil || got2.UID != "wb-1" {
+		t.Errorf("显式指定 workbuddy 且清单里有该模型，应选出 wb-1，实际 %v", got2)
+	}
+	// qoder 自己的模型仍要能选出来（别把拦截做成"整个产品不可用"）
+	got3 := p.PickForModelProductRegion("qwen3.8-flash", nil, auth.RegionAny, "qoder")
+	if got3 == nil || got3.ProductOf() != auth.ProductQoder {
+		t.Errorf("qoder 自己的模型必须仍能选出，实际 %v", got3)
+	}
+}
+
+// TestProductUnknownListDoesNotBlock ★ 清单**未知**时不能拦。
+//
+// # 为什么这条和上面同等重要
+//
+// 判据是"**知道**才拦"而不是"没写就拦"。宿主那份 `product_models`
+// 来自用户白名单，**可能不全**（实测：workbuddy 就不在里面）。
+// 若把"清单里没有"一律当成"不支持"，workbuddy 账号会被整片误杀 ——
+// 表现为"裸名模型全部报没有可用账号"，那比幽灵统计严重得多。
+//
+// `productMayServeLocked` 的三态语义正是为此：
+//
+//	清单有 + 含该模型 → 放行
+//	清单有 + 不含     → 看兜底表，兜底表也没有才拦
+//	清单**未知**      → 放行（宁可放行）
+func TestProductUnknownListDoesNotBlock(t *testing.T) {
+	p := newProductGuardPool(t)
+	// 只给 qoder 清单，**不给** workbuddy —— 模拟宿主白名单为空的实际情形
+	p.SetProductModels(map[string][]string{"qoder": {"qwen3.8-flash"}})
+
+	got := p.PickForModelProductRegion("deepseek-v4.1-flash", nil, auth.RegionAny, "workbuddy")
+	if got == nil {
+		t.Fatal("workbuddy 清单**未知**时不该拦 —— 否则宿主白名单为空会让" +
+			"所有裸名模型报「没有可用账号」，那是比幽灵统计严重得多的回归")
+	}
+	if got.ProductOf() != auth.ProductWorkBuddy {
+		t.Errorf("应选出 workbuddy 账号，实际 %s（%s）", got.UID, got.ProductOf())
+	}
+}
+
+// TestProductFallbackListStillAllows 兜底（猜测）清单里的模型仍放行。
+//
+// 兜底清单是"网关已知的更多可能性"，用于避免"宿主清单不全导致误拦"。
+// 它只放宽、不收紧 —— 与 productMayServeLocked 的取向一致。
+func TestProductFallbackListStillAllows(t *testing.T) {
+	p := newProductGuardPool(t)
+	p.SetProductModels(map[string][]string{"qoder": {"qwen3.8-flash"}})
+	p.SetProductModelsFallback(map[string][]string{"qoder": {"deepseek-v4.1-flash"}})
+
 	got := p.PickForModelProductRegion("deepseek-v4.1-flash", nil, auth.RegionAny, "qoder")
 	if got == nil {
-		t.Fatal("显式指定 qoder 时应选出 Qoder 账号 —— 用户意图优先于清单（清单只用于防误路由）")
+		t.Fatal("可信清单没有但**兜底清单有**时应放行 —— 兜底表只放宽、不收紧")
 	}
 	if got.ProductOf() != auth.ProductQoder {
 		t.Errorf("应选出 qoder 账号，实际 %s（%s）", got.UID, got.ProductOf())
-	}
-	// 指定 workbuddy 则选 workbuddy
-	got2 := p.PickForModelProductRegion("deepseek-v4.1-flash", nil, auth.RegionAny, "workbuddy")
-	if got2 == nil || got2.UID != "wb-1" {
-		t.Errorf("显式指定 workbuddy 应选出 wb-1，实际 %v", got2)
 	}
 }
 

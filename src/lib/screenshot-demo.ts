@@ -598,6 +598,24 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_gateway_status":
       return { running: true, port: 7864, pid: 12345, accounts: demoAccounts.length };
 
+    // 「平台 × 区域 → 模型」白名单 + 禁用清单。
+    //
+    // 演示值刻意**两种状态都有**：qoder 那边放一个"禁用"的
+    //（`deepseek-v4.1-flash` —— 正是所有者反馈过的那个被上游清单放行、
+    // 光删白名单删不掉的模型），这样走查时能看到禁用条目的样式
+    //（划掉 + 红色「禁用」徽标），而不是只有一片"允许"。
+    case "get_platform_models":
+      return {
+        platform_models: {
+          qoder: { cn: ["qwen3.8-flash", "glm-5.3"], intl: ["qwen3.8-max"] },
+          zcode: { "": ["glm-5.3", "glm-5.3-flash"] },
+          workbuddy: { cn: ["deepseek-v4.1-flash"] },
+        },
+        platform_models_disabled: {
+          qoder: { cn: ["deepseek-v4.1-flash"] },
+        },
+      };
+
     default: throw new Error(`演示模式缺少只读数据: ${command}`);
   }
 }

@@ -43,6 +43,7 @@ import type {
   LocalScanResult,
   OAuthPollResult,
   OAuthStartResult,
+  PlatformModelsState,
   RotateLog,
   RotateStatus,
   Session,
@@ -85,6 +86,8 @@ const DEMO_READ_COMMANDS = new Set([
   "zcode_scan_local",
   // 网关配置（Qoder/ZCode 的「配置」弹窗要读它才显示自动领取开关）
   "get_gateway_config", "get_gateway_status",
+  // 三平台「配置」弹窗里的「可用的模型」表单要读它
+  "get_platform_models",
 ]);
 
 export function isDemoMode(): boolean {
@@ -183,6 +186,13 @@ const ROUTES: Record<string, Route> = {
   // 也没有请求发出 —— 排查了很久）。而 Tauri 桌面端走 IPC 不经此表，
   // 所以只在 webui/测试里暴露。
   set_model_platforms: { method: "POST", path: "/api/gateway/model-platforms" },
+  // 「平台 × 区域 → 允许的模型」白名单（方向与上一条相反）。
+  //
+  // 读走 GET、写走 POST，同一条路径 —— 与 Rust 侧
+  // `api_get_platform_models` / `api_set_platform_models` 对应。
+  // 同样**必须**注册：漏了在 webui 下是静默失败（详见上一条注释）。
+  get_platform_models: { method: "GET", path: "/api/gateway/platform-models" },
+  set_platform_models: { method: "POST", path: "/api/gateway/platform-models" },
   start_gateway: { method: "POST", path: "/api/gateway/start" },
   check_gateway_port: { method: "POST", path: "/api/gateway/port-check" },
   kill_gateway_port_holder: { method: "POST", path: "/api/gateway/port-kill" },
@@ -1122,6 +1132,54 @@ export function setAllowedModel(model: string): Promise<GatewayModeSwitchResult>
   return call<GatewayModeSwitchResult>("set_allowed_model", { model });
 }
 
+/**
+ * 读取「平台 × 区域 → 允许的模型」白名单**与**逐条禁用清单。
+ *
+ * 两个清单一次读回（宿主侧同一份快照），故界面不会渲染出
+ * "白名单是新的、禁用项是旧的"这种现实中从未存在过的组合。
+ */
+export function getPlatformModels(): Promise<PlatformModelsState> {
+  return call<PlatformModelsState>("get_platform_models");
+}
+
+/**
+ * 写入「平台 × 区域 → 允许的模型」白名单，可选同时写禁用清单。
+ *
+ * ## 方向（与 {@link setModelPlatforms} 相反）
+ *
+ *	setModelPlatforms   模型 → 允许的平台
+ *	setPlatformModels   平台(+区域) → 允许的模型   ← 本函数
+ *
+ * ## `disabled` 的三态（别当成"可选参数"随手传）
+ *
+ *	数组（可为空）→ 连同禁用清单一起写
+ *	undefined      → **不动**已有的禁用清单，而不是清空
+ *
+ * 为什么 undefined 是"不动"：老界面 / 只改白名单的调用方不该因为
+ * 没传这个字段就**静默清掉**用户配好的禁用项 —— 那正是本功能最不该
+ * 出现的失败模式。要清空得显式传 `[]`（或 `{}`）。
+ *
+ * ## ⚠ 为什么"禁用"不能靠"从白名单里删掉"来实现
+ *
+ * 放行判据是「手动配置 ∪ 接口返回 ∪ 兜底」的**并集**，只要还有
+ * **任何一个**来源放行就通过 —— 所以删掉手动项删不掉它
+ *（`qoder:deepseek-v4.1-flash` 就是被"接口返回"那份放行的）。
+ * 禁用必须是并集**之外**的独立否决项，故它有单独一个配置键。
+ */
+export function setPlatformModels(
+  platforms: Record<string, Record<string, string[]>>,
+  disabled?: Record<string, Record<string, string[]>>,
+): Promise<GatewayModeSwitchResult> {
+  // ⚠ 必须显式构造 args：Tauri 侧 `disabled` 是 `Option<Value>`，
+  // 传 `undefined` 时**不能**让键出现在 payload 里（出现即被当成
+  // "要写这个键"，与"不触碰"语义相反）。故这里用条件展开，
+  // 而不是 `{ platforms, disabled }`。
+  return call<GatewayModeSwitchResult>("set_platform_models", {
+    platforms,
+    ...(disabled === undefined ? {} : { disabled }),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // 一键导入：接入本机 AI 客户端
 // ---------------------------------------------------------------------------
@@ -1978,7 +2036,7 @@ export interface ZcodeScannedItem {
    */
   hasQuotaToken: boolean;
   /**
-   * 账号名（来自客户端登录态，如 `wish`）。
+   * 账号名（来自客户端登录态，如 `acct-a`）。
    *
    * ## 为什么它可以和 suggestedNickname 不同
    *

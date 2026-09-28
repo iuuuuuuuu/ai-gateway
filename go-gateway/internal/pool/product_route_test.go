@@ -112,7 +112,7 @@ func TestPickForModelProductRegionLegacyEmptyProductCountsAsWorkBuddy(t *testing
 // 修复前粘性那一支**没有产品校验**，于是 `zcode:glm-5.3` 会继续用该会话
 // 此前绑定的 WorkBuddy 账号 —— 实测确认：
 //
-//	`zcode:glm-5.3` → 选中 e2891116（**workbuddy**）→ 报"额度已耗尽"
+//	`zcode:glm-5.3` → 选中 acct-c（**workbuddy**）→ 报"额度已耗尽"
 //
 // 用户看到的是"我明明指定了 zcode，却报了 WorkBuddy 账号的错"。
 func TestPickByUIDForModelProductRegionRejectsWrongProduct(t *testing.T) {

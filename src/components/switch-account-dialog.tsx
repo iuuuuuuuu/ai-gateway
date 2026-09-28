@@ -18,6 +18,7 @@ import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
 import type { AccountMeta, Session } from "@/lib/types";
+import { firstVisibleText } from "@/lib/utils";
 
 interface Props {
   open: boolean;
@@ -119,7 +120,8 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         accountId: account.id,
         copySessionIds: copySessions ? [...selected] : undefined,
       });
-      const nickname = account.nickname || account.email || account.uid || "该账号";
+      const nickname =
+        firstVisibleText(account.nickname, account.email, account.uid) || account.uid || "该账号";
       const parts: string[] = [];
       if (res.sessionCopy?.copied.length) {
         parts.push(`已复制 ${res.sessionCopy.copied.length} 个会话`);
@@ -207,7 +209,13 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         className="flex max-h-[min(90vh,calc(100vh-2rem))] min-w-0 flex-col overflow-hidden"
       >
         <DialogHeader className="shrink-0">
-          <DialogTitle>切换到「{account?.nickname || account?.email || account?.uid || "该账号"}」</DialogTitle>
+          <DialogTitle>
+            切换到「
+            {firstVisibleText(account?.nickname, account?.email, account?.uid) ||
+              account?.uid ||
+              "该账号"}
+            」
+          </DialogTitle>
           <DialogDescription>
             切换会关闭并重启 WorkBuddy，认证文件将写入目标账号。
           </DialogDescription>

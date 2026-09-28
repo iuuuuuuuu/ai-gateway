@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/select";
 import * as api from "@/lib/api";
 import type { AccountMeta, AccountRegionKey } from "@/lib/types";
+import { firstVisibleText } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
 interface Props {
@@ -184,7 +185,7 @@ export function OAuthLoginDialog({ open, onOpenChange }: Props) {
         {result && (
           <Alert>
             <AlertDescription>
-              已采集账号：{result.nickname || result.email || result.id}
+              已采集账号：{firstVisibleText(result.nickname, result.email, result.id) || result.id}
             </AlertDescription>
           </Alert>
         )}

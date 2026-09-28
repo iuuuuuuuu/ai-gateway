@@ -49,17 +49,17 @@ type Config struct {
 		// TrialHours 国际版 trial 加油包领取时点，默认 [9, 21]（与签到同步）。
 		// 国际版没有签到/任务中心，trial 是其唯一积分增益动作；幂等可每天重试。
 		TrialHours []int `json:"trial_hours"`
-	// ProductTasksHours Qoder/ZCode 日常任务的自动执行时点，默认 [10]。
-	//
-	// # 为什么是"每天一次"而不是参考实现的"每 5 分钟"
-	//
-	// 参考实现（TriDefender/zcode-api）每 5 分钟探测一次，因为它要**抢**
-	// 限量套餐（先到先得）。而所有者的诉求是「任务也应该自动执行」
-	//（别让我每天手点）—— 那不需要抢：幂等任务每天做一次就够，
-	// 高频只会扩大风控面。
-	//
-	// 两个端点都幂等：Qoder 已领回 `replayed:true`、ZCode 回 `1003`。
-	// 故"重复执行"的最坏情况只是"今天已经领过了"。
+		// ProductTasksHours Qoder/ZCode 日常任务的自动执行时点，默认 [10]。
+		//
+		// # 为什么是"每天一次"而不是参考实现的"每 5 分钟"
+		//
+		// 参考实现（TriDefender/zcode-api）每 5 分钟探测一次，因为它要**抢**
+		// 限量套餐（先到先得）。而所有者的诉求是「任务也应该自动执行」
+		//（别让我每天手点）—— 那不需要抢：幂等任务每天做一次就够，
+		// 高频只会扩大风控面。
+		//
+		// 两个端点都幂等：Qoder 已领回 `replayed:true`、ZCode 回 `1003`。
+		// 故"重复执行"的最坏情况只是"今天已经领过了"。
 		// CheckinEnabled/KeepaliveEnabled/ActivityEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -367,6 +367,108 @@ type Config struct {
 		// 否则升级后老用户仍然"功能永远关着"。
 		ZcodeCaptchaEnabled bool `json:"zcode_captcha_enabled"`
 
+		// WbDeviceTokenURL 宿主提供的 **WorkBuddy 设备 token 服务**地址
+		//（形如 `http://127.0.0.1:51234/device-token`）。
+		//
+		// # 为什么需要它（2026-09-28，所有者要求走 B 路线）
+		//
+		// 官方 WorkBuddy 客户端**每个请求**都带 `X-Device-Token`
+		//（`v3:` 形态，约 1030 字符），而网关此前完全不带。
+		//
+		// 该 token 由官方自带的腾讯 TuringShield SDK 生成，参数取自
+		// `cli/product.json`（已核实并逐字使用）：
+		//
+		//	channelId      = 400111
+		//	sdkVariant     = "overseas"     （isOversea=true）
+		//	productName    = "workbuddy-ai" （applicationName）
+		//	productVersion = "5.6.2"
+		//
+		// 实测（2026-09-28，用客户端自带 node 加载 turing_sdk.node）：
+		//
+		//	configure(400111, workbuddy-ai, 5.6.2) → OK
+		//	fetchDeviceToken → len=1030 prefix=v3:AAAAAaDle...
+		//	耗时：首次 122ms，后续 39~51ms
+		//	**每次调用都不同**（按请求签发，故不能缓存固定值）
+		//
+		// # 它解决什么、不解决什么（务必看清，别期待过高）
+		//
+		//	✅ 让网关请求与官方客户端**同形态** —— 长期缺设备凭证会被
+		//	   风控逐步标记，带上它可避免这一类新增标记。
+		//	❌ **不能**救活已被上游标记失效的账号：那是服务端的
+		//	   (设备,账号) 绑定状态（实测 403 11140 的账号带上它仍然 403）。
+		//	   那种账号只能去官方客户端重登一次（所有者已亲自验证）。
+		//
+		// 空 = 不启用（网关不发 `X-Device-Token`，行为与本特性引入前一致）。
+		WbDeviceTokenURL string `json:"wb_device_token_url"`
+		// WbDeviceTokenToken 调该服务时的共享密钥（同机 IPC 鉴权）。
+		WbDeviceTokenToken string `json:"wb_device_token_token"`
+
+		// PlatformModels 用户配置的「平台 × 区域 → 允许的模型」白名单。
+		//
+		// # 为什么需要它（2026-09-28 所有者要求）
+		//
+		// 他原话：
+		//
+		//	「qoder 的 deepseek-v4.1-flash 不应该不拦截，而是给每个平台
+		//	  手动配置支持的模型，而且要区分国内外版本」
+		//
+		// # 与 ProductModels 的关键区别（别混用）
+		//
+		//	ProductModels   上游**查询**来的清单 → 只用于"无前缀时优先选
+		//	                声明提供该模型的产品"，未知 = 不排除（路由提示）
+		//	PlatformModels  用户**手动配**的白名单 → 用于"显式指定平台时
+		//	                只放行他允许的模型"，未知 = 不拦（准入控制）
+		//
+		// 背景：qoder 上游**实际上能服务**很多没列在查询清单里的模型
+		//（实测 `qoder:deepseek-v4.1-flash` 10/10 全 200），但那是
+		// **上游能力**，不等于**用户想让它跑**。两者必须分开：
+		//
+		//	· 上游能力（超集）→ 不该由网关替用户判断
+		//	· 用户白名单      → 由用户在界面上配，网关严格执行
+		//
+		// # 形状（二级键为区域，`cn` / `intl`）
+		//
+		//	{
+		//	  "qoder":     {"cn": ["Qwen3.8-Flash"], "intl": ["Qwen3.8-Max"]},
+		//	  "zcode":     {"cn": ["glm-5.3"],       "intl": ["glm-5.3-flash"]},
+		//	  "workbuddy": {"cn": [...],             "intl": [...]}
+		//	}
+		//
+		// 区域键 `""` 表示"该平台不分区域"（简单用法的兼容路径）。
+		//
+		// ⚠ 平台不在 map 里 / 该平台某区域没配 ⇒ **不拦**（向后兼容：
+		// 老配置没有这个键，升级后行为必须逐字不变）。
+		PlatformModels map[string]map[string][]string `json:"platform_models"`
+
+		// PlatformModelsDisabled 用户显式**禁用**的「平台 × 区域 → 模型」。
+		//
+		// 形状与 `PlatformModels` **完全相同**（含区域键 `cn` / `intl` / `""`），
+		// 归一化规则也完全相同（两侧共用 `pool.normalizePlatformModels`），
+		// 但语义相反且**更强**：命中即**拦**，**先于**上面那份白名单的并集判定。
+		//
+		// # 为什么需要它（而不是"从 PlatformModels 里删掉"）
+		//
+		// 放行判据是**并集**（见 `pool.platformAllowsModelLocked`）：
+		//
+		//	放行 = 手动配置 ∪ 接口返回 ∪ 网关兜底
+		//
+		// 故把一个模型从 `PlatformModels` 里删掉**是删不掉的** ——
+		// 它可能仍由"接口返回"那一支放行。实测 `qoder:deepseek-v4.1-flash`
+		// 正是如此。用户要的"禁用"是一个**独立于并集的否决项**：
+		// 「不管哪个来源说它能用，我就是不许它跑」。
+		//
+		// # nil = 未配置 = 不否决
+		//
+		// `Default()` **刻意不给它赋非 nil 默认值**（与 `PlatformModels` 一致）：
+		// nil 表示"用户没禁用任何东西"，行为与引入该键之前逐字不变。
+		// 若赋成空 map，虽结果相同，但会让"没配"与"配了个空的"再也分不清 ——
+		// 与 QoderClaimEnabled 那组 `*bool` 是同一个道理。
+		//
+		// ⚠ 空清单同样**不写入**（`{"qoder":{"cn":[]}}` = 未配置，不否决）：
+		// 界面里把禁用列表清空，语义应是"没有禁用任何模型"，
+		// 而不是"该平台所有模型都禁用" —— 后者会让该平台彻底不可用。
+		PlatformModelsDisabled map[string]map[string][]string `json:"platform_models_disabled"`
+
 		// WatchAuthDir 是否监听凭证目录、运行期自动热加载（缺省 true）。
 		//
 		// # 为什么需要它
@@ -525,7 +627,7 @@ func (a *AllowedModels) UnmarshalJSON(data []byte) error {
 }
 
 // RecordIdentities 把配置里的账号身份映射转成 records 包需要的形状
-//（uid → 宿主的 id 与展示名）。
+// （uid → 宿主的 id 与展示名）。
 //
 // 抽成方法而不是在 main 里内联转换：identities 是切片结构体，
 // 内联转换会在 main 里引入一个与 records 包重复的匿名类型。
@@ -910,7 +1012,7 @@ func checkHourRange(field, switchKey string, hours []int) error {
 //
 // 与 `validateScheduleHours` 分开，是因为它的"关闭方式"不同：
 // 其它任务的开关是 `xxx_enabled=false`，而 Qoder 领取关闭有两级
-//（`qoder_claim_enabled=false` 或 `product_tasks_enabled=false`），
+// （`qoder_claim_enabled=false` 或 `product_tasks_enabled=false`），
 // 报错信息里要同时给出两者，否则用户不知道该改哪个。
 func (c *Config) validateQoderClaimHours() error {
 	for _, h := range c.Schedule.QoderClaimHours {
@@ -928,8 +1030,8 @@ func (c *Config) validateQoderClaimHours() error {
 //
 // # 两级开关的语义（2026-09-22 拆分）
 //
-//		qoder_claim_enabled  **显式**配置 ⇒ 以它为准
-//		未配置（nil）        ⇒ 回落到总闸 product_tasks_enabled
+//	qoder_claim_enabled  **显式**配置 ⇒ 以它为准
+//	未配置（nil）        ⇒ 回落到总闸 product_tasks_enabled
 //
 // 这样两种用户都对：
 //

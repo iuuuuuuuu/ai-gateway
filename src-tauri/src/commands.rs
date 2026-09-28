@@ -1133,6 +1133,71 @@ pub async fn set_model_platforms(platforms: Value) -> Result<Value, String> {
     Ok(result)
 }
 
+/// 设置「平台 × 区域 → 允许的模型」白名单。
+///
+/// # 与 `set_model_platforms` 方向相反
+///
+///	set_model_platforms   模型 → 允许的平台
+///	set_platform_models   平台(+区域) → 允许的模型   ← 本命令
+///
+/// 所有者 2026-09-28 原话：
+///
+///	「qoder 的 deepseek-v4.1-flash 不应该不拦截，而是给每个平台
+///	  手动配置支持的模型，而且要区分国内外版本」
+///	「手动配置的+接口返回的,可不是以手动配置的为准」
+///
+/// 形状（二级键为区域 `cn` / `intl`，`""` 表示不分区域）：
+///
+///	{"qoder":{"cn":["Qwen3.8-Flash"],"intl":["Qwen3.8-Max"]}}
+///
+/// 空对象 = 恢复不限制（向后兼容）。
+/// 网关运行时后端会重启它以生效（白名单在网关启动时读取）。
+///
+/// # `disabled`：逐条禁用（否决项）
+///
+/// 形状与 `platforms` **完全相同**，落在另一个配置键
+/// `platform_models_disabled` 上，语义是**独立于并集的否决**：
+///
+///	{"qoder":{"cn":["deepseek-v4.1-flash"]}}
+///
+/// ⚠ 为什么不能靠"从 platforms 里删掉"来实现禁用：放行判据是
+/// 「手动配置 ∪ 接口返回 ∪ 兜底」的**并集**，只要还有**任何一个**来源
+/// 放行就通过 —— 所以删掉手动项删不掉它（`qoder:deepseek-v4.1-flash`
+/// 就是被"接口返回"那份放行的）。禁用必须是并集**之外**的独立否决。
+///
+/// `None`（前端未传该字段）＝ **不动**已有的禁用项，而不是清空 ——
+/// 老界面 / 只改白名单的调用方不会因此丢掉用户配好的禁用项。
+#[tauri::command]
+pub async fn set_platform_models(
+    platforms: Value,
+    disabled: Option<Value>,
+) -> Result<Value, String> {
+    let result =
+        ai_gateway_core::modules::gateway::set_platform_models(&platforms, disabled.as_ref()).await;
+    if result.get("ok").and_then(Value::as_bool) == Some(false) {
+        let msg = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("设置平台模型白名单失败")
+            .to_string();
+        return Err(msg);
+    }
+    Ok(result)
+}
+
+/// 读取「平台 × 区域 → 允许的模型」白名单**与**逐条禁用清单。
+///
+/// 返回（一次读盘，两份同时取，避免两次调用之间夹着一次保存而渲染出
+/// 现实中从未存在过的组合）：
+///
+///	{"platform_models":{...},"platform_models_disabled":{...}}
+///
+/// 只读：不写配置、不重启网关。
+#[tauri::command]
+pub fn get_platform_models() -> Result<Value, String> {
+    Ok(ai_gateway_core::modules::gateway::platform_models_state())
+}
+
 /// 启动网关；传 port 时先保存再启动（前端「选端口 → 启动」一步完成）。
 #[tauri::command]
 pub async fn start_gateway(port: Option<u16>) -> Result<Value, String> {

@@ -12,6 +12,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import * as api from "@/lib/api";
+import { firstVisibleText } from "@/lib/utils";
 import type { AccountMeta } from "@/lib/types";
 
 interface Props {
@@ -24,7 +25,7 @@ interface Props {
 
 /** 账号展示名（与账号卡片一致）。 */
 function accountLabel(a: AccountMeta): string {
-  return a.nickname || a.email || a.uid || a.id;
+  return firstVisibleText(a.nickname, a.email, a.uid) || a.id;
 }
 
 /** 导出文件名：ai-gateway-accounts-YYYY-MM-DD.json */

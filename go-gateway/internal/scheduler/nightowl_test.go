@@ -168,6 +168,37 @@ func TestRunNightOwlDirectCallRespectsWindow(t *testing.T) {
 }
 
 // TestNightOwlSkipsDisabledAccounts 禁用账号不参与。
+//
+// # ⚠⚠ 这条用例当前**失败**，且是**既有问题**，不是新引入的回归
+//
+// 2026-09-28 核实：把 `nightowl.go` 还原到 HEAD（`git show HEAD:...`）后
+// 单独跑本用例，**同样 FAIL** —— 即实现里从来没有过 `st.Disabled` 跳过逻辑，
+// 而本用例从写下那天起就与实际实现不一致。
+//
+// # 冲突的两套语义（需要所有者裁决后再统一）
+//
+//	本用例                 → disabled 账号**跳过**夜猫子任务
+//	TestActivityRunsForDisabledAccounts      → disabled 账号**仍参与**活跃上报
+//	TestGrowthMapRunsForDisabledAccounts     → 同上
+//	TestSchoolRunsForDisabledAccounts        → 同上
+//	TestTrialRunsForDisabledAccounts         → 同上
+//	TestRunTravelRunsDisabledAndContinuesFailures → 同上（"仍应被查询"）
+//
+// 而同目录的 `TestActivityStillRunsForNoRouteAccounts` 又明确了另一件事：
+// **`no_route`（用户手动禁用）才该"只不选号、养号照跑"**。
+//
+// 即两个概念在测试层被混用了：
+//
+//	no_route → 用户意图「别把流量给它」，任务**照跑**（这条有明确注释）
+//	disabled → 网关判定账号已死（session 死/额度冻结），任务**宜跳过**
+//
+// 按 `disabled` 的本意，**本用例是对的**，那 5 条"仍参与"的用例才该改。
+// 但改它们会牵动 5 个任务的语义，**不属于本次缺陷修复的范围**，
+// 故此处只如实记录，不擅自改动 —— 免得把一次账号可用性修复
+// 扩大成调度语义重构。
+//
+// ⚠ 若后续要统一，请连同 `AGENTS.md` 里那张 `NoRoute`/`disabled` 对照表
+// 一起改，并同步那 5 条用例。
 func TestNightOwlSkipsDisabledAccounts(t *testing.T) {
 	if !withinNightWindow() {
 		t.Skip("需在夜猫窗口内运行")
@@ -231,8 +262,8 @@ func TestNightOwlDisabledNoSchedule(t *testing.T) {
 		KeepaliveDisabled: true,
 		ActivityDisabled:  true,
 		NightOwlDisabled:  true,
-		SchoolDisabled:  true,
-		TrialDisabled:  true,
+		SchoolDisabled:    true,
+		TrialDisabled:     true,
 		NightOwlHours:     []int{1},
 	})
 

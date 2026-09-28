@@ -61,7 +61,7 @@ func (s *Scheduler) runSchool(ctx context.Context) {
 	anyInPeriod := false
 	anyAnswered := false
 
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range s.poolList() {
 		// 账号作用域：只在「作用于该账号」的手动触发时收窄（排程路径恒为 true）。
 		if !inAccountScope(ctx, st.UID) {
 			continue

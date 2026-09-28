@@ -280,7 +280,7 @@ func (h *Handler) fetchModelsForRegion(region auth.Region) []upstream.ModelInfo 
 //	   `ProductOf()` 把空串归一成 workbuddy ⇒ 被当成 WorkBuddy 账号；
 //	③ `qoder.com.cn` 不以 `.ai` 结尾 ⇒ `Region()` 判成 **cn**；
 //	④ `ProbeUIDs()` 按 **uid 字典序**排序 ⇒ `{qoder-uid}…` 排在
-//	   `{exp-uid}…` / `1f3c55e5…` 之前 ⇒ **它被选中国服探测**；
+//	   `{exp-uid}…` / `acct-d…` 之前 ⇒ **它被选中国服探测**；
 //	⑤ 拿 Qoder 的 token 去打 WorkBuddy 的 `/v3/config` ⇒ **空清单**；
 //	⑥ `len(infos)==0` ⇒ 判定国服"没拉到" ⇒ 所有 cn 侧模型都带
 //	   `unverified_regions=[cn]` ⇒ 界面说「国服未检测到真值」。

@@ -64,7 +64,7 @@ func qoderAuthOf(cr *qoder.Cred) *auth.Auth {
 // **AccessToken** 字段承载它（而不是新增一个只对 ZCode 有意义的字段）。
 //
 // **服务商**（Z.AI / 智谱）通过 Domain 承载 —— auth.Auth 已有这个字段
-//（WorkBuddy 用它判区域），复用它避免给池加字段。下游用
+// （WorkBuddy 用它判区域），复用它避免给池加字段。下游用
 // `zcode.ProviderOfDomain` 反解。
 //
 // ⚠ ZCode **没有令牌刷新**（凭证长期有效），故 RefreshToken / ExpiresAt 留空。
@@ -280,6 +280,20 @@ func main() {
 	}
 
 	up := upstream.New()
+	// WorkBuddy 设备 token（`X-Device-Token`）：宿主提供生成服务。
+	//
+	// 官方客户端每个请求都带它（v3: 形态，约 1030 字符），网关此前不带。
+	// 见 devicetoken.go 的说明：它**不解决**账号失效（那是服务端绑定状态），
+	// 但让网关请求与官方同形态，避免长期缺设备凭证被风控标记。
+	//
+	// 未配置时 provider 为 nil，`attachDeviceToken` 直接返回 ——
+	// 行为与本特性引入前逐字相同（不发该头）。
+	if u := strings.TrimSpace(cfg.Pool.WbDeviceTokenURL); u != "" {
+		up.DeviceToken = upstream.NewDeviceTokenProvider(u, cfg.Pool.WbDeviceTokenToken)
+		log.Printf("WorkBuddy 设备 token：已启用（宿主服务 %s）", u)
+	} else {
+		log.Printf("WorkBuddy 设备 token：未配置（国际版请求不带 X-Device-Token）")
+	}
 	// 出站代理：必须在 New() 之后、其它 transport 调优之前设置 ——
 	// SetProxy 会重建 Transport，之后的调优（ResponseHeaderTimeout）才作用在新实例上。
 	//
@@ -341,30 +355,30 @@ func main() {
 	}
 
 	sch := scheduler.New(scheduler.Config{
-		Pool:                p,
-		Upstream:            up,
-		CheckinHours:        cfg.Schedule.CheckinHours,
-		KeepaliveHours:      cfg.Schedule.KeepaliveHours,
-		ActivityHours:       cfg.Schedule.ActivityHours,
-		NightOwlHours:       cfg.Schedule.NightOwlHours,
-		SchoolHours:         cfg.Schedule.SchoolHours,
-		TrialHours:          cfg.Schedule.TrialHours,
-		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
-		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
-		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
-		NightOwlDisabled:    !cfg.Schedule.NightOwlEnabled,
-		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
-		TrialDisabled:       !cfg.Schedule.TrialEnabled,
+		Pool:              p,
+		Upstream:          up,
+		CheckinHours:      cfg.Schedule.CheckinHours,
+		KeepaliveHours:    cfg.Schedule.KeepaliveHours,
+		ActivityHours:     cfg.Schedule.ActivityHours,
+		NightOwlHours:     cfg.Schedule.NightOwlHours,
+		SchoolHours:       cfg.Schedule.SchoolHours,
+		TrialHours:        cfg.Schedule.TrialHours,
+		CheckinDisabled:   !cfg.Schedule.CheckinEnabled,
+		KeepaliveDisabled: !cfg.Schedule.KeepaliveEnabled,
+		ActivityDisabled:  !cfg.Schedule.ActivityEnabled,
+		NightOwlDisabled:  !cfg.Schedule.NightOwlEnabled,
+		SchoolDisabled:    !cfg.Schedule.SchoolEnabled,
+		TrialDisabled:     !cfg.Schedule.TrialEnabled,
 		// Qoder 权益领取时点与开关（2026-09-22 新增）。
 		//
 		// ⚠ 用 `cfg.QoderClaimOn()` 而不是某个具体字段：它封装了
 		// 「分产品键优先、缺席回落到总闸」的两级语义（见该方法说明）。
 		// 这里直接读 `QoderClaimEnabled` 会把老配置（只有总闸）当成关闭。
-		QoderClaimHours:    cfg.Schedule.QoderClaimHours,
-		QoderClaimDisabled: !cfg.QoderClaimOn(),
-		ActivityReportCount:  cfg.Schedule.ActivityReportCount,
-		CheckinScope:         cfg.Schedule.CheckinScope,
-		Records:              recorder,
+		QoderClaimHours:     cfg.Schedule.QoderClaimHours,
+		QoderClaimDisabled:  !cfg.QoderClaimOn(),
+		ActivityReportCount: cfg.Schedule.ActivityReportCount,
+		CheckinScope:        cfg.Schedule.CheckinScope,
+		Records:             recorder,
 	})
 	if normalizeCheckinScope(cfg.Schedule.CheckinScope) == "all" {
 		log.Printf("签到与猫猫旅行范围：国服 + 国际版（schedule.checkin_scope=all）")
@@ -545,7 +559,7 @@ func main() {
 		// 而所有者明确要求「qoder改为 早十点,晚九点 两次触发」。
 		sch.SetProductTasksRunner(newProductTasksRunner(
 			zd, claimSched,
-			qoderDir,          // Qoder 凭证目录（领取要遍历账号）
+			qoderDir,           // Qoder 凭证目录（领取要遍历账号）
 			cfg.QoderClaimOn(), // 分产品开关（缺席回落总闸）
 		))
 		log.Printf("ZCode 自动领取：启动即跑，之后每 %v 轮询（失败冷却 %v，开关=%v）",
@@ -617,6 +631,50 @@ func main() {
 		}
 		p.SetProductModelsFallback(fallback)
 		p.SetProductModels(pm)
+
+		// 用户白名单（平台 × 区域 → 允许的模型）。
+		//
+		// 与上面的 `ProductModels` **分工不同**（见 config.go 的注释）：
+		// 那份是上游查询来的**路由提示**，这份是用户手动配的**准入控制**。
+		// 只有后者会拦请求 —— 因为"上游能服务"不等于"用户想让它跑"。
+		p.SetPlatformModels(cfg.Pool.PlatformModels)
+		if n := len(cfg.Pool.PlatformModels); n > 0 {
+			for plat, byRegion := range cfg.Pool.PlatformModels {
+				for region, models := range byRegion {
+					label := region
+					if label == "" {
+						label = "不分区域"
+					}
+					log.Printf("平台白名单：%s / %s → %d 个模型", plat, label, len(models))
+				}
+			}
+		} else {
+			log.Printf("平台白名单未配置（platform_models 为空）：显式指定平台时不拦模型，行为与引入前一致")
+		}
+
+		// 用户**禁用**清单（平台 × 区域 → 不许跑的模型）。
+		//
+		// ⚠ 它是**否决项**，先于上面那份白名单的并集判定 —— 理由见
+		// `pool.platformModelsDisabled` 的注释：并集语义下"从白名单里
+		// 删掉一个模型"是删不掉的（接口返回/兜底那两支仍会放行它），
+		// 故"不许它跑"必须是一条独立的、压过并集的判据。
+		//
+		// 在 `SetPlatformModels` 之后调用只是习惯顺序；两者写的是
+		// 互不相干的字段，判定顺序由 `platformAllowsModelLocked` 保证。
+		p.SetPlatformModelsDisabled(cfg.Pool.PlatformModelsDisabled)
+		if n := len(cfg.Pool.PlatformModelsDisabled); n > 0 {
+			for plat, byRegion := range cfg.Pool.PlatformModelsDisabled {
+				for region, models := range byRegion {
+					label := region
+					if label == "" {
+						label = "不分区域"
+					}
+					log.Printf("平台禁用清单：%s / %s → %d 个模型（否决项，压过白名单并集）", plat, label, len(models))
+				}
+			}
+		} else {
+			log.Printf("平台禁用清单未配置（platform_models_disabled 为空）：不否决任何模型")
+		}
 	} else {
 		log.Printf("多产品路由已关闭（pool.multi_product=false）：只使用 WorkBuddy 账号")
 	}
@@ -730,7 +788,7 @@ func main() {
 	}
 	go func() {
 		<-ctx.Done()
-		p.Flush()         // 信号触发：先落盘再做优雅停机
+		p.Flush()          // 信号触发：先落盘再做优雅停机
 		usageStore.Flush() // Token 用量同样在退出前补一次落盘
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -747,7 +805,7 @@ func main() {
 // configWatchInterval 配置文件的轮询周期。
 //
 // 5 秒与 `pool.WatchAuthDir` 的默认值一致：配置变更是低频事件
-//（用户点一次"刷新账号"），5 秒延迟无感；而更密只会带来无谓的 IO。
+// （用户点一次"刷新账号"），5 秒延迟无感；而更密只会带来无谓的 IO。
 const configWatchInterval = 5 * time.Second
 
 // startConfigWatch 轮询配置文件与多产品凭证目录，变化时热重载。
@@ -874,7 +932,7 @@ func fileStamp(path string) string {
 // 逐文件比对会让每个周期都分配一堆字符串。
 //
 // 目录为空/不存在时返回空串 —— 与"该产品未启用"这一态一致
-//（调用方对空串直接跳过，不再尝试加载）。
+// （调用方对空串直接跳过，不再尝试加载）。
 func dirStamp(dir string) string {
 	if dir == "" {
 		return ""

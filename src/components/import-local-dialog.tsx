@@ -19,6 +19,7 @@ import type {
   LocalImportCandidate,
   LocalScanResult,
 } from "@/lib/types";
+import { firstVisibleText } from "@/lib/utils";
 
 interface Props {
   open: boolean;
@@ -27,9 +28,15 @@ interface Props {
   onImported?: (result: { imported: number; added: number; updated: number }) => void;
 }
 
-/** 候选账号展示名（与账号卡片一致）。 */
+/**
+ * 候选账号展示名（与账号卡片一致）。
+ *
+ * 判据是 `firstVisibleText` 而不是 `||`：上游昵称可能是整串不可见字符
+ * （真实案例：单个 U+E0000 标签字符），`||` 会把它当成「有名字」而不回退，
+ * 结果这一项在列表里是一片空白，用户无法确认要导入哪个号。
+ */
 function candidateLabel(meta: AccountMeta): string {
-  return meta.nickname || meta.email || meta.uid || meta.id;
+  return firstVisibleText(meta.nickname, meta.email, meta.uid, meta.id) || meta.id;
 }
 
 /** 只展示到分钟，避免把毫秒时间戳直接抛给用户。 */

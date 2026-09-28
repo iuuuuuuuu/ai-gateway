@@ -134,7 +134,7 @@ func TestSchoolClaimsOnlyFinished(t *testing.T) {
 // 这是本功能的设计红线：task_student_verify（学生认证）、share_invite（邀请）、
 // expert_use（专家功能）都需要真实动作，伪造属于刷量。
 // 本任务只做「把已达标的奖励领回来」，因此这些任务即使在列也不会被 claim
-//（除非它们已经是 finished 状态 —— 那是用户自己完成的，领取是正当的）。
+// （除非它们已经是 finished 状态 —— 那是用户自己完成的，领取是正当的）。
 func TestSchoolDoesNotFakeActions(t *testing.T) {
 	rec := &schoolRecorder{
 		inPeriod: true,

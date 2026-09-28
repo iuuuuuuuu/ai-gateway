@@ -113,8 +113,8 @@ func TestFetchModelsSendsWorkBuddyUA(t *testing.T) {
 	if !strings.HasPrefix(ua, "WorkBuddy/") {
 		t.Fatalf("UA 必须以 WorkBuddy/ 开头（否则拿到 CodeBuddy 产品清单），实际 %q", ua)
 	}
-	if ua == clientUA {
-		t.Fatalf("模型接口不能复用全局 clientUA（%q）—— 那会返回 CodeBuddy 的模型清单", clientUA)
+	if ua == clientUACN {
+		t.Fatalf("模型接口不能复用国服 CLI 的 UA（%q）—— 那会返回 CodeBuddy 的模型清单", clientUACN)
 	}
 }
 

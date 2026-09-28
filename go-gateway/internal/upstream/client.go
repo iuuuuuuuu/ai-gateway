@@ -83,6 +83,191 @@ const (
 	// 故与 ErrContextTooLong / ErrEffortRejected 同样处理：请求侧错误，
 	// 不轮转、不冷却账号、原样透出并给出可操作的提示。
 	ErrModelNotInRegion
+	// ErrAccountUnusable 该账号**当前打不通**，但账号本身没坏（HTTP 403 code=11140）。
+	//
+	// # 为什么必须与 ErrClient 区分开（2026-09-27 实测缺陷）
+	//
+	// 实测原文：
+	//
+	//	{"code":11140,"msg":"request illegal",
+	//	 "displayMsg":{"zh":"内容未通过安全审核"}}
+	//
+	// 它此前落进通用 `ErrClient`，而 `applyErrorPolicy` 对 `ErrClient` 是
+	// **"只换号不罚"**（防雪崩）。于是这些账号**永不冷却** ⇒
+	// 每轮换号都被重新选中 ⇒ 请求在「坏号集合」里空转直到 MaxRotate 用尽。
+	//
+	// 实测（8 个国际版账号，裸名 `deepseek-v4.1-flash`）：
+	//
+	//	修复前：0/6 成功（全 502）—— 始终在坏号里轮转
+	//	把坏号冷却后：可用账号立刻被选中，请求成功
+	//
+	// 这与所有者的调度模型直接相关：
+	//
+	//	「账号不可用就冷却，然后这时候再自动降级到（下一个成本档位）」
+	//
+	// 「冷却」是自动降级能发生的前提 —— 不冷却，成本分层就永远
+	// 卡在最便宜但不可用的那一档，永远降不下去。
+	//
+	// # 与相邻概念的区分（所有者要求三者分开）
+	//
+	//	ErrModelRate   模型冷却：某账号的**这个模型**额度用尽，换模型仍可用
+	//	ErrAccountUnusable 账号冷却：整号当前打不通，冷却后到期自动恢复
+	//	ErrSessionDead 账号封禁：凭证失效，需人工重登（Disable，不自动恢复）
+	//
+	// 三者粒度与恢复方式都不同，混为一谈会让"等一会儿就好"与"必须重登"
+	// 变成同一件事。
+	//
+	// =====================================================================
+	// ⚠⚠ 11140 的**真实根因**：该账号在本设备上未完成登录（设备注册失效）
+	// =====================================================================
+	//
+	// 2026-09-28 逐账号实测（同一请求体、同一 UA、同一端点，直连上游）：
+	//
+	//	uid        refresh  chat(刷新后)  chat(原始)
+	//	a1b2c3d4   200✅     200✅        200✅     ← 刚在官方客户端登录过
+	//	b2c3d4e5   200✅     403❌ 11140  403❌
+	//	c3d4e5f6   200✅     403❌ 11140  403❌
+	//	d4e5f6a7   200✅     403❌ 11140  403❌
+	//	e5f6a7b8   200✅     403❌ 11140  403❌
+	//	f6a7b8c9   200✅     403❌ 11140  403❌
+	//	a7b8c9da   200✅     429（无额度）
+	//	b8c9daeb   200✅     429（无额度）
+	//
+	// 三条**否证**（都做过，都排除了）：
+	//
+	//	① 不是 UA 问题 —— 用官方客户端同款 UA
+	//	   `workbuddy-ai/5.6.2 workbuddy-ai/5.6.2 CLI/2.147.0` 直连，
+	//	   结果与网关一致（a1b2c3d4 通、其余 11140）。
+	//	② 不是 token 过期 —— 8 个账号的 AT 都还有 350+ 天；
+	//	   且**刷新成功后立刻重试仍然 11140**（逐账号 refresh→chat 实测，
+	//	   refresh 全部 200 且返回新 AT，chat 仍 403）。
+	//	③ 不是 X-Device-Token 缺失 —— 这条做过**完整矩阵**（2026-09-28，
+	//	   用所有者导出的全部 9 个国际版账号，三组对照）：
+	//
+	//		nickname          A 无DT    B 带登录DT  C 自造DT
+	//		acct1(刚重登)     200✅     200✅       200✅
+	//		acct2             403      403         403
+	//		acct3             403      403         403
+	//		acct4             403      403         403
+	//		acct5             403      403         403
+	//		acct6             403      403         403
+	//		acct7 / acct8     429      429         429   ← 额度耗尽，非本问题
+	//
+	//	   B 用的是从抓包里取出的、真·OIDC 登录请求携带的那个 device token
+	//	   （990 字符 v3 形态）；C 是每账号独立自造 UUID。**两者都不改变结果**。
+	//	   即 device token **不是**准入开关，上游的 (设备,账号) 绑定是
+	//	   **服务端记录**，客户端无法用请求头伪造或迁移。
+	//
+	// ⇒ **上游把 (设备, 账号) 绑定作为准入条件**。账号只在本机官方客户端
+	//   完成过一次登录（设备注册）才可用；重装/换机/退出登录会让绑定失效，
+	//   而失效**不会**体现在 token 上（refresh 照样成功）。
+	//
+	// 实测还有一个更细的线索（auth_time = 真正的登录时刻，非刷新时刻）：
+	//
+	//	可用的 acct1   auth_time ≈ 09-16 且**单独**登录
+	//	403 的六个账号        auth_time ≈ 09-24，**同一时间段批量登录**
+	//
+	// 这与「同一设备短时间内登录多个账号被上游标记」一致 —— 也正好呼应
+	// 所有者那句「一个设备一个独立的，不然会被认为一个设备多个账号」。
+	//
+	// 所有者验证：**重新登录国际版账号后即恢复正常**。
+	//
+	// # 对网关的含义（重要，不要据此改出"神奇修复"）
+	//
+	// 网关**无法**凭空修复这种账号 —— 它需要本人在官方客户端重登一次
+	// （设备注册是客户端原生风控 SDK 的行为，网关既生成不了也不该伪造）。
+	// 网关能做且已做的是**把它当成"账号不可用"正确归类**，从而：
+	//
+	//	· 冷却该账号，不再反复选中它（否则在坏号集合里空转）；
+	//	· 让成本分层**降级**到下一个可用档位，请求照样成功。
+	//
+	// 两条**别踩**的路（都试过、都错）：
+	//
+	//	✗ 把裸名"偏好国服"来绕开 —— 那是拿可用性换成本，且与所有者
+	//	  「按成本调度、不可用就冷却、再自动降级」的模型相反。
+	//	✗ 伪造/搬运 device token —— 上面的完整矩阵已证伪；共用只会让
+	//	  上游看到"一设备多账号"，把好号也拖下水。
+	//
+	// =====================================================================
+	// ⚠⚠ 「网关自己生成设备身份」这条路**已评估并否决**（2026-09-28）
+	// =====================================================================
+	//
+	// 所有者提过：能不能像 ZCode 那样用 WebView 模拟，给每个账号分配
+	// 独立设备 ID，免得反复手动重登。查证结果如下（证据都实测过）。
+	//
+	// # 组件确实找得到，SDK 也真的能加载
+	//
+	//	app.asar.unpacked/native/turing-sdk/
+	//	  ├── index.cjs            N-API 包装，导出 configure / fetchDeviceToken
+	//	  ├── build/Release/turing_sdk.node
+	//	  └── build/Release/TuringShieldSDK.dll   （仅导出 createTSObject）
+	//
+	// 用客户端自带 node 加载 `index.cjs`：`isSupported=true`（**能加载**）。
+	//
+	// # 但它是**联网申请**设备凭证，不是本地生成
+	//
+	// 按真实签名 `configure(channelId:number, productName, productVersion)`
+	// 调用（第一版传字符串会报 "A number was expected"）：
+	//
+	//	configure(0)     → THROW: channelId must be a positive integer assigned by T-Sec
+	//	configure(1)     → OK
+	//	fetchDeviceToken → THROW: request token error, response code[14]
+	//	configure(10001) → THROW: Turing SDK channelId cannot change after initialization
+	//
+	// 关键是那句 **`request token error`** —— 它是向腾讯 T-Sec 风控服务
+	// **发请求换 token**。且有 `response code[14]` 这类服务端校验，
+	// 说明不是随便调就能过；真实 channelId 也由客户端配置注入，
+	// 且 SDK 初始化后锁死。
+	//
+	// # 为什么不做（三条，任一条都足够）
+	//
+	//	① **性质是伪造**：device token 是风控服务发放的设备凭证。
+	//	   网关替每个账号"申请"一个，等于伪造设备身份绕过风控 ——
+	//	   这与本仓库「如实透传、不替上游判断」的既有原则直接冲突。
+	//	② **方向与目标相反**：所有者原话是「一个设备一个独立的，
+	//	   不然会被认为一个设备多个账号」。而在一台机器上为 N 个账号
+	//	   各造一个设备身份，做的**正是**制造"一设备多账号"这件事。
+	//	③ **官方路径已经有效且更简单**：在官方客户端重登一次即恢复
+	//	   （所有者已亲自验证）。网关要做的是**正确归类 + 冷却降级**，
+	//	   让坏号不影响其它请求，而不是去修上游的风控状态。
+	//
+	// ⇒ 结论：网关**不实现**设备身份生成。失效账号请去官方客户端重登。
+	ErrAccountUnusable
+	// ErrModelParamInvalid 请求参数不符合**当前模型**的要求（HTTP 400 code=11133）。
+	//
+	// 实测原文（2026-09-28，所有者开发会话的真实报错）：
+	//
+	//	{"code":11133,"msg":"Invalid request parameters",
+	//	 "extError":{"code":"model_param_invalid",
+	//	   "message":"the request parameters were rejected by the model provider",
+	//	   "param":"","type":"invalid_request_error","StatusCode":400}}
+	//
+	// # 为什么必须独立成型
+	//
+	// 它此前落进通用 ErrClient ⇒ 被当成**账号问题**逐号轮转 ⇒
+	// 每个账号都被同一个请求体打一遍，最后包装成：
+	//
+	//	503 {"code":"no_healthy_account",
+	//	     "message":"all accounts unavailable (cooling/disabled): ..."}
+	//
+	// 而真实原因是**请求参数被模型提供商拒了**（extError 里写着
+	// "rejected by the model provider"），与账号毫无关系 ——
+	// 换一万个账号也是同样的 400。
+	//
+	// 这与 ErrModelNotInRegion（11102）/ ErrContextTooLong（11115）
+	// 是同一类**请求侧**错误，处置也相同：
+	//
+	//	· 不轮转（省掉 N 次无用的上游请求）
+	//	· 不罚账号（账号是好的，罚它只会造成"我们自己弄坏好号"）
+	//	· 原样透出上游原文（extError 里带着真实的拒绝理由）
+	//
+	// ⚠ 与 ErrContextTooLong 的区别：那条有明确的 token 计数与窗口，
+	// 客户端可据此触发自动压缩；11133 的 `param` 字段上游给了**空串**，
+	// 拿不到具体是哪个参数 —— 故只能如实转达，不猜。
+	//
+	// ⚠ 特别提示：`param` 为空时**不要**自作聪明地把它归到上下文超长去。
+	// 那会让客户端误触发压缩，而压缩并不会解决参数问题。
+	ErrModelParamInvalid
 )
 
 func (k ErrKind) String() string {
@@ -107,6 +292,10 @@ func (k ErrKind) String() string {
 		return "effort_rejected"
 	case ErrModelNotInRegion:
 		return "model_not_in_region"
+	case ErrAccountUnusable:
+		return "account_unusable"
+	case ErrModelParamInvalid:
+		return "model_param_invalid"
 	default:
 		return "none"
 	}
@@ -381,6 +570,11 @@ func FriendlyMessage(kind ErrKind, status int, body string) string {
 		//（如 "the reasoning effort value is not supported by the current model"），
 		// 自己换一个档位即可，与账号状态无关。
 		return "上游不接受本次指定的思考档位（reasoning_effort）：" + EffortRejectedDetail(body)
+	case kind == ErrModelParamInvalid:
+		// 保留 extError.message —— 这是**请求侧**错误，用户要原样看到上游说了什么
+		//（如 "the request parameters were rejected by the model provider"），
+		// 自己调整参数即可，与账号状态无关。
+		return ModelParamInvalidMessage(body)
 	case kind == ErrServer && status > 0:
 		return "上游服务异常（HTTP " + strconv.Itoa(status) + "），已切换到其他账号"
 	}
@@ -407,9 +601,72 @@ var effortRejectedMarkers = []string{
 // 只放**足够特异**的片段 —— 通用词（如 "model not found"）会误伤正常报错。
 // 主判据仍是业务码 11102（见 IsModelNotInRegion）。
 var modelNotInRegionMarkers = []string{
-	"service info not found",   // 实测原文：model [X] service info not found
+	"service info not found", // 实测原文：model [X] service info not found
 	"model service not found",
 	"model info not found",
+}
+
+// IsModelParamInvalid 请求参数不符合**当前模型**的要求（HTTP 400 code=11133）。
+//
+// # 为什么独立识别（2026-09-28 新增）
+//
+// 实测原文（所有者开发会话的真实报错）：
+//
+//	{"code":11133,"msg":"Invalid request parameters",
+//	 "extError":{"code":"model_param_invalid",
+//	   "message":"the request parameters were rejected by the model provider"}}
+//
+// 它此前落进通用 ErrClient ⇒ 被当成**账号问题**逐号轮转 ⇒
+// 每个账号都被同一个请求体打一遍，最后包装成：
+//
+//	503 {"code":"no_healthy_account",
+//	     "message":"all accounts unavailable (cooling/disabled): ..."}
+//
+// 而真实原因是**请求参数被模型提供商拒了**（extError 里明写
+// "rejected by the model provider"），与账号毫无关系 ——
+// 换一万个账号也是同样的 400。
+//
+// 处置与 ErrContextTooLong / ErrModelNotInRegion 相同：
+//   - 不轮转（省掉 N 次无用的上游请求）
+//   - 不罚账号（账号是好的，罚它只会造成"我们自己弄坏好号"）
+//   - 原样透出上游原文（extError 里带着真实的拒绝理由）
+//
+// ⚠ `param` 字段上游给了**空串**，拿不到具体是哪个参数 ——
+// 故只能如实转达，不猜。特别提示：**不要**把它归到上下文超长去，
+// 那会让客户端误触发压缩，而压缩并不会解决参数问题。
+func IsModelParamInvalid(body string) bool {
+	if strings.Contains(body, "11133") {
+		return true
+	}
+	// extError.code = "model_param_invalid" 是更特异的特征（全小写比较）
+	if strings.Contains(strings.ToLower(body), "model_param_invalid") {
+		return true
+	}
+	return false
+}
+
+// ModelParamInvalidMessage 生成 11133 的可读文案。
+//
+// 尽量保留 extError.message（如 "the request parameters were rejected by
+// the model provider"），让用户知道是**参数**被拒而不是账号故障。
+func ModelParamInvalidMessage(body string) string {
+	var envelope struct {
+		ExtError struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Param   string `json:"param"`
+		} `json:"extError"`
+	}
+	head := "上游拒绝本次请求的参数（code=11133）"
+	if err := json.Unmarshal([]byte(body), &envelope); err == nil {
+		if envelope.ExtError.Message != "" {
+			head += "：" + envelope.ExtError.Message
+		}
+		if envelope.ExtError.Param != "" {
+			head += "（参数：" + envelope.ExtError.Param + "）"
+		}
+	}
+	return head + "。这不是账号问题，换账号无效；请检查请求参数（如模型名、思考档位、工具定义）后重试。"
 }
 
 // IsEffortRejected 上游是否在拒绝本次请求的思考档位。
@@ -451,6 +708,27 @@ func IsModelNotInRegion(body string) bool {
 	return false
 }
 
+// accountUnusableCodes 上游表达「这个账号当前打不通」的业务码。
+//
+// 11140 = request illegal。实测（2026-09-27）它由**账号侧**状态决定：
+// 同一份请求体、同一个模型，有的账号 200、有的账号 403 11140，
+// 且后者在官方客户端上同样打不通（不是网关请求形态的问题）。
+//
+// ⚠ 只收「确定是账号侧」的码。判据是**同一请求在不同账号上结果不同** ——
+// 若某个码对任何账号都同样失败，那它是**请求侧**错误（应像 11102 那样
+// 独立成型、不冷却账号），加进来只会让健康账号被误冷却。
+var accountUnusableCodes = []string{"11140"}
+
+// IsAccountUnusable 报告响应体是否表达「该账号当前打不通」。
+func IsAccountUnusable(body string) bool {
+	for _, c := range accountUnusableCodes {
+		if strings.Contains(body, c) {
+			return true
+		}
+	}
+	return false
+}
+
 // ModelNotInRegionMessage 把 11102 渲染成**可操作**的中文提示。
 //
 // # 为什么必须重写而不是透传原文
@@ -461,7 +739,7 @@ func IsModelNotInRegion(body string) bool {
 //	· 完全没说**该怎么办** —— 用户只会反复重试同一个模型。
 //
 // 真实成因是**区域不匹配**：同名模型可能只在某一侧上游存在
-//（见 `capability.go` 的 regionNote）。故提示里给出两条出路：
+// （见 `capability.go` 的 regionNote）。故提示里给出两条出路：
 // 换一个模型，或用 `平台:区域:模型名` 的写法明确指定。
 //
 // 保留了原始模型名与上游文案 —— 排查时仍需要它们。
@@ -482,9 +760,9 @@ func ModelNotInRegionMessage(model, body string) string {
 // upstreamMsgOf 从响应体里取一句可读的上游说明（取不到返回空）。
 func upstreamMsgOf(body string) string {
 	var env struct {
-		Msg      string `json:"msg"`
-		Message  string `json:"message"`
-		Error    struct {
+		Msg     string `json:"msg"`
+		Message string `json:"message"`
+		Error   struct {
 			Message string `json:"message"`
 			Msg     string `json:"msg"`
 		} `json:"error"`
@@ -506,14 +784,14 @@ func upstreamMsgOf(body string) string {
 // EffortRejectedDetail 从上游响应体里取出可读的原始说明。
 //
 // 保留原文很重要：用户要据此判断该换哪个档位，而我们的猜测未必对
-//（实测不同模型接受的范围并不相同：off 在 14/16 个模型被接受，
+// （实测不同模型接受的范围并不相同：off 在 14/16 个模型被接受，
 // 却被两个 deepseek 模型拒绝 —— 没有任何一张通用表能替他判断）。
 //
 // 取不到 msg 字段时回退到原始 body（截断），而不是编一句像是我们判断的话。
 func EffortRejectedDetail(body string) string {
 	var env struct {
-		Msg      string `json:"msg"`
-		Error    struct {
+		Msg   string `json:"msg"`
+		Error struct {
 			Message string `json:"message"`
 			Msg     string `json:"msg"`
 		} `json:"error"`
@@ -583,8 +861,30 @@ func Classify(status int, body string) ErrKind {
 	if IsModelNotInRegion(body) {
 		return ErrModelNotInRegion
 	}
+	// 请求参数不符合当前模型要求（11133）也是**请求侧**错误。
+	//
+	// 实测原文（所有者 2026-09-28 开发会话）：
+	//	{"code":11133,"extError":{"code":"model_param_invalid",
+	//	  "message":"the request parameters were rejected by the model provider"}}
+	//
+	// 换号毫无意义 —— 同一请求体给任何账号都会被同一模型提供商拒；
+	// 落进 ErrClient 只会被逐号轮转，最后伪装成「账号全部不可用」。
+	//
+	// ⚠ 放在 IsModelNotInRegion 之后、ErrNotFound 之前：
+	// 它与 11102 同属"请求侧、换号无用"这一类，措辞不同但处置相同。
+	if IsModelParamInvalid(body) {
+		return ErrModelParamInvalid
+	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
+	}
+	// 账号侧不可用（403 code=11140）必须早于通用 4xx 判定。
+	//
+	// 归进通用 ErrClient 的后果是 `applyErrorPolicy` 对它"只换号不罚" ⇒
+	// 坏号永不冷却 ⇒ 成本分层永远卡在最便宜却打不通的那一档，
+	// **永远降级不到下一个档位**（见 ErrAccountUnusable 的注释）。
+	if IsAccountUnusable(body) {
+		return ErrAccountUnusable
 	}
 	if status >= 500 {
 		return ErrServer
@@ -607,8 +907,8 @@ func Classify(status int, body string) ErrKind {
 // 中文提示同时给人类看。上游字段缺失时逐级回退，最终回退到原始 body。
 func ContextTooLongMessage(body string) string {
 	var env struct {
-		Msg       string `json:"msg"`
-		ExtError  struct {
+		Msg      string `json:"msg"`
+		ExtError struct {
 			Message string `json:"message"`
 		} `json:"extError"`
 		DisplayMsg struct {
@@ -681,6 +981,13 @@ type Client struct {
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
 
+	// DeviceToken 设备 token 提供者（宿主服务）。nil = 该特性未启用。
+	//
+	// 官方 WorkBuddy 客户端每个请求都带 `X-Device-Token`，网关此前不带。
+	// 见 devicetoken.go 的说明：它**不解决**账号失效（那是服务端绑定），
+	// 但能让网关请求与官方同形态，避免长期缺设备凭证被风控标记。
+	DeviceToken *DeviceTokenProvider
+
 	ChatBaseCN    string
 	BillingBaseCN string
 	// WebBaseCN / WebBaseIntl 官网域（成长中心）基址。
@@ -717,8 +1024,9 @@ type Client struct {
 // IsIntl 判断账号是否属于国际版（供签到/旅行的区域范围过滤复用）。
 //
 // 依据 auth 文件里的 domain 字段：
-//   *.workbuddy.cn / *.codebuddy.cn -> 国服
-//   *.workbuddy.ai / *.codebuddy.ai -> 国际版
+//
+//	*.workbuddy.cn / *.codebuddy.cn -> 国服
+//	*.workbuddy.ai / *.codebuddy.ai -> 国际版
 //
 // domain 缺失时按国服处理：历史上只存在国服账号，保持向后兼容。
 //
@@ -785,7 +1093,7 @@ func newTransport(proxyURL *url.URL) *http.Transport {
 // ProxyFromEnvironment」：开关的名字与文案都是「使用代理」，用户关掉它就是要
 // **不走代理**。若这时还偷偷吃 HTTPS_PROXY，用户会在界面上看到「已关闭」、
 // 实际流量仍绕道 —— 与「关了开关却仍在走代理」是同一种欺骗，而且更难查
-//（现象只在设了环境变量的机器上出现）。
+// （现象只在设了环境变量的机器上出现）。
 //
 // 代价与边界：这是本次唯一会让国服出站行为变化的路径，且**只发生在用户
 // 主动关掉国内版开关时**（配置里没有这个键的老用户仍走 ProxyFromEnvironment，
@@ -819,7 +1127,7 @@ func newDirectTransport() *http.Transport {
 //	第 3 次  TLS 0     总 1.25s
 //
 // 「能不能复用」直接决定快慢，而每次新建都要重付 ~0.8 秒握手
-//（跨境链路，握手本身就慢）。
+// （跨境链路，握手本身就慢）。
 //
 // ⚠ 上游不支持 h2 时该字段**无副作用**：ALPN 协商回 h1.1，行为与现在完全一致。
 // 故这是一个「支持就赚、不支持不亏」的开关。
@@ -850,8 +1158,8 @@ func newTransportSkeleton() *http.Transport {
 // 地址仍只填一次（宿主透传），本结构只决定「哪些区域使用它」。
 //
 // 为什么需要它：同一个代理对两个区域的收益完全相反 —— 国际版
-//（workbuddy.ai）国内直连实测 wsarecv 超时，必须走代理；国服
-//（copilot.tencent.com / codebuddy.cn）直连即通，绕进代理只会多一跳延迟、
+// （workbuddy.ai）国内直连实测 wsarecv 超时，必须走代理；国服
+// （copilot.tencent.com / codebuddy.cn）直连即通，绕进代理只会多一跳延迟、
 // 多一个故障面（代理一挂，本来好好的国服账号跟着不可用）。
 //
 // 零值（false/false）**不是**默认语义：默认由宿主写入，见 cmd/server/config.go
@@ -1270,6 +1578,35 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	return nil
 }
 
+// attachDeviceToken 给国际版请求带上 `X-Device-Token`。
+//
+// # 失败必须静默降级（重要设计决策）
+//
+// 拿不到 token 时**不发该头**，请求照常发出。理由：
+//
+//	· 该头是"锦上添花"（防未来风控标记），**不是准入条件** ——
+//	  实测不带它，健康账号照样 200。
+//	· 若因拿不到就拒绝请求，等于把一个**可选增强**变成**新的单点故障**：
+//	  宿主服务没起来 / node 缺失 / 用户没装官方客户端，都会让
+//	  所有国际版对话不可用。那是拿可用性换完整性，方向错。
+//
+// 故这里只记日志（便于排查"为什么没带上"），绝不上抛错误。
+func (c *Client) attachDeviceToken(req *http.Request, a *auth.Auth) {
+	if !isIntl(a) {
+		return
+	}
+	if c.DeviceToken == nil || !c.DeviceToken.Enabled() {
+		return
+	}
+	tok, err := c.DeviceToken.Fetch()
+	if err != nil {
+		// 降级：不发该头。日志保留原因，否则"为什么这次没带"无从查起。
+		log.Printf("device_token uid=%s: 获取失败（本次不发该头，请求照常）: %v", a.UID, err)
+		return
+	}
+	req.Header.Set("X-Device-Token", tok)
+}
+
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify(status, string(body))）、err 为 nil；
 // 只有传输层失败才返回 err。
@@ -1280,6 +1617,13 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 		return nil, 0, nil, err
 	}
 	ChatHeaders(req, a)
+	// 设备 token：只对**国际版**发。
+	//
+	// 为什么限定国际版：抓包证据只覆盖国际版（workbuddy.ai）—— 官方国服
+	// 客户端走的是另一套（codebuddy.cn / copilot.tencent.com），我们没有
+	// 它的证据，不该凭"国际版有"就推断"国服也要"。多发给国服一个它不认的
+	// 头，风险大于收益（国服当前实测良好，不动它）。
+	c.attachDeviceToken(req, a)
 	ctx, cancel := context.WithCancel(context.Background())
 	req = req.WithContext(ctx)
 	resp, err := c.chatClientFor(a).Do(req)
@@ -1603,8 +1947,8 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 				//
 				// 用非指针 string 会让那 19 个模型全部被判成免费 —— 正是
 				// 「把该计费的算成免费」，与本缺陷反方向但同样错。
-				Credits *string `json:"credits"`
-				Reasoning          struct {
+				Credits   *string `json:"credits"`
+				Reasoning struct {
 					// effort 与 defaultEffort 是**同一个东西的两种拼写**：
 					// 实测 0 个模型同时带这两个键（带 supportedEfforts 的一律用
 					// defaultEffort，不带的用 effort），故两者都读，见 DefaultEffort。

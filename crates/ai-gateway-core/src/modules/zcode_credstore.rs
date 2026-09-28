@@ -15,7 +15,7 @@
 //! `~/.zcode/v2/credentials.json` 的 `oauth:bigmodel:user_info` 里，
 //! 只是被 `enc:v1:` 加密了：
 //!
-//!   {"id":"12345678901234567","username":"wish","displayName":"wish","avatarUrl":"..."}
+//!   {"id":"12345678901234567","username":"demo-user","displayName":"demo-user","avatarUrl":"..."}
 //!
 //! ## 解密方案（**逐字**从客户端 app.asar 提取，不是猜的）
 //!
@@ -71,9 +71,9 @@ const ENV_SECRET: &str = "ZCODE_CREDENTIAL_SECRET";
 /// 从 credentials.json 里读出的账号信息。
 #[derive(Debug, Clone, Default)]
 pub struct ZcodeIdentity {
-    /// 用户名（如 `wish`）。
+    /// 用户名（如 `demo-user`）。
     pub username: String,
-    /// 展示名（实测上游叫 `name`，如 `旅行者5800`）。
+    /// 展示名（实测上游叫 `name`，如 `示例用户`）。
     pub display_name: String,
     /// 账号 ID（数字串或 UUID）。
     pub id: String,
@@ -97,7 +97,7 @@ impl ZcodeIdentity {
     ///
     /// # 优先级（2026-09-21 按所有者要求调整）
     ///
-    ///	1. `display_name`（上游字段 `name`，如 `旅行者5800`）
+    ///	1. `display_name`（上游字段 `name`，如 `示例用户`）
     ///	2. `username`
     ///	3. **手机号**（从 email 里提取）
     ///	4. `id`
@@ -277,7 +277,7 @@ pub fn identity_from_doc(doc: &Value, key: &[u8; 32]) -> Option<ZcodeIdentity> {
     //
     // ```json
     // {"user_id":"…","email":"13900000000@phone.local",
-    //  "avatar":"https://chat.z.ai/user.png","name":"旅行者5800"}
+    //  "avatar":"https://chat.z.ai/user.png","name":"示例用户"}
     // ```
     //
     // 而旧代码读的是 `username` / `displayName` / `id` / `avatarUrl` ——
@@ -393,7 +393,7 @@ mod tests {
     fn roundtrip_matches_client_format() {
         let secret = "test-secret";
         let key = derive_key(secret);
-        let plain = r#"{"username":"wish","displayName":"wish"}"#;
+        let plain = r#"{"username":"demo-user","displayName":"demo-user"}"#;
         let enc = client_encrypt(plain, secret);
         assert!(enc.starts_with("enc:v1:"));
         assert_eq!(enc.matches('.').count(), 2, "应是三段");
@@ -447,8 +447,8 @@ mod tests {
         let key = derive_key(secret);
         let info = json!({
             "id": "12345678901234567",
-            "username": "wish",
-            "displayName": "wish",
+            "username": "demo-user",
+            "displayName": "demo-user",
             "avatarUrl": "https://example.invalid/a.png",
             "rawProfile": {"zcodeProfileMigrationRetryAfter": 1786351398839i64}
         });
@@ -460,11 +460,11 @@ mod tests {
         });
 
         let ident = identity_from_doc(&doc, &key).expect("应解析出身份");
-        assert_eq!(ident.username, "wish");
-        assert_eq!(ident.display_name, "wish");
+        assert_eq!(ident.username, "demo-user");
+        assert_eq!(ident.display_name, "demo-user");
         assert_eq!(ident.id, "12345678901234567");
         assert_eq!(ident.active_provider, "bigmodel");
-        assert_eq!(ident.best_name(), "wish");
+        assert_eq!(ident.best_name(), "demo-user");
     }
 
     /// ★ 上游**真实**字段名：`name` / `user_id` / `avatar` / `email`。
@@ -480,7 +480,7 @@ mod tests {
     ///
     /// ```json
     /// {"user_id":"{uuid}","email":"{手机号}@phone.local",
-    ///  "avatar":"https://chat.z.ai/user.png","name":"旅行者5800"}
+    ///  "avatar":"https://chat.z.ai/user.png","name":"示例用户"}
     /// ```
     ///
     /// 而旧实现读的是 `username` / `displayName` / `id` / `avatarUrl` ——
@@ -496,7 +496,7 @@ mod tests {
             "user_id": "00000000-0000-4000-8000-000000000001",
             "email": "13900000000@phone.local",
             "avatar": "https://chat.z.ai/user.png",
-            "name": "旅行者5800"
+            "name": "示例用户"
         });
         let doc = json!({
             "oauth:zai:user_info": client_encrypt(&info.to_string(), secret),
@@ -504,7 +504,7 @@ mod tests {
         });
 
         let ident = identity_from_doc(&doc, &key).expect("应解析出身份");
-        assert_eq!(ident.display_name, "旅行者5800", "名字在 `name` 字段里");
+        assert_eq!(ident.display_name, "示例用户", "名字在 `name` 字段里");
         assert_eq!(
             ident.id, "00000000-0000-4000-8000-000000000001",
             "账号标识在 `user_id` 字段里"
@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(ident.avatar_url, "https://chat.z.ai/user.png", "头像在 `avatar` 里");
         assert_eq!(ident.email, "13900000000@phone.local");
         assert_eq!(ident.phone, "13900000000", "手机号应从 email 里提取出来");
-        assert_eq!(ident.best_name(), "旅行者5800", "有名字就用名字");
+        assert_eq!(ident.best_name(), "示例用户", "有名字就用名字");
     }
 
     /// 没有名字时**回退到手机号**（所有者明确要求）。

@@ -456,7 +456,7 @@ fn enrich_account_after_import(uid: &str, _auth_dir: &str) -> Result<Value, Stri
 /// 支持的**全部**模型都列出来，**与账号套餐无关**。
 /// 而 `plans[].entitlements[].showName` 才是**这个账号真能用的**。
 ///
-/// 实测（2026-09-20，wish 账号 `zcode-75b9a1dc64af`）：
+/// 实测（2026-09-20，demo-user 账号 `zcode-abcdef123456`）：
 ///
 ///	/models 目录           → 11 个（glm-4.5, glm-4.5-air, …, glm-5.3-flashx）
 ///	plans[0].entitlements  → 1 个（showName = "GLM-5.3-Flash"）
@@ -709,13 +709,13 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
     // ---- ⚠⚠ 「套餐实际能用哪些模型」≠ `/models` 目录（所有者 2026-09-20 纠正）----
     //
     // 所有者原话：
-    //   「wish 这个套餐,他被局限于 只能用 glm-5.3-flash,
+    //   「demo-user 这个套餐,他被局限于 只能用 glm-5.3-flash,
     //     所以你支持的模型并不准确,而且抓包数据我都给你了,
     //     你居然还犯了错,如图 SmartPlan 到期时间和余量和支持模型都显示出来」
     //
     // 根因：`/api/coding/paas/v4/models`（`FetchModels`）返回的是**平台目录**
     // —— 上游把该 provider 支持的**全部**模型都列出来，**与当前账号的套餐无关**。
-    // 实测 wish 账号：目录 11 个（glm-4.5 … glm-5.3-flashx），
+    // 实测 demo-user 账号：目录 11 个（glm-4.5 … glm-5.3-flashx），
     // 而它的套餐 `ZCode Weekend Build` **只授权一个**：
     //
     //	plans[0].entitlements[0].showName = "GLM-5.3-Flash"
@@ -726,7 +726,7 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
     //
     // 修法：**套餐授权（entitlements.showName）优先**，目录只在拿不到授权时兜底。
     // 这样：
-    //   · wish 这种"套餐只给一个模型"→ 界面如实显示 1 个
+    //   · demo-user 这种"套餐只给一个模型"→ 界面如实显示 1 个
     //   · 拿不到 plans 的账号 → 仍回落到目录（宁可多显示，也不显示空）
     let entitled = entitled_model_names(&plans);
     if entitled.is_empty() {
@@ -1001,14 +1001,14 @@ mod tests {
 
     /// **套餐授权优先于 `/models` 目录**（所有者 2026-09-20 纠正）。
     ///
-    /// 原话：「wish 这个套餐,他被局限于 只能用 glm-5.3-flash,
+    /// 原话：「demo-user 这个套餐,他被局限于 只能用 glm-5.3-flash,
     ///   所以你支持的模型并不准确,而且抓包数据我都给你了,你居然还犯了错」
     ///
     /// 下面两组数据都是**真实抓包**（`~/.wb-switch/zcode/accounts.json` 与
     /// `open.bigmodel.cn` 的 `/models` 返回）。
     #[test]
     fn entitled_model_names_wins_over_catalog() {
-        // 真实 plans（wish 账号，逐字取自账号库）
+        // 真实 plans（demo-user 账号，逐字取自账号库）
         let plans: Vec<Value> = serde_json::from_str(
             r#"[{"description":"ZCode 周末活动","endsAt":1789866000,
                  "name":"ZCode Weekend Build","planId":"zcode-v3-start-plan-wk-0918",

@@ -25,8 +25,10 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/qoder"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/zcode"
 )
 
 // sseProbeTimeout 流式请求预读首帧的**兜底**超时（未配置时用）。
@@ -453,6 +455,38 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 								"重新打开它们的路由开关即可。", total),
 					}
 			}
+			// ⚠ 选不出号的另一个原因：**用户白名单不允许「该平台 × 该区域」
+			// 跑这个模型**（2026-09-28 所有者要求）。
+			//
+			// # 现场（所有者截图）
+			//
+			// 他发 `qoder:deepseek-v4.1-flash`，而 qoder 的白名单里没有它
+			// ⇒ 用量统计里出现「deepseek-v4.1-flash · Qoder」。
+			//
+			// 他的要求（两句话，缺一不可）：
+			//
+			//	「在选号侧就是要挡请求」
+			//	「给每个平台手动配置支持的模型，而且要区分国内外版本」
+			//
+			// # 判据是**用户白名单**，不是上游清单
+			//
+			// qoder 上游**实际上能服务**这个模型（实测 10/10 全 200）——
+			// 但"能服务"不等于"用户允许"。拦的是后者。
+			// 详见 config.go `PlatformModels` 的注释。
+			//
+			// ⚠ 用 400 而不是 503：503 的语义是"稍后重试就好"，
+			// 而这里**等多久都不会出现**（要改白名单或换模型）。
+			// 与 11102（model_not_in_region）同一处置。
+			if product != "" && !modelAllowedForProduct(h, product, route, model) {
+				return &chatResult{Model: model}, http.StatusBadRequest,
+					&forwardFailure{
+						Kind:   FailureModelNotInProduct,
+						Status: http.StatusBadRequest,
+						Message: modelNotInProductMessage(
+							product, route.Region, model,
+							h.cfg.Pool.PlatformAllowedModels(product, route.Region)),
+					}
+			}
 			break
 		}
 		tried[acct.UID] = true
@@ -604,6 +638,35 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 				return &chatResult{UID: uid, Model: model}, http.StatusPaymentRequired,
 					&forwardFailure{Kind: FailureQuotaExhausted, Status: http.StatusPaymentRequired, Message: terr.Error()}
 			}
+			// ⚠ 上游**根本没有这个模型**（2026-09-28）：请求侧错误。
+			//
+			// 必须放在这里 —— 在 `fail(acct.UID)` + `continue` **之前**：
+			//
+			//	① **绝不轮转**：同一请求体发给池里任何账号，上游清单都一样没有它。
+			//	   轮转只是把同一个请求对着每个账号重传一遍（终归全失败）。
+			//	② **绝不罚账号**：这是**请求侧**错误，账号完全无辜。罚号会让好账号
+			//	   被冷却 —— 用户改好模型名之后发现"账号又挂了"，故障面被我们放大。
+			//
+			// 与 quota 分支同款写法：releaseHeld() 释放租约后立即返回。
+			//
+			// 判据由 qoder 包给出（查上游模型清单，**发请求之前**就已判定），
+			// 这里只负责把它翻译成对外错误。见 qoder.ModelNotFoundError 的注释：
+			// 不能用计费字段判（会误杀合法免费模型，且时序上做不到）。
+			var mnf *qoder.ModelNotFoundError
+			if errors.As(terr, &mnf) {
+				uid := acct.UID
+				releaseHeld()
+				log.Printf("chat uid=%s: 上游 %s 没有模型 %q（清单 %d 个），"+
+					"请求侧错误 —— 不轮转、不罚账号",
+					uid, mnf.Region.Label(), mnf.Model, len(mnf.Available))
+				return &chatResult{UID: uid, Model: mnf.Model}, http.StatusBadRequest,
+					&forwardFailure{
+						Kind:   FailureModelNotInUpstream,
+						Status: http.StatusBadRequest,
+						Message: modelNotInUpstreamMessage(
+							mnf.Region, mnf.Model, mnf.Available),
+					}
+			}
 			lastStatus = http.StatusServiceUnavailable
 			lastErr = terr
 			// 传输层失败（超时/连接被拒/DNS）没有上游业务体，Classify 不适用；
@@ -649,6 +712,39 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 						Kind:    FailureUnusualActivity,
 						Status:  http.StatusServiceUnavailable,
 						Message: unusualActivityMessage(time.Until(until)),
+					}
+			}
+
+			// ⚠ ZCode 3007「需要人机验证」：**立即停止换号**（详见
+			// FailureCaptchaRequired 的说明）。
+			//
+			// # 判据为什么不是 `kind`
+			//
+			// 3007 的 HTTP 状态是 **400**，`upstream.Classify` 只能按状态码
+			// 与通用文案把它归到 ErrClient —— zcode 包自己的分类器
+			//（`zcode.Classify`，认得 3007 → ErrCaptchaRequired）**从不参与
+			// 转发决策**，这正是本缺陷的成因。所以这里直接用 zcode 包的
+			// 判据函数，而不是等 Classify 给出正确分类。
+			//
+			// # 为什么只对 ZCode 账号生效
+			//
+			// `IsCaptchaRequiredBody` 是宽匹配（"3007" / "验证码" /
+			// "captcha verify failed"）—— 其它产品的响应体里偶然出现同样的
+			// 数字串或字样时，不该被这条分支截走（那会让它们失去既有的
+			// 冷却/换号处置）。加产品判定把影响面锁死在 ZCode 上。
+			if acct.ProductOf() == auth.ProductZcode && zcode.IsCaptchaRequiredBody(respBody) {
+				uid := acct.UID
+				// 与 3012 分支同款：只 releaseHeld，**不调 fail(uid)** ——
+				// fail 会在这个号正是粘性绑定号时 Unbind 掉会话，
+				// 而账号完全无辜（问题在上游对这次请求的验证要求）。
+				releaseHeld()
+				log.Printf("chat uid=%s product=zcode: 上游要求人机验证（3007），"+
+					"自动求解未通过 —— 不再换号重试（换号对同一请求同样无效）", uid)
+				return &chatResult{UID: uid, Model: model}, http.StatusServiceUnavailable,
+					&forwardFailure{
+						Kind:    FailureCaptchaRequired,
+						Status:  http.StatusServiceUnavailable,
+						Message: captchaRequiredMessage(string(respBody)),
 					}
 			}
 
@@ -763,6 +859,26 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 					Status: status,
 					Message: upstream.ModelNotInRegionMessage(
 						modelOf(body), string(respBody)),
+				}
+			}
+
+			// 请求参数不符合当前模型要求（11133）：**同样是请求侧错误**。
+			//
+			// 所有者 2026-09-28 开发会话的真实现场：一个 417 轮 / 458M token
+			// 的会话报 400 11133，而网关把它当成账号故障逐号轮转，
+			// 最终展示成 503「all accounts unavailable (cooling/disabled)」——
+			// 用户以为账号挂了，实际是**参数被模型提供商拒了**。
+			//
+			// 与 11102 同一处置：不轮转、不罚账号、原样透出上游理由。
+			// 轮转在这里尤其有害 —— 大请求体会被对着每个账号重传一遍
+			//（11102 那条注释里记着实测：1.12M token 的请求被重传 3 次）。
+			if kind == upstream.ErrModelParamInvalid {
+				uid := acct.UID
+				releaseHeld()
+				return &chatResult{UID: uid}, status, &forwardFailure{
+					Kind:    FailureModelParamInvalid,
+					Status:  status,
+					Message: upstream.ModelParamInvalidMessage(string(respBody)),
 				}
 			}
 
@@ -1005,6 +1121,38 @@ const (
 	// 故单独成型：不轮转、不冷却账号，直接说"这个模型在这条通道上不存在，
 	// 等多久都不会出现"，并给出可操作的出路（换模型 / 用区域前缀）。
 	FailureModelNotInRegion
+	// FailureModelParamInvalid 请求参数不符合当前模型要求（上游 11133）。
+	//
+	// 所有者 2026-09-28 的真实现场：一个 417 轮 / 458M token 的开发会话
+	// 报 400 11133（extError.code=model_param_invalid），而网关把它当成
+	// 账号故障逐号轮转，最终展示成 503「all accounts unavailable
+	// (cooling/disabled)」—— 用户以为账号挂了，实际是**参数被模型提供商拒了**。
+	//
+	// 与 FailureModelNotInRegion 同一性质（请求侧、换号无用），故同样：
+	// 不轮转、不冷却账号、原样透出上游理由。
+	//
+	// ⚠ 不与 FailureContextTooLong 合并：那条让客户端触发**自动压缩**，
+	// 而 11133 的 `param` 是空串、未必与长度有关，误导客户端压缩无济于事。
+	FailureModelParamInvalid
+	// FailureModelNotInProduct 用户显式指定的**产品不提供这个模型**（2026-09-28）。
+	//
+	// # 现场（所有者截图）
+	//
+	// 他发 `qoder:deepseek-v4.1-flash`，而 qoder 的可信清单（18 个模型）里
+	// **没有**它。此前网关照发不误：
+	//
+	//	· qoder 上游有时回内容 ⇒ 用量统计里出现
+	//	  「deepseek-v4.1-flash · Qoder」的**幽灵数据**（那个模型不属于它）
+	//	· 有时由模型提供商拒绝 ⇒ 400 code=11133「参数不符合当前模型要求」，
+	//	  用户完全想不到是**平台选错了**
+	//
+	// 现在选号侧会拦住它（`pool.PickForModelProductRegion`），走到这里时
+	// 必须**说清"这个平台没有这个模型"**，而不是笼统的「账号全部不可用」。
+	//
+	// 状态码用 **400**（不是 503）：503 的语义是"稍后重试就好"，
+	// 而这里等多久都不会出现 —— 要换模型或换平台。
+	// 与 FailureModelNotInRegion（11102）同一处置。
+	FailureModelNotInProduct
 	// FailureUnusualActivity 上游回了 3012「unusual activity」风控，
 	// 网关已**主动停止换号重试**（详见 unusual.go）。
 	//
@@ -1023,6 +1171,64 @@ const (
 	// FailureAllNoRoute 池里的账号**全部**被用户设为不参与选号（no_route）
 	// （2026-09-22）。不是故障，是配置 —— 文案必须说清这一点。
 	FailureAllNoRoute
+	// FailureModelNotInUpstream **上游根本没有这个模型**（2026-09-28）。
+	//
+	// # 与 FailureModelNotInProduct 的区别（两者都是 400，但原因完全不同）
+	//
+	//	FailureModelNotInProduct  → **用户白名单**不允许（模型可能在，是你没放行）
+	//	FailureModelNotInUpstream → **上游 Qoder 的清单里就没有它**（谁都没法放行）
+	//
+	// 文案与出路也不同：前者说"去白名单里加上它"，后者说"上游没有这个模型，
+	// 加白名单也没用，请改用上游真实存在的 key"。
+	//
+	// # 现场（本错误的存在理由）
+	//
+	// 用户配了 `qoder:deepseek-v4.1-flash`，而该模型在 Qoder 两个区域的清单里
+	// 都不存在。Qoder 上游对不认识的 key **不报错**：静默回退到免费通道并返回
+	// 200 ⇒ 用量统计里出现「deepseek-v4.1-flash · Qoder」的**幽灵数据**。
+	//
+	// 判据是**上游模型清单**（见 qoder.ModelNotFoundError 的注释：
+	// 计费字段既会误杀合法免费模型，又只在最后一个 usage 帧才出现，
+	// 时序上无法在发请求前判定）。
+	//
+	// 处置与其它请求侧错误完全一致：不轮转、不罚账号、立即 400。
+	FailureModelNotInUpstream
+	// FailureCaptchaRequired ZCode 上游要求**人机验证**（3007），
+	// 网关已尝试自动求解但未成功（或求解器正在冷却）。
+	//
+	// # 现场（本错误的存在理由，所有者 2026-09-28 报告）
+	//
+	// 用户实测收到：
+	//
+	//	503 {"code":"no_healthy_account",
+	//	     "message":"all accounts unavailable (cooling/disabled):
+	//	                upstream client (http 400):
+	//	                {\"error\":{\"code\":3007,\"message\":\"captcha verify failed\"}}"}
+	//
+	// 这条消息**每一句都在误导**：
+	//
+	//	· "all accounts unavailable" —— 账号一个都没问题，本分支刻意不罚号；
+	//	· "(cooling/disabled)"      —— 没有任何账号因此进入冷却；
+	//	· "captcha verify failed"   —— 唯一真实的信息，却被埋在最后。
+	//
+	// 成因：3007 的 HTTP 状态是 **400**，`upstream.Classify` 只按状态码
+	// 与通用文案判定 ⇒ 归到 ErrClient ⇒ `applyErrorPolicy` 的 default 分支
+	// 「只换号不罚号」⇒ 继续轮转。而 ZCode 池往往只有一两个账号，
+	// 轮转瞬间耗尽，于是回出上面那句"账号全挂了"。
+	//
+	// # 为什么必须**停止轮转**
+	//
+	// 3007 是上游对**这次请求/这个出口**提出的验证要求，与"用哪个账号"无关：
+	// 同一个请求体换一个 ZCode 账号重发，极可能回同样的 3007。
+	// 继续轮转有两个坏处：把「上游偶发验证码」放大成「账号全部不可用」，
+	// 并且每次重发都在继续触碰上游的防滥用判定。
+	//
+	// # 为什么不罚账号
+	//
+	// 与 FailureUnusualActivity 同因：验证码与账号信誉无关，罚号会让
+	// 好账号在验证要求过去后仍被我们冷却 —— 把上游的临时要求变成
+	// 我们自己造成的持续故障。
+	FailureCaptchaRequired
 )
 
 // imageRegionUnavailableMessage 生成「带图片请求缺少该区域账号」的说明。
@@ -1052,6 +1258,179 @@ type forwardFailure struct {
 }
 
 func (e *forwardFailure) Error() string { return e.Message }
+
+// captchaRequiredMessage 生成 ZCode 3007「需要人机验证」的可读文案。
+//
+// # 为什么复用 zcode 包的措辞
+//
+// `zcode.FriendlyMessage()` 的 ErrCaptchaRequired 分支已经定好了口径
+//（「需要人机验证 …… 本网关不会绕过验证码 —— 请在 ZCode 官方客户端里
+// 完成一次验证后重试」）。这里若另写一套，同一件事会在两处出现两种说法，
+// 用户无法判断是不是同一个问题。
+//
+// 但**不能**直接调 `zcode.Classify` 再取 FriendlyMessage：它认的是
+// **字符串** 业务码（`extractCode` 只读 `error.code` 为 string、或顶层 `code`），
+// 而 server 层拿到的响应体已经过 `zcode.NormalizeErrorBody` 归一 ——
+// code 变成了**数字** 3007，`extractCode` 取不到 ⇒ Classify 返回 ErrNone
+// ⇒ FriendlyMessage 只会给一句无用的默认文案。
+//
+// 故这里自己构造一个 `zcode.Error`（字段均导出）再取文案：
+// 分类是我们自己确定的（调用点已用 `IsCaptchaRequiredBody` 判过），
+// 措辞仍由 zcode 包统一维护。
+func captchaRequiredMessage(body string) string {
+	msg := captchaUpstreamDetail(body)
+	e := &zcode.Error{
+		Kind:   zcode.ErrCaptchaRequired,
+		Status: http.StatusBadRequest,
+		Code:   zcode.CodeCaptchaRequired,
+		Msg:    msg,
+	}
+	return e.FriendlyMessage()
+}
+
+// captchaUpstreamDetail 从归一后的错误体里取出上游那句话（尽量短）。
+//
+// 取不到时回退截断的原始 body —— 与 `upstream.EffortRejectedDetail` 同一
+// 思路：宁可给用户看原始片段，也不要编一句像是我们判断的话。
+func captchaUpstreamDetail(body string) string {
+	var env struct {
+		Msg   string `json:"msg"`
+		Error struct {
+			Message string `json:"message"`
+			Msg     string `json:"msg"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &env); err == nil {
+		for _, s := range []string{env.Error.Message, env.Error.Msg, env.Msg} {
+			if t := strings.TrimSpace(s); t != "" {
+				return t
+			}
+		}
+	}
+	t := strings.TrimSpace(body)
+	if len(t) > 300 {
+		t = t[:300] + "…"
+	}
+	if t == "" {
+		return "captcha verify failed"
+	}
+	return t
+}
+
+// modelAllowedForProduct 报告用户白名单是否允许该平台跑这个模型。
+//
+// 返回 false 表示**用户明确禁止**（白名单配了、但里面没有它）；
+// 白名单未配置时返回 true（向后兼容 —— 老配置没有 `platform_models` 键，
+// 升级后不该突然开始拦请求）。
+//
+// # 为什么把区域判断收在这里
+//
+// 请求的 `route.Region` 可能是 `RegionAny`（用户没指定区域），
+// 而白名单是**按区域**配的。此时只要**任一**区域允许，就放行 ——
+// 因为具体选到哪个区域的账号由选号侧决定，那里会拿**账号自己的区域**
+// 再判一次（见 `pool.PickForModelProductRegion`）。
+//
+// 即：本函数是"早退优化 + 好文案"，真正的准入判定在 pool 里按账号区域做。
+// 两处判据必须一致，故都走 `Pool.PlatformAllowsModel`。
+func modelAllowedForProduct(h *Handler, product string, route imageRoute, model string) bool {
+	if route.Region == auth.RegionAny {
+		for _, r := range []auth.Region{auth.RegionCN, auth.RegionIntl} {
+			if allowed, configured := h.cfg.Pool.PlatformAllowsModel(product, r, model); !configured || allowed {
+				return true
+			}
+		}
+		return false
+	}
+	allowed, configured := h.cfg.Pool.PlatformAllowsModel(product, route.Region, model)
+	return !configured || allowed
+}
+
+// modelNotInProductMessage 生成「该平台白名单不允许这个模型」的可读文案。
+//
+// # 为什么要列出该平台**实际允许**的模型
+//
+// 用户看到"qoder 不允许 deepseek-v4.1-flash"之后，下一个问题必然是
+// "那它允许什么" —— 网关手里正好有那份白名单，直接列出来能让他一次改对。
+//
+// # 为什么要说明"可以去加"
+//
+// 这不是"这个模型不存在"，而是"**你没把它加进白名单**"——
+// 所有者本人的用法就是手动往平台里加模型。文案必须把这条出路写清楚，
+// 否则用户会以为"qoder 永远用不了这个模型"。
+//
+// ⚠ 白名单**为空**时不列清单（那说明用户没配这个平台/区域）——
+// 只给"去配置"的指引，不编造。
+func modelNotInProductMessage(
+	product string, region auth.Region, model string, allowed []string,
+) string {
+	regionName := "国服"
+	if region == auth.RegionIntl {
+		regionName = "国际版"
+	}
+	if region == auth.RegionAny {
+		regionName = "该"
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "平台 %s（%s）的模型白名单里没有 %s，所以没有账号可以处理这个请求。",
+		product, regionName, model)
+	if len(allowed) > 0 {
+		shown := allowed
+		suffix := ""
+		if len(shown) > 12 {
+			shown = shown[:12]
+			suffix = fmt.Sprintf(" 等 %d 个", len(allowed))
+		}
+		fmt.Fprintf(&b, "当前允许：%s%s。", strings.Join(shown, "、"), suffix)
+	}
+	fmt.Fprintf(&b, "这是**可配置**的 —— 想用这个模型，请在「兼容网关」页把 %s 加进"+
+		"平台 %s 的%s白名单；否则请换一个已允许的模型，"+
+		"或去掉「平台:」前缀让网关自动选择平台。", model, product, regionName)
+	return b.String()
+}
+
+// modelNotInUpstreamMessage 生成「上游根本没有这个模型」的可读文案。
+//
+// # 为什么不复用 modelNotInProductMessage
+//
+// 语义完全不同，出路也相反：
+//
+//	modelNotInProductMessage  → 「你没把它加进白名单」 ⇒ 去配置页加上即可
+//	本函数                    → 「上游就没有这个模型」 ⇒ 加白名单**也没用**，
+//	                             必须换成上游真实存在的模型名
+//
+// 复用会让用户去白名单里加一个根本不存在的模型，然后发现"加了还是不行"。
+//
+// # 为什么要列出上游**实际可用**的模型
+//
+// 用户看到"上游没有 deepseek-v4.1-flash"之后，下一个问题必然是
+// "那上游有什么" —— 网关手里正好有那份清单（判定时已经拉到），
+// 直接列出来能让他一次改对。这比让他去翻文档或猜要快得多。
+//
+// ⚠ 清单为空时不列清单、**不编造**（与 modelNotInProductMessage 同款口径）：
+// 走到这里的错误必定带着非空清单（判定要求 len(models) > 0），
+// 但把这个函数当纯函数单测时可能传空 —— 故仍然显式处理。
+func modelNotInUpstreamMessage(region qoder.Region, model string, available []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "上游 Qoder（%s）没有 %s 这个模型，所以这个请求无法处理。",
+		region.Label(), model)
+	fmt.Fprintf(&b, "Qoder 对不认识的模型名**不会报错**，而是静默回退到免费通道并返回 200 —— "+
+		"那会产生不属于该模型的用量数据，所以网关在这里直接拦下（在发请求之前）。")
+	if len(available) > 0 {
+		shown := available
+		suffix := ""
+		// 截断口径与 modelNotInProductMessage 一致（12 个），
+		// 避免把整个清单塞进错误消息。
+		if len(shown) > 12 {
+			shown = shown[:12]
+			suffix = fmt.Sprintf(" 等 %d 个", len(available))
+		}
+		fmt.Fprintf(&b, "上游当前可用：%s%s。", strings.Join(shown, "、"), suffix)
+	}
+	fmt.Fprintf(&b, "这条模型白名单**改不了它** —— 请改用上面列出的上游真实模型名，"+
+		"或去掉「平台:」前缀让网关自动选择平台。")
+	return b.String()
+}
 
 // pickAccount 按 imageRoute 选号。
 //
@@ -1183,6 +1562,26 @@ func (h *Handler) pickAccountFor(model string, tried map[string]bool, route imag
 }
 
 // pickAccount 按区域选号（无产品约束）。
+//
+// # 裸名不做区域偏好 —— 调度完全由**成本**决定（2026-09-27 所有者澄清）
+//
+// 我第一版修法是把裸名偏好改成国服，那是**错的**。所有者原话：
+//
+//	「跟区域没关系，就是成本有关系」
+//	「所有的请求模型的策略，都应该按照成本优先的调度去调度，
+//	  然后账号不可用就冷却，然后这时候再自动降级到国服的才对」
+//
+// 即正确的模型是**与区域无关**的三段式：
+//
+//	① 按成本调度（倍率低者优先；倍率是**动态**的，不是"免费/计费"两档）
+//	② 打不通的账号冷却（退出候选）
+//	③ 便宜档位全冷却后，**自动降级**到更贵的档位
+//
+// 区域只是"账号恰好属于哪个池子"的附带属性，不是调度维度。
+// 故这里保持 RegionAny，让 pool 的成本分层去决定选谁；
+// 之前 0/6 失败的真正原因在**冷却缺失**（403/11140 不罚账号 ⇒
+// 坏号反复被选中，永远轮不到便宜档之外的可用账号），已在
+// `applyErrorPolicy` 里修（见 upstream.ErrAccountUnusable）。
 func (h *Handler) pickAccount(model string, tried map[string]bool, route imageRoute) *auth.Auth {
 	if route.Region == auth.RegionAny {
 		return h.cfg.Pool.PickForModelRegion(model, tried, auth.RegionAny)

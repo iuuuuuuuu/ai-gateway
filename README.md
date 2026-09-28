@@ -1523,7 +1523,7 @@ cd path/to/workbuddy2api && go test ./...
 
 ```json
 {"user_id":"{uuid}","email":"{手机号}@phone.local",
- "avatar":"https://chat.z.ai/user.png","name":"旅行者5800"}
+ "avatar":"https://chat.z.ai/user.png","name":"示例用户"}
 ```
 
 而旧实现读的是 `username` / `displayName` / `id` / `avatarUrl` ——

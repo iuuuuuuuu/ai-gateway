@@ -88,7 +88,7 @@ func TestManualSchoolWithNoRewardsStillRecords(t *testing.T) {
 
 	got := findByTitle(recordsOf(t, path), "开学季活动")
 	if len(got) == 0 {
-		t.Fatalf("手动触发开学季、虽无可领奖励，也必须留一条**账号级**记录；"+
+		t.Fatalf("手动触发开学季、虽无可领奖励，也必须留一条**账号级**记录；" +
 			"实际 0 条 —— 所有者看到的正是这个现象（手动执行了却查不到）")
 	}
 	if got[0]["accountId"] != "host-id-1" {

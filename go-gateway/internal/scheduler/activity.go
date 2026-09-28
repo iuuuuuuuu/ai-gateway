@@ -44,7 +44,7 @@ func (s *Scheduler) RunActivityNow() {
 // 一个号失败不该拖垮整轮。
 func (s *Scheduler) runActivity(ctx context.Context) {
 	first := true
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range s.poolList() {
 		// 账号作用域：只在「作用于该账号」的手动触发时收窄（排程路径恒为 true）。
 		if !inAccountScope(ctx, st.UID) {
 			continue

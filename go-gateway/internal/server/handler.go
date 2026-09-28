@@ -198,8 +198,9 @@ type Handler struct {
 // 换掉不影响任何已建立的连接或后台任务。
 //
 // 不能：监听地址/端口（要重建 listener，属重启语义）、
-//       Pool / Upstream / 各回调（持有连接池与后台 goroutine，
-//       换掉会泄漏且让在途请求失去归属）。
+//
+//	Pool / Upstream / 各回调（持有连接池与后台 goroutine，
+//	换掉会泄漏且让在途请求失去归属）。
 type DynamicConfig struct {
 	// ProductModels 各产品实际可用的模型清单（`{"qoder":[...],"zcode":[...]}`）。
 	//
@@ -924,6 +925,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；模型冷却按各自截止到期；
 // 熔断按其指数退避截止到期；成功（NoteSuccess）清 fails/熔断；
 // 签到解冻（ReenableIfCredits→reviveCoolingLocked）只清账号级冷却，不动熔断与模型冷却。
+//
+// # ⚠ 三类"不可用"必须分开（2026-09-27 所有者要求）
+//
+// 所有者原话：「要区分是模型冷却，还是账号冷却，还是账号封禁，
+// 这是三个概念，需要区分」。三者粒度与**恢复方式**都不同：
+//
+//	模型冷却 ErrModelRate      → CooldownModel：只有这个模型不可用，换模型仍可用；
+//	                             到期按上游给的重置时间。
+//	账号冷却 ErrAccountUnusable → Cooldown(CoolSoft)：整号暂时打不通，
+//	                             到期**自动**恢复（这里是 11140 的归属）。
+//	账号封禁 ErrSessionDead     → Disable：凭证失效，**必须人工重登**，
+//	                             不自动恢复。
+//
+// 混为一谈的后果：把"等一会儿就好"当成"必须重登"（用户白跑一趟），
+// 或把"必须重登"当成"等一会儿"（永远等不到）。
 func (h *Handler) applyErrorPolicy(uid, model string, kind upstream.ErrKind, rawBody string) {
 	switch kind {
 	case upstream.ErrHardCredit:
@@ -949,6 +965,28 @@ func (h *Handler) applyErrorPolicy(uid, model string, kind upstream.ErrKind, raw
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")
+	case upstream.ErrAccountUnusable:
+		// 账号侧不可用（403 code=11140）：**账号级软冷却**，到期自动恢复。
+		//
+		// # 为什么必须是冷却而不是"只换号"
+		//
+		// 该 kind 此前落进 default（只换号不罚）⇒ 坏号永不退出候选 ⇒
+		// 成本分层永远停在最便宜却打不通的那一档，**降级不下去**。
+		// 实测裸名 `deepseek-v4.1-flash` 因此 0/6 全败。
+		//
+		// 冷却后：坏号退出候选 → 下一轮选号自动落到下一个成本档位 → 请求成功。
+		// 这正是所有者要的「不可用就冷却，然后自动降级」。
+		//
+		// ⚠ 用 CoolSoft（有到期、可自动恢复）而非 Disable：
+		// 11140 的上游根因是「该账号在本设备未完成登录（设备注册失效）」，
+		// 用户去官方客户端重登一次即可恢复 —— 所以它**不该**被永久禁用
+		// （那是 ErrSessionDead「凭证失效必须重登」的语义，两者的恢复
+		// 动作不同：一个等冷却或重登，一个只能重登）。
+		//
+		// ⚠ 冷却时长取 SoftCooldown：太短会被立刻重新选中（空转），
+		// 太长会让恢复的账号闲置。SoftCooldown 是既有配置项，
+		// 沿用它可以避免新增一个只有这里用的魔数。
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "上游拒绝该账号（11140 request illegal）")
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
@@ -1033,6 +1071,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 //
 // 另有一类**不是请求侧、但同样「重试无用」**的失败：
 //   - 出口 IP 疑似被 WAF 拦 → egress_ip_blocked（见 wafip.go）
+//
 // 它与前三类的共同点是「换号/重试都解决不了」，区别是出路在网络出口而非请求。
 func openAIFailure(err error) (code, msg string) {
 	if f := failureOf(err); f != nil && f.Kind == FailureContextTooLong {
@@ -1056,6 +1095,27 @@ func openAIFailure(err error) (code, msg string) {
 		// 503 会让客户端去重试，而这里等多久都不会出现（要换模型/加区域前缀）。
 		return "model_not_in_region", f.Message
 	}
+	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInProduct {
+		// 用户显式指定的平台不提供该模型（2026-09-28）：同为请求侧错误。
+		// 独立码让客户端/用户一眼看出"是平台选错了，不是账号或网络问题"。
+		return "model_not_in_product", f.Message
+	}
+	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInUpstream {
+		// **上游根本没有**这个模型（2026-09-28）：同为请求侧错误，但出路与
+		// model_not_in_product **相反** —— 那个是"去白名单里放行"，这个是
+		// "白名单放行了也没用，上游就没有这个模型"。
+		//
+		// 独立码是必需的：混用会让用户反复去配置页加一个不存在的模型。
+		return "model_not_in_upstream", f.Message
+	}
+	if f := failureOf(err); f != nil && f.Kind == FailureModelParamInvalid {
+		// 请求参数不符合当前模型要求（上游 11133）：同样是**请求侧**错误，
+		// 重试/换号都无用（同一请求体给任何账号都会被同一模型提供商拒）。
+		//
+		// 状态码原样透出上游的 400（不走 503）—— 与 model_not_in_region 同款：
+		// 503 的语义是「稍后重试就好」，而这里必须让用户**改参数**。
+		return "model_param_invalid", f.Message
+	}
 	if f := failureOf(err); f != nil && f.Kind == FailureQuotaExhausted {
 		return "quota_exhausted", f.Message
 	}
@@ -1069,6 +1129,17 @@ func openAIFailure(err error) (code, msg string) {
 		//	· 客户端据此可以**不要立即重试** —— 这正是所有者要的效果
 		//	（「3012 后自动退避一段时间不重试」）。
 		return "unusual_activity", f.Message
+	}
+	if f := failureOf(err); f != nil && f.Kind == FailureCaptchaRequired {
+		// ZCode 上游要求**人机验证**（3007），网关已尝试自动求解但未成功。
+		//
+		// 独立错误码的理由与 unusual_activity 同构：落进 no_healthy_account
+		// 会显示「账号全部不可用（冷却/禁用）」，把用户引去查账号池 ——
+		// 而账号一个都没问题（本分支刻意不罚号、不换号）。
+		//
+		// 状态码仍是 503（上游侧条件、稍后重试可能就好），故客户端会重试；
+		// 独立码让它能看出「重试之前可能需要先过一次验证」。
+		return "captcha_required", f.Message
 	}
 	// 其余交给 errorCodeFor（当前只有 model_not_allowed 与 no_healthy_account），
 	// 即 chat/completions 一直以来的行为。
@@ -1100,6 +1171,21 @@ func anthropicFailure(err error) (code, msg string) {
 	// 模型在该通道不存在：请求侧问题（要改模型名或加区域前缀），
 	// 与上面两类「重试无用」的错误同一取向 —— 报 api_error 会让客户端重试。
 	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInRegion {
+		return "invalid_request_error", f.Message
+	}
+	// 请求参数不符合模型要求（11133）：同属请求侧问题（要改参数），
+	// 报 api_error 会让客户端以为"上游暂时坏了，重试即可"，方向错。
+	if f := failureOf(err); f != nil && f.Kind == FailureModelParamInvalid {
+		return "invalid_request_error", f.Message
+	}
+	// 用户显式指定的平台不提供该模型：同属请求侧问题（要换模型/平台）。
+	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInProduct {
+		return "invalid_request_error", f.Message
+	}
+	// 上游根本没有这个模型：同属请求侧问题（要换成上游真实存在的模型名）。
+	// Anthropic 词汇表里 invalid_request_error 是正确归属 —— 用户的请求需要改，
+	// 报 api_error 会让客户端以为"上游暂时坏了，重试即可"。
+	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInUpstream {
 		return "invalid_request_error", f.Message
 	}
 	if errorCodeFor(err) != "no_healthy_account" {
@@ -1137,6 +1223,21 @@ func responsesFailure(err error) (code, msg string) {
 	//（用户的请求需要改：换模型或加区域前缀），不是 upstream_error ——
 	// 后者会让客户端以为"上游暂时坏了，重试即可"。
 	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInRegion {
+		return "invalid_request_error", f.Message
+	}
+	// 请求参数不符合当前模型要求（11133）：同属请求侧问题（要改参数），
+	// 不能走 upstream_error 让客户端以为"上游坏了，重试即可"。
+	if f := failureOf(err); f != nil && f.Kind == FailureModelParamInvalid {
+		return "invalid_request_error", f.Message
+	}
+	// 用户显式指定的平台不提供该模型：同属请求侧问题（要换模型/平台）。
+	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInProduct {
+		return "invalid_request_error", f.Message
+	}
+	// 上游根本没有这个模型：Responses 词汇表里同属 invalid_request_error
+	//（用户的请求需要改：换成上游真实存在的模型名）。
+	// 不能走 upstream_error —— 那会让客户端以为"上游暂时坏了，重试即可"。
+	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInUpstream {
 		return "invalid_request_error", f.Message
 	}
 	if errorCodeFor(err) != "no_healthy_account" {
@@ -1235,6 +1336,29 @@ func errorCodeFor(err error) string {
 	// 故给独立错误码，让客户端与用户都能看出"这是请求的问题，不是账号的问题"。
 	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInRegion {
 		return "model_not_in_region"
+	}
+	// 用户显式指定的**平台不提供该模型**（2026-09-28）：
+	// 同属请求侧问题（要换模型或换平台），不能落进 no_healthy_account ——
+	// 那会让用户去查账号池，而账号一个都没问题。
+	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInProduct {
+		return "model_not_in_product"
+	}
+	// 上游**根本没有**这个模型（2026-09-28）：同属请求侧问题，
+	// 但出路与 model_not_in_product 相反（那个能靠配置解决，这个不能）。
+	// 独立码让用户不至于反复去白名单里加一个上游不存在的模型。
+	if f := failureOf(err); f != nil && f.Kind == FailureModelNotInUpstream {
+		return "model_not_in_upstream"
+	}
+	// ZCode 上游要求人机验证（3007），自动求解未通过（2026-09-28）。
+	//
+	// 与 unusual_activity 同因需要独立码：落进 no_healthy_account 会显示
+	// 「账号全部不可用（冷却/禁用）」，而本分支刻意不罚号、不换号 ——
+	// 账号一个都没问题，把用户引去查账号池是彻底的误导。
+	//
+	// 状态码仍是 503（见 forward.go 的 FailureCaptchaRequired 说明），
+	// 故这里只换码不换状态：客户端会重试，但能从码面值看出真实原因。
+	if f := failureOf(err); f != nil && f.Kind == FailureCaptchaRequired {
+		return "captcha_required"
 	}
 	return "no_healthy_account"
 }

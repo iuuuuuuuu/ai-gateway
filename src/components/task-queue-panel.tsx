@@ -21,7 +21,7 @@ import {
 } from "@/components/ui/select";
 import * as api from "@/lib/api";
 import type { AccountMeta } from "@/lib/types";
-import { cn } from "@/lib/utils";
+import { cn, firstVisibleText } from "@/lib/utils";
 
 /**
  * 跨账号任务队列面板（成长任务「一键完成」）。
@@ -172,12 +172,13 @@ function isTerminal(status: QueueStatus): boolean {
  *
  * 与账号池口径（GatewayPage 的 `accountLabel`）保持一致 —— 成长任务跑在网关
  * 账号池里，两处叫法不同会让用户对不上是哪个号。
+ *
+ * 各档都要求**有可见内容**（`firstVisibleText`）：上游昵称存在整串由不可见
+ * 字符组成的真实案例（单个 U+E0000），只判 `||` 会让它冒充成有效名字。
  */
 function accountLabel(account: AccountMeta): string {
   return (
-    account.note?.trim() ||
-    account.nickname?.trim() ||
-    account.email?.trim() ||
+    firstVisibleText(account.note, account.nickname, account.email) ||
     account.uid?.slice(0, 8) ||
     account.id
   );
