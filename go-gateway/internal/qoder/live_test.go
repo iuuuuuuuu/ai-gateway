@@ -205,3 +205,72 @@ func TestLiveCredentialsAreReadOnly(t *testing.T) {
 		}
 	}
 }
+
+// TestLiveUserStatusReachable 真实请求 /algo/api/v3/user/status。
+//
+// 这是 N4 的**关键未知项**：该端点走的是与 COSY 签名完全不同的
+// 「appcode 通道」（appcode + date + md5 signature + 机器指纹头），
+// 参考实现声称可用，但我方代码此前从未打过这个端点。单元测试只能
+// 证明"我们自己签自己验通过"，证明不了"上游接受"。
+//
+// 判据：
+//
+//	200 + 能解析出 nextResetAt ⇒ 通道有效，N4 可用
+//	101 / Signature invalid   ⇒ 签名算法或 secret 失效（需要重新逆向）
+//	105 / Login expired       ⇒ 令牌过期（不否定通道有效性）
+//	404                       ⇒ 端点路径不对（v3 或 Encode=1 的猜测有误）
+//
+// 无论结果如何都**不断言"成功"** —— 本用例的产物是一份**实测结论**，
+// 不是绿灯。上游不可达时它 Skip 并打印原因，由人判断。
+func TestLiveUserStatusReachable(t *testing.T) {
+	creds := liveCreds(t)
+	c := New()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	seen := map[Region]bool{}
+	for _, cr := range creds {
+		if seen[cr.Region] {
+			continue
+		}
+		seen[cr.Region] = true
+
+		t.Run(cr.Region.Label(), func(t *testing.T) {
+			t.Logf("请求端点: %s%s", cr.Region.Gateway(), UserStatusPath)
+			st, err := c.FetchUserStatus(ctx, cr)
+			if err != nil {
+				msg := err.Error()
+				switch {
+				case strings.Contains(msg, "101"), strings.Contains(msg, "Signature invalid"):
+					t.Errorf("上游拒绝签名（101）—— appcode 通道的签名算法/secret 已失效: %v", err)
+				case strings.Contains(msg, "404"):
+					t.Errorf("端点不存在（404）—— 路径或 Encode=1 参数有误: %v", err)
+				case strings.Contains(msg, "105"), strings.Contains(msg, "Login expired"):
+					t.Skipf("令牌已失效（不否定通道有效性）: %v", err)
+				default:
+					t.Skipf("未能取得结论（网络/其它）: %v", err)
+				}
+				return
+			}
+			t.Logf("✓ %s /user/status 可达：nextResetAt=%d (%s)", cr.Region.Label(),
+				st.NextResetAtMs, time.UnixMilli(st.NextResetAtMs).In(time.Local).Format(time.RFC3339))
+			t.Logf("   userType=%q plan=%q userTag=%q orgName=%q 超额=%v 用量=%.4f%%",
+				st.UserType, st.Plan, st.UserTag, st.OrgName, st.IsQuotaExceeded, st.TotalUsagePercentage)
+
+			// 关键：拿到的边界必须是**可信**的，否则 N4 无意义。
+			if !PlausibleResetMs(st.NextResetAtMs) {
+				t.Errorf("端点可达但 nextResetAt=%d 不可信（哨兵/零值）—— N4 无法据此工作", st.NextResetAtMs)
+				return
+			}
+			// 与额度接口的 expiresAt 对照，确认「谁是权威」这个约定。
+			if q, qerr := c.FetchQuota(ctx, cr); qerr == nil {
+				t.Logf("   对照 OpenAPI 额度：expiresAt=%d remaining=%d total=%d",
+					q.ExpiresAt, q.Remaining, q.Total)
+				if resolved := ResolveNextResetMs(st, q); resolved != st.NextResetAtMs {
+					t.Errorf("ResolveNextResetMs 未优先采用 /user/status: got %d want %d",
+						resolved, st.NextResetAtMs)
+				}
+			}
+		})
+	}
+}

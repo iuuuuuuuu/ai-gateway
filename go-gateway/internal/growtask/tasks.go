@@ -14,7 +14,9 @@ package growtask
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/upstream"
@@ -37,6 +39,47 @@ const (
 	// ViewLocked 上游标记未解锁。
 	ViewLocked = "locked"
 )
+
+// intlOnlyCodes 国际版独有的 5 个任务码 —— **不下发给界面**（删除，不是置灰）。
+//
+// # 为什么是「删掉」而不是「标成需人工」（2026-09-25 实测结论）
+//
+// 这 5 项是国际版（workbuddy.ai）growth 域返回的**静态目录**：
+// 7 个国际版账号 × 5 项 = 35 项，**每一项都恒为 `available`**，
+// 且响应里没有 `accept_status` / `reward_credit` / `reward_energy` /
+// `has_reward` / `progress` 字段 —— 也就是说**没有任何状态机可以推进**，
+// 不存在「做完了」这个状态。三条独立证据：
+//
+//	1. 目录是静态的：任何国际版账号、任何时刻读到的都是同样 5 项 available；
+//	2. 真实遥测事件无效：按客户端 `EVENT_NAME_MAPPING` 的口径，把全部 5 个
+//	   事件码（`chat_request_send` / `skill_installed` / `wechat_linked` /
+//	   `expert_summoned` / `template_used`，带完整业务字段）POST 到
+//	   `/v2/report`，全部 HTTP 200 `{"code":0,"msg":"OK"}`，
+//	   回读任务清单**零变化**；
+//	3. 官方客户端自己也不走接口：国际版客户端把用户**交给 growth-center
+//	   网页**（Cookie/会话通道），网关够不到那条通道。
+//
+// 结论：这 5 项在本工具里**只能**渲染成「需在客户端手动完成」，
+// 对用户是纯噪音 —— 所有者 2026-09-25：
+//
+//	「如果你无法通过抓包把这些任务变成可执行的,那你就把这些任务给删掉」
+//
+// ⚠ 与 `Expert_Philanthropy` / `workstation_expert` 的区别（那两个**保留**）：
+// 它们是**国服**任务，有真实的报名与进度状态，只是动作需人工（捐款回执 /
+// 桌面端换血对话），因此仍列出并给出具体的置灰原因。
+// 删掉的只有这 5 个「点了也没有状态可变」的。
+//
+// ⚠ 国际版的任务码 ≠ 遥测事件码。上面括号里列的是**客户端遥测**事件码，
+// 与任务码恰好有 4 个同名（`first_chat` 对应的事件码是 `chat_request_send`，
+// 它根本不在 `EVENT_NAME_MAPPING` 里）—— 同名是巧合，
+// 不能当成「任务码即事件码」的依据。
+var intlOnlyCodes = map[string]bool{
+	"first_chat":      true,
+	"skill_installed": true,
+	"wechat_linked":   true,
+	"expert_summoned": true,
+	"template_used":   true,
+}
 
 // TaskView 「任务中心」列表项：查询结果，可安全序列化给界面。
 type TaskView struct {
@@ -63,6 +106,14 @@ type TaskView struct {
 	Claimable bool `json:"claimable"`
 	Claimed   bool `json:"claimed"`
 
+	// Locked 上游标记为尚未解锁（此时**不可执行**，见 UnlockAt）。
+	//
+	// 必须透出给界面：锁定与「需人工完成」是两种不同的等待，
+	// 界面把它们混在一起显示，用户就分不清「等时间到」与「得自己去点」。
+	Locked bool `json:"locked,omitempty"`
+	// UnlockAt 解锁时刻（RFC3339）。只在 Locked 为真时非空。
+	UnlockAt string `json:"unlock_at,omitempty"`
+
 	// Automatable 是否可一键完成。
 	Automatable bool `json:"automatable"`
 	// NeedsChat 完成它是否需要消耗真实对话（界面据此提示资源消耗）。
@@ -84,12 +135,20 @@ func (r *Runner) ListTasks(ctx context.Context, a *auth.Auth) ([]TaskView, error
 	}
 	out := make([]TaskView, 0, len(tasks))
 	for _, t := range tasks {
+		// 国际版那 5 个静态任务直接**不下发**（见 intlOnlyCodes 的说明）：
+		// 它们没有可推进的状态，列出来只会变成 5 条「需在客户端手动完成」的噪音。
+		// 过滤放在这里而不是让界面自己跳过 —— ListTasks / PendingTasks /
+		// task-queue-panel 的扫描共用这一个口径，只定义一次才不会漂移。
+		if intlOnlyCodes[t.Code] {
+			continue
+		}
 		view := TaskView{
 			Code: t.Code, Title: t.Title, Description: t.Description, TaskDesc: t.TaskDesc,
 			Credit: t.Credit, Energy: t.Energy,
 			AcceptStatus: t.AcceptStatus, HasProgress: t.HasProgress,
 			Current: t.Current, Target: t.Target, Progress: t.ProgressText(),
 			Claimable: t.Claimable(), Claimed: t.Claimed(),
+			Locked: t.Locked, UnlockAt: t.UnlockAt,
 		}
 		if act := actionFor(t.Code); act != nil {
 			view.Automatable = true
@@ -108,6 +167,13 @@ func (r *Runner) ListTasks(ctx context.Context, a *auth.Auth) ([]TaskView, error
 }
 
 // PendingTasks 只返回「还没做完」的可自动任务（界面「一键完成」的作用范围）。
+//
+// ⚠ 未解锁（Locked）的必须排除。实测（2026-09-30，Sequential_Tasks_2，
+// unlock_at=2026-10-01T00:00:00+08:00）：对锁定任务上报行为事件，
+// 上游返回 **HTTP 200 且不报错**，但事件被静默丢弃、进度纹丝不动 ——
+// 若不排除，一键完成会把它们算进范围，逐条报「已完成」而实际什么都没发生，
+// 用户既拿不到奖励，也看不出是锁的问题。锁是**上游的时间条件**，
+// 不是本地可以绕过的东西，唯一的正确处理是等。
 func (r *Runner) PendingTasks(ctx context.Context, a *auth.Auth) ([]TaskView, error) {
 	all, err := r.ListTasks(ctx, a)
 	if err != nil {
@@ -115,7 +181,7 @@ func (r *Runner) PendingTasks(ctx context.Context, a *auth.Auth) ([]TaskView, er
 	}
 	out := make([]TaskView, 0, len(all))
 	for _, v := range all {
-		if v.Claimed || !v.Automatable {
+		if v.Claimed || !v.Automatable || v.Locked {
 			continue
 		}
 		out = append(out, v)
@@ -133,7 +199,7 @@ func viewStatus(t upstream.GrowthTask, automatable bool) (string, string) {
 	case !automatable:
 		return ViewUnsupported, "需在客户端手动完成"
 	case t.Locked:
-		return ViewLocked, "尚未解锁"
+		return ViewLocked, lockedText(t.UnlockAt)
 	case !t.Participated():
 		return ViewNotAccepted, "未报名（可一键报名并完成）"
 	case t.HasProgress:
@@ -141,6 +207,27 @@ func viewStatus(t upstream.GrowthTask, automatable bool) (string, string) {
 	default:
 		return ViewAccepted, "已报名"
 	}
+}
+
+// lockedText 未解锁状态的中文说明：带上解锁时刻。
+//
+// 为什么值得为一句文案单独写个函数：实测（2026-09-30，Sequential_Tasks_2）
+// 上游下发的 locked 任务是**日期锁**，`unlock_at` 明确到秒。只说「尚未解锁」
+// 用户无从判断是上游故障还是正常等待，也无法决定「现在要不要重试」；
+// 带上时刻，「等明天」就变成了可自行核实的结论。
+//
+// 解析失败或字段缺失时回退成「尚未解锁」而**不报错**：这是纯展示字段，
+// 上游改格式不该让整张任务列表打不开 —— 少一句话远好过列表整体失败。
+func lockedText(unlockAt string) string {
+	s := strings.TrimSpace(unlockAt)
+	if s == "" {
+		return "尚未解锁"
+	}
+	ts, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return "尚未解锁"
+	}
+	return "尚未解锁（" + ts.Local().Format("2006-01-02 15:04") + " 开放）"
 }
 
 // viewRank 排序权重：待办在前，已完成垫底。

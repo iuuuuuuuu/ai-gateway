@@ -279,8 +279,73 @@ pub fn store_dir() -> PathBuf {
     home_dir().join(".wb-switch")
 }
 
+/// uid 是否可安全用作路径片段。
+///
+/// uid 来自抓包、客户端 `storage.json`、`Local State` 等**外部输入**，
+/// 含 `..` 或路径分隔符时可以越出数据目录（如 `..\..\..\Windows\System32`）。
+/// 因此每个 uid → 路径的入口都必须先过这一关。
+///
+/// 放在 `config` 而不是某个账号模块：这是**路径策略**，Trae / 豆包 / 快照槽位
+/// 都要用；挂在豆包模块下会让人觉得只有豆包需要校验（这正是之前 Trae 路径
+/// 漏掉校验的原因）。
+pub fn ensure_uid_safe(uid: &str) -> Result<(), String> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        return Err("缺少账号标识（userId）".to_string());
+    }
+    if uid.len() > 64 {
+        return Err("账号标识过长（超过 64 字符）".to_string());
+    }
+    if uid.contains("..") {
+        return Err("账号标识含非法片段 `..`".to_string());
+    }
+    if !uid
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("账号标识只能包含字母、数字、下划线与连字符".to_string());
+    }
+    Ok(())
+}
+
 pub fn accounts_file() -> PathBuf {
     store_dir().join("accounts.json")
+}
+
+/// 把数据目录重定向到临时目录 —— **仅供测试**，供集成测试（`tests/*.rs`）使用。
+///
+/// ## 为什么需要它（`cfg(test)` 覆盖不到集成测试）
+///
+/// `config::test_isolation` 整个模块是 `#[cfg(test)]` 的，而 `#[cfg(test)]` 只在
+/// **本 crate 自己的单元测试**编译时成立。集成测试（`tests/zz_*.rs`）把本 crate
+/// 当**外部依赖**链接，`cfg(test)` 不成立 —— 那个模块连同它的 `#[ctor]` 一起
+/// 不会被编进集成测试二进制，于是隔离完全失效。
+///
+/// 这不是理论风险，是实测：一个只调用 `store_dir()` 的探针集成测试，
+/// 在 `#[ctor]` 修复之后仍然读到 `C:\Users\<用户>\.wb-switch`（真实账号库）。
+/// 只要有任何集成测试走账号读写路径，它就会污染用户真实数据。
+///
+/// ## 用法
+///
+/// 在集成测试文件里，**在任何线程创建之前**（文件顶层 `#[ctor]`，或每个
+/// `#[test]` 的第一行且在 `--test-threads=1` 下）调用一次：
+///
+/// ```no_run
+/// #[ctor::ctor]
+/// fn isolate() { ai_gateway_core::modules::config::pin_store_dir_for_tests("my-test"); }
+/// ```
+///
+/// 幂等：重复调用不会改变已生效的目录。
+pub fn pin_store_dir_for_tests(tag: &str) {
+    // 已经指向临时目录就不动它 —— 幂等，且不会覆盖单元测试的隔离。
+    if std::env::var_os("AI_GATEWAY_HOME").is_some_and(|v| {
+        !v.is_empty() && std::path::Path::new(&v).starts_with(std::env::temp_dir())
+    }) {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("ai-gateway-it-{tag}-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::env::set_var("AI_GATEWAY_HOME", dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -298,23 +363,79 @@ pub fn app_settings_file() -> PathBuf {
 
 /// 把数据目录隔离到临时目录，供单元测试使用。
 ///
-/// 为什么需要一把全局锁：`AI_GATEWAY_HOME` 是**进程级**环境变量，而 cargo 默认
-/// 多线程跑测试。两个测试同时改它，会让其中一个读到另一个的目录 ——
-/// 表现为「刚写入的账号查不到」这类看似随机的失败。
-/// 所有依赖数据目录的测试都必须先拿这把锁。
+/// ## 为什么用 `set_var` 是错的（2026-09-16 实测事故）
+///
+/// 初版用「一把全局 `Mutex` + `std::env::set_var(AI_GATEWAY_HOME)`」做隔离，
+/// 并假设「所有依赖数据目录的测试都先拿这把锁」就安全。**这个假设不成立**：
+///
+/// 1. `std::env::set_var` 在 Rust 2024 起已是 `unsafe`，并且**在任何平台上都不是
+///    线程安全的** —— 它只对「调用时恰好在读同一变量」的线程构成 UB，而对
+///    「根本没去拿锁、却读了 `store_dir()`」的线程**不会报错，只会读到真实 home**。
+///    并发测试里只要有任何一个测试（或测试 helper）没拿锁就调用了 `store_dir()`，
+///    它就会把种子数据写进**用户真实的 `~/.wb-switch`**。
+/// 2. 事故证据：本机账号库里出现了 16 条一模一样的
+///    `{"uid":"legacy-user","email":"old@example.com"}` —— 这正是
+///    `account::tests` 里那条「只有 uid 没有 id」用例的种子数据。它先污染了
+///    `~/.ai-gateway`，随后被数据目录迁移原样搬进 `~/.wb-switch`，最终以一条
+///    「永远登录不了」的僵尸账号出现在界面上（见 `account::sanitize_accounts`
+///    与 `account::purge_credentialless_leftovers`）。
+///
+/// ## 现在的做法：在**任何线程被创建之前**把变量定死
+///
+/// `AI_GATEWAY_HOME` 改为在 `#[ctor]` 里于 `main` 之前指向一个**固定的、进程级**
+/// 临时目录，并在整个测试进程生命周期内不再改动：
+///
+/// - 不再需要 `set_var` 来「建立隔离」⇒ 隔离根目录在任何测试跑之前就已就位。
+/// - 所有测试线程读到的都是同一个隔离根目录 ⇒ 即使某个测试忘了拿锁，也不会碰到
+///   用户真实数据（最坏结果是测试之间互相看见，属可接受的失败模式）。
+/// - `Isolated` 退化为「拿锁 + 给一个唯一子目录」，用**子目录**把需要独立账号库的
+///   测试彼此隔开，且 `Drop` 时**还原到隔离根目录而非删除变量** —— 直接删除变量
+///   会让后续 `store_dir()` 退回真实 home，这正是事故的成因。
+///
+/// 关键点：环境变量的写入必须发生在 `std::thread` 首次 spawn **之前**。
+/// `#[ctor]` 在 `main` 之前运行，满足这个条件；在测试函数体里写则可能在其它测试
+/// 线程已经缓存了 `getenv` 结果之后才发生。
 #[cfg(test)]
 pub mod test_isolation {
     use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// 进程级隔离根目录。整个测试进程共用，永不变动。
+    fn root() -> &'static PathBuf {
+        static ROOT: OnceLock<PathBuf> = OnceLock::new();
+        ROOT.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("ai-gateway-tests-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        })
+    }
+
+    /// 在 `main` / 测试线程启动前把数据目录钉死到隔离根目录。
+    ///
+    /// 这是隔离**真正生效**的那一步：只要它在任何线程 spawn 之前执行完毕，
+    /// 后续任何一次 `store_dir()` 都不可能落到用户真实 home。
+    ///
+    /// **只覆盖 `--lib`（单元测试）**。集成测试（`tests/*.rs`）把本 crate 当外部
+    /// 依赖链接，`cfg(test)` 不成立，所以本模块连同 `#[ctor]` 一起不会被编进
+    /// 那些二进制 —— 它们的数据目录仍是**用户真实 home**（已用探针实测确认）。
+    /// 集成测试要隔离必须自己调用 `config::pin_store_dir_for_tests()`，
+    /// 参见 `tests/store_isolation.rs`。
+    #[ctor::ctor]
+    fn pin_test_home() {
+        let dir = root();
+        std::env::set_var("AI_GATEWAY_HOME", dir);
+    }
 
     fn lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    /// 隔离守卫：持有期间数据目录指向临时目录，释放时清理。
+    /// 隔离守卫：持有期间测试独占一个数据子目录。
     ///
-    /// 用 `MutexGuard` 而非 `Drop` 实现清理：这样即使测试 panic，锁也会释放，
+    /// 不再改环境变量 —— 只分配一个唯一子目录并把它设为当前测试的工作目录。
+    /// `MutexGuard` 而非 `Drop` 实现清理：即使测试 panic，锁也会释放，
     /// 后续测试不会被永久阻塞（poisoned 锁用 `into_inner` 兜底）。
     pub struct Isolated {
         _guard: MutexGuard<'static, ()>,
@@ -324,8 +445,8 @@ pub mod test_isolation {
     impl Isolated {
         pub fn new(tag: &str) -> Self {
             let guard = lock().lock().unwrap_or_else(|e| e.into_inner());
-            let dir = std::env::temp_dir().join(format!(
-                "ai-gateway-test-{tag}-{}-{}",
+            let dir = root().join(format!(
+                "{tag}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -334,6 +455,9 @@ pub mod test_isolation {
             ));
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::create_dir_all(&dir);
+            // 只改**子目录**：仍然经由环境变量下发，因为 `store_dir()` 是纯函数、
+            // 只认这一个来源；但写入的是进程级固定根目录下的唯一子目录，
+            // 因此即便与其它测试交错，也绝不会落到真实 home。
             std::env::set_var("AI_GATEWAY_HOME", &dir);
             Self { _guard: guard, dir }
         }
@@ -346,15 +470,33 @@ pub mod test_isolation {
 
     impl Drop for Isolated {
         fn drop(&mut self) {
-            std::env::remove_var("AI_GATEWAY_HOME");
-            let _ = std::fs::remove_dir_all(&self.dir);
+            // 还原到进程级隔离根目录（**不是**删除变量 —— 删除会让后续
+            // `store_dir()` 退回真实 home，正是本次事故的成因）。
+            std::env::set_var("AI_GATEWAY_HOME", root());
+//
+// ⚠ 这里**刻意不再** `remove_dir_all(&self.dir)`（2026-09 实测的偶发失败）。
+//
+// 上面那条原则（「最坏结果是测试之间互相看见」）对**删除**并不成立：
+// 大量测试并不持有本守卫，却会通过 `store_dir()` 读到「当前正在被某个
+// `Isolated` 使用中的」子目录，并在其中建自己的文件。守卫一 Drop 就把整个
+// 子目录删掉，等于**删掉了别的测试刚写完的东西**。
+//
+// 实盘证据：`modules::trae_agent::tests::导入会备份并同时写入两个库的全部键`
+// 偶发 panic 在 `trae_agent.rs` 的「必须创建备份」上 —— 它先经
+// `agent_import::backup_files` -> `backup_root()` -> `store_dir()` 在临时子目录里
+// 建好 `agent-backups/trae/<stamp>/`，随后某个并发 `Isolated` 测试跑完 Drop，
+// 把那个子目录整个删掉，断言再执行时目录已不存在。同一个测试单独跑 38/38
+// 全绿，正是「只有并发交错才失败」的典型特征。
+//
+// 不做删除是安全的：子目录名带 pid + 纳秒，永不重用；且 `root()` 每次
+// 测试进程启动时都会先 `remove_dir_all` 再重建，残留不会跨进程累积。
         }
     }
 }
 
-
 /// 读取应用设置（缺失或损坏返回空对象）。
-pub fn load_app_settings() -> Value {    std::fs::read_to_string(app_settings_file())
+pub fn load_app_settings() -> Value {
+    std::fs::read_to_string(app_settings_file())
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .filter(Value::is_object)
@@ -914,6 +1056,15 @@ pub fn utc_iso() -> String {
 
 /// 原子写文件（临时文件 + rename），对照 Python atomic_write。
 pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    // 先确保父目录存在：临时文件与目标同目录，父目录缺失时 `write` 会以
+    // 「系统找不到指定的路径 (os error 3)」失败 —— 而这在迁移动线上是**静默丢数据**：
+    // 合并写入失败后 `copy_dir_merged` 会把未过滤的旧账号库整个拷过去，
+    // 调用方只看得到 `Err`，文件却已经躺在目标目录里了（实测踩到）。
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -1038,6 +1189,126 @@ pub async fn http_request(
     headers: Option<&HashMap<String, String>>,
 ) -> Value {
     http_request_with_proxy(url, method, body, headers, None).await
+}
+
+/// 强制**直连**的 HTTP 请求（忽略设置里的代理，也忽略**系统代理**）。
+///
+/// 专供 OAuth 交换链路：本地 MITM 代理解密浏览器 OAuth 流量会让授权页报
+/// `ERR_CERT_AUTHORITY_INVALID`，而且 ExchangeToken 走代理时一旦 CA 未信任就
+/// 直接失败。这条链路必须绕开代理 —— 参考实现为此单独做了代理豁免白名单，
+/// 这里用「不挂代理的独立客户端」达到同样效果且不依赖系统代理配置。
+///
+/// # ★★ 2026-10-02 修正：此前并未真正绕开系统代理
+///
+/// 函数名与注释都声称「直连」，但 reqwest 的 `ClientBuilder` **默认
+/// `auto_sys_proxy = true`**（`reqwest-0.12.28/src/async_impl/client.rs:309`
+/// 初始化、`:419-421` 在 `build()` 时把系统代理推进 `proxies`），只有调用
+/// `.proxy(..)` 或 `.no_proxy()` 才会把它置 false（同文件 `:1416` / `:1429`）。
+/// 本函数两者都没调 ⇒ **系统代理一直生效**。
+///
+/// 这个缺陷被「所有者机器上系统代理恰好可用」掩盖了很久，一旦系统代理
+/// 指向一个不通的地址（如抓包工具退出后残留的 `127.0.0.1:9000`），
+/// 整条 OAuth 链路就会表现为「访问超时」。
+///
+/// 现在显式 `.no_proxy()`：清空所有代理并关闭系统代理，语义与函数名一致。
+///
+/// ⚠ 注意 `.no_proxy()` 与 `apply_proxy` 里用的
+/// `Proxy::no_proxy(Some(NoProxy))` **不是一回事**：前者是「一个代理都不用」，
+/// 后者是「用这个代理，但排除这些主机」。此处要的是前者。
+pub async fn http_request_direct(
+    url: &str,
+    method: &str,
+    body: Option<Value>,
+    headers: Option<&HashMap<String, String>>,
+) -> Value {
+    static DIRECT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = DIRECT.get_or_init(|| {
+        // 有意不调用 apply_proxy：这就是「直连」的定义
+        reqwest::Client::builder()
+            // ★★ 2026-10-02：`.no_proxy()` 是**必须**的，不是装饰。
+            //
+            // reqwest 的 `ClientBuilder` 默认 `auto_sys_proxy = true`
+            // （`reqwest-0.12.28/src/async_impl/client.rs:309`，`build()` 时在
+            // `:419-421` 把系统代理推进 `proxies`），只有 `.proxy(..)` 或
+            // `.no_proxy()` 才会把它置 false（同文件 `:1416` / `:1429`）。
+            // 此前这里两者都没调 ⇒ 系统代理一直生效，「直连」名不副实。
+            //
+            // 危害：系统代理指向一个不通的地址（抓包工具退出后残留的
+            // `127.0.0.1:9000` 就是典型）时，整条 OAuth 链路表现为「访问超时」。
+            // 所有者机器实测（`test-bin\trae-exchange-probe\proxy_impact_probe.py`）：
+            // ```text
+            // 直连（绕开代理）   HTTP 400  100.101s   ← 慢在 IPv6，不是代理
+            // 经系统代理 7890    HTTP 400    0.076s
+            // ```
+            // ⇒ 本函数必须**同时**有 `.no_proxy()` 与下面的 `.local_address(Ipv4)`：
+            // 只加 `.no_proxy()` 会掉进「直连 + IPv6 优先」= 105s；
+            // 只加 `.local_address(Ipv4)` 则仍会被不通的系统代理拖死。
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(120))
+            .user_agent(DEFAULT_HTTP_USER_AGENT)
+            // ★★ 强制 IPv4 源地址 ⇒ 只走 IPv4（2026-10-02 所有者现场）。
+            //
+            // # 症状
+            //
+            // `ExchangeToken` 超时，而同一个 URL 用 `curl` 测是好的。
+            //
+            // # 实测定位
+            //
+            // ```text
+            // 本机全局 IPv6      : 240e:33e:30c:a701::640（电信）
+            // DNS www.trae.cn    : 先返回 240e:93d:9:10:8000:0:b00:143 等 IPv6
+            // curl -6 trae.cn    : 超时 15s      ← IPv6 到该站不通
+            // curl -4 trae.cn    : 200 / 0.21s
+            // TCP 直连 IPv4:443  : 0.01s
+            // ```
+            //
+            // 即：**本机有 IPv6 地址，但到该站的 IPv6 路由不通**。
+            //
+            // # 为什么 curl 能通、代码不通
+            //
+            // curl 实现了 Happy Eyeballs（RFC 8305）：IPv6 连不上会**并行**试 IPv4，
+            // 所以看不出问题。reqwest/hyper **没有**这个回退 —— 它按 DNS 顺序
+            // 逐个尝试，IPv6 排在前面就一头撞上超时。
+            // 这种「工具能通、代码不通」最容易误判成代码 bug，故在此记下判据。
+            //
+            // # 取舍
+            //
+            // 代价：IPv6-only 环境下这条链路会失败。但那种环境下 DNS 也不会给出
+            // A 记录，与「IPv6 不通」是同一类故障 —— 而当前写法在**大量家用宽带**
+            // （有 IPv6 地址、到部分站点 IPv6 不通）上必然超时。
+            // 两害相权，固定 IPv4 是更稳的一侧。
+            .local_address(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+    let mut req = client.request(method, url);
+    req = req.header("Content-Type", "application/json");
+    if let Some(h) = headers {
+        for (k, v) in h {
+            req = req.header(k, v);
+        }
+    }
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                serde_json::from_str(&text).unwrap_or(Value::Null)
+            } else {
+                serde_json::from_str(&text).unwrap_or_else(|_| {
+                    json!({
+                        "code": status.as_u16(),
+                        "message": text.chars().take(500).collect::<String>(),
+                    })
+                })
+            }
+        }
+        Err(e) => json!({"code": -1, "message": e.to_string()}),
+    }
 }
 
 /// 通用 HTTP 请求，可为单次请求显式指定 HTTP/HTTPS 代理。

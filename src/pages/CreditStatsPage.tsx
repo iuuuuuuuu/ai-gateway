@@ -1350,7 +1350,12 @@ function loadCachedStatistics(refresh: boolean): Promise<CreditStatistics> {
   });
 }
 
-export default function CreditStatsPage() {
+/**
+ * `embedded`：被「账号管理」页（AccountHubPage）的 WorkBuddy tab 以二级 tab 嵌进来时为 true ——
+ * 去掉最外层留白容器与页面级大标题，只保留右侧「刷新统计」入口。
+ * 默认 false 时行为与合并前**逐字一致**。
+ */
+export default function CreditStatsPage({ embedded = false }: { embedded?: boolean } = {}) {
   const {
     accounts,
     creditMap,
@@ -1426,14 +1431,23 @@ export default function CreditStatsPage() {
   const official = isOfficialUsageAvailable(officialUsage) ? officialUsage : undefined;
 
   return (
-    <div className="mx-auto w-full max-w-[1180px] min-w-0 px-4 py-6 sm:px-8 sm:py-9">
-      <header className="mb-10 flex min-w-0 flex-wrap items-start justify-between gap-4 sm:mb-12">
-        <div className="min-w-0">
-          <h1 className="text-[28px] font-semibold tracking-tight">积分统计</h1>
-          <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-            当前数据更新于 {stats ? formatDateTime(official?.collectedAt ?? stats.generatedAt) : "—"}
-          </p>
-        </div>
+    <div className={embedded ? "space-y-5" : "mx-auto w-full max-w-[1180px] min-w-0 px-4 py-6 sm:px-8 sm:py-9"}>
+      <header
+        className={
+          embedded
+            ? "mb-0 flex min-w-0 flex-wrap items-start justify-end gap-4"
+            : "mb-10 flex min-w-0 flex-wrap items-start justify-between gap-4 sm:mb-12"
+        }
+      >
+        {/* 嵌入时不再渲染页面级标题（账号管理页已有一份），刷新入口必须留着。 */}
+        {!embedded && (
+          <div className="min-w-0">
+            <h1 className="text-[28px] font-semibold tracking-tight">积分统计</h1>
+            <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+              当前数据更新于 {stats ? formatDateTime(official?.collectedAt ?? stats.generatedAt) : "—"}
+            </p>
+          </div>
+        )}
         <DemoAction>
           <Button
             className="shrink-0"

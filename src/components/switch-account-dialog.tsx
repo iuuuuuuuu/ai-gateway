@@ -43,13 +43,22 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const [progress, setProgress] = useState("");
 
   // 监听后端切换进度：桌面端走 Tauri 事件，webui 走 HTTP 轮询
+  //
+  // ⚠ 依赖数组必须带 `open`，且关闭时**不能**建 timer。
+  // 这个弹窗在 AccountsPage 里是常驻挂载的（`open={switchAccount !== null}`），
+  // 早期写成 `[]` + 无条件 setInterval ⇒ 只要停在账号页，哪怕弹窗从没打开过，
+  // 也会每 600 ms 发一次 /api/switch/progress，永不停止。
+  // 实测（27 账号 + 20 个并发重接口）该接口被拖到 17–24 秒，堆积出「启动后长时间无响应」。
   useEffect(() => {
+    if (!open) return;
     if (api.isWebui()) {
-      const timer = setInterval(() => {
+      const tick = () => {
         void api.switchProgress().then((p) => {
           if (p.progress) setProgress(p.progress);
         });
-      }, 600);
+      };
+      tick();
+      const timer = setInterval(tick, 600);
       return () => clearInterval(timer);
     }
     let unlisten: (() => void) | undefined;
@@ -61,7 +70,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     return () => {
       unlisten?.();
     };
-  }, []);
+  }, [open]);
 
   // 打开时加载当前账号会话
   useEffect(() => {

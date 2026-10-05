@@ -1,5 +1,6 @@
 import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
+  CliQuotaAccount, CliQuotaStatusItem,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
   GatewayUsageGroup, GatewayUsageResult,
   GithubConfig, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals,
@@ -7,7 +8,25 @@ import type {
 } from "./types";
 // Qoder / ZCode 的账号类型定义在 api.ts（不在 types.ts）——
 // 演示模式要给这两个页面造假数据，故从这里取真实类型。
-import type { QoderAccount, ZcodeAccount } from "./api";
+import type {
+  DoubaoHealthEvent,
+  DoubaoHistory,
+  GroupApp,
+  GroupsView,
+  ProxyLogEntry,
+  ProxyLogList,
+  ProxyLogsOverview,
+  QoderAccount,
+  TraeCheckinTodayMap,
+  TraeCheckinTrendPoint,
+  TraeCheckinTrends,
+  TraeCreditDetail,
+  TraeCreditsDay,
+  TraeCreditsStats,
+  TraeUsageDay,
+  TraeUsageHistory,
+  ZcodeAccount,
+} from "./api";
 import { demoModeEnabled } from "./demo-mode";
 
 export const screenshotDemoEnabled = demoModeEnabled;
@@ -111,6 +130,20 @@ function futureAt(daysAhead: number, hour = 23, minute = 59): number {
   date.setDate(date.getDate() + daysAhead);
   date.setHours(hour, minute, 0, 0);
   return date.getTime();
+}
+
+/**
+ * 后端运维事件的时间戳形态。
+ *
+ * ⚠ 是 `YYYY-MM-DDTHH-MM-SSZ`（**时间里是连字符**），来自 `config::utc_iso`，
+ * 不是 RFC3339 的冒号形态。演示数据必须照这个写：
+ * 后端的 `parse_iso_ts` 两种都认，但如果我们演示里用冒号，
+ * 就等于在演示模式下掩盖了"真实数据长什么样"。
+ */
+function demoUtcIso(daysAgo: number, hour: number, minute: number): string {
+  const hh = String(hour).padStart(2, "0");
+  const mm = String(minute).padStart(2, "0");
+  return `${localDate(daysAgo)}T${hh}-${mm}-00Z`;
 }
 
 function hydratedAccounts(): AccountMeta[] {
@@ -616,6 +649,338 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
         },
       };
 
+    // 统一账号页的「参加兼容网关路由」开关（只读快照）。
+    //
+    // 演示值刻意**两种状态都有**：qoder 关掉，其余参加 —— 这样走查时
+    // 能同时看到开、关两种 Switch 外观，以及"关掉的平台"在页头提示语
+    // 上的表现（而不是一片全开，看不出关掉长什么样）。
+    //
+    // ⚠ 键缺失 = 参加（后端语义）。这里把 trae 显式写成 true 只是为了
+    // 演示数据自解释；界面判断必须用 !== false，别依赖键存在。
+    case "get_platform_enabled":
+      return {
+        platformEnabled: { qoder: false, trae: true },
+      };
+
+    // ---- 本机 AI CLI 额度查询（额度查询页）----
+    //
+    // 这两个命令已登记进 `api.ts` 的 `DEMO_READ_COMMANDS`，**必须**在这里
+    // 也有 case —— 否则白名单放行后落到 `default` 抛「演示模式缺少只读数据」，
+    // 正是上面 Qoder/ZCode 那一段注释里记录过的坑（数据没写 = 页面空白）。
+    //
+    // 演示值刻意覆盖**三种展示状态**，这样走查时能一次看到全部分支：
+    //   claude      —— 有额度、两个窗口都拿到百分比（正常态）
+    //   codex       —— `remainingPercent: null`（**未知 ≠ 用尽**：界面要显示
+    //                  「—」而不是 0，否则看起来像额度耗尽）
+    //   antigravity —— `loggedIn: false`（**未登录不是错误**：中性提示 + 登录引导）
+    case "get_cli_quota_status":
+      return {
+        providers: [
+          { provider: "claude", label: "Claude Code", loggedIn: true, loginHint: "运行 `claude` 完成登录" },
+          { provider: "antigravity", label: "Antigravity", loggedIn: false, loginHint: "打开 Antigravity 登录一次" },
+          { provider: "codex", label: "Codex", loggedIn: true, loginHint: "运行 `codex login` 完成登录" },
+          { provider: "xai", label: "Grok Build", loggedIn: false, loginHint: "运行 `grok login` 完成登录" },
+          { provider: "kimi", label: "Kimi Code", loggedIn: false, loginHint: "运行 `kimi` 完成登录" },
+        ] satisfies CliQuotaStatusItem[],
+      };
+    case "get_cli_quotas":
+      return {
+        accounts: [
+          {
+            id: "claude:keychain",
+            provider: "claude",
+            providerLabel: "Claude Code",
+            label: "demo@example.com",
+            loggedIn: true,
+            source: "本机凭据（演示）",
+            plan: "Max",
+            windows: [
+              { label: "5 小时", remainingPercent: 72, resetAtMs: Date.now() + 3 * 3600_000, detail: null },
+              { label: "每周", remainingPercent: 41, resetAtMs: Date.now() + 4 * 86400_000, detail: null },
+            ],
+            error: null,
+            fetchedAt: Date.now(),
+            resetCredits: null,
+            subscriptionActiveUntil: null,
+          },
+          {
+            id: "codex:auth.json",
+            provider: "codex",
+            providerLabel: "Codex",
+            label: "demo@example.com",
+            loggedIn: true,
+            source: "本机凭据（演示）",
+            plan: "Pro",
+            windows: [
+              // remainingPercent = null：上游没给出可比口径 ⇒ 界面显示「—」
+              { label: "每周", remainingPercent: null, resetAtMs: null, detail: "$25.00 / $100.00" },
+            ],
+            error: null,
+            fetchedAt: Date.now(),
+            resetCredits: { available: 2, applicable: 1, earliestExpiryMs: Date.now() + 6 * 86400_000 },
+            subscriptionActiveUntil: null,
+          },
+          {
+            id: "antigravity:desktop",
+            provider: "antigravity",
+            providerLabel: "Antigravity",
+            label: "未登录",
+            loggedIn: false,
+            source: "未检测到",
+            plan: null,
+            windows: [],
+            error: null,
+            fetchedAt: Date.now(),
+            resetCredits: null,
+            subscriptionActiveUntil: null,
+          },
+        ] satisfies CliQuotaAccount[],
+      };
+
+    // ---- 分组 / 积分 / 签到趋势 / 用量 / 抓包日志 ----
+    //
+    // 这 8 条已登记进 `api.ts` 的 `DEMO_READ_COMMANDS`，**必须**在这里也有 case
+    // —— 只登记不写数据时 `call()` 放行后落到 `default` 抛
+    // 「演示模式缺少只读数据」，页面空白、看起来像"功能没做"。
+    //
+    // 演示值刻意覆盖各组件注释里点名的**边界展示状态**，走查时能一次看全：
+    //   `null` ≠ `0`（这天没采到数据 ≠ 积分归零；当天没签到 ≠ 成功率 0）
+    //   `error` 非空（拉取失败但有缓存时，要写明"展示的是缓存"）
+    //   `status: "-"`（取不到响应状态）
+    //   空分组 / `observedDays` 偏少（趋势可信度提示）
+    case "groups_list": {
+      const app = (args?.app === "Doubao" ? "Doubao" : "Trae") satisfies GroupApp;
+      return {
+        app,
+        groups: [
+          { id: "g-demo-1", name: "主力号", color: "emerald", order: 0, count: 2, uids: ["demo-user-001", "demo-user-002"] },
+          { id: "g-demo-2", name: "备用号", color: "sky", order: 1, count: 1, uids: ["demo-user-003"] },
+          // 空分组：刚建好还没拖账号进去 —— 界面要能正常显示，
+          // 不能因为 count 为 0 就当脏数据藏掉
+          { id: "g-demo-3", name: "待归档", color: "slate", order: 2, count: 0, uids: [] },
+        ],
+        // 只含仍然存在的分组；没有分组的 uid 不出现在这里
+        membership: { "demo-user-001": "g-demo-1", "demo-user-002": "g-demo-1", "demo-user-003": "g-demo-2" },
+      } satisfies GroupsView;
+    }
+
+    case "trae_credit_detail":
+      return {
+        userId: String(args?.userId ?? "demo-user-001"),
+        total: 8420.5,
+        packs: [
+          { name: "个人版积分包", remaining: 1180.75, total: 2400, expireAt: new Date(futureAt(18)).toISOString() },
+          // expireAt 为 null = 不过期（不是"已过期"）
+          { name: "新用户体验包", remaining: 386.4, total: 800, expireAt: null },
+        ],
+        payIdentity: "个人版",
+        payExpireAt: new Date(futureAt(96)).toISOString(),
+        // 部分来源失败时仍返回已拿到的数据 ⇒ 界面要能"部分数据 + 逐来源说明"，
+        // 而不是整块失败
+        errors: ["权益包接口超时，上面是上次成功抓到的值"],
+      } satisfies TraeCreditDetail;
+
+    case "trae_credits_stats": {
+      // 刻意留一天 total/consumed 都是 null：那天没采到数据。
+      // 画成 0 会让人以为额度掉了 —— 这是注释里点名的"与积分归零不同"。
+      const daily = [6, 5, 4, 2, 1, 0].map((ago, index) => ({
+        date: localDate(ago),
+        total: index === 1 ? null : 9000 - index * 120,
+        consumed: index === 1 ? null : 120 + index * 8,
+      })) satisfies TraeCreditsDay[];
+      return {
+        days: 30,
+        daily,
+        summary: {
+          latestTotal: 9000,
+          firstTotal: 8420.5,
+          consumed: 720.5,
+          // 只采到 6 天 ⇒ 趋势可信度有限，界面要据此提示
+          observedDays: daily.length,
+          change: 579.5,
+        },
+        accounts: [
+          { userId: "demo-user-001", name: "测试 A", credits: 8420.5, updatedAt: new Date(atLocalTime(0, 9, 12)).toISOString() },
+          { userId: "demo-user-002", name: "测试 B", credits: 2210, updatedAt: new Date(atLocalTime(0, 9, 19)).toISOString() },
+          // 从没采到过 ⇒ credits/updatedAt 都为 null，界面显示「—」
+          { userId: "demo-user-003", name: "测试 C", credits: null, updatedAt: null },
+        ],
+      } satisfies TraeCreditsStats;
+    }
+
+    case "trae_checkin_trends": {
+      // 只含实际有记录的日期（**不补 0 高度的柱子**）；
+      // 其中一天 successRate 为 null —— 那天没有账号需要签到，
+      // 不是"成功率 0"（显示 0% 会被误读成全部失败）
+      const points = [5, 4, 3, 1, 0].map((ago, index) => ({
+        date: localDate(ago),
+        ok: 2,
+        already: index === 2 ? 3 : 0,
+        failed: index === 3 ? 1 : 0,
+        skipped: index === 4 ? 2 : 0,
+        total: index === 2 ? 5 : 2,
+        successRate: index === 1 ? null : 100,
+      })) satisfies TraeCheckinTrendPoint[];
+      return {
+        days: 30,
+        points,
+        summary: {
+          ok: 10,
+          already: 3,
+          failed: 1,
+          skipped: 2,
+          total: 14,
+          observedDays: points.length,
+          successRate: 92.9,
+        },
+      } satisfies TraeCheckinTrends;
+    }
+
+    case "trae_checkin_status": {
+      // 三态都要出现：已签 / 未签 / **不知道**（没有键）。
+      // 「不知道」必须是缺键而不是 false —— 演示数据也要示范正确的语义，
+      // 否则截图会教人把"没问到"当成"未签到"。
+      return {
+        date: localDate(0),
+        accounts: {
+          "demo-user-001": { checkedIn: true, status: "success", name: "测试 A", updatedAt: `${localDate(0)}T09:12:00Z` },
+          "demo-user-002": { checkedIn: false, status: "not_checked_in", name: "测试 B", updatedAt: `${localDate(0)}T09:19:00Z` },
+          "demo-user-004": { checkedIn: null, status: "fail", name: "测试 D", updatedAt: `${localDate(0)}T09:21:00Z` },
+        },
+      } satisfies TraeCheckinTodayMap;
+    }
+
+    case "trae_usage_history": {
+      const daily = [3, 2, 1, 0].map((ago, index) => ({
+        date: localDate(ago),
+        credits: 128.5 - index * 12,
+        sessions: 9 - index,
+        models: { "deepseek-v4-flash": 96.5 - index * 10, "kimi-k3-1": 32 - index * 2 } satisfies Record<string, number>,
+        inputTokens: 184000 - index * 12000,
+        outputTokens: 46000 - index * 3000,
+        cacheReadTokens: 920000 - index * 60000,
+      })) satisfies TraeUsageDay[];
+      return {
+        fetchedAt: Date.now(),
+        // 演示里走"这是缓存"的样式，避免看起来像刚拉过上游
+        cached: true,
+        accounts: [
+          {
+            userId: "demo-user-001",
+            name: "测试 A",
+            ok: true,
+            error: null,
+            daily,
+            totalCredits: 128.5,
+            sessions: 9,
+            // 按扣费降序
+            models: [
+              { model: "deepseek-v4-flash", credits: 96.5 },
+              { model: "kimi-k3-1", credits: 32 },
+            ],
+          },
+          {
+            // 拉取失败但有缓存 ⇒ error 里要写明"展示的是缓存"，
+            // 否则用户会把旧数据当成实时数据
+            userId: "demo-user-002",
+            name: "测试 B",
+            ok: false,
+            error: "上游超时，展示的是缓存",
+            daily: [],
+            totalCredits: 0,
+            sessions: 0,
+            models: [],
+          },
+        ],
+      } satisfies TraeUsageHistory;
+    }
+
+    case "proxy_logs_list": {
+      const entries = [
+        { id: "2026-09-30.log:412", timestamp: `${localDate(0)} 09:31:04`, method: "HTTP GET", host: "api.workbuddy.ai", path: "/v1/models", status: "200", size: 18432 },
+        {
+          id: "2026-09-30.log:418",
+          timestamp: `${localDate(0)} 09:32:47`,
+          method: "HTTP POST",
+          host: "api.workbuddy.ai",
+          path: "/v1/chat/completions",
+          status: "200",
+          size: 96421,
+          // SSE 流式请求才有这两个字段：模型名 + token 摘要
+          sseModel: "deepseek-v4-flash",
+          sseTokens: "p:120 c:340 t:460",
+        },
+        { id: "2026-09-30.log:433", timestamp: `${localDate(0)} 09:35:12`, method: "HTTP POST", host: "copilot.tencent.com", path: "/v2/chat", status: "429", size: 512 },
+        // WebSocket 与"取不到响应状态"两种展示形态
+        { id: "2026-09-30.log:441", timestamp: `${localDate(0)} 09:38:55`, method: "WebSocket", host: "gateway.example", path: "/ws", status: "-", size: 2048 },
+      ] satisfies ProxyLogEntry[];
+      return {
+        entries,
+        // total 是**过滤后的总数**，不是本页条数 —— 演示里刻意远大于本页，
+        // 这样分页区的「共 N 条」才看得出与列表长度不是一回事
+        total: 137,
+      } satisfies ProxyLogList;
+    }
+
+    // 详情返回的是 `{ content }`（`proxyLogDetail` 内部取 `.content`）
+    case "proxy_log_detail":
+      return {
+        content: [
+          "HTTP GET https://api.workbuddy.ai/v1/models",
+          "→ 200 OK (18,432 bytes)",
+          "",
+          "（演示模式下的假正文）",
+        ].join("\n"),
+      };
+
+    case "proxy_logs_overview":
+      return {
+        dir: "/demo/proxy-logs",
+        fileCount: 12,
+        totalBytes: 8_642_304,
+        oldest: `${localDate(29)} 00:12:03`,
+        newest: `${localDate(0)} 09:38:55`,
+      } satisfies ProxyLogsOverview;
+
+    case "doubao_history": {
+      // ★ 趋势**至少 2 天**：`doubao-insights.tsx:14` 里 `trend.length < 2`
+      // 会显示「额度趋势需要至少两天的数据」，只给一天就等于演示模式看不到折线。
+      // 纵轴固定 0~100，所以 usedPercent 用个位/十位数量级才像真实额度。
+      const trend = [6, 5, 4, 3, 2, 1, 0].map((ago) => ({
+        date: localDate(ago),
+        usedPercent: 8.4 + (6 - ago) * 2.15,
+        level: "个人版",
+        uid: "demo-doubao-0001",
+      }));
+      return {
+        // 事件按时间升序（组件自己 `reverse()` 后取前 8 条），这里给 6 条覆盖
+        // 三种 kind × 成功/失败，走查时能看到「保活/续期/额度」三类标签
+        // 与失败态的红色徽标。
+        events: [
+          { at: demoUtcIso(6, 9, 12), kind: "keepalive", ok: true, uid: "demo-doubao-0001", summary: "会话保活成功" },
+          { at: demoUtcIso(5, 9, 8), kind: "quota", ok: true, uid: "demo-doubao-0001", level: "个人版", windows: [{ name: "5小时", usedPercent: 6.2, exhausted: false }] },
+          { at: demoUtcIso(3, 21, 40), kind: "renew", ok: false, uid: "demo-doubao-0001", summary: "续期失败：上游返回 503，已保留原 sessionid" },
+          { at: demoUtcIso(2, 9, 11), kind: "quota", ok: true, uid: "demo-doubao-0001", level: "个人版", windows: [{ name: "5小时", usedPercent: 7.8, exhausted: false }, { name: "7天", usedPercent: 41.3, exhausted: false }] },
+          { at: demoUtcIso(1, 9, 9), kind: "keepalive", ok: true, uid: "demo-doubao-0001", summary: "会话保活成功" },
+          { at: demoUtcIso(0, 9, 10), kind: "quota", ok: true, uid: "demo-doubao-0001", level: "个人版", windows: [{ name: "5小时", usedPercent: 8.4, exhausted: false }] },
+        ] satisfies DoubaoHealthEvent[],
+        trend,
+        health: {
+          // days 与 requestedDays 刻意不同：健康计数按**固定窗口**统计，
+          // 事件/趋势按请求天数截取 —— 界面不能拿一个当另一个用
+          days: 7,
+          keepalive: 6,
+          renew: 1,
+          quota: 12,
+          ok: 18,
+          // 留一个失败：`failed > 0` 才渲染红色徽标，全绿就看不出这条路径
+          failed: 1,
+          lastKeepaliveAt: demoUtcIso(1, 9, 9),
+        },
+        requestedDays: 30,
+      } satisfies DoubaoHistory;
+    }
+
     default: throw new Error(`演示模式缺少只读数据: ${command}`);
   }
 }
@@ -658,5 +1023,7 @@ function demoZcodeAccount(): ZcodeAccount {
     credits: 299999978,
     creditsTotal: 300000000,
     expireAt: Math.floor(Date.now() / 1000) + 30 * 86400,
+    // 演示数据按「已激活」渲染，避免截图里出现「从未激活」的提示
+    warmedAt: Math.floor(Date.now() / 1000) - 3600,
   } satisfies ZcodeAccount;
 }

@@ -114,6 +114,26 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # ⚠ 本步骤是 2026-10-01 补上的**缺失环节**，不要删。
+      #
+      # 此前本工作流从 checkout 直接走到 `cargo build -p ai-gateway-server`，
+      # 中间**从来没有**构建内嵌网关。而 `crates/ai-gateway-core/build.rs` 在
+      # 找不到网关时**不报错** —— 它只打一行 `cargo:warning=未找到网关二进制，
+      # 本次构建不内嵌` 然后写 `None`。于是本工作流产出的"Windows 试装包"
+      # 内嵌的是**空网关**，装完应用能起、点「兼容网关」才报
+      #「本构建未内嵌网关二进制」。
+      #
+      # 这与所有者报过的那个缺陷（「我发现每次都会内嵌的是旧的网关」）是同一个
+      # 根因的两面：网关的构建步骤**没有跟构建产物绑定**。release.yml 与
+      # ci.yml 都在 2026-09-21 那次修复里加了这一步，本文件被漏掉了 ——
+      # 因为它当时已改成只在 workflow_dispatch 手动触发，不在日常路径上。
+      #
+      # 放在 `cargo` 之前：build.rs 是在编译期读 `embedded/` 的，晚于它就没用了。
+      # 前端构建不碰 cargo，故放在它前面即可。
+      - name: Build embedded gateway
+        shell: bash
+        run: sh scripts/build-gateway.sh
+
       # 前端构建产物（CLI 二进制 rust-embed 嵌入 + Tauri App 使用）
       - name: Build frontend
         run: |
@@ -121,6 +141,11 @@ jobs:
           npm run build
 
       # CLI 二进制
+      #
+      # ⚠ 这里**不要**改成 `cargo build -p ai-gateway-router --bin gateway`：
+      # 本步骤要的是**宿主 CLI**（`ai-gateway-server`，npm 分发的那个命令），
+      # 不是网关。网关由上面那条 `sh scripts/build-gateway.sh` 产出并被 build.rs
+      # 内嵌进本产物。两者是不同的 crate，改错会得到一个不含宿主 UI 的包。
       - name: Build server binary
         shell: bash
         run: |

@@ -146,6 +146,23 @@ pub struct ZcodeAccount {
     ///   "used":0,"unitType":"token","expiresAt":…}]
     /// ```
     pub quota_entries: Vec<Value>,
+    /// 最近一次「激活」（上报官方启动事件 + 领取套餐）的时刻（Unix 秒）；
+    /// 0 = 从未激活过。
+    ///
+    /// # 为什么需要它（2026-08-xx 所有者要求「启动激活要能自动执行」）
+    ///
+    /// 激活是**写**操作：以账号身份向上游报 `app_launch` / `app_daily_active`。
+    /// 官方客户端在用户**首次启动**时才会报这两个事件，所以自动激活必须
+    /// 做成「每个账号只做一次」—— 每次网关启动都重报，等于告诉上游
+    /// 「这个账号每天被启动几十次」，那比不报更糟。
+    ///
+    /// 本字段就是那个**幂等依据**：自动侧只在
+    /// `warmed_at == 0 || 距上次 > 阈值` 时才发。
+    ///
+    /// ⚠ 它**不能**放在内存里（对比 `claim_scheduler` 的 `hold_until` 只在内存）：
+    /// 那需要用户在同一个进程里连续运行，而「启动激活」的语义恰恰是跨进程的
+    /// —— 用户重启一次网关就会重报一次。故必须落账号库。
+    pub warmed_at: i64,
 }
 
 impl ZcodeAccount {
@@ -172,6 +189,9 @@ impl ZcodeAccount {
             "avatarUrl": self.avatar_url,
             "accountId": self.account_id,
             "models": self.models,
+            // 最近一次自动/手动激活的时刻（Unix 秒，0 = 从未）。
+            // 界面据此显示「已激活 / 未激活」并解释自动激活为何不再重跑。
+            "warmedAt": self.warmed_at,
         })
     }
 }
@@ -235,6 +255,9 @@ fn account_from_value(v: &Value) -> Option<ZcodeAccount> {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default(),
+                // 激活时刻（老记录没有这个键 ⇒ 0 ⇒ 会被自动激活认作"从未激活"，
+                // 这正是升级后第一次启动该有的行为）。
+                warmed_at: i64_of(v, "warmedAt"),
                 avatar_url: str_of(v, "avatarUrl"),
                 account_id: str_of(v, "accountId"),
                 models: v
@@ -417,6 +440,13 @@ fn apply_patch(a: &mut ZcodeAccount, patch: &Value) {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect();
+                }
+            }
+            // 激活时刻（Unix 秒）。只接受整数 —— 0 是合法值
+            //（"重置为从未激活"，供测试与将来的手动重置用）。
+            "warmedAt" => {
+                if let Some(n) = v.as_i64() {
+                    a.warmed_at = n;
                 }
             }
             _ => {}

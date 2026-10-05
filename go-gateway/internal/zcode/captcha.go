@@ -1040,6 +1040,22 @@ func (s *CaptchaSolver) solveOnce(ctx context.Context) (string, error) {
 
 	cmd := exec.CommandContext(cctx, node, entry, scene, region, prefix)
 	cmd.Dir = dir
+	// ⚠ 这里**刻意不设 `cmd.Env`** —— 求解器子进程继承本进程的环境，
+	// 而网关的代理是显式 `SetProxy` 配进 `http.Transport` 的（见 client.go），
+	// **不会**变成 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量，所以求解器
+	// **不会**走用户配的代理。
+	//
+	// # 为什么"给求解器注入代理"不是显然的修复（**发现但未修**）
+	//
+	// 线上配置常是 `proxy=http://127.0.0.1:7890` +
+	// `proxy_scope={"cn":false,"intl":true}` —— 国服直连、只有国际版走代理。
+	// 而阿里云验证码是**国内服务**，按该配置本来就该直连。故注入代理未必是修复，
+	// 反而可能把当前可用的直连路径弄坏。
+	// ⇒ 在没有真实实例 A/B 证据前不动这条路径（本项目最敏感的区域：
+	// 验证码只应由用户手动触发、绝不进轮询、不猛打验证码端点）。
+	//
+	// 同理，F001 的提示文案（见 errors.go 的 riskCodeHints）**不承诺**
+	// "配了代理求解器就会走代理"，只说清症状与出路，并提醒该代理按区域生效。
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1091,11 +1107,44 @@ func (s *CaptchaSolver) solveOnce(ctx context.Context) (string, error) {
 			firstLine(stderrText))
 	}
 
-	msg := firstLine(stderrText)
+	msg := solverDetail(stderrText)
 	if msg == "" && waitErr != nil {
 		msg = waitErr.Error()
 	}
 	return "", fmt.Errorf("验证码求解失败：%s", msg)
+}
+
+// solverDetail 汇总求解器的 stderr 供错误信息使用（截断，避免刷屏）。
+//
+// # ⚠ 为什么不能只取 firstLine（本次改动）
+//
+// 求解器把**失败原因**写在 stderr 里，而它可能不是第一行。实测形态
+// （`assets/zcode-captcha/solver.js` 的 `handleCaptchaResult`）：
+//
+//	verify rejected: {"verifyCode":"F001","certifyId":"…"}
+//
+// 宿主（WebView2）路径同样会把 SDK 回传的 `fail`/`onError` 对象
+// `JSON.stringify` 后带回来（见 `src-tauri/src/captcha_webview.rs`）。
+//
+// 旧实现只取 `firstLine` ⇒ 这些内容**全被丢掉**，用户只看到一句
+// `exit status 4`（`waitErr.Error()`）—— 而可操作的线索（风控码）
+// 就在被丢掉的那段里。`errors.go` 的 `AnnotateRiskCode` 正需要看到它。
+//
+// ⚠ 这**只**改变"报错时保留多少信息"，不碰任何重试/求解逻辑。
+// 截断上限复用 `riskRawLimit`（300，与参考实现同口径）。
+func solverDetail(stderrText string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(stderrText, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString(" ")
+		}
+		b.WriteString(line)
+	}
+	return truncateStr(b.String(), riskRawLimit)
 }
 
 // CooldownLeft 距离冷却结束还有多久（0 = 不在冷却）。

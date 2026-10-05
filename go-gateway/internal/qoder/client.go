@@ -30,6 +30,11 @@ type Client struct {
 	HTTP *http.Client
 	// Timeout 短请求（模型列表 / 额度）的总时长上限。
 	Timeout time.Duration
+	// userStatusBase 覆盖 `/user/status` 的基址，**仅供测试**。
+	//
+	// 那个端点的基址取自 `cr.Region.Gateway()`，而 httptest 的地址不是
+	// 任何一个真实区域，没法从 Region 推出来。生产路径留空即可。
+	userStatusBase string
 }
 
 // New 生产默认客户端。

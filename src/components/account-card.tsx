@@ -1,5 +1,5 @@
 import { ArrowRight, Ban, Boxes, CalendarCheck, CalendarHeart, Cat, Check, CircleCheck, Clock3, Coins, Copy, Ellipsis, Gift, Globe, GraduationCap, History, Info, ListChecks, Loader2, MapPin, Moon, PencilLine, PlaneTakeoff, RefreshCw, Save, Sparkles, Star, Trash2, Zap } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -495,7 +495,7 @@ function growthMapAvailability(account: AccountMeta): TaskAvailability {
 }
 
 /**
- * 全部成长任务的动态列表（本账号）。
+ * 全部成长任务的动态列表（本账号）—— **由父级集中预加载后传入**。
  *
  * # 为什么需要它（2026-09-22 所有者反馈）
  *
@@ -504,49 +504,27 @@ function growthMapAvailability(account: AccountMeta): TaskAvailability {
  * 菜单里此前是**硬编码**的 6 项，而后端 `growtask/actions.go` 的表里有
  * 18+ 项。硬编码必然漏 —— 这次只是把它暴露出来了而已。
  *
- * 改为打开菜单时向 `POST /tasks/growth {"action":"list"}` 拉**全量**清单：
+ * 改为向 `POST /tasks/growth {"action":"list"}` 拉**全量**清单：
  * 上游加任务时界面自动跟上，不需要再改这段代码。
  *
  * ⚠ `list` 是**只读**的（后端 `ListTasks` 明确无任何写操作），
- * 所以打开菜单就拉一次是安全的，不会消耗任何额度。
+ * 所以多拉一次是安全的，不会消耗任何额度。
+ *
+ * # ⚠ 为什么拉取**不在这里**做（2026-09-25 所有者反馈后改）
+ *
+ *	「这些任务不要每次都动态加载,默认就显示出来就行了,不然这个突然变长,
+ *	  我操作起来还可麻烦」
+ *
+ * 此前是「打开菜单才拉」（`useGrowthTasks(account.id, menuOpen)`），
+ * 于是每次打开菜单都要先转圈、列表再"突然变长"把下面的菜单项顶下去 ——
+ * 用户点「备注」的手感被打断。而**不能**改成「每张卡片挂载时各拉一次」：
+ * 19 个账号会瞬间打出 19 个请求（与签到/旅行那两个启动期请求风暴同源）。
+ *
+ * 故改为**父级集中预加载一次**（`AccountsPage` 的 `fetchGrowthTasksMap`，
+ * 复用已有的 `mapWithConcurrency` 限流），结果按账号 id 下发到卡片 ——
+ * 菜单一打开就是最终长度，不再有转圈与跳动。
  */
-function useGrowthTasks(
-  accountId: string,
-  enabled: boolean,
-): { tasks: GrowthTaskView[] | null; error: string | null } {
-  const [tasks, setTasks] = useState<GrowthTaskView[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (!enabled) return;
-    let alive = true;
-    setTasks(null);
-    setError(null);
-    void (async () => {
-      try {
-        const res = await api.runGrowthTask("list", accountId);
-        if (!alive) return;
-        if (!res.ok) {
-          // 后端明确说不 ok（如账号正忙）时如实显示，不要静默空列表 ——
-          // 空列表会被读成"这个号没有任务"，而那是另一个意思。
-          setError(res.error || "读取任务列表失败");
-          setTasks([]);
-          return;
-        }
-        setTasks(res.tasks ?? []);
-      } catch (e) {
-        if (!alive) return;
-        setError(api.asError(e));
-        setTasks([]);
-      }
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [accountId, enabled]);
-
-  return { tasks, error };
-}
 
 /** 任务列表项的显示名：优先上游标题，回落任务码（任务码总比空白强）。 */
 function growthTaskLabel(t: GrowthTaskView): string {
@@ -556,13 +534,17 @@ function growthTaskLabel(t: GrowthTaskView): string {
 /**
  * 该任务能否被本工具自动完成。
  *
- * ⚠ 三个条件缺一不可：
+ * ⚠ 四个条件缺一不可：
  *   `automatable` —— 后端知道怎么做（有对应的 action 实现）
  *   `needs_chat`  —— 需要真实对话，**会消耗额度**，界面必须让用户知情
  *   非 `claimed`  —— 已领过的不必再点
+ *   非 `locked`   —— 上游时间锁未到期，执行也不会计分（后端 `pending_tasks` 同样排除）
  */
 function growthTaskRunnable(t: GrowthTaskView): boolean {
   if (t.status === "claimed") return false;
+  // 上游时间锁未到期：现在执行上游返回 200 但**静默丢弃**事件、进度纹丝不动
+  // （实测 2026-09-30 `Sequential_Tasks_2`），点了也只是白跑一趟。
+  if (t.status === "locked" || t.locked === true) return false;
   return t.automatable === true;
 }
 
@@ -826,6 +808,22 @@ interface Props {
    */
   growthAllRunningAccountId?: string | null;
   /**
+   * 本账号的全部成长任务清单（由父级**集中预加载**后下发）。
+   *
+   * ⚠ `null` 与 `[]` 是**两个不同的意思**，界面必须区分（见下方渲染分支）：
+   *   · `null`      —— 还没读到（预加载中 / 该账号读取失败）
+   *   · `[]`        —— 读到了，该账号确实没有可执行的成长任务
+   * 把 `null` 当成 `[]` 会让「读取中」显示成「没有任务」，
+   * 用户会以为这个号真的没任务，而不是"还没查完"。
+   *
+   * ⚠ 为什么由父级下发而不是卡片自己拉：19 张卡片各自在挂载时拉，
+   * 会瞬间打出 19 个请求（与签到/旅行那两个启动期请求风暴同源）；
+   * 而「打开菜单才拉」又会让列表每次打开都"突然变长"（所有者 2026-09-25
+   * 反馈：「不要每次都动态加载,默认就显示出来就行了」）。
+   * 父级用 `mapWithConcurrency` 限流预加载一次，两个问题一起解决。
+   */
+  growthTasks?: GrowthTaskView[] | null;
+  /**
    * 本账号参与了**正在跑的那一轮**养号任务时下发的标记；否则为 null/undefined。
    *
    * 由父级按 `taskRuntime.processedIds.includes(account.id)` 判定 —— 注意是
@@ -891,7 +889,7 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
   );
 }
 
-export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, onCheckin, onRefresh, onAdopt, onRunTask, taskRunning, onRunGrowthTask, growthTaskRunning, onRunAllGrowthTasks, growthAllRunningAccountId, runningTask, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, onCheckin, onRefresh, onAdopt, onRunTask, taskRunning, onRunGrowthTask, growthTaskRunning, onRunAllGrowthTasks, growthAllRunningAccountId, growthTasks, runningTask, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
   /** 备注编辑弹窗；`noteDraft` 是受控输入（打开时用当前备注初始化）。 */
   const [noteOpen, setNoteOpen] = useState(false);
@@ -901,15 +899,6 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
   const [detailOpen, setDetailOpen] = useState(false);
   /** 账号记录弹窗：任务 / 积分 / Token 三类事件，带日期筛选。 */
   const [recordsOpen, setRecordsOpen] = useState(false);
-  /**
-   * 全部成长任务清单（本账号）。
-   *
-   * ⚠ **只在菜单打开时拉取**（`menuOpen`）：拉取要发一次 HTTP 请求，
-   * 19 个账号的页面若每张卡片挂载时都拉，会瞬间打出 19 个请求 ——
-   * 而用户可能一个菜单都不会打开。
-   */
-  const [menuOpen, setMenuOpen] = useState(false);
-  const { tasks: growthTasks } = useGrowthTasks(account.id, menuOpen);
   const name = firstVisibleText(account.nickname) || account.uid || "未命名账号";
   /** 需重新登录时的报警内容；账号仍能自愈（access token 过期）时为 null。
    *  判定口径集中在 `@/lib/account-expiry`，与兼容网关页共用同一套。 */
@@ -1071,7 +1060,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
               </Button>
             </DemoAction>
           ) : (
-            <DropdownMenu onOpenChange={setMenuOpen}>
+            <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button variant="ghost" size="icon" className={cn("rounded-lg text-muted-foreground hover:text-foreground", compact ? "size-7" : "size-8")} aria-label={`管理账号 ${name}`} title="更多账号操作">
                   <Ellipsis />
@@ -1194,7 +1183,29 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                     ⚠ 与「养号任务」分组**并列而不是合并**：那 5 项走
                     `/tasks/run`（整轮、只有任务名），这些走 `/tasks/growth`
                     （逐任务、可指定 code）。接口语义不同，混在一起会让
-                    "点了没反应"很难排查。 */}
+                    "点了没反应"很难排查。
+
+                    # ⚠ 国际版账号**整组不渲染**（2026-09-25 所有者要求）
+
+                    「如果你无法通过抓包把这些任务变成可执行的,那你就把这些任务给删掉」
+
+                    国际版的 growth 域返回的是**静态 5 项目录**（first_chat /
+                    skill_installed / wechat_linked / expert_summoned /
+                    template_used），全部恒为 available，且没有 accept_status /
+                    reward_* / progress 字段 —— **没有可推进的状态**。
+                    实测把 5 个真实遥测事件码 POST 到 `/v2/report` 全部 HTTP 200
+                    且回读零变化；官方国际版客户端自己也不走接口（它把用户交给
+                    growth-center 网页，走 Cookie 会话通道，网关够不到）。
+
+                    故这 5 项在后端已被 `intlOnlyCodes` 过滤掉，这里再把
+                    **整组**（含「一键执行全部任务」）对国际版隐藏 ——
+                    否则会剩一个「该账号暂无可读取的成长任务」的空组 +
+                    一个点了什么都不会发生的按钮，比噪音更糟。
+
+                    ⚠ 国服的 Expert_Philanthropy / workstation_expert **不受影响**：
+                    它们是国服任务、有真实状态，只是动作需人工，仍照常列出并置灰。 */}
+                {!isIntlAccount(account) && (
+                  <>
                 <DropdownMenuSeparator />
                 <DropdownMenuLabel>全部成长任务（本账号）</DropdownMenuLabel>
                 {/* ── 一键执行全部（所有者 2026-09-22 要求）────────────────
@@ -1246,7 +1257,10 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   </span>
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
-                {growthTasks === null ? (
+                {/* `== null` 同时覆盖 `null`（读到了但失败/未开始）与
+                    `undefined`（父级还没下发）—— 两者都该显示"读取中"，
+                    而不是当成"这个号没有任务"。 */}
+                {growthTasks == null ? (
                   <DropdownMenuItem disabled>
                     <Loader2 className="animate-spin" />
                     正在读取任务列表…
@@ -1301,6 +1315,8 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                       </span>
                     </DropdownMenuItem>
                   ))
+                )}
+                  </>
                 )}
 
                 <DropdownMenuSeparator />

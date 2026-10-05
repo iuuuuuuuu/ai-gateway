@@ -24,6 +24,7 @@ import { cn } from "@/lib/utils";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { DemoAction } from "@/components/demo-action";
 import { LogTail, LogTailHeader, LOG_LEVEL_CLASS, logLevelOf } from "@/components/log-tail";
+import { ProxyLogsPanel } from "@/components/proxy-logs-panel";
 import { useAccountsStore } from "@/stores/accounts";
 
 // 设置分组原件已抽到公共文件（2026-09-22）：
@@ -677,125 +678,6 @@ function AppearanceCard() {
 }
 
 /**
- * 多应用环境配置：Trae Work / Trae / 豆包 的安装路径与豆包端点。
- *
- * 为什么需要手动指定路径：客户端安装位置五花八门（自定义盘符、绿色版），
- * exe 发现链的 6 级回退仍可能在部分机器上落空。此时让用户直接给出路径，
- * 比让他反复重装客户端现实得多。
- */
-function AppEnvCard() {
-  const APPS = [
-    { kind: "TraeWork", label: "Trae Work", hint: "TRAE SOLO CN.exe" },
-    { kind: "Trae", label: "Trae", hint: "Trae CN.exe" },
-    { kind: "Doubao", label: "豆包", hint: "Doubao.exe" },
-  ] as const;
-
-  const [envs, setEnvs] = useState<Record<string, api.AppEnvStatus | null>>({});
-  const [paths, setPaths] = useState<Record<string, string>>({});
-  const [busy, setBusy] = useState(false);
-
-  const load = useCallback(async () => {
-    const results = await Promise.all(
-      APPS.map(async (app) => {
-        try {
-          return [app.kind, await api.appEnvCheck(app.kind)] as const;
-        } catch {
-          return [app.kind, null] as const;
-        }
-      }),
-    );
-    const nextEnvs: Record<string, api.AppEnvStatus | null> = {};
-    const nextPaths: Record<string, string> = {};
-    for (const [kind, status] of results) {
-      nextEnvs[kind] = status;
-      nextPaths[kind] = status?.manualPath ?? "";
-    }
-    setEnvs(nextEnvs);
-    setPaths(nextPaths);
-  }, []);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
-
-  const savePath = async (kind: string) => {
-    setBusy(true);
-    try {
-      await api.appSetManualPath(kind, paths[kind] ?? "");
-      toast.success("已保存安装路径");
-      await load();
-    } catch (e) {
-      toast.error(api.asError(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <SettingsGroup id="settings-app-env" title="应用环境">
-      <CardContent className="space-y-0 p-0">
-        <p className="px-4 pt-4 text-xs text-muted-foreground sm:px-5">
-          Trae Work / Trae / 豆包的安装路径。自动探测失败时可在此手动指定。
-        </p>
-        {APPS.map((app, index) => {
-          const env = envs[app.kind];
-          return (
-            <div
-              key={app.kind}
-              className={cn(
-                "space-y-2 px-4 py-4 sm:px-5",
-                index < APPS.length - 1 && "border-b border-border/60",
-              )}
-            >
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-sm font-medium">{app.label}</span>
-                {env ? (
-                  <>
-                    <Badge variant={env.installed ? "secondary" : "outline"}>
-                      {env.installed ? "已安装" : "未检测到"}
-                    </Badge>
-                    <Badge variant={env.running ? "secondary" : "outline"}>
-                      {env.running ? "运行中" : "未运行"}
-                    </Badge>
-                    <span className="text-xs text-muted-foreground">
-                      快照 {env.snapshotCount} 个
-                    </span>
-                  </>
-                ) : (
-                  <Badge variant="outline">检测失败</Badge>
-                )}
-              </div>
-              {env?.exePath && (
-                <p className="break-all font-mono text-xs text-muted-foreground">{env.exePath}</p>
-              )}
-              <div className="flex gap-2">
-                <Input
-                  value={paths[app.kind] ?? ""}
-                  onChange={(e) =>
-                    setPaths((prev) => ({ ...prev, [app.kind]: e.target.value }))
-                  }
-                  placeholder={`手动指定路径，例如 D:\\Programs\\${app.hint}`}
-                  className="font-mono text-xs"
-                  aria-label={`${app.label} 安装路径`}
-                />
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={busy}
-                  onClick={() => void savePath(app.kind)}
-                >
-                  保存
-                </Button>
-              </div>
-            </div>
-          );
-        })}
-      </CardContent>
-    </SettingsGroup>
-  );
-}
-
-/**
  * 本地代理：设备身份隔离与凭证抓取。
  *
  * 代理会**改写系统代理设置**，停止时还原为用户原有的值。因此界面必须把
@@ -1254,7 +1136,30 @@ function defaultTimeFor(kind: string): string {
 /** 设置页：自动签到配置 / 权限检测 / 更新配置。 */
 export default function SettingsPage() {
   return (
-    <div className="mx-auto min-w-0 w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
+    // 流式布局：内容随窗口铺满（减去侧栏），只保留内边距。
+    //
+    // 留白的演进（按 2340px 屏、侧栏 220px 计算，每侧留白）：
+    //   max-w-3xl (768px)  → 676px   ← 所有者反馈"设置页面两侧留白过多"
+    //   去除上限（本版）    → 0（仅 px-8 内边距）
+    // 内边距量级与「兼容网关」「WorkBuddy 账号」「Qoder」「ZCode」四页**逐字一致**
+    // （`px-5 py-6 sm:px-8 sm:py-8`），切换页面时页头不会左右跳动。
+    //
+    // ⚠ 本页**不能**照抄那两页的"单列完全铺满"，理由是**内容形态不同**：
+    //   那边是横向铺开的行式布局（状态块、账号池卡片、用量表），能自然拉伸；
+    //   本页主体是**表单行**，而 `SettingsFieldRow` 是两端布局 ——
+    //   标签 `flex-1` 在左、控件 `shrink-0` 在右。单列铺满 2056px 时，
+    //   标签与它对应的输入框会被拉开近 2000px，比留白更难用：眼睛要在同一行上
+    //   横跨整屏，才能把"这一行在改什么"与"改它的控件"对上。
+    //
+    //   另一种常见做法是"外层放开 + 给每个字段加 max-w-[640px]"，
+    //   本页也**不可行**：那只收窄**控件**，收不窄**行**本身 —— 控件仍被
+    //   `justify-between` 推到最右，中间照旧空出一大片。要收窄行就得改
+    //   `settings-primitives.tsx`，而那个文件被本页 + 三个平台页共用，
+    //   不在本次可改范围。
+    //
+    //   故取第三条路：**外层放开 + 卡片自适应多列**。横向空间用来多放几列，
+    //   而不是把一行拉长 —— 每列都落在可读宽度内，两侧留白同时消失。
+    <div className="w-full min-w-0 px-5 py-6 sm:px-8 sm:py-8">
       <header className="mb-10 sm:mb-12">
         <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
         {/* ⚠ 文案不要再列"自动签到/权限检测" —— 那些是**平台专属配置**，
@@ -1266,15 +1171,116 @@ export default function SettingsPage() {
         </p>
       </header>
 
-      <div className="min-w-0 space-y-12">
-        <AppearanceCard />
-        <AppEnvCard />
-        <NetworkProxyCard />
-        <ProxyCard />
-        <ScheduledTaskCard />
-        <RecordRetentionCard />
-        {api.isDesktop() || api.isDemoMode() ? <StartupCard /> : null}
-        {api.isWebui() && !api.isDemoMode() ? null : <UpdateCard />}
+      {/*
+        卡片容器：**自适应多列**（auto-fill），而不是单列铺满。
+
+        ⚠ 下界取 560px 的理由（算出来的，不是拍的）：
+        本页最宽的两个表单控件是「网络代理地址」与「拦截域名」，都是 `sm:w-80`
+        （320px）；而 `SettingsFieldRow` 是"标签在左 `flex-1`、控件在右 `shrink-0`"
+        的两端布局 ⇒ 卡片窄于 ~520px 时标签只剩几十像素，描述会挤成竖条。
+
+        按所有者那台 2340px 屏算：减 220px 侧栏、再减 `sm:px-8` 的 64px 内边距
+        ⇒ 可用 **2056px**。`n*560 + (n-1)*24 ≤ 2056` 解得 **3 列、每列约 669px**。
+
+        ⚠ 与改动前**逐项对比**（不写"基本一致"这种含糊话）：
+        改动前 `max-w-3xl` = 768px **含** `sm:px-6`（两侧 24px）
+        ⇒ 卡片 720px；`SettingsRow` 的 `sm:mx-5` 再两侧各 20px ⇒ 行内 680px；
+        减去 320px 控件与 12px 间隙 ⇒ 标签可用 **348px**。
+        改动后每列 669px ⇒ 行内 629px ⇒ 标签可用 **297px**。
+        即标签区窄约 **15%**。本页最长的一句描述
+        （「签到日志、积分快照与任务记录都会按此天数清理；超出部分在下次写入时
+        自动删除。」38 字）在 `text-xs`(12px) 下由约 29 字/行变为约 25 字/行，
+        即折 2 行 —— 仍可读，只是比原来紧一些。
+
+        下界在 (496, 669] 区间内都会解出同样的 3 列，560 距下沿 64px、
+        距上沿 109px，落在带宽中部，故窗口宽度略有出入时不会在临界点上跳列数。
+        其他分辨率下的退化（已算过）：
+          2340px 屏 → 可用 2056px → **3 列**，每列 669px
+          1920px 屏 → 可用 1636px → **2 列**，每列 806px
+          1600px 屏 → 可用 1316px → **2 列**，每列 646px
+          ≤1427px  → **1 列**占满（与窄窗口的单列观感一致）
+
+        `min(100%,560px)` 而不是裸 `560px`：窗口最小可到 720px
+        （`tauri.conf.json` 的 `minWidth`），减侧栏与内边距只剩约 436px，
+        裸 560px 会撑出横向滚动条；套一层 `min()` 后退化成"一列占满"。
+
+        ⚠ 代价（如实记下）：`items-start` 让每张卡片保持自身高度，故同一行里
+        一高一矮时，矮的那张下方会空出来 —— 本页卡片高度差异不小
+        （`ProxyLogsPanel` 带表格与筛选器，`AppearanceCard` 只有一行）。
+
+        ★★ 2026-10-01 改为 **CSS 多列（瀑布流）** —— 上面那个"代价"所有者不接受。
+
+        所有者原话：「这个设置还是留白多,不好看」，并附了截图：
+        `外观` 卡片只有约 45px 高，而同一行的 `应用环境` 有约 425px ——
+        `items-start` 让前者**不拉伸**，于是它下面空了约 465px。
+        这种高度差（45px ~ 570px）下，**任何**「按行对齐」的 grid 都必然留洞：
+        `items-start` 留洞、`stretch` 则把 45px 的卡片拉成 570px（更难看）。
+
+        `columns-*` 是唯一不留洞的做法：它把内容按**列**填充，
+        每列内部自上而下紧密堆叠，短卡片下面立刻接下一张。
+        代价是**阅读顺序变成"先填满第一列，再第二列"**（纵向优先），
+        而 grid 是"从左到右再换行"（横向优先）。
+
+        ⚠ 为什么这个顺序变化可接受：本页每张卡片自成一组、**彼此无先后依赖**
+        （不像向导或步骤条）。所有者要的是"别留洞"，顺序换向是必要代价。
+
+        ⚠ 两个必须一起加的类，缺一不可：
+          · `break-inside-avoid` —— 否则一张卡片会被**从中间劈开**跨到下一列，
+            这是多列布局最典型的坑（卡片带边框时尤其明显）；
+          · `mb-*` 而不是 `gap-y-*` —— `gap` 在多列布局里只作用于**列间距**，
+            纵向间距必须靠子元素自己的 margin。
+      */}
+      <div className="columns-1 gap-6 [column-fill:balance] sm:columns-2 xl:columns-3">
+        <div className="mb-6 break-inside-avoid">
+          <AppearanceCard />
+        </div>
+        <div className="mb-6 break-inside-avoid">
+          <NetworkProxyCard />
+        </div>
+        <div className="mb-6 break-inside-avoid">
+          <ProxyCard />
+        </div>
+        {/* 代理请求日志：紧跟在「本地代理」之后 —— 它是那个代理抓到的
+            结构化请求记录（可筛选、可看详情），与上面卡片里的原始文本日志
+            是同一件事的两个视角，分开太远用户找不到。
+
+            ⚠ 多列布局带来的新问题：它是本页**唯一**没有用 `SettingsGroup`
+            包的卡片（标题「抓包日志」在卡片**内部**，其它卡片的标题在卡片
+            **外面**、由 `SettingsGroup` 渲染）。那个外置标题行高 30px
+            （`leading-5` 的 20px + `space-y-2.5` 的 10px），于是并排时
+            本卡片的上边缘会比同排邻居**高 30px**。
+
+            单列时看不出来（上下堆叠没有可比的边缘），并排就很显眼。
+            故补一行等高占位（`h-5` + `space-y-2.5` = 同样 30px）把它压齐；
+            占位行 `aria-hidden`，不产生多余的标题语义。
+
+            ⚠ 2026-10-01 改多列瀑布流后，这个 30px 占位**仍然必要**：
+            它保证本卡片的**内容**与其它卡片的**卡片体**上边缘对齐
+            （别的卡片标题在 `SettingsGroup` 里、占 30px，本卡片没有标题行）。 */}
+        <div className="mb-6 break-inside-avoid">
+          <div className="min-w-0 space-y-2.5">
+            <div className="h-5" aria-hidden="true" />
+            <ProxyLogsPanel />
+          </div>
+        </div>
+        {/* 其余卡片统一包一层：`mb-6` 提供纵向间距、`break-inside-avoid`
+            防止卡片被从中间劈开跨列（多列布局最典型的坑）。 */}
+        <div className="mb-6 break-inside-avoid">
+          <ScheduledTaskCard />
+        </div>
+        <div className="mb-6 break-inside-avoid">
+          <RecordRetentionCard />
+        </div>
+        {api.isDesktop() || api.isDemoMode() ? (
+          <div className="mb-6 break-inside-avoid">
+            <StartupCard />
+          </div>
+        ) : null}
+        {api.isWebui() && !api.isDemoMode() ? null : (
+          <div className="mb-6 break-inside-avoid">
+            <UpdateCard />
+          </div>
+        )}
       </div>
     </div>
   );

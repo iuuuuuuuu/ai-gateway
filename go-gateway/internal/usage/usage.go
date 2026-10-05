@@ -120,6 +120,18 @@ type fileState struct {
 	// 键是 `model\x00归属键`（与内存里的形状一致）。倍率**必须**一起存：
 	// 只有计数而没有倍率，界面就无法显示"这一份用量按多少倍率计费"。
 	BillingMeta map[string]Billing `json:"billingMeta,omitempty"`
+
+	// BillingCycles 各账号的**计费周期**状态（2026-09-28 新增，N4）。
+	//
+	// # 为什么不另建一本账
+	//
+	// 周期是"每账号一条"的**属性**（与 BillingMeta 同构：都是不可加的
+	// 归属/状态信息），而不是可加的计量。本文件已经有完整的
+	// load / Flush / dirty 管线，另起一个文件或另起一个结构体只会
+	// 多出一套并行管线，两边的版本号、原子写、容错逻辑必然分叉。
+	//
+	// 故周期字段直接挂在既有结构上（见 cycle.go 的包内说明）。
+	BillingCycles map[string]CycleState `json:"billingCycles,omitempty"`
 }
 
 // Stats 网关 Token 用量聚合器。并发安全；path 为空时纯内存（不落盘）。
@@ -146,6 +158,13 @@ type Stats struct {
 	// 混在一起会让 Add 悄悄产生一个假的倍率。
 	billingMeta map[string]Billing
 
+	// billingCycles：uid -> 该账号的计费周期状态（2026-09-28 新增，N4）。
+	//
+	// 与 billingMeta 同样只增不减：账号被移除后它的周期状态留在文件里，
+	// 无害（不会出现在快照里，除非调用方按 uid 查）。清理由账号池负责，
+	// 不在统计器里做猜测式删除。
+	billingCycles map[string]CycleState
+
 	// now 供测试注入时钟；nil 时用 time.Now。
 	now func() time.Time
 }
@@ -160,6 +179,7 @@ func New(path string) *Stats {
 		accountModels: map[string]map[string]map[string]Counters{},
 		billed:        map[string]map[string]map[string]Counters{},
 		billingMeta:   map[string]Billing{},
+		billingCycles: map[string]CycleState{},
 	}
 	if path != "" {
 		s.load()
@@ -284,6 +304,15 @@ func (s *Stats) recordAt(uid, model string, b Billing, at time.Time, c Counters)
 		// 记住该 (模型, 归属) 的元信息，供 Snapshot 输出倍率。
 		s.billingMeta[model+"\x00"+key] = b
 	}
+	// 写路径推进计费周期（2026-09-28，N4）。
+	//
+	// ⚠ 只有**写**路径推进（这里与 SetBillingCycle）；读路径只投影。
+	// 若读路径也推进，一次恰好落在重置点之后的 /usage 轮询就会把推进
+	// 落盘，从而在没有任何请求进来时凭空翻过一个周期。见 cycle.go。
+	//
+	// 用 at 而不是 clock() 作为"现在"：本方法已经接收了显式时刻，
+	// 拿另一个时钟会让测试里注入的时刻与推进判据不一致。
+	s.rollCycleLocked(uid, at.UnixMilli())
 	s.dirty.Store(true)
 }
 
@@ -501,6 +530,13 @@ func (s *Stats) Snapshot(days int) map[string]any {
 	// `accounts` 只有账号 —— 都无法建立"这个模型×这个账号"的关联。
 	s.backfillBillingLocked(modelBilling, cutoff)
 
+	// 计费周期投影（2026-09-28，N4）。
+	//
+	// ⚠ 这里调的是**投影**（projectCycleLocked）而不是写路径的推进：
+	// 面板每 15 秒拉一次 /usage，若读路径也推进边界，一个恰好落在重置点
+	// 之后的轮询就会把推进结果落盘。见 cycle.go 开头的说明。
+	billingCycles := s.cycleReportLocked(now.UnixMilli())
+
 	var rangeDays any
 	if days > 0 {
 		rangeDays = days
@@ -515,7 +551,41 @@ func (s *Stats) Snapshot(days int) map[string]any {
 		"modelBilling":  modelBilling,
 		"daily":         daily,
 		"dailyByModel":  dailyByModel,
+		"billingCycles": billingCycles,
 	}
+}
+
+// cycleReportLocked 导出全部账号的周期投影，供 /usage 展示。
+//
+// 调用方必须已持有 s.mu。
+//
+// # 形状
+//
+//	uid -> { nextResetAtMs, cycleStartAtMs, known, used: {…Counters.Value()} }
+//
+// `used` 用 Counters.Value() 的既有口径（与 models/accounts 里的行**同一套
+// 字段**），前端不需要为周期另写一套渲染逻辑。
+//
+// # 为什么只输出**有周期信息**的账号
+//
+// 没有任何周期信息的账号（从没刷新过 /user/status）若也输出一行
+// `known:false` + 全部历史用量，界面会把"这个号历史上用过的总量"
+// 显示成"本周期用量" —— 那是**错的数字**，比不显示更糟。故这里只输出
+// 真正知道边界的账号；界面据此区分"有周期"与"没周期"。
+func (s *Stats) cycleReportLocked(nowMs int64) map[string]any {
+	out := make(map[string]any, len(s.billingCycles))
+	for uid := range s.billingCycles {
+		p := s.projectCycleLocked(uid, nowMs)
+		if !p.Known {
+			continue
+		}
+		row := p.Used.Value()
+		row["nextResetAtMs"] = p.NextResetMs
+		row["cycleStartAtMs"] = p.CycleStartMs
+		row["known"] = p.Known
+		out[uid] = row
+	}
+	return out
 }
 
 // productFromUID 由账号 uid 的**形态**推断平台。
@@ -801,6 +871,12 @@ func (s *Stats) fileStateLocked() fileState {
 		// 见 fileState 里 Billed 字段的注释。
 		Billed:      s.billed,
 		BillingMeta: s.billingMeta,
+		// ⚠ 计费周期同样必须落盘（2026-09-28，N4）。
+		//
+		// 周期边界来自上游 `/user/status`，只在**刷新时**才拿得到。若只存内存，
+		// 网关每次重启都会丢掉边界 ⇒ 界面上的"本周期用量/下次重置"要么空白、
+		// 要么（更糟）在下一个请求到达时把边界当成"全新周期"而清掉本周期额度。
+		BillingCycles: s.billingCycles,
 	}
 }
 
@@ -889,6 +965,30 @@ func (s *Stats) load() {
 				k = bareModelName(k[:i]) + k[i:]
 			}
 			s.billingMeta[k] = v
+		}
+	}
+	// 计费周期（2026-09-28 起落盘，N4）。
+	//
+	// ⚠ 这里**只做形状容错，不判断可信度** —— 上游的"永不过期"哨兵
+	//（9999-12-31）会被原样读回来。那是有意的：参考实现的现场数据里
+	// 就存着哨兵，若在装载时直接丢弃，用户要等到下一次 `/user/status`
+	// 刷新才能重新看到周期。留着它，`setBillingCycleAt` 的 case ② 会因为
+	// "已跟踪的值不可信"而放行真实边界（见 cycle.go 的四情形），
+	// 于是**下一个报告就能自愈**，不需要用户做任何事。
+	if fs.BillingCycles != nil {
+		s.billingCycles = make(map[string]CycleState, len(fs.BillingCycles))
+		for uid, cs := range fs.BillingCycles {
+			if cs.NextResetMs < 0 {
+				cs.NextResetMs = 0
+			}
+			if cs.CycleStartMs < 0 {
+				cs.CycleStartMs = 0
+			}
+			if cs.NextResetMs == 0 && cs.CycleStartMs == 0 {
+				// 两个都是"未知"：没有可用的信息，不必占一个键。
+				continue
+			}
+			s.billingCycles[uid] = cs
 		}
 	}
 }

@@ -1,11 +1,43 @@
 [package]
 name = "ai-gateway-router"
-version = "1.0.10"
+version = "1.0.23"
 edition = "2021"
 description = "workbuddy2api 网关内核（Rust 版）：账号池 + OpenAI 兼容 HTTP 接口，替代原 Go gateway.exe"
 
+# 网关可执行文件。产物名就是 `gateway[.exe]`，与宿主
+# `resolve_gateway_exe()` 查找的文件名一致 —— 构建脚本把它拷到
+# `crates/ai-gateway-core/embedded/` 后由 build.rs 压缩内嵌。
+[[bin]]
+name = "gateway"
+path = "src/bin/gateway.rs"
+
+# 诊断探针（读 state.json 打印账号数），不参与分发。
+[[bin]]
+name = "probe_state"
+path = "src/bin/probe_state.rs"
+
 [dependencies]
-ai-gateway-core = { path = "../ai-gateway-core" }
+# ⚠ 这里**刻意没有** `ai-gateway-core` 依赖（2026-10-01 移除）。
+#
+# 它从骨架期就躺在清单里，但**全 crate 零引用** —— 只有 `cfgwatch.rs` 的文档注释
+# 写过一个 `[`ai_gateway_core::…`]` 链接（已改成普通文本）。而 `ai-gateway-core`
+# 自己 `include!` 了 `build.rs` 生成的 `gateway_embed.rs`，也就是**把网关二进制
+# gzip 内嵌进库**；网关又反过来依赖本 crate。留着的后果不是报错，而是：
+#
+#   · 只要 `crates/ai-gateway-core/embedded/gateway.exe` 存在，`cargo build -p
+#     ai-gateway-router --bin gateway` 就会先把整份内嵌数据链进 core、再由本 crate
+#     链接 core —— 网关可执行文件里多背一份**自己被压缩后的副本**（约 3 MB），
+#     且每次改 `build.rs`/embedded 都触发 core 与网关整链重编；
+#   · 更隐蔽的是它把宿主侧的全部重依赖（rusqlite bundled、windows-rs、ring…）
+#     拉进网关的依赖闭包 —— `cargo tree -p ai-gateway-router -e normal` 实测
+#     212 个 crate、570 行。
+#
+# 当前实测未观察到内嵌字节真的进入产物（链接器把零引用的 rlib 整体丢了），
+# 所以这是**潜在**而非已发生的体积回归 —— 但「零引用却声明」本身就是错的：
+# 它让网关的依赖闭包取决于宿主，而两者本该是单向的（宿主 → 网关）。
+#
+# 若将来网关真的需要复用 core 的某个纯工具函数，正确做法是把它抽到第三个
+# 轻量 crate（例如 `ai-gateway-shared`），而不是把宿主整个链进来。
 
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
@@ -13,6 +45,10 @@ tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# 流式透传：把 reqwest 的字节流按 SSE 行边界重切成帧。
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+bytes = "1"
+async-stream = "0.3"
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
@@ -20,6 +56,58 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5"
 thiserror = "2"
 base64 = "0.22"
+# 多产品上游层（Qoder/ZCode）用到的通用件。
+async-trait = "0.1"
+regex = "1"
+url = "2"
+rand = "0.8"
+hex = "0.4"
+sha2 = "0.10"
+# Qoder 的 COSY 签名（RSA 包 AES 临时密钥 + AES-CBC 身份 JSON + MD5）。
+# ⚠ 这三项的**存在本身就是协议要求**，不是随手选的实现：
+#   · `rsa`  —— cosy-key = base64(RSA_PKCS1v15(16 个 ASCII 字符的临时密钥))；
+#   · `aes`/`cbc` —— info = base64(AES-128-CBC(身份 JSON, key=iv=临时密钥))；
+#   · `md-5` —— 签名 = MD5(payloadB64 + "\n" + cosyKey + "\n" + date + "\n" + body + "\n" + pathSig)。
+# 换掉任何一个（比如用 SHA-256 代替 MD5）都会被上游判 101 Signature invalid。
+rsa = "0.9"
+md-5 = "0.10"
+aes = "0.8"
+cbc = "0.1"
+# Trae 的设备密钥：device.rs 读 trae_device.json 里的 EC P-256 私钥做
+# ExchangeToken 的 DeviceProof 签名（与 core 的 trae_refresh.rs 同算法）。
+rcgen = "0.14"
+
+# `qoder-login import-client`：读 Qoder 客户端自己的登录态
+# （`%APPDATA%\com.qodercn.app.stable\auth.v1.dat`）。
+#
+# 格式是 Electron 的 `safeStorage`，Windows 上两段式：
+#   1. `Local State` → `os_crypt.encrypted_key` = base64("DPAPI" + DPAPI(AES-256 key))
+#   2. `auth.v1.dat` → "v10" + nonce(12) + ciphertext + tag(16)，AES-256-GCM
+#
+# ⚠ 这**正是** Go 侧 `internal/qoderclient` 的实现路径，逐字对齐：
+# DPAPI 只用来保护**密钥**，载荷是 AES-GCM 密文 —— 所以拿 DPAPI 的
+# GUID 头（`01000000d08c9ddf…`）去比 `auth.v1.dat` 会**匹配不上**，
+# 从而误判成"自定义加密、拿不到"（Go 侧注释专门记录过这个误判）。
+aes-gcm = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI（`CryptUnprotectData`）：解 Electron `Local State` 里的
+# `os_crypt.encrypted_key`。仅 `import-client` 用得上。
+#
+# ⚠ 只声明 `Win32_Security_Cryptography` —— 网关的依赖闭包要尽量小
+# （见文件头关于 212 个 crate 的说明），别把 core 的全套 feature 抄过来。
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
+# 读 BIOS / CPU / OS 的注册表字符串，用于 Trae 的 DeviceInfo（device_model /
+# device_brand / device_cpu / os_version）。与 windows 同属 Trae 的设备指纹面。
+windows-registry = "0.6"
+
+[target.'cfg(not(windows))'.dependencies]
+# 非 Windows：`import-client` 显式报错（客户端登录态依赖 DPAPI）。
+# 声明一个同名可选空依赖会让代码到处 cfg 分支，故这里什么都不加，
+# 由 `products/qoder/client_import.rs` 内部 `#[cfg(windows)]` 分派。
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

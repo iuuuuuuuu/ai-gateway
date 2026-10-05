@@ -108,6 +108,32 @@ type Config struct {
 	// nil = 该构建未接线（排程直接跳过，不报错）。
 	RunProductTasks func() (detail string, err error)
 
+	// RunBillingCycleRefresh 计费周期（Qoder `/user/status` 的 nextResetAt）
+	// 的**执行体**，由 main.go 用 `internal/qoder` + `internal/usage` 实现。
+	//
+	// # 为什么单独一个回调，而不是塞进 refreshCreditsWithGap
+	//
+	// 两者**语义不同**，混在一起会互相污染：
+	//
+	//	积分巡检（WorkBuddy）  有出站写语义的余额刷新，判产品闸门后只跑 WorkBuddy
+	//	计费周期（Qoder）      纯只读状态轮询，只跑 Qoder
+	//
+	// `refreshCreditsWithGap` 里那条 `ProductOf() != ProductWorkBuddy` 的闸门
+	// 正是为了让 Qoder/ZCode 账号**不**被带去打 WorkBuddy 端点；若把周期刷新
+	// 塞进同一个循环，就得在循环体里为两族账号写两套分支，反而更易错。
+	//
+	// # 为什么是 setter 注入而不是在 Config 里给执行体
+	//
+	// 理由与 RunProductTasks 完全相同（见 SetProductTasksRunner 的注释）：
+	// 执行体依赖的 `qoder.Client` 在 main.go 里的赋值位置**晚于**
+	// `scheduler.New`，走 Config 会引用尚未声明的变量。
+	//
+	// ⚠ 类型只用到 context：`internal/scheduler` 不 import `internal/usage`
+	// 也不 import `internal/qoder`，这条依赖方向不能反过来。
+	//
+	// nil = 该构建未接线（**直接跳过，不 panic**）—— 单产品部署必须能跑。
+	RunBillingCycleRefresh func(ctx context.Context)
+
 	// ActivityReportCount 每个账号每日上报条数，默认 3（与官方客户端行为接近）。
 	// 多条共用同一 conversationId，requestId 各自独立。
 	ActivityReportCount int
@@ -741,6 +767,8 @@ func (s *Scheduler) RunCreditRefreshLoop(ctx context.Context, interval time.Dura
 	// 启动先跑一轮：否则重启后要等一个周期才拿到到期日，
 	// 这段时间内分层选号只能依赖 state.json 里持久化的旧值。
 	s.refreshCreditsWithGap(ctx)
+	// 计费周期刷新搭同一条循环的便车（同属"只读状态巡检"，见 Config 注释）。
+	s.runBillingCycleRefresh(ctx)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -749,8 +777,38 @@ func (s *Scheduler) RunCreditRefreshLoop(ctx context.Context, interval time.Dura
 			return
 		case <-ticker.C:
 			s.refreshCreditsWithGap(ctx)
+			s.runBillingCycleRefresh(ctx)
 		}
 	}
+}
+
+// runBillingCycleRefresh 跑一轮计费周期刷新；未接线时直接跳过。
+//
+// 与 runProductTasks 同口径：回调为 nil = 该构建没接这一族产品，
+// 排程静默跳过而不是报错 —— 单产品部署（没有 Qoder 账号）是合法配置。
+func (s *Scheduler) runBillingCycleRefresh(ctx context.Context) {
+	if s.cfg.RunBillingCycleRefresh == nil {
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	s.cfg.RunBillingCycleRefresh(ctx)
+}
+
+// SetBillingCycleRefreshRunner 注入计费周期刷新的执行体。
+//
+// # 为什么用 setter（与 SetProductTasksRunner 同因，2026-09-30）
+//
+// 执行体依赖 `*qoder.Client`，而它在 `main.go` 里的创建位置**晚于**
+// `scheduler.New`（初始化顺序所致）。走 `scheduler.Config` 会引用一个
+// 还没声明的变量（编译期 `undefined`）。
+//
+// ⚠ 必须在 `RunCreditRefreshLoop` **之前**调用：该循环启动时立刻跑一轮，
+// 之后每次 tick 各跑一轮；在循环启动后才注入会漏掉启动那一轮
+// （要等下一个 interval）。main.go 的调用位置满足这一点。
+func (s *Scheduler) SetBillingCycleRefreshRunner(fn func(ctx context.Context)) {
+	s.cfg.RunBillingCycleRefresh = fn
 }
 
 // refreshCreditsWithGap 跑一轮积分巡检，账号之间留出间隔；ctx 取消时提前退出。

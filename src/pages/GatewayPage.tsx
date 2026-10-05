@@ -69,6 +69,7 @@ import * as api from "@/lib/api";
 import { SENSITIVE_STRING_INPUT_PROPS } from "@/lib/sensitive-input";
 import { useAccountsStore } from "@/stores/accounts";
 import { useVisibilityInterval } from "@/lib/use-visibility-interval";
+import { loadTraeCredit, traeExpiryDay } from "@/lib/trae-credit-cache";
 import type {
   AccountMeta,
   CreditBillingVerdict,
@@ -87,6 +88,9 @@ import type {
   GatewayUsageResult,
   GatewayUsageSnapshot,
 } from "@/lib/types";
+// ⚠ 单独一条**值**导入（上面那条是 `import type`，不能带函数进来）。
+// `normalizeAccountModels` 是运行时归一化函数，见 `types.ts` 里的白屏事故注释。
+import { normalizeAccountModels } from "@/lib/types";
 import { cn, firstVisibleText } from "@/lib/utils";
 import { toast } from "sonner";
 
@@ -222,6 +226,32 @@ type UsageBillingRow = {
   hasMultiplier?: boolean;
   creditMultiplier?: number | null;
 };
+
+/**
+ * 一行的**来源标签**（平台 + 区域，如「国服」「WorkBuddy」）。
+ *
+ * 抽成函数是为了让「列表里那一行叫什么」与「提示条 / 口径条里说点的是哪一行」
+ * 用**同一份**拼接逻辑：这两处若各写一遍，改了一处必然分叉，届时用户看到
+ * 提示条说的名字和列表里那行对不上 —— 而"我到底点的是哪一行"正是本次
+ *（勾一行亮三行）bug 之后最需要说清的事。本项目已有太多「两处各算一遍
+ * 然后对不上」的教训。
+ */
+function usageBillingSourceLabel(row: UsageBillingRow): string {
+  const regionLabel = row.region ? REGION_LABEL[row.region] || row.region : "";
+  const productLabel = row.product ? PRODUCT_LABELS[row.product] || row.product : "";
+  return [productLabel, regionLabel].filter(Boolean).join(" ");
+}
+
+/**
+ * 一行的**完整显示名**（`模型名 · 平台 区域`）。
+ *
+ * 没有任何来源信息时退回裸模型名 —— 此时这一行**就是**整个模型，
+ * 说「模型 X」不是含糊，而是准确（见 usageBillingRows 的三种无归属情况）。
+ */
+function usageBillingRowLabel(row: UsageBillingRow): string {
+  const src = usageBillingSourceLabel(row);
+  return src ? `${row.model.key} · ${src}` : row.model.key;
+}
 
 /**
  * 网关页布局，持久化到 localStorage。
@@ -940,6 +970,44 @@ function usableResources(credit?: CreditExpiry): CreditResource[] {
       return leftExpiry === rightExpiry ? left.index - right.index : leftExpiry - rightExpiry;
     })
     .map(({ resource }) => resource);
+}
+
+/**
+ * 把宿主的 Trae 积分详情适配成勾选列表认识的 `CreditExpiry`。
+ *
+ * 为什么需要适配：手动模式勾选列表的 `credit` 来自「WorkBuddy 账号」页那份
+ * `POST /api/credits`，按**账号库 id** 建键；而 Trae 的网关 uid 是
+ * `trae-<userId>`（`ai-gateway-router/src/products/trae/cred.rs` 的
+ * `CRED_PREFIX`），账号库里没有对应条目 —— 于是 Trae 行永远显示「—」。
+ * 宿主那条 `trae_credit_detail` 本来答的就是同一件事（这个号还剩多少积分、
+ * 什么时候到期），只是形状不同；适配一份比另写一套渲染便宜得多。
+ *
+ * 取不到任何东西时返回 `undefined`，让调用方的 `??` 原样落到现状 ——
+ * **不返回**一个「ok 但空」的对象：那会把格子从「—」变成「0 个积分包」，
+ * 等于把「没查到」说成「查到了，是空的」。
+ */
+function traeCreditAsExpiry(detail: api.TraeCreditDetail | undefined): CreditExpiry | undefined {
+  if (!detail) return undefined;
+  const total = typeof detail.total === "number" ? detail.total : undefined;
+  const packs = detail.packs ?? [];
+  if (total === undefined && packs.length === 0) return undefined;
+  const resources: CreditResource[] = packs.map((pack) => {
+    const ts = pack.expireAt ? Date.parse(pack.expireAt) : Number.NaN;
+    return {
+      packageCode: null,
+      packageName: pack.name,
+      total: pack.total,
+      remaining: pack.remaining,
+      // 上游只给「总量 / 剩余」，已用量是算出来的（与账号卡片同一口径）。
+      used: Math.max(0, pack.total - pack.remaining),
+      status: null,
+      expireAt: Number.isNaN(ts) ? null : ts,
+      // 是否「已过期 / 即将过期」由宿主的到期口径决定，这里不替它下结论。
+      expired: false,
+      expiringSoon: false,
+    };
+  });
+  return { ok: true, totalRemaining: total, resources };
 }
 
 /**
@@ -2222,6 +2290,17 @@ export default function GatewayPage() {
   const [usageUpdatedAt, setUsageUpdatedAt] = useState<number | null>(null);
   /** 每秒自增，驱动「上次更新 xx 秒前」的相对时间重新渲染。 */
   const [nowTick, setNowTick] = useState(() => Date.now());
+  /**
+   * Trae 账号的积分详情（key = 网关账号 uid）。
+   *
+   * 为什么单独存一份：Trae 是另一条产品线，网关 `/status` 结构上不采集它的积分
+   * 与到期档位（`credits` 恒为 0、`expire_day` 恒为空串），真正的值只能从宿主的
+   * `trae_credit_detail`（桌面端走 IPC、浏览器走 `/api/trae/credits/detail`）拿 ——
+   * 这是本页唯一的外部数据源，必须显式存下来，否则每渲染一次就查一次。
+   */
+  const [traeDetails, setTraeDetails] = useState<Map<string, api.TraeCreditDetail>>(
+    () => new Map(),
+  );
 
   /**
    * 用量展示的模型筛选（空数组 = 全部，默认）。
@@ -2253,15 +2332,56 @@ export default function GatewayPage() {
    * 注意：账号池那一侧本轮已**没有**任何「选中」状态（所有者决定：去掉选中功能，
    * 展开是就地看详情、不是挑一个对象当筛选条件）。因此这里不存在与账号池
    * 抢状态的问题 —— 账号池的行展开状态是 `poolExpandedUids`，只影响它自己。
+   *
+   * ★★ 2026-10-XX 修正：模型侧拆成**两层键** —— `key`（模型名 = 筛选条件）与
+   * `rowKey`（行标识 = 勾选状态）。这两者此前被当成同一个东西，正是本次的 bug。
+   *
+   * 所有者原话：「token用量这里一个模型拆分出来两个统计,而且勾选deepseek-v4.1-falsh
+   * 就会把国内国外同时勾选,这是错误的」。
+   *
+   * 根因：`usageBillingRows` 会把**同一个模型名**按「平台 × 区域 × 倍率」拆成多行
+   *（这是所有者 2026-09-21 明确要求的设计，**不能取消**），而选中判定与切换都只认
+   * `model.key`（模型名）⇒ 三行共用同一个 key ⇒ 勾一行三行全亮。
+   *
+   * # 为什么是「多加一个 rowKey」而不是「把 key 换成 rowKey」
+   *
+   * 因为这两者回答的是**不同的问题**，合成一个必然顾此失彼：
+   *   - `rowKey` 回答「用户勾的是哪一行」（**身份**）—— 只用于选中态；
+   *   - `key`（模型名）回答「要按什么收窄数据」（**条件**）—— 下游全部消费点靠它。
+   *
+   * 若把 key 换成 rowKey，下游那些按模型名的查表（`usageModelsAll.find` /
+   * `usageCrossCoverage.modelCross` / `accountKeysByModel.get` / `crossByUidModel`）
+   * 会**全部落空**，筛选直接失效（列表变空或退回全量）；若只留模型名（原状），
+   * 就是本次这个「勾一行亮三行」的 bug。所以两者都留，各司其职。
+   *
+   * # 为什么不把平台/区域一并存进 state
+   *
+   * 那会造出第二份「这一行是什么」的事实：快照刷新后它与 `usageBillingRows`
+   * 必然漂移（倍率一改 rowKey 就变），届时界面会显示一个列表里根本不存在的归属。
+   * 行信息一律按 `rowKey` 现查（见下方 `usageCrossRow`），查不到就退回裸模型名。
    */
   const [usageCrossFilter, setUsageCrossFilter] = useState<
-    { kind: "model"; key: string } | { kind: "account"; key: string } | null
+    | { kind: "model"; key: string; rowKey: string }
+    | { kind: "account"; key: string }
+    | null
   >(null);
 
-  /** 把交叉筛选切到「这个模型」；已经是它则取消（toggle）。 */
-  function toggleUsageModelFilter(key: string) {
+  /**
+   * 把交叉筛选切到「这一行」；已经是同一行则取消（toggle）。
+   *
+   * ★ 判定必须用 `rowKey`（行）而不是 `key`（模型名）：同一个模型的「国服 / 国际版」
+   * 两行，点第二行时应当**改选到第二行**，而不是因为「模型名相同」被判成「又点了
+   * 同一项」而整个取消 —— 那会让用户点另一行时筛选莫名其妙消失，是同一个 bug 的
+   * 镜像（都是「按模型名当身份」造成的）。
+   *
+   * 参数从 `string`（模型名）改成整行：调用点手里就有行对象，让它在调用处拆出
+   * `model.key` 与 `rowKey` 会把「哪两个键、分别干什么」的知识散到 JSX 里。
+   */
+  function toggleUsageModelFilter(row: UsageBillingRow) {
     setUsageCrossFilter((current) =>
-      current?.kind === "model" && current.key === key ? null : { kind: "model", key },
+      current?.kind === "model" && current.rowKey === row.rowKey
+        ? null
+        : { kind: "model", key: row.model.key, rowKey: row.rowKey },
     );
   }
 
@@ -2891,11 +3011,21 @@ export default function GatewayPage() {
     }
   }, [applyConfig]);
 
-  // 网关状态轮询（5 秒）。
+  // 网关状态轮询（**10 秒**，2026-10-03 由 5 秒放宽，见问题 ⑩-2）。
+  //
+  // `refresh()` 打的是 `gateway_status`：宿主每次都要探活网关（HTTP `/healthz`
+  // + `/status`，各带超时）再解析账号记录文件，实测单发 **1.2~2.3 秒**。
+  // 5 秒一轮的占空比接近 50%，而网关状态本来就是**秒级不敏感**的旁路信息
+  //（网关进程起没起、池子里几个账号）。
+  //
+  // 为什么只放宽到 10 秒、不像账号页那样放到 30 秒：本页是**用户主动点进来**
+  // 看网关的地方，页面上有「启动 / 停止网关」按钮与账号池表格，刚点完按钮
+  // 需要很快看到结果。10 秒是「点了按钮马上看得到变化」与「别常驻占并发位」
+  // 之间的折中；点按钮后的即时刷新由操作本身触发，不依赖这条轮询。
   //
   // 用 useVisibilityInterval 而非裸 setInterval：窗口隐藏/收进托盘时**销毁**定时器，
   // 避免后台空转（裸 setInterval 只在组件卸载时被清理，隐藏时仍在跑）。
-  useVisibilityInterval(() => void refresh(), 5000, { onResume: () => void refresh() });
+  useVisibilityInterval(() => void refresh(), 10_000, { onResume: () => void refresh() });
 
   // Token 用量按所选范围拉取。
   //
@@ -3138,6 +3268,42 @@ export default function GatewayPage() {
 
   const pool = status?.pool ?? null;
   const poolAccounts = pool?.accounts ?? [];
+  /**
+   * 需要补数据的 Trae 账号 uid 集合（排序后拼成字符串当依赖）。
+   *
+   * 为什么不是直接返回数组：数组每次都是新引用，会让下面的 effect **每渲染一次
+   * 就重跑一次** —— 而本页每秒都有一次重渲染（`nowTick`），那等于每秒重发一轮
+   * 宿主请求。用「内容字符串」当依赖，只有账号集合真的变了才重跑。
+   */
+  const traeUidsKey = useMemo(
+    () =>
+      poolAccounts
+        .filter((acc) => acc.product === "trae")
+        .map((acc) => acc.uid)
+        .sort()
+        .join("\n"),
+    [poolAccounts],
+  );
+  useEffect(() => {
+    if (!traeUidsKey) return;
+    let cancelled = false;
+    for (const uid of traeUidsKey.split("\n")) {
+      // uid 形如 `trae-<userId>`；真实 userId 是去掉产品前缀的那部分（与 TraePage 同口径）。
+      const userId = uid.startsWith("trae-") ? uid.slice("trae-".length) : uid;
+      loadTraeCredit(userId)
+        .then((detail) => {
+          if (cancelled) return;
+          setTraeDetails((prev) => new Map(prev).set(uid, detail));
+        })
+        .catch(() => {
+          // 宿主 ai-gateway 没在跑、或上游失败：静默降级为「保持网关现状显示」。
+          // 这里只影响两列的取值，绝不能因为一条可选请求失败就弹错或让整页白屏。
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [traeUidsKey]);
   /** 处于模型冷却的账号数（用于区块顶部的统一说明，替代逐账号重复提示）。 */
   const poolModelCooledCount = poolAccounts.filter((a) => (a.model_cooling?.length ?? 0) > 0).length;
   /**
@@ -3158,8 +3324,25 @@ export default function GatewayPage() {
   const usageSummary = usageSnapshot?.summary ?? null;
   const usageModelsAll = usageSnapshot?.models ?? [];
   const usageAccountsAll = usageSnapshot?.accounts ?? [];
-  /** 账号 → 该账号用过的模型明细（网关 /usage 的 accountModels）。 */
-  const usageAccountModels = usageSnapshot?.accountModels;
+  /**
+   * 账号 → 该账号用过的模型明细（网关 /usage 的 accountModels）。
+   *
+   * ★★ 必须过 `normalizeAccountModels` —— 网关的线上形状是
+   * `{ uid: { 模型名: 计数 } }`（**对象**），而本页下面 6 处都在
+   * `for (const model of models)` 里按**数组**迭代它。
+   *
+   * 2026-10-01 白屏事故：类型声明曾写成 `GatewayUsageGroup[]`，TS 不报错、
+   * 运行时 `TypeError: xxx is not iterable`，而 `main.tsx` 没有 ErrorBoundary
+   * ⇒ 点「兼容网关」整页永久白屏。详见 `types.ts` 的
+   * `GatewayAccountModelsRaw` 注释。
+   *
+   * 归一化放在**这一个入口**而不是各消费点：本页有 6 处用它
+   * （反向索引 / 覆盖度 / 交叉索引 / 占比基准 / 汇总口径…），各写一遍必然漂移。
+   */
+  const usageAccountModels = useMemo(
+    () => normalizeAccountModels(usageSnapshot?.accountModels),
+    [usageSnapshot?.accountModels],
+  );
   const usageDaily = usageSnapshot?.daily ?? [];
   const usageMaxDaily = maxOf(usageDaily.map((d) => d.total));
 
@@ -3368,8 +3551,44 @@ export default function GatewayPage() {
       // 点账号：右侧收窄到被点的这一个（它必然在 usageAccounts 里，否则点不到）。
       return usageAccounts.filter((a) => a.key === usageCrossFilter.key);
     }
-    // 点模型：右侧只剩用过该模型的账号 —— 靠上面反转出的反向索引，不靠数值大小
-    // 猜（用 `total > 0` 猜会在「该账号在此范围外/被第一级筛掉」时给出错误结论）。
+    /*
+     * ★★ 点模型：右侧只剩用过该模型的账号 —— 收窄粒度是**模型名**，不是「行」。
+     *
+     * # 为什么按行收窄做不到（不是偷懒，是数据上不存在）
+     *
+     * 用户的直觉是「我勾了『deepseek-v4.1-flash · 国服』这一行，右边就该只剩
+     * 用过**国服那份**的账号」。但网关能给的交叉明细只有 `accountModels`，
+     * 它的形状是 `{ uid: { 模型名: 计数 } }` —— **只有「账号 × 模型」两个维度**，
+     * 没有任何平台/区域字段（见 `types.ts` 的 `GatewayAccountModelsRaw` 与
+     * Rust 侧 `usage.rs` 的 `account_models` 构造：键是 `uid → model → day`）。
+     *
+     * 平台/区域只存在于**另一本账** `modelBilling`（`{ 模型名: [归属...] }`），
+     * 而它按模型名聚合、**不带 uid** ⇒ 拿不到「哪个账号用了国服那一份」。
+     * 两本账无法 join：一边缺区域、一边缺账号，交集为空。
+     *
+     * 所以「按行筛账号」在**当前网关契约下无解**。可选的三条路：
+     *   ① 按模型名收窄（现状，也是这里选的）；
+     *   ② 拿 `billing_meta` 里的倍率去反推账号 —— 那是**猜**：同一个账号完全
+     *      可能同时用过国服与国际版，倍率推不出"这一次调用属于哪个归属"；
+     *   ③ 改网关契约（`accountModels` 加一层区域维度）—— 属跨端改动，
+     *      不在本次「只改 GatewayPage.tsx」的范围内，且会动到别人的文件。
+     *
+     * 选 ① 的理由：它**不编造**。①的结果是「该模型的全部账号」，这是一个**真**结论，
+     * 只是比用户期望的粗一档；②会给出一个看起来精确、实则可能张冠李戴的账号列表
+     * ——用户会据此判断"该烧哪个号的额度"，错了代价远大于"筛得不够细"。
+     * 本项目对这类取舍的既有判据是「宁可少显示，不可编造」（见 `types.ts` 里
+     * `normalizeAccountModels` 的注释、以及 usageCrossItemBlank 的假结论警告）。
+     *
+     * # 界面上必须说清楚（不能假装按行筛了）
+     *
+     * 收窄不到行，但**勾选状态仍然是按行的**（见 JSX 的 `selected`）。这个组合
+     * 若不加说明，用户会看到「只勾了国服、右边却是两个区域的账号」，进而认为
+     * 勾选又坏了 —— 那正是本次投诉的延续。故：
+     *   - `usageCrossNote` 在 `usageScopeModelIsSplit` 时明说
+     *     「右侧仍是该模型**全部归属**的账号」；
+     *   - 顶部口径条同样带上这一句（见 JSX 的 `usage-scope-bar`）。
+     * 两处都写是因为它们是两个不同视线落点，任一处缺席都会让用户在那儿困惑。
+     */
     const users = accountKeysByModel.get(usageCrossFilter.key);
     if (!users) return [];
     return usageAccounts.filter((a) => users.has(a.key));
@@ -3520,6 +3739,95 @@ export default function GatewayPage() {
     }
     return rows;
   }, [usageModelsDisplay, usageSnapshot]);
+
+  /**
+   * 左栏**实际渲染的那几行**（与 JSX 里那份列表逐字一致）。
+   *
+   * # 为什么必须提出来（本次 bug 的结构性根因）
+   *
+   * 这份回退逻辑（`usageBillingRows` 为 null 时按模型名一行）此前**只写在 JSX 里**，
+   * 于是「列表里到底有哪几行」这个事实在 JSX 之外根本拿不到 —— 这正是
+   * 「勾选状态按模型名判定」能长期存活的原因：判定处（JSX 内）手里只有 `model`，
+   * 而行的身份要到**同一段 JSX**里才拼得出来。
+   *
+   * 提出来之后，选中态判定与 `usageCrossRow`（按 rowKey 反查行）用的是**同一份**
+   * 行清单，不可能出现「按 rowKey 查不到自己刚点的那一行」。
+   */
+  const usageModelRows = useMemo<UsageBillingRow[]>(
+    () =>
+      usageBillingRows ??
+      usageModelsDisplay.map((model): UsageBillingRow => ({ rowKey: model.key, model })),
+    [usageBillingRows, usageModelsDisplay],
+  );
+
+  /**
+   * 按 `rowKey` 反查被勾选的那一行（拿它的平台/区域，供提示文案使用）。
+   *
+   * # 为什么按 rowKey 现查，而不是把平台/区域存进 state
+   *
+   * 快照每 15 秒刷新一次，而 `rowKey` 里含**倍率**（`usageBillingRows` 的构造：
+   * `模型 \0 平台 \0 区域 \0 倍率`）。倍率一改，同一个归属的 rowKey 就变了 ——
+   * 若把「这一行是什么」也存进 state，刷新后提示条会继续说一个列表里**已经不存在**
+   * 的归属。现查则天然跟随：查不到（行已被刷掉）就退回裸模型名，
+   * 与「点了一行但列表变了」这个事实一致，不编造。
+   *
+   * 查不到还有第二种情形：`usageCrossFilter` 是**上一次**渲染点出来的，而本次快照
+   * 里那个模型已经没有计费明细（`modelBilling` 变空）⇒ 行退化成裸模型名一行。
+   * 此时 `rowKey` 恰好等于模型名，判定 `usageCrossRow?.rowKey === row.rowKey`
+   * 仍会亮 —— 这是对的：用户点的就是「整个模型」，现在列表里也只有这一行。
+   */
+  const usageCrossRow = useMemo(() => {
+    if (usageCrossFilter?.kind !== "model") return null;
+    const rowKey = usageCrossFilter.rowKey;
+    return usageModelRows.find((row) => row.rowKey === rowKey) ?? null;
+  }, [usageCrossFilter, usageModelRows]);
+
+  /**
+   * ★★ 被点那一行是不是**整个模型的一部分**（该模型被拆成了多行）。
+   *
+   * 这是「勾选按行、筛选按模型名」这个取舍**唯一**需要向用户交代的条件：
+   *   - 该模型只有一行（无倍率信息 / 只有一份归属）→ 行 == 模型，
+   *     「点模型 → 右侧只剩用过它的账号」这句话**完全准确**，不需要任何额外说明；
+   *   - 该模型有多行（国服 / 国际版…）→ 用户勾的是其中**一份归属**，
+   *     而右侧**做不到**只按这一份收窄（见 usageAccountsScoped 的注释），
+   *     必须明说「右侧仍是该模型的全部账号」，否则就是假装按行筛了。
+   *
+   * 判据用「当前列表里该模型的行数」而不是 `modelBilling[key].length`：
+   * 用户看到的行数才是他能核对的事实。两者在正常数据下一致，但若某份归属
+   * 被 `usageModelsDisplay` 换口径后行数变了，以**看见的**为准才不会自相矛盾。
+   */
+  const usageScopeModelRowCount = useMemo(
+    () =>
+      usageScopeModel
+        ? usageModelRows.filter((row) => row.model.key === usageScopeModel).length
+        : 0,
+    [usageScopeModel, usageModelRows],
+  );
+  const usageScopeModelIsSplit = usageScopeModelRowCount > 1;
+
+  /**
+   * 被点选那一行的**显示名**（提示条 / 口径条用）。
+   *
+   * # 只在**该模型确实被拆成多行**时才加平台/区域后缀
+   *
+   * 后缀的唯一作用是**消除歧义**（「我点的到底是国服还是国际版」）。只有一行时
+   * 没有歧义，加上后缀反而让文案变长、还与既有观感/断言不一致 —— 那是噪音，
+   * 不是信息。故：
+   *   - 未拆行 → 就是模型名（与改动前逐字相同）；
+   *   - 已拆行 → 「模型名 · 平台 区域」，与列表里那一行的 label 完全一致
+   *     （同一个 `usageBillingRowLabel`，不可能对不上）。
+   *
+   * 拆行时为什么**必须**带后缀：用户刚因为「两行长得像、勾一个亮两个」来投诉，
+   * 提示条若只说「deepseek-v4.1-flash」，他会分不清自己点的是哪一行 ——
+   * 那是把同一个困惑换个地方重现。
+   *
+   * 查不到那一行时退回裸模型名：此时列表里那个模型确实只有一行
+   *（`modelBilling` 变空 ⇒ 退化成按模型名一行），说模型名不是含糊而是准确。
+   */
+  const usageScopeModelLabel =
+    usageScopeModelIsSplit && usageCrossRow
+      ? usageBillingRowLabel(usageCrossRow)
+      : usageScopeModel;
 
   /**
    * 「点模型 → 右侧每行的数值换成该模型在该账号上的量」—— 反方向同理。
@@ -3681,7 +3989,7 @@ export default function GatewayPage() {
 
     if (usageCrossDegraded) {
       return {
-        text: `已点击${usageCrossFilter.kind === "model" ? "模型" : "账号"}「${usageCrossFilter.key}」，但当前网关未提供「账号 × 模型」明细，无法据此筛选。`,
+        text: `已点击${usageCrossFilter.kind === "model" ? "模型" : "账号"}「${usageScopeModelLabel || usageCrossFilter.key}」，但当前网关未提供「账号 × 模型」明细，无法据此筛选。`,
         hint: "请更新网关后重试；下面的列表仍是未筛选的全量数据。",
         emptyReason: "",
       };
@@ -3696,16 +4004,29 @@ export default function GatewayPage() {
         text:
           usageCrossFilter.kind === "account"
             ? `已点击账号「${usageNickname.get(usageCrossFilter.key) ?? usageCrossFilter.key.slice(0, 8)}」，但网关没有记录它在「账号 × 模型」里的明细，无法列出它用过哪些模型。`
-            : `已点击模型「${usageCrossFilter.key}」，但网关没有记录它在「账号 × 模型」里的明细，无法列出哪些账号用过它。`,
+            : `已点击模型「${usageScopeModelLabel}」，但网关没有记录它在「账号 × 模型」里的明细，无法列出哪些账号用过它。`,
         hint: "该账号/模型的用量发生在网关开始记录交叉明细之前；换更近的统计范围（如「今日」）可看到明细。",
         emptyReason: `此范围内它有 ${exactTokenFormatter.format(usageCrossMissing?.expected ?? 0)} tokens 的用量，只是明细缺失。`,
       };
     }
 
-    // 部分缺失：列表可用但可能不全，必须提示，否则用户会以为「它就只用了这一个模型」。
+    /*
+     * 部分缺失：列表可用但可能不全，必须提示，否则用户会以为「它就只用了这一个模型」。
+     *
+     * ★ 「收窄粒度是模型名而非行」的说明就挂在这条 hint 上（`rowScopeHint`）。
+     * 为什么不单开一段文案：hint 是**每次点选都会出现**的那一行，而拆行说明也
+     * 只在「点了一个被拆开的模型」时才需要 —— 两者的出现条件完全重合，
+     * 合并后不会在"单行模型"上凭空多出一句无关的话。
+     *
+     * ⚠ 这里是纯文本（渲染进 `<span>`），**不能**用 `**加粗**` 这类 Markdown 记号
+     * —— 那会原样显示成星号。强调靠措辞（「全部」）而不是记号。
+     */
+    const rowScopeHint = usageScopeModelIsSplit
+      ? `⚠ 右侧仍显示用过「${usageScopeModel}」的全部账号 —— 网关只记录「账号 × 模型」，没有平台/区域维度，无法只按「${usageScopeModelLabel}」这一份归属筛选。`
+      : "";
     const partialHint = usageCrossItemPartial
       ? `注意：网关只记录了部分「账号 × 模型」明细（${formatUsageCompact(usageCrossMissing?.known ?? 0)} / ${formatUsageCompact(usageCrossMissing?.expected ?? 0)}），以下列表可能不全。`
-      : "再次点击同一项可取消选择。";
+      : "再次点击同一行可取消选择。";
 
     // 两个维度都为 0 说明第一级（ModelFilter）就把数据掐没了：
     // 被点的这项在 ModelFilter 选中的模型里一个都没用上。
@@ -3721,8 +4042,25 @@ export default function GatewayPage() {
       text:
         usageCrossFilter.kind === "account"
           ? `已点击账号「${usageNickname.get(usageCrossFilter.key) ?? usageCrossFilter.key.slice(0, 8)}」，左侧只显示它用过的模型（${visible} / ${total}）。`
-          : `已点击模型「${usageCrossFilter.key}」，右侧只显示用过它的账号（${visible} / ${total}）。`,
-      hint: partialHint,
+          : /*
+             * ★ 文案分两支，按「该模型有没有被拆成多行」选：
+             *
+             *   未拆行 → 与改动前**逐字相同**（行 == 模型，原句完全准确，
+             *            没有理由改；既有断言也钉着这句）。
+             *   已拆行 → 说清「勾的是这一行、筛的是整个模型」。
+             *
+             * 拆行那支为什么要把两件事分开写：用户勾的是「deepseek-v4.1-flash · 国服」
+             * 这**一行**，但右侧收窄用的是**模型名**（见 usageAccountsScoped 的注释：
+             * 网关没有区域维度的账号明细）。若含混成一句「已点击模型 X」，用户会以为
+             * 右侧也按国服筛过了 —— 那是假装按行筛，正是本次要避免的。
+             * 故前一句回述**行**（带平台/区域），后一句点明筛的是**模型**，
+             * 分子分母（`visible / total`）也都是模型维度的账号数。
+             * 差额由 `rowScopeHint` 进一步交代「为什么做不到」。
+             */
+            usageScopeModelIsSplit
+            ? `已勾选「${usageScopeModelLabel}」，右侧显示用过模型「${usageScopeModel}」的账号（${visible} / ${total}）。`
+            : `已点击模型「${usageScopeModel}」，右侧只显示用过它的账号（${visible} / ${total}）。`,
+      hint: [rowScopeHint, partialHint].filter(Boolean).join(" "),
       emptyReason,
     };
   }, [
@@ -3738,6 +4076,9 @@ export default function GatewayPage() {
     usageNickname,
     modelFilterActive,
     modelFilter,
+    usageScopeModel,
+    usageScopeModelLabel,
+    usageScopeModelIsSplit,
   ]);
 
   /** uid → 该账号在所选范围内的 Token 用量（卡片直接取用）。 */
@@ -3878,6 +4219,23 @@ export default function GatewayPage() {
       // 「全部」范围没有对应的免费判定窗口 → unknown（与上面的 null 一致）。
       const creditVerdict =
         usageRange === "all" ? "unknown" : (creditVerdictByUid.get(acc.uid) ?? "unknown");
+      // Trae 是另一条产品线：网关 `/status` 结构上不采集它的积分与到期档位
+      // （`credits` 恒为 0、`expire_day` 恒为空串），真实值只能从宿主那份详情里取。
+      // 取不到时下面两行会**原样走网关现状**，不做任何猜测性兜底。
+      const traeDetail = acc.product === "trae" ? traeDetails.get(acc.uid) : undefined;
+      const traeDay = traeExpiryDay(traeDetail);
+      // 有宿主详情就用它（`total` 可能为 null —— 保持「未取到」的既有语义，不回退成 0）；
+      // 否则逐字回到网关快照那条老路。
+      const balance = traeDetail
+        ? // 宿主缺 `total` 时（老宿主 / 异常响应）必须落到 `null`：直接取
+          // `detail.total` 会得到 `undefined`，而渲染侧只判 `!== null`，
+          // 于是 `Intl.NumberFormat.format(undefined)` 会印出「NaN」。
+          typeof traeDetail.total === "number"
+          ? traeDetail.total
+          : null
+        : typeof acc.credits === "number"
+          ? acc.credits
+          : null;
       return {
         acc,
         total,
@@ -3891,8 +4249,9 @@ export default function GatewayPage() {
         creditTodayVerdict: creditStats
           ? (creditTodayVerdictByUid.get(acc.uid) ?? "unknown")
           : "unknown",
-        balance: typeof acc.credits === "number" ? acc.credits : null,
-        expiryKey: poolExpiryKey(acc.expire_day),
+        balance,
+        // 有宿主档位就用它（复用同一把键，保证与「到期」列同源）；没有就回到网关现状。
+        expiryKey: poolExpiryKey(traeDay ?? acc.expire_day),
         stateRank: poolStateRank(acc),
         modelCoolCount: (acc.model_cooling ?? []).length,
       } satisfies PoolRowMetrics;
@@ -4249,7 +4608,10 @@ export default function GatewayPage() {
                     checked={manualUids.includes(a.uid)}
                     onToggle={() => void toggleManualUid(a.uid)}
                     meta={accountByUid.get(a.uid)}
-                    credit={creditByUid.get(a.uid)}
+                    // Trae 账号在账号库里没有条目（uid 是 `trae-<userId>`），
+                    // 兜底取宿主那份详情适配出来的形状；非 Trae 行取到的一定是
+                    // 原值（`traeDetails` 只装 `product === "trae"` 的号）。
+                    credit={creditByUid.get(a.uid) ?? traeCreditAsExpiry(traeDetails.get(a.uid))}
                     creditLoading={creditLoadingByUid.get(a.uid)}
                   />
                 ))}
@@ -4715,19 +5077,31 @@ export default function GatewayPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {poolSortedRows.map((row) => (
-                        <PoolAccountRow
-                          key={row.acc.uid}
-                          metrics={row}
-                          expanded={poolExpandedSet.has(row.acc.uid)}
-                          onToggle={() => togglePoolExpanded(row.acc.uid)}
-                          detailId={`pool-detail-${row.acc.uid}`}
-                          usageRangeLabel={usageRangeLabel}
-                          creditStatsLoaded={Boolean(creditStats)}
-                          stickySessions={pool?.sticky_sessions ?? 0}
-                          now={nowTick}
-                        />
-                      ))}
+                      {poolSortedRows.map((row) => {
+                        // 「到期」列与二级行「最近到期」读的都是 `acc.expire_day`，而网关对
+                        // Trae 不下发它 —— 只改 `expiryKey` 会让行**排对位置、格子里却仍写
+                        // 「未知」**。这里只对「Trae 且拿到了宿主档位」的行传一份覆写
+                        // `expire_day` 的副本（不原地改 `acc`）；其余行拿到的还是原来那个
+                        // 对象引用，渲染路径逐字不变。
+                        const traeDay = traeExpiryDay(traeDetails.get(row.acc.uid));
+                        const metrics =
+                          row.acc.product === "trae" && traeDay
+                            ? { ...row, acc: { ...row.acc, expire_day: traeDay } }
+                            : row;
+                        return (
+                          <PoolAccountRow
+                            key={row.acc.uid}
+                            metrics={metrics}
+                            expanded={poolExpandedSet.has(row.acc.uid)}
+                            onToggle={() => togglePoolExpanded(row.acc.uid)}
+                            detailId={`pool-detail-${row.acc.uid}`}
+                            usageRangeLabel={usageRangeLabel}
+                            creditStatsLoaded={Boolean(creditStats)}
+                            stickySessions={pool?.sticky_sessions ?? 0}
+                            now={nowTick}
+                          />
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -4778,7 +5152,9 @@ export default function GatewayPage() {
                   {usageScopeAccount
                     ? ` · 账号 ${usageNickname.get(usageScopeAccount) ?? usageScopeAccount.slice(0, 8)}`
                     : usageScopeModel
-                      ? ` · 模型 ${usageScopeModel}`
+                      ? // 用**行**标签（带平台/区域）而不是裸模型名：拆行后模型名不再唯一，
+                        // 只说模型名会让用户分不清自己点的是国服还是国际版。
+                        ` · 模型 ${usageScopeModelLabel}`
                       : ""}
                 </span>
               </span>
@@ -4885,12 +5261,21 @@ export default function GatewayPage() {
               当前口径：
               {usageScopeAccount
                 ? `账号 ${usageNickname.get(usageScopeAccount) ?? usageScopeAccount.slice(0, 8)}`
-                : `模型 ${usageScopeModel}`}
+                : `模型 ${usageScopeModelLabel}`}
             </span>
             <span className="text-muted-foreground">
               顶部汇总与左右列表<strong className="font-medium">都只统计这一项</strong>
               {usageScopeAccount ? "在该范围内的用量" : "在各账号上的用量"}，
               不是网关总量
+              {/*
+                ★ 拆行时的诚实交代（见 usageAccountsScoped 的长注释）。
+                为什么口径条也必须写这一句：它是「当前到底在按什么统计」的**权威落点**
+                （紧贴汇总卡），而用户最容易在这里核对「我勾的国服，为什么数字是两块的」。
+                只把说明放在下面列表的提示条里不够 —— 视线停在汇总卡上的用户看不到它。
+              */}
+              {usageScopeModelIsSplit
+                ? `；右侧账号列表仍按模型「${usageScopeModel}」收窄（含其全部平台/区域归属），网关未提供按归属拆分的账号明细`
+                : ""}
             </span>
             <button
               type="button"
@@ -5088,21 +5473,15 @@ export default function GatewayPage() {
                   {usageModelsDisplay.length > 0 ? (
                     // 有计费明细时按归属**拆开显示**（每个平台/区域一行，各带倍率）。
                     // 见 usageBillingRows 的注释：只有一份归属时不拆。
-                    (usageBillingRows ??
-                      usageModelsDisplay.map(
-                        (model): UsageBillingRow => ({ rowKey: model.key, model }),
-                      )
-                    ).map(
+                    // 行清单取 `usageModelRows`（与选中态判定、usageCrossRow 同一份），
+                    // 不再在这里就地拼 —— 见 usageModelRows 的注释。
+                    usageModelRows.map(
                       (row) => {
                         const model = row.model;
                         // 倍率文本：三态（数字 / null=未声明 / 缺省=无此概念）。
                         const mult = row.hasMultiplier ? multiplierText(row.creditMultiplier) : "";
                         // 平台+区域标签。
-                        const regionLabel = row.region ? REGION_LABEL[row.region] || row.region : "";
-                        const productLabel = row.product
-                          ? PRODUCT_LABELS[row.product] || row.product
-                          : "";
-                        const srcLabel = [productLabel, regionLabel].filter(Boolean).join(" ");
+                        const srcLabel = usageBillingSourceLabel(row);
                         /*
                          * # 左边要**按区域各显示一行**（2026-09-21 所有者要求）
                          *
@@ -5135,7 +5514,7 @@ export default function GatewayPage() {
                          * 故改用 `srcLabel`：有区域时显示「平台 区域」，
                          * 只有平台时显示「平台」。两者都比"什么都不显示"强。
                          */
-                        const label = srcLabel ? `${model.key} · ${srcLabel}` : model.key;
+                        const label = usageBillingRowLabel(row);
                         return (
                           <UsageBarRow
                             key={row.rowKey}
@@ -5153,8 +5532,26 @@ export default function GatewayPage() {
                             ]
                               .filter(Boolean)
                               .join(" · ")}
-                            selected={usageCrossModel === model.key}
-                            onToggle={() => toggleUsageModelFilter(model.key)}
+                            /*
+                             * ★★ 选中态按**行**判定，不按模型名。
+                             *
+                             * 这里此前是 `usageCrossModel === model.key` —— 同一个模型
+                             * 被拆成「国服 / 国际版」多行后，三行的 `model.key` 相同，
+                             * 于是勾一行三行全亮。所有者原话：「勾选 deepseek-v4.1-falsh
+                             * 就会把国内国外同时勾选,这是错误的」。
+                             *
+                             * `row.rowKey` 里含平台/区域/倍率（见 usageBillingRows 的
+                             * 构造），因此**同一模型的不同归属各自独立**，勾哪行只亮哪行。
+                             *
+                             * ⚠ 注意这里**只**改「选中态」的判据，`onToggle` 里传下去的
+                             * 筛选条件仍是模型名（`row.model.key`）—— 见
+                             * `toggleUsageModelFilter` 与 `usageCrossRow` 的长注释：
+                             * 网关的 `accountModels` 只有「账号 × 模型」，
+                             * **没有平台/区域维度**，按行收窄在数据上做不到。
+                             * 即「勾选按行、筛选按模型名」，界面文案已明说这一点。
+                             */
+                            selected={usageCrossRow?.rowKey === row.rowKey}
+                            onToggle={() => toggleUsageModelFilter(row)}
                           />
                         );
                       },

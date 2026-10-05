@@ -898,6 +898,92 @@ pub fn refresh_account(uid: &str) -> Result<Value, String> {
     }))
 }
 
+/// 激活一个 ZCode 账号（**写操作**）：先报官方激活事件，再领取上游给出的所有套餐。
+///
+/// # 为什么需要它
+///
+/// 刚导入的账号在上游看来「从未活动过」：额度查得到、模型列得出，但活动套餐
+/// 要么拿不到 offer、要么被判异常活动。官方客户端在用户**首次启动**时会报两个
+/// 激活事件（`app_launch` / `app_daily_active`），本函数复刻的就是那个行为。
+///
+/// 协议细节全在 Go 侧 `internal/zcode/warm.go`（16 字段事件 body、按 priority
+/// 降序领、3007 重铸一次重试、1003 already-claimed 视为成功）—— 这里只做编排，
+/// 与 `refresh_account` 同一分工。
+///
+/// # 触发时机（2026-10-05 起有两个入口）
+///
+/// 1. **用户显式触发** —— 账号卡片菜单里的「激活」按钮、CLI `zcode-login warm`；
+/// 2. **宿主启动后每账号一次** —— `multi_product_credit_patrol::warm_zcode_accounts`。
+///    官方客户端在用户首次启动时就报这两个事件，复刻它属于**还原真实行为**；
+///    但「每次启动都报」不属于，故那边用账号库里的 `warmed_at` 做幂等
+///    （距上次 ≥ `WARM_REFRESH_AFTER` 才再报一次）。
+///
+/// ⚠ 仍然**绝不挂进任何定时轮询**（`claim_scheduler`）：定时自动「激活 + 领取」
+/// 会让账号表现出非人类的活动模式，而上游正是按活动模式判风控的。
+/// 本函数自身**不做**任何幂等判断 —— 那是调用方的责任，改调用方前先读
+/// `zcode_account::ZcodeAccount::warmed_at` 的说明。
+///
+/// # ⚠⚠ 必须检查 `status`，不能只看 `Ok/Err`
+///
+/// `run_login_cmd` 只把**非零退出码**转成 `Err`，而 Go 侧 `warm` 子命令刻意让
+/// 「上游业务状态」（事件被拒 / 领取失败 / 没有可领套餐）回**退出码 0** ——
+/// 结果写进 `events` / `claim` / `skipped` 三个字段，**空串 = 该阶段成功**。
+///
+/// 理由与 `preview-plan` / `claim-plan` 一致：否则宿主会把「上游拒绝了这次领取」
+/// 当成「网关命令执行失败」，用户看到笼统的「命令失败」而不是具体原因。
+///
+/// 故这里对 `status != "ok"` 显式报错，并且**不把三个字段的语义压平** ——
+/// 原样透出，让界面能分别显示「事件发了没」与「套餐领到没」。
+///
+/// # ⚠ 为什么激活后还要刷新一次
+///
+/// 激活的收益（领到的套餐）**不在 `warm` 的响应里**：它挂在 start-plan 上，
+/// 要下一次额度查询才看得到。不刷新的话，用户点完按钮界面数字纹丝不动，
+/// 看起来像「没生效」—— 而套餐其实已经领到了。
+///
+/// ⚠ 刷新失败**不让整个调用失败**：激活本身已经成功（那是用户点这个按钮的
+/// 主要目的），刷新只是顺带更新展示。失败如实放进 `refreshError` 由界面决定。
+pub fn warm_account(uid: &str) -> Result<Value, String> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        return Err("账号 uid 不能为空".into());
+    }
+
+    let auth_dir = zcode_account::auth_dir();
+    let auth_dir_s = auth_dir.to_string_lossy().to_string();
+
+    let r = run_login_cmd(&["warm", "--uid", uid, "--auth-dir", &auth_dir_s])?;
+    if r.get("status").and_then(Value::as_str) != Some("ok") {
+        return Err(r
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("激活失败")
+            .to_string());
+    }
+
+    // 激活后刷新（理由见上面「为什么激活后还要刷新一次」）
+    let (account, refresh_error) = match refresh_account(uid) {
+        Ok(v) => (v.get("account").cloned(), None),
+        Err(e) => (None, Some(e)),
+    };
+
+    Ok(json!({
+        "status": "ok",
+        "uid": uid,
+        // 三个阶段字段**原样透出**（空串 = 该阶段成功），口径见 Go 侧 WarmReport。
+        // 特意不在这里拼成人话：界面要分别显示"事件发了没"与"套餐领到没"，
+        // 压平成一句会丢掉那个区分。`message` 是 Go 侧给的汇总句，够用。
+        "events": r.get("events").cloned().unwrap_or(json!("")),
+        "claim": r.get("claim").cloned().unwrap_or(json!("")),
+        "skipped": r.get("skipped").cloned().unwrap_or(json!("")),
+        "plans": r.get("plans").cloned().unwrap_or(json!([])),
+        "claimed": r.get("claimed").cloned().unwrap_or(json!([])),
+        "message": r.get("message").cloned().unwrap_or(json!("激活完成")),
+        "account": account,
+        "refreshError": refresh_error,
+    }))
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         return s.to_string();

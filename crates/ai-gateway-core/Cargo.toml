@@ -1,6 +1,6 @@
 [package]
 name = "ai-gateway-core"
-version = "1.0.10"
+version = "1.0.23"
 edition = "2021"
 description = "ai-gateway 核心逻辑（账号/切换/会话/签到/更新），不依赖 Tauri，可被桌面端与 HTTP server 复用"
 
@@ -68,8 +68,15 @@ regex = "1"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # 读取本机 AI CLI 的登录凭证（凭据管理器 `gemini:antigravity`）
+    "Win32_Security_Credentials",
     "Win32_Security_Cryptography",
     "Win32_System_JobObjects",
+    # 一次 Toolhelp 快照枚举全部进程（pid + 映像名）：切换器的进程枚举与
+    # exe 发现的「正在运行的进程」回退都用它，替代「每个映像名起一次
+    # tasklist」（本机实测 265–474 ms/次）与「每次一个 PowerShell 查路径」
+    # （~280 ms/次）。
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
@@ -79,3 +86,9 @@ windows-registry = "0.6"
 [build-dependencies]
 # 构建期压缩内嵌网关
 flate2 = "1"
+
+[dev-dependencies]
+# 测试数据目录隔离：`#[ctor]` 让环境变量在 main / 任何测试线程启动**之前**就位。
+# 这是隔离能否生效的关键 —— 见 config::test_isolation 的事故注释。
+# 仅在 cfg(test) 下使用，不进发布产物。
+ctor = "0.2"

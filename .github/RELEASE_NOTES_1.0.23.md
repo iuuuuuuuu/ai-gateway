@@ -1,0 +1,114 @@
+## AI Gateway 1.0.23 · 正式版
+
+这一版修**你最近报的三件事**（⑪⑫⑬），1.0.21 修掉的十条（平台路由开关并入标签、全平台统一任务区、首启静默等）**一条都没回退**。
+
+> ⚠ **必读**：安装前请先退出正在运行的 AI Gateway。
+> 安装器的 NSIS 模板里有 `CheckIfAppIsRunning`（按可执行文件名找并结束 `ai-gateway.exe`），
+> 开着桌面版安装会弹确认框并结束它。干净起见先退出，再双击安装包。
+
+完整的技术细节、每一处的根因/修法/实测数字，见 **`test-bin/DELIVERY-1.0.23.md`**。本文件只列结论。
+
+---
+
+## 一、你报的问题，逐项结果
+
+| # | 你报的现象 | 结果 |
+|---|---|---|
+| ⑪ | ZCode 账号的套餐接口只返回 `glm-5.3-flash`，但我调 `glm-5.3` 却把一个账号直接打到「积分不足」、冷却到次日 04:00 | ✅ 已修。**这条错误文案本身就是错的** —— 上游回的是「这条通道没有该账号的资源包」，不是「账号没额度」。现在只做 **60 秒软冷却 + 只封该模型**，不再动账号整体额度 |
+| ⑫ | 重试延迟 500 ms / 失败原因 `upstream stream ended before the completion event: error decoding response body` | ✅ 已修。那句话是 **reqwest 在 body 层的固定占位串**，跟真实原因无关。现在会带上真正的断流原因（见第二节） |
+| ⑬ | 跨账号任务队列：不点开某个账号，都不知道它的任务**一个都没执行**；有些账号全跑了、有些全没跑、有些跑一半 | ✅ 已修。抓出**四处**独立根因（见第三节），其中一处是「明明没执行却记成成功」 |
+
+---
+
+## 二、⑫ 流式中断：为什么以前只看到一句废话
+
+**根因**：上游半截断流时，`reqwest` 的 `Error` 在 body 层 `Display` **恒为** `error decoding response body`
+（`reqwest-0.12.28/src/error.rs:233`）—— 它只是「body 层出错了」这个分类名，不含任何真因。
+真实原因藏在 `source()` 链里（`error reading a body from connection` ⇒ `end of file before message length reached`）。
+
+**修法**：沿 `std::error::Error::source()` 往上取最多三层、去重，并**过滤掉 reqwest 自己的三个分类占位串**，
+拼成 `上游流中断：<真因> ← <更底层>`；空闲超时单独给一句人话。
+
+**★ 一条不能碰的约束**：客户端（含 DSH）靠字面前缀 `stream ended before|without` 判定「这是传输层错误、可以重试」。
+所以原文案前缀**原样保留**，只在冒号后面补归因 —— 改了就会从「可重试」变成「不可重试」。
+
+**实测**（本地假上游：回 `200` + `content-length: 400`，只写一帧就 `destroy` socket）：
+
+```
+旧（1.0.21）：upstream stream ended before the completion event: error decoding response body
+新（1.0.23）：upstream stream ended before the completion event: 上游流中断：
+            error reading a body from connection ← end of file before message length reached
+```
+
+两条链路都验过：**裸网关 exe** 和 **打进安装包后由宿主自解压出来的网关**，文案一致。
+
+---
+
+## 三、⑬ 跨账号任务队列：四处根因，逐个拔掉
+
+先说结论：**任务不是没派发，是「排队」被误读成「没执行」，再加上一条假成功**。
+我把 `account_records.json` 里 09:41:49–09:54:02 那个窗口的 **92 条记录**逐条对账：
+**15/15 个合格账号、91/91 条队列项全部 `result=success`** —— 队列本身是通的。真正的缺陷是这四个：
+
+| # | 缺陷 | 修法 |
+|---|---|---|
+| 1 | **「夜猫子」假成功**：不在 23:00–08:00 时段时上游根本不计入，任务却记成 `success` | 改成 `跳过`，并写明「当前不在夜猫时段（23:00–08:00 北京时间），上游不计入本次上报；请在时段内重试」 |
+| 2 | **`locked` 口径不一致**：卡片认为可跑、后端认为不该跑 | 后端 `pending_tasks` 与前端 `growthTaskRunnable` 统一到同一口径（`claimed` / `locked` / 非 `automatable` 一律不跑） |
+| 3 | **卡片快照过期**：队列跑完了，卡片还写着「可一键完成」 | 新增 `growthTasksNonce`，队列结束（`onFinished`）后强制重取 27 个账号的任务态 |
+| 4 | **队列位置不可见**：「还没轮到」看起来跟「被跳过」一模一样 | 面板显示 `第 n / N 个账号`、`共 N 个账号 · 同时最多 2 个，其余按序排队`，并把「扫到了但没待办」的账号单列一栏并注明不会出现在队列里 |
+
+**实测**（真机 + CDP 挂钩 `__TAURI_INTERNALS__.invoke`）：
+
+- 面板：`已结束 15 / 15`、`完成 0 · 跳过 15`，每个账号都带 `第 n / 15 个账号` 与跳过原因；
+- 卡片刷新：`run_growth_task` **42** 次（15 次 run + 27 次 list）、`get_credit_expiry` **27** 次，
+  最后一次 run 之后 **1.33 秒**就发出了新一轮 27 次 list —— 且**全程没有重开面板**，
+  所以这 27 次只可能来自新增的 `growthTasksNonce`。
+
+---
+
+## 四、⑪ ZCode 1113：被误判成「额度耗尽」
+
+**根因**：ZCode 的 `429 [1113] 余额不足或无可用资源包,请充值。` 里的「余额不足」是**上游对这条通道的措辞**，
+含义是「**这条通道上没有该账号的资源包**」，不是「账号没额度」。
+而通用错误分类器的 `HARD_MARKERS` 命中「余额不足」且**没有状态码闸门** ⇒ 判成 `HardCredit`
+⇒ `pool.cooldown_until_tomorrow_4am()` ⇒ 账号被打到次日 04:00。
+
+**修法**：新增独立分类 `NoResourcePack`（429 + 业务码 1113 / 「无可用资源包」文案），
+命中后只做 **60 秒软冷却** 并 **只封该模型**，账号整体照常参与其他模型的调度。
+文案也刻意**不提充值** —— 因为问题不在余额。
+
+**真机 A/B**（同一个账号、同一个模型）：
+
+| | `state.json` 里的落点 | 客户端看到 |
+|---|---|---|
+| 修复前 | `{credits:0, reason:"余额不足", until: 次日 04:00, cool_kind:1}`（硬冷却） | 账号整体不可用 |
+| 修复后 | `cool_kind:0`（软冷却，仅该模型） | `503` + 「该 ZCode 账号在这条通道上没有可用资源包」 |
+
+★ 顺带说清一件事：ZCode **有两条通道**（额度 / 资源包走不同的端点）。
+`1113` 只说明「这条通道没资源包」，换模型或换通道就能用，**不代表账号废了**。
+
+---
+
+## 五、回归与测试基线
+
+| 项 | 结果 |
+|---|---|
+| `cargo test -p ai-gateway-router --lib` | **1651 passed / 0 failed** |
+| `cargo test -p ai-gateway-router --lib upstream::sse::` | **37 passed / 0 failed** |
+| 真机 A/B（⑪ / ⑫ / ⑬） | 全部通过，详见 `test-bin/DELIVERY-1.0.23.md` |
+
+> 版本号说明：`1.0.22` 是内部构建（早于 ⑪/⑫/⑬），**已被这一版取代，不要装它**。
+> Tauri 的 NSIS 不允许同号覆盖升级，所以取下一个空号。
+
+---
+
+## 六、安装
+
+```
+dist\AI Gateway_1.0.23_x64-setup.exe
+dist\AI Gateway_1.0.23_x64-setup.exe.sig   （更新签名，keyid 7e7ce64b6fc3a36f）
+```
+
+1. **先退出正在运行的 AI Gateway**（托盘图标右键退出，确认任务管理器里没有 `ai-gateway.exe`）；
+2. 双击安装包，覆盖安装即可（同目录 `D:\APP\AI Gateway`）；
+3. 装完启动，账号数据 / 网关配置 / 用量记录都在 `%USERPROFILE%\.wb-switch`，**不会被覆盖**。

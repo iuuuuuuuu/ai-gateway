@@ -85,7 +85,10 @@ impl ParsedQuota {
                 }
             }
         }
-        for item in self.items.iter().take(4 - parts.len().min(4)) {
+        // 剩余名额：`parts` 最多 4 项，用 saturating_sub 保证不为负。
+        // 早期写成 `4 - parts.len().min(4)`，当窗口数 ≥4 时结果恒为 0，
+        // 兜底项永远进不来（虽然 items 与 windows 通常互斥，但不该靠这个前提）。
+        for item in self.items.iter().take(4usize.saturating_sub(parts.len())) {
             let name = item.get("name").and_then(Value::as_str).unwrap_or("额度");
             if let (Some(left), Some(total)) = (
                 item.get("left").and_then(Value::as_f64),
@@ -379,15 +382,14 @@ pub async fn run_batch() -> Value {
                     exhausted.push(name.clone());
                 }
                 // 写回额度缓存（供账号列表直接展示，无需每次重新查询）
-                let level = parsed.level.clone();
-                let expire = parsed.expire_at.clone();
-                let summary_clone = summary.clone();
-                let _ = doubao_account::mutate_account(uid, |obj| {
-                    obj.insert("quota_level".to_string(), json!(level));
-                    obj.insert("quota_expire_at".to_string(), json!(expire));
-                    obj.insert("quota_summary".to_string(), json!(summary_clone));
-                    obj.insert("quota_checked_at".to_string(), json!(config::utc_iso()));
-                });
+                crate::modules::apps_ops::write_quota_cache(uid, &parsed);
+                let _ = crate::modules::doubao_health::record_quota(
+                    true,
+                    uid,
+                    &parsed.level.clone().unwrap_or_default(),
+                    &summary,
+                    &parsed.windows,
+                );
                 results.push(json!({
                     "userId": uid, "name": name, "ok": true, "summary": summary,
                     "level": parsed.level, "expireAt": parsed.expire_at,

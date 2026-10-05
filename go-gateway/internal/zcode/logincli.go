@@ -101,6 +101,136 @@ func loadSession(authDir, flowID string) (*LoginSession, error) {
 	return &s, nil
 }
 
+// captchaConfig 是网关配置里的验证码求解器参数（纯数据）。
+//
+// 单独抽成类型是为了让 `loadCaptchaConfig` 保持**纯**：只读文件、只返回值，
+// 不碰任何包级状态。为什么这很重要见下。
+type captchaConfig struct {
+	Dir   string
+	URL   string
+	Token string
+}
+
+// loadCaptchaConfig 从网关配置文件里读出验证码求解器的三个参数。
+//
+// # 为什么需要它（这是一处真实的接线缺口，不是预防性加固）
+//
+// 求解器**只在服务模式被配置**：`cmd/server/main.go` 在 `flag.Parse()` 之前
+// 就拦截了 `qoder-login` / `zcode-login` 并 `os.Exit`，配置**根本不读**。
+// 于是 `gateway.exe zcode-login warm --uid …` 走到 `warm.go::mintCaptcha`
+// → `client.go::solveCaptcha` → `SharedCaptchaSolver()`（dir 与 externalURL
+// 都是空）→ `UnavailableReason()` 返回「求解器组件未安装」。
+//
+// 后果是 `warm` 这条**宿主要用的路径**永远拿不到 param，领取阶段必回 3007
+// —— 而服务模式的同一功能是好的。这正是 captcha.go 注释里记过的那类缺陷：
+// 「新路径接好了、旧的前置检查把它挡在门外」。
+//
+// 形状照抄 `qoder/logincli.go` 的 `loadProxyConfig`（同样的三个候选位置、
+// 同样「找不到就不报错」）：两者读的是**同一份** `gateway_native_config.json`。
+//
+// # ⚠ 本函数必须是纯的（只读文件、只返回值）
+//
+// 曾经把它写成「读配置 + 直接 SetDir/SetExternalSolver」的一体式函数，并在
+// `RunLoginCLI` 开头**无条件**调用。实测证伪：那会**污染包级共享求解器**。
+//
+// `captcha_link_test.go` 明写着本包的不变量：「本包测试从不给
+// `SharedCaptchaSolver()` 设 dir / 外部求解服务，故 `UnavailableReason()`
+// 必非空 ⇒ `solveCaptcha` 确定性失败」。而本机
+// `~/.wb-switch/gateway/gateway_native_config.json` 真实存在（候选②命中），
+// 于是任意一次 `RunLoginCLI` 都会把这个不变量翻掉：
+//
+//	BEFORE: "求解器组件未安装（发行包应包含 assets/zcode-captcha）"
+//	AFTER:  ""   DIR="D:\\APP\\AI Gateway\\_up_\\assets\\zcode-captcha"
+//
+// 当时全包 `go test` 仍绿，纯属 `captcha_link_test.go` 字典序在前、先跑完的
+// **偶然**（`logincli_warm_test.go` 有四处调 `RunLoginCLI`），不是设计保证。
+//
+// 故这里只返回值；「装到求解器上」那一步交给 `installCaptchaSolver`，且只在
+// 真正要求解的子命令里调。
+func loadCaptchaConfig(authDir string) captchaConfig {
+	// 配置文件与凭证目录同属一个数据目录：
+	//   <data>/gateway/gateway_native_config.json
+	//   <data>/zcode/auths
+	// 用 authDir 往上找而不是写死 %USERPROFILE% —— 既支持自定义数据目录，
+	// 也让测试能指向临时目录。
+	var candidates []string
+	if d := filepath.Dir(filepath.Dir(authDir)); d != "" {
+		candidates = append(candidates,
+			filepath.Join(d, "gateway", "gateway_native_config.json"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates,
+			filepath.Join(home, ".wb-switch", "gateway", "gateway_native_config.json"))
+	}
+	if env := strings.TrimSpace(os.Getenv("AI_GATEWAY_HOME")); env != "" {
+		candidates = append(candidates,
+			filepath.Join(env, "gateway", "gateway_native_config.json"))
+	}
+
+	for _, p := range candidates {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		// ⚠ 这几个 captcha 键在 `pool` 段**内**，不在顶层 ——
+		// 顶层解不出来会静默拿到空串，表现与"文件不存在"一模一样。
+		//
+		// `zcode_captcha_enabled` 刻意**不解析**：见下面"与 main.go 同口径"。
+		var doc struct {
+			Pool struct {
+				Dir   string `json:"zcode_captcha_dir"`
+				URL   string `json:"zcode_captcha_solver_url"`
+				Token string `json:"zcode_captcha_solver_token"`
+			} `json:"pool"`
+		}
+		if json.Unmarshal(raw, &doc) != nil {
+			continue
+		}
+
+		// 与 main.go 同口径：**刻意不读 zcode_captcha_enabled**。
+		// 老配置里可能留着 false，据此关闭会让升级后的用户"功能永远关着"。
+		return captchaConfig{
+			Dir:   strings.TrimSpace(doc.Pool.Dir),
+			URL:   strings.TrimSpace(doc.Pool.URL),
+			Token: strings.TrimSpace(doc.Pool.Token),
+		}
+	}
+	// 找不到配置文件不是错误：调用方拿零值，求解器保持不可用，
+	// 与"用户没配求解器"表现一致（而不是凭空报一个读文件失败）。
+	return captchaConfig{}
+}
+
+// installCaptchaSolver 把 loadCaptchaConfig 读到的参数装到共享求解器上。
+//
+// ⚠ 只在**真正要求解**的子命令里调（当前只有 `warm`），且要在凭证加载成功
+// **之后**调 —— 见 loadCaptchaConfig 的注释：无条件调用会污染包级单例，
+// 把 `captcha_link_test.go` 依赖的那个不变量翻掉。
+//
+// 当前只有 `warm` 需要：`claim-plan` 的 doc 明写着「本命令不主动求解」，
+// 它只把调用方给的 `Cred.CaptchaParam` 转发出去（claim.go:249）。
+func installCaptchaSolver(authDir string) {
+	cfg := loadCaptchaConfig(authDir)
+	if cfg.Dir == "" && cfg.URL == "" {
+		// 一个都没配：不必碰单例，让 UnavailableReason() 保持原样。
+		return
+	}
+
+	cs := SharedCaptchaSolver()
+	if cfg.Dir != "" {
+		cs.SetDir(cfg.Dir)
+	}
+	// 外部求解（宿主 WebView2）优先：真实浏览器环境，比模拟环境更快更稳。
+	if cfg.URL != "" {
+		cs.SetExternalSolver(cfg.URL, cfg.Token)
+	}
+	// 配置完仍不可用就**如实报**到 stderr（不阻断子命令）：
+	// 否则用户只会看到 3007，而不知道为什么。
+	if reason := cs.UnavailableReason(); reason != "" {
+		fmt.Fprintf(os.Stderr,
+			"⚠ ZCode 验证码求解器不可用：%s（本次领取会因 3007 失败）\n", reason)
+	}
+}
+
 // RunLoginCLI 执行 zcode-login 子命令。
 //
 // 用法：
@@ -111,11 +241,15 @@ func loadSession(authDir, flowID string) (*LoginSession, error) {
 //
 // 输出一律是**单行 JSON**（宿主按行解析），错误写 stderr 并以非零码退出。
 func RunLoginCLI(args []string, defaultAuthDir string) int {
+	// ⚠ 这里**刻意不配置验证码求解器**：子命令模式下 `main.go` 确实不读配置，
+	// 但求解器只有 `warm` 用得上，装它必须延后到真正要用的地方
+	// （`runWarm` 里、凭证加载成功之后）。在这里无条件装会改包级单例，
+	// 破坏 `captcha_link_test.go` 依赖的不变量 —— 详见 loadCaptchaConfig。
 	if len(args) == 0 {
 		// ⚠ 帮助文案必须与**实际派发的子命令**一致（同 qoder 侧的教训）：
 		// 旧文案只列 start|poll|import，漏了 quota / models，
 		// 排查时会误判「子命令没注册」。
-		fmt.Fprintln(os.Stderr, "用法: zcode-login <start|poll|import|quota|models|preview-plan|claim-plan> [选项]")
+		fmt.Fprintln(os.Stderr, "用法: zcode-login <start|poll|import|quota|models|preview-plan|claim-plan|warm> [选项]")
 		return 2
 	}
 	switch args[0] {
@@ -158,8 +292,14 @@ func RunLoginCLI(args []string, defaultAuthDir string) int {
 		//
 		// ⚠ 只由用户显式触发（界面点击或本子命令），**不做定时自动抢**。
 		return runClaimPlan(args[1:], defaultAuthDir)
+	case "warm":
+		// 激活账号（**写操作**）：报两个激活事件，再领上游给出的所有套餐。
+		//
+		// ⚠ 同样只由用户显式触发。绝不挂进 claim_scheduler 的自动轮询 ——
+		// 定时自动"激活 + 领取"会让账号表现出非人类的活动模式。
+		return runWarm(args[1:], defaultAuthDir)
 	default:
-		fmt.Fprintf(os.Stderr, "未知子命令 %q（应为 start / poll / import / quota / models / preview-plan / claim-plan）\n", args[0])
+		fmt.Fprintf(os.Stderr, "未知子命令 %q（应为 start / poll / import / quota / models / preview-plan / claim-plan / warm）\n", args[0])
 		return 2
 	}
 }
@@ -414,6 +554,84 @@ func runClaimPlan(args []string, defaultAuthDir string) int {
 			}
 			return "领取成功"
 		}(),
+	})
+	return 0
+}
+
+// runWarm 激活一个账号（**写操作**）：先报激活事件，再领上游给出的所有套餐。
+//
+// # 为什么需要它
+//
+// 刚导入的账号在上游看来"从未活动过"：额度查得到、模型列得出，但活动套餐
+// 要么拿不到 offer、要么被判异常活动。官方客户端在用户首次启动时会报两个
+// 激活事件（`app_launch` / `app_daily_active`），本条子命令复刻的就是那个
+// 行为 —— 详见 warm.go 的文件头。
+//
+// # ⚠ 这是写操作，只由用户显式触发
+//
+// 与 `claim-plan` 同一取舍：**绝不挂进 claim_scheduler 的自动轮询**。定时
+// 自动"激活 + 领取"会让账号表现出非人类的活动模式，而上游正是按活动模式
+// 判风控的。
+//
+// ⚠ 本目录是历史 Go 实现，已不参与构建；Rust 版另有「宿主启动后每账号一次」
+// 的幂等自动入口（`multi_product_credit_patrol::warm_zcode_accounts`）。
+//
+// # 退出码
+//
+// 与 `preview-plan` / `claim-plan` 一致：**上游业务状态回退出码 0**，
+// 结果（含失败原因）写进 JSON 的 events / claim / skipped 三个字段
+// （**空串 = 成功**）。只有"账号都加载不出来"才是非零退出码 ——
+// 否则宿主会把"上游拒绝了这次领取"当成"网关命令执行失败"。
+func runWarm(args []string, defaultAuthDir string) int {
+	fs := flag.NewFlagSet("zcode-login warm", flag.ContinueOnError)
+	uid := fs.String("uid", "", "账号 uid")
+	authDir := fs.String("auth-dir", defaultAuthDir, "凭证目录")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	// 复用 loadCredForPlan：激活的事件 body 需要 user_id（从 JWT 解）、
+	// 领取需要 Authorization: Bearer <jwt>，所以缺 JWT 时**如实说明**
+	// 而不是发一堆必然失败的请求上去。
+	c, code := loadCredForPlan(*authDir, *uid)
+	if c == nil {
+		return code
+	}
+
+	// 求解器装在这里而不是 `RunLoginCLI` 开头：只有本子命令要求解，且必须在
+	// 凭证确实加载出来之后 —— 早退路径（缺 --uid / 账号不存在 / 无 JWT）不该
+	// 碰共享单例。原因见 loadCaptchaConfig 的注释（实测污染过一次）。
+	installCaptchaSolver(*authDir)
+
+	rep, err := New().WarmAccount(context.Background(), c)
+	if err != nil {
+		writeJSON(map[string]any{"status": "error", "uid": c.UID, "message": err.Error()})
+		return 0
+	}
+
+	// 汇总一句话，让宿主/用户不必自己拼三个字段的语义。
+	// 口径与 WarmReport 一致：空串 = 该阶段成功。
+	summary := "激活完成"
+	switch {
+	case rep.Events != "":
+		summary = "激活事件未发出，未执行领取"
+	case rep.Skipped != "":
+		summary = "激活事件已发出；未执行领取：" + rep.Skipped
+	case rep.Claim != "":
+		summary = fmt.Sprintf("激活事件已发出；领取部分失败：%s", rep.Claim)
+	case len(rep.Claimed) > 0:
+		summary = fmt.Sprintf("激活事件已发出；已领取 %d 个套餐", len(rep.Claimed))
+	}
+
+	writeJSON(map[string]any{
+		"status":  "ok",
+		"uid":     c.UID,
+		"events":  rep.Events,
+		"claim":   rep.Claim,
+		"skipped": rep.Skipped,
+		"plans":   rep.Plans,
+		"claimed": rep.Claimed,
+		"message": summary,
 	})
 	return 0
 }

@@ -1018,7 +1018,17 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 		} else if lastTransportErr != nil {
 			msg = "无法连接上游（网络超时 / 连接被拒）：请检查本机网络或代理设置后重试"
 		} else {
-			msg += ": " + lastErr.Error()
+			// ⚠ **绝不能**拼 lastErr.Error()（2026-09-29 实测缺陷）。
+			//
+			// upstream.Error.Error() 的格式是
+			// `"upstream %s (http %d): %s"`（upstream/client.go:311-313），
+			// 拼进来会把 `(http 403)` 和整段上游 JSON 一起透给客户端 ——
+			// 而客户端判「API 密钥无效」靠的正是文案里的裸 403
+			//（见 clienttext.go）。整段上游 JSON 对用户也毫无用处。
+			//
+			// 改用**错误类别名**：不含任何裸状态码，归因信息却不丢
+			//（排查时仍能按 account_unusable / soft_rate 区分）。
+			msg += "（" + lastKind.String() + "）；已尝试切换账号，请稍后重试"
 		}
 	}
 	// 失败时也带上最后尝试过的账号，请求日志据此仍能显示 uid（与原实现一致）。
@@ -1034,24 +1044,35 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 //	「密钥明明是正确的，不知道怎么对话过程中就提示『本轮运行失败 API 密钥无效』，
 //	  而且我还是可以通过我配置的密钥获取到模型的名称」
 //
-// 查证结论：**密钥从头到尾都是对的**，是状态码被客户端误读了。
+// 查证结论：**密钥从头到尾都是对的**，是错误信息被客户端误读了。
 //
-// DSH Desktop 客户端的映射（`dsh-llm-deepseek/lib/index.js:1527`）：
+// # ★ 判据更正（2026-09-29，此前这里写错了）
 //
-//	if (status === 401 || status === 403) return "AUTH";
+// 本注释原先声称客户端是按**状态码**判的：
 //
-// 而 `AUTH` 在界面上被渲染成 **「API 密钥无效」**
-// （`dsh-client-ui-chat/lib/client.js:2696` 的 `message.failure.auth`）。
+//	if (status === 401 || status === 403) return "AUTH";   // ← dsh-llm-deepseek
 //
-// 于是完整因果是：
+// **那条路径不生效**：DSH 里 `ai` provider 的 namespace 是 `llm-pi-ai`
+//（见 `dsh-config-manager` 的 providers.json），走的是 pi-ai 适配层。
+// 真正的判据是**文案文本正则**（`dsh-llm-pi-ai/lib/index.js:1376-1387`）：
 //
-//	上游返回 403（排队 / 额度 / 风控 / WAF）
-//	→ 我们**原样透传 403**
-//	→ 客户端把 403 归类为 AUTH
-//	→ 界面显示「API 密钥无效」  ← 与事实完全不符
+//	function classifyPiAiError(message) {
+//	  if (/\b(?:401|403)\b/.test(message)) return "AUTH";
+//	  ...
+//	}
 //
-// 用户据此会去**反复改密钥**，而真正原因是上游拒绝了这次请求 ——
-// 这是最坏的一类误导：它把用户引向一个不可能修好的方向。
+// 而错误文案来自上游响应体：`pi-ai/dist/utils/error-body.js:111-118` 的
+// `formatProviderError` 会把 `(status): body` **原样拼进 message**。
+// ⇒ **只要文案里出现裸 "401"/"403"，不管 HTTP 状态码是什么，都被判 AUTH。**
+//
+// 这就是为什么**只把 403 改写成 502 是无效的** —— 上一版正是这么做的，
+// 所有者装了新包实测仍然报「API 密钥无效」，因为文案里还留着
+// 「上游 403 业务码 11140」这几个字。**光改状态码治不了这个病。**
+//
+// 所以现在有**两道**防线，缺一不可：
+//  1. 状态码：403 → 502（本函数），避免任何按状态码判的分支误读；
+//  2. 文案：`clientSafeMessage`（clienttext.go）在**所有**对外出口
+//     把裸 401/403 就地改写成 4xx —— 这才是真正兜住 DSH 的那道。
 //
 // # 为什么改成 502 而不是保留 403
 //
@@ -1064,7 +1085,9 @@ func (h *Handler) forwardChatCtx(ctx context.Context, body []byte, stream bool, 
 // 故这里把 403 改掉不会与"我们自己的拒绝"混淆。
 //
 // 401 不在这里处理：那是我们自己的鉴权结果，**必须**保持 401 让客户端
-// 提示"密钥无效" —— 那种情况下提示是对的。
+// 提示"密钥无效" —— 那种情况下提示是对的。注意它仍然要过 `clientSafeMessage`：
+// 我们自己的 401 文案是 "missing or invalid API key"（不含裸数字），
+// 改写是恒等变换，不受影响。
 func clientFacingStatus(status int) int {
 	if status == http.StatusForbidden {
 		return http.StatusBadGateway

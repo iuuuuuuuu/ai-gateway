@@ -142,6 +142,109 @@ func TestPendingTasksExcludesClaimedAndUnsupported(t *testing.T) {
 	}
 }
 
+// TestListTasksDropsIntlOnlyCodes 国际版那 5 个静态任务**不得下发**。
+//
+// # 守的是什么
+//
+// 所有者 2026-09-25：
+//
+//	「如果你无法通过抓包把这些任务变成可执行的,那你就把这些任务给删掉」
+//
+// 这 5 项（first_chat / skill_installed / wechat_linked / expert_summoned /
+// template_used）在国际版 growth 域里恒为 available，没有任何可推进的状态，
+// 列出来只会变成 5 条「需在客户端手动完成」的噪音。删除的理由见
+// `intlOnlyCodes` 的注释。
+//
+// ⚠ 与「不可自动但**保留**」的任务必须区分开：Expert_Philanthropy /
+// workstation_expert 是国服任务、有真实状态，只是动作需人工 ——
+// 它们仍须出现在列表里并带置灰指引。这条测试同时守住这两侧，
+// 否则很容易"顺手"把国服那两个也一起过滤掉。
+func TestListTasksDropsIntlOnlyCodes(t *testing.T) {
+	f := newFakeUpstream().
+		// 国际版那 5 项，全部 available（真实形态：无 accept_status）。
+		add("first_chat", 0, 0, upstream.TaskAcceptAccepted).
+		add("skill_installed", 0, 0, upstream.TaskAcceptAccepted).
+		add("wechat_linked", 0, 0, upstream.TaskAcceptAccepted).
+		add("expert_summoned", 0, 0, upstream.TaskAcceptAccepted).
+		add("template_used", 0, 0, upstream.TaskAcceptAccepted).
+		// 国服任务必须原样保留。
+		add("chat_5", 0, 5, upstream.TaskAcceptNotAccepted).
+		add("Expert_Philanthropy", 0, 1, upstream.TaskAcceptAccepted)
+	r := testRunner(f)
+
+	views, err := r.ListTasks(context.Background(), testAuth())
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	byCode := map[string]TaskView{}
+	for _, v := range views {
+		byCode[v.Code] = v
+	}
+	for _, code := range []string{
+		"first_chat", "skill_installed", "wechat_linked", "expert_summoned", "template_used",
+	} {
+		if _, ok := byCode[code]; ok {
+			t.Errorf("国际版静态任务 %s 不该下发（应被 intlOnlyCodes 过滤）", code)
+		}
+	}
+	if _, ok := byCode["chat_5"]; !ok {
+		t.Error("国服可自动任务 chat_5 不该被过滤")
+	}
+	// 国服的"需人工"任务必须**保留**，且仍带置灰指引。
+	ph, ok := byCode["Expert_Philanthropy"]
+	if !ok {
+		t.Fatal("国服的 Expert_Philanthropy 不该被过滤（它只是需人工，不是国际版静态项）")
+	}
+	if ph.Status != ViewUnsupported || ph.Hint == "" {
+		t.Errorf("Expert_Philanthropy: status=%s hint=%q want unsupported + 指引", ph.Status, ph.Hint)
+	}
+	if len(views) != 2 {
+		t.Errorf("views=%d want 2（chat_5 + Expert_Philanthropy）", len(views))
+	}
+}
+
+// TestPendingTasksDropsIntlOnlyCodes 被删的那 5 项也不得出现在待办里。
+//
+// PendingTasks 是「一键执行全部任务」的作用范围，它会复用 ListTasks 的口径。
+// 单独守一条是因为 `actions.go` 的 actions 表**本来就没有**这 5 个码，
+// 所以它们即使漏过 ListTasks 也会被 `!v.Automatable` 挡在待办之外 ——
+// 也就是说这条路径坏了也看不出来。断言直接盯 ListTasks 的过滤是否生效。
+func TestPendingTasksDropsIntlOnlyCodes(t *testing.T) {
+	f := newFakeUpstream().
+		add("first_chat", 0, 0, upstream.TaskAcceptAccepted).
+		add("chat_5", 0, 5, upstream.TaskAcceptNotAccepted)
+	r := testRunner(f)
+
+	pending, err := r.PendingTasks(context.Background(), testAuth())
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	for _, v := range pending {
+		if intlOnlyCodes[v.Code] {
+			t.Errorf("国际版静态任务 %s 不该出现在待办里", v.Code)
+		}
+	}
+	if len(pending) != 1 || pending[0].Code != "chat_5" {
+		t.Errorf("pending=%+v want [chat_5]", pending)
+	}
+}
+
+// TestIntlOnlyCodesAreNotActionable 这 5 个码**不得**被注册成可自动动作。
+//
+// 两条约束互为镜像：既然它们的上游状态不可推进（删掉的唯一理由），
+// 就不该有人给它们加动作实现 —— 那会造出"点了报成功但状态永远不变"的假象。
+// 将来若真做出可执行的接口，这条测试会先失败，提醒把 intlOnlyCodes
+// 里的对应项一并去掉（而不是只加动作）。
+func TestIntlOnlyCodesAreNotActionable(t *testing.T) {
+	for code := range intlOnlyCodes {
+		if act := actionFor(code); act != nil {
+			t.Errorf("%s 被注册成可自动动作（%q），但它没有可推进的上游状态；"+
+				"若已实现接口，请同步从 intlOnlyCodes 移除", code, act.Desc)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 多账号批量
 // ---------------------------------------------------------------------------

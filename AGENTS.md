@@ -81,7 +81,18 @@ Token 统计与网关的接口契约可直接查阅实现本身：
 **根因**：`crates/ai-gateway-core/build.rs` 会**无条件内嵌**
 `crates/ai-gateway-core/embedded/gateway.exe` 里当时躺着的那一份，
 而 `build-signed.ps1` **此前从不构建网关**（只有 `build-single.ps1` 有那段逻辑）。
-于是改了 `go-gateway/` 却没手动重建 embedded 时，打出来的包内嵌旧网关。
+于是改了网关源码却没手动重建 embedded 时，打出来的包内嵌旧网关。
+
+**★ 2026-10 变更：网关已从 Go 重写为 Rust**（`crates/ai-gateway-router`，
+产物 `target/<profile>/gateway.exe`）。`go-gateway/` 仍留在仓库里作为对照实现，
+但**构建链路上已完全不依赖 Go 工具链**（`build-gateway.{sh,ps1}` 不再调用 `go build`，
+CI 里的 `actions/setup-go` 已全部删除）。三个 workflow 都走
+`sh scripts/build-gateway.sh`，因此 CI 验证的就是打包时真正执行的那条路径。
+
+**★ 交叉编译已取消**：脚本在收到 `GOOS`/`GOARCH` 时只打一行提示后**忽略**。
+原因是交叉编译需要额外装目标三元组的 std 与链接器，而 CI 四腿的 host 与 target
+本来就一致；保留交叉只会引入「三元组没装」这一类新故障。若将来真要交叉，
+必须在 workflow 里显式 `rustup target add` 并配好链接器，不能只设环境变量。
 
 **现在的约定**：`build-signed.ps1` 的第 `[3/4]` 步会**强制重建**网关
 （调用 `scripts/build-gateway.ps1 -Force`），并在构建后做**双端指纹比对**：
@@ -159,6 +170,51 @@ Get-Process -Name "gateway*" | Stop-Process
 $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$pid" -ErrorAction SilentlyContinue
 if ($proc -and $proc.ExecutablePath -like "*test-bin*") { Stop-Process -Id $pid -Force }
 ```
+
+### ⚠⚠ 绝对禁止：直接运行共享目录里的可执行文件（**哪怕只是 `--version`**）
+
+**2026-10-01 事故**：一名队友为了「取一下版本号」跑了
+
+```powershell
+& "crates\ai-gateway-core\embedded\gateway.exe" --version    # ❌ 禁止
+```
+
+他以为「取版本号」不算运行 —— **它就是运行**。
+
+**为什么危险**：
+
+1. **Windows 对正在运行的可执行文件加锁** ⇒ 此时任何 `cargo build` 都会
+   报 `failed to remove file ... gateway.exe` / `Caused by: 拒绝访问。 (os error 5)`。
+   本仓库在 2026-10-01 就因此**整次打包失败**（`cargo build exit 101`）。
+2. **它可能不只是打个版本号就退出** —— 网关的 `main()` 在没有 `-config` 时
+   会**照常启动 HTTP 服务**（默认 `:7863`）并**常驻不退出**。若它绑上了某个
+   真实端口、写进了某个真实数据目录，就是在**碰所有者的状态**。
+3. 若该二进制恰好与所有者正在跑的实例**同名**，还会踩到与「按进程名杀进程」
+   同型的坑。
+
+那次事故侥幸无害：进程因 `:7864` 已被占用而 bind 失败**自行退出**，
+且 CWD 下 `auths`/`data`/`gateway_config.json`/`usage.json` 等**全部未生成**。
+**侥幸不是理由** —— 换个端口空闲的场合就是真事故。
+
+**规矩**：
+
+```powershell
+# 要检查任何共享目录里的可执行文件，先拷出来
+Copy-Item "crates\ai-gateway-core\embedded\gateway.exe" "$env:TEMP\probe-gw.exe"
+& "$env:TEMP\probe-gw.exe" --version        # ✅ 拷出来再用
+
+# 要跑接口，连**可执行文件本身**也必须独立（见下一节）
+```
+
+⚠ **「跑用例要独立实例」这条同样适用于「探一下」「看一眼」「取个字符串」** ——
+判据不是**你打算干什么**，而是**你有没有碰那个共享文件**。
+
+⚠⚠ **「读一下版本号」也是运行**（2026-10-01 补）：`--version` / `-v` / `version`
+不改变判据 —— 它们仍然是**执行那个文件**。更危险的是网关的 `main()` 里
+**根本没有 `--version` 分支**：参数会被当成「无 config 启动」，
+于是它**照常起 HTTP 服务并常驻**，直到你手动杀掉为止。
+即「只想看一眼版本号」实际得到的是「多了一个常驻进程 + 可能占了端口 +
+可能写了数据目录」。要读版本就拷出来读（见上面的 `Copy-Item`）。
 
 ### 验证一律用独立实例：独立名 + 独立端口 + 独立数据目录
 

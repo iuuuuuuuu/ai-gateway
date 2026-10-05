@@ -403,9 +403,74 @@ pub(crate) fn ps_output(script: &str, timeout_secs: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// 一次 Toolhelp 快照枚举**全部**进程（pid + 映像名），匹配留给调用方在内存里做。
+///
+/// 为什么不用 `tasklist /FI "IMAGENAME eq X"`：
+/// 1. 每个映像名都要起一个子进程（本机实测 265–474 ms/次）；
+/// 2. `IMAGENAME` 过滤器是**精确**匹配 —— 传 `node` 匹配不到 `node.exe`，
+///    必须带 `.exe` 后缀。切换器的 `proc_names` 恰恰刻意不带后缀
+///    （见 `switcher::proc` 的 `进程名白名单不带_exe_因此必须归一化`），
+///    于是每一级都拿不到任何行，`is_running` 恒 false、「关闭旧实例 → 带
+///    `--proxy-server` 启动新实例」静默退化成什么都没做。
+///
+/// 快照只有一次内核调用（实测个位数毫秒），且返回的映像名天然带 `.exe`，
+/// 归一化交给调用方，从根上消掉「过滤器写法」这类坑。
+///
+/// 失败（句柄耗尽等）返回 `None`，调用方回退到 `tasklist`。
+#[cfg(target_os = "windows")]
+pub(crate) fn windows_process_rows_snapshot() -> Option<Vec<WindowsProcessRow>> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let mut rows = Vec::new();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        // 首项失败 = 空快照或枚举不可用，两种都按「拿不到」处理。
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|c| *c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+                if !name.is_empty() {
+                    rows.push(WindowsProcessRow {
+                        pid: entry.th32ProcessID,
+                        name,
+                        exe_path: None,
+                    });
+                }
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    Some(rows)
+}
+
+/// 精确映像名收集进程行（`image` 可带可不带 `.exe`，大小写不敏感）。
 #[cfg(target_os = "windows")]
 pub(crate) fn windows_tasklist_image_rows(image: &str) -> Vec<WindowsProcessRow> {
-    let filter = format!("IMAGENAME eq {image}");
+    let stem = image_stem(image);
+    if let Some(rows) = windows_process_rows_snapshot() {
+        return rows
+            .into_iter()
+            .filter(|r| image_stem(&r.name).eq_ignore_ascii_case(stem))
+            .collect();
+    }
+    // 快照不可用才退回 tasklist。这里必须自己补 `.exe`：`IMAGENAME` 过滤器
+    // 是精确匹配，`IMAGENAME eq node` 永远匹配不到 `node.exe`。
+    let filter = format!("IMAGENAME eq {stem}.exe");
     let Some(out) = run_cmd_timeout("tasklist", &["/FI", &filter, "/FO", "CSV", "/NH"], 5) else {
         return Vec::new();
     };
@@ -1217,13 +1282,25 @@ pub fn taskkill_pid(pid: u32, force: bool) {
     }
 }
 
-/// 取某个 PID 的可执行文件完整路径（Windows 用 PowerShell 查 `ExecutablePath`）。
+/// 取某个 PID 的可执行文件完整路径（Windows 走 `QueryFullProcessImageNameW`）。
 ///
 /// 用于 exe 发现的「正在运行的进程」回退级别：客户端可能装在非默认目录，
 /// 但只要它正在运行，就能从进程反查出真实路径。
+///
+/// 为什么不继续用 `(Get-Process -Id N).Path`：每次都要起一个 PowerShell，
+/// 本机实测 ~280 ms。原生调用是微秒级，而且这条路径在 `app_env_check`
+/// 这类「前端一刷新就连打几次」的接口上会被反复走到。
+///
+/// `PROCESS_QUERY_LIMITED_INFORMATION` 而不是 `PROCESS_QUERY_INFORMATION`：
+/// 前者在受保护/提权进程上也能拿到映像路径（Vista 起推荐），且不需要
+/// SeDebugPrivilege。拿不到（权限不足 / 进程已退出）时回退 PowerShell，
+/// 保持旧行为不变。
 pub fn windows_process_exe_path(pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
+        if let Some(path) = windows_process_exe_path_native(pid) {
+            return Some(path);
+        }
         let script = format!(
             "(Get-Process -Id {pid} -ErrorAction SilentlyContinue).Path"
         );
@@ -1243,6 +1320,41 @@ pub fn windows_process_exe_path(pid: u32) -> Option<PathBuf> {
     {
         let _ = pid;
         None
+    }
+}
+
+/// `OpenProcess` + `QueryFullProcessImageNameW` 直读映像全路径（不走子进程）。
+///
+/// 缓冲区给 32768 个 UTF-16 码元：`QueryFullProcessImageNameW` 的成功条件是
+/// 「缓冲区够放」，给足就不用处理 `ERROR_INSUFFICIENT_BUFFER` 的二次调用。
+#[cfg(target_os = "windows")]
+fn windows_process_exe_path_native(pid: u32) -> Option<PathBuf> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        // 第二参是 BOOL，windows 0.58 为 bool 实现了 Param<BOOL>，直接传 false。
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        // 这里的 PWSTR 是 windows-strings 的 newtype（`windows_core` 在
+        // `#[cfg(windows)]` 下 `pub use windows_strings::*` 重导出），构造器是
+        // 公开的元组字段 —— 不能传裸 `*mut u16`，必须 `PWSTR(ptr)` 包一层。
+        // 注意别从 `windows::core::imp` 拿：那里是另一个同名类型别名 `*mut u16`。
+        let mut buf = vec![0u16; 32768];
+        let mut len = buf.len() as u32;
+        let query = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = CloseHandle(handle);
+        query.ok()?;
+        let path = PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]));
+        // 与 PowerShell 分支保持一致：只认真实存在的文件。
+        path.is_file().then_some(path)
     }
 }
 
@@ -1344,6 +1456,51 @@ pub fn launch_workbuddy(region: Region, progress: Option<&dyn Fn(&str)>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ⑬ 提速（2026-10-04）：Toolhelp 快照替代「每个映像名一次 tasklist」。
+    //
+    // 这条测试同时守住两件事：
+    // 1. 快照真的能枚举出进程（过去 list_procs 恒空的根因是过滤器精确匹配，
+    //    现在改成内存匹配，必须证明内存里确实拿得到名字）；
+    // 2. 名字**带 `.exe`** —— 这是与 tasklist 输出对齐的前提，
+    //    switcher 侧的 image_name_matches 依赖它做归一化。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn 进程快照能枚举出带_exe_后缀的映像名() {
+        let rows = windows_process_rows_snapshot().expect("Toolhelp 快照不该失败");
+        assert!(
+            rows.len() > 5,
+            "本机至少应有若干进程，实际只有 {} 条 —— 快照大概率坏了",
+            rows.len()
+        );
+        assert!(
+            rows.iter().any(|r| r.name.to_ascii_lowercase().ends_with(".exe")),
+            "快照返回的映像名应带 .exe（与 tasklist 输出一致）"
+        );
+        // 自己一定在列表里（测试进程本身）
+        let me = std::process::id();
+        assert!(
+            rows.iter().any(|r| r.pid == me),
+            "快照应包含当前测试进程 pid={me}"
+        );
+    }
+
+    // 快照必须比「逐映像名 tasklist」快一个量级，否则这次改造白做。
+    // 阈值给得宽松（100 ms）只为拦住「退化回子进程」这类回归 ——
+    // 本机实测快照是个位数毫秒，而 tasklist 单次 265–474 ms。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn 进程快照不依赖子进程且足够快() {
+        let start = Instant::now();
+        let rows = windows_process_rows_snapshot().expect("Toolhelp 快照不该失败");
+        let elapsed = start.elapsed();
+        assert!(!rows.is_empty());
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "快照耗时 {:?}，疑似退化回子进程实现",
+            elapsed
+        );
+    }
 
     #[test]
     fn self_image_names_are_detected() {

@@ -16,7 +16,13 @@
 use serde_json::json;
 
 /// 已知任务键。
-pub const TASK_KEYS: [&str; 3] = ["trae-checkin", "doubao-keepalive", "doubao-quota"];
+pub const TASK_KEYS: [&str; 5] = [
+    "trae-checkin",
+    "trae-credits-snapshot",
+    "doubao-keepalive",
+    "doubao-renew",
+    "doubao-quota",
+];
 
 /// 执行一个 CLI 任务，返回进程退出码。
 pub fn run_cli_task(name: &str) -> i32 {
@@ -55,7 +61,20 @@ async fn dispatch(name: &str) -> Result<serde_json::Value, String> {
                 return Ok(json!({"ok": true, "skipped": true, "reason": "没有 Trae 账号"}));
             }
             let summary = crate::modules::trae_checkin::run_round(&accounts, 1).await;
-            Ok(summary.to_json())
+            let value = summary.to_json();
+            // 按日落库：没有这一步，计划任务跑出来的签到结果只存在于返回值里，
+            // 界面上的「今日签到状态」和成功率趋势永远看不到（`skip` 也记，
+            // 与 apps_ops::trae_checkin_run 同规则：跳过要让用户看见原因）。
+            crate::modules::trae_checkin_results::record_today(
+                summary
+                    .outcomes
+                    .iter()
+                    .map(|o| (o.user_id.clone(), o.name.clone(), o.status.to_string())),
+            );
+            // 统一事件流：计划任务跑出来的结果同样要能在账号卡片上查到
+            // （与 webui/桌面端共用同一个 helper，口径不分叉；skip 也记）。
+            crate::modules::apps_ops::record_checkin_task_records(&summary);
+            Ok(value)
         }
         // 豆包会话保活：启动客户端 → 等待 → 关闭，触发服务端滑动续期
         "doubao-keepalive" => {
@@ -70,14 +89,55 @@ async fn dispatch(name: &str) -> Result<serde_json::Value, String> {
                 expected_current_uid: String::new(),
                 store_dir: crate::modules::config::store_dir(),
             };
-            let outcome = switcher::run_action(args, &switcher::LogSink)?;
+            let outcome = switcher::run_action(args, &switcher::LogSink);
             let _ = crate::modules::doubao_account::set_last_keepalive(
                 &crate::modules::config::utc_iso(),
             );
+            let _ = crate::modules::doubao_health::record_keepalive(
+                outcome.is_ok(),
+                outcome.as_deref().unwrap_or("保活失败"),
+            );
             Ok(json!({"ok": true, "message": outcome}))
+        }
+        // 豆包 HTTP 续期巡检（不启动客户端，只跑凭证续期请求）
+        "doubao-renew" => {
+            let summary = crate::modules::doubao_session::run_renewal(false).await;
+            let value = summary.to_json();
+            let _ = crate::modules::doubao_health::record_renew(&value);
+            Ok(value)
         }
         // 豆包额度巡检：批量查询并回写额度缓存
         "doubao-quota" => Ok(crate::modules::doubao_quota::run_batch().await),
+        // Trae 积分日快照：为趋势图留数据，不依赖界面是否打开
+        "trae-credits-snapshot" => {
+            let accounts = crate::modules::trae_account::load_accounts();
+            if accounts.is_empty() {
+                return Ok(json!({"ok": true, "skipped": true, "reason": "没有 Trae 账号"}));
+            }
+            let mut snapshotted = 0usize;
+            let mut errors: Vec<String> = Vec::new();
+            for acc in &accounts {
+                let Some(uid) = acc.get("user_id").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                match crate::modules::trae_credits::fetch_credit_total(uid).await {
+                    Ok(Some(total)) => {
+                        // 写快照失败不该让整个任务失败：趋势图少一个点
+                        // 比整轮巡检报错更可接受
+                        let _ = crate::modules::trae_credits::daily_snapshot(uid, total, 0);
+                        snapshotted += 1;
+                    }
+                    Ok(None) => errors.push(format!("{uid}: 服务端未返回积分总数")),
+                    Err(e) => errors.push(format!("{uid}: {e}")),
+                }
+            }
+            Ok(json!({
+                "ok": true,
+                "snapshotted": snapshotted,
+                "total": accounts.len(),
+                "errors": errors,
+            }))
+        }
         other => Err(format!(
             "未知任务: {other}（可用：{}）",
             TASK_KEYS.join(" / ")

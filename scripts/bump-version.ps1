@@ -28,6 +28,19 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# **必须同时设进程级 cwd**：本脚本下面大量使用
+# `[System.IO.File]::ReadAllText("package.json")` 这类**相对路径**，
+# 而 .NET 静态 API 解析相对路径用的是 [Environment]::CurrentDirectory，
+# 不是 PowerShell 的 $PWD —— `Set-Location` 只改后者。
+#
+# 症状（2026-09-29 实测）：从仓库根以外的 cwd 调用（例如工具默认 cwd 是
+# 仓库的父目录）时，第一处 ReadAllText 就抛
+#   Could not find file 'D:\WishProject\WorkbuddySwitchAPi\package.json'
+# 而 `Set-Location $root` 明明已经执行过。
+#
+# 只在 cwd 恰好等于仓库根时才会"碰巧能用"，因此这条不能省。
+[Environment]::CurrentDirectory = $root
+
 if ($Version -notmatch '^\d+\.\d+\.\d+$') {
     throw "版本号格式应为 x.y.z，收到：$Version"
 }
@@ -91,15 +104,25 @@ foreach ($f in (Get-ChildItem 'npm/platform/*/package.json')) {
 }
 
 # ── 4. npm/package.json 的 optionalDependencies ──────────────────────────
-$npmPkgPath = 'npm/package.json'
-$npmPkg = [System.IO.File]::ReadAllText($npmPkgPath) | ConvertFrom-Json
-foreach ($k in @($npmPkg.optionalDependencies.PSObject.Properties.Name)) {
-    $npmPkg.optionalDependencies.$k = $Version
-}
-# 保持仓库既有的 2 空格缩进 + 末尾换行，并统一为 LF。
-$json = ($npmPkg | ConvertTo-Json -Depth 20) -replace "`r`n", "`n"
-[System.IO.File]::WriteAllText($npmPkgPath, $json + "`n", $utf8NoBom)
-Write-Host "  optionalDependencies  $npmPkgPath（$($npmPkg.optionalDependencies.PSObject.Properties.Name.Count) 项）"
+#
+# **刻意不走 `ConvertFrom-Json | ConvertTo-Json`**（旧实现就是那么写的，
+# 2026-09-29 实测把文件改坏了）。PowerShell 5.1 的 ConvertTo-Json 有两个
+# 破坏性行为，都是纯噪音，会把「只改 6 个版本号」变成整文件重写：
+#
+#   1) 重新缩进：2 空格 → 4 空格，且嵌套块被拉成对齐列
+#      （`"bin": {` 的下一行被推到第 17 列）。
+#   2) 转义 HTML 敏感字符：`engines.node` 从 `">=16"` 变成 `"\u003e=16"`。
+#
+# 改为锚定依赖名的定点替换：只动 `"ai-gateway-<平台>": "x.y.z"` 里的版本号，
+# 其余字节原样保留（含缩进、键序、末尾换行）。
+#
+# ★ 必须用 lookahead `(?=")` 而不是直接匹配结尾的 `"`：2026-09-29 实测，
+#   写成 `...\d+\.\d+\.\d+"` 时那个 `"` 会被**吃掉**，而替换串只补回 `${1}$Version`
+#   ⇒ 每个可选依赖的版本号都丢掉收尾引号，npm/package.json 直接变成非法 JSON
+#   （vercheck.py 报 `Invalid control character at: line 13 column 40`）。
+#   lookahead 不消耗字符，收尾引号原样保留。
+$optDepPattern = '("ai-gateway-(?:darwin|linux|win32)-[a-z0-9_]+": ")\d+\.\d+\.\d+(?=")'
+[void](Set-FileVersion -Path 'npm/package.json' -Pattern $optDepPattern -Replacement "`${1}$Version" -Label '可选依赖')
 
 # ── 5. Cargo.lock（锚定包名，含根包） ─────────────────────────────────────
 [void](Set-LockedCrateVersion -Path 'Cargo.lock' -CrateNames @(

@@ -1,6 +1,6 @@
 {
   "name": "ai-gateway-win32-x64",
-  "version": "1.0.10",
+  "version": "1.0.23",
   "description": "ai-gateway platform binary (win32-x64)",
   "os": [
     "win32"

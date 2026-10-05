@@ -367,7 +367,7 @@ func (s *responsesStreamState) completedEvent() map[string]any {
 
 func (s *responsesStreamState) failedEvent(msg string) map[string]any {
 	resp := s.snapshot("failed", []any{})
-	resp["error"] = map[string]any{"code": "upstream_error", "message": msg}
+	resp["error"] = map[string]any{"code": "upstream_error", "message": clientSafeMessage(msg)}
 	return map[string]any{
 		"type":            "response.failed",
 		"sequence_number": s.seq(),

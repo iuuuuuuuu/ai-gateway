@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -60,6 +61,49 @@ const (
 	freeModel = "fast-model"
 )
 
+// 国服「成长任务集」的三个任务码（Sequential_Tasks_1/_2/_3）。
+//
+// ★ 实测纠正（2026-09-30，真实国服账号）：它们**不是**单纯的「顺序解锁」，
+// 而是两道不同的门槛叠加：
+//
+//	_1 完成前 → _2/_3 在两种列表口径里都不下发（连影子都没有）
+//	_1 完成后 → _2 立刻出现，但带 locked=true + unlock_at=2026-10-01T00:00:00+08:00，
+//	            progress 仍是 null —— 日期锁：**露面 ≠ 能动手**
+//
+// 即「完成前一个」只负责让下一个**露面**，能不能执行另由 unlock_at 决定。
+// 把两者混为一谈会写出「列表里有了就去做」的代码，而那种代码在锁定任务上
+// 会发出注定被静默丢弃的事件（见 runner.go runAction 的锁定守卫）。
+//
+// 已验证范围：_1 全程跑通（报名 → 上报 → 领奖 +100 积分 +5 能量）；
+// _2 已验证「能出现在列表里」且「事件发得出去」，但**未验证能计分**
+//（锁着时事件被丢弃）；_3 至今未在两种口径下出现过。
+const (
+	sequentialChatCode   = "Sequential_Tasks_1"
+	sequentialExpertCode = "Sequential_Tasks_2"
+	sequentialChat5Code  = "Sequential_Tasks_3"
+)
+
+// mpOnlyCodes 必须走**小程序口径**（X-Client-Platform: miniprogram）的任务码。
+//
+// 口径差别是实测出来的，不是猜的（2026-09-30，同一账号同一天）：
+//
+//	默认口径 accept Sequential_Tasks_1 → HTTP 200 + code=0，
+//	                                     但逐条结果 {"status":"error","message":"task not found"}
+//	加 mp 头 accept  Sequential_Tasks_1 → {"status":"accepted"}
+//
+// 也就是说「HTTP 200 + code=0」并不代表报名成功 —— 200 的壳里可以装着
+// 「任务不存在」。这个集合同时决定报名与领奖走哪个口径（见 runner.go 的
+// acceptOne / claim）。
+//
+// school_season 与它们同属「小程序限定任务」，参考实现也把它放在同一组；
+// 但校园日活动已结束（上游不再下发），无法实测它是否同样强制 mp 头，
+// 故这里**只收已验证的三个码**，不动 school_season 的既有报名路径。
+var mpOnlyCodes = map[string]bool{
+	sequentialChatCode:   true,
+	sequentialExpertCode: true,
+	sequentialChat5Code:  true,
+}
+
 // actions 动作表（顺序即执行顺序，见包注释的分类说明）。
 var actions = []action{
 	// ---- A 类：纯行为事件上报（零对话消耗） ----
@@ -84,6 +128,16 @@ var actions = []action{
 	// 必须发小程序指纹（mini_program / workbuddy-mp）+ activityId 才计分。
 	// 挂在 C 类之前是因为它零对话消耗（纯事件上报）。
 	{Code: "school_season", Desc: "上报校园日活动对话事件（小程序指纹 + activityId）", run: runSchoolSeason},
+
+	// 国服「成长任务集」：与 school_season 同为小程序指纹的纯事件上报
+	//（零对话消耗），差别是**不带 activityId** 且报名要走 mp 口径 —— 见 runMPMiniChat
+	// 的注释。三条是「露面靠前一个完成、能动手靠 unlock_at」的双重门槛，
+	// 见 sequentialChatCode 的说明；锁定项由 runAction 的守卫挡下。
+	{Code: sequentialChatCode, Desc: "上报小程序对话事件（成长任务集，无 activityId）", run: runSequentialChat},
+	{Code: sequentialExpertCode, Desc: "上报小程序专家使用事件（expert_actual_use）", run: runMiniExpert},
+	// _3 的判据与 _1 同形状、只是 target=5，但**有反作弊节奏要求**（见 runMPMiniChat
+	// 的 mpChatGap 说明）：秒级连发会被整体回滚，必须按真人节奏逐条上报。
+	{Code: sequentialChat5Code, Desc: "按真人节奏补报 5 次小程序对话（反作弊：需间隔）", run: runSequentialChat5},
 
 	// ---- B 类：真实对话（消耗 token） ----
 
@@ -242,6 +296,189 @@ func runSchoolSeason(r *Runner, ctx context.Context, a *auth.Auth, before *upstr
 		return fmt.Sprintf("已上报 %d 条（等待归账时被取消）", sent), nil
 	}
 	return fmt.Sprintf("已上报 %d 条校园日活动事件", sent), nil
+}
+
+// ---------------------------------------------------------------------------
+// 国服「成长任务集」：Sequential_Tasks_1 / _2 / _3
+// ---------------------------------------------------------------------------
+
+// mpChatJitter 在 mpChatGap 之上叠加的抖动上限。
+//
+// 为什么需要抖动：固定周期的上报本身就是一种机器指纹 —— 「每 45.000 秒一条、
+// 连续 5 条」比「间隔 45~55 秒」更像脚本。参考实现用的是固定 0~10 秒随机；
+// 这里改成**跟随 gap 缩放**（gap/5，45s → 9s，同量级），好处是测试把 gap
+// 压到毫秒级时抖动自动一起消失，不需要额外开一个「关掉抖动」的开关
+//（那种开关本身就会被误用成「测试里把反作弊节奏也关掉」）。
+func mpChatJitter(gap time.Duration) time.Duration {
+	span := gap / 5
+	if span <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(span)))
+}
+
+// runMPChatTask 是 Sequential_Tasks_1/_3 的公共实现：按差额补报小程序对话事件。
+//
+// # 与 school_season 的唯一差别：**不带 activityId**
+//
+// 两个任务的判据事件 eventCode 相同（chat_request_send）、指纹相同
+//（mini_program / wx_app_cloud / WorkBuddy_MP / workbuddy-mp），服务端
+// 靠**有没有 activityId** 区分它们：school_season 必带
+// activityId=school_open_day_2026，成长任务集必须不带（见 report.go 里
+// miniChatRequestEvent.ActivityID 的 omitempty 说明）。搞反的表现是
+// HTTP 200 + 进度恒为 0 —— 最难排查的一类失败。
+//
+// # 反作弊：为什么每条上报前都要先睡
+//
+// 上游对「有效对话」有节奏校验（参考实现 2026-09-26 实测，与本次移植前的
+// 真实账号观察一致）：数秒级连发的事件会**先被计入进度**（回读 5/5、
+// accept_status 甚至短暂变 completed），随后被判定无效**整体回滚** ——
+// 进度回落、claim 返回 400 task not completed。2 秒连发 4 条全灭；
+// 45 秒间隔逐条上报全存活且能领到奖励。
+//
+// 所以这里**每条上报前都睡**（首条也睡）。首条也等看着多余（单条上报不存在
+// 「连发」），但实测存在另一种失败：上一轮被回滚后立即重报同样无效 ——
+// 宁可多等 45 秒，也不要发出一条注定被静默丢弃的事件（后者要赔上整个重试周期）。
+//
+// # 为什么要重新读一次任务
+//
+// accept 之后上游才下发真实 progress。RunAll 的批量报名路径里，动作拿到的
+// before 是**报名前**的快照（target=0、progress=null），照它算差额会少报：
+// 参考实现实测 Sequential_Tasks_6 报名后真实 target=10，只补 1 条就被误判
+// 达标去领奖 → claim 400。故这里先 refetch 一次，拿不到才回落用 before。
+func runMPChatTask(r *Runner, ctx context.Context, a *auth.Auth, before *upstream.GrowthTask, code string, withActivityID bool) (string, error) {
+	if before == nil {
+		return "", errors.New("任务不存在")
+	}
+	t := before
+	if fresh := r.refetch(a, code); fresh != nil {
+		t = fresh
+	}
+	if t.Claimed() {
+		return "该任务奖励已领取", nil
+	}
+	target := t.Target
+	if target <= 0 {
+		// 未报名时上游不下发 progress，target 兜底 1（报名后会被上面的
+		// refetch 纠正成真实值）。
+		target = 1
+	}
+	if t.Current >= target {
+		return "进度已达标，无需上报", nil
+	}
+
+	need := target - t.Current
+	sent := int64(0)
+	for i := int64(0); i < need; i++ {
+		if err := sleepCtx(ctx, r.mpChatGap+mpChatJitter(r.mpChatGap)); err != nil {
+			if sent == 0 {
+				return "本轮在首次上报前被取消", nil
+			}
+			return fmt.Sprintf("已上报 %d/%d 条（本轮被取消）", sent, need), nil
+		}
+		cid := fmt.Sprintf("wb2api-mp-%d-%d", time.Now().UnixMilli(), i)
+		var err error
+		if withActivityID {
+			err = r.up.ReportSchoolSeasonActivity(a, cid)
+		} else {
+			err = r.up.ReportMPChatActivity(a, cid)
+		}
+		if err != nil {
+			// 部分成功如实汇报：已发的那些条可能已经计分，
+			// 返回 error 会让调用方跳过回读，连已达标的进度都发现不了。
+			return fmt.Sprintf("已上报 %d/%d 条后中断: %v", sent, need, err), nil
+		}
+		sent++
+	}
+	return fmt.Sprintf("已上报 %d 条小程序对话事件", sent), nil
+}
+
+// runSequentialChat 完成 Sequential_Tasks_1「在小程序内完成一次有效对话」。
+//
+// 判据 = 一条**不带 activityId** 的小程序 chat_request_send（target=1）。
+// 参考实现实测该任务值 100 积分 + 5 能量。
+func runSequentialChat(r *Runner, ctx context.Context, a *auth.Auth, before *upstream.GrowthTask) (string, error) {
+	return runMPChatTask(r, ctx, a, before, sequentialChatCode, false)
+}
+
+// runSequentialChat5 完成 Sequential_Tasks_3「完成 5 次有效对话」。
+//
+// 判据与 _1 同形状、只是 target=5，服务端按上报条数累加 —— 但**有节奏要求**，
+// 见 runMPChatTask 的反作弊说明。45 秒间隔补满 5/5 后领奖 +300 积分 +5 能量，
+// 领后 accept_status=claimed 稳定不回滚。
+//
+// 代价：5 条 × (45s + 0~9s 抖动) ≈ 4~5 分钟，是全部动作里最慢的一项。
+// 仍在宿主 growTaskTimeout（10 分钟）预算内，但同账号把它和 _1 排在一起时
+// 剩余预算要留够。
+//
+// ⚠ 截至 2026-09-30，本任务**未在真实实例上验证过**：_3 连露面都没露面
+//（_1 完成后复读列表，只多出 _2，_3 仍不在）。所以它的实现是按参考实现的
+// 形状移植的，未经验证 —— 若上游对它的判据与 _1 有出入，这里的 45 秒节奏
+// 与事件形状都可能是错的。首次真实执行时请留意进度是否真的推进。
+func runSequentialChat5(r *Runner, ctx context.Context, a *auth.Auth, before *upstream.GrowthTask) (string, error) {
+	return runMPChatTask(r, ctx, a, before, sequentialChat5Code, false)
+}
+
+// runMiniExpert 完成 Sequential_Tasks_2「在小程序内选中专家并完成有效对话」。
+//
+// 判据 = mp 指纹 expert_actual_use（**不带** activityId/conversationId、
+// extVersion=2.2.8、type=send_message）—— 与 school 域的专家事件是两套口径，
+// 别混用；见 report.go 的 mpExpertUseEvent。参考实现实测上报即 completed，
+// 领奖 +200 积分 +5 能量。
+//
+// # 为什么先解析专家市场
+//
+// 判据事件的专家 id 必须是市场里**真实存在的 ex_ id**：空 id 或编造的 id
+// 服务端照样返回 200，但不计分。所以拉不到市场列表就整个任务不动作 ——
+// 宁可不做，也不要发一条注定不计分的事件（用户会以为已经完成）。
+//
+// ⚠ 与参考实现的一处**顺序差异**：它把市场检查放在 accept **之前**，
+// 而本项目里 accept 由 Runner 统一负责（RunOne / acceptPending 在任何
+// 动作之前完成），动作函数拿到的已经是报名后的状态。差异的后果仅是
+// 可能多报名一次 —— 报名是幂等的（重复返回 already_accepted），
+// 任务停在「已报名未上报」也不影响下一轮重试，故不为此改动 Runner 的
+// 统一报名时序。
+//
+// ⚠ 截至 2026-09-30，本任务**只验证到「能出现、能发出事件」**，未验证能计分：
+// _1 完成后 _2 确实出现在列表里（默认口径 total 20 → 21），但带
+// locked=true + unlock_at=2026-10-01T00:00:00+08:00，此时上报事件被服务端
+// **静默丢弃**（HTTP 200 但进度 before/after 都是 not_accepted）。
+// 实现按参考实现的形状移植；锁定态由 runAction 的守卫挡下，解锁后才可能计分。
+func runMiniExpert(r *Runner, ctx context.Context, a *auth.Auth, before *upstream.GrowthTask) (string, error) {
+	if before == nil {
+		return "", errors.New("任务不存在")
+	}
+	t := before
+	if fresh := r.refetch(a, sequentialExpertCode); fresh != nil {
+		t = fresh
+	}
+	if t.Claimed() {
+		return "该任务奖励已领取", nil
+	}
+	target := t.Target
+	if target <= 0 {
+		target = 1
+	}
+	if t.Current >= target {
+		return "进度已达标，无需上报", nil
+	}
+
+	experts, err := r.up.MarketExpertList(a, "")
+	if err != nil {
+		return fmt.Sprintf("专家市场不可用（%v），跳过以防半程态", err), nil
+	}
+	if len(experts) == 0 {
+		return "专家市场未返回可用专家，跳过以防半程态", nil
+	}
+	e := experts[0]
+	name := e.DisplayNameZH
+	if name == "" {
+		name = e.ProfessionZH
+	}
+	if err := r.up.ReportMPExpertUse(a, e.ExpertID, name, e.ExpertType); err != nil {
+		return fmt.Sprintf("上报 expert_actual_use 失败: %v", err), nil
+	}
+	return fmt.Sprintf("已上报小程序专家使用事件（%s）", name), nil
 }
 
 // runFirstBuddy 领养第一只 Buddy：上报（解锁前置）→ 同意协议 → 领养。

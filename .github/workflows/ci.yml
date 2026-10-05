@@ -7,6 +7,10 @@ name: ci
 # 让问题在 push 阶段暴露，而不是等到发版当天。
 # 三平台都跑是重点：历史上出现过多次「只在某一个平台编译失败」的回归
 # （例如 macOS 专用的 Dock 图标代码打断 Windows 构建）。
+#
+# ⚠ 2026-10-01：网关已从 Go 全量重写为 Rust（crates/ai-gateway-router），
+# 故 `gateway` 这一路不再需要 setup-go，改为对**Rust 网关**跑单测与构建。
+# Go 源码 go-gateway/ 仍保留作对照参考，但已不参与构建。
 
 on:
   push:
@@ -81,28 +85,44 @@ jobs:
         run: cargo check --workspace --all-targets --target x86_64-apple-darwin
 
   gateway:
-    name: gateway / Go 单测与构建
+    name: gateway / Rust 单测与构建
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      # cache-dependency-path 不可省：setup-go 默认找**仓库根**的 go.sum，
-      # 而本仓库的 go.mod/go.sum 在 go-gateway/ 下 —— 不指路的话缓存永远不生效
-      # （默认的 hashFiles('**/go.sum') 也会因为找不到而落到空缓存分支）。
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-          cache-dependency-path: go-gateway/go.sum
+      - uses: dtolnay/rust-toolchain@stable
 
-      # 网关源码随仓库分发（Go 版本），这里验证单测与三平台交叉构建链路。
-      - name: Go 单测
-        working-directory: go-gateway
-        run: go test ./...
+      - uses: Swatinem/rust-cache@v2
 
-      - name: 构建网关（linux）
-        env:
-          GOOS: linux
-          GOARCH: amd64
+      # 网关源码随仓库分发（Rust 版，crates/ai-gateway-router），
+      # 这里验证单测与构建链路。
+      #
+      # ⚠ 不再需要 actions/setup-go：2026-10-01 起网关是 Rust 的。
+      # 旧版这里还带 `cache-dependency-path: go-gateway/go.sum`，那是为了
+      # 让 setup-go 的缓存生效（它默认找**仓库根**的 go.sum，而本仓库的
+      # go.mod/go.sum 在 go-gateway/ 下）。整条 setup-go 一起去掉。
+      - name: 网关单测
+        run: cargo test -p ai-gateway-router --lib
+
+      # ★ 宿主 WebUI 服务端（npm 分发的那个 `ai-gateway` 命令）的单测。
+      #
+      # 为什么必须单独加这一条：它此前**从未在 CI 里跑过** —— 而这里住着一条
+      # 「前端 ROUTES ↔ 服务端路由」的一致性测试
+      # （`api.rs::every_frontend_route_path_has_a_server_handler`），
+      # 它正是用来抓「前端登记了路由、服务端没实现」这个**反复出现**的缺陷类
+      # （webui 下点了 404，而桌面端走 Tauri IPC 看不出来 ⇒ 桌面端测试全覆盖不到）。
+      # 2026-10-01 我据此查出并修好 4 条真实缺口：`/api/proxy/test-upstream`、
+      # `/api/proxy/probe-nodes`、`/api/gateway/sms/send`、`/api/gateway/sms/verify`。
+      #
+      # ⚠ 不加这条的话，那个测试**永远不会被执行** —— 写了等于没写。
+      - name: 宿主 WebUI 服务端单测
+        run: cargo test -p ai-gateway-server
+
+      # 走真正的构建入口，而不是 `cargo build -p … --bin gateway`：
+      # 这样 CI 验证的是**打包时实际执行的那条路径**（含产物后缀判定、
+      # CARGO_TARGET_DIR 归一、1 MB 阈值校验），而不是一条平行的近似命令。
+      # 历史上「脚本能跑但 CI 用的是另一条命令」正是回归能溜过去的原因。
+      - name: 构建网关
         run: sh scripts/build-gateway.sh
 
   # 这一路补上 build.yml 被摘掉 tag 触发后失去的覆盖：
@@ -125,11 +145,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-          cache-dependency-path: go-gateway/go.sum
 
       # build.rs 会把网关二进制 gzip 后编进主程序，缺了它这一步会报
       # 「本构建未内嵌网关二进制」—— 所以必须先产出网关。

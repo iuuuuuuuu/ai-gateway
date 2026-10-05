@@ -73,10 +73,10 @@ use tokio::sync::Mutex;
 ///
 /// 第一版是**每请求 spawn 一次 node**。后果：
 ///
-///	① **一直弹 cmd 黑窗** —— 每发一次国际版请求就起一个控制台进程。
-///	   `CREATE_NO_WINDOW` 能压住窗口，但"每请求起进程"本身就是错设计。
-///	② 每次都要重新加载 turing-sdk、重新 `configure`（实测冷启动 122ms
-///	   vs 复用后 39~51ms）。
+///  ① **一直弹 cmd 黑窗** —— 每发一次国际版请求就起一个控制台进程。
+///     `CREATE_NO_WINDOW` 能压住窗口，但"每请求起进程"本身就是错设计。
+///  ② 每次都要重新加载 turing-sdk、重新 `configure`（实测冷启动 122ms
+///     vs 复用后 39~51ms）。
 ///
 /// 常驻后：起一次，之后每次请求只是往 stdin 写一行 JSON。
 struct NodeWorker {
@@ -225,9 +225,9 @@ impl DeviceTokenState {
     ///
     /// # 生命周期策略
     ///
-    ///	· worker 未启动 → 启动（懒启动：没用过这个功能就不起进程）
-    ///	· worker 已退出 → 重启一次再重试（覆盖"node 崩了/被杀了"）
-    ///	· 重启后仍失败 → 如实报错，网关据此**降级**（不发该头）
+    ///  · worker 未启动 → 启动（懒启动：没用过这个功能就不起进程）
+    ///  · worker 已退出 → 重启一次再重试（覆盖"node 崩了/被杀了"）
+    ///  · 重启后仍失败 → 如实报错，网关据此**降级**（不发该头）
     ///
     /// 整个流程持 `worker` 锁 ⇒ 天然串行。
     /// 这既符合 turing-sdk 的进程级单例语义，也让"重启"不会与在途请求打架。
@@ -284,13 +284,13 @@ struct FetchReq {
 ///
 /// 他说得对：**不能期盼用户机器上有 node**。但本功能有个特殊之处 ——
 ///
-///	**turing-sdk 本身就在官方客户端目录里**
-///	（`...\WorkBuddyAI\resources\app.asar.unpacked\native\turing-sdk`）
+///  **turing-sdk 本身就在官方客户端目录里**
+///  （`...\WorkBuddyAI\resources\app.asar.unpacked\native\turing-sdk`）
 ///
 /// 即"必须装了官方客户端"是这个功能的**硬前提**（没客户端就没有 SDK，
 /// 也就根本无从生成 token）。而官方客户端**自带 node**：
 ///
-///	%USERPROFILE%\.workbuddy-ai\binaries\node\versions\<ver>\node.exe
+///  %USERPROFILE%\.workbuddy-ai\binaries\node\versions\<ver>\node.exe
 ///
 /// ⇒ 两个依赖**同源**：有 SDK 的地方就有 node。
 /// 真正的缺口只有"客户端在、但 node 目录被清理或残缺"这一种。
@@ -300,9 +300,9 @@ struct FetchReq {
 /// 实测客户端那份 node.exe **83 MB** —— 内嵌会让安装包从 12MB 涨到
 /// 90MB+。这正是 ZCode 验证码那条路被所有者否决的原因，原话：
 ///
-///	「不是每个用户电脑上都有node，你那个求解器，不能期盼所有用户都能
-///	  满足运行环境，你需要修复这个问题」
-///	（当时为此外置 node 会让包从 12MB 涨到约 105MB）
+///  「不是每个用户电脑上都有node，你那个求解器，不能期盼所有用户都能
+///    满足运行环境，你需要修复这个问题」
+///  （当时为此外置 node 会让包从 12MB 涨到约 105MB）
 ///
 /// ZCode 的解法是用**宿主自带的 WebView2**（零体积）替代 node。
 /// 但 turing-sdk 是 **N-API 原生模块**，WebView2 加载不了 ——
@@ -384,8 +384,8 @@ fn resolve_node() -> Option<PathBuf> {
 ///
 /// 两者协议不同，**不可混用**：
 ///
-///	`wb-device-token.cjs`         一次性：`node <script> <sdkDir> <count>` → 一行 JSON
-///	`wb-device-token-worker.cjs`  常驻：stdin 收 `{"count":N}`、stdout 回一行 JSON
+///  `wb-device-token.cjs`         一次性：`node <script> <sdkDir> <count>` → 一行 JSON
+///  `wb-device-token-worker.cjs`  常驻：stdin 收 `{"count":N}`、stdout 回一行 JSON
 ///
 /// 本模块只用 worker 版（起一次、复用）—— 一次性版保留给"手工排查"
 /// 场景（命令行直接跑一次看结果），不参与运行期。
@@ -397,7 +397,7 @@ fn resolve_node() -> Option<PathBuf> {
 ///
 /// `tauri.conf.json` 里写 `"../assets/wb-device-token"`，安装后落在
 ///
-///	$INSTDIR\assets\wb-device-token
+///  $INSTDIR\assets\wb-device-token
 ///
 /// **不是** `$INSTDIR\wb-device-token`，也不是 `$INSTDIR\resources\...` ——
 /// 这一点在 `zcode-captcha` 上已经踩过一次（当时按后者找，直到解包看到

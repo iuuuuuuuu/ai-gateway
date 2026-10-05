@@ -150,7 +150,14 @@ type miniChatRequestEvent struct {
 	ConversationID      string `json:"conversationId"`
 	RequestID           string `json:"requestId"`
 	InputLength         int    `json:"inputLength"`
-	ActivityID          string `json:"activityId"`
+	// ActivityID 活动归属。**空值时整个字段不出现在报文里**（omitempty）。
+	//
+	// 这条不是风格问题，是语义问题：上游按「有没有 activityId」区分两件事 ——
+	// 带了才算「开学季/校园日活动」的对话（school_season），
+	// 不带才算「成长任务集」里的对话（Sequential_Tasks_1/_3）。
+	// 若这里不加 omitempty，给 Sequential_Tasks_1 发的事件会带上
+	// `"activityId":""` —— 那与「没有该字段」在服务端是两种输入。
+	ActivityID          string `json:"activityId,omitempty"`
 	MentionContexts     []any  `json:"mentionContexts"`
 	MentionContextCount int    `json:"mentionContextCount"`
 	UserID              string `json:"userId"`
@@ -194,6 +201,113 @@ func (c *Client) ReportSchoolSeasonActivity(a *auth.Auth, conversationID string)
 		UserID:              a.UID,
 	}
 	raw, err := json.Marshal([]miniChatRequestEvent{ev})
+	if err != nil {
+		return err
+	}
+	_, err = c.billingJSON(a, http.MethodPost, reportPath, json.RawMessage(raw))
+	return err
+}
+
+// ReportMPChatActivity 发一条小程序指纹的对话事件，**不带 activityId**。
+//
+// 这是 Sequential_Tasks_1 / _3（成长任务集里的小程序对话任务）的判据。
+//
+// ★ 与 ReportSchoolSeasonActivity 的唯一差别就是 activityId 的有无 ——
+// 而服务端正是靠它区分两个任务集（2026-09-27 实测确认）：
+//
+//	带 activityId=school_open_day_2026 → 计入「校园日」活动（school_season）
+//	不带 activityId                   → 计入「成长任务集」（Sequential_Tasks_1/_3）
+//
+// 因此**绝不能**复用 ReportSchoolSeasonActivity 去点 Sequential_Tasks_1：
+// 那会给事件带上活动归属，服务端不会把它算作成长任务集的对话 ——
+// 表现为 HTTP 200 但 growth 域进度恒为 0，是最难排查的一类失败。
+//
+// 反过来也一样：school_season 缺了 activityId 就不计分。两者同形状、不同归属。
+func (c *Client) ReportMPChatActivity(a *auth.Auth, conversationID string) error {
+	if conversationID == "" {
+		conversationID = fmt.Sprintf("wb-run-%d", time.Now().UnixMilli())
+	}
+	now := time.Now().UnixMilli()
+	ev := miniChatRequestEvent{
+		EventCode:           "chat_request_send",
+		Timestamp:           now,
+		ReportDelay:         0,
+		Source:              "mini_program",
+		IDEName:             "wx_app_cloud",
+		IDEType:             "WorkBuddy_MP",
+		ExtName:             "workbuddy-mp",
+		ExtVersion:          "SaaS",
+		Mode:                "chat",
+		ConversationID:      conversationID,
+		RequestID:           conversationID,
+		InputLength:         12,
+		ActivityID:          "", // 刻意留空 → omitempty 让该字段整体消失（见字段注释）
+		MentionContexts:     []any{},
+		MentionContextCount: 0,
+		UserID:              a.UID,
+	}
+	raw, err := json.Marshal([]miniChatRequestEvent{ev})
+	if err != nil {
+		return err
+	}
+	_, err = c.billingJSON(a, http.MethodPost, reportPath, json.RawMessage(raw))
+	return err
+}
+
+// mpExpertUseEvent 小程序「专家实际使用」事件（判据 expert_actual_use）。
+//
+// 与 school 域的专家事件是**两套口径**，勿混：这里没有 conversationId，
+// 也没有 activityId —— 判据是「哪个专家被真实用过」，不是「哪次对话」。
+type mpExpertUseEvent struct {
+	EventCode      string `json:"eventCode"`
+	Timestamp      int64  `json:"timestamp"`
+	ReportDelay    int    `json:"reportDelay"`
+	Source         string `json:"source"`
+	IDEName        string `json:"ideName"`
+	IDEType        string `json:"ideType"`
+	ExtName        string `json:"extName"`
+	ExtVersion     string `json:"extVersion"`
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	ExpertTitle    string `json:"expertTitle"`
+	Type           string `json:"type"`
+	CharacterCount int    `json:"characterCount"`
+	ExpertType     string `json:"expertType"`
+	UserID         string `json:"userId"`
+}
+
+// ReportMPExpertUse 上报「专家被真实使用」，点亮 Sequential_Tasks_2。
+//
+// expertID 必须是**专家市场里真实存在**的 ex_ id（由 MarketExpertList 取得）：
+// 自造 id 的上报会 HTTP 200 但不计分 —— 服务端校验该 id 在平台上存在。
+//
+// extVersion 刻意用 2.2.8 而不是对话事件的 SaaS：这两个事件来自小程序内
+// **不同的 SDK 版本**，照抄官方形状而不是统一成一个值（统一反而会成为指纹异常）。
+func (c *Client) ReportMPExpertUse(a *auth.Auth, expertID, expertName, expertType string) error {
+	if expertName == "" {
+		expertName = expertID
+	}
+	if expertType == "" {
+		expertType = "agent"
+	}
+	ev := mpExpertUseEvent{
+		EventCode:      "expert_actual_use",
+		Timestamp:      time.Now().UnixMilli(),
+		ReportDelay:    0,
+		Source:         "mini_program",
+		IDEName:        "wx_app_cloud",
+		IDEType:        "WorkBuddy_MP",
+		ExtName:        "workbuddy-mp",
+		ExtVersion:     "2.2.8",
+		ID:             expertID,
+		Name:           expertID,
+		ExpertTitle:    expertName,
+		Type:           "send_message",
+		CharacterCount: 12,
+		ExpertType:     expertType,
+		UserID:         a.UID,
+	}
+	raw, err := json.Marshal([]mpExpertUseEvent{ev})
 	if err != nil {
 		return err
 	}

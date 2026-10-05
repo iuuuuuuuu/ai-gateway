@@ -22,6 +22,19 @@ async function fetchCreditExpiry(id: string): Promise<CreditExpiry> {
     return { ok: false, error: api.asError(e) };
   }
 }
+/**
+ * 批量取积分；`null` = 本端没有批量通道（桌面端 / 演示模式）或请求失败。
+ *
+ * 失败也返回 `null` 而不是抛：调用方退回逐个路径即可，不该因为一次批量
+ * 请求失败就让整个积分面板空白。
+ */
+async function fetchCreditExpiryMap(): Promise<Record<string, CreditExpiry> | null> {
+  try {
+    return await api.getCreditExpiryMap();
+  } catch {
+    return null;
+  }
+}
 
 interface AccountsState {
   accounts: AccountMeta[];
@@ -139,6 +152,50 @@ async function loadCredits(accountIds: string[], force: boolean, silent: boolean
         refreshingCredits: force ? true : s.refreshingCredits,
       };
     });
+  }
+
+  // ★ 批量优先（2026-10-03，问题 ⑩-2 的最后一个热路径）。
+  //
+  // webui 下服务端有 `GET /api/credits/batch`：一次 HTTP 把全部账号查完
+  // （服务端 4 并发）。上面这套逐个调用是「N 次 HTTP × 每次上游 3~4 次
+  // 往返」，27 个账号实测累计 11~22 秒，全压在启动那一刻。
+  //
+  // ⚠ 只在账号数够多时走批量：`AccountsPage.tsx:806/845` 会在切换/接管成功后
+  // 单独刷新**一个**账号（`refreshCredits([a.id])`），为它去查全部 27 个是
+  // 纯浪费。`BATCH_MIN_ACCOUNTS` 就是这条分界。
+  //
+  // 桌面端没有批量命令 ⇒ `fetchCreditExpiryMap()` 返回 `null` ⇒ 自动退回
+  // 下面的逐个路径（桌面端是本地 IPC，本来就没有这个问题）。
+  const BATCH_MIN_ACCOUNTS = 4;
+  if (toFetch.length >= BATCH_MIN_ACCOUNTS) {
+    const batched = await fetchCreditExpiryMap();
+    if (batched) {
+      for (const id of toFetch) creditInflight.delete(id);
+      const now = Date.now();
+      useAccountsStore.setState((s) => {
+        const creditMap = { ...s.creditMap };
+        const creditUpdatedAtMap = { ...s.creditUpdatedAtMap };
+        const creditLoadingMap = { ...s.creditLoadingMap };
+        for (const id of toFetch) {
+          const result = batched[id];
+          // 服务端没给这个账号（查询失败）⇒ 保留上一次的结果，
+          // 不把它写成 `undefined`（那会让卡片显示成「没有积分」）。
+          if (result) {
+            creditMap[id] = result;
+            creditUpdatedAtMap[id] = now;
+          }
+          if (!silent) creditLoadingMap[id] = false;
+        }
+        return {
+          creditMap,
+          creditUpdatedAtMap,
+          creditLoadingMap,
+          lastCreditRefreshAt: now,
+          refreshingCredits: silent ? s.refreshingCredits : force ? false : s.refreshingCredits,
+        };
+      });
+      return;
+    }
   }
 
   // ⚠ 限流到 4 并发（2026-09-22 所有者的"打开后无响应"）。

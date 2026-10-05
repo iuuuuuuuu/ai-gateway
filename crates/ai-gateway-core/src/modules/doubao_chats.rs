@@ -114,19 +114,30 @@ pub fn backup_chatdata(uid: &str) -> Result<Value, String> {
     close_doubao()?;
 
     let root = chat_backup_root(uid);
-    // 整体覆盖：先删干净，避免上一次备份的残留文件混进新备份
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).map_err(|e| format!("创建备份目录失败: {e}"))?;
+    // 先拷到兄弟临时目录，全部成功后再换掉旧备份。
+    //
+    // 为什么不直接 remove_dir_all(root) 再拷：拷贝阶段是会失败的
+    //（豆包未完全退出仍占着 leveldb 文件锁、权限不足、磁盘满），一旦中途失败，
+    // 旧备份已被删、新备份只有半份甚至为空，函数却仍返回 ok —— 用户丢失上一份
+    // 可用备份，此后「恢复」只能恢复到残缺数据。先写临时目录则失败无副作用。
+    let staging = root.with_extension("new");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| format!("创建备份目录失败: {e}"))?;
 
     let mut files = 0usize;
     for (rel, src) in &sources {
-        let dest = root.join(rel.replace('/', "\\"));
+        let dest = staging.join(rel.replace('/', "\\"));
         if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建备份子目录 {rel} 失败: {e}"))?;
         }
-        if copy_dir_counted(src, &dest).is_ok() {
-            files += count_files(&dest);
-        }
+        // 拷贝失败必须上抛：静默跳过会让备份集残缺而调用方以为成功。
+        files += copy_dir_counted(src, &dest)
+            .map_err(|e| format!("备份 {rel} 失败: {e}"))?;
+    }
+    if files == 0 {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err("备份失败：没有拷贝到任何文件（豆包可能仍在运行并占用数据目录）".to_string());
     }
 
     let meta = json!({
@@ -135,10 +146,28 @@ pub fn backup_chatdata(uid: &str) -> Result<Value, String> {
         "files": files,
         "backedAt": config::utc_iso(),
     });
-    let _ = std::fs::write(
-        root.join("chat_backup_meta.json"),
+    std::fs::write(
+        staging.join("chat_backup_meta.json"),
         serde_json::to_string_pretty(&meta).unwrap_or_default(),
-    );
+    )
+    .map_err(|e| format!("写入备份元数据失败: {e}"))?;
+
+    // 换盘：旧备份先挪到 .old（rename 是原子的，失败也不会留下半份），
+    // 新备份到位后再清理 .old。任何一步失败都能把 .old 挪回来。
+    let old = root.with_extension("old");
+    let _ = std::fs::remove_dir_all(&old);
+    let had_old = root.exists();
+    if had_old {
+        std::fs::rename(&root, &old).map_err(|e| format!("挪走旧备份失败: {e}"))?;
+    }
+    if let Err(e) = std::fs::rename(&staging, &root) {
+        if had_old {
+            let _ = std::fs::rename(&old, &root); // 尽量还原，避免既无新备份也无旧备份
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!("启用新备份失败: {e}"));
+    }
+    let _ = std::fs::remove_dir_all(&old);
 
     Ok(json!({
         "ok": true,

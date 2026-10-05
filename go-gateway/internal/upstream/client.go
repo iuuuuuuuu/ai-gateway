@@ -563,6 +563,33 @@ func FriendlyMessage(kind ErrKind, status int, body string) string {
 		return "账号被上游限流（HTTP 429），已短暂冷却，稍后会自动重试"
 	case kind == ErrSessionDead:
 		return "账号登录态已失效，需在「账号管理」页重新登录"
+	case kind == ErrAccountUnusable:
+		// 11140 的根因是**账号侧状态**（该账号在本设备未完成登录），
+		// 与请求体/模型/区域无关 —— 实测同一份请求体换个账号就是 200。
+		//
+		// 必须给出「怎么办」：只说「账号不可用」用户会去查网络、查模型、
+		// 查密钥（正是「API 密钥无效」那类误判的来源），而真正有效的动作
+		// 只有一个 —— 重登这个账号。
+		//
+		// ⚠ **绝对不能出现 "403" 这三个字符**（2026-09-29 实测缺陷）。
+		//
+		// DSH 客户端判「密钥无效」靠的不是 HTTP 状态码，而是**文案正则**
+		//（`dsh-llm-pi-ai/lib/index.js:1376-1377`）：
+		//
+		//	if (/\b(?:401|403)\b/.test(message)) return "AUTH";
+		//
+		// 而 pi-ai 会把**响应体原文**拼进 message（`utils/error-body.js:111-118`
+		// 的 formatProviderError）。所以只要这句话里写了「403」，哪怕我们
+		// 对外回的是 502、哪怕密钥完全正确，界面照样显示「API 密钥无效」。
+		//
+		// 上一版正是在这里写了「上游 403 业务码 11140」，导致所有者装了新包
+		// 实测仍然报 AUTH。归因改用**业务码 11140** —— 它对排查同样唯一，
+		// 且不含任何会被误判的数字。
+		//
+		// 同时不透出上游原文（"request illegal" 那种措辞会让人以为是自己
+		// 请求写错了，而实际请求完全合法）。
+		return "账号在本设备尚未完成登录（上游业务码 11140），" +
+			"已冷却该账号并自动切换；若持续失败请在「账号管理」页重新登录该账号"
 	case kind == ErrNotFound:
 		return "上游返回 404（接口或模型不存在），已短暂冷却并切换账号"
 	case kind == ErrEffortRejected:
@@ -576,9 +603,25 @@ func FriendlyMessage(kind ErrKind, status int, body string) string {
 		// 自己调整参数即可，与账号状态无关。
 		return ModelParamInvalidMessage(body)
 	case kind == ErrServer && status > 0:
-		return "上游服务异常（HTTP " + strconv.Itoa(status) + "），已切换到其他账号"
+		return "上游服务异常（HTTP " + serverStatusLabel(status) + "），已切换到其他账号"
 	}
 	return ""
+}
+
+// serverStatusLabel 把状态码渲染成文案用的标签。
+//
+// 5xx **原样输出** —— 那是 ErrServer 的正当取值（`Classify` 只在
+// `status >= 500` 时返回它），也是排查线索。
+//
+// 其余值统一收敛成 "5xx"：本函数是导出的纯函数，可以拿到任意 status，
+// 而一旦写出裸 401/403，客户端就会把「上游服务异常」读成「API 密钥无效」
+//（`/\b(?:401|403)\b/` → AUTH，见 server/clienttext.go）。
+// 这里不赌调用方永远传 5xx —— 上一版正是赌错了地方。
+func serverStatusLabel(status int) string {
+	if status >= 500 && status <= 599 {
+		return strconv.Itoa(status)
+	}
+	return "5xx"
 }
 
 // effortRejectedMarkers 上游拒绝思考档位时的响应特征。

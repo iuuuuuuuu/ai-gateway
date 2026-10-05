@@ -29,6 +29,7 @@
 // 失败一次只是少一个数据点，差值会跨到下一轮（仍在 2 小时内）。
 // 若在这里重试，反而可能与下一轮叠加成请求风暴。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -124,11 +125,11 @@ pub async fn run_once() -> (usize, usize) {
     }
 
     // ---- ZCode ----
-    let zcode_uids: Vec<String> = zcode_account::load_accounts()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|a| a.uid)
-        .collect();
+    //
+    // ⚠ 这里**保留整个账号对象**（而不只是 uid）：后面的「启动激活」要靠
+    // `warmed_at` 判断该账号是否已经激活过（幂等的唯一依据）。
+    let zcode_accounts = zcode_account::load_accounts().unwrap_or_default();
+    let zcode_uids: Vec<String> = zcode_accounts.iter().map(|a| a.uid.clone()).collect();
     for uid in &zcode_uids {
         let u = uid.clone();
         let r = tokio::task::spawn_blocking(move || zcode_login::refresh_account(&u)).await;
@@ -137,6 +138,24 @@ pub async fn run_once() -> (usize, usize) {
             _ => failed += 1,
         }
     }
+
+    // ---- ZCode 启动激活（2026-10-05 所有者要求：「启动激活也不会自动执行」）----
+    //
+    // # 为什么放在巡检里
+    //
+    // 巡检是宿主**唯一**「启动后自动跑一次、之后每 20 分钟再跑」的载体
+    // （`src-tauri/src/lib.rs` 先 `sleep(90s)` 再 `loop { run_once().await; … }`），
+    // 正是「启动激活」需要的形态。再起一个循环只会多一个调度器去碰同一批账号。
+    //
+    // # 为什么必须在 resync 之前
+    //
+    // 激活成功后内部会刷新账号（套餐/额度/模型），而紧接着的
+    // `resync_native_config()` 正是把这些清单写进网关配置的地方 ——
+    // 顺序反了，新领到的套餐要等下一轮巡检才生效。
+    //
+    // ⚠ 与余额采样**分开计数**：激活失败不该让消费记录看起来也失败了
+    // （与上面 Qoder 领取同款取舍）。
+    warm_zcode_accounts(&zcode_accounts).await;
 
     // ---- 巡检后重写网关配置（2026-09-22，修一个真实的路由缺陷）----
     //
@@ -190,6 +209,159 @@ pub async fn run_once() -> (usize, usize) {
         );
     }
     (ok, failed)
+}
+
+/// 「启动激活」的重跑阈值：距上次激活超过这么久才再发一次。
+///
+/// # 为什么不是「每个进程只做一次」
+///
+/// 幂等标记 `warmed_at` 落在**账号库**上（见 `zcode_account::ZcodeAccount::warmed_at`），
+/// 跨进程有效。若只靠进程内标记，用户每次重启网关都会重报一次启动事件 ——
+/// 而上游看到的会是「这个账号一天被启动几十次」，比不报更糟。
+///
+/// 7 天是**保守**取值：官方客户端是「装了就一直开着」，真实用户不会 7 天
+/// 才启动一次客户端；对上游而言「每周一次启动」完全在人类活动区间内。
+pub const WARM_REFRESH_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// 本进程是否已经跑过「启动激活」——保证**一次进程生命周期只跑一次**。
+///
+/// 巡检是每 20 分钟一轮的循环，而「启动激活」只该发生在**启动后第一轮**；
+/// 没有这个闸门就会变成「每 20 分钟激活一次」（= 定时自动激活，
+/// 正是 `warm.rs` 的合规立场明确拒绝的形态）。
+static STARTUP_WARM_DONE: AtomicBool = AtomicBool::new(false);
+
+/// 自动激活是否被允许（读网关配置里已有的自动领取开关）。
+///
+/// # 为什么复用「自动领取」的开关，而不是新造一个
+///
+/// 激活的**唯一目的**就是「报启动事件 ⇒ 让上游给出可领套餐 ⇒ 领掉」。
+/// 用户关掉自动领取时再自动激活，等于每周往上游发两次事件却什么都不领 ——
+/// 只增加风控暴露面，没有任何收益。故与 `zcode_claim_enabled` 同闸。
+///
+/// ⚠ 三态语义必须与 Go 侧一致（见 `gateway.rs` 里 `zcode_claim_enabled`
+/// 附近的说明）：显式值优先，**缺席时回落总闸**，两者都缺席才用默认 `true`。
+/// 写成 `unwrap_or(false)` 会让存量用户**静默失去**这个功能。
+fn zcode_warm_enabled(cfg: &Value) -> bool {
+    fn flag(cfg: &Value, key: &str) -> Option<bool> {
+        cfg.get(key).and_then(Value::as_bool)
+    }
+    flag(cfg, "zcode_claim_enabled")
+        .or_else(|| flag(cfg, "product_tasks_enabled"))
+        .unwrap_or(true)
+}
+
+/// 对每个 ZCode 账号做**一次性**激活：报官方启动事件 + 领取上游给出的套餐。
+///
+/// # 为什么要它（2026-10-05 所有者原话：「zcode那个启动激活也不会自动执行」）
+///
+/// 激活此前**只有**两个入口：账号卡片的菜单按钮、CLI 子命令。刚导入的账号
+/// 在上游看来「从未活动过」—— 额度查得到、模型列得出，但活动套餐拿不到 offer
+/// 或被判异常活动。用户不知道要点那个按钮，于是账号长期停在「未激活」。
+///
+/// # 幂等（唯一必须守住的不变量）
+///
+/// 每个账号**只在需要时激活一次**，判据是账号库里的 `warmed_at`：
+///
+///	从未激活（0）                 → 激活
+///	距上次 ≥ WARM_REFRESH_AFTER   → 激活
+///	否则                          → 跳过
+///
+/// ⚠ 成功后**必须**把 `warmed_at` 写回账号库。漏写 = 每次启动都重报，
+/// 而那正是「非人类活动模式」的定义。
+///
+/// ⚠ 事件发失败时**不写** `warmed_at`（否则一次网络抖动就永久放弃该账号）。
+///
+/// # 计数与日志
+///
+/// 与余额采样**分开计数**（同 Qoder 领取的取舍）：激活失败不该让消费记录
+/// 看起来也失败了。故本函数不返回计数、只打日志。
+///
+/// ⚠ 每个账号都用 `spawn_blocking` 包裹：`warm_account` 内部**同步执行**
+/// 子进程（`gateway.exe zcode-login warm`）并阻塞等待，直接在 async 任务里调
+/// 会堵死 tokio 的一个 worker 线程（见本文件 Qoder 段的同款说明）。
+async fn warm_zcode_accounts(accounts: &[zcode_account::ZcodeAccount]) {
+    // 进程级闸门：只在启动后第一轮巡检里跑（见 STARTUP_WARM_DONE 的说明）。
+    if STARTUP_WARM_DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let cfg = crate::modules::gateway::load_gateway_config();
+    if !zcode_warm_enabled(&cfg) {
+        return;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let grace = WARM_REFRESH_AFTER.as_secs() as i64;
+
+    // 只激活**真的有凭证**的账号：没有凭证时 warm 必然失败，
+    // 而失败日志会让「启动激活」看起来一直在报错。
+    let on_disk: std::collections::HashSet<String> =
+        zcode_account::credential_uids().into_iter().collect();
+
+    let mut warmed = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    for acc in accounts {
+        let uid = acc.uid.trim().to_string();
+        if uid.is_empty() || !on_disk.contains(&uid) {
+            skipped += 1;
+            continue;
+        }
+        if acc.warmed_at > 0 && now.saturating_sub(acc.warmed_at) < grace {
+            skipped += 1;
+            continue;
+        }
+
+        let u = uid.clone();
+        let r = tokio::task::spawn_blocking(move || zcode_login::warm_account(&u)).await;
+        match r {
+            Ok(Ok(v)) => {
+                // ⚠ 空串 = 该阶段成功（口径见 `zcode_login::warm_account` 与
+                // `WarmReport`）：`events` 非空说明激活事件根本没发出去。
+                let events = v.get("events").and_then(Value::as_str).unwrap_or("");
+                if events.is_empty() {
+                    warmed += 1;
+                    let claimed = v
+                        .get("claimed")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0);
+                    eprintln!("[启动激活] ZCode {uid}：激活事件已上报，领取 {claimed} 个套餐");
+                    // 幂等依据必须落盘 —— 失败只留痕，不影响本轮结果。
+                    if let Err(e) =
+                        zcode_account::upsert_account(&uid, &serde_json::json!({ "warmedAt": now }))
+                    {
+                        eprintln!(
+                            "[启动激活] ZCode {uid}：激活成功但未能记录激活时刻（下次启动会重报）: {e}"
+                        );
+                    }
+                } else {
+                    failed += 1;
+                    eprintln!("[启动激活] ZCode {uid}：激活事件未发出：{events}");
+                }
+            }
+            Ok(Err(e)) => {
+                failed += 1;
+                eprintln!("[启动激活] ZCode {uid}：激活失败：{e}");
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("[启动激活] ZCode {uid}：激活任务异常：{e}");
+            }
+        }
+    }
+
+    // 只有真碰过账号才打汇总（池为空时静默，避免刷屏）
+    if warmed + failed > 0 {
+        eprintln!(
+            "[启动激活] ZCode：已激活 {warmed} 个 / 失败 {failed} 个 / 无需激活 {skipped} 个（每个账号只做一次，距上次超过 {} 天才重做）",
+            WARM_REFRESH_AFTER.as_secs() / 86400,
+        );
+    }
 }
 
 /// snapshot_from_refresh_result 从 refresh 的返回 JSON 里补记一次快照。
@@ -329,12 +501,21 @@ mod tests {
     /// 改成按**花括号深度**切：与行尾无关，且找不到闭合花括号时会
     /// panic（测试失败）而不是静默降级。
     fn run_once_source() -> String {
+        fn_body("pub async fn run_once()")
+    }
+
+    /// 取任意函数（按签名定位）的源码，切法与 `run_once_source` 完全一致。
+    ///
+    /// 抽出来是为了让新增的 `warm_zcode_accounts` 复用**同一套**边界判定 ——
+    /// 抄第二份很容易只修一处，留下一份静默失效的（这个坑本文件已经踩过一次，
+    /// 见上面 `find("\n}\n")` 的说明）。
+    fn fn_body(sig: &str) -> String {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/modules/multi_product_credit_patrol.rs"
         );
         let src = std::fs::read_to_string(path).expect("读不到本文件");
-        let start = src.find("pub async fn run_once()").expect("找不到 run_once");
+        let start = src.find(sig).expect("找不到目标函数");
 
         let mut depth = 0i32;
         let mut seen_open = false;
@@ -355,7 +536,18 @@ mod tests {
                 _ => {}
             }
         }
-        panic!("找不到 `run_once` 的闭合花括号 —— 源码结构变了，请更新本测试");
+        panic!("找不到 `{sig}` 的闭合花括号 —— 源码结构变了，请更新本测试");
+    }
+
+    /// 剥掉注释行 —— 注释里也写着这些符号名，不剥的话「调用被删掉」测不出来。
+    ///
+    /// 与 `run_once_claims_qoder_campaigns` 里那段内联实现同款；
+    /// 抽成函数是为了让新测试不必各抄一份（抄漏一处就会得到假绿）。
+    fn code_lines(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Qoder 权益活动必须**自动领取**（2026-09-22 所有者要求）。
@@ -402,5 +594,82 @@ mod tests {
              \n\
              剥离注释后的代码：\n{code}"
         );
+    }
+
+    /// ZCode「启动激活」必须真的被 `run_once` 调用（2026-10-05 所有者要求）。
+    ///
+    /// # 为什么必须有这条测试
+    ///
+    /// 激活此前**只有**界面按钮与 CLI 两个入口，而所有者的原话是
+    /// 「zcode那个启动激活也不会自动执行」—— 功能存在、但没有任何自动入口。
+    /// 修法就是在巡检（宿主唯一「启动后自动跑一次」的载体）里调一次。
+    ///
+    /// ⚠ 失败模式很明确：有人重构 `run_once` 时把这次调用删掉，
+    /// 而**其余所有测试仍然是绿的**（功能本身没坏，只是又没人调它了）。
+    #[test]
+    fn run_once_warms_zcode_accounts() {
+        let code = code_lines(&run_once_source());
+        assert!(
+            code.contains("warm_zcode_accounts"),
+            "`run_once` 的**代码**里必须调用 `warm_zcode_accounts()` \
+             （不能只在注释里提到它）——\n\
+             否则「启动激活」就只剩界面按钮这一个入口，\n\
+             而所有者报的正是「zcode那个启动激活也不会自动执行」。\n\
+             \n\
+             剥离注释后的代码：\n{code}"
+        );
+    }
+
+    /// 自动激活的幂等依据 `warmedAt` **必须**在成功后落盘。
+    ///
+    /// # 这是本功能唯一会伤到用户的地方
+    ///
+    /// 激活是**写**操作：以账号身份向上游报 `app_launch` / `app_daily_active`。
+    /// 若成功后没写回 `warmed_at`，每次网关启动都会重报一次 ——
+    /// 上游看到的是「这个账号一天被启动几十次」，比不激活更糟。
+    ///
+    /// 故这里钉住「成功分支里有 upsert_account(..., warmedAt)」。
+    /// 只查 `warm_zcode_accounts` 的函数体，避免被别处的同名符号蒙混过关。
+    #[test]
+    fn warm_records_warmed_at_on_success() {
+        let code = code_lines(&fn_body("async fn warm_zcode_accounts("));
+        assert!(
+            code.contains("upsert_account") && code.contains("warmedAt"),
+            "`warm_zcode_accounts` 成功激活后**必须**把 `warmedAt` 写回账号库 ——\n\
+             漏写会让每次网关启动都重报启动事件（= 非人类活动模式），\n\
+             而本功能存在的理由恰恰是「像官方客户端那样只报一次」。\n\
+             \n\
+             剥离注释后的代码：\n{code}"
+        );
+    }
+
+    /// 「启动激活」与自动领取同闸，且**键缺席时回落总闸**。
+    ///
+    /// 三态语义（显式值 > 总闸 > 默认 true）是这里最容易写错的地方：
+    /// 写成 `unwrap_or(false)` 会让存量用户**静默失去**这个功能 ——
+    /// 老配置里根本没有 `zcode_claim_enabled` 这个键。
+    #[test]
+    fn warm_gate_falls_back_to_product_tasks() {
+        let cases = [
+            (serde_json::json!({}), true, "两个键都缺席 ⇒ 默认开启"),
+            (
+                serde_json::json!({ "product_tasks_enabled": false }),
+                false,
+                "只有总闸且为 false ⇒ 关闭",
+            ),
+            (
+                serde_json::json!({ "product_tasks_enabled": false, "zcode_claim_enabled": true }),
+                true,
+                "分产品显式 true 优先于总闸 false",
+            ),
+            (
+                serde_json::json!({ "product_tasks_enabled": true, "zcode_claim_enabled": false }),
+                false,
+                "分产品显式 false 优先于总闸 true",
+            ),
+        ];
+        for (cfg, want, why) in cases {
+            assert_eq!(zcode_warm_enabled(&cfg), want, "{why}");
+        }
     }
 }

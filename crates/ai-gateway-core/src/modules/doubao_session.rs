@@ -453,19 +453,32 @@ pub fn diagnose() -> Value {
         &config::store_dir(),
     )
     .data_dir;
+    // 抓包文件里 `multi_sids` 解析出多少个账号 —— 同机多账号时它能一次补全多个
+    let captured_sids = captured
+        .as_ref()
+        .and_then(|c| c.get("sids"))
+        .and_then(Value::as_object)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let (missing_credentials, inferable) = doubao_account::credential_inference_state();
 
     json!({
         "accountsTotal": accounts.len(),
         "accountsWithSession": accounts.iter().filter(|a| {
             a.get("session_id").and_then(Value::as_str).map(|s| !s.trim().is_empty()).unwrap_or(false)
         }).count(),
+        // 缺凭证的账号数，以及能否靠「唯一候选」自动补上
+        "accountsMissingCredential": missing_credentials,
+        "uidInferenceAvailable": inferable,
         "capturedAvailable": captured.is_some(),
         "capturedUid": captured.as_ref().and_then(|c| c.get("uid")).cloned(),
+        "capturedSidsCount": captured_sids,
         "capturedAt": captured.as_ref().and_then(|c| c.get("captured_at")).cloned(),
         "userDataDir": accounts_dir.to_string_lossy(),
         "userDataExists": accounts_dir.is_dir(),
         "note": "豆包客户端在 Chromium v10 之外还有一层客户端级加密，离线无法解出明文 sessionid。\
-保活依靠启动客户端触发服务端滑动续期；凭证可通过本地代理抓包自动获取。",
+保活依靠启动客户端触发服务端滑动续期；凭证可通过本地代理抓包自动获取。\
+同机多账号的凭证在客户端登录/使用时会随 multi_sids 一并抓取并各自补全。",
     })
 }
 

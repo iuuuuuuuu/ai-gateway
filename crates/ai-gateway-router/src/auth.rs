@@ -22,6 +22,20 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{GatewayError, Result};
 
+/// 账号所属产品（空串等价于 [`ProductWorkBuddy`]）。
+///
+/// 与 Go 侧 `auth.ProductWorkBuddy` / `ProductQoder` / `ProductZcode` 逐字一致。
+pub const PRODUCT_WORKBUDDY: &str = "workbuddy";
+/// QoderWork。
+pub const PRODUCT_QODER: &str = "qoder";
+/// ZCode（Z.AI / 智谱 GLM 编码套餐）。
+pub const PRODUCT_ZCODE: &str = "zcode";
+/// Trae（字节跳动 Trae / TRAE SOLO）。
+///
+/// 与 Go 侧 `auth.ProductTrae` 同口径。Trae 有**两个区域**（国服 / 国际版）
+/// 共用同一个产品标识，区域由凭证的 `domain` 承载（见 [`region_of_domain`]）。
+pub const PRODUCT_TRAE: &str = "trae";
+
 /// 归一化后的账号凭证。
 #[derive(Debug, Clone, Default)]
 pub struct Auth {
@@ -39,6 +53,20 @@ pub struct Auth {
     pub enterprise_id: String,
     /// 昵称。
     pub nickname: String,
+    /// 账号所属产品；空串等价于 [`PRODUCT_WORKBUDDY`]。
+    ///
+    /// 与 Go 侧 `Auth.Product` 同口径。**读取请一律走 [`Auth::product_of`]**，
+    /// 直接比较空串容易漏判（见其注释）。
+    pub product: String,
+    /// 用户手动禁用：**只不参与选号**，养号任务照跑。
+    ///
+    /// 由宿主在导出凭证时写入 `account.no_route`。与 `pool` 里的 `disabled` 区分：
+    ///
+    /// - `NoRoute` → 用户意图「别把流量给它」；签到/上报/成长任务仍应执行
+    /// - `disabled` → 网关判定该号已死（session 死 / 额度冻结），任务也跳过
+    ///
+    /// 与 Go 侧 `Auth.NoRoute` 一致。
+    pub no_route: bool,
     /// 来源文件路径；refresh 后原子写回此处。
     pub file_path: String,
     /// 仍有剩余积分的套餐中最早到期时刻（Unix 秒）；0 = 未知。
@@ -61,16 +89,167 @@ impl Auth {
         now + within.as_secs() as i64 >= self.expires_at
     }
 
-    /// 是否国际版（workbuddy.ai）。
+    /// 是否国际版。
     ///
-    /// 严格对齐 Go 侧 `upstream.IsIntl`：
-    /// `strings.HasSuffix(strings.ToLower(strings.TrimSpace(domain)), ".ai")`。
-    ///
-    /// 注意是**域名后缀**判定而非包含匹配：`copilot.tencent.com` 不含 `.ai`，
-    /// 而 `xxx.workbuddy.ai` 与 `workbuddy.ai` 都命中。大小写与首尾空白均不敏感。
+    /// 判据与 [`region_of_domain`] 完全一致 —— **只此一处**，与 Go 侧
+    /// `(*Auth).IsIntl` 同口径。
     pub fn is_intl(&self) -> bool {
-        self.domain.trim().to_ascii_lowercase().ends_with(".ai")
+        region_of_domain(&self.domain) == Region::Intl
     }
+
+    /// 返回账号所属区域。
+    ///
+    /// 与 Go 侧 `(*Auth).Region` 一致：依据凭证里的 `domain` 字段判定，
+    /// 空域名按国服（历史行为）。
+    pub fn region(&self) -> Region {
+        region_of_domain(&self.domain)
+    }
+
+    /// 返回账号所属产品，空串归一成 [`PRODUCT_WORKBUDDY`]。
+    ///
+    /// 与 Go 侧 `(*Auth).ProductOf` 同口径：**归一化而非保留空串** ——
+    /// 调用方写 `a.product_of() == PRODUCT_WORKBUDDY` 比 `== ""` 更不容易错。
+    pub fn product_of(&self) -> &str {
+        if self.product.is_empty() {
+            PRODUCT_WORKBUDDY
+        } else {
+            &self.product
+        }
+    }
+
+    /// 是否 QoderWork 账号。
+    pub fn is_qoder(&self) -> bool {
+        self.product == PRODUCT_QODER
+    }
+
+    /// 是否 ZCode 账号。
+    pub fn is_zcode(&self) -> bool {
+        self.product == PRODUCT_ZCODE
+    }
+
+    /// 是否 Trae 账号。
+    ///
+    /// 判据是**产品字段**而不是 uid 前缀：Trae 凭证的 uid 形如 `trae-<user_id>`，
+    /// 但那是凭证加载层拼出来的；产品归属的唯一真相是 [`Auth::product`]。
+    pub fn is_trae(&self) -> bool {
+        self.product == PRODUCT_TRAE
+    }
+}
+
+/// 账号所属服务区域。
+///
+/// 存在的意义：**同名模型在两个区域可能是不同的后端模型**，能力并不一致。
+/// 实测（2026-09-16，`/v3/config` 元数据 + 逐账号发图验证）：
+///
+/// ```text
+/// glm-5.3  国服「旗舰模型，擅长复杂软件工程与长程 Agent 任务」out=64000
+///          国际版「能力均衡，适合日常使用」                out=48000
+///          —— 国服后端能读图；国际版后端把图片换成固定占位符（token 增量
+///          恒为 +29，与图片体积无关），模型只能回答「无法查看图片」。
+/// ```
+///
+/// 因此「同一个 glm-5.3 时好时坏」的真实原因是**选号随机命中了两个不同后端**，
+/// 而不是模型本身不稳定。见 `pool::PickForModelRegion` 与 server 的区域路由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Region {
+    /// 不限区域（默认；等价于引入本概念之前的行为）。
+    Any,
+    /// 国服（`*.workbuddy.cn` / `*.codebuddy.cn`）。
+    CN,
+    /// 国际版（`*.workbuddy.ai` / `*.codebuddy.ai`）。
+    Intl,
+}
+
+impl Region {
+    /// 与 Go 侧 `Region.String()` 逐字一致（`"cn"` / `"intl"` / `"any"`）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Region::CN => "cn",
+            Region::Intl => "intl",
+            Region::Any => "any",
+        }
+    }
+
+    /// 解析区域名；未知/空一律按 [`Region::Any`]（与 Go 侧调用方口径一致）。
+    pub fn parse(s: &str) -> Region {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "cn" => Region::CN,
+            "intl" => Region::Intl,
+            _ => Region::Any,
+        }
+    }
+}
+
+/// 国际版域名白名单（**完整域名**）。
+///
+/// # ⚠⚠ 为什么必须是完整域名，不能再用 `ends_with(".ai")`（2026-09-22 修）
+///
+/// Go 侧原判据是 `strings.HasSuffix(domain, ".ai")`。它同时**过宽**又**过窄**：
+///
+/// - **过窄（真缺陷）**：Qoder 国际版的域名是 `qoder.sh`（`.sh` 不是 `.ai`）
+///   ⇒ 被判成**国服** ⇒ `proxy_scope.intl` 对它**不生效** ⇒ 永远走直连。
+///   实测 `openapi.qoder.sh`：直连 10.3s，走代理 1.2s（**慢 8.7 倍**）。
+///   而 `qoderAuthOf` 的注释写着「域名用于区域判定（qoder.sh = 国际版）」
+///   —— 写那段代码时以为判据认得出它，实际认不出。两处口径分叉。
+/// - **过宽**：任何以 `.ai` 结尾的域名都算国际版。今天恰好没有反例，
+///   但那是巧合 —— 判据不该依赖「恰好没人用别的 .ai 域名」。
+///
+/// 故改为**白名单精确匹配**：列出每个产品真实使用的域名，未列出的按国服处理
+/// （与「历史只有国服账号」的向后兼容口径一致）。
+///
+/// ⚠ 新增产品/域名时**必须同步这里**，否则它的国际版账号会静默走直连 ——
+/// 表现是「某个产品的国际版特别慢/连不上」，而其它产品正常。
+///
+/// ⚠⚠ 本项对 Rust 版是**真实缺陷修复**而非对齐：移植前 Rust 的
+/// `Auth::is_intl` 正是那个旧的 `ends_with(".ai")` 判据，故 Qoder 国际版
+/// （`qoder.sh`）与 ZCode 国际版（`api.z.ai`）在 Rust 侧**全部被判成国服**
+/// ⇒ 走直连、`proxy_scope.intl` 对它们不生效。Rust 侧另有 `pool::region_of`
+/// 曾按同一旧判据实现，本次一并统一到本函数。
+const INTL_DOMAINS: &[&str] = &[
+    // WorkBuddy 国际版（也是短信登录用的那个域）。
+    "workbuddy.ai",
+    // 未在任何真实凭证中观察到，但本仓库多处注释（config.rs / update.rs /
+    // types.ts / client.go）都把「*.workbuddy.ai / *.codebuddy.ai」并列为国际版。
+    // 保留它：真出现时能正确走代理，不出现时零成本。
+    "codebuddy.ai",
+    // Qoder 国际版的凭证域名（`qoder.Region.Domain()` 写的就是它），
+    // 另有 API 域 openapi.qoder.sh / api3.qoder.sh。
+    "qoder.sh",
+    // Qoder 国际版授权页（`qoder.RegionFromDomain` 判为 intl）。
+    "qoder.com",
+    // ZCode（Z.AI）的 API 域（`zcode.DomainOfProvider` 写的就是它）。
+    "z.ai",
+];
+
+/// 按**完整域名**判定区域。
+///
+/// 匹配规则：域名等于清单项，或以 `.<清单项>` 结尾（覆盖子域）。
+/// 例如清单里有 `qoder.sh` 时，`api3.qoder.sh` 与 `qoder.sh` 都命中，
+/// 而 `notqoder.sh` / `qoder.sh.evil.com` 都不命中。
+///
+/// 空域名按国服（历史行为，见 [`Region`] 的注释）。
+pub fn region_of_domain(domain: &str) -> Region {
+    let mut d = domain.trim().to_ascii_lowercase();
+    if d.is_empty() {
+        return Region::CN;
+    }
+    // 去掉可能的协议前缀与路径，容忍凭证里写成 URL 的情况。
+    if let Some(i) = d.find("://") {
+        d = d[i + 3..].to_string();
+    }
+    if let Some(i) = d.find(['/', '?', '#']) {
+        d = d[..i].to_string();
+    }
+    // 去掉端口。用 rfind 与 Go 侧 LastIndex 一致（IPv6 字面量不是本场景的输入）。
+    if let Some(i) = d.rfind(':') {
+        d = d[..i].to_string();
+    }
+    for base in INTL_DOMAINS {
+        if d == *base || d.ends_with(&format!(".{base}")) {
+            return Region::Intl;
+        }
+    }
+    Region::CN
 }
 
 /// 嵌套形凭证文件（插件 OAuth 输出）。
@@ -101,6 +280,14 @@ struct NestedAccountBlock {
     enterprise_id: String,
     #[serde(default)]
     nickname: String,
+    /// 用户手动禁用 = **只不接流量**，养号任务照跑。
+    ///
+    /// 与池里的 `disabled` 完全不同：那个是网关自己判定的（连续 3 次
+    /// 12153 session 死 / 额度冻结），跑了也白跑，所以养号任务该跳过。
+    /// 而这个只是「别把请求路由到它」，签到 / 活跃上报 / 成长任务等仍应照跑
+    /// —— 所有者明确过这个语义。
+    #[serde(default)]
+    no_route: bool,
 }
 
 /// 扁平形凭证文件（手写 / 旧版）。
@@ -120,6 +307,10 @@ struct FlatAuth {
     enterprise_id: String,
     #[serde(default)]
     nickname: String,
+    /// 扁平形同样支持 `no_route`（两种形状的字段语义必须一致，
+    /// 否则同一个账号换种写法就会「突然开始接流量」）。
+    #[serde(default)]
+    no_route: bool,
     /// 扁平形把 credit 字段平铺在顶层（兼容旧版手写凭证）。
     #[serde(rename = "soonestExpireAt", default)]
     soonest_expire_at: i64,
@@ -162,9 +353,9 @@ pub fn parse(raw: &[u8]) -> Result<Auth> {
             Some(b) => (b.access_token, b.refresh_token, b.expires_at, b.domain),
             None => (String::new(), String::new(), 0, String::new()),
         };
-        let (uid, eid, nick) = match n.account {
-            Some(b) => (b.uid, b.enterprise_id, b.nickname),
-            None => (String::new(), String::new(), String::new()),
+        let (uid, eid, nick, no_route) = match n.account {
+            Some(b) => (b.uid, b.enterprise_id, b.nickname, b.no_route),
+            None => (String::new(), String::new(), String::new(), false),
         };
         Auth {
             access_token: at,
@@ -174,6 +365,7 @@ pub fn parse(raw: &[u8]) -> Result<Auth> {
             uid,
             enterprise_id: eid,
             nickname: nick,
+            no_route,
             soonest_expire_at: normalize_epoch(n.credit.map(|c| c.soonest_expire_at).unwrap_or(0)),
             ..Default::default()
         }
@@ -190,6 +382,7 @@ pub fn parse(raw: &[u8]) -> Result<Auth> {
             uid: f.uid,
             enterprise_id: f.enterprise_id,
             nickname: f.nickname,
+            no_route: f.no_route,
             soonest_expire_at: normalize_epoch(f.soonest_expire_at),
             ..Default::default()
         }
@@ -249,6 +442,36 @@ impl Auth {
         account.insert("uid".into(), self.uid.clone().into());
         account.insert("enterpriseId".into(), self.enterprise_id.clone().into());
         account.insert("nickname".into(), self.nickname.clone().into());
+
+        // ★★ `account.no_route` 必须原样保留（2026-09-30 修，对应 SPEC 附录 A-1）。
+        //
+        // 它是**宿主**写的（账号页的「停止接流量」开关），而本方法是**网关**
+        // 写的（令牌刷新时）。令牌刷新很频繁 —— 若这里整体覆盖，用户的禁用
+        // 标记会在几分钟内被**悄悄抹掉**：那个账号重新开始接流量，而用户以为
+        // 它还停着。症状是「明明关了它，请求还是走到它上面」。
+        //
+        // 保留策略：**从磁盘读回再合并**，而不是只用内存字段重建。这样宿主
+        // 后来加的、我们还不认识的字段也不会丢（`credit` 段就是先例）。
+        if let Ok(raw) = std::fs::read(&path) {
+            if let Ok(existing) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                if let Some(obj) = existing.as_object() {
+                    // 未知的顶层字段：先原样搬过来，随后被下面显式写入的段覆盖。
+                    for (k, v) in obj {
+                        if k != "auth" && k != "account" {
+                            doc.insert(k.clone(), v.clone());
+                        }
+                    }
+                    // 未知的 account 字段（含 `no_route`）：读回磁盘值。
+                    if let Some(acct) = obj.get("account").and_then(|v| v.as_object()) {
+                        for (k, v) in acct {
+                            if k != "uid" && k != "enterpriseId" && k != "nickname" {
+                                account.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         doc.insert("auth".into(), auth.into());
         doc.insert("account".into(), account.into());
 
@@ -413,20 +636,98 @@ mod tests {
     }
 
     #[test]
-    fn is_intl_uses_trimmed_lowercased_ai_suffix() {
-        // 对齐 Go：HasSuffix(ToLower(TrimSpace(domain)), ".ai")
-        let cases: &[(&str, bool)] = &[
-            ("https://copilot.tencent.com", false), // 国服
-            ("https://workbuddy.ai", true),
-            ("https://WORKUDDY.AI", true),   // 大小写不敏感
-            ("  https://workbuddy.ai  ", true), // 首尾空白不敏感
-            ("https://api.workbuddy.ai", true), // 子域名同样命中
-            ("", false),
-            ("https://copilot.tencent.com.ai", true), // 后缀判定，非包含匹配
+    fn is_intl_matches_every_real_domain() {
+        // 对齐 Go：`internal/auth/region_domain_test.go::TestIsIntlMatchesEveryRealDomain`。
+        //
+        // 域名取值来自代码里的字面量（不是猜的）：
+        //   - WorkBuddy: smslogin.go 的 www.workbuddy.ai / www.workbuddy.cn，
+        //     以及凭证里的 copilot.tencent.com / www.codebuddy.cn
+        //   - Qoder: region.go 的 Region.Domain() → qoder.sh / qoder.com.cn
+        //   - ZCode: dispatch.go 的 DomainOfProvider → api.z.ai / open.bigmodel.cn
+        let cases: &[(&str, bool, &str)] = &[
+            // ---- 国际版：必须判 true，否则拿不到代理 ----
+            ("www.workbuddy.ai", true, "WorkBuddy 国际版（短信登录域）"),
+            ("workbuddy.ai", true, "裸根域"),
+            ("www.codebuddy.ai", true, "注释里并列为国际版（未在真实凭证中出现）"),
+            ("qoder.sh", true, "Qoder 国际版（凭证里写的就是它）"),
+            ("api3.qoder.sh", true, "Qoder 国际版网关域"),
+            ("openapi.qoder.sh", true, "Qoder 国际版 OpenAPI 域"),
+            ("qoder.com", true, "Qoder 国际版授权页"),
+            ("api.z.ai", true, "ZCode（Z.AI）API 域"),
+            ("z.ai", true, "Z.AI 裸根域"),
+            // ---- 国服：必须判 false，否则会被无谓地绕进代理 ----
+            ("copilot.tencent.com", false, "WorkBuddy 国服"),
+            ("www.codebuddy.cn", false, "CodeBuddy 国服"),
+            ("www.workbuddy.cn", false, "WorkBuddy 国服（短信登录用）"),
+            ("qoder.com.cn", false, "Qoder 国服"),
+            ("openapi.qoder.com.cn", false, "Qoder 国服 OpenAPI 域"),
+            ("gateway.qoder.com.cn", false, "Qoder 国服网关域"),
+            ("open.bigmodel.cn", false, "ZCode 国服（智谱）"),
+            ("", false, "空域名按国服（历史行为）"),
         ];
-        for (domain, want) in cases {
+        for (domain, want, why) in cases {
             let a = Auth { domain: (*domain).into(), ..Default::default() };
-            assert_eq!(a.is_intl(), *want, "domain={domain:?} want={want}");
+            assert_eq!(a.is_intl(), *want, "IsIntl({domain:?}) 应为 {want}（{why}）");
+            // Region() 必须与 IsIntl 一致（两者同源，别再分叉）。
+            let want_region = if *want { Region::Intl } else { Region::CN };
+            assert_eq!(
+                a.region(),
+                want_region,
+                "Region({domain:?}) 应与 IsIntl 一致（{why}）"
+            );
+        }
+    }
+
+    #[test]
+    fn is_intl_does_not_match_lookalike_domains() {
+        // 对齐 Go：`TestIsIntlDoesNotMatchLookalikeDomains`。
+        //
+        // 后缀匹配的另一个毛病是「过宽」。正确的匹配是「等于，或以 `.＋清单项`
+        // 结尾」，故 `api3.qoder.sh` 命中子域，而下面这些**只是形似**。
+        for d in [
+            "notqoder.sh",
+            "qoder.sh.evil.com",
+            "evil-workbuddy.ai.com", // .ai 在中间，TLD 是 .com
+            "fakez.ai",
+            "z.ai.evil.com",
+            "qoder.shx",
+            "myqoder.com",
+        ] {
+            assert!(
+                !(&Auth { domain: d.into(), ..Default::default() }).is_intl(),
+                "IsIntl({d:?}) 不应为 true —— 它只是形似，不是我们的域名"
+            );
+        }
+    }
+
+    #[test]
+    fn is_intl_is_case_and_noise_tolerant() {
+        // 对齐 Go：`TestIsIntlIsCaseAndNoiseTolerant`。
+        //
+        // 这些不是假想：手写凭证与旧版导出都出现过带 URL 形态的 domain。
+        for d in [
+            "WWW.WorkBuddy.AI",
+            "  www.workbuddy.ai  ",
+            "https://www.workbuddy.ai",
+            "https://www.workbuddy.ai/v2/chat",
+            "www.workbuddy.ai:443",
+            "https://qoder.sh/",
+        ] {
+            assert!(
+                (&Auth { domain: d.into(), ..Default::default() }).is_intl(),
+                "IsIntl({d:?}) 应为 true —— 归一化后它就是国际版域名"
+            );
+        }
+        // 国服侧同样要容忍噪声（别把带端口的国服域误判成国际版）。
+        for d in [
+            "HTTPS://Copilot.Tencent.COM",
+            "copilot.tencent.com:443",
+            "https://qoder.com.cn/path",
+        ] {
+            assert!(
+                !(&Auth { domain: d.into(), ..Default::default() }).is_intl(),
+                "IsIntl({d:?}) 不应为 true（是国服域名）"
+            );
         }
     }
 

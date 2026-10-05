@@ -39,7 +39,7 @@ jobs:
   # 发版前的快速验证门。
   #
   # 背景：本工作流此前**没有任何测试** —— 没有 cargo test、没有 cargo check、
-  # 没有 go test，唯一的校验是产物断言（.sig 数量、安装包存在性）。也就是说，
+  # 没有网关单测，唯一的校验是产物断言（.sig 数量、安装包存在性）。也就是说，
   # 一个 tag 完全可以为「从未通过编译校验与单测」的代码发布安装包，而且发布
   # 一旦出去就撤不回来。这一点在 push 阶段由 ci.yml 覆盖，但打 tag 时并不强制
   # 要求 ci 绿 —— tag 可以打在任意 commit 上。
@@ -65,10 +65,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-          cache-dependency-path: go-gateway/go.sum
+      # ⚠ 2026-10-01：网关已从 Go 全量重写为 Rust（crates/ai-gateway-router），
+      # 故不再需要 actions/setup-go / matrix.goos / matrix.goarch。
+      # Go 源码 go-gateway/ 仍保留作对照参考，但已不参与构建。
 
       - name: 安装 Linux 系统依赖
         run: |
@@ -89,12 +88,31 @@ jobs:
       - name: 核心单测
         run: cargo test -p ai-gateway-core
 
+      # ⚠ 这一条是替换掉旧版的 `go test ./...`（2026-10-01 网关改为 Rust）。
+      #
+      # **不能**因为"网关单测在 ci.yml 里已经跑过"就省掉：tag 可以打在任意
+      # commit 上，ci 未绿也能发版 —— 这正是上面那段背景注释所说的漏洞。
+      # preflight 存在的意义就是让"发布出去的必定测过"，而网关是分发包里
+      # 唯一会直接对着上游发请求的组件，它的单测是最不该漏的一项。
+      #
+      # 只跑 `--lib`：`--bins` 与 `--lib` 共用同一份源码，bins 只是薄入口，
+      # 多跑一遍约 30s 换不到新信息；而真正会挂的是逻辑层（lib）。
+      - name: 网关单测
+        run: cargo test -p ai-gateway-router --lib
+
+      # ★ 宿主 WebUI 服务端单测（npm 分发的 `ai-gateway` 命令）。
+      #
+      # ⚠ 此前从未在 CI 或发布流程里跑过 —— 而「前端 ROUTES ↔ 服务端路由」
+      # 一致性测试（`api.rs::every_frontend_route_path_has_a_server_handler`）
+      # 就住在那里，它是抓「前端登记了、服务端没实现」那个反复出现的缺陷类的
+      # 唯一闸门（2026-10-01 据此修好 4 条：`/api/proxy/test-upstream`、
+      # `/api/proxy/probe-nodes`、`/api/gateway/sms/send`、`/api/gateway/sms/verify`）。
+      # 不跑它，那条测试等于没写 —— 发布前最后一次机会也就白白放过。
+      - name: 宿主 WebUI 服务端单测
+        run: cargo test -p ai-gateway-server
+
       - name: 全 workspace 编译校验
         run: cargo check --workspace --all-targets --profile test
-
-      - name: Go 网关单测
-        working-directory: go-gateway
-        run: go test ./...
 
   build:
     name: build / ${{ matrix.name }}
@@ -125,14 +143,10 @@ jobs:
             # 用运行时计算就没有这个不确定性：run 步骤里的表达式求值
             # 是本仓库已经在用的、确定可行的路径。
             bundles: nsis,msi
-            goos: windows
-            goarch: amd64
           - name: macos-arm64
             os: macos-14
             target: aarch64-apple-darwin
             bundles: app
-            goos: darwin
-            goarch: arm64
             arch_label: aarch64
           # Intel Mac（x86_64-apple-darwin）—— 2026-09-22 **加回**。
           #
@@ -156,15 +170,11 @@ jobs:
             os: macos-15-intel
             target: x86_64-apple-darwin
             bundles: app
-            goos: darwin
-            goarch: amd64
             arch_label: x86_64
           - name: linux-x64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             bundles: deb,appimage
-            goos: linux
-            goarch: amd64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -214,13 +224,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      # 同 ci.yml：不指 cache-dependency-path 的话 setup-go 会去找仓库根的
-      # go.sum（不存在），缓存形同虚设，每次都要重新编译整个 stdlib。
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-          cache-dependency-path: go-gateway/go.sum
-
       - name: 解析版本号
         shell: bash
         run: |
@@ -235,11 +238,14 @@ jobs:
 
       # 必须在前端与 Rust 构建之前：build.rs 会把网关 gzip 后编进主程序，
       # 缺了它应用能起来但网关功能会报「本构建未内嵌网关二进制」。
-      - name: 构建内嵌网关（Go）
+      #
+      # ★ 刻意**不传 GOOS/GOARCH**（旧版传过）：Rust 版按**构建主机**出产物，
+      # 而本矩阵每一腿的 host 与 target 本来就一致（windows-latest→msvc、
+      # macos-14→aarch64-apple-darwin、macos-15-intel→x86_64-apple-darwin、
+      # ubuntu-22.04→x86_64-unknown-linux-gnu），所以本机产物就是需要的产物。
+      # 脚本收到这两个变量时会打一行提示后忽略，不报错。
+      - name: 构建内嵌网关（Rust）
         shell: bash
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
         run: sh scripts/build-gateway.sh
 
       - run: npm ci

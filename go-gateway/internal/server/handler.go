@@ -1247,10 +1247,13 @@ func responsesFailure(err error) (code, msg string) {
 }
 
 // writeOpenAIError 写出 OpenAI 形状的错误体。
+//
+// msg 一律过 clientSafeMessage：客户端判 AUTH 靠的是**文案里的 401/403**
+//（不是状态码），任何一条文案漏了都会被读成「API 密钥无效」，见 clienttext.go。
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, map[string]any{
 		"error": map[string]any{
-			"message": msg,
+			"message": clientSafeMessage(msg),
 			"type":    "api_error",
 			"code":    code,
 		},

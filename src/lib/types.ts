@@ -868,6 +868,17 @@ export interface GrowthTaskView {
   action_desc?: string;
   /** 无法自动完成时的原因说明。 */
   hint?: string;
+  /**
+   * 上游标记为**尚未解锁**：现在执行不会计分（上游会静默丢弃事件）。
+   *
+   * ★ 后端 `TaskView.locked` 是 `skip_serializing_if = "is_false"` ⇒ 只有为真时
+   * 才会出现在 JSON 里，所以这里必须是可选字段。界面判定「可执行」时必须一起
+   * 排除 `locked`，否则会混入注定 skipped 的项（口径见后端 `pending_tasks`：
+   * `!claimed && automatable && !locked`）。
+   */
+  locked?: boolean;
+  /** 解锁时刻（RFC3339，本地时间由后端渲染好）；仅在 `locked` 为真时有值。 */
+  unlock_at?: string;
 }
 
 /** 单项任务的执行结果（action=run）。 */
@@ -1310,6 +1321,81 @@ export interface GatewayUsageGroup extends GatewayUsageTotals {
   key: string;
 }
 
+/**
+ * `accountModels[uid]` 的**线上真实形状**：`{ 模型名: 计数 }`。
+ *
+ * ⚠⚠ 2026-10-01 白屏事故的根因就在这里。
+ *
+ * 这里此前声明成 `GatewayUsageGroup[]`（数组），而网关**一直**输出的是对象：
+ * Rust 侧 `usage.rs:399-412` 是 `groups.insert(model, c.value())` 塞进
+ * `serde_json::Map`，Go 侧 `bare_model_name_test.go:99-113` 也用
+ * `map[string]any` 取值 —— **两个后端都是对象，只有前端类型写成了数组**。
+ *
+ * 后果：`for (const model of models)` 迭代一个普通对象 ⇒
+ * `TypeError: xxx is not iterable`。而 `main.tsx` **没有 ErrorBoundary**，
+ * 于是 React 卸载整棵树 ⇒ **点「兼容网关」整页永久白屏**（连左侧导航都没了，
+ * 只能重启应用）。
+ *
+ * ★ 教训：`Record<K, V[]>` 这种「值声明为数组」的类型一旦与后端不符，
+ * TypeScript **不会报错**（它只信声明），运行时才炸，而且炸在最难查的地方。
+ * 跨语言报文的类型必须**对着实际发送方**写 —— 本仓库 `AGENTS.md` 里
+ * `#[serde(flatten)]` 那条踩坑记录是同一类错误的另一种表现。
+ */
+export type GatewayAccountModelsRaw = Record<string, Record<string, GatewayUsageTotals>>;
+
+/**
+ * 把 `accountModels` 归一化成前端各处都在用的 `GatewayUsageGroup[]`。
+ *
+ * 为什么归一化放在**一处**而不是让每个消费点自己 `Object.entries`：
+ * 本页有 6 处用到它（反向索引 / 覆盖度 / 交叉索引 / 占比基准 / 汇总口径…），
+ * 各写一遍必然漂移 —— 这正是本仓库反复记录的教训。
+ *
+ * 兼容两种形状：
+ *   - 对象 `{ "glm-5.3": {...} }`（**网关的真实输出**）
+ *   - 数组 `[{ key: "glm-5.3", ... }]`（若将来网关改成数组也能吃下）
+ *
+ * ★★ **缺失时返回 `undefined`，而不是 `{}`** —— 这一点是必须的：
+ * `GatewayPage` 有 14 处 `if (!usageAccountModels)` 走「旧版网关没有交叉明细」
+ * 的降级分支，而**空对象是 truthy** ⇒ 若把缺失归一成 `{}`，那些降级分支会
+ * 全部失效，界面就会把「拿不到明细」显示成「这个号没用过任何模型」——
+ * 那正是本页注释里反复强调「最容易犯、也最伤人的假结论」。
+ *
+ * 对非对象非数组的值（`null` / 字符串 / 数字）返回 `{}` 而**不是抛异常**：
+ * 这个函数跑在渲染路径上，抛异常就是白屏。
+ */
+export function normalizeAccountModels(
+  raw: unknown,
+): Record<string, GatewayUsageGroup[]> | undefined {
+  // 缺失 ⇒ undefined（保住调用方的降级分支，见上）
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object") return {};
+
+  const out: Record<string, GatewayUsageGroup[]> = {};
+
+  for (const [uid, value] of Object.entries(raw as Record<string, unknown>)) {
+    // 形状①：数组（含 key 字段）
+    if (Array.isArray(value)) {
+      out[uid] = value.filter(
+        (v): v is GatewayUsageGroup =>
+          !!v && typeof v === "object" && typeof (v as GatewayUsageGroup).key === "string",
+      );
+      continue;
+    }
+    // 形状②：对象 { 模型名: 计数 }
+    if (value && typeof value === "object") {
+      const list: GatewayUsageGroup[] = [];
+      for (const [model, totals] of Object.entries(value as Record<string, unknown>)) {
+        if (totals && typeof totals === "object") {
+          list.push({ key: model, ...(totals as GatewayUsageTotals) });
+        }
+      }
+      out[uid] = list;
+    }
+    // 其它一律当空（宁可少显示，不可白屏）
+  }
+  return out;
+}
+
 /** 网关 /usage 响应（enabled=false 表示该网关未启用统计）。 */
 export interface GatewayUsageSnapshot {
   enabled: boolean;
@@ -1328,8 +1414,12 @@ export interface GatewayUsageSnapshot {
    * 界面「按账号筛选看用了哪些模型」才有可信数据。
    *
    * 缺失（老版本网关）时按「无明细」处理，不回退到假的交叉结果。
+   *
+   * ⚠ 这里是**线上原始形状**（`{ uid: { 模型名: 计数 } }`），不是数组 ——
+   * 详见 [`GatewayAccountModelsRaw`] 的注释（它记录了一次白屏事故）。
+   * 消费前必须过 [`normalizeAccountModels`] 转成 `GatewayUsageGroup[]`。
    */
-  accountModels?: Record<string, GatewayUsageGroup[]>;
+  accountModels?: GatewayAccountModelsRaw;
   /**
    * 模型 → 该模型的**按计费归属拆开**的用量列表（2026-09-21 新增）。
    *
@@ -1620,5 +1710,68 @@ export interface AgentBackupItem {
   id: string;
   createdAt: number;
   path: string;
+}
+
+// ---------------------------------------------------------------------------
+// 本机 AI CLI 登录额度查询（Codex / Claude / Antigravity / Grok / Kimi）
+// ---------------------------------------------------------------------------
+
+/** 支持的 CLI provider 标识；与后端 `CliProvider::id()` 对齐。 */
+export type CliQuotaProvider = "codex" | "claude" | "antigravity" | "xai" | "kimi";
+
+/** 单个额度窗口。 */
+export interface CliQuotaWindow {
+  /** 窗口展示名，如「5 小时」「每周」。 */
+  label: string;
+  /**
+   * 剩余百分比（0..100）。
+   *
+   * `null` = 上游没给出可比口径，界面必须显示「—」而**不是 0** ——
+   * 0 代表「已用尽」，把未知渲染成用尽会误导用户去等重置。
+   */
+  remainingPercent: number | null;
+  /** 重置时刻（Unix 毫秒）。 */
+  resetAtMs: number | null;
+  /** 附注（如「$25.00 / $100.00」）。 */
+  detail: string | null;
+}
+
+/** Codex 的手动重置次数。 */
+export interface CliResetCredit {
+  available: number | null;
+  applicable: number | null;
+  earliestExpiryMs: number | null;
+}
+
+/** 单个 provider 账号的额度视图（不含任何 token）。 */
+export interface CliQuotaAccount {
+  /** 稳定账号 id：`<provider>:<凭证来源>`。 */
+  id: string;
+  provider: CliQuotaProvider;
+  /** provider 展示名。 */
+  providerLabel: string;
+  /** 账号展示名（邮箱 / 用户名）。 */
+  label: string;
+  /** 本机是否已有登录态。 */
+  loggedIn: boolean;
+  /** 凭证来源说明（排查用，不含 token）。 */
+  source: string;
+  plan: string | null;
+  windows: CliQuotaWindow[];
+  /** 失败原因；成功时为 null。 */
+  error: string | null;
+  /** 本次查询时间（Unix 毫秒）。 */
+  fetchedAt: number;
+  resetCredits: CliResetCredit | null;
+  subscriptionActiveUntil: string | null;
+}
+
+/** 单个 provider 的登录态（不触网）。 */
+export interface CliQuotaStatusItem {
+  provider: CliQuotaProvider;
+  label: string;
+  loggedIn: boolean;
+  /** 未登录时引导用户去哪里登录。 */
+  loginHint: string;
 }
 

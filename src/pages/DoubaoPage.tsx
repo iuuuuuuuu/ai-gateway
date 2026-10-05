@@ -16,7 +16,10 @@ import {
   UserPlus,
 } from "lucide-react";
 
+import { AppEnvConfigCard } from "@/components/app-env-config-card";
+import { DoubaoInsights } from "@/components/doubao-insights";
 import { DoubaoMark } from "@/components/product-marks";
+import { PlatformConfigButton, PlatformConfigDialog } from "@/components/platform-config-dialog";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -38,6 +41,15 @@ import * as api from "@/lib/api";
 import { SENSITIVE_STRING_INPUT_PROPS } from "@/lib/sensitive-input";
 import type { AppEnvStatus, DoubaoAccountView, DoubaoQuotaView } from "@/lib/api";
 import { cn } from "@/lib/utils";
+
+/**
+ * 「配置」弹窗里的应用环境条目：豆包客户端的安装路径。
+ *
+ * 只含本平台自己的应用 —— 两个 Trae 客户端那两条归 Trae 页，设置页不再
+ * 集中展示（所有者强约束：平台专属配置下放到各自 tab 的「配置」里）。
+ * 写成模块级常量而不是在组件里现建：它进了 `load` 的依赖数组。
+ */
+const DOUBAO_ENV_KINDS = [{ kind: "Doubao", label: "豆包", hint: "Doubao.exe" }] as const;
 
 /** 会话状态展示。 */
 function sessionBadge(account: DoubaoAccountView) {
@@ -185,15 +197,28 @@ function QuotaDialog({
   );
 }
 
-export default function DoubaoPage() {
+/**
+ * 豆包账号页。
+ *
+ * `embedded`：被「账号管理」页（AccountHubPage）以 tab 内容嵌进来时为 true ——
+ * 去掉最外层留白容器与页面级大标题，只保留自己的四个操作按钮与全部内容。
+ * 默认 false 时行为与合并前**逐字一致**。
+ */
+export default function DoubaoPage({ embedded = false }: { embedded?: boolean } = {}) {
   const [accounts, setAccounts] = useState<DoubaoAccountView[]>([]);
   const [lastKeepaliveAt, setLastKeepaliveAt] = useState<string | null>(null);
+  // 健康史（额度趋势 / 保活·续期·巡检计数 / 最近事件）。
+  // 与账号列表分开存：它来自本地记录文件，账号列表来自凭证库，
+  // 两者互不依赖，一个缺失不该让另一个也不显示。
+  const [history, setHistory] = useState<api.DoubaoHistory | null>(null);
   const [env, setEnv] = useState<AppEnvStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [quota, setQuota] = useState<DoubaoQuotaView | null>(null);
   const [diagOpen, setDiagOpen] = useState(false);
   const [diag, setDiag] = useState<Record<string, unknown> | null>(null);
+  // 「配置」弹窗：应用环境（豆包客户端的安装路径）。
+  const [configOpen, setConfigOpen] = useState(false);
 
   // 新增/编辑
   const [editOpen, setEditOpen] = useState(false);
@@ -211,13 +236,17 @@ export default function DoubaoPage() {
 
   const load = useCallback(async () => {
     try {
-      const [list, envStatus] = await Promise.all([
+      const [list, envStatus, hist] = await Promise.all([
         api.doubaoListAccounts(),
         api.appEnvCheck("Doubao"),
+        // 健康史是**本地记录**，读不到不算错误（新装机器上还没有记录文件），
+        // 故单独 catch 成 null：不能让它的失败把账号列表一起吞掉。
+        api.doubaoHistory(30).catch(() => null),
       ]);
       setAccounts(list.accounts);
       setLastKeepaliveAt(list.lastKeepaliveAt);
       setEnv(envStatus);
+      setHistory(hist);
     } catch (e) {
       toast.error(api.asError(e));
     } finally {
@@ -482,19 +511,24 @@ export default function DoubaoPage() {
 
   return (
     <TooltipProvider delayDuration={250}>
-      <div className="mx-auto max-w-5xl space-y-5 p-6">
+      <div className={embedded ? "space-y-5" : "mx-auto max-w-5xl space-y-5 p-6"}>
         <header className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h1 className="flex items-center gap-2 text-xl font-semibold tracking-tight">
-              <DoubaoMark size={26} />
-              豆包账号
-            </h1>
-            <p className="mt-1 text-sm text-muted-foreground">
-              豆包客户端在 Chromium 加密之外还有一层客户端级加密，离线读不出明文凭证 ——
-              请用本地代理抓包自动获取，或用「保活」触发服务端滑动续期。
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
+          {/* 嵌入时只保留操作按钮行：说明文案改由「账号管理」页的豆包 tab 承担
+              （那里要写明「不参与兼容网关路由」），这里再写一遍就是重复。 */}
+          {!embedded && (
+            <div>
+              <h1 className="flex items-center gap-2 text-xl font-semibold tracking-tight">
+                <DoubaoMark size={26} />
+                豆包账号
+              </h1>
+              <p className="mt-1 text-sm text-muted-foreground">
+                豆包客户端在 Chromium 加密之外还有一层客户端级加密，离线读不出明文凭证 ——
+                请用本地代理抓包自动获取，或用「保活」触发服务端滑动续期。
+              </p>
+            </div>
+          )}
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <PlatformConfigButton onClick={() => setConfigOpen(true)}>配置</PlatformConfigButton>
             <Button variant="outline" size="sm" disabled={busy} onClick={() => void openDiagnose()}>
               <Stethoscope className="size-3.5" />
               诊断
@@ -694,6 +728,19 @@ export default function DoubaoPage() {
           </CardContent>
         </Card>
 
+        {/* 运维概览：额度趋势 + 健康卡 + 最近记录。
+            放在账号列表之后：账号是"要操作的对象"，这里是"回看历史"，
+            先操作后回顾。`health.lastKeepaliveAt` 优先于列表里的值 ——
+            前者来自健康记录（更精确），后者是账号库上的汇总字段。 */}
+        {history && (
+          <DoubaoInsights
+            trend={history.trend}
+            health={history.health}
+            events={history.events}
+            lastKeepaliveAt={history.health.lastKeepaliveAt ?? lastKeepaliveAt}
+          />
+        )}
+
         {/* 编辑弹窗 */}
         <Dialog open={editOpen} onOpenChange={setEditOpen}>
           <DialogContent className="sm:max-w-lg">
@@ -813,6 +860,16 @@ export default function DoubaoPage() {
         </Dialog>
 
         <QuotaDialog quota={quota} onClose={() => setQuota(null)} />
+
+        {/* 平台配置：豆包客户端的安装路径（原先在设置页的「应用环境」）。 */}
+        <PlatformConfigDialog
+          open={configOpen}
+          onOpenChange={setConfigOpen}
+          title="豆包配置"
+          description="豆包客户端的安装路径。自动探测失败时可在此手动指定。"
+        >
+          <AppEnvConfigCard kinds={DOUBAO_ENV_KINDS} id="doubao-app-env" />
+        </PlatformConfigDialog>
       </div>
     </TooltipProvider>
   );

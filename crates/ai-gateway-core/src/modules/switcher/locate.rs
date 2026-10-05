@@ -4,14 +4,24 @@
 //!
 //! 级别顺序（命中即返回，全部经 `exe_names` 白名单过滤防串台）：
 //! 1. 设置里手动指定的路径（`settings_path_key`）
-//! 2. 档案内的候选路径（`exe_candidates`）
-//! 3. 开始菜单 / 桌面 `.lnk` 快捷方式
-//! 4. 注册表 Uninstall 键
-//! 5. 正在运行的进程
-//! 6. 上次成功启动的缓存
+//! 2. 上次成功发现的缓存（`{settings_path_key}_exe.json`）
+//! 3. 档案内的候选路径（`exe_candidates`）
+//! 4. 开始菜单 / 桌面 `.lnk` 快捷方式
+//! 5. 注册表 Uninstall 键
+//! 6. 正在运行的进程
 //!
 //! 为什么需要这么多级：客户端安装位置五花八门（`%LOCALAPPDATA%\Programs`、
 //! `%ProgramFiles%`、自定义盘符、绿色版），任何单一来源都会在部分机器上落空。
+//!
+//! 为什么缓存排在第 2 而不是最后：第 4 级每命中一个 `.lnk` 就要起一个 PowerShell
+//! 跑 `WScript.Shell` COM 解析目标（本机实测 ~280 ms/个），第 6 级要先枚举进程
+//! 再按 pid 反查映像路径。`app_env_check` / `current_account` 这类接口在 GUI
+//! 启动瞬间会被连打多次，每次把整条链走一遍是纯浪费。缓存命中时整条链退化成
+//! 一次 `is_file()` + 一次白名单校验。
+//!
+//! 缓存前置的安全性：① 改手动路径时 `app_set_manual_path` 会 `clear_exe_cache`；
+//! ② 缓存里的路径仍要过 `is_file()` 与 `exe_matches()` 白名单，客户端被卸载 /
+//! 换目录后不会命中旧路径，也不会串台到别的应用。
 
 use std::path::{Path, PathBuf};
 
@@ -24,37 +34,45 @@ pub fn find_exe(sess: &Session) -> Result<PathBuf, String> {
 }
 
 /// 带缓存写入的查找（供 [`Session`] 持有可变缓存时使用）。
+///
+/// 命中第 3 级及以后（需要跑子进程 / 查注册表的那几级）时会把结果写回缓存，
+/// 下次直接命中第 2 级。手动路径命中不写缓存 —— 它本身就只有一次 `is_file()`。
 pub fn find_exe_cached(sess: &Session, prof: &AppProfile) -> Result<PathBuf, String> {
-    // 1. 设置里的手动路径
+    // 1. 设置里的手动路径（用户显式指定，永远最优先；改路径时会清缓存）
     if let Some(path) = manual_path(prof) {
         if path.is_file() && exe_matches(&path, prof) {
             return Ok(path);
         }
     }
-    // 2. 档案候选
-    for candidate in &prof.exe_candidates {
-        if candidate.is_file() && exe_matches(candidate, prof) {
-            return Ok(candidate.clone());
-        }
-    }
-    // 3. .lnk 快捷方式
-    if let Some(path) = from_lnk(prof) {
-        return Ok(path);
-    }
-    // 4. 注册表 Uninstall 键
-    if let Some(path) = from_registry(prof) {
-        return Ok(path);
-    }
-    // 5. 正在运行的进程
-    if let Some(path) = super::proc::running_exe_of(prof) {
-        if exe_matches(&path, prof) {
-            return Ok(path);
-        }
-    }
-    // 6. 上次启动缓存
+    // 2. 上次成功发现的缓存（校验通过即返回，避免重复走下面几级）
     if let Some(cached) = read_exe_cache(sess, prof) {
         if cached.is_file() && exe_matches(&cached, prof) {
             return Ok(cached);
+        }
+    }
+    // 3. 档案候选
+    for candidate in &prof.exe_candidates {
+        if candidate.is_file() && exe_matches(candidate, prof) {
+            let path = candidate.clone();
+            save_exe_cache(sess, prof, &path);
+            return Ok(path);
+        }
+    }
+    // 4. .lnk 快捷方式
+    if let Some(path) = from_lnk(prof) {
+        save_exe_cache(sess, prof, &path);
+        return Ok(path);
+    }
+    // 5. 注册表 Uninstall 键
+    if let Some(path) = from_registry(prof) {
+        save_exe_cache(sess, prof, &path);
+        return Ok(path);
+    }
+    // 6. 正在运行的进程
+    if let Some(path) = super::proc::running_exe_of(prof) {
+        if exe_matches(&path, prof) {
+            save_exe_cache(sess, prof, &path);
+            return Ok(path);
         }
     }
     Err(format!(

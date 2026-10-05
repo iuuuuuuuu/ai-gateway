@@ -29,9 +29,13 @@ import { SettingsFieldRow, SettingsGroup } from "@/components/settings-primitive
 //     失败有冷却（见该处日志文案「启动即跑，之后每 5m0s 轮询」）
 //   · Qoder / ZCode 权益活动：`multi_product_credit_patrol::run_once`
 //     —— 每 **20 分钟**一轮，随额度巡检一起（见 `PATROL_INTERVAL`）
+//   · ZCode 激活：`multi_product_credit_patrol::warm_zcode_accounts`
+//     —— 宿主**启动后每账号一次**（幂等：距上次 ≥ 7 天才重报，见
+//     `WARM_REFRESH_AFTER`；标记落在账号库的 `warmed_at`）。**不是**定时轮询。
+//     也可由用户点账号卡片的「激活」立即触发（`api.zcodeWarmAccount`）。
 //   · 活动重置：**每天 10:00（UTC+8）**（来自上游活动描述，实测）
 //
-// ⚠ 改这里之前先核对上面三处源码 —— 文案与行为不一致比没有文案更糟：
+// ⚠ 改这里之前先核对上面四处源码 —— 文案与行为不一致比没有文案更糟：
 // 用户会照着它判断"为什么还没领到"。
 export function ZcodeAutoClaimScheduleCard() {
   return (
@@ -50,6 +54,22 @@ export function ZcodeAutoClaimScheduleCard() {
           <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
             <CalendarClock className="size-3.5" />
             约 5 分钟一轮
+          </span>
+        </SettingsFieldRow>
+
+        <SettingsFieldRow
+          label="ZCode 激活"
+          description={
+            <>
+              宿主<strong className="font-medium text-foreground">启动后每账号各一次</strong>（上报官方启动事件 <code className="text-[11px]">app_launch</code> /
+              <code className="text-[11px]">app_daily_active</code> 并领取套餐）。已激活过的账号<strong className="font-medium text-foreground">不重复上报</strong> ——
+              距上次超过 7 天才重报一次。账号卡片上的「已激活 / 从未激活」就是它。
+            </>
+          }
+        >
+          <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+            <CalendarClock className="size-3.5" />
+            每次启动一次
           </span>
         </SettingsFieldRow>
 
@@ -73,8 +93,9 @@ export function ZcodeAutoClaimScheduleCard() {
           <Alert>
             <Info />
             <AlertDescription>
-              自动任务**在后台运行**，无需保持本页面打开；但要<strong className="font-medium">网关处于运行状态</strong>。
-              想立刻验证而不等下一轮，可在上面的「立即领取」里手动跑一次。
+              自动任务<strong className="font-medium text-foreground">在后台运行</strong>，
+              无需保持本页面打开；但要<strong className="font-medium">网关处于运行状态</strong>。
+              想立刻验证而不等下一轮，可在账号卡片的菜单里手动跑一次。
             </AlertDescription>
           </Alert>
         </div>

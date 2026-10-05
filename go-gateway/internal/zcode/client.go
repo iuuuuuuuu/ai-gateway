@@ -52,6 +52,21 @@ type Client struct {
 	// 与 anthropicBaseOverride 同一个理由：领取是真打上游的写操作，
 	// 集成测试不该真的去领一遍（会消费账号的领取机会，也可能触发风控）。
 	claimBaseOverride string
+
+	// eventBaseOverride 覆盖**激活事件端点**的基址（仅测试用）。
+	//
+	// 同一个理由，而且这里更硬：`app_daily_active` 上游是**按 device_mid +
+	// 日期去重**的 —— 测试若打到真实上游，就会把该账号当天那一次
+	// daily_active 真的用掉，之后正式激活时上游会认为"今天已经活跃过"。
+	// 事件上报虽然不带认证头，但它确实是一次真实的写操作。
+	eventBaseOverride string
+
+	// mintCaptchaFn 覆盖验证码铸造（仅测试用）。
+	//
+	// 真求解会起 Node 进程（约 3 秒）并**真的打上游**换 param，连续求解
+	// 还会被上游限流（求解器报 `[pe-stall]`，约 90 秒才恢复）。单测绝不能
+	// 走那条路，故留一个可注入的铸造函数（见 SetCaptchaMinterForTest）。
+	mintCaptchaFn func(ctx context.Context) (param, region string, err error)
 }
 
 // SetAnthropicBaseForTest 覆盖 Anthropic 端点基址（**仅测试用**）。
@@ -69,6 +84,36 @@ func (c *Client) SetClaimBaseForTest(base string) { c.claimBaseOverride = base }
 func (c *Client) claimHost(cr *Cred) string {
 	if c.claimBaseOverride != "" {
 		return c.claimBaseOverride
+	}
+	return cr.Provider.QuotaHost()
+}
+
+// SetEventBaseForTest 覆盖**激活事件端点**基址（**仅测试用**）。
+//
+// 见 eventBaseOverride 的注释：`app_daily_active` 上游按 device_mid + 日期
+// 去重，测试打到真实上游会真的消耗掉该账号当天的活跃记录。
+func (c *Client) SetEventBaseForTest(base string) { c.eventBaseOverride = base }
+
+// SetCaptchaMinterForTest 注入验证码铸造函数（**仅测试用**）。
+//
+// 传 nil 恢复真实求解。见 mintCaptchaFn 的注释：真求解会起 Node 进程并
+// 真的打上游，单测必须能绕开它。
+func (c *Client) SetCaptchaMinterForTest(
+	fn func(ctx context.Context) (param, region string, err error),
+) {
+	c.mintCaptchaFn = fn
+}
+
+// eventHost 激活事件端点用的 host（测试覆盖优先）。
+//
+// 事件与领取走**同一个 host**：两者在官方客户端里都是同一个业务网关
+// （`zcode.z.ai`），参考实现也是这么分派的（它的 OriginBaseURL 同时供
+// 事件与 billing 使用）。这里单独留一个覆盖点，是因为事件与领取要能
+// **分别**被测试指向不同的 httptest 服务器 —— 一个测试要验证"事件失败
+// 就不领取"，就必须让事件端点失败而领取端点仍可观测到"没有被调用"。
+func (c *Client) eventHost(cr *Cred) string {
+	if c.eventBaseOverride != "" {
+		return c.eventBaseOverride
 	}
 	return cr.Provider.QuotaHost()
 }
@@ -549,6 +594,13 @@ func IsCaptchaRequiredBody(body []byte) bool {
 //
 // 现在改成：**把说明放进 error.message**（结构不变，说明也能透出）。
 func appendCaptchaNote(body []byte, reason string) []byte {
+	// ⚠ 先过一遍风控码注释：求解失败的原因里可能带着阿里云 SDK 回传的
+	// verifyCode（F001/T001/T002），那是**唯一可操作的线索** ——
+	// 直接透传 `verify rejected: {"verifyCode":"F001"}` 用户看不懂，
+	// 而「换住宅出口」这个动作才是他要做的（见 errors.go 的 riskCodeHints）。
+	// 认不出码时 AnnotateRiskCode 原样返回，不损失任何信息。
+	reason = AnnotateRiskCode(reason)
+
 	note := fmt.Sprintf(
 		"（网关附注：上游要求人机验证，但求解未成功，故未重试。原因：%s"+
 			"；若为组件缺失请确认安装包含 assets/zcode-captcha，"+

@@ -57,6 +57,16 @@ const (
 	// defaultChatGap 真实对话之间的间隔。对话比事件上报昂贵（消耗 token 且
 	// 在上游留下真实会话记录），间隔取更大值。
 	defaultChatGap = 6 * time.Second
+	// defaultMPChatGap 小程序对话事件之间的间隔（Sequential_Tasks_1/_3）。
+	//
+	// 45 秒不是保守取值，而是**该任务的反作弊阈值**：上游对「有效对话」有
+	// 节奏校验，数秒级连发的事件会先被计入进度（回读 5/5、accept_status
+	// 甚至短暂变 completed），随后被判定无效**整体回滚** —— 进度回落、
+	// claim 返回 400 task not completed。参考实现 2026-09-26 实测：2 秒连发
+	// 4 条全灭；45 秒间隔逐条上报全存活且领奖成功。
+	//
+	// 调小这个值不会「更快完成」，只会让本轮的上报全部作废。
+	defaultMPChatGap = 45 * time.Second
 )
 
 // Options 构造参数。
@@ -77,6 +87,10 @@ type Options struct {
 	ReportGap time.Duration
 	// ChatGap 真实对话间隔（<=沿用默认）。
 	ChatGap time.Duration
+	// MPChatGap 小程序对话事件间隔（<=沿用默认 45s，见 defaultMPChatGap）。
+	//
+	// 测试必须把它压到毫秒级，否则一个 _3 用例要真睡 5×45 秒。
+	MPChatGap time.Duration
 }
 
 // Runner 成长任务执行器。
@@ -92,6 +106,7 @@ type Runner struct {
 	pollGap      time.Duration
 	reportGap    time.Duration
 	chatGap      time.Duration
+	mpChatGap    time.Duration
 
 	mu   sync.Mutex
 	busy map[string]bool
@@ -112,6 +127,7 @@ func New(o Options) *Runner {
 		pollGap:      o.PollGap,
 		reportGap:    o.ReportGap,
 		chatGap:      o.ChatGap,
+		mpChatGap:    o.MPChatGap,
 		busy:         make(map[string]bool),
 	}
 	if r.pollAttempts <= 0 {
@@ -125,6 +141,9 @@ func New(o Options) *Runner {
 	}
 	if r.chatGap <= 0 {
 		r.chatGap = defaultChatGap
+	}
+	if r.mpChatGap <= 0 {
+		r.mpChatGap = defaultMPChatGap
 	}
 	return r
 }
@@ -247,7 +266,7 @@ func (r *Runner) RunOne(ctx context.Context, a *auth.Auth, code string) ItemResu
 	}
 	// 未报名则先报名：未报名时上游不下发 progress，动作执行后无法回读验证。
 	if t.NeedsAccept() {
-		if _, err := r.up.AcceptGrowthTasks(a, []string{code}); err != nil {
+		if _, err := r.acceptTasks(a, []string{code}); err != nil {
 			log.Printf("growtask: accept %s uid=%s: %v（继续走行为链路）", code, uid8(a.UID), err)
 		} else if refreshed := r.refetch(a, code); refreshed != nil {
 			t = refreshed
@@ -298,7 +317,7 @@ func (r *Runner) acceptPending(a *auth.Auth, tasks []upstream.GrowthTask) *ItemR
 		return nil
 	}
 	res := &ItemResult{Code: "(批量报名)", Desc: "报名尚未参加的任务"}
-	results, err := r.up.AcceptGrowthTasks(a, codes)
+	results, err := r.acceptTasks(a, codes)
 	if err != nil {
 		// 报名失败不阻塞后续动作：行为事件才是进度的唯一判据，
 		// 而报名只是让服务端开始跟踪进度。若真的因为未报名而不计分，
@@ -317,6 +336,51 @@ func (r *Runner) acceptPending(a *auth.Auth, tasks []upstream.GrowthTask) *ItemR
 	}
 	res.Message = fmt.Sprintf("已报名 %d 个任务（其中 %d 个为本次新报名）", len(codes), news)
 	return res
+}
+
+// acceptTasks 报名一组任务，按任务码所属口径分派平台头。
+//
+// # 为什么必须分派
+//
+// 小程序限定任务（mpOnlyCodes）的报名要求 X-Client-Platform: miniprogram。
+// 缺该头时上游返回 **HTTP 200 + code=0**，但逐条结果是
+// {"status":"error","message":"task not found"} —— 报名根本没发生，
+// 而只看 HTTP 状态（甚至只看 code=0）会以为成功了。这正是本次移植前
+// 真实账号上 Sequential_Tasks_1 报名后仍无 progress 的原因。
+//
+// # 为什么不给整批统一加 mp 头
+//
+// RunAll 的批量报名把当轮**所有**未报名任务并成一次请求，通常是混合批次
+//（普通任务 + 小程序任务）。给整批加 mp 头是另一种输入，其行为未经验证，
+// 所以按码分组、分别请求，再合并结果。
+//
+// 失败时返回**已受理的部分结果**而非丢弃：混合批次里一半成功一半失败是
+// 常见形态，调用方据此能给出诚实的汇报，而不是把已成功的那些也说成失败。
+func (r *Runner) acceptTasks(a *auth.Auth, codes []string) ([]upstream.AcceptResult, error) {
+	var plain, mp []string
+	for _, c := range codes {
+		if mpOnlyCodes[c] {
+			mp = append(mp, c)
+		} else {
+			plain = append(plain, c)
+		}
+	}
+	var out []upstream.AcceptResult
+	if len(plain) > 0 {
+		res, err := r.up.AcceptGrowthTasks(a, plain)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, res...)
+	}
+	if len(mp) > 0 {
+		res, err := r.up.AcceptTasksMP(a, mp)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, res...)
+	}
+	return out, nil
 }
 
 // runAction 执行单项任务的完整闭环：执行 → 回读（轮询）→ 达标领奖。
@@ -342,6 +406,29 @@ func (r *Runner) runAction(ctx context.Context, a *auth.Auth, act action, before
 		item.Message = "进度已达标，直接领奖"
 		item.ProgressAfter = before.ProgressText()
 		r.claim(a, act.Code, &item)
+		return item
+	}
+	// 未解锁的任务**必须**在这里挡住（2026-09-30 实测缺陷）。
+	//
+	// # 为什么这是缺陷而不是保守
+	//
+	// 对 locked 的 Sequential_Tasks_2（unlock_at=2026-10-01T00:00:00+08:00）
+	// 走完整链路，上游返回 HTTP 200、**不报任何错**，动作函数也如实汇报
+	// 「已上报事件」，于是整项被判成 done —— 而真实结果是事件被服务端
+	// 静默丢弃、进度从 not_accepted 到 not_accepted 纹丝不动。
+	//
+	// 这正是本包存在的根本理由（「上报 200 ≠ 计分」）在**新维度**上的复现：
+	// 此前只在「客户端指纹不对」时见过静默丢弃，现在知道**未解锁**同样如此。
+	// 二者都无法从单次响应里看出来，只能靠前置条件判断。
+	//
+	// 判成 StatusSkipped 而不是 StatusError：上游一切正常，是时间没到，
+	// 报错会让用户以为程序或账号出了问题，而实际只需要等。
+	//
+	// 位置在 Claimable 之后：万一上游下发了「已达标但带锁」的矛盾组合，
+	// 领奖是纯读奖励、不发行为事件，试一次没有代价；而发行为事件没有意义。
+	if before.Locked {
+		item.Status = StatusSkipped
+		item.Message = lockedText(before.UnlockAt) + "，现在执行不会计分（上游会静默丢弃），已跳过"
 		return item
 	}
 
@@ -386,7 +473,7 @@ func (r *Runner) runAction(ctx context.Context, a *auth.Auth, act action, before
 // 把它标成失败会让用户以为白做了。真实情况是「达标但领奖没成功」，
 // 用 ClaimError 单独表达，用户可在界面上手动重试。
 func (r *Runner) claim(a *auth.Auth, code string, item *ItemResult) {
-	credit, energy, already, err := r.up.ClaimGrowthTask(a, code)
+	credit, energy, already, err := r.claimReward(a, code)
 	if err != nil {
 		item.ClaimError = err.Error()
 		if upstream.IsGrowthTaskNotCompleted(err) {
@@ -405,6 +492,25 @@ func (r *Runner) claim(a *auth.Auth, code string, item *ItemResult) {
 	item.Credit = credit
 	item.Energy = energy
 	item.Message += fmt.Sprintf("；已自动领奖 +%d 积分 +%d 能量", credit, energy)
+}
+
+// claimReward 领奖，按任务码所属口径分派领奖接口。
+//
+// # 为什么小程序任务要单独一条路径
+//
+// 小程序限定任务的领奖走聊天域（chatBase）+ mp 头；普通任务走 Web 域
+// （www.workbuddy.cn）。用错域的表现是 HTTP 400 —— 与「任务未达标」
+// 是同一个状态码，两者从响应上分不出来（见 upstream.IsGrowthTaskNotCompleted）。
+// 换句话说：走错域的失败会被报成「计分可能还在落定」，用户会一直重试，
+// 而任务永远领不到。故必须按码分派，不能靠试错。
+//
+// ClaimRewardMP 自身在 4xx 时回落到 Web 域路径（有些 mp 任务的实际领奖
+// 入口在 Web 域），5xx 不回落 —— 上游故障换域重试不会改善。
+func (r *Runner) claimReward(a *auth.Auth, code string) (credit, energy int64, already bool, err error) {
+	if mpOnlyCodes[code] {
+		return r.up.ClaimRewardMP(a, code)
+	}
+	return r.up.ClaimGrowthTask(a, code)
 }
 
 // waitProgress 在轮询预算内回读任务进度，直到达标/已领取或预算耗尽。

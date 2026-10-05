@@ -22,6 +22,7 @@ package zcode
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -413,4 +414,152 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// ---------------------------------------------------------------------------
+// 验证码求解器回传的 verifyCode（F001 / T001 / T002 …）
+// ---------------------------------------------------------------------------
+
+// riskRawLimit 认不出 verifyCode 时，回退展示的原文截断长度。
+//
+// 取 300 与参考实现（`zcode-yourhoneypomelo` 的 `_format_risk_reject`，
+// 其 `json.dumps(msg, ensure_ascii=False)[:300]`）对齐 —— 口径一致才好对照。
+//
+// ⚠ 为什么必须截断而不是整段透传：求解器失败时 stderr 可能带 SDK 的整页
+// 调试输出（`[guest-err]` 系列），无界写进响应体既刷屏又会把真正的原因挤到
+// 用户看不到的地方。
+const riskRawLimit = 300
+
+// 阿里云验证码 SDK 回传给求解器的风控码（verifyCode）。
+//
+// # 这些码从哪来
+//
+// 求解器在 `success` 回调里拿到 `{verifyResult:false, verifyCode:…}` 时
+// 会把它**抛成错误**（本地 Node：`assets/zcode-captcha/solver.js` 的
+// `handleCaptchaResult`；宿主：`src-tauri/src/captcha_webview.rs` 的
+// `fail` / `onError` 回调把整个 err 对象 `JSON.stringify` 后回报）。
+//
+// # ⚠ 可达性（**别把这张表当成已经生效**）
+//
+// 宿主（WebView2）路径的 `error` 字段**确实**会把码带回 Go 侧
+// （见 `captcha.go` 的 `solveViaExternal` → `宿主求解失败：%s`），
+// 故那张路径上是活的。
+//
+// 而本地 Node 回退路径默认**带不回来**：`solver.js` 打印失败原因的
+// `dbg("[solve-fail] …")` 受 `CAPTCHA_DEBUG` 开关控制（默认关），
+// 于是 `captcha.go` 只能拿到一句 `exit status 4`。
+// 这是**已知的、未修的**信息损失 —— 不在本次改动范围内（改求解器行为
+// 属于另一件事），这里如实记下来，免得日后误判成"映射表没接线"。
+//
+// 因此本表的定位是：**能拿到码时给出可操作提示，拿不到时如实回退原文**。
+const (
+	// RiskEnvRejected 环境风险：出口 IP / 运行环境被判定为自动化或数据中心。
+	//
+	// 实测来源：`zcode-a137460387/src/captcha/browser.js` 记着
+	// 「headless + 默认 UA → F001」，即 SDK 据此识别自动化环境。
+	RiskEnvRejected = "F001"
+	// RiskVerifyExpired 验证参数已过期。
+	RiskVerifyExpired = "T001"
+	// RiskVerifyUsed 验证参数已被使用（param 是一次性的）。
+	RiskVerifyUsed = "T002"
+)
+
+// riskCodeHints verifyCode → 面向用户的可操作提示。
+//
+// # 合规立场（写文案前必读）
+//
+// 这里做的是**如实告知用户"你被风控了、以及为什么"** —— 是透明度，
+// **不是**绕过。故文案里绝不出现"如何骗过风控"的动作，只说明现象与出路。
+// 与 `ErrCaptchaRequired` 的既有立场一致（见其定义处："刻意不实现绕过"）。
+//
+// # 为什么 T001/T002 说的是"下一次请求"而不是"自动刷新"
+//
+// 参考实现（`zcode-yourhoneypomelo`）的原话是「网关会自动刷新重试」。
+// **我们这里不能照抄** —— 实测核对：本项目的求解器
+// （`captcha.go`）**没有**"检测到 param 失效就主动作废缓存/重新求解"的动作
+// （全文件 grep `invalidate` 零命中）。真实的语义是：
+//
+//	StreamChat：先不带 param 发一次 → 吃 3007 → 现解一个 → 带新 param 重发
+//	claimWithCaptcha：每次尝试都**新铸**一个 param（最多两次）
+//
+// 即"**下一次请求会重新求解一次**"，而不是"网关自己发现失效并刷新"。
+// 照抄参考实现就是说满了 —— 用户会以为不用管，而实际需要再发一次请求。
+var riskCodeHints = map[string]string{
+	RiskEnvRejected: "当前出口 IP / 运行环境被上游风控识别（云服务器、数据中心 IP、" +
+		"或自动化环境几乎必现）。出路是让请求从一个**住宅/家宽出口**发出：" +
+		"在网关的代理设置里填地址。⚠ 该代理按区域生效 —— " +
+		"默认**只对国际版开启、国服关闭**（`proxy_scope`），" +
+		"若 ZCode 流量走的是未勾选的区域，填了代理也不会经过它。",
+	RiskVerifyExpired: "验证参数已过期（阿里云验证码的 param 寿命约 90 秒）。" +
+		"网关会在**下一次请求**时重新求解一个新的参数并重试，通常无需手动干预。",
+	RiskVerifyUsed: "验证参数已被使用（每个 param 只能用一次）。" +
+		"网关会在**下一次请求**时重新求解一个新的参数并重试，通常无需手动干预。",
+}
+
+// riskCodeJSONRe 优先匹配 `"verifyCode":"F001"` 这种带键名的形状。
+//
+// 为什么优先：裸匹配（下面那条）会把正文里恰好出现的 `T100` 之类误当风控码，
+// 而带键名的形状是求解器实际产出的形状（`JSON.stringify({verifyCode:…})`）。
+var riskCodeJSONRe = regexp.MustCompile(`"verifyCode"\s*:\s*"([A-Za-z]\d{3})"`)
+
+// riskCodeBareRe 裸码兜底：`F001` / `T001` 这类「一个字母 + 三位数字」。
+//
+// ⚠ 用 `\b` 卡边界，避免 `F0012` 被当成 `F001`（与 server 层
+// `hasBareCode` 防 `30120` 误命中 `3012` 是同一个教训）。
+var riskCodeBareRe = regexp.MustCompile(`\b([FTft]\d{3})\b`)
+
+// RiskCodeHint 返回某个 verifyCode 的可操作提示（**未收录的码返回空串**）。
+//
+// 空串是刻意的：调用方据此决定"回退到原文"，而不是显示一句空洞的
+// "未知风控码" —— 那和没有提示是一样的，还占掉了原文的位置。
+func RiskCodeHint(code string) string {
+	return riskCodeHints[strings.ToUpper(strings.TrimSpace(code))]
+}
+
+// RiskCodeOf 从任意文本里提取已收录的 verifyCode（没有则返回空串）。
+//
+// 输入可以是求解器的报错、宿主求解服务返回的 error 字段、
+// 或上游响应体 —— 它们的形状各不相同，故这里两种正则都试。
+//
+// ⚠ 只认**已收录**的码：未收录的码返回空串，让调用方走"回退原文"，
+// 而不是把码本身当成提示（`风控拒绝(F008)` 这种对用户毫无信息量）。
+func RiskCodeOf(text string) string {
+	if text == "" {
+		return ""
+	}
+	if m := riskCodeJSONRe.FindStringSubmatch(text); m != nil {
+		if code := strings.ToUpper(m[1]); riskCodeHints[code] != "" {
+			return code
+		}
+	}
+	for _, m := range riskCodeBareRe.FindAllStringSubmatch(text, -1) {
+		if code := strings.ToUpper(m[1]); riskCodeHints[code] != "" {
+			return code
+		}
+	}
+	return ""
+}
+
+// AnnotateRiskCode 在文本前附上可操作提示；**认不出码时原样返回**。
+//
+// # 回退契约（本次改动的验收点之一）
+//
+//	认得出码 → "风控拒绝(F001)：<提示>。原始信息：<原文截断 300>"
+//	认不出码 → 原文**逐字**返回（不截断、不加前缀）
+//
+// ⚠ 认不出时为什么不截断：调用方（`appendCaptchaNote`）会把返回值原样
+// 拼进给用户看的错误体，而那里的原文往往正是**唯一有用的线索**
+// （如"求解器组件未安装"）。截断它等于把可诊断的信息砍掉。
+// 截断只用在"已经认出码、原文退居次要"的场合。
+func AnnotateRiskCode(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return text
+	}
+	code := RiskCodeOf(text)
+	if code == "" {
+		return text
+	}
+	return fmt.Sprintf("风控拒绝(%s)：%s。原始信息：%s",
+		code, riskCodeHints[code], truncateStr(text, riskRawLimit))
 }

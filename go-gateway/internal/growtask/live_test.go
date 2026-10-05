@@ -50,6 +50,19 @@ type liveAccount struct {
 	Nickname     string `json:"nickname"`
 }
 
+// IsIntl 报告该账号是否属于国际版 —— **委托生产的区域判定**，不在这里另写一套。
+//
+// 为什么必须委托：国际版域名白名单（auth.intlDomains）在 auth 包里，且它的注释
+// 记录过一次真实事故 —— 旧的近似判据 `HasSuffix(".ai")` 把 Qoder 国际版的
+// `qoder.sh` 误判成国服，导致代理策略对它不生效。联调代码若自己写一套近似判据，
+// 就会出现"联调时按国服跑、生产按国际版跑"的分叉，而联调的全部价值恰恰是
+// **复现生产行为**。故这里构造一个最小 Auth 走同一条判定。
+//
+// （本方法此前缺失，导致 `-tags live` 整体编译失败 —— 联调基建一度不可用。）
+func (a liveAccount) IsIntl() bool {
+	return (&auth.Auth{Domain: a.Domain}).IsIntl()
+}
+
 // loadLiveAccount 读取真实账号并转成网关的凭证形态。
 //
 // 转换而非直接解析：账号库用的是 snake_case 扁平形，而 auth.Parse 认的是
@@ -132,6 +145,25 @@ func shortUID(uid string) string {
 // liveClient 生产默认上游客户端（真实域名）。
 func liveClient() *upstream.Client { return upstream.New() }
 
+// liveAbsenceExpected 记录「在真实列表里缺席属正常」的任务码。
+//
+// 白名单只收**有实测依据**的两类，不收「跑不通就加进来」的任务 ——
+// 后者会让这条漂移断言慢慢失效：
+//
+//   - school_season：校园日活动。活动到期后上游把整条任务撤下。
+//     2026-09-30 实测已消失；解析器本身正常，只是没数据可解。
+//   - Sequential_Tasks_2 / _3：成长任务集的后续两环。_1 未完成前上游
+//     在两种列表口径都查不到它们（2026-09-30 实测）；_1 完成后 _2 会露面
+//     但带日期锁（unlock_at），_3 仍未露面。缺席属设计如此。
+//
+// 注意 _1 不在白名单里：它是这一串的入口，任何时候都应当可见；
+// 若它消失，说明整组任务被撤了，那是真漂移，必须报出来。
+var liveAbsenceExpected = map[string]bool{
+	"school_season":      true,
+	"Sequential_Tasks_2": true,
+	"Sequential_Tasks_3": true,
+}
+
 // TestLiveListTasksShape 只读：拉取真实任务列表，核对解析结果。
 //
 // 这一步的价值是**校验解析器对真实响应的适配**：形状认错了，
@@ -168,21 +200,41 @@ func TestLiveListTasksShape(t *testing.T) {
 	}
 	t.Logf("汇总：可领奖 %d、待报名 %d、已领奖 %d", claimable, needsAccept, claimed)
 
-	// 需求里的 17 个可自动任务应当都在真实列表里出现。
-	// 缺失说明上游任务集变了，动作表需要同步 —— 这是必须被发现的漂移。
+	// 动作表里的可自动任务应当都在真实列表里出现。缺失说明上游任务集变了，
+	// 动作表需要同步 —— 这是必须被发现的漂移。
+	//
+	// 但有两类任务缺席**不是**漂移，混在一起判失败会让这条断言长期红着，
+	// 最后谁都不看了（那就等于没有断言）：
+	//
+	//  1. 活动任务：活动一到期，上游把整条任务撤下。2026-09-30 实测
+	//     school_season 已消失 —— 而解析器对它的处理完全正常，只是没数据。
+	//  2. 成长任务集的后续两环 _2/_3：_1 未完成前上游根本不下发它们
+	//     （实测两种列表口径都查不到）；_1 完成后 _2 才露面（且带日期锁），
+	//     _3 仍未露面。缺席是设计如此，不是解析漏了。
+	//
+	// 所以这两类缺席只打提示。真正要抓的漂移是「本来该在的常规任务不见了」。
 	have := map[string]bool{}
 	for _, task := range tasks {
 		have[task.Code] = true
 	}
-	var missing []string
+	var missing, missingExpected []string
 	for _, code := range SupportedCodes() {
-		if !have[code] {
-			missing = append(missing, code)
+		if have[code] {
+			continue
 		}
+		if liveAbsenceExpected[code] {
+			missingExpected = append(missingExpected, code)
+			continue
+		}
+		missing = append(missing, code)
 	}
 	sort.Strings(missing)
+	sort.Strings(missingExpected)
 	if len(missing) > 0 {
 		t.Errorf("动作表里的任务在真实列表中缺失（任务集可能已变更）: %v", missing)
+	}
+	if len(missingExpected) > 0 {
+		t.Logf("以下任务缺席属预期（活动已结束 / 成长任务集尚未露面），不作为失败：%v", missingExpected)
 	}
 }
 
@@ -197,6 +249,12 @@ func TestLiveAcceptIdempotent(t *testing.T) {
 	}
 	a := loadLiveAccount(t, os.Getenv("WB_LIVE_ACCOUNT"))
 	c := liveClient()
+	// 走 Runner 的报名分派而不是直接调上游：小程序限定任务（如
+	// Sequential_Tasks_1）必须带 X-Client-Platform: miniprogram 才会登记，
+	// 缺头时上游返回 HTTP 200 + code=0，逐条却是 {"status":"error"}。
+	// 用生产路径才能测出这条真实差别 —— 直接调 c.AcceptGrowthTasks 会
+	// 把它算成「报名后仍无 progress」，那是**测试自己走错口径**的假失败。
+	r := New(Options{Upstream: c})
 
 	before, err := c.ListGrowthTasks(a)
 	if err != nil {
@@ -214,22 +272,22 @@ func TestLiveAcceptIdempotent(t *testing.T) {
 	t.Logf("uid8=%s 待报名 %d 个：%v", shortUID(a.UID), len(pending), pending)
 
 	// 第一次：应为新报名。
-	first, err := c.AcceptGrowthTasks(a, pending)
+	first, err := r.acceptTasks(a, pending)
 	if err != nil {
 		t.Fatalf("首次报名失败: %v", err)
 	}
-	for _, r := range first {
-		t.Logf("  首次报名 %-24s → %s", r.Code, r.Status)
+	for _, one := range first {
+		t.Logf("  首次报名 %-24s → %s", one.Code, one.Status)
 	}
 
 	// 第二次：必须幂等（already_accepted），且不报错。
-	second, err := c.AcceptGrowthTasks(a, pending)
+	second, err := r.acceptTasks(a, pending)
 	if err != nil {
 		t.Fatalf("重复报名应为幂等而非报错: %v", err)
 	}
-	for _, r := range second {
-		if r.Status != "already_accepted" && r.Status != upstream.TaskAcceptAccepted {
-			t.Errorf("重复报名 %s 返回意外状态 %q", r.Code, r.Status)
+	for _, one := range second {
+		if one.Status != "already_accepted" && one.Status != upstream.TaskAcceptAccepted {
+			t.Errorf("重复报名 %s 返回意外状态 %q", one.Code, one.Status)
 		}
 	}
 

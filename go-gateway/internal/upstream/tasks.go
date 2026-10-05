@@ -69,18 +69,26 @@ const (
 // 字段名与上游 JSON 对齐（上游用 reward_ 前缀）；对外只透出这个子集，
 // 避免把 icon_url / 弹窗按钮样式等纯展示字段带进日志与接口。
 type GrowthTask struct {
-	Code         string `json:"task_code"`
-	Title        string `json:"title,omitempty"`
-	Description  string `json:"description,omitempty"` // 操作指引（含客户端跳转说明）
-	TaskDesc     string `json:"task_desc,omitempty"`   // 达成条件简述
-	Credit       int64  `json:"reward_credit,omitempty"`
-	Energy       int64  `json:"reward_energy,omitempty"`
-	RewardBuddy  bool   `json:"reward_buddy,omitempty"`
-	HasReward    bool   `json:"has_reward,omitempty"`
-	TaskType     string `json:"task_type,omitempty"`
-	Tag          string `json:"tag,omitempty"`      // 端标记（PC / 限定 / 限量）
-	JumpURL      string `json:"jump_url,omitempty"` // workbuddy:// 跳转协议
-	Locked       bool   `json:"locked,omitempty"`
+	Code        string `json:"task_code"`
+	Title       string `json:"title,omitempty"`
+	Description string `json:"description,omitempty"` // 操作指引（含客户端跳转说明）
+	TaskDesc    string `json:"task_desc,omitempty"`   // 达成条件简述
+	Credit      int64  `json:"reward_credit,omitempty"`
+	Energy      int64  `json:"reward_energy,omitempty"`
+	RewardBuddy bool   `json:"reward_buddy,omitempty"`
+	HasReward   bool   `json:"has_reward,omitempty"`
+	TaskType    string `json:"task_type,omitempty"`
+	Tag         string `json:"tag,omitempty"`      // 端标记（PC / 限定 / 限量）
+	JumpURL     string `json:"jump_url,omitempty"` // workbuddy:// 跳转协议
+	Locked      bool   `json:"locked,omitempty"`
+	// UnlockAt 未解锁任务的解锁时刻（RFC3339，如 2026-10-01T00:00:00+08:00）。
+	//
+	// 只在 Locked 为真时下发。实测（2026-09-30，Sequential_Tasks_2）：
+	// 顺序任务集的**下一项一出现就带日期锁**，这与「上一项是否完成」是
+	// 两个独立条件 —— 完成上一项只是让下一项**出现在列表里**，
+	// 能否动手还要看这个时间。少了它，界面只能说「尚未解锁」，
+	// 用户无从判断是故障还是等待。
+	UnlockAt     string `json:"unlock_at,omitempty"`
 	AcceptStatus string `json:"accept_status,omitempty"`
 
 	// HasProgress 上游是否下发了 progress 对象。
@@ -190,7 +198,15 @@ type growthTaskWire struct {
 	Locked       bool   `json:"locked"`
 	AcceptStatus string `json:"accept_status"`
 	Status       string `json:"status"`
-	Progress     *struct {
+	// UnlockAt 未解锁任务的解锁时刻（RFC3339，如 2026-10-01T00:00:00+08:00）。
+	//
+	// 只在 locked=true 时下发。实测（2026-09-30，Sequential_Tasks_2）：
+	// 顺序任务集里**下一项一出现就带着这个日期锁**，与「上一项是否完成」
+	// 是两个独立条件 —— 完成上一项只是让下一项**出现在列表里**，
+	// 能否动手还要看这个时间。少了它，界面只能说「尚未解锁」而说不出
+	// 什么时候能解锁，用户无从判断是故障还是等待。
+	UnlockAt string `json:"unlock_at"`
+	Progress *struct {
 		Current int64 `json:"current"`
 		Target  int64 `json:"target"`
 	} `json:"progress"`
@@ -240,6 +256,7 @@ func (c *Client) ListGrowthTasks(a *auth.Auth) ([]GrowthTask, error) {
 			Tag:          t.Tag,
 			JumpURL:      t.JumpURL,
 			Locked:       t.Locked,
+			UnlockAt:     t.UnlockAt,
 			AcceptStatus: status,
 		}
 		// progress 为 null 时保持 HasProgress=false：这是「未报名」的信号，

@@ -22,7 +22,10 @@ package upstream
 //
 // 这些测试锁住「11140 必须被单独识别」——它是冷却得以发生的前提。
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestClassifyAccountUnusable 403 + 11140 必须判成 ErrAccountUnusable。
 //
@@ -148,6 +151,58 @@ func TestClassifyUnaffectedCodes(t *testing.T) {
 		if got := Classify(c.status, c.body); got != c.want {
 			t.Errorf("Classify(%d, %q) = %v，期望 %v（新增 kind 不该改动既有分类）",
 				c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// TestAccountUnusableFriendlyMessage 账号池耗尽时的对外文案。
+//
+// 为什么必须有这条分支：此前 ErrAccountUnusable 在 FriendlyMessage 里没有分支，
+// 于是池耗尽时回落到 `msg += ": " + lastErr.Error()`，客户端拿到的是
+//
+//	all accounts unavailable (cooling/disabled): upstream account_unusable
+//	(http 403): {"code":11140,"msg":"request illegal"}
+//
+// —— 一段既没有归因、也没有下一步动作的原始 JSON。所有者遇到的
+// 「不知道怎么对话过程中就提示『本轮运行失败 API 密钥无效』」正是这类
+// 无行动指引的失败被客户端二次误读的结果。
+func TestAccountUnusableFriendlyMessage(t *testing.T) {
+	msg := FriendlyMessage(ErrAccountUnusable, 403, `{"code":11140,"msg":"request illegal"}`)
+
+	if msg == "" {
+		t.Fatal("ErrAccountUnusable 没有专属文案 —— 池耗尽时会回落成整段上游 JSON")
+	}
+	// 归因：必须能看出是哪个码，否则排查时无法与别的 403 区分。
+	if !strings.Contains(msg, "11140") {
+		t.Errorf("文案缺少 11140 归因：%q", msg)
+	}
+	// 动作：唯一有效的处置是重登该账号，必须写出来。
+	if !strings.Contains(msg, "重新登录") {
+		t.Errorf("文案没有告诉用户该做什么（重登账号）：%q", msg)
+	}
+	// 不得退化成把上游原文整段抛给用户。
+	if strings.Contains(msg, "request illegal") || strings.Contains(msg, `{"code"`) {
+		t.Errorf("文案把上游原始报文直接透出：%q", msg)
+	}
+}
+
+// 归因与动作两件事不能互相覆盖：别的 kind 的文案不受本次新增影响。
+func TestAccountUnusableMessageDoesNotHijackOtherKinds(t *testing.T) {
+	cases := []struct {
+		kind ErrKind
+		want string
+	}{
+		{ErrHardCredit, "额度已耗尽"},
+		{ErrSoftRate, "限流"},
+		{ErrSessionDead, "登录态已失效"},
+	}
+	for _, c := range cases {
+		msg := FriendlyMessage(c.kind, 403, `{}`)
+		if !strings.Contains(msg, c.want) {
+			t.Errorf("FriendlyMessage(%v) = %q，期望含 %q", c.kind, msg, c.want)
+		}
+		if strings.Contains(msg, "11140") {
+			t.Errorf("FriendlyMessage(%v) 被 11140 文案劫持：%q", c.kind, msg)
 		}
 	}
 }

@@ -24,12 +24,22 @@ use std::process::Command;
 pub const TASK_PREFIX: &str = "AIGateway";
 
 /// 任务类型。
+///
+/// **命名陷阱**：[`TaskKind::DoubaoRenew`] 的 `task_name` 是
+/// `AIGateway_DoubaoRenew`、启动器是 `doubao_renew`，但它实际跑的是
+/// **会话保活**（`cli_key = "doubao-keepalive"`）。这是历史命名，两个标识都已
+/// 注册在用户机器的计划任务里，改名会让旧任务变成无人清理的孤儿，因此保留。
+/// 真正跑 HTTP 续期的任务是 [`TaskKind::DoubaoRenewHttp`]。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskKind {
     /// Trae 每日签到。
     TraeCheckin,
-    /// 豆包会话保活。
+    /// Trae 积分日快照（供趋势图，不依赖界面打开）。
+    TraeCreditsSnapshot,
+    /// 豆包会话保活（历史命名见类型注释）。
     DoubaoRenew,
+    /// 豆包凭证 HTTP 续期巡检。
+    DoubaoRenewHttp,
     /// 豆包额度巡检。
     DoubaoQuota,
 }
@@ -39,7 +49,9 @@ impl TaskKind {
     pub fn task_name(self) -> &'static str {
         match self {
             TaskKind::TraeCheckin => "AIGateway_TraeCheckin",
+            TaskKind::TraeCreditsSnapshot => "AIGateway_TraeCreditsSnapshot",
             TaskKind::DoubaoRenew => "AIGateway_DoubaoRenew",
+            TaskKind::DoubaoRenewHttp => "AIGateway_DoubaoRenewHttp",
             TaskKind::DoubaoQuota => "AIGateway_DoubaoQuotaCheck",
         }
     }
@@ -48,7 +60,9 @@ impl TaskKind {
     pub fn cli_key(self) -> &'static str {
         match self {
             TaskKind::TraeCheckin => "trae-checkin",
+            TaskKind::TraeCreditsSnapshot => "trae-credits-snapshot",
             TaskKind::DoubaoRenew => "doubao-keepalive",
+            TaskKind::DoubaoRenewHttp => "doubao-renew",
             TaskKind::DoubaoQuota => "doubao-quota",
         }
     }
@@ -57,7 +71,9 @@ impl TaskKind {
     pub fn launcher_name(self) -> &'static str {
         match self {
             TaskKind::TraeCheckin => "trae_checkin",
+            TaskKind::TraeCreditsSnapshot => "trae_credits_snapshot",
             TaskKind::DoubaoRenew => "doubao_renew",
+            TaskKind::DoubaoRenewHttp => "doubao_renew_http",
             TaskKind::DoubaoQuota => "doubao_quota",
         }
     }
@@ -66,14 +82,18 @@ impl TaskKind {
     pub fn label(self) -> &'static str {
         match self {
             TaskKind::TraeCheckin => "Trae 每日签到",
+            TaskKind::TraeCreditsSnapshot => "Trae 积分日快照",
             TaskKind::DoubaoRenew => "豆包会话保活",
+            TaskKind::DoubaoRenewHttp => "豆包凭证续期",
             TaskKind::DoubaoQuota => "豆包额度巡检",
         }
     }
 
-    pub const ALL: [TaskKind; 3] = [
+    pub const ALL: [TaskKind; 5] = [
         TaskKind::TraeCheckin,
+        TaskKind::TraeCreditsSnapshot,
         TaskKind::DoubaoRenew,
+        TaskKind::DoubaoRenewHttp,
         TaskKind::DoubaoQuota,
     ];
 }
@@ -351,13 +371,56 @@ mod tests {
     #[test]
     fn 状态汇总形态完整() {
         let all = all_task_status();
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), TaskKind::ALL.len());
         for item in &all {
             for key in ["kind", "name", "label", "cliKey", "registered"] {
                 assert!(item.get(key).is_some(), "缺少字段 {key}");
             }
             assert!(item["registered"].is_boolean());
         }
+    }
+
+    /// 每个任务类型的五个标识都必须互不相同。
+    ///
+    /// 复制粘贴新增任务时最容易漏改其中一处（尤其是 `launcher_name`），
+    /// 后果是两个任务共用同一个启动器脚本 —— 后注册的覆盖先注册的，
+    /// 表现为「某个定时任务永远不执行」且没有任何报错。
+    #[test]
+    fn 任务标识两两不重复() {
+        let mut names: Vec<&str> = TaskKind::ALL.iter().map(|k| k.task_name()).collect();
+        let mut keys: Vec<&str> = TaskKind::ALL.iter().map(|k| k.cli_key()).collect();
+        let mut launchers: Vec<&str> = TaskKind::ALL.iter().map(|k| k.launcher_name()).collect();
+        let mut labels: Vec<&str> = TaskKind::ALL.iter().map(|k| k.label()).collect();
+        for set in [&mut names, &mut keys, &mut launchers, &mut labels] {
+            let before = set.len();
+            set.sort_unstable();
+            set.dedup();
+            assert_eq!(set.len(), before, "任务标识存在重复: {set:?}");
+        }
+    }
+
+    /// 新增的 Trae 积分快照任务必须落在一天末尾。
+    ///
+    /// 早上跑会把「昨夜消耗」记进新的一天，日差趋势整体错位一天。
+    #[test]
+    fn 积分快照任务在一天末尾() {
+        let kind = TaskKind::TraeCreditsSnapshot;
+        assert_eq!(kind.cli_key(), "trae-credits-snapshot");
+        assert_eq!(kind.task_name(), "AIGateway_TraeCreditsSnapshot");
+        assert!(kind.label().contains("快照"));
+    }
+
+    /// 历史命名陷阱的护栏：`DoubaoRenew` 跑的是保活，`DoubaoRenewHttp` 才是续期。
+    /// 谁把这两个键对调，都会让用户的计划任务静默跑错动作。
+    #[test]
+    fn 豆包两个续期类任务的_cli_键不得对调() {
+        assert_eq!(TaskKind::DoubaoRenew.cli_key(), "doubao-keepalive");
+        assert_eq!(TaskKind::DoubaoRenewHttp.cli_key(), "doubao-renew");
+        assert_ne!(
+            TaskKind::DoubaoRenew.launcher_name(),
+            TaskKind::DoubaoRenewHttp.launcher_name(),
+            "两个任务的启动器脚本不能同名"
+        );
     }
 
     #[test]

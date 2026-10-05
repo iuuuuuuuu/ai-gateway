@@ -12,6 +12,7 @@ import {
   History,
   Laptop,
   Loader2,
+  Maximize2,
   Network,
   Plus,
   RefreshCw,
@@ -32,6 +33,7 @@ import openclawIcon from "@/assets/agent-icons/openclaw.svg";
 import opencodeIcon from "@/assets/agent-icons/opencode.svg";
 import piIcon from "@/assets/agent-icons/pi-logo-on-light.svg";
 import zcodeIcon from "@/assets/agent-icons/zcode.png";
+import traeWorkIcon from "@/assets/trae-work-official-icon.png";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -47,6 +49,10 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { AgentSwitcher } from "@/components/agents/agent-switcher";
+import { ClientDetail } from "@/components/agents/client-detail";
+import { ClientDetailQuota } from "@/components/agents/client-detail-quota";
+import { FullScreenPanel } from "@/components/common/full-screen-panel";
 import { ModelCapabilityRow } from "@/components/model-capability-chip";
 // 「分发模型」卡片的**可复制写法**行与兼容网关的模型路由清单共用同一组实现。
 //
@@ -67,6 +73,28 @@ import type {
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
+// Trae 图标 —— **官方应用图标**（2026-09-22 改为官方资源）。
+//
+// # 为什么改了（此前是内联 data-URI 的「横杠 + 竖杆」渐变方块）
+//
+// 所有者原话：
+//
+//	「zcode后面不还是一个闪电小卡片么?还不是官方的logo  qoder也一样」
+//
+// 此前的注释写着「官方图标是受版权保护的美术资源，本仓库不内置」——
+// **那个理由是错的/过期的**：上面第 35 行 import 的 `agent-icons/zcode.png`
+// 就是官方图标，本页早就在用它；`components/product-marks.tsx` 的
+// WorkBuddy / Qoder / ZCode 也全是官方资源，只剩 Trae 是自绘。
+//
+// # 来源
+//
+// 从**本机已安装的官方客户端 exe** 的 RT_GROUP_ICON / RT_ICON 资源里提取
+//（取 256×256 那一档）：`D:\APP\TRAE SOLO CN\TRAE SOLO CN.exe`（白底 + 黑字形）。
+//
+// ⚠ 图标映射的值是图片地址（`string`），放不下 React 组件；
+// 这里 import 官方 png 后由 Vite 转成 URL 字符串，写法与上面的
+// `zcodeIcon` 完全一致（这正是当初"只能内联 data-URI"那个前提失效的地方）。
+
 /** 客户端图标映射 */
 const CLIENT_ICONS: Record<string, string> = {
   "claude-code": claudeIcon,
@@ -81,6 +109,7 @@ const CLIENT_ICONS: Record<string, string> = {
   openclaw: openclawIcon,
   hermes: hermesIcon,
   "minimax-code": minimaxIcon,
+  trae: traeWorkIcon,
 };
 
 /** Claude 客户端的模型槽位上限：Sonnet / Opus / Haiku / Fable。 */
@@ -158,6 +187,12 @@ const CLIENT_METAS: Record<string, ClientMeta> = {
     description:
       "MiniMax Code 桌面客户端。在 provider 块注册本网关（Anthropic 协议适配器），并把 defaultModel 指向它；官方 MiniMax 账号配置原样保留。",
   },
+  trae: {
+    protocol: "OpenAI Chat",
+    protocolBadge: "POST /v1/chat/completions",
+    description:
+      "Trae Work / Trae 客户端。模型列表存在 SQLite 的 state.vscdb 里，导入时把本网关作为自定义模型写进全部模型组（SOLO 的 9 组与 IDE 的 7 组）；写入前自动备份原库，官方内置模型原样保留。",
+  },
 };
 
 type FilterTab = "all" | "installed" | "configured" | "uninstalled";
@@ -234,12 +269,48 @@ export default function AgentsPage() {
   const [batchUpdating, setBatchUpdating] = useState(false);
   const [filterTab, setFilterTab] = useState<FilterTab>("all");
 
+  /**
+   * 客户端分段切换控件的选中项。
+   *
+   * 它是**纯视图状态**，不参与任何数据流：`AgentSwitcher` 只负责在头部把
+   * 12 个客户端收成一个不溢出的分段条（溢出项进「更多」），点一下就把
+   * 卡片网格过滤到那一个客户端 —— 这是本页唯一缺的「快速定位某个客户端」
+   * 入口（此前只能靠下面的 全部/已安装/已接入/未安装 四个粗粒度页签）。
+   *
+   * ⚠ 与 `filterTab` **正交**：切换器选的是"哪一个客户端"，页签选的是
+   * "哪一类客户端"。两者同时生效（见 `filteredTargets`），不互相覆盖 ——
+   * 否则用户点一下切换器就会发现自己的页签选择被悄悄重置了。
+   *
+   * `null` = 不聚焦任何客户端（显示页签筛出的全部）。
+   */
+  const [focusedTargetId, setFocusedTargetId] = useState<string | null>(null);
+
+  /**
+   * 三级下钻：当前展开详情的客户端 id。
+   *
+   * 用 id 而不是 `AgentClientTarget` 对象：`fetchData()` 每次刷新都会
+   * 产生一批**新对象**，持有旧对象会让「刷新后详情面板里还是上一份
+   * installed/configured 状态」成为可能。存 id 则每轮渲染都从最新的
+   * `targets` 里现取，永远一致。
+   */
+  const [detailTargetId, setDetailTargetId] = useState<string | null>(null);
+
   // 备份管理对话框
   const [backupDialogOpen, setBackupDialogOpen] = useState(false);
   const [activeBackupTarget, setActiveBackupTarget] = useState<AgentClientTarget | null>(null);
   const [backups, setBackups] = useState<AgentBackupItem[]>([]);
   const [loadingBackups, setLoadingBackups] = useState(false);
   const [restoringBackupId, setRestoringBackupId] = useState<string | null>(null);
+
+  /**
+   * 详情面板的备份记录，与卡片上的「备份历史」弹窗**分开持有**。
+   *
+   * 不复用上面那三个 state：两个入口可以同时开着（弹窗盖在面板上），
+   * 共用一个 `backups` 会让后打开的那个把前一个的列表冲掉 ——
+   * 表现为"面板里点刷新，背后的弹窗列表跟着变了"。
+   */
+  const [detailBackups, setDetailBackups] = useState<AgentBackupItem[]>([]);
+  const [detailBackupsLoading, setDetailBackupsLoading] = useState(false);
 
   // 读取客户端检测与网关信息
   const fetchData = useCallback(async (quiet = false) => {
@@ -431,6 +502,24 @@ export default function AgentsPage() {
     setCustomTargetModels((prev) => ({ ...prev, [targetId]: next }));
   };
 
+  /**
+   * 把某个客户端重置回「跟随全局模型池」。
+   *
+   * 实现是**删除**该 key 而不是写入 `selectedGlobalModels`：`getModelsForTarget`
+   * 的判据是 `customTargetModels[targetId] ?? selectedGlobalModels`，
+   * 只有 key 不存在才代表"没定制过"。若写成写入一份全局池的**副本**，
+   * 之后全局池再变（用户在上面勾了别的模型）这个客户端就跟不上了 ——
+   * 而界面上它会显示成"跟随全局"，语义与行为分叉。
+   */
+  const resetTargetModels = (targetId: string) => {
+    setCustomTargetModels((prev) => {
+      if (!(targetId in prev)) return prev;
+      const next = { ...prev };
+      delete next[targetId];
+      return next;
+    });
+  };
+
   // 单个接入 / 更新配置
   const handleImport = async (target: AgentClientTarget) => {
     const hasKey = Boolean(gatewayStatus?.config?.api_key || detection?.hasApiKey);
@@ -512,22 +601,70 @@ export default function AgentsPage() {
     }
   };
 
+  /**
+   * 读详情面板那份备份记录。
+   *
+   * 与 `handleOpenBackups` 的唯一区别是**不弹窗**：详情面板自己就是一块
+   * 常驻区域，进去时自动拉一次，之后由面板上的「刷新」按钮触发。
+   * 传 id 而不是 target 对象，与 `detailTargetId` 的存法保持一致。
+   */
+  const loadDetailBackups = useCallback(async (targetId: string) => {
+    setDetailBackupsLoading(true);
+    try {
+      const res = await api.listAgentBackups(targetId);
+      setDetailBackups(res.backups || []);
+    } catch (err) {
+      // 备份读不到不该让详情面板报错：它只是面板里的一块次要信息，
+      // 主信息（协议、模型槽位）仍然可用。给空列表 + 控制台留痕。
+      console.warn("读取详情备份记录失败:", err);
+      setDetailBackups([]);
+    } finally {
+      setDetailBackupsLoading(false);
+    }
+  }, []);
+
+  /**
+   * 打开详情面板时拉一次备份记录。
+   *
+   * 依赖 `detailTargetId` 而不是 `detailTarget`：后者每轮 `fetchData()`
+   * 都会产生**新对象**，用它作依赖会让"刷新状态"顺带重拉一次备份 ——
+   * 而备份列表并不随客户端状态刷新而变，那次请求纯属浪费。
+   */
+  useEffect(() => {
+    if (!detailTargetId) {
+      setDetailBackups([]);
+      return;
+    }
+    void loadDetailBackups(detailTargetId);
+  }, [detailTargetId, loadDetailBackups]);
+
   // 恢复备份
-  const handleRestore = async (backupId?: string) => {
-    if (!activeBackupTarget) return;
+  //
+  // 抽成"显式传 target"的形态，因为有两个入口：卡片上的备份弹窗
+  // （用 `activeBackupTarget`）与详情面板（用当前下钻的客户端）。
+  // ⚠ 详情面板那条路**不能**靠 `setActiveBackupTarget(detailTarget)` 再调
+  // 旧签名 —— setState 是异步的，而 `handleRestore` 闭包读的是**本次渲染**
+  // 的 `activeBackupTarget`，会拿到 null 而静默 return（表现为"点了没反应"）。
+  const restoreBackupFor = async (target: AgentClientTarget, backupId?: string) => {
     setRestoringBackupId(backupId ?? "latest");
     try {
-      const res = await api.restoreAgentClient(activeBackupTarget.id, backupId);
-      toast.success(`已成功恢复 ${activeBackupTarget.label} 的配置`, {
+      const res = await api.restoreAgentClient(target.id, backupId);
+      toast.success(`已成功恢复 ${target.label} 的配置`, {
         description: `已回滚 ${res.restored} 个配置文件至备份状态`,
       });
       setBackupDialogOpen(false);
       await fetchData(true);
+      await loadDetailBackups(target.id);
     } catch (err) {
       toast.error("恢复配置失败: " + String(err));
     } finally {
       setRestoringBackupId(null);
     }
+  };
+
+  const handleRestore = async (backupId?: string) => {
+    if (!activeBackupTarget) return;
+    await restoreBackupFor(activeBackupTarget, backupId);
   };
 
   const hasApiKey = Boolean(gatewayStatus?.config?.api_key || detection?.hasApiKey);
@@ -537,17 +674,61 @@ export default function AgentsPage() {
   const configuredCount = useMemo(() => targets.filter((t) => t.configured).length, [targets]);
 
   const filteredTargets = useMemo(() => {
-    switch (filterTab) {
-      case "installed":
-        return targets.filter((t) => t.installed);
-      case "configured":
-        return targets.filter((t) => t.configured);
-      case "uninstalled":
-        return targets.filter((t) => !t.installed);
-      default:
-        return targets;
-    }
-  }, [targets, filterTab]);
+    const byTab = (() => {
+      switch (filterTab) {
+        case "installed":
+          return targets.filter((t) => t.installed);
+        case "configured":
+          return targets.filter((t) => t.configured);
+        case "uninstalled":
+          return targets.filter((t) => !t.installed);
+        default:
+          return targets;
+      }
+    })();
+    // 切换器聚焦：与上面的页签**同时**生效（两者语义正交，见 focusedTargetId 注释）。
+    // 聚焦的客户端若被页签筛掉，结果是空网格 —— 这是**正确**的：
+    // 「未安装」页签下聚焦一个已安装客户端，本来就不该显示它。
+    if (!focusedTargetId) return byTab;
+    return byTab.filter((t) => t.id === focusedTargetId);
+  }, [targets, filterTab, focusedTargetId]);
+
+  /**
+   * 分段切换器的数据源。
+   *
+   * 取 `targets` 而**不是** `filteredTargets`：切换器自己就是筛选器，
+   * 用筛选结果喂它会让"点一下 → 候选只剩一个 → 再也切不回去"。
+   *
+   * `icon` 用页面已有的 `CLIENT_ICONS`（与卡片上那个是同一份映射），
+   * `badge` 只在同品牌两个客户端之间做区分（Claude Code 终端 /
+   * Claude Desktop 显示器）—— 这两个图标完全相同，不给角标就分不出谁是谁。
+   * `hint` 给出该客户端的接入状态，鼠标悬浮即可确认，不必先点开。
+   */
+  const switcherItems = useMemo(
+    () =>
+      targets.map((t) => ({
+        id: t.id,
+        label: t.label,
+        icon: CLIENT_ICONS[t.id] || claudeIcon,
+        badge:
+          t.id === "claude-code"
+            ? ("terminal" as const)
+            : t.id === "claude-desktop"
+              ? ("monitor" as const)
+              : undefined,
+        hint: t.configured ? "已接入网关" : t.installed ? "已安装，未接入" : "未安装",
+      })),
+    [targets],
+  );
+
+  /** 三级下钻的目标：每轮渲染都从最新的 `targets` 现取（见 detailTargetId 注释）。 */
+  const detailTarget = useMemo(
+    () => targets.find((t) => t.id === detailTargetId) ?? null,
+    [targets, detailTargetId],
+  );
+
+  /** 详情面板里这个客户端当前的模型槽位。 */
+  const detailModels = detailTarget ? getModelsForTarget(detailTarget.id) : [];
 
   /**
    * 每个模型的能力视图（上下文 / 视觉 / 思考档位 / 区域）。
@@ -640,6 +821,23 @@ export default function AgentsPage() {
               </p>
             </div>
           </div>
+        </div>
+
+        {/*
+          弹性中段：空间不足时由 AgentSwitcher 自行把溢出的客户端收进「更多」。
+          ⚠ 外层必须是 `min-w-0 flex-1 overflow-hidden` —— AgentSwitcher 内部用
+          `ResizeObserver` 观察**父元素**宽度来决定收几个（见其 :79-110 注释：
+          用自身宽度会形成「收起→变窄→再收起」的反馈循环）。父容器若没有
+          确定宽度，它就永远量不到可用空间，只能一路收到底。
+        */}
+        <div className="flex min-w-0 flex-1 items-center justify-end overflow-hidden">
+          {switcherItems.length > 0 ? (
+            <AgentSwitcher
+              items={switcherItems}
+              activeId={focusedTargetId ?? ""}
+              onSelect={(id) => setFocusedTargetId((prev) => (prev === id ? null : id))}
+            />
+          ) : null}
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
@@ -802,6 +1000,14 @@ export default function AgentsPage() {
               档位列表（而所有者明确要求信息不能为了清爽而丢），所以每张卡给足两行。
               列表高度也跟着放大（max-h-56 → max-h-96）：卡片变高后原来的高度
               只能装下 2 行，「模型一多就看不到下面」这个既有反馈会立刻复现。
+
+            ⚠ 加 `h-full` 会不会撑破这个滚动容器（`max-h-96` + `overflow-y-auto`）？
+              实测**不会**（2026-10-01，40 个模型 / 14 行，含超长名与三平台折行）：
+                · 容器 clientHeight 仍为 **384px**（= max-h-96），没被撑开；
+                · scrollHeight **3109px** > clientHeight ⇒ 滚动条正常出现；
+                · 滚到底 scrollTop 到 2725（= 最大滚动量），最后一张卡完整可见。
+              原因：`h-full` 的高度参照是 **grid 区**（由行高决定），不是容器的
+              滚动高度；`max-h` 限制的是容器自身，两者不冲突。
             */
             <div className="grid grid-cols-1 gap-2 pt-1 max-h-96 overflow-y-auto p-0.5 sm:grid-cols-2 lg:grid-cols-3">
               {gatewayModels.map((m, index) => {
@@ -839,7 +1045,27 @@ export default function AgentsPage() {
                       }
                     }}
                     className={cn(
-                      "flex cursor-pointer flex-col gap-1.5 rounded-lg border px-2.5 py-2 text-left text-xs transition-all",
+                      // ⚠ 关于 `h-full`：**本网格其实不靠它等高**（2026-10-01 实测）。
+                      //
+                      // 我原先写的理由是「没有 h-full ⇒ 卡片按内容取高 ⇒ 同排高矮
+                      // 不一」。用真实 bundle 在 Chrome 里量过之后，**这个推断被证伪**：
+                      // 这里的卡片 div **本身就是 grid 项**（外面没有包一层），
+                      // 于是 grid 默认的 `align-items: stretch` 直接作用在它身上 ——
+                      // 它本来就被拉伸到行高，不存在「只拉伸了外层」这回事。
+                      //
+                      // 实测（40 个模型 / 14 行，含超长模型名与三平台折行）：
+                      // 带 `h-full` 与摘掉 `h-full`，每行的行内高度差**都是 0.00px**。
+                      //
+                      // 留着它是**防御性**的，理由也已实测：给这个网格人为加上
+                      // `items-start`（即禁用 stretch）后 ——
+                      //   · 卡片**无** `h-full` ⇒ 行内高度差立刻爆到 **416px**
+                      //     （各模型写法条数不同，最高那行被撑开）；
+                      //   · 卡片**有** `h-full` ⇒ 行内差回到 **0.00px**。
+                      // 即 `h-full` 确实能在「stretch 被关掉」时兜住，是**冗余但有用**。
+                      // 万一后人给这个网格补上 `items-start`
+                      //（下方「智能体客户端」那个网格就踩过这个坑，见它的四格矩阵），
+                      // 有 `h-full` 就不会重新裂开。它是**保险**，不是等高主因。
+                      "flex h-full cursor-pointer flex-col gap-1.5 rounded-lg border px-2.5 py-2 text-left text-xs transition-all",
                       selected
                         ? "border-primary/50 bg-primary/10 text-foreground shadow-2xs"
                         : "border-border/60 bg-muted/20 text-muted-foreground hover:bg-muted/40 hover:text-foreground",
@@ -976,7 +1202,32 @@ export default function AgentsPage() {
                       const forms = routeFormsOf(m);
                       if (forms.length === 0) return null;
                       return (
-                        <div className="mt-0.5 flex flex-wrap gap-1" data-slot="agent-model-route-forms">
+                        /*
+                         * ★ `mt-auto` 让这一块**贴到卡片底部**（2026-10-01）。
+                         *
+                         * 这是「(b) 等高 + 底部元素对齐到底」而不是「(a) 纯等高」。
+                         *
+                         * 为什么选 (b)：本卡片的信息层次是
+                         * 模型名 → 能力 → 平台开关 → **可复制写法**（用户看完就去
+                         * 客户端里粘贴）。最后一块是**行动出口**，让它对齐成一排
+                         * 比让它随内容浮动更好找；而「平台开关」那一行的高度天然
+                         * 不同（1/2/3 个平台、折行与否），无法也不需要对齐。
+                         *
+                         * ⚠ 实测（反事实检验，2026-10-01）：摘掉 `mt-auto` 后，
+                         * 同排「可复制写法」的**底边差从 0px 变成 50~52px**
+                         *（`hy3` 的底边距卡底 9px → 31px，`kimi-k2.7` → 59px），
+                         * 卡片本身仍然等高（高度差 0px）—— 正好说明：
+                         * 等高由 grid 保证，**底部对齐由这一行 `mt-auto` 保证**，
+                         * 两者解决的是不同的问题，缺了它就会「卡片齐、内容不齐」。
+                         *
+                         * ⚠ 关于「平台开关行错位」：那一行的**上边偏移**在同排内
+                         * 实测差 22px（有「默认主模型」徽章的卡片把它往下推了
+                         * 22px），这是**信息层次的真实差异**，不是缺陷 ——
+                         * 强行拉平只能靠给无徽章的卡片塞等高空占位，
+                         * 代价是每张卡都多一块空白，反而更难读。
+                         * 真正需要对齐的是「可复制写法」这一行，已由 `mt-auto` 保证。
+                         */
+                        <div className="mt-auto flex flex-wrap gap-1 pt-0.5" data-slot="agent-model-route-forms">
                           {forms.map((f) => (
                             <CopyableForm key={f} form={f} />
                           ))}
@@ -1095,7 +1346,48 @@ export default function AgentsPage() {
           ⚠ 不加 `auto-rows-fr`：那会让所有行等于容器高度的一份，
           短卡片被撑出大片空白（我在模型清单上刚犯过这个错）。
         */}
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] items-start gap-3.5">
+        {/*
+          ★ 卡片等高（2026-10-01 所有者反馈「卡片的高度不一致」）。
+
+          这里此前是 `items-start` —— 它**明确禁止** grid 的默认拉伸行为
+          （`align-items: stretch`），于是每张卡片的高度就是它自己的内容高度。
+          而各客户端卡片的内容行数天然不同：
+            · 描述文字 1 行 vs 2 行
+            · 「已接入」时的账号/模型明细块有无
+            · 展开态（`expandedTargetModels`）多出一整块
+          ⇒ 同一排的卡片高矮不齐，视觉上像没对齐。
+
+          改法：去掉 `items-start`，恢复 grid 默认的 `stretch`。
+
+          ★ 实测的四格矩阵（2026-10-01，真实 bundle + 12 张卡，量行内高度差）：
+
+              grid 的 items-start | 卡片的 h-full | 行内高度差
+              ────────────────────┼───────────────┼────────────
+                     有           |      无       |  122px  ← 缺陷原状
+                     有           |      有       |    0px
+                     无           |      无       |    0px
+                     无           |      有       |    0px  ← 现状
+
+            读法：**只要二者有其一，就等高**。
+              · 去掉 `items-start` ⇒ grid 项被 stretch 拉齐，行高取本行最高者；
+              · 卡片自带 `h-full` ⇒ 即使网格是 `flex-start`，`height:100%`
+                也会把卡片撑到 grid 区的高度。
+            两者是**互相替代**的关系，不是「缺一不可」—— 我最初写的
+            「必须同时做」是**推断，且被实测证伪**。同时保留只是双保险。
+
+          ⚠ 之所以两处都留着：本网格与上方「分发模型配置」那个网格（`max-h-96`
+          滚动区）日后任一处被改，另一处的写法仍能兜住；且这两条各自都不产生
+          副作用（`stretch` 按行对齐、`h-full` 在已被拉伸时等于无操作）。
+
+          ⚠ 为什么**不加** `auto-rows-fr`（原作者在下面注释里也提过）：
+          那会让**所有行**都等于最高那一行的高度，短卡片被撑出大片空白。
+          这里要的只是「同一行内等高」，而 `stretch` 正是这个语义 ——
+          它按**行**对齐，不跨行统一。
+
+          卡片本身已有 `flex flex-col justify-between`，等高之后
+          底部那块会被 `justify-between` 推到卡底，同排卡片的底边自然对齐。
+        */}
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-3.5">
           {filteredTargets.map((target) => {
             const meta = CLIENT_METAS[target.id] ?? {
               protocol: "通用兼容",
@@ -1120,7 +1412,10 @@ export default function AgentsPage() {
                 data-slot="agent-client-card"
                 data-client={target.id}
                 className={cn(
-                  "flex flex-col justify-between rounded-xl border p-4 transition-all",
+                  // `h-full` 与上面 grid 去掉 `items-start` **任一即可**等高
+                  //（实测：有其一 → 行内差 0px；两者都无 → 122px），
+                  // 这里两条都留着是双保险，理由见网格处的四格矩阵。
+                  "flex h-full flex-col justify-between rounded-xl border p-4 transition-all",
                   // 色相：左侧一道色条 + 图标底色，让同类客户端一眼可辨
                   accent.border,
                   accent.bg,
@@ -1197,6 +1492,20 @@ export default function AgentsPage() {
                       <Copy className="size-3" />
                     </button>
                   </div>
+
+                  {/*
+                    套餐额度（Claude Code / Codex / Grok Build / Kimi Code）。
+
+                    只有 `CLIENT_TO_PROVIDER` 里确实有映射的客户端才会渲染 ——
+                    其余客户端这个组件 `return null`，卡片外观与从前**完全一致**，
+                    不会多出一块空白。映射表刻意不含 `claude-desktop`：
+                    它和 claude-code 共用一套额度，宁可少显示也不显示错的账号。
+
+                    ⚠ 组件自身 `autoLoad` 缺省 false ⇒ **不会**自动发查询请求，
+                    要用户点里面的「查询」按钮才拉数据。这是有意为之：
+                    卡片网格一次渲染 12 张，自动查询会瞬间打 12 个上游请求。
+                  */}
+                  <ClientDetailQuota targetId={target.id} />
 
                   {/* 多选模型状态栏 */}
                   <div className="rounded-lg border border-border/40 bg-muted/15 p-2 space-y-1.5">
@@ -1300,15 +1609,33 @@ export default function AgentsPage() {
 
                 {/* 卡片底部操作栏 */}
                 <div className="mt-3.5 flex items-center justify-between gap-2 border-t border-border/40 pt-2.5">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 px-2 text-[11px] text-muted-foreground"
-                    onClick={() => void handleOpenBackups(target)}
-                  >
-                    <History className="mr-1 size-3" />
-                    备份历史
-                  </Button>
+                  <div className="flex items-center gap-0.5">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 px-2 text-[11px] text-muted-foreground"
+                      onClick={() => void handleOpenBackups(target)}
+                    >
+                      <History className="mr-1 size-3" />
+                      备份历史
+                    </Button>
+
+                    {/*
+                      三级下钻入口。卡片上只放得下模型摘要与两个操作，
+                      协议细节 / 完整模型池 / 备份记录放不进来 ——
+                      点这里进全屏详情面板（FullScreenPanel + ClientDetail）。
+                    */}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 px-2 text-[11px] text-muted-foreground"
+                      onClick={() => setDetailTargetId(target.id)}
+                      title="查看客户端详情"
+                    >
+                      <Maximize2 className="mr-1 size-3" />
+                      详情
+                    </Button>
+                  </div>
 
                   <TooltipProvider>
                     <Tooltip>
@@ -1428,6 +1755,82 @@ export default function AgentsPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/*
+        三级下钻：单个客户端的完整详情（全屏面板）。
+
+        为什么用 `FullScreenPanel` 而不是再开一个 Dialog：卡片网格本身已经很密
+        （12 张卡 × 模型多选），详情里要放协议细节 + 完整模型池勾选 + 备份记录，
+        用居中弹窗会立刻撑爆高度并出现内外两层滚动条。全屏面板自带
+        `createPortal` + `z-[60]` + ESC 关闭（且会跳过输入框里的 ESC），
+        正好是"从卡片推进去、按返回退回来"的形态。
+
+        ⚠ `isOpen` 与 `children` 都受 `detailTarget` 控制：面板关闭后
+        `usePresence` 还要播 220ms 退场动画才卸载，所以退场期间
+        `detailTargetId` 已被置 null ⇒ `detailTarget` 为 null ⇒ 这里渲染
+        `null` 而不是崩在 `target.id` 上。标题同理走可选链。
+      */}
+      <FullScreenPanel
+        isOpen={Boolean(detailTarget)}
+        motionPreset="slide-from-right"
+        title={detailTarget ? detailTarget.label : ""}
+        description={
+          detailTarget
+            ? `${(CLIENT_METAS[detailTarget.id] ?? { protocol: "通用兼容", protocolBadge: "API" }).protocol} · ${
+                (CLIENT_METAS[detailTarget.id] ?? { protocol: "通用兼容", protocolBadge: "API" }).protocolBadge
+              }`
+            : undefined
+        }
+        onClose={() => setDetailTargetId(null)}
+        footer={
+          <div className="flex items-center justify-between gap-2">
+            <Button variant="outline" size="sm" onClick={() => setDetailTargetId(null)}>
+              返回
+            </Button>
+            {detailTarget ? (
+              <Button
+                size="sm"
+                className="gap-1.5 text-xs font-medium"
+                disabled={operatingTarget === detailTarget.id || batchUpdating || !hasApiKey}
+                onClick={() => void handleImport(detailTarget)}
+              >
+                {operatingTarget === detailTarget.id ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : detailTarget.configured ? (
+                  <RotateCcw className="size-3.5" />
+                ) : (
+                  <Wand2 className="size-3.5" />
+                )}
+                {detailTarget.configured ? "更新配置" : "一键接入"}
+              </Button>
+            ) : null}
+          </div>
+        }
+      >
+        {detailTarget ? (
+          <ClientDetail
+            target={detailTarget}
+            models={gatewayModels}
+            assignedModels={detailModels}
+            isCustomized={Boolean(customTargetModels[detailTarget.id])}
+            expanded={Boolean(expandedTargetModels[detailTarget.id])}
+            onToggleExpanded={() =>
+              setExpandedTargetModels((prev) => ({
+                ...prev,
+                [detailTarget.id]: !prev[detailTarget.id],
+              }))
+            }
+            onToggleModel={(modelId) => toggleTargetModel(detailTarget.id, modelId)}
+            onResetModels={() => resetTargetModels(detailTarget.id)}
+            onCopyPath={() => void copyToClipboard(detailTarget.configPath, "配置路径")}
+            backups={detailBackups}
+            loadingBackups={detailBackupsLoading}
+            restoringBackupId={restoringBackupId}
+            onRestore={(backupId) => void restoreBackupFor(detailTarget, backupId)}
+            onRefreshBackups={() => void loadDetailBackups(detailTarget.id)}
+          />
+        ) : null}
+      </FullScreenPanel>
     </div>
   );
 }

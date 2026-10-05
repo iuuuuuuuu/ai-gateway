@@ -1,6 +1,6 @@
 //! 一键导入与更新：把本网关接入本机已安装的 AI 客户端。
 //!
-//! 支持 12 类主流客户端智能体：
+//! 支持 13 类主流客户端智能体：
 //!
 //! | # | 客户端 | 配置文件 | 协议 |
 //! |---|---|---|---|
@@ -16,6 +16,12 @@
 //! | 10 | OpenClaw | `~/.openclaw/openclaw.json` | OpenAI Chat |
 //! | 11 | Hermes Agent | `~/.hermes/config.yaml` | OpenAI Chat |
 //! | 12 | MiniMax Code | `~/.minimax/config.yaml` | Anthropic Messages（`@ai-sdk/anthropic`） |
+//! | 13 | Trae | `%APPDATA%\TRAE SOLO CN\User\globalStorage\state.vscdb`（SQLite） | OpenAI Chat（自定义模型表） |
+//!
+//! Trae 是唯一的**非文件**目标：模型列表存在 SQLite 的 `state.vscdb` 里
+//! （`ItemTable` 表的 `{uid}[:|_]AI.agent.model.model_list_map` 键），
+//! 详见 [`crate::modules::trae_agent`]。因此它不走 `read_json` / `atomic_write`
+//! 那条文本路径，而是走 `rusqlite` 读-改-写。
 //!
 //! 安全约定：
 //!   - 写入前一律备份原文件到 `~/.wb-switch/agent-backups/<target>/<时间戳>/`；
@@ -28,9 +34,10 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use crate::modules::config::{atomic_write, home_dir, now_ms, store_dir};
+use crate::modules::trae_agent;
 
-/// 受支持的全部 12 类客户端标识（与 UI 列表顺序严格对齐）。
-pub const TARGETS: [&str; 12] = [
+/// 受支持的全部 13 类客户端标识（与 UI 列表顺序严格对齐）。
+pub const TARGETS: [&str; 13] = [
     "claude-code",
     "claude-desktop",
     "codex",
@@ -43,6 +50,7 @@ pub const TARGETS: [&str; 12] = [
     "openclaw",
     "hermes",
     "minimax-code",
+    "trae",
 ];
 
 /// 托管配置在客户端侧使用的提供方名称（显示名，会写进各客户端配置文件）。
@@ -288,7 +296,7 @@ fn probe_cmd_version(exe: &str, args: &[&str]) -> Option<String> {
     None
 }
 
-/// 探测全部 12 类目标客户端的安装与配置状态。
+/// 探测全部 13 类目标客户端的安装与配置状态。
 pub fn detect_all(gateway_base: &str, api_key: &str) -> Vec<TargetStatus> {
     vec![
         detect_claude_code(gateway_base, api_key),
@@ -303,6 +311,7 @@ pub fn detect_all(gateway_base: &str, api_key: &str) -> Vec<TargetStatus> {
         detect_openclaw(gateway_base, api_key),
         detect_hermes(gateway_base, api_key),
         detect_minimax_code(gateway_base, api_key),
+        detect_trae(gateway_base, api_key),
     ]
 }
 
@@ -693,6 +702,82 @@ fn detect_minimax_code(gateway_base: &str, api_key: &str) -> TargetStatus {
 // 备份与恢复
 // ---------------------------------------------------------------------------
 
+/// 探测 Trae（Trae Work / Trae CN）。
+///
+/// 与其余 12 类目标最大的不同：Trae 的模型列表不在配置文件里，而在
+/// SQLite 库 `state.vscdb` 的 `ItemTable` 表中，所以「安装」= 至少有一个
+/// `state.vscdb`，「已配置」= 其中某个库已经写着指向本网关的条目。
+///
+/// 注意这里**绝不**去跑 Trae 的可执行文件探测版本号：Trae 是 Electron 应用，
+/// 启动即拉起完整 IDE 进程（会占用户桌面、写用户真实数据目录），
+/// 在「探测」这种只读语义里做这件事是不可接受的。
+fn detect_trae(gateway_base: &str, api_key: &str) -> TargetStatus {
+    let dbs = trae_agent::trae_vscdb_paths();
+    let installed = !dbs.is_empty();
+    let configured = dbs
+        .iter()
+        .any(|db| trae_agent::is_configured(db, gateway_base, api_key));
+
+    TargetStatus {
+        id: "trae",
+        label: "Trae",
+        installed,
+        configured,
+        config_path: dbs
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("; "),
+        note: if installed {
+            "模型列表存于 SQLite（state.vscdb），导入后需重启 Trae 生效".to_string()
+        } else {
+            "未检测到 Trae（%APPDATA%\\TRAE SOLO CN 或 %APPDATA%\\Trae CN 下没有 state.vscdb）"
+                .to_string()
+        },
+        version: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 备份与恢复
+// ---------------------------------------------------------------------------
+
+/// 原子写**字节**文件（临时文件 + rename），与 [`atomic_write`] 同构。
+///
+/// [`atomic_write`] 只接受 `&str`，而 Trae 的目标文件是二进制 SQLite 库；
+/// 直接 `read_to_string` 会以 `stream did not contain valid UTF-8` 失败。
+/// 因此备份/恢复路径统一走字节版：**先尝试 UTF-8**，成功才走原文本路径，
+/// 失败则原样搬运字节 —— 对既有的 12 个纯文本目标逐字节不变。
+fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!("{file_name}.tmp-{}", uuid::Uuid::new_v4().simple()));
+    if let Err(e) = std::fs::write(&tmp, content) {
+        eprintln!("[atomic] write tmp FAILED: {e}");
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        eprintln!("[atomic] rename FAILED: {e}");
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// 把 `content` 写到 `path`：能解成 UTF-8 就走原文本原子写，否则走字节原子写。
+fn write_preserving_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    match std::str::from_utf8(content) {
+        Ok(text) => atomic_write(path, text),
+        Err(_) => atomic_write_bytes(path, content),
+    }
+}
+
 /// 备份一组文件到 `<backup_root>/<target>/<ts>/`，返回备份目录。
 pub fn backup_files(target: &str, paths: &[PathBuf]) -> Result<PathBuf, String> {
     let stamp = now_ms().to_string();
@@ -705,9 +790,10 @@ pub fn backup_files(target: &str, paths: &[PathBuf]) -> Result<PathBuf, String> 
             continue;
         }
         let name = format!("{index}-{}", path.file_name().unwrap_or_default().to_string_lossy());
-        let content = std::fs::read_to_string(path)
+        // 按字节读：Trae 的 state.vscdb 是二进制 SQLite，`read_to_string` 会直接失败。
+        let content = std::fs::read(path)
             .map_err(|e| format!("读取待备份文件失败 {}: {e}", path.display()))?;
-        atomic_write(&dir.join(&name), &content)
+        write_preserving_bytes(&dir.join(&name), &content)
             .map_err(|e| format!("写入备份失败 {}: {e}", path.display()))?;
         manifest.insert(name, json!(path.to_string_lossy()));
     }
@@ -775,13 +861,14 @@ pub fn restore_backup(target: &str, backup_id: &str) -> Result<usize, String> {
         if !backup_file.is_file() {
             continue;
         }
-        let content = std::fs::read_to_string(&backup_file)
+        // 同样按字节读回：二进制库（Trae 的 state.vscdb）不能走 `read_to_string`。
+        let content = std::fs::read(&backup_file)
             .map_err(|e| format!("读取备份文件失败: {e}"))?;
         let target_path = PathBuf::from(target_path_str);
         if let Some(parent) = target_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        atomic_write(&target_path, &content)
+        write_preserving_bytes(&target_path, &content)
             .map_err(|e| format!("恢复文件失败 {target_path_str}: {e}"))?;
         restored += 1;
     }
@@ -831,6 +918,9 @@ pub fn import_target(
         "openclaw" => import_openclaw(base, api_key, &safe_models),
         "hermes" => import_hermes(base, api_key, &safe_models),
         "minimax-code" => import_minimax_code(base, api_key, &safe_models),
+        // Trae 不走文本文件路径：它把模型列表存在 SQLite 的 state.vscdb 里，
+        // 备份 / 读-改-写 / 保持原存储类型都由 trae_agent 负责。
+        "trae" => trae_agent::import_trae(base, api_key, &safe_models),
         other => Err(format!("不支持的客户端: {other}")),
     }
 }
@@ -2523,5 +2613,40 @@ permissionMode: bypassPermissions
         let found = statuses.iter().find(|s| s.id == "minimax-code");
         assert!(found.is_some(), "detect_all 必须包含 minimax-code");
         assert_eq!(found.unwrap().label, "MiniMax Code");
+    }
+
+    /// Trae 必须出现在目标清单与探测结果里。
+    ///
+    /// 与其余 12 类不同，Trae 的「配置」落在 SQLite 库而不是文本配置文件里，
+    /// 所以这里额外确认探测走的是 `trae_agent` 的库路径解析，而不是某个
+    /// 会误判成「未安装」的配置文件路径。
+    #[test]
+    fn trae_target_is_registered() {
+        assert!(TARGETS.contains(&"trae"));
+        assert_eq!(TARGETS.len(), 13, "新增 Trae 后目标总数应为 13");
+
+        let statuses = detect_all("http://127.0.0.1:7864", "k");
+        let found = statuses
+            .iter()
+            .find(|s| s.id == "trae")
+            .expect("detect_all 必须包含 trae");
+        assert_eq!(found.label, "Trae");
+
+        // 探测是纯只读的：即便本机真有 Trae，也绝不允许这一步改动任何库。
+        // 未安装时 config_path 必须是空串而不是某个编造出来的路径。
+        if !found.installed {
+            assert!(
+                found.config_path.is_empty(),
+                "未安装时不得编造 config_path: {}",
+                found.config_path
+            );
+            assert!(
+                found.note.contains("未检测到 Trae"),
+                "未安装时 note 应说明原因: {}",
+                found.note
+            );
+        }
+        // 版本号必须留空：Trae 是 Electron 应用，跑它探测版本会拉起整个 IDE。
+        assert!(found.version.is_none(), "不得通过运行 Trae 来探测版本");
     }
 }

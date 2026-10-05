@@ -452,12 +452,15 @@ func anthropicUsage(v any) map[string]any {
 }
 
 // anthropicError 生成 Anthropic 形状的错误体。
+//
+// msg 过 clientSafeMessage：DSH 读「API 密钥无效」靠的是文案里的 401/403，
+// 与状态码无关（见 clienttext.go）。流式 error 事件也走这里，一并覆盖。
 func anthropicError(status int, code, msg string) map[string]any {
 	return map[string]any{
 		"type": "error",
 		"error": map[string]any{
 			"type":    code,
-			"message": msg,
+			"message": clientSafeMessage(msg),
 		},
 	}
 }

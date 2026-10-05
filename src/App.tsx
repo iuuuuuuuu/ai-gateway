@@ -1,24 +1,23 @@
 import { useEffect, useState } from "react";
-import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
-import { ArrowUp, Bot, Braces, MessageCircle, MessagesSquare, Server, Settings, Sparkles, Terminal, User, Zap } from "lucide-react";
+import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation } from "react-router-dom";
+import { ArrowUp, Bot, Gauge, Server, Settings, Users } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import type { UpdateInfo } from "@/lib/types";
-import AccountsPage from "@/pages/AccountsPage";
-import CreditStatsPage from "@/pages/CreditStatsPage";
-import TokenStatsPage from "@/pages/TokenStatsPage";
+// ★ 五个「XX账号」页（WorkBuddy / Qoder / ZCode / Trae / 豆包）不再各自挂路由：
+// 它们现在都是「账号管理」页（AccountHubPage）里的 tab，由那一个页面统一 import。
+import AccountHubPage from "@/pages/AccountHubPage";
 import GatewayPage from "@/pages/GatewayPage";
 import AgentsPage from "@/pages/AgentsPage";
 import SettingsPage from "@/pages/SettingsPage";
-import TraePage from "@/pages/TraePage";
-import DoubaoPage from "@/pages/DoubaoPage";
-import QoderPage from "@/pages/QoderPage";
-import ZcodePage from "@/pages/ZcodePage";
+import CliQuotaPage from "@/pages/CliQuotaPage";
 import { StatusDot, AppIconMark } from "@/components/product-marks";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+// ★ 顶层错误边界：任何页面渲染期异常都不该让整页白屏（2026-10-01 事故）。
+import { ErrorBoundary } from "@/components/error-boundary";
 import { Toaster } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { demoModeEnabled, pagesDemoHostingEnabled } from "@/lib/demo-mode";
@@ -96,6 +95,8 @@ function UpdateCenter({ running }: { running: boolean | undefined }) {
 }
 
 function Layout() {
+  // 用于给错误边界做 key：换页时重置，避免上一个页面的错误粘住新页面。
+  const location = useLocation();
   const running = useAccountsStore((s) => s.status?.running);
   const hasUnifiedTitleBar =
     api.isDesktop() && typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
@@ -137,9 +138,14 @@ function Layout() {
           </div>
         </div>
         <nav className="flex min-h-0 flex-1 flex-col gap-0.5" aria-label="主导航">
+          {/* 「账号管理」：五个账号页（WorkBuddy / Qoder / ZCode / Trae / 豆包）合并后的唯一入口。
+              为什么要合并：五个入口并排时，用户要来回点才能看清「到底有哪些号在接流量」，
+              而它们本来就是同一类页面（登录一个上游账号）。现在一个页面里用 tab 切换，
+              平台开关与各平台的账号状态在同一屏里就能对照。
+              旧路径（/、/qoder、/zcode、/trae、/doubao）保留为重定向，见下面的路由表 ——
+              老书签、老文档、别人贴过的链接都不会失效。 */}
           <NavLink
-            to="/"
-            end
+            to="/accounts"
             className={({ isActive }) =>
               cn(
                 "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
@@ -149,15 +155,16 @@ function Layout() {
               )
             }
           >
-            <User className="size-4" />
-            WorkBuddy 账号
+            <Users className="size-4" />
+            账号管理
           </NavLink>
-          {/* Qoder 账号：与 Trae / 豆包 并列的第二个「XX账号」入口。
-              路由独立（/qoder），账号库与凭证也独立 —— 三个产品互不干扰。
-              放在 WorkBuddy 之后，是因为它与 WorkBuddy 一样属于「主力产品」，
-              而 Trae / 豆包 是各自客户端的辅助工具。 */}
+          {/* 「Token 统计」「积分统计」两条侧栏入口已删除：它们现在是「账号管理」
+              WorkBuddy tab 里的二级 tab（业主 m02672），旧路径保留为重定向，见路由表。 */}
+          {/* 额度查询：本机 AI CLI（Codex / Claude / Antigravity / Grok / Kimi）
+              的登录额度，与 WorkBuddy 账号体系无关 —— 它读的是本机各 CLI
+              自己的凭证，故放在「积分统计」之后、与网关功能并列。 */}
           <NavLink
-            to="/qoder"
+            to="/cli-quota"
             className={({ isActive }) =>
               cn(
                 "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
@@ -167,41 +174,8 @@ function Layout() {
               )
             }
           >
-            <Braces className="size-4" />
-            Qoder 账号
-          </NavLink>
-          {/* ZCode 账号：第三个「XX账号」入口（Z.AI / 智谱 GLM 编码套餐）。
-              路由独立（/zcode），账号库与凭证也独立 —— 各产品互不干扰。
-              与 Qoder 的区别：ZCode 的凭证是用户可复制的字符串，
-              故页面上「粘贴凭证」是主路径而不是浏览器授权。 */}
-          <NavLink
-            to="/zcode"
-            className={({ isActive }) =>
-              cn(
-                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
-                isActive
-                  ? "bg-foreground/[0.06] font-medium text-foreground"
-                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
-              )
-            }
-          >
-            <Zap className="size-4" />
-            ZCode 账号
-          </NavLink>
-          <NavLink to="/token-stats" className={({ isActive }) => cn("flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors", isActive ? "bg-foreground/[0.06] font-medium text-foreground" : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground")}><MessagesSquare className="size-4" />Token 统计</NavLink>
-          <NavLink
-            to="/credit-stats"
-            className={({ isActive }) =>
-              cn(
-                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
-                isActive
-                  ? "bg-foreground/[0.06] font-medium text-foreground"
-                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
-              )
-            }
-          >
-            <Sparkles className="size-4" />
-            积分统计
+            <Gauge className="size-4" />
+            额度查询
           </NavLink>
           <NavLink
             to="/gateway"
@@ -232,34 +206,6 @@ function Layout() {
             智能体管理
           </NavLink>
           <NavLink
-            to="/trae"
-            className={({ isActive }) =>
-              cn(
-                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
-                isActive
-                  ? "bg-foreground/[0.06] font-medium text-foreground"
-                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
-              )
-            }
-          >
-            <Terminal className="size-4" />
-            Trae 账号
-          </NavLink>
-          <NavLink
-            to="/doubao"
-            className={({ isActive }) =>
-              cn(
-                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
-                isActive
-                  ? "bg-foreground/[0.06] font-medium text-foreground"
-                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
-              )
-            }
-          >
-            <MessageCircle className="size-4" />
-            豆包账号
-          </NavLink>
-          <NavLink
             to="/settings"
             className={({ isActive }) =>
               cn(
@@ -282,7 +228,17 @@ function Layout() {
           hasUnifiedTitleBar && "pt-16 [&>div]:pt-4",
         )}
       >
-        <Outlet />
+        {/*
+          ★★ 错误边界包在 <Outlet /> **外侧、main 内侧** —— 位置是刻意的：
+            · 包在 main 外 ⇒ 出错时连左侧导航一起消失（2026-10-01 的真实白屏
+              就是这样：点「兼容网关」后整页空白，用户连切页自救都做不到）；
+            · 包在这里 ⇒ 只有**内容区**被替换成错误页，导航仍在，用户能切走。
+          另加 `key`：切换路由时重置边界，避免上一个页面的错误状态粘住新页面
+          （React 的错误边界状态不会因 children 变化自动清除）。
+        */}
+        <ErrorBoundary key={location.pathname}>
+          <Outlet />
+        </ErrorBoundary>
       </main>
     </div>
   );
@@ -296,17 +252,28 @@ export default function App() {
       <Router>
         <Routes>
           <Route element={<Layout />}>
-            <Route path="/" element={<AccountsPage />} />
-            <Route path="/qoder" element={<QoderPage />} />
-            <Route path="/zcode" element={<ZcodePage />} />
-            <Route path="/credit-stats" element={<CreditStatsPage />} />
-            <Route path="/token-stats" element={<TokenStatsPage />} />
+            {/* 「账号管理」：五个平台共用一个页面，平台由 URL 的 tab 段决定。
+                默认 tab = workbuddy（/accounts 等价于 /accounts/workbuddy）。
+                ★ tab 由 URL 派生而不是组件内的 state：这样刷新、前进/后退、
+                  把链接发给别人，看到的都是同一个 tab。 */}
+            <Route path="/accounts" element={<AccountHubPage />} />
+            <Route path="/accounts/:tab" element={<AccountHubPage />} />
+            <Route path="/cli-quota" element={<CliQuotaPage />} />
             <Route path="/gateway" element={<GatewayPage />} />
             <Route path="/agents" element={<AgentsPage />} />
-            <Route path="/trae" element={<TraePage />} />
-            <Route path="/doubao" element={<DoubaoPage />} />
             <Route path="/settings" element={<SettingsPage />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
+            {/* 旧路径全部重定向到对应的 tab —— 用 replace 而不是 push，
+                否则用户的「后退」会退回旧地址、再被弹回，来回打转退不出去。 */}
+            <Route path="/" element={<Navigate to="/accounts/workbuddy" replace />} />
+            <Route path="/qoder" element={<Navigate to="/accounts/qoder" replace />} />
+            <Route path="/zcode" element={<Navigate to="/accounts/zcode" replace />} />
+            <Route path="/trae" element={<Navigate to="/accounts/trae" replace />} />
+            <Route path="/doubao" element={<Navigate to="/accounts/doubao" replace />} />
+            {/* 统计页并进 WorkBuddy tab 后，旧路径同样重定向（不带二级 tab 段：
+                WorkBuddy tab 内部默认就停在「账号」，用户可在页内切到统计）。 */}
+            <Route path="/credit-stats" element={<Navigate to="/accounts/workbuddy" replace />} />
+            <Route path="/token-stats" element={<Navigate to="/accounts/workbuddy" replace />} />
+            <Route path="*" element={<Navigate to="/accounts/workbuddy" replace />} />
           </Route>
         </Routes>
         <Toaster />

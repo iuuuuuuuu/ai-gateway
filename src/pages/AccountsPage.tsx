@@ -67,7 +67,7 @@ import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import { TaskQueuePanel } from "@/components/task-queue-panel";
 import * as api from "@/lib/api";
 import { useVisibilityInterval } from "@/lib/use-visibility-interval";
-import type { AccountMeta, AccountRunningTask, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, GatewayTaskName, GatewayTaskRuntime, TravelConfig, TravelStatus } from "@/lib/types";
+import type { AccountMeta, AccountRunningTask, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, GatewayTaskName, GatewayTaskRuntime, GrowthTaskView, TravelConfig, TravelStatus } from "@/lib/types";
 import { cn, firstVisibleText } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -79,6 +79,39 @@ import { useAccountsStore } from "@/stores/accounts";
  */
 function accountsInScope(accounts: AccountMeta[]): AccountMeta[] {
   return accounts.filter((account) => account.regionKey !== "intl");
+}
+
+/**
+ * 账号 id 的**稳定依赖键**：把 id 拼成一个字符串，供 `useEffect` 依赖数组使用。
+ *
+ * # 为什么不能用 `accounts` 本身（2026-10-04 业主现场）
+ *
+ *	「每次启动都要响应好长时间,如果直接点击就会无响应」
+ *	「之前是说刚启动的时候并发很多请求导致的卡顿,要等一段时间之后才能恢复」
+ *
+ * `accounts` 这个**数组引用**每次 `fetchAll()` / `reconcileAccounts()` 都是新的
+ * （store 里直接 `set({ accounts })`，换引用而不是原地改）。把它放进依赖数组，
+ * 本页三条预加载 effect（签到 / 旅行 / 积分）就会**反复重跑**：备注保存、
+ * 禁用切换、积分刷新、OAuth 登录……每一次都触发一整轮「每个账号一个 IPC」。
+ * 19 个账号 × 3 条 ≈ 57 个请求一轮接一轮，而每个宿主请求最坏要占住上游
+ * 30 秒（`config.rs` 的 `http_client_builder()` 统一 30s 超时），
+ * 4 并发 × 19 账号 ⇒ 最坏 150 秒才轮到最后一批 —— 正是「要等一段时间
+ * 之后才能恢复」。
+ *
+ * 而这三条 effect 真正关心的只是「**有哪些账号**」：账号集合没变就不该重拉。
+ * 故依赖键取 id 拼串 —— 数组引用变了但 id 集合没变时字符串相等，
+ * React 判定依赖未变，effect 不重跑。
+ *
+ * ⚠ 分隔符用换行而不是逗号：id 是上游 uid（数字 / 短横线 / 下划线），
+ * 含换行的 id 不可能出现；用逗号则理论上存在 `["a,b"]` 与 `["a","b"]`
+ * 撞成同一个键。换行分隔符下二者分别是 `"a,b"` 与 `"a\nb"`，不会撞。
+ *
+ * ⚠ 空列表 ⇒ 空串：首次进入本页时 `accounts` 从 `[]` 变成 N 个账号，
+ * 键从 `""` 变成 `"id1\nid2…"`，**只跳变一次**；空串那一次各 effect
+ * 都有 `if (!xxx.length) { setXxx({}); return; }` 兜底，一个请求都不会发。
+ */
+function accountIdsKey(accounts: AccountMeta[]): string {
+  return accounts.map((account) => account.id).join("\n");
 }
 
 function expiringSoonAmount(credit?: CreditExpiry): number {
@@ -167,11 +200,35 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-/** 并行查询今日签到；失败的账号不写入，由调用方保留原值。 */
+/**
+ * 并行查询今日签到；失败的账号不写入，由调用方保留原值。
+ *
+ * ⚠ **先走批量通道**（`api.getCheckinStatusMap`，理由见那里的长注释）：
+ * webui 的 `GET /api/checkin/status` 本身就是批量接口，而
+ * `api.getCheckinStatus(id)` 是「整批拉一次 → find 出自己那一条」。
+ * 按账号循环调用 ⇒ 27 个账号打出 **27 次全量请求**，每次 8–27 秒，
+ * 在途 4 并发 ⇒ 实测启动后 30 秒窗口内累计占用 80 秒，界面全程排队。
+ * 批量通道可用时**一次请求**拿全表；不可用（桌面端 / 演示模式）才退回
+ * 逐个调用 —— 那两种情况是本地 invoke，没有上游排队问题。
+ */
 async function fetchTodayCheckinMap(
   accountIds: string[],
   isStale?: () => boolean,
 ): Promise<Record<string, boolean>> {
+  try {
+    const batch = await api.getCheckinStatusMap();
+    if (batch) {
+      if (isStale?.()) return {};
+      const next: Record<string, boolean> = {};
+      for (const id of accountIds) {
+        const one = batch[id];
+        if (one?.ok) next[id] = one.todayCheckedIn;
+      }
+      return next;
+    }
+  } catch {
+    // 批量通道失败不整块失败：退回逐个调用，能读到的账号照常显示。
+  }
   const entries = await mapWithConcurrency(accountIds, STARTUP_FETCH_CONCURRENCY, async (id) => {
     try {
       const res = await api.getCheckinStatus(id);
@@ -188,11 +245,30 @@ async function fetchTodayCheckinMap(
   return next;
 }
 
-/** 并行查询各账号今日旅行状态；失败的账号不写入，由调用方保留原值。 */
+/** 并行查询各账号今日旅行状态；失败的账号不写入，由调用方保留原值。
+ *
+ * ⚠ 与 `fetchTodayCheckinMap` 同理，**先走批量通道**：旅行接口本身很便宜
+ * （实测空闲 9 ms），但按账号循环调用时会变成 N 次全量请求，在风暴里
+ * 15 次累计占用 83 秒 —— 那些时间全花在排队上。
+ */
 async function fetchTravelMap(
   accountIds: string[],
   isStale?: () => boolean,
 ): Promise<Record<string, TravelStatus>> {
+  try {
+    const batch = await api.getTravelStatusMap();
+    if (batch) {
+      if (isStale?.()) return {};
+      const next: Record<string, TravelStatus> = {};
+      for (const id of accountIds) {
+        const one = batch[id];
+        if (one) next[id] = one;
+      }
+      return next;
+    }
+  } catch {
+    // 同上：批量通道失败退回逐个调用。
+  }
   const entries = await mapWithConcurrency(accountIds, STARTUP_FETCH_CONCURRENCY, async (id) => {
     try {
       const res = await api.getTravelStatus(id);
@@ -217,7 +293,63 @@ async function fetchTravelMap(
  */
 const STARTUP_FETCH_CONCURRENCY = 4;
 
-export default function AccountsPage() {
+/**
+ * 并行预加载各账号的全部成长任务清单。
+ *
+ * # 为什么由本页集中拉，而不是让每张卡片自己拉
+ *
+ * 所有者 2026-09-25：
+ *
+ *	「这些任务不要每次都动态加载,默认就显示出来就行了,不然这个突然变长,
+ *	  我操作起来还可麻烦」
+ *
+ * 此前是「打开菜单才拉」，每次打开都要先转圈、列表再突然变长把下面的
+ * 「备注 / 查看记录」等菜单项顶下去，点起来很难受。而**不能**简单改成
+ * 「卡片挂载时各自拉」：19 个账号会瞬间打出 19 个请求 —— 正是本文件
+ * `mapWithConcurrency` 那段注释里记录过的启动期请求风暴。
+ *
+ * 故复用同一个限流器，在账号列表就绪后集中拉一次，结果按账号 id 下发。
+ * 菜单打开时拿到的就是最终列表，不再有转圈与跳动。
+ *
+ * ⚠ 与签到 / 旅行不同，这里**不**按区域过滤账号：国服账号有真实的成长任务；
+ * 国际版账号虽然在后端已被 `intlOnlyCodes` 过滤掉那 5 项、且卡片整组不渲染，
+ * 但这里仍不去猜 —— 区域判据只在前端渲染层用一次（`isIntlAccount`），
+ * 多一处判据就多一处漂移点。请求量本来就与账号数同阶，省不了多少。
+ *
+ * 返回 `Record<id, GrowthTaskView[] | null>`：读取失败记 `null` 而不是 `[]`，
+ * 让卡片能区分「读不到」与「确实没有任务」（见 `growthTasksMap` 的说明）。
+ */
+async function fetchGrowthTasksMap(
+  accountIds: string[],
+  isStale?: () => boolean,
+): Promise<Record<string, GrowthTaskView[] | null>> {
+  const entries = await mapWithConcurrency(accountIds, STARTUP_FETCH_CONCURRENCY, async (id) => {
+    try {
+      const res = await api.runGrowthTask("list", id);
+      if (isStale?.()) return null;
+      // `ok=false`（账号正忙 / 不在池中）与抛异常一样记 null：
+      // 两者对用户都是"这次没读到"，不该伪装成空清单。
+      if (!res.ok) return [id, null] as const;
+      return [id, res.tasks ?? []] as const;
+    } catch {
+      return [id, null] as const;
+    }
+  });
+  const next: Record<string, GrowthTaskView[] | null> = {};
+  for (const entry of entries) {
+    if (entry) next[entry[0]] = entry[1];
+  }
+  return next;
+}
+
+/**
+ * WorkBuddy / CodeBuddy 账号页。
+ *
+ * `embedded`：被「账号管理」页（AccountHubPage）以 tab 内容嵌进来时为 true ——
+ * 去掉最外层留白容器与页面级大标题，只保留「配置」入口与三个产品状态图标。
+ * 默认 false 时行为与合并前**逐字一致**。
+ */
+export default function AccountsPage({ embedded = false }: { embedded?: boolean } = {}) {
   const {
     accounts,
     status,
@@ -253,6 +385,32 @@ export default function AccountsPage() {
   const [autoTravelSaving, setAutoTravelSaving] = useState(false);
   /** 账号 id -> 今日旅行状态（undefined=查询中/未知） */
   const [travelMap, setTravelMap] = useState<Record<string, TravelStatus>>({});
+  /**
+   * 账号 id -> 全部成长任务清单（`null` = 还没读到 / 读取失败）。
+   *
+   * ⚠ 三种取值的语义必须分清（卡片渲染分支依赖它）：
+   *   · 键不存在（`undefined`）—— 尚未下发，卡片显示「正在读取任务列表…」
+   *   · `null`               —— 读过了但失败（账号正忙 / 不在池中），同上显示
+   *   · `[]`                 —— 读到了，该账号确实没有可执行的成长任务
+   * 把后两者合并会让「读取失败」显示成「这个号没任务」，是误导。
+   *
+   * 见 `fetchGrowthTasksMap` 的说明：集中预加载是为了让菜单一打开就是
+   * 最终长度（所有者 2026-09-25：「不要每次都动态加载,默认就显示出来就行了」）。
+   */
+  const [growthTasksMap, setGrowthTasksMap] = useState<
+    Record<string, GrowthTaskView[] | null>
+  >({});
+  /**
+   * 「成长任务清单需要重拉」的计数器（见 `refreshGrowthTasks`）。
+   *
+   * 为什么需要它：清单的预加载只按 `accounts.length` 触发（见下方 useEffect
+   * 的说明），而**跑完任务并不会改变账号数量** —— 于是「一键执行全部任务」跑完
+   * 后，卡片菜单里仍是跑之前的旧快照，`growthTaskRunnable` 照样认为可以点。
+   * 所有者 2026-10-05：「如果不是我点了一个账号发现任务都没执行我都不知道」
+   * 就是这么来的（那次是跨账号队列跑完、卡片仍显示旧状态）。
+   * 递增这个计数器即让那段 effect 重跑一次。
+   */
+  const [growthTasksNonce, setGrowthTasksNonce] = useState(0);
   const [codebuddyCli, setCodebuddyCli] = useState<CodeBuddyCliStatus | null>(null);
   const [codebuddyCliSwitchingId, setCodebuddyCliSwitchingId] = useState<string | null>(null);
   const [codebuddyCnIde, setCodebuddyCnIde] = useState<CodeBuddyCnIdeStatus | null>(null);
@@ -334,6 +492,10 @@ export default function AccountsPage() {
    */
   const scopedAccounts = accountsInScope(accounts);
   const travelScopedAccounts = accountsInScope(accounts);
+  // 三条预加载 effect 的稳定依赖键（见 `accountIdsKey` 的说明）。
+  const scopedIdsKey = accountIdsKey(scopedAccounts);
+  const travelScopedIdsKey = accountIdsKey(travelScopedAccounts);
+  const allIdsKey = accountIdsKey(accounts);
 
   useEffect(() => {
     let cancelled = false;
@@ -415,7 +577,12 @@ export default function AccountsPage() {
     };
   }, [accounts.length]);
 
-  // 账号列表变化后并行查询各账号今日签到状态（仅查国服账号）
+  // 账号集合变化后并行查询各账号今日签到状态（仅查国服账号）。
+  //
+  // ⚠ 依赖数组是 `scopedIdsKey`（id 拼串）而**不是** `accounts`：后者每次
+  // `fetchAll()` 都是新数组引用，会让这段预加载反复重跑 —— 而签到状态与
+  // 备注 / 禁用无关。与下面成长任务那段（依赖 `accounts.length`）同一个理由，
+  // 只是这里要连"换成了哪些账号"也算进去，故用 id 拼串而不是数量。
   useEffect(() => {
     if (!scopedAccounts.length) {
       setCheckinMap({});
@@ -431,7 +598,8 @@ export default function AccountsPage() {
     return () => {
       cancelled = true;
     };
-  }, [accounts]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scopedIdsKey]);
 
   async function loadTravelMap(accountIds: string[], isStale?: () => boolean) {
     const next = await fetchTravelMap(accountIds, isStale);
@@ -467,7 +635,56 @@ export default function AccountsPage() {
     return () => {
       cancelled = true;
     };
-  }, [accounts]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [travelScopedIdsKey]);
+
+  /**
+   * 账号列表就绪后**集中预加载**各账号的成长任务清单（见 `fetchGrowthTasksMap`）。
+   *
+   * ⚠ 依赖数组是 `accounts.length` 而**不是** `accounts`：后者在每次
+   * `fetchAll()`（备注保存、禁用切换、积分刷新等都会触发）后都是新数组引用，
+   * 会让这段预加载反复重跑 —— 而成长任务清单与备注/禁用无关，
+   * 每 5 秒一轮的 `taskRuntime` 轮询更是与它毫不相干。
+   * 只按账号**数量**变化重拉：加号/删号时才需要新的清单。
+   *
+   * ⚠ 但「数量没变、清单却变了」的情况确实存在：跑完成长任务之后每一项的
+   * 状态都会变（未领奖 → 已领奖）。这类刷新不能靠数量，改用
+   * `growthTasksNonce` 显式点名（见 `refreshGrowthTasks`）。
+   *
+   * ⚠ 首次进入本页时会连跑两次（`accounts` 从 [] 变成 N），这是可接受的：
+   * 空列表那次 `accountIds` 为空、`mapWithConcurrency` 直接返回，
+   * 一个请求都不会发。
+   */
+  useEffect(() => {
+    if (accounts.length === 0) {
+      setGrowthTasksMap({});
+      return;
+    }
+    let cancelled = false;
+    const ids = accounts.map((account) => account.id);
+    void fetchGrowthTasksMap(ids, () => cancelled).then((next) => {
+      if (!cancelled) setGrowthTasksMap(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accounts.length, growthTasksNonce]);
+
+  /**
+   * 跑完任务后把账号卡片的成长任务清单**重新拉一次**。
+   *
+   * 清单本身是父级集中预加载的（`fetchGrowthTasksMap`），它只认账号数量变化；
+   * 单账号「一键执行全部任务」/「执行某个任务」以及跨账号任务队列跑完后，
+   * 清单里每一项的状态都已过期 —— 不重拉的话菜单还显示「未报名（可一键报名并完成）」，
+   * 用户根本看不出刚才到底做没做。
+   *
+   * 不直接在这里 await：调用点都在 `finally` 之前，await 会拖住 toast；
+   * 递增计数器让上面那段 effect 自己重跑即可（它自带 cancelled 守卫）。
+   */
+  function refreshGrowthTasks() {
+    setGrowthTasksNonce((n) => n + 1);
+  }
 
   // 网关任务运行态轮询（5 秒一轮）。
   //
@@ -477,11 +694,22 @@ export default function AccountsPage() {
   // 而设置页那个 2 秒轮询只在设置页挂载，切回本页就没了。所以这里必须新增一条，
   // 而不是「复用既有的」（确实没有可复用的）。
   //
-  // 周期取 5 秒（与网关页的 status 轮询同档，而不是设置页的 2 秒）：设置页 2 秒
-  // 是为了盯着进度条看，而本页只需「一眼看到在跑什么」。5 秒对一轮 40 秒以上的
-  // 任务来说最迟 12% 处就能看到标记，同时把这条**较重**的接口（宿主每次都要
-  // 探活网关 + 解析账号记录文件）的开销压到可接受范围 —— 本页是默认落地页，
-  // 常驻打开，2 秒一轮会长期空转。
+  // 周期取 **30 秒**（2026-10-03 由 5 秒放宽，见问题 ⑩-2）。
+  //
+  // 5 秒是错的量级。本接口（宿主 `gateway_status`）每次都要**探活网关**（HTTP
+  // `/healthz` + `/status`，各带超时）再解析账号记录文件，实测单发 **1.2~2.3 秒**
+  //（idle 2271/1244 ms；启动期 1357 ms）。5 秒一轮意味着这条请求几乎**无缝衔接**、
+  // 长期占着宿主的一个并发位 —— 本页是默认落地页、常驻打开，于是它成了启动期
+  // 「点不动」的固定背景负载之一。
+  //
+  // 为什么 30 秒够用：这个轮询的唯一用途是「一眼看到本轮在跑什么」——它是
+  // `taskRuntime`（当前任务名 + 已处理账号数）的旁路观测，不是进度条。一轮任务
+  // 40 秒以上，30 秒采样一次也总能看到标记；而真正需要秒级进度的场景在**设置页**
+  // 与**网关页**（那里有自己的轮询与进度条）。
+  //
+  // 仍用 useVisibilityInterval：窗口隐藏/收进托盘时**销毁**定时器，不在后台空转
+  //（与旅行轮询、设置页、网关页同一做法）；切回本页时 `onResume` 会立刻补一发，
+  // 所以放宽周期不会让人看到过期状态。
   //
   // 用 useVisibilityInterval：窗口隐藏/收进托盘时**销毁**定时器，不在后台空转
   //（与旅行轮询、设置页、网关页同一做法）。
@@ -498,15 +726,21 @@ export default function AccountsPage() {
     }
   }, []);
 
-  useVisibilityInterval(() => void loadTaskRuntime(), 5000, {
+  useVisibilityInterval(() => void loadTaskRuntime(), 30_000, {
     onResume: () => void loadTaskRuntime(),
   });
 
   // 只给尚未缓存的账号拉积分；切回首页不重复请求。点「刷新积分」才强制更新。
+  //
+  // ⚠ 依赖数组是 `allIdsKey`（id 拼串）而**不是** `accounts`：后者每次
+  // `fetchAll()` 都是新数组引用，会让这里反复重跑。虽然 `loadCredits` 内部有
+  // 「已缓存 / 在途」双门兜底（不会真的重复发请求），但每轮仍要重建一遍
+  // `toFetch` 列表 —— 账号多时是纯浪费，也掩盖了"到底谁在发请求"。
   useEffect(() => {
     if (!accounts.length) return;
     void ensureCredits(accounts.map((account) => account.id));
-  }, [accounts, ensureCredits]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allIdsKey, ensureCredits]);
 
   /** 从本机批量导入完成提示（含新增/覆盖拆分）。 */
   function onLocalImported(result: { imported: number; added: number; updated: number }) {
@@ -750,6 +984,8 @@ export default function AccountsPage() {
         }
       }
       void fetchAll();
+      // 任务状态变了，卡片菜单里的清单必须重拉（只按账号数量触发的那段 effect 不会动）
+      refreshGrowthTasks();
     } catch (e) {
       toast.error("一键执行失败", { description: api.asError(e) });
     } finally {
@@ -784,7 +1020,10 @@ export default function AccountsPage() {
           toast.success("校园日活动", { description: detail });
         }
       }
-      if (res.ok) void fetchAll();
+      if (res.ok) {
+        void fetchAll();
+        refreshGrowthTasks();
+      }
     } catch (e) {
       toast.error("成长任务执行失败", { description: api.asError(e) });
     } finally {
@@ -1040,15 +1279,20 @@ export default function AccountsPage() {
     // 结论：只要保留居中定宽，宽屏上就一定有留白；本页内容（账号卡片、
     // 状态块、操作按钮）都是横向铺开的行式布局，能自然拉伸，故完全放开。
     // 兼容网关页同步做了相同处理，两页留白表现保持一致。
-    <div className="w-full space-y-6 px-5 py-6 sm:px-8 sm:py-8">
-      <header className="mb-6">
-        <div className="flex items-start justify-between gap-4">
-          <div className="min-w-0">
-            <h1 className="text-[28px] font-semibold tracking-tight">WorkBuddy 账号</h1>
-            <p className="mt-2 text-sm leading-6 text-muted-foreground">
-              统一管理 WorkBuddy、CodeBuddy IDE 与 CodeBuddy CLI 账号、积分和签到状态。
-            </p>
-          </div>
+    <div className={embedded ? "space-y-5" : "w-full space-y-6 px-5 py-6 sm:px-8 sm:py-8"}>
+      {/* 嵌入时不再渲染页面级标题（账号管理页已有一份），但「配置」入口与三个
+          产品状态图标必须留着 —— 前者是这个平台唯一的配置入口，后者是
+          「客户端在不在跑、当前登录的是哪个号」的即时信号。 */}
+      <header className={embedded ? undefined : "mb-6"}>
+        <div className={cn("flex items-start justify-between gap-4", embedded && "justify-end")}>
+          {!embedded && (
+            <div className="min-w-0">
+              <h1 className="text-[28px] font-semibold tracking-tight">WorkBuddy 账号</h1>
+              <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                统一管理 WorkBuddy、CodeBuddy IDE 与 CodeBuddy CLI 账号、积分和签到状态。
+              </p>
+            </div>
+          )}
           <div className="flex shrink-0 items-center gap-4 pt-1">
             {/* WorkBuddy 专属配置入口（2026-09-22 从设置页迁来）。
                 收进弹窗而不是平铺：那四张卡片一千三百多行，
@@ -1472,6 +1716,9 @@ export default function AccountsPage() {
                 growthTaskRunning={growthTaskRunning}
                 onRunAllGrowthTasks={onRunAllGrowthTasks}
                 growthAllRunningAccountId={growthAllAccountId}
+                // 父级集中预加载的清单（见 `fetchGrowthTasksMap`）：
+                // 菜单一打开就是最终长度，不再有转圈与"突然变长"。
+                growthTasks={growthTasksMap[a.id]}
                 runningTask={runningTaskByAccountId.get(a.id) ?? null}
                 todayCheckedIn={checkinMap[a.id]}
                 travelStatus={travelMap[a.id]}
@@ -1533,8 +1780,10 @@ export default function AccountsPage() {
           void fetchAll();
         }}
       />
-      {/* 跨账号任务队列面板。onFinished 里刷新账号列表与积分：
-          成长任务会写账号记录并可能带来领奖积分，不刷新的话卡片上还是旧值。 */}
+      {/* 跨账号任务队列面板。onFinished 里刷新账号列表、积分与**成长任务清单**：
+          成长任务会写账号记录并可能带来领奖积分，不刷新的话卡片上还是旧值；
+          任务清单同样会整体过期（这就是所有者 2026-10-05 报的那次：
+          队列跑完了、卡片菜单里还显示「可一键完成」）。 */}
       <TaskQueuePanel
         open={taskQueueOpen}
         onOpenChange={setTaskQueueOpen}
@@ -1542,6 +1791,7 @@ export default function AccountsPage() {
         onFinished={() => {
           void fetchAll();
           void refreshCredits(accounts.map((account) => account.id));
+          refreshGrowthTasks();
         }}
       />
       <ExportAccountsDialog

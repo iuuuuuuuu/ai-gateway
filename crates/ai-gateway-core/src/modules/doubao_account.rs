@@ -66,24 +66,11 @@ pub fn find_account(user_id: &str) -> Option<Value> {
 ///
 /// **每个** uid → 路径的入口都必须先过这一关：uid 来自抓包/本地存储，
 /// 属于外部输入，含 `..` 或分隔符时可以越出数据目录。
+///
+/// 实现已上移到 [`crate::modules::config::ensure_uid_safe`]（Trae 路径也要用），
+/// 这里保留同名包装以免已有的 20 余处调用点与测试全部改名。
 pub fn ensure_uid_safe(uid: &str) -> Result<(), String> {
-    let uid = uid.trim();
-    if uid.is_empty() {
-        return Err("缺少账号标识（userId）".to_string());
-    }
-    if uid.len() > 64 {
-        return Err("账号标识过长（超过 64 字符）".to_string());
-    }
-    if uid.contains("..") {
-        return Err("账号标识含非法片段 `..`".to_string());
-    }
-    if !uid
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err("账号标识只能包含字母、数字、下划线与连字符".to_string());
-    }
-    Ok(())
+    config::ensure_uid_safe(uid)
 }
 
 /// 脱敏：保留末 `keep` 位。
@@ -119,11 +106,83 @@ pub fn session_state(acc: &Value) -> &'static str {
     }
 }
 
+/// 凭证到期分层（界面按此上色：正常 / 临期黄 / 已过期红）。
+///
+/// 为什么要分层而不是只给一个布尔：豆包 `sid_guard` 有效期 30 天且服务端滑动续期，
+/// 用户只有在「快到期」时才有必要去保活。只告诉「有效/失效」的话，用户要么
+/// 每天白跑一次保活，要么等到失效才发现 —— 临期提醒才是这条链路的实际价值。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExpiryTier {
+    /// 无 `sid_guard` 或解析不出 → 未知，界面不显示到期信息
+    Unknown,
+    /// 30 天以上
+    Fresh,
+    /// 7 天内到期（含今天）
+    ExpiringSoon,
+    /// 已过到期日
+    Expired,
+}
+
+impl ExpiryTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExpiryTier::Unknown => "unknown",
+            ExpiryTier::Fresh => "fresh",
+            ExpiryTier::ExpiringSoon => "soon",
+            ExpiryTier::Expired => "expired",
+        }
+    }
+}
+
+/// 临期阈值（天）。
+pub const EXPIRY_SOON_DAYS: i64 = 7;
+
+/// 解析到期时间字符串为 Unix 秒（支持 `%Y-%m-%d %H:%M:%S` 与纯日期两种形态）。
+fn parse_expire_ts(value: &str) -> Option<i64> {
+    let v = value.trim();
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(v, fmt) {
+            return Some(dt.and_utc().timestamp());
+        }
+    }
+    chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc().timestamp())
+}
+
+/// 计算到期分层与剩余天数。
+pub fn expiry_tier(expire_at: Option<&str>, now_ts: i64) -> (ExpiryTier, Option<i64>) {
+    let Some(raw) = expire_at.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (ExpiryTier::Unknown, None);
+    };
+    let Some(ts) = parse_expire_ts(raw) else {
+        return (ExpiryTier::Unknown, None);
+    };
+    // 向上取整到天：剩 12 小时应显示「1 天后到期」而不是「0 天后」
+    let seconds_left = ts - now_ts;
+    let days_left = if seconds_left <= 0 {
+        seconds_left / 86_400
+    } else {
+        (seconds_left + 86_399) / 86_400
+    };
+    let tier = if seconds_left < 0 {
+        ExpiryTier::Expired
+    } else if days_left <= EXPIRY_SOON_DAYS {
+        ExpiryTier::ExpiringSoon
+    } else {
+        ExpiryTier::Fresh
+    };
+    (tier, Some(days_left))
+}
+
 /// 账号的展示视图（**凭证脱敏**）。
 pub fn account_view(acc: &Value) -> Value {
     let session_id = acc.get("session_id").and_then(Value::as_str).unwrap_or("");
     let sid_guard = acc.get("sid_guard").and_then(Value::as_str).unwrap_or("");
     let ttwid = acc.get("ttwid").and_then(Value::as_str).unwrap_or("");
+    let expire_at = acc.get("session_expire_at").and_then(Value::as_str);
+    let (tier, days_left) = expiry_tier(expire_at, chrono::Utc::now().timestamp());
     json!({
         "userId": acc.get("user_id"),
         "name": acc.get("name"),
@@ -136,9 +195,12 @@ pub fn account_view(acc: &Value) -> Value {
         "ttwidMasked": mask_secret(ttwid, 4),
         "hasSessionId": !session_id.is_empty(),
         "hasTtwid": !ttwid.is_empty(),
-        "sessionExpireAt": acc.get("session_expire_at"),
+        "sessionExpireAt": expire_at,
         "expired": acc.get("expired"),
         "sessionState": session_state(acc),
+        // 到期分层：界面据此上色（fresh 常态 / soon 黄 / expired 红）
+        "expiryTier": tier.as_str(),
+        "daysLeft": days_left,
         "sessionSource": acc.get("session_source"),
         "cookiesSyncedAt": acc.get("cookies_synced_at"),
         "lastRenewAt": acc.get("last_renew_at"),
@@ -147,6 +209,7 @@ pub fn account_view(acc: &Value) -> Value {
         "quotaExpireAt": acc.get("quota_expire_at"),
         "quotaSummary": acc.get("quota_summary"),
         "quotaCheckedAt": acc.get("quota_checked_at"),
+        "quotaUsedPercent": acc.get("quota_used_percent"),
     })
 }
 
@@ -293,10 +356,27 @@ pub fn apply_credential(
             let sg = sg.trim();
             if sg.is_empty() {
                 obj.insert("sid_guard".to_string(), Value::Null);
-            } else {
-                obj.insert("sid_guard".to_string(), json!(sg));
-                // 换了新凭证，旧的过期判定作废
                 obj.insert("session_expire_at".to_string(), Value::Null);
+            } else {
+                // 只有 sid_guard **确实变了**才作废旧的过期判定。
+                //
+                // 早期实现无条件清空，导致「改个备注点保存」也会把 `session_expire_at`
+                // 抹掉 —— 界面上的「会话到期」整行随之消失，而且这条路径上没有任何
+                // 地方会把它重新算回来（`parse_sid_guard` 只在续期拿到新 guard 时才写），
+                // 于是过期时间会一直空到下次服务端下发新 guard 为止。
+                let changed = obj.get("sid_guard").and_then(Value::as_str) != Some(sg);
+                obj.insert("sid_guard".to_string(), json!(sg));
+                if changed {
+                    // 服务端给了新 guard 但没给新 sessionid 时，过期时间可由 guard 自算
+                    match crate::modules::doubao_session::parse_sid_guard(sg) {
+                        Some(expire) => {
+                            obj.insert("session_expire_at".to_string(), json!(expire));
+                        }
+                        None => {
+                            obj.insert("session_expire_at".to_string(), Value::Null);
+                        }
+                    }
+                }
             }
         }
         // ttwid 只在显式给值时才覆盖（抓包可能没带 ttwid，清掉会让对话导出失效）
@@ -328,11 +408,22 @@ pub fn save_captured(captured: &Value) -> Result<(), String> {
 
 /// 把抓包凭证回写到账号池。
 ///
-/// 三条硬性约束（都来自实测踩坑）：
+/// 四条硬性约束（都来自实测踩坑）：
 /// 1. **目标账号取抓包文件自己的 uid** —— 用探测链定位会让两个账号拿到同一凭证
 /// 2. **绝不自动建号** —— 网页版/其他字节应用的 cookie 会污染账号池
-/// 3. **幂等** —— `session_id`、`sid_guard`、`ttwid` 三者都没变时不写盘，
+/// 3. **幂等** —— 写入的字段都没变时不写盘，
 ///    避免每 20 秒的轮询把文件时间戳刷得毫无意义
+/// 4. **已有凭证的账号不被覆盖** —— 映射里的 sid 可能比池里的旧
+///
+/// ## 三条取值路径（按可靠性从高到低）
+///
+/// - **精确**：抓包文件带 `uid` 且该 uid 在池中 → 直接回写（原路径）
+/// - **映射**：抓包文件带 `sids`（`multi_sids` 全量映射）→ 池内属于该映射的账号
+///   各自补上**自己那一条** sessionid。一个豆包客户端可同时挂多个账号，
+///   而一次请求只带当前那一个 sessionid —— 映射里其余项本来就在 cookie 里，
+///   不补等于白丢
+/// - **唯一候选**：连 `multi_sids` 都没有时，若池中**恰好只有一个**账号缺凭证，
+///   认它。候选为 0 或 ≥2 都拒绝 —— 归属不明时宁可不写（跨账号污染事故的教训）
 pub fn auto_apply_captured() -> Result<Option<Value>, String> {
     let Some(captured) = load_captured() else {
         return Ok(None);
@@ -350,38 +441,178 @@ pub fn auto_apply_captured() -> Result<Option<Value>, String> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
-    if uid.is_empty() {
-        // 没有 multi_sids 就无法可靠归属，宁可不写
-        return Ok(None);
-    }
-    if ensure_uid_safe(uid).is_err() {
-        return Ok(None);
-    }
-    let Some(existing) = find_account(uid) else {
-        // 不自动建号
-        return Ok(None);
-    };
-
     let sid_guard = captured.get("sid_guard").and_then(Value::as_str);
     let ttwid = captured.get("ttwid").and_then(Value::as_str);
+
+    // 路径 1：精确匹配（`uid` 来自 `multi_sids` 里与本次 sessionid 相等的那一项）
+    if !uid.is_empty() && ensure_uid_safe(uid).is_ok() {
+        if let Some(existing) = find_account(uid) {
+            if !credential_unchanged(&existing, Some(session_id), sid_guard, ttwid) {
+                let updated =
+                    apply_credential(uid, Some(session_id), sid_guard, ttwid, "proxy", false)?;
+                // **不能在这里 return**：这一份抓包同时带着 multi_sids 映射，
+                // 同机其余账号的 sessionid 就在映射里。只回写当前这一个就等于
+                // 把它们白丢（「读得到却没填进去」）。先落当前账号，再继续走映射路径。
+                let current = account_view(&updated);
+                return Ok(Some(
+                    apply_sids_map(&captured, sid_guard, ttwid)?.unwrap_or(current),
+                ));
+            }
+            // 该账号无变化，但仍可能有别的账号能从映射里补全 —— 不 return，
+            // 继续走下面两条路径（映射路径是幂等的，重复调用无副作用）
+        }
+    }
+
+    // 路径 2：`multi_sids` 全量映射，逐个补全池内账号
+    if let Some(applied) = apply_sids_map(&captured, sid_guard, ttwid)? {
+        return Ok(Some(applied));
+    }
+
+    // 路径 3：uid 缺失（或不在池中）时的唯一候选推断。
+    // 只在**完全没有** uid 线索时才用 —— 有 uid 却不在池中意味着这是别人的
+    // 会话（网页版/其他字节应用），推断会把它错记到池内唯一那个账号上。
+    if uid.is_empty() {
+        if let Some(applied) = apply_unique_candidate(session_id, sid_guard, ttwid)? {
+            return Ok(Some(applied));
+        }
+    }
+
+    Ok(None)
+}
+
+/// 判断账号的凭证字段是否与将写入的值完全一致（幂等比对）。
+///
+/// 空/缺失的入参视为「不写入」，因此不算变化 —— 与 [`apply_credential`]
+/// 的「None 不覆盖」语义一致。
+fn credential_unchanged(
+    existing: &Value,
+    session_id: Option<&str>,
+    sid_guard: Option<&str>,
+    ttwid: Option<&str>,
+) -> bool {
     let same = |key: &str, incoming: Option<&str>| -> bool {
         let current = existing.get(key).and_then(Value::as_str).unwrap_or("");
         match incoming.map(str::trim) {
-            // 抓包没带这个字段 → 不算变化
             None | Some("") => true,
             Some(v) => v == current,
         }
     };
-    if same("session_id", Some(session_id))
-        && same("sid_guard", sid_guard)
-        && same("ttwid", ttwid)
-    {
+    same("session_id", session_id) && same("sid_guard", sid_guard) && same("ttwid", ttwid)
+}
+
+/// 路径 2：按 `sids` 映射给池内账号补全各自缺失的凭证。
+///
+/// 只补**当前没有有效 sessionid** 的账号：池里的凭证可能比映射里的更新
+/// （映射是本次抓包的快照），用它覆盖等于把刚续期好的凭证退回旧值。
+///
+/// `ttwid` / `sid_guard` 是设备级/会话级字段，对同机全部账号都适用，
+/// 因此对所有从映射命中的账号都写（沿用「显式给值才覆盖」语义）。
+///
+/// 返回第一个真正发生变化的账号视图；无任何变化返回 `None`。
+fn apply_sids_map(
+    captured: &Value,
+    sid_guard: Option<&str>,
+    ttwid: Option<&str>,
+) -> Result<Option<Value>, String> {
+    let Some(map) = captured.get("sids").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    if map.is_empty() {
         return Ok(None);
     }
+    let mut first: Option<Value> = None;
+    for (uid, sid) in map {
+        let uid = uid.trim();
+        let sid = sid.as_str().map(str::trim).unwrap_or("");
+        if sid.is_empty() || ensure_uid_safe(uid).is_err() {
+            continue;
+        }
+        let Some(existing) = find_account(uid) else {
+            continue; // 不自动建号
+        };
+        // 该账号已有凭证 → 只补它缺的设备级字段，绝不改 sessionid
+        let has_credential = existing
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let incoming_sid = if has_credential { None } else { Some(sid) };
+        if credential_unchanged(&existing, incoming_sid, sid_guard, ttwid) {
+            continue;
+        }
+        let updated = apply_credential(uid, incoming_sid, sid_guard, ttwid, "proxy", false)?;
+        if first.is_none() {
+            first = Some(account_view(&updated));
+        }
+    }
+    Ok(first)
+}
 
-    let updated = apply_credential(uid, Some(session_id), sid_guard, ttwid, "proxy", false)?;
+/// 路径 3：uid 缺失时的唯一候选推断。
+///
+/// `uid` 来自 `multi_sids`，不是每个请求都带。而当池中**恰好只有一个**账号
+/// 还没有凭证时，本次抓到的 sessionid 只可能是它的 —— 这属于「读得到却填不上」
+/// 的典型场景，不推断就等于要求用户手贴一个本机已有的值。
+///
+/// **候选数 ≥2 时必须拒绝**：这时无法判断 sessionid 属于谁，
+/// 猜错会把 A 的凭证写到 B 名下（[`crate::modules::doubao_account`] 文档记录的
+/// 账号 908/232 跨账号污染事故）。
+///
+/// `session_source` 记为 `proxy_inferred` 而非 `proxy`，让用户能分辨
+/// 「这条凭证是推断归属的」，而不是服务端直接标明的。
+fn apply_unique_candidate(
+    session_id: &str,
+    sid_guard: Option<&str>,
+    ttwid: Option<&str>,
+) -> Result<Option<Value>, String> {
+    let candidates: Vec<String> = load_accounts()
+        .iter()
+        .filter(|a| {
+            a.get("session_id")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+        })
+        .filter_map(|a| a.get("user_id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    if candidates.len() != 1 {
+        return Ok(None);
+    }
+    let uid = &candidates[0];
+    let Some(existing) = find_account(uid) else {
+        return Ok(None);
+    };
+    if credential_unchanged(&existing, Some(session_id), sid_guard, ttwid) {
+        return Ok(None);
+    }
+    let updated = apply_credential(
+        uid,
+        Some(session_id),
+        sid_guard,
+        ttwid,
+        "proxy_inferred",
+        false,
+    )?;
     Ok(Some(account_view(&updated)))
 }
+
+/// 凭证归属推断的当前状态（供 [`crate::modules::doubao_session::diagnose`] 解释
+/// 「为什么抓到了凭证却没填上」）。
+///
+/// 返回 `(缺少凭证的账号数, 是否可自动推断)`。
+pub fn credential_inference_state() -> (usize, bool) {
+    let missing = load_accounts()
+        .iter()
+        .filter(|a| {
+            a.get("session_id")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+        })
+        .count();
+    (missing, missing == 1)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -442,6 +673,91 @@ mod tests {
     }
 
     #[test]
+    fn 到期分层_无凭证为未知() {
+        assert_eq!(expiry_tier(None, 0), (ExpiryTier::Unknown, None));
+        assert_eq!(expiry_tier(Some(""), 0), (ExpiryTier::Unknown, None));
+        assert_eq!(expiry_tier(Some("不是日期"), 0), (ExpiryTier::Unknown, None));
+    }
+
+    #[test]
+    fn 到期分层_远期为_fresh() {
+        let now = 1_700_000_000;
+        let expire = chrono::DateTime::from_timestamp(now + 20 * 86_400, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let (tier, days) = expiry_tier(Some(&expire), now);
+        assert_eq!(tier, ExpiryTier::Fresh);
+        assert_eq!(days, Some(20));
+    }
+
+    #[test]
+    fn 到期分层_七天内为_soon() {
+        let now = 1_700_000_000;
+        for d in [0i64, 1, 7] {
+            let expire = chrono::DateTime::from_timestamp(now + d * 86_400, 0)
+                .unwrap()
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            let (tier, days) = expiry_tier(Some(&expire), now);
+            assert_eq!(tier, ExpiryTier::ExpiringSoon, "{d} 天后应为临期");
+            assert_eq!(days, Some(d));
+        }
+    }
+
+    /// 关键：剩 12 小时必须显示「1 天后」而不是「0 天后」——
+    /// 显示 0 会让用户以为今天就到期而白跑一次保活。
+    #[test]
+    fn 到期分层_不足一天向上取整为一天() {
+        let now = 1_700_000_000;
+        let expire = chrono::DateTime::from_timestamp(now + 12 * 3600, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let (tier, days) = expiry_tier(Some(&expire), now);
+        assert_eq!(tier, ExpiryTier::ExpiringSoon);
+        assert_eq!(days, Some(1));
+    }
+
+    #[test]
+    fn 到期分层_过期时为_expired_且天数为负() {
+        let now = 1_700_000_000;
+        let expire = chrono::DateTime::from_timestamp(now - 3 * 86_400, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let (tier, days) = expiry_tier(Some(&expire), now);
+        assert_eq!(tier, ExpiryTier::Expired);
+        assert_eq!(days, Some(-3));
+    }
+
+    #[test]
+    fn 到期分层_接受纯日期格式() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let (tier, days) = expiry_tier(Some("2026-01-11"), now);
+        assert_eq!(tier, ExpiryTier::Fresh);
+        assert_eq!(days, Some(10));
+    }
+
+    #[test]
+    fn 账号视图带到期分层字段() {
+        let acc = json!({
+            "user_id": "123",
+            "session_id": "x",
+            "expired": false,
+            "session_expire_at": "2026-01-01 00:00:00",
+        });
+        let view = account_view(&acc);
+        assert!(view["expiryTier"].is_string(), "界面需要 expiryTier 上色");
+        assert!(view.get("daysLeft").is_some());
+    }
+
+    #[test]
     fn 账号增删改查() {
         let _iso = Isolated::new("crud");
         assert!(load_accounts().is_empty());
@@ -498,6 +814,50 @@ mod tests {
     }
 
     #[test]
+    fn 重复提交同一_sid_guard_不清掉会话到期时间() {
+        // 回归：早期实现只要 sid_guard 非空就无条件把 `session_expire_at` 置空。
+        // 于是「改个备注点保存」也会让界面上的「会话到期」整行消失，
+        // 而且没有任何路径会把它算回来（只有续期拿到新 guard 时才写）。
+        let _iso = Isolated::new("guard-expire");
+        upsert_account("123456", None, None, true).unwrap();
+
+        let guard = "abc|1767225600|2592000";
+        apply_credential("123456", Some("sid-1"), Some(guard), None, "manual", true).unwrap();
+        let expire = find_account("123456").unwrap()["session_expire_at"]
+            .as_str()
+            .map(str::to_string);
+        assert!(
+            expire.is_some(),
+            "首次写入 sid_guard 时应由 guard 算出会话到期时间"
+        );
+
+        // 再次提交**同一个** guard（模拟只改备注后保存）→ 到期时间必须保留
+        apply_credential("123456", Some("sid-1"), Some(guard), None, "manual", true).unwrap();
+        assert_eq!(
+            find_account("123456").unwrap()["session_expire_at"]
+                .as_str()
+                .map(str::to_string),
+            expire,
+            "sid_guard 未变化时不得清掉会话到期时间"
+        );
+
+        // guard 真的换了 → 到期时间随新 guard 重算
+        let new_guard = "def|1767225600|86400";
+        apply_credential("123456", Some("sid-1"), Some(new_guard), None, "manual", true).unwrap();
+        let new_expire = find_account("123456").unwrap()["session_expire_at"]
+            .as_str()
+            .map(str::to_string);
+        assert!(new_expire.is_some());
+        assert_ne!(new_expire, expire, "换 guard 后到期时间应重算");
+
+        // 显式清空 guard → 到期时间也清空
+        apply_credential("123456", Some("sid-1"), Some(""), None, "manual", true).unwrap();
+        let acc = find_account("123456").unwrap();
+        assert!(acc["sid_guard"].is_null());
+        assert!(acc["session_expire_at"].is_null());
+    }
+
+    #[test]
     fn 抓包回写按抓包文件的_uid_定位且不自动建号() {
         let _iso = Isolated::new("capture");
 
@@ -538,13 +898,133 @@ mod tests {
     }
 
     #[test]
-    fn 抓包缺_uid_时不回写() {
-        let _iso = Isolated::new("nouid");
+    fn 抓包缺_uid_但有唯一候选时推断归属() {
+        let _iso = Isolated::new("nouid-uniq");
+        // 池中只有一个账号，且它没有凭证 → 本次抓到的 sid 只可能是它的
         upsert_account("111", None, None, true).unwrap();
-        save_captured(&json!({"session_id": "sid-only"})).unwrap();
+        save_captured(&json!({
+            "session_id": "sid-only",
+            "sid_guard": "guard-only",
+            "ttwid": "tw-only",
+        }))
+        .unwrap();
+        let applied = auto_apply_captured().unwrap().expect("唯一候选应被推断");
+        assert_eq!(applied["userId"], "111");
+        let acc = find_account("111").unwrap();
+        assert_eq!(acc["session_id"], "sid-only");
+        assert_eq!(acc["ttwid"], "tw-only");
+        assert_eq!(
+            acc["session_source"], "proxy_inferred",
+            "推断归属必须与「服务端直接标明」区分开，便于排查"
+        );
+        // 幂等
+        assert!(auto_apply_captured().unwrap().is_none());
+    }
+
+    /// 回归：候选数 ≥2 时**绝不**推断 —— 归属不明时猜错就是跨账号凭证污染。
+    #[test]
+    fn 抓包缺_uid_且多候选时拒绝推断() {
+        let _iso = Isolated::new("nouid-multi");
+        upsert_account("111", None, None, true).unwrap();
+        upsert_account("222", None, None, true).unwrap();
+        save_captured(&json!({"session_id": "sid-only", "ttwid": "tw-only"})).unwrap();
         assert!(
             auto_apply_captured().unwrap().is_none(),
-            "没有 multi_sids 就无法可靠归属，宁可不写"
+            "两个候选无法区分，必须拒绝写入"
         );
+        for uid in ["111", "222"] {
+            let acc = find_account(uid).unwrap();
+            assert!(
+                acc.get("session_id").is_none() || acc["session_id"].is_null(),
+                "账号 {uid} 不得被写入不属于它的凭证"
+            );
+            assert!(acc.get("ttwid").is_none(), "ttwid 也不得写入");
+        }
+        // 诊断应把「有几个候选」摆给用户看，而不是让他反复重试
+        assert_eq!(credential_inference_state(), (2, false));
+    }
+
+    /// 映射路径：一个客户端挂多个账号时，一次抓包要把**所有**已知账号都补上。
+    #[test]
+    fn 抓包映射为同机多账号各自补全() {
+        let _iso = Isolated::new("sids-map");
+        upsert_account("111", None, None, true).unwrap();
+        upsert_account("222", None, None, true).unwrap();
+        // 本次会话是 222，multi_sids 里同时带着 111
+        save_captured(&json!({
+            "session_id": "sidB",
+            "sid_guard": "guard-x",
+            "ttwid": "tw-x",
+            "uid": "222",
+            "sids": {"111": "sidA", "222": "sidB"},
+        }))
+        .unwrap();
+
+        assert!(auto_apply_captured().unwrap().is_some(), "应至少回写一个账号");
+        let a = find_account("111").unwrap();
+        let b = find_account("222").unwrap();
+        assert_eq!(a["session_id"], "sidA", "111 必须拿到**自己那条** sid");
+        assert_eq!(b["session_id"], "sidB");
+        assert_eq!(a["ttwid"], "tw-x", "ttwid 是设备级字段，同机账号都该补上");
+        assert_eq!(b["ttwid"], "tw-x");
+        assert_eq!(a["session_source"], "proxy");
+        // 幂等：全部无变化
+        assert!(auto_apply_captured().unwrap().is_none());
+    }
+
+    /// 映射路径**不得覆盖**已有凭证的账号：映射是本次抓包快照，
+    /// 池里的可能是刚续期好的更新的凭证。
+    #[test]
+    fn 抓包映射不覆盖已有凭证() {
+        let _iso = Isolated::new("sids-nocover");
+        upsert_account("111", None, None, true).unwrap();
+        apply_credential("111", Some("fresh-sid"), None, None, "manual", true).unwrap();
+
+        save_captured(&json!({
+            "session_id": "sidB",
+            "uid": "222", // 不在池中，精确路径落空
+            "sids": {"111": "stale-sid"},
+        }))
+        .unwrap();
+        assert!(
+            auto_apply_captured().unwrap().is_none(),
+            "111 已有凭证，映射不得改动任何字段"
+        );
+        assert_eq!(
+            find_account("111").unwrap()["session_id"],
+            "fresh-sid",
+            "已有凭证绝不能被映射里的旧值退回"
+        );
+    }
+
+    /// 映射里出现池外账号 → 不建号（沿用既有防污染约束）。
+    #[test]
+    fn 抓包映射不自动建号() {
+        let _iso = Isolated::new("sids-nocreate");
+        upsert_account("111", None, None, true).unwrap();
+        save_captured(&json!({
+            "session_id": "sidB",
+            "uid": "222",
+            "sids": {"111": "sidA", "999": "sidZ"},
+        }))
+        .unwrap();
+        auto_apply_captured().unwrap();
+        assert!(find_account("999").is_none(), "池外账号不得自动创建");
+        assert_eq!(find_account("111").unwrap()["session_id"], "sidA");
+    }
+
+    /// 抓包 uid 在池中、映射为空时，精确路径照常工作（老抓包文件的兼容性）。
+    #[test]
+    fn 抓包无映射字段时退化为精确路径() {
+        let _iso = Isolated::new("sids-absent");
+        upsert_account("111", None, None, true).unwrap();
+        save_captured(&json!({
+            "session_id": "sidA",
+            "uid": "111",
+        }))
+        .unwrap();
+        let applied = auto_apply_captured().unwrap().expect("应回写成功");
+        assert_eq!(applied["userId"], "111");
+        assert_eq!(applied["sessionSource"], "proxy");
     }
 }

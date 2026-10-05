@@ -427,6 +427,18 @@ func main() {
 	var zcodeDispatch server.ProductUpstream
 	// claimSched ZCode 套餐自动领取调度器（见下方 newClaimScheduler 处）。
 	var claimSched *zcode.ClaimScheduler
+	// qoderClient Qoder 上游客户端。
+	//
+	// ⚠ 声明提到这里（而不是就在下面 `qoderClient = qoder.New()` 那一行）是
+	// **必须的**：计费周期刷新（billing_cycle.go）在下面的 `if
+	// cfg.Pool.CreditRefreshEnabled` 块里接线，那一段**不在** `if
+	// cfg.Pool.MultiProduct` 块内 —— 若在这里用 `:=` 声明，那个变量出不了
+	// 块，接线点只能引用到一个未声明的名字（编译期 undefined）。
+	//
+	// nil 是**正常状态**：多产品关闭时它就是 nil，此时
+	// `qoderBillingCycleFetcher(nil)` 返回 nil、执行体构造返回 nil、
+	// 回调不装 —— 与"没有 Qoder 账号"同一条路径（单产品部署是合法配置）。
+	var qoderClient *qoder.Client
 	if cfg.Pool.MultiProduct {
 		// ---- Qoder ----
 		qoderDir := cfg.Pool.QoderAuthDir
@@ -459,9 +471,9 @@ func main() {
 		log.Printf("多产品路由已开启：Qoder 凭证目录 %s，载入 %d 个账号（解析失败 %d 个）",
 			qoderDir, added, len(failed))
 
-		qc := qoder.New()
+		qoderClient = qoder.New()
 		// Qoder 的网关对 HTTP/2 不友好，New() 里已禁用 h2（见 qoder.New 的注释）。
-		qoderDispatch = qoder.NewDispatch(qc)
+		qoderDispatch = qoder.NewDispatch(qoderClient)
 
 		// ---- ZCode ----
 		zcodeDir := cfg.Pool.ZcodeAuthDir
@@ -742,12 +754,36 @@ func main() {
 	// 与上面的 `sch.Run` 并列而不是并进去：两者的节奏完全不同
 	//（网关排程按小时时点，本调度器按分钟级轮询抢限量名额）。
 	startProductTasks(ctx, claimSched)
+	// 计费周期刷新（Qoder `/user/status` 的 nextResetAt）搭积分巡检的便车。
+	//
+	// # 为什么在这里接线而不是写进 scheduler.Config
+	//
+	// `sch` 在上面的 `scheduler.New(...)` 处就建好了，而执行体依赖的
+	// `qoderClient` 到 `if cfg.Pool.MultiProduct` 块里才有值 —— 走 Config
+	// 会引用一个尚未赋值的变量。这正是 `SetProductTasksRunner` 存在的同一
+	// 理由（见 internal/scheduler/scheduler.go 的 setter 注释）。
+	//
+	// ⚠ **必须**在 `RunCreditRefreshLoop` 之前调用：那个循环启动时立刻跑一轮，
+	// 之后再按 interval 跑；顺序反了会漏掉启动那一轮（要等一个 interval）。
+	//
+	// ⚠ 多产品关闭时 `qoderClient == nil` ⇒ 执行体为 nil ⇒ 回调不装，
+	// 循环里 `runBillingCycleRefresh` 直接跳过（**不 panic**）。
+	sch.SetBillingCycleRefreshRunner(newBillingCycleRefreshRunner(
+		p, qoderBillingCycleFetcher(qoderClient), usageStore,
+	))
 	// 积分到期巡检：独立于签到的高频刷新，驱动账号池「先烧快过期额度」的分层选号。
 	if cfg.Pool.CreditRefreshEnabled {
 		go sch.RunCreditRefreshLoop(ctx, cfg.CreditRefreshIntervalD)
 		log.Printf("积分到期巡检已启用：每 %s 刷新一次（驱动到期分层选号）", cfg.CreditRefreshIntervalD)
 	} else {
 		log.Printf("积分到期巡检已禁用（pool.credit_refresh_enabled=false）：到期分层仅依赖签到与宿主同步")
+	}
+	// ⚠ 计费周期刷新搭的是上面那条循环 ⇒ 巡检被关时它**一起停**。
+	// 这一点在 N4 的降级说明里如实写明，不是疏漏（要让它独立就得再开一条
+	// 循环，而"只读状态巡检"合成一条是刻意的：少一条常驻 goroutine、
+	// 少一处周期配置）。
+	if qoderClient == nil {
+		log.Printf("计费周期刷新未接线（多产品路由关闭）：/usage 的 billingCycles 将为空")
 	}
 
 	// ── 配置与多产品凭证的热重载（2026-09-21 所有者报的缺陷）──────────

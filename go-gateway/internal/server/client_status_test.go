@@ -11,20 +11,39 @@ package server
 //
 // 查证：**密钥从头到尾都是对的**。
 //
-// DSH Desktop 客户端的映射（`dsh-llm-deepseek/lib/index.js:1527`）：
+// # ★ 判据更正（2026-09-29，此前这里写错了）
 //
-//	if (status === 401 || status === 403) return "AUTH";
+// 本文件原先声称客户端是按**状态码**判的：
 //
-// 而 `AUTH` 在界面上就是 **「API 密钥无效」**
-//（`dsh-client-ui-chat/lib/client.js:2696`）。
+//	if (status === 401 || status === 403) return "AUTH";   // dsh-llm-deepseek
 //
-// 于是：上游 403（排队/额度/风控/WAF）→ 我们透传 403 → 界面说"密钥无效"。
+// **那条路径不生效**：DSH 里 `ai` provider 的 namespace 是 `llm-pi-ai`
+//（见 `dsh-config-manager` 的 providers.json），走的是 pi-ai 适配层。
+// 真正的判据是**文案文本正则**（`dsh-llm-pi-ai/lib/index.js:1376-1387`）：
+//
+//	function classifyPiAiError(message) {
+//	  if (/\b(?:401|403)\b/.test(message)) return "AUTH";
+//	  ...
+//	}
+//
+// 错误文案由 `pi-ai/dist/utils/error-body.js:111-118` 的 `formatProviderError`
+// 把 `(status): body` **原样拼进 message** 得到。
+// ⇒ **只要文案里出现裸 "401"/"403"，HTTP 状态码是什么都无所谓，一律判 AUTH。**
+//
+// 于是：上游 403（排队/额度/风控/WAF）→ 文案里带 "403" → 界面说"密钥无效"。
 // 用户会去**反复改密钥**，而真正原因是上游拒绝 —— 最坏的一类误导。
+//
+// # 为什么本文件只测状态码、文案另有一处
+//
+// 状态码归一是**必要但不充分**的防线（挡住按状态码判的分支）。
+// 真正兜住 DSH 的是文案闸门 `clientSafeMessage`（clienttext.go），
+// 其回归断言在 `clienttext_test.go`。两者都改掉才算修完 ——
+// 上一版只做了状态码归一，所有者实测**仍然**报「API 密钥无效」。
 //
 // # 为什么用单测
 //
 // 复现需要"上游恰好返回 403"这一外部条件（且会真打上游），
-// 而判据是一个纯函数映射，单测能精确锁定，零风险。
+// 而状态码判据是一个纯函数映射，单测能精确锁定，零风险。
 import (
 	"net/http"
 	"testing"

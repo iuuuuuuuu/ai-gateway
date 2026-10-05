@@ -779,11 +779,53 @@ pub fn warmup_prefetch(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         // 稍等：让主窗口先完成创建，避免启动瞬间抢资源（用户看到的是主界面先出来）。
         tokio::time::sleep(Duration::from_millis(800)).await;
+        // 再等主窗口真正画完第一帧。
+        //
+        // # 为什么固定 800ms 不够（2026-10-05）
+        //
+        // `WebviewWindowBuilder::build()` 是**同步**创建 WebView2 的
+        //（tauri-runtime-wry `create_webview` → `WebViewBuilder::build`，
+        // 无 `run_on_main_thread` 派发），所以这个预热窗口一建，
+        // 浏览器进程就要再起一套环境。启动期它和主窗口的 WebView2 初始化
+        // 叠在同一段时间里，正是所有者反馈「启动响应好久」的可疑来源之一。
+        //
+        // 固定 800ms 在快机器上够、在慢机器/大账号库上不够，
+        // 所以改成等一个**真实信号**（主窗口首帧），并保留上限：
+        // 预热本身只是优化，最多等 8 秒，超时照跑。
+        wait_main_window_first_frame().await;
         if let Err(e) = do_warmup(&app) {
             // 只记日志，不报错 —— 预热失败时求解仍会在首次请求时正常走一遍
             log_info(&format!("预热未成功（不影响功能，首次求解会稍慢）：{e}"));
         }
     });
+}
+
+/// 等主窗口画完第一帧 —— 由前端上报 `frontend_ready` 触发（见 `crate::tray`）。
+///
+/// # 为什么轮询，而不是订阅事件
+///
+/// 这个等待跑在 `setup` 之后的异步任务里，早于任何窗口事件的订阅点；
+/// 而「前端就绪」只是一次性的布尔翻牌（`tray::frontend_ready_flag`），
+/// 100ms 轮询最多 80 次原子读，代价可以忽略，却省掉了事件通道的时序坑
+/// —— 万一上报比订阅还早，事件就永远收不到了。
+///
+/// 上限 8 秒：预热只是优化，等不到就照跑（宁可慢一点，也不能一直不预热）。
+async fn wait_main_window_first_frame() {
+    #[cfg(not(desktop))]
+    {
+        // 移动端没有托盘与「主窗口被藏起来等首帧」这套时序（也没有 `tray` 模块），
+        // 保持调用方那 800ms 的固定等待即可。
+    }
+    #[cfg(desktop)]
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            if crate::tray::frontend_ready_flag() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 }
 
 fn do_warmup(app: &tauri::AppHandle) -> Result<(), String> {

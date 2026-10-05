@@ -296,6 +296,15 @@ export function TaskQueuePanel({ open, onOpenChange, accounts, onFinished }: Tas
   const [concurrency, setConcurrency] = useState<number>(DEFAULT_CONCURRENCY);
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [scanFailures, setScanFailures] = useState<ScanFailure[]>([]);
+  /**
+   * 本次扫描**成功读到清单**的账号（含那些一项待办都没有的）。
+   *
+   * 为什么必须单独记一份：`queue` 只装有待办的账号，于是「这个号没有待办」
+   * 与「这个号还没轮到」在界面上长得一模一样 —— 所有者 2026-10-05 就是被这个
+   * 混淆误导的（截图里只有三个账号在列，看起来像其余账号被漏派发了，
+   * 实际是并发 2、按账号顺序推进，剩下的还没轮到）。见下方 `idleAccounts`。
+   */
+  const [scannedAccounts, setScannedAccounts] = useState<AccountMeta[]>([]);
   const [scanning, setScanning] = useState(false);
   const [running, setRunning] = useState(false);
   /** 本批是否已跑过（用于把进度文案从「待执行」切成「已结束」）。 */
@@ -352,7 +361,7 @@ export function TaskQueuePanel({ open, onOpenChange, accounts, onFinished }: Tas
   /**
    * 扫描待办：逐账号拉任务列表（**只读**），筛出可自动完成的未完成项。
    *
-   * 筛选口径照抄后端 `growtask.PendingTasks`（`!Claimed && Automatable`）——
+   * 筛选口径照抄后端 `growtask.PendingTasks`（`!Claimed && Automatable && !locked`）——
    * 界面自己再定一套「什么算待办」只会与后端的作用范围漂移。
    * 顺序也**不重排**：后端 `ListTasks` 已经把待办排前面（可领奖 → 进行中 →
    * 可报名 → 已领奖垫底），排序口径只该有一处。
@@ -366,6 +375,7 @@ export function TaskQueuePanel({ open, onOpenChange, accounts, onFinished }: Tas
       setScanning(true);
       setQueue([]);
       setScanFailures([]);
+      setScannedAccounts([]);
       setHasRun(false);
     }
 
@@ -396,12 +406,15 @@ export function TaskQueuePanel({ open, onOpenChange, accounts, onFinished }: Tas
 
     const nextQueue: QueueItem[] = [];
     const nextFailures: ScanFailure[] = [];
+    const nextScanned: AccountMeta[] = [];
     for (const result of results) {
       const name = accountLabel(result.account);
       if (!result.ok) {
         nextFailures.push({ accountId: result.account.id, accountName: name, message: result.error });
         continue;
       }
+      // 读到了清单就算「扫过」，与有没有待办无关（用于区分「没待办」和「还没轮到」）。
+      nextScanned.push(result.account);
       for (const task of result.tasks) {
         if (!isPendingTask(task)) continue;
         nextQueue.push({
@@ -418,6 +431,7 @@ export function TaskQueuePanel({ open, onOpenChange, accounts, onFinished }: Tas
 
     setQueue(nextQueue);
     setScanFailures(nextFailures);
+    setScannedAccounts(nextScanned);
     setScanning(false);
     scanningRef.current = false;
   }, [concurrency, eligibleAccounts]);
@@ -605,6 +619,29 @@ export function TaskQueuePanel({ open, onOpenChange, accounts, onFinished }: Tas
   const nothingPending = !scanning && !running && total === 0 && scanFailures.length === 0;
   const allScansFailed = !scanning && !running && total === 0 && scanFailures.length > 0;
 
+  /**
+   * 本次扫描**读到清单但一项待办都没有**的账号。
+   *
+   * 必须与「队列里的账号」分开列出，否则界面无法回答「为什么我的号没在里面」：
+   * 队列按账号分组发放令牌，并发档位只决定同时在跑的账号数，剩下的账号要排队
+   * —— 它们在界面上此前**完全不出现**，与「这个号没有待办」长得一模一样。
+   */
+  const idleAccounts = useMemo(() => {
+    const withTasks = new Set(queue.map((item) => item.accountId));
+    return scannedAccounts.filter((account) => !withTasks.has(account.id));
+  }, [queue, scannedAccounts]);
+
+  /** 账号 id → 本批的派发序号（1 起，按队列中首次出现的顺序）。 */
+  const runIndex = useMemo(() => {
+    const index = new Map<string, number>();
+    for (const item of queue) {
+      if (!index.has(item.accountId)) index.set(item.accountId, index.size + 1);
+    }
+    return index;
+  }, [queue]);
+
+  const groupCount = runIndex.size;
+
   return (
     <Dialog
       open={open}
@@ -696,6 +733,11 @@ export function TaskQueuePanel({ open, onOpenChange, accounts, onFinished }: Tas
             <div className="flex items-center justify-between gap-3 text-xs">
               <span className="font-medium tabular-nums">
                 {progressPrefix} {settled} / {total}
+                {groupCount > 1 ? (
+                  <span className="ml-2 font-normal text-muted-foreground">
+                    共 {groupCount} 个账号 · 同时最多 {concurrency} 个，其余按序排队
+                  </span>
+                ) : null}
               </span>
               <span className="tabular-nums text-muted-foreground">
                 完成 {doneCount}
@@ -759,6 +801,31 @@ export function TaskQueuePanel({ open, onOpenChange, accounts, onFinished }: Tas
             </div>
           )}
 
+          {idleAccounts.length > 0 && (
+            <section className="space-y-1.5">
+              <header className="flex items-center gap-2 px-1">
+                <h3 className="text-sm font-semibold tracking-tight">没有待办</h3>
+                <span className="text-[11px] tabular-nums text-muted-foreground">
+                  {idleAccounts.length} 个账号
+                </span>
+              </header>
+              <p className="px-1 text-xs leading-5 text-muted-foreground">
+                这些账号已扫描，当前没有可自动完成的待办任务（可能已全部完成或已领奖）。
+                它们不会出现在上方的队列里 —— 上方的账号是**按序排队**，还没轮到不代表被跳过。
+              </p>
+              <ul className="flex flex-wrap gap-1.5 px-1">
+                {idleAccounts.map((account) => (
+                  <li
+                    key={account.id}
+                    className="rounded-lg border px-2 py-0.5 text-[11px] text-muted-foreground"
+                  >
+                    {accountLabel(account)}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
           {scanFailures.length > 0 && (
             <section className="space-y-1.5">
               <header className="flex items-center gap-2 px-1">
@@ -794,6 +861,13 @@ export function TaskQueuePanel({ open, onOpenChange, accounts, onFinished }: Tas
                   <span className="text-[11px] tabular-nums text-muted-foreground">
                     {groupSummary(group)}
                   </span>
+                  {/* 派发序号：并发档位只决定同时在跑的账号数，其余账号按序等待。
+                      不标序号时，用户会以为后面的账号被漏掉了（所有者 2026-10-05 的误判）。 */}
+                  {groupCount > 1 ? (
+                    <span className="text-[11px] tabular-nums text-muted-foreground/70">
+                      第 {runIndex.get(group.accountId) ?? 0} / {groupCount} 个账号
+                    </span>
+                  ) : null}
                 </header>
                 <ul className="divide-y divide-border rounded-xl border">
                   {group.items.map((item) => (
@@ -851,15 +925,23 @@ export function TaskQueuePanel({ open, onOpenChange, accounts, onFinished }: Tas
 /**
  * 该任务是否属于「待办」。
  *
- * 口径照抄后端 `growtask.PendingTasks`：`!Claimed && Automatable`。
- * 已领奖的不再跑（跑了也是白费上游请求）；不可自动完成的只展示指引、不给入口，
- * 因此这里直接滤掉，避免队列里出现注定「跳过」的行。
+ * 口径照抄后端 `growtask.PendingTasks`：`!Claimed && Automatable && !locked`。
+ * 已领奖的不再跑（跑了也是白费上游请求）；不可自动完成的只展示指引、不给入口；
+ * **未解锁的必须排除** —— 上游对锁定任务返回 HTTP 200 但静默丢弃事件、进度纹丝
+ * 不动，混进队列只会白打上游请求并让用户误以为做过。
  *
  * 「已领奖」用 `status === "claimed"` 判断，而不是读某个布尔字段：Go 侧
  * `TaskView` 里 `claimed` 是个**非 omitempty 的 bool**，但前端 `GrowthTaskView`
  * 只声明了 `claimable` —— 直接读 `task.claimed` 会编译不过。用 status 更稳：
  * 它是后端 `viewStatus` 推导出的稳定枚举（ViewClaimed），语义唯一。
+ *
+ * ★ 早前这里漏了 `locked`（后端 `pending_tasks` 有、前端没有）⇒ 队列里混入注定
+ * `skipped` 的项，面板显示「排队」而实际什么都没发生。
  */
 function isPendingTask(task: GrowthTaskView): boolean {
-  return task.status !== "claimed" && task.automatable === true;
+  if (task.status === "claimed") return false;
+  // locked 同时看 status 与布尔字段：status 是后端 viewStatus 的主判据，
+  // locked 是原始标记，两者任一命中都视为不可执行。
+  if (task.status === "locked" || task.locked === true) return false;
+  return task.automatable === true;
 }

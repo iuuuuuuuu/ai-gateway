@@ -25,6 +25,32 @@ use crate::modules::vscode_cn_inject::{
 };
 
 const STATE_FILE: &str = "codebuddy_cn_ide.json";
+/// 通用短缓存：命中 TTL 内则返回克隆，否则计算一次并写回。
+///
+/// 为什么要有这个：本模块在 Windows 上判断「客户端是否在运行」要 spawn 一次
+/// powershell 枚举进程（实测 ~600 ms），而**同一次 HTTP 请求内**会连着问两遍
+/// （`status()` 先经 `codebuddy_cn_app_path()` 问一次，再直接问
+/// `is_codebuddy_cn_running()`）。把它做成带 TTL 的读，第二次就变成 0 成本。
+///
+/// 用 `unwrap_or_else(|e| e.into_inner())` 而不是 `unwrap()`：缓存本身是纯
+/// 加速层，任何调用方 panic 都不该让后续请求跟着一起 panic（同
+/// `gateway.rs` 的 `proc_slot()`）。
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+fn cached_with_ttl<T: Clone>(
+    cache: &std::sync::Mutex<Option<(Instant, T)>>,
+    ttl: Duration,
+    compute: impl FnOnce() -> T,
+) -> T {
+    let mut slot = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, value)) = slot.as_ref() {
+        if at.elapsed() < ttl {
+            return value.clone();
+        }
+    }
+    let value = compute();
+    *slot = Some((Instant::now(), value.clone()));
+    value
+}
 #[cfg(target_os = "macos")]
 const MACOS_BUNDLE_ID: &str = "com.tencent.codebuddycn";
 #[cfg(target_os = "macos")]
@@ -399,8 +425,24 @@ fn windows_cn_cim_process_script() -> &'static str {
          ForEach-Object { '{0}|{1}|{2}' -f $_.ProcessId, $_.Name, $_.ExecutablePath }"
 }
 
+/// 状态展示用的进程行短缓存（TTL = `CN_PROC_ROWS_TTL`）。
 #[cfg(target_os = "windows")]
-fn windows_cn_process_rows() -> Vec<process::WindowsProcessRow> {
+static CN_PROC_ROWS_CACHE: std::sync::Mutex<Option<(Instant, Vec<process::WindowsProcessRow>)>> =
+    std::sync::Mutex::new(None);
+
+/// 2 s。取值依据：进程开关是秒级事件，2 s 的滞后对「footer 显示是否运行中」
+/// 无感；而前端启动瞬间会连打两次 status（`AccountsPage` 的 detect + refresh），
+/// 2 s 足够把第二次变成 0 成本。
+///
+/// ⚠ **关闭 / 重启进程的路径不吃这个缓存** —— `close_codebuddy_cn_windows` 走
+/// `windows_cn_process_rows_now()`。否则「刚 taskkill 完又读到旧行」会让关闭
+/// 逻辑拿到已经死掉的 pid，白等满 8 s 优雅期。
+#[cfg(target_os = "windows")]
+const CN_PROC_ROWS_TTL: Duration = Duration::from_secs(2);
+
+/// 实时枚举（无缓存）：关闭 / 重启路径必须用这个。
+#[cfg(target_os = "windows")]
+fn windows_cn_process_rows_now() -> Vec<process::WindowsProcessRow> {
     let self_pid = std::process::id();
     if let Some(stdout) = process::ps_output(windows_cn_cim_process_script(), 5) {
         let rows: Vec<_> = process::parse_windows_process_rows(&stdout)
@@ -419,10 +461,21 @@ fn windows_cn_process_rows() -> Vec<process::WindowsProcessRow> {
         .collect()
 }
 
+/// 状态展示用的进程行（带 `CN_PROC_ROWS_TTL` 短缓存）。
+///
+/// 缓存的是**原始枚举结果**（不是「是否在运行」的布尔）：这样
+/// `is_codebuddy_cn_running()` 与 `windows_cn_running_exe()` 可以共用同一次
+/// powershell —— 改造前它俩各跑一次，`status()` 里就是 2 次 ≈ 1.2 s。
+#[cfg(target_os = "windows")]
+fn windows_cn_process_rows() -> Vec<process::WindowsProcessRow> {
+    cached_with_ttl(&CN_PROC_ROWS_CACHE, CN_PROC_ROWS_TTL, windows_cn_process_rows_now)
+}
+
 #[cfg(target_os = "windows")]
 fn windows_cn_running_exe() -> Option<PathBuf> {
-    let stdout = process::ps_output(windows_cn_cim_process_script(), 5)?;
-    for row in process::parse_windows_process_rows(&stdout) {
+    // 复用上面的短缓存：原先这里自己再 spawn 一次 powershell（同一条 CIM 脚本），
+    // 与 `is_codebuddy_cn_running()` 重复，是 `status()` 2.2 s 的主因之一。
+    for row in windows_cn_process_rows() {
         if !keep_windows_cn_row(&row) {
             continue;
         }
@@ -735,7 +788,9 @@ fn close_codebuddy_cn_macos(timeout_secs: i64) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn close_codebuddy_cn_windows(timeout_secs: i64) -> Result<(), String> {
-    let rows = windows_cn_process_rows();
+    // 必须实时枚举（不吃 `CN_PROC_ROWS_TTL` 缓存）：这里要的是「现在还有哪些
+    // pid」，缓存会让刚被杀掉的进程继续出现在列表里，白等满 8 s 优雅期。
+    let rows = windows_cn_process_rows_now();
     if rows.is_empty() {
         return Ok(());
     }

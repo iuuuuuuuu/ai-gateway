@@ -455,10 +455,13 @@ func numOf(v any) int {
 }
 
 // responsesError 生成 Responses 形状的错误体。
+//
+// msg 过 clientSafeMessage：客户端读「API 密钥无效」靠的是文案里的 401/403，
+// 与状态码无关（见 clienttext.go）。流式 failedEvent 也复用本函数的措辞口径。
 func responsesError(status int, code, msg string) map[string]any {
 	return map[string]any{
 		"error": map[string]any{
-			"message": msg,
+			"message": clientSafeMessage(msg),
 			"type":    "api_error",
 			"code":    code,
 		},

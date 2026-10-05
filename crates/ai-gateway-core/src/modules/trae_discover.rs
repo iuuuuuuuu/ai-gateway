@@ -12,7 +12,7 @@
 //! 直接用 dc uid 入库会产生**跨体系的重复账号**，且这个号永远签到失败。
 //!
 //! 因此本机登录账号的 Cloud-IDE uid 必须由**使用痕迹**推导：
-//! 1. Trae CN：`storage.json` 的 `icube_gtm.users` 键名
+//! 1. Trae CN：`storage.json` 的 `icube_gtm.users` 键名（**嵌套**：`icube_gtm` → `users`）
 //! 2. Trae Work：`state.vscdb` 里 `solo.mobile.allowControl` 的 per-uid
 //!    `updatedTime` 最新者，辅以 `<uid>:*` / `:user:<uid>` 键名证据计数
 //! 3. 两应用证据合并，取（最新时间, 证据数）最大者
@@ -26,22 +26,37 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 
 /// `storage.json` 相对应用数据目录的后缀。
-const STORAGE_SUFFIX: &str = r"User\globalStorage\storage.json";
+///
+/// **必须用 `/` 而不是 `\`**：`Path::join` 在 Unix 下把 `\` 当普通字符，
+/// 于是 `r"User\globalStorage\storage.json"` 会变成一个**单段文件名**
+/// （整个串里没有路径分隔符），路径永远不存在 —— 表现为 Linux/macOS 上
+/// 该功能静默失效、只在 Windows 上「看着正常」。
+/// `Path::join` 在 Windows 上同样接受 `/`，因此用 `/` 两边都对。
+const STORAGE_SUFFIX: &str = "User/globalStorage/storage.json";
 /// `state.vscdb` 相对应用数据目录的后缀。
-const VSCDB_SUFFIX: &str = r"User\globalStorage\state.vscdb";
+///
+/// 与 [`STORAGE_SUFFIX`] 同理，必须用 `/`。
+const VSCDB_SUFFIX: &str = "User/globalStorage/state.vscdb";
 
 /// 应用数据目录候选（按优先级）。
 ///
 /// 每个应用给多个候选：客户端改过目录名（`TRAE SOLO` → `TRAE SOLO CN`），
 /// 只认一个会让老安装的用户发现不到账号。
 pub fn app_data_dirs(app_kind: &str) -> Vec<PathBuf> {
-    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    app_data_dirs_under(app_kind, &std::env::var("APPDATA").unwrap_or_default())
+}
+
+/// [`app_data_dirs`] 的纯函数内核：显式接收 APPDATA 根目录。
+///
+/// 拆出来是为了让测试不必 `set_var("APPDATA")` —— 环境变量是进程全局的，
+/// 并行测试下会互相串扰（详见 `gtm_users_evidence_under` 的注释）。
+fn app_data_dirs_under(app_kind: &str, appdata: &str) -> Vec<PathBuf> {
     match app_kind {
         "TraeWork" => vec![
-            PathBuf::from(&appdata).join("TRAE SOLO CN"),
-            PathBuf::from(&appdata).join("TRAE SOLO"),
+            PathBuf::from(appdata).join("TRAE SOLO CN"),
+            PathBuf::from(appdata).join("TRAE SOLO"),
         ],
-        "Trae" => vec![PathBuf::from(&appdata).join("Trae CN")],
+        "Trae" => vec![PathBuf::from(appdata).join("Trae CN")],
         _ => vec![],
     }
 }
@@ -56,13 +71,34 @@ pub fn app_label(app_kind: &str) -> &str {
 }
 
 /// 读取应用的 `storage.json`（多候选目录取第一个存在的）。
+///
+/// ## 加密值的处理
+///
+/// Trae 客户端可能把若干**值**写成 base64 密文（容器格式见
+/// [`crate::modules::trae_crypt`]）。本函数在 JSON 解析成功后，对顶层字符串值
+/// 做一次解密旁路；**明文路径不受影响**：
+///
+/// - 值以 `{` / `"` 开头 ⇒ 已是明文，原样保留（JS 参考实现的快路径，`trae-decrypt.js:151`）
+/// - 值不是容器形态 ⇒ 原样保留
+/// - 是容器形态但解不开 ⇒ **保留原值**并计入失败统计（不静默塞错误对象）
+///
+/// 因此对未加密的机器，本函数的返回值与加解密功能引入前**逐字节相同**。
 pub fn read_storage_json(app_kind: &str) -> Option<Value> {
+    read_storage_json_with_stats(app_kind).map(|(v, _)| v)
+}
+
+/// 与 [`read_storage_json`] 相同，但额外返回解密统计，便于排查
+/// 「为什么本机发现不到账号」。
+pub fn read_storage_json_with_stats(
+    app_kind: &str,
+) -> Option<(Value, crate::modules::trae_crypt::StorageDecryptStats)> {
     for dir in app_data_dirs(app_kind) {
         let path = dir.join(STORAGE_SUFFIX);
         if path.is_file() {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 if let Ok(v) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) {
-                    return Some(v);
+                    let (v, stats) = crate::modules::trae_crypt::decrypt_storage_values_with_stats(&v);
+                    return Some((v, stats));
                 }
             }
         }
@@ -100,9 +136,18 @@ struct UidEvidence {
     count: i64,
 }
 
-/// 是否为 15~16 位纯数字 uid。
+/// 是否为合法 uid 形态的纯数字串（Cloud-IDE id 空间）。
+///
+/// 长度窗口是 **15~19 位**，不是更窄的范围：实测同一台机器上同时存在
+/// - 16 位（`icube_gtm.users` 键名、Cloud-IDE JWT `data.id`，如 `1883919207380040`）
+/// - 19 位（`solo.mobile.allowControl` 的 uid 键，如 `7679751654497928200`）
+///
+/// 早期只认 15~16 位，导致 19 位的账号在发现阶段被**静默丢弃**
+/// （`solo.mobile.allowControl` 正是最强证据来源，丢掉它等于漏掉整个账号）。
+/// 上限取 19 位：账号中心（dc）uid 同样是长数字串，靠长度区分不可靠，
+/// 因此这里只做「形态像 uid」的判断，跨体系去重由 [`discover_all`] 的证据排序负责。
 fn is_uid_token(token: &str) -> bool {
-    (15..=16).contains(&token.chars().count()) && token.chars().all(|c| c.is_ascii_digit())
+    (15..=19).contains(&token.chars().count()) && token.chars().all(|c| c.is_ascii_digit())
 }
 
 /// 把 `YYYY-MM` 转为近似时间戳（当月 1 日 0 点，毫秒），用于与毫秒时间戳同维度比较。
@@ -132,29 +177,39 @@ fn month_to_ts_ms(month: &str) -> i64 {
 /// - `*:user:<uid>[:YYYY-MM]`（如 `commercial-banner-popup:...:user:<uid>:2026-09`）
 fn vscdb_uid_evidence(app_kind: &str) -> HashMap<String, UidEvidence> {
     let mut out: HashMap<String, UidEvidence> = HashMap::new();
-    let Some(db_path) = app_data_dirs(app_kind)
+    // **必须遍历全部候选目录**，不能取第一个存在的就收工：客户端改名后
+    // （`TRAE SOLO` → `TRAE SOLO CN`）两个目录会**同时留在磁盘上**，各自存着
+    // 不同账号的使用痕迹。只读第一个会让另一个目录里的账号在发现阶段整体消失
+    // —— 实测本机 `TRAE SOLO CN` 有 16 位 uid、`TRAE SOLO` 有 19 位 uid，
+    // 早期实现只发现前者。
+    for db_path in app_data_dirs(app_kind)
         .into_iter()
         .map(|d| d.join(VSCDB_SUFFIX))
-        .find(|p| p.is_file())
-    else {
-        return out;
-    };
+        .filter(|p| p.is_file())
+    {
+        merge_vscdb_into(&mut out, &db_path);
+    }
+    out
+}
+
+/// 把单个 `state.vscdb` 的证据并入 `out`（同一 uid 取时间最大值、计数累加）。
+fn merge_vscdb_into(out: &mut HashMap<String, UidEvidence>, db_path: &std::path::Path) {
     // 只读打开：客户端可能正在运行并持有写锁
     let Ok(conn) = rusqlite::Connection::open_with_flags(
-        &db_path,
+        db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ) else {
-        return out;
+        return;
     };
     let Ok(mut stmt) = conn.prepare("SELECT key, value FROM ItemTable") else {
-        return out;
+        return;
     };
     let Ok(rows) = stmt.query_map([], |row| {
         let key: String = row.get(0)?;
         let value: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
         Ok((key, value))
     }) else {
-        return out;
+        return;
     };
 
     for (key, value) in rows.flatten() {
@@ -203,13 +258,37 @@ fn vscdb_uid_evidence(app_kind: &str) -> HashMap<String, UidEvidence> {
             }
         }
     }
-    out
 }
 
 /// 从 `storage.json` 的 `icube_gtm.users` 键名提取 Cloud-IDE uid（Trae CN 专用证据）。
+///
+/// ## 键形状是**嵌套**的，不是扁平点号键
+///
+/// 真实形态：
+///
+/// ```text
+/// {"icube_gtm": {"users": {"<15~19 位 uid>": {"gtm101_idea": {...}}}}}
+/// ```
+///
+/// 实测本机 `Trae CN` 的 `storage.json`（顶层 26 键）：`icube_gtm` 是对象，
+/// 其下 `users` 是对象，含 1 个 16 位 uid 键；整份数据里**不存在**任何含 `.`
+/// 的顶层键。
+///
+/// ★ 早期实现取的是扁平键 `storage.get("icube_gtm.users")` —— 在真实数据上
+/// **永不命中**，本函数因此恒返回空表：整条 gtm 证据通道静默失效，只剩
+/// [`vscdb_uid_evidence`] 一路。对只装了 `Trae CN` 且 `state.vscdb` 无命中的
+/// 机器，`discover_app` 会退回「展示 dc uid 但标不可信、禁止入池」。
+/// 之所以长期没被发现：单测夹具构造的正是那个**非真实**的扁平形状。
+///
+/// 键缺失时返回空表而非报错：这是**合法**状态（未登录 / 该应用不用 gtm 记录），
+/// 调用方据此回退到其它证据源。
 fn gtm_users_evidence(storage: &Value) -> HashMap<String, UidEvidence> {
     let mut out = HashMap::new();
-    let Some(users) = storage.get("icube_gtm.users").and_then(Value::as_object) else {
+    let Some(users) = storage
+        .get("icube_gtm")
+        .and_then(|gtm| gtm.get("users"))
+        .and_then(Value::as_object)
+    else {
         return out;
     };
     for (uid, info) in users {
@@ -275,6 +354,40 @@ pub fn read_entitlement(app_kind: &str) -> Option<Value> {
     }))
 }
 
+/// 合并全部候选目录的 `icube_gtm.users` 证据。
+///
+/// 与 [`vscdb_uid_evidence`] 同理：改名后的两个目录会并存且可能各自记录了
+/// 不同账号，只看第一个会把另一个目录的账号漏掉。
+fn gtm_users_evidence_all(app_kind: &str) -> HashMap<String, UidEvidence> {
+    gtm_users_evidence_under(app_kind, &std::env::var("APPDATA").unwrap_or_default())
+}
+
+/// [`gtm_users_evidence_all`] 的**纯函数内核**：显式接收 APPDATA 根目录。
+///
+/// 抽出它只为可测性：直接测 `gtm_users_evidence_all` 需要 `set_var("APPDATA")`，
+/// 而环境变量是**进程全局**的 —— 并行跑测试时其他用例可能读到被改写的值
+///（实测该用例本地单跑通过、CI 全量跑必失败，就是并行串扰所致）。
+/// 这里把根目录改成入参后，测试不再需要碰任何全局状态。
+fn gtm_users_evidence_under(app_kind: &str, appdata: &str) -> HashMap<String, UidEvidence> {
+    let mut out: HashMap<String, UidEvidence> = HashMap::new();
+    for dir in app_data_dirs_under(app_kind, appdata) {
+        let path = dir.join(STORAGE_SUFFIX);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(storage) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}'))
+        else {
+            continue;
+        };
+        for (uid, ev) in gtm_users_evidence(&storage) {
+            let entry = out.entry(uid).or_default();
+            entry.latest_ts_ms = entry.latest_ts_ms.max(ev.latest_ts_ms);
+            entry.count += ev.count;
+        }
+    }
+    out
+}
+
 /// 发现指定应用的本机登录账号。
 pub fn discover_app(app_kind: &'static str, pool_uids: &[String]) -> Vec<DiscoveredAccount> {
     let mut results = Vec::new();
@@ -290,14 +403,12 @@ pub fn discover_app(app_kind: &'static str, pool_uids: &[String]) -> Vec<Discove
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    // 合并两路证据
+    // 合并两路证据（各自都已跨全部候选目录）
     let mut evidence: HashMap<String, UidEvidence> = vscdb_uid_evidence(app_kind);
-    if let Some(storage) = storage.as_ref() {
-        for (uid, ev) in gtm_users_evidence(storage) {
-            let entry = evidence.entry(uid).or_default();
-            entry.latest_ts_ms = entry.latest_ts_ms.max(ev.latest_ts_ms);
-            entry.count += ev.count;
-        }
+    for (uid, ev) in gtm_users_evidence_all(app_kind) {
+        let entry = evidence.entry(uid).or_default();
+        entry.latest_ts_ms = entry.latest_ts_ms.max(ev.latest_ts_ms);
+        entry.count += ev.count;
     }
 
     if evidence.is_empty() {
@@ -422,14 +533,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uid_token_判定_15_或_16_位纯数字() {
-        assert!(is_uid_token("2328112497170937"));
-        assert!(is_uid_token("123456789012345"));
-        assert!(is_uid_token("1234567890123456"));
+    fn uid_token_判定_15_到_19_位纯数字() {
+        assert!(is_uid_token("2328112497170937"), "16 位（JWT data.id / gtm 键名）");
+        assert!(is_uid_token("1883919207380040"), "16 位实测样本");
+        assert!(is_uid_token("123456789012345"), "15 位");
+        assert!(is_uid_token("12345678901234567"), "17 位");
+        assert!(is_uid_token("123456789012345678"), "18 位");
+        assert!(
+            is_uid_token("7679751654497928200"),
+            "19 位（solo.mobile.allowControl 实测样本）—— 早期只认 15~16 位时这个账号会被漏掉"
+        );
         assert!(!is_uid_token("12345678901234"), "14 位不是 uid");
-        assert!(!is_uid_token("12345678901234567"), "17 位不是 uid");
+        assert!(!is_uid_token("12345678901234567890"), "20 位超出上限");
         assert!(!is_uid_token("12345678901234a"));
         assert!(!is_uid_token(""));
+    }
+
+    #[test]
+    fn 十九位_uid_的证据能被收集() {
+        // 回归：solo.mobile.allowControl 里 19 位 uid 必须能进入证据表，
+        // 否则「本机发现账号」会整条漏掉该账号。
+        let storage = json!({
+            "icube_gtm": {
+                "users": {
+                    "7679751654497928200": {"updatedTime": 1788081577344i64},
+                }
+            }
+        });
+        let evidence = gtm_users_evidence(&storage);
+        assert!(
+            evidence.contains_key("7679751654497928200"),
+            "19 位 uid 必须被 gtm 证据收集，实际: {evidence:?}"
+        );
+        assert_eq!(evidence["7679751654497928200"].latest_ts_ms, 1788081577344);
     }
 
     #[test]
@@ -502,6 +638,47 @@ mod tests {
     }
 
     #[test]
+    fn gtm_证据跨全部候选目录合并() {
+        // 回归：客户端改名后 `TRAE SOLO` 与 `TRAE SOLO CN` 会**并存**，
+        // 各自可能记录不同账号。只读第一个目录会让另一个目录的账号整体消失。
+        //
+        // 走 `app_data_dirs_under` 而不是临时改 APPDATA：环境变量是进程全局的，
+        // `set_var` 会与并行跑的其他用例互相串扰 —— 本用例曾因此在本地单跑通过、
+        // CI 全量跑必失败。纯函数内核让这里零全局副作用。
+        let base = std::env::temp_dir().join(format!(
+            "ai-gateway-trae-gtm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let write_storage = |dir: &str, uid: &str, ts: i64| {
+            // 用 `/` 分段（与 STORAGE_SUFFIX 一致）：`\` 在 Unix 下不是分隔符，
+            // 写进去会变成一个含反斜杠的单段文件名，读侧永远找不到。
+            let p = base.join(dir).join("User/globalStorage");
+            std::fs::create_dir_all(&p).unwrap();
+            let body = json!({
+                "icube_gtm": { "users": { uid: {"updatedTime": ts} } }
+            });
+            std::fs::write(
+                p.join("storage.json"),
+                serde_json::to_string(&body).unwrap(),
+            )
+            .unwrap();
+        };
+        write_storage("TRAE SOLO CN", "1883919207380040", 1_778_078_246_409);
+        write_storage("TRAE SOLO", "7679751654497928200", 1_788_081_577_344);
+
+        let merged = gtm_users_evidence_under("TraeWork", &base.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(merged.len(), 2, "两个目录的账号都要被看到，实际: {merged:?}");
+        assert_eq!(merged["1883919207380040"].latest_ts_ms, 1_778_078_246_409);
+        assert_eq!(merged["7679751654497928200"].latest_ts_ms, 1_788_081_577_344);
+    }
+
+    #[test]
     fn 发现结果在无本机数据时不panic() {
         // 本机可能装了也可能没装；两种情况都必须返回结构良好的结果
         let found = discover_all();
@@ -513,5 +690,119 @@ mod tests {
                 assert_eq!(item["userId"], "");
             }
         }
+    }
+
+    /// ★★ 回归（task-18 修复 1）：`icube_gtm.users` 是**嵌套**键，真实形态必须被采纳。
+    ///
+    /// 本机 `Trae CN` 的真实 `storage.json` 实测形状：
+    /// `{"icube_gtm": {"users": {"<16 位 uid>": {"gtm101_idea": {...}}}}}`。
+    /// 修复前实现取扁平键 `storage.get("icube_gtm.users")`，在这份数据上恒为空表。
+    #[test]
+    fn gtm_证据采纳嵌套形态_真实形状() {
+        let storage = json!({
+            "icube_gtm": {
+                "users": {
+                    "1883919207380040": {"gtm101_idea": {"showCount": 1, "closed": true}},
+                }
+            }
+        });
+        let ev = gtm_users_evidence(&storage);
+        assert_eq!(ev.len(), 1, "嵌套形态必须被采纳，实际: {ev:?}");
+        assert!(ev.contains_key("1883919207380040"), "uid 必须进表");
+        // ★ 真实条目里**没有** `updatedTime`（只有 `gtm101_idea`）⇒ 时间戳回落 0。
+        //   这不是缺陷：证据计数仍然记录，排序时由 `vscdb` 那一路提供时间戳。
+        assert_eq!(ev["1883919207380040"].latest_ts_ms, 0);
+        assert_eq!(ev["1883919207380040"].count, 2);
+    }
+
+    /// ★★ 负向（task-18 修复 1）：**扁平**点号键**不得**再被采纳。
+    ///
+    /// 真实数据里从不存在这种键；以「向后兼容」为名把它加回来，只会让
+    /// 「恒空」这一静默失效重新出现而不被察觉。
+    #[test]
+    fn gtm_证据拒绝扁平点号键() {
+        let flat = json!({
+            "icube_gtm.users": {
+                "1883919207380040": {"updatedTime": 1788081577344i64},
+            }
+        });
+        assert!(
+            gtm_users_evidence(&flat).is_empty(),
+            "扁平点号键是**非真实**形态，不得被采纳（否则静默失效会复活）"
+        );
+
+        // 同时存在扁平键与嵌套键时，只认嵌套那份
+        let both = json!({
+            "icube_gtm.users": {"1883919207380040": {"updatedTime": 1i64}},
+            "icube_gtm": {"users": {"7679751654497928200": {"updatedTime": 2i64}}},
+        });
+        let ev = gtm_users_evidence(&both);
+        assert_eq!(ev.len(), 1, "只应采纳嵌套那份，实际: {ev:?}");
+        assert!(ev.contains_key("7679751654497928200"));
+        assert!(!ev.contains_key("1883919207380040"));
+    }
+
+    /// 形状异常时一律返回空表且**不 panic**（键缺失/类型不对都是合法状态）。
+    #[test]
+    fn gtm_证据形状异常不panic() {
+        let cases: Vec<Value> = vec![
+            json!({}),
+            json!({"icube_gtm": null}),
+            json!({"icube_gtm": 42}),
+            json!({"icube_gtm": []}),
+            json!({"icube_gtm": {}}),
+            json!({"icube_gtm": {"users": null}}),
+            json!({"icube_gtm": {"users": "not-an-object"}}),
+            json!({"icube_gtm": {"users": []}}),
+            // 键名不是合法 uid 形态（14 位过短 / 含非数字）
+            json!({"icube_gtm": {"users": {"12345678901234": {}}}}),
+            json!({"icube_gtm": {"users": {"not-a-uid": {}}}}),
+            // 顶层根本不是对象
+            json!([]),
+            json!("a string"),
+            json!(null),
+            json!(42),
+        ];
+        for c in &cases {
+            let ev = gtm_users_evidence(c);
+            assert!(ev.is_empty(), "形状异常应得空表，输入 {c} 得到 {ev:?}");
+        }
+    }
+
+    /// ★ 修复 1 的**降级路径不被堵死**：证据全空时 `discover_app` 仍走「不可信」分支。
+    ///
+    /// 降级分支的判据是 `discover_app` 里的 `evidence.is_empty()`，而证据只由
+    /// [`vscdb_uid_evidence`] 与 [`gtm_users_evidence_all`] 两路填充。本用例证明
+    /// 「storage.json 只有 dc 键、没有 gtm」时 gtm 那一路确实**仍**返回空表
+    /// （而不是被修复成「总能凑出证据」）⇒ 降级分支依旧可达。
+    ///
+    /// 不直接调 `discover_app`：它读进程级 `APPDATA`，测试里改环境变量会与并行
+    /// 用例串扰（见 [`gtm_users_evidence_under`] 的注释）。这里用纯函数内核。
+    #[test]
+    fn gtm_证据全空时降级分支仍可达() {
+        let base = std::env::temp_dir().join(format!(
+            "ai-gateway-trae-gtm-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let p = base.join("Trae CN").join("User/globalStorage");
+        std::fs::create_dir_all(&p).unwrap();
+        // 只有 dc 键：没有 gtm，也没有 state.vscdb
+        std::fs::write(
+            p.join("storage.json"),
+            r#"{"iCubeAuthInfo://icube-dc:199439841787403":{}}"#,
+        )
+        .unwrap();
+
+        let gtm = gtm_users_evidence_under("Trae", &base.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(
+            gtm.is_empty(),
+            "无 gtm 键时必须为空 —— 否则「不可信」降级分支会被堵死，实际: {gtm:?}"
+        );
     }
 }

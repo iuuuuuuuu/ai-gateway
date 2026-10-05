@@ -1,13 +1,19 @@
 pub mod account;
 // 账号记录：任务 / 积分 / Token 三类事件的统一追加式流水，供单账号记录视图查询。
 pub mod account_records;
+// 账号分组（Trae / 豆包 分域，各自独立存储）
+pub mod account_groups;
 pub mod agent_import;
 // 多应用档案表（5 应用 × 3 快照布局）：切换流程的表驱动参数源。
 pub mod app_profile;
+// Trae / 豆包 / 应用切换的宿主无关操作层（Tauri 与 webui 共用，避免两边逻辑漂移）
+pub mod apps_ops;
 pub mod auth_file;
 pub mod checkin;
 // CLI 任务模式（--task-run <key>，刻意不启动 Tauri）
 pub mod cli_task;
+// 本机 AI CLI（Codex/Claude/Antigravity/Grok/Kimi）的登录额度查询
+pub mod cli_quota;
 pub mod codebuddy_cli;
 pub mod codebuddy_cn_ide;
 pub mod config;
@@ -23,6 +29,8 @@ pub mod device_proxy;
 // 豆包：账号池与凭证 / 会话保活 / 会员额度 / 对话备份导出
 pub mod doubao_account;
 pub mod doubao_chats;
+// 豆包运维健康史（保活/续期/额度事件，供趋势图与健康卡）
+pub mod doubao_health;
 pub mod doubao_quota;
 pub mod doubao_session;
 pub mod export_import;
@@ -36,6 +44,7 @@ pub mod model_billing;
 pub mod oauth;
 pub mod official_usage;
 pub mod process;
+pub mod proxy_logs;
 // Qoder（QoderWork）：账号库。凭证由 Go 侧 internal/qoder 管理（COSY 签名
 // 需要机器指纹与 dt/drt 令牌），宿主只存界面需要的元信息。
 pub mod qoder_account;
@@ -70,9 +79,17 @@ pub mod switcher;
 pub mod token_stats;
 // Trae：账号库 / JWT 解析 / 设备指纹 / 签到 / 本机发现
 pub mod trae_account;
+pub mod trae_agent;
 pub mod trae_checkin;
+pub mod trae_checkin_results;
+pub mod trae_credits;
+pub mod trae_crypt;
+pub mod trae_realm;
+pub mod trae_usage_history;
 pub mod trae_device;
 pub mod trae_discover;
+pub mod trae_oauth;
+pub mod trae_refresh;
 pub mod travel;
 pub mod update;
 pub mod vscode_cn_inject;

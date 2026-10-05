@@ -51,7 +51,7 @@ param(
     [string]$KeyFile = "",
     [string]$PasswordFile = "",
     [switch]$CheckOnly,
-    # 跳过 Go 网关重建，沿用 embedded/ 下现有的产物。
+    # 跳过网关重建，沿用 embedded/ 下现有的产物。
     #
     # 只建议在"确定网关没动、只想快速重打前端/UI"时使用 —— 它会**放弃**
     # 本次构建对"内嵌网关新鲜度"的保证（校验仍会跑，但基准是旧产物）。
@@ -233,7 +233,7 @@ if ($CheckOnly) {
     return
 }
 
-# ── 3) 构建/刷新内嵌的 Go 网关 ─────────────────────────────────────────
+# ── 3) 构建/刷新内嵌的网关 ─────────────────────────────────────────────
 #
 # # 为什么这一步必须在这里（2026-09-21 所有者反馈，这是结构性缺陷）
 #
@@ -246,7 +246,8 @@ if ($CheckOnly) {
 # `crates/ai-gateway-core/embedded/gateway.exe` 里当时躺着的那一份，
 # 而**本脚本此前从不构建网关**（只有 build-single.ps1 有那段逻辑）。
 #
-# 于是：改了 `go-gateway/` 的代码但没手动重建 embedded/gateway.exe，
+# 于是：改了网关源码（当时是 `go-gateway/`；2026-10 起是
+# `crates/ai-gateway-router/`）但没手动重建 embedded/gateway.exe，
 # 打出来的包就内嵌旧网关 —— 症状是"新功能在开发机上好好的，装完却没有"，
 # 而构建日志里**没有任何异常**。所有者已经不止一次踩到。
 #
@@ -255,14 +256,15 @@ if ($CheckOnly) {
 $embeddedGw = Join-Path $root "crates/ai-gateway-core/embedded/gateway.exe"
 $gwScript = Join-Path $PSScriptRoot "build-gateway.ps1"
 
-Write-Host "==> [3/4] 构建/刷新内嵌网关（Go）" -ForegroundColor Cyan
+Write-Host "==> [3/4] 构建/刷新内嵌网关（Rust）" -ForegroundColor Cyan
 if (-not (Test-Path -LiteralPath $gwScript)) {
     throw "未找到 $gwScript —— 内嵌网关无法保证新鲜，拒绝继续构建"
 }
 
 # -Force：打包场景下一律重建。
 #
-# 为什么不用"源码比产物新才重建"的增量判断：Go 的构建很快（约 10 秒），
+# 为什么不用"源码比产物新才重建"的增量判断：网关的构建很快（增量重编约 10 秒；
+# 无改动时 build-gateway.ps1 自己会跳过 cargo 重编，只做拷贝），
 # 而"内嵌了旧网关"这个错误的代价极高（一个装完才发现功能没生效的安装包）。
 # 用 10 秒换"绝不可能内嵌旧网关"，在这个场景下是明显划算的交易。
 # （需要快速迭代 UI 时可用 -SkipGateway 跳过，见下方参数。）

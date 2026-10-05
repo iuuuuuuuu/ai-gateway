@@ -34,6 +34,15 @@ type fakeUpstream struct {
 
 	// acceptCalls 收到的报名请求（每次调用一组 task_codes）。
 	acceptCalls [][]string
+	// acceptPlatforms 每次报名请求带的 X-Client-Platform（无该头则为空串）。
+	//
+	// 为什么必须记录这个头：小程序限定任务的报名缺该头时，上游照样返回
+	// HTTP 200 + code=0，只是逐条结果是 {"status":"error","message":"task not
+	// found"} —— 报名根本没发生。也就是说**从状态码和业务码都看不出区别**，
+	// 只有请求头能证明走对了口径。假上游若不复刻这一层，就测不出
+	// 「Sequential_Tasks_1 报名走错口径」这个真实故障（本次移植前它就发生在
+	// 真实账号上：报名后 progress 恒为 null）。
+	acceptPlatforms []string
 	// claimCalls 收到的领奖请求（任务码序列）。
 	claimCalls []string
 	// reports 收到的上报（路径 → 次数）。
@@ -51,6 +60,12 @@ type fakeUpstream struct {
 	acceptFail bool
 	// listFail 让列表请求失败。
 	listFail bool
+	// marketExpertFail 让专家市场列表失败。
+	//
+	// 需要它是因为 Sequential_Tasks_2 有一条**前置守卫**：判据事件的专家 id
+	// 必须是市场里真实存在的 ex_ id，所以拉不到市场就整个任务不动作。
+	// 没有这个开关就测不出「宁可不做，也不发一条注定不计分的事件」。
+	marketExpertFail bool
 
 	// acceptMaterializesProgress 报名后是否让 progress 出现（默认 true）。
 	//
@@ -93,6 +108,13 @@ type fakeTask struct {
 	// 而"无奖励 + 进度不推进"正是最需要被诚实报告的组合（见 runAction 的守卫）。
 	credit int64
 	energy int64
+	// locked / unlockAt 复刻日期锁任务（2026-09-30 实测 Sequential_Tasks_2：
+	// locked=true + unlock_at=2026-10-01T00:00:00+08:00，progress=null）。
+	//
+	// 需要它是因为锁定任务**能被报名、能被发事件、服务端返回 HTTP 200**，
+	// 只是静默丢弃不计分 —— 光看状态码根本发现不了，必须有回归用例钉住。
+	locked   bool
+	unlockAt string
 }
 
 // fakeResp 一条可编程的上游响应（状态码 + 响应体）。
@@ -129,6 +151,19 @@ func (f *fakeUpstream) addTask(code string, current, target int64, status string
 		hasProgress: status != upstream.TaskAcceptNotAccepted,
 	}
 	f.order = append(f.order, code)
+	return f
+}
+
+// addLocked 登记一个**日期锁**任务（复刻 2026-09-30 实测的 Sequential_Tasks_2 形态）。
+//
+// 真实形态是 accept_status=not_accepted、progress=null（未报名且锁着），
+// 但 locked 与 accept 是**正交**的两个维度：锁着的任务照样能被报名成功，
+// 报名后仍是 locked，只是发事件不计分。这里保留 status 参数以便两种都测。
+func (f *fakeUpstream) addLocked(code string, current, target int64, status, unlockAt string) *fakeUpstream {
+	f.addTask(code, current, target, status, 100, 5)
+	ft := f.tasks[code]
+	ft.locked = true
+	ft.unlockAt = unlockAt
 	return f
 }
 
@@ -198,6 +233,7 @@ func (f *fakeUpstream) roundTrip(r *http.Request) (*http.Response, error) {
 		raw, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(raw, &body)
 		f.acceptCalls = append(f.acceptCalls, body.TaskCodes)
+		f.acceptPlatforms = append(f.acceptPlatforms, r.Header.Get("X-Client-Platform"))
 		type res struct {
 			Code   string `json:"task_code"`
 			Status string `json:"status"`
@@ -206,6 +242,12 @@ func (f *fakeUpstream) roundTrip(r *http.Request) (*http.Response, error) {
 		for _, code := range body.TaskCodes {
 			t := f.tasks[code]
 			if t == nil {
+				continue
+			}
+			// 复刻真实上游：小程序限定任务缺 mp 头时不登记，只回逐条 error。
+			// 注意 HTTP 状态码与业务码都是「成功」，区别只在 results 里。
+			if mpOnlyCodes[code] && r.Header.Get("X-Client-Platform") != "miniprogram" {
+				results = append(results, res{code, "error"})
 				continue
 			}
 			if t.acceptStatus == upstream.TaskAcceptAccepted || t.acceptStatus == upstream.TaskAcceptClaimed {
@@ -243,7 +285,13 @@ func (f *fakeUpstream) roundTrip(r *http.Request) (*http.Response, error) {
 		}
 		t.claimed = true
 		t.acceptStatus = upstream.TaskAcceptClaimed
-		return jsonResp(200, `{"code":0,"msg":"OK","data":{"already_claimed":false,"credit":100,"energy":5}}`), nil
+		// 奖励取自任务本身而不是写死 100/5：Sequential_Tasks_3 的真实奖励是
+		// 300 积分，写死会让「到账多少」这类断言失去意义。
+		out, _ := json.Marshal(map[string]any{
+			"code": 0, "msg": "OK",
+			"data": map[string]any{"already_claimed": false, "credit": t.credit, "energy": t.energy},
+		})
+		return jsonResp(200, string(out)), nil
 
 	case r.Method == http.MethodPost && path == "/v2/report":
 		// 两个域共用该路径，靠 host 区分哪个通道。
@@ -277,6 +325,9 @@ func (f *fakeUpstream) roundTrip(r *http.Request) (*http.Response, error) {
 		return jsonResp(200, `{"code":0,"msg":"OK","data":{}}`), nil
 
 	case r.Method == http.MethodPost && path == "/portal/operation-platform/market/expert/list":
+		if f.marketExpertFail {
+			return jsonResp(500, `{"code":500,"msg":"market unavailable"}`), nil
+		}
 		return jsonResp(200, `{"code":0,"msg":"OK","data":{"experts":[
 			{"expert_id":"ex_1","expert_type":"agent","display_name_zh":"专家一","profession_zh":"职业","version":"1.0.0"},
 			{"expert_id":"ex_2","expert_type":"agent","display_name_zh":"专家二","profession_zh":"职业","version":"1.0.0"}
@@ -332,12 +383,47 @@ func (f *fakeUpstream) applyEvent(ev map[string]any) {
 	// 且带 activityId=school_open_day_2026 才点亮。
 	// 若把这里放宽成「只看 eventCode」，就会让「误用桌面指纹」的实现也通过测试 ——
 	// 那正是本次要锁住的回归。
+	// 成长任务集（Sequential_Tasks_1/_3）：同一条 chat_request_send，
+	// **不带** activityId 才计分。
+	//
+	// 与上面 school_season 分支合起来构成一个互斥判据：同一个 eventCode、
+	// 同一套 mp 指纹，服务端只靠「有没有 activityId」区分两个任务。
+	// 若这里放宽成「有 mp 指纹就都给分」，那么把 _1 的事件写成带 activityId
+	// （或反过来把 school_season 写成不带）的实现也能通过测试 ——
+	// 而这两种写法在真实上游都会让进度恒为 0（HTTP 200，最难排查的一类失败）。
 	if t := f.tasks["school_season"]; t != nil {
 		src, _ := ev["source"].(string)
 		ext, _ := ev["extName"].(string)
 		act, _ := ev["activityId"].(string)
 		if src == "mini_program" && ext == "workbuddy-mp" && act == upstream.SchoolSeasonActivityID {
 			set("school_season", t.target)
+		}
+	}
+	if code == "chat_request_send" {
+		src, _ := ev["source"].(string)
+		ext, _ := ev["extName"].(string)
+		_, hasActivity := ev["activityId"]
+		if src == "mini_program" && ext == "workbuddy-mp" && !hasActivity {
+			for _, tc := range []string{"Sequential_Tasks_1", "Sequential_Tasks_3"} {
+				if t := f.tasks[tc]; t != nil {
+					next := t.current + 1
+					if next > t.target {
+						next = t.target
+					}
+					set(tc, next)
+				}
+			}
+		}
+	}
+	// Sequential_Tasks_2：mp 指纹 expert_actual_use，专家 id 必须是真实市场 id。
+	if code == "expert_actual_use" {
+		src, _ := ev["source"].(string)
+		ext, _ := ev["extName"].(string)
+		id, _ := ev["id"].(string)
+		if t := f.tasks["Sequential_Tasks_2"]; t != nil {
+			if src == "mini_program" && ext == "workbuddy-mp" && strings.HasPrefix(id, "ex_") {
+				set("Sequential_Tasks_2", t.target)
+			}
 		}
 	}
 	// 对话成功回执点亮 RichMeow_Chat。
@@ -357,6 +443,9 @@ func (f *fakeUpstream) tasksJSON() string {
 		RewardCredit int64  `json:"reward_credit"`
 		RewardEnergy int64  `json:"reward_energy"`
 		Progress     any    `json:"progress"`
+		// locked / unlock_at 与真实上游一致：未锁定时 omitempty 不出现。
+		Locked   bool   `json:"locked,omitempty"`
+		UnlockAt string `json:"unlock_at,omitempty"`
 	}
 	items := make([]wire, 0, len(f.order))
 	for _, code := range f.order {
@@ -368,6 +457,7 @@ func (f *fakeUpstream) tasksJSON() string {
 		items = append(items, wire{
 			TaskCode: code, Title: t.title, AcceptStatus: t.acceptStatus,
 			RewardCredit: t.credit, RewardEnergy: t.energy, Progress: prog,
+			Locked: t.locked, UnlockAt: t.unlockAt,
 		})
 	}
 	out, _ := json.Marshal(map[string]any{
@@ -380,6 +470,9 @@ func (f *fakeUpstream) tasksJSON() string {
 //
 // 压缩间隔是**必需**的：默认轮询预算是 4×3 秒、上报间隔 1 秒，
 // 一轮完整测试要跑十几秒。缩短的是时序参数而非逻辑，覆盖的执行路径完全相同。
+//
+// ⚠ MPChatGap 尤其不能漏：默认是 45 秒（反作弊阈值，见 defaultMPChatGap），
+// 一个 Sequential_Tasks_3 用例要发 5 条事件，漏了就真睡 3 分多钟。
 func testRunner(f *fakeUpstream) *Runner {
 	return New(Options{
 		Upstream:     f.client(),
@@ -387,6 +480,7 @@ func testRunner(f *fakeUpstream) *Runner {
 		PollGap:      time.Millisecond,
 		ReportGap:    time.Millisecond,
 		ChatGap:      time.Millisecond,
+		MPChatGap:    time.Millisecond,
 	})
 }
 
@@ -776,6 +870,11 @@ func TestSupportedCodesMatchActionTable(t *testing.T) {
 		// 活动 2026-09-24 截止；它过期后上游不再下发该 code，
 		// RunOne 会走「该账号没有此任务」分支，动作表留着无害。
 		"school_season",
+		// 国服成长任务集（_2/_3 在 _1 完成前上游不下发；_1 完成后 _2
+		// 露面但带日期锁 unlock_at —— 两道门槛，见 sequentialChatCode 注释）。
+		// 判据都在 mp 指纹，但与 school_season 的关键区别是**不带**
+		// activityId —— 见 runMPChatTask 的注释。
+		"Sequential_Tasks_1", "Sequential_Tasks_2", "Sequential_Tasks_3",
 	}
 	have := map[string]bool{}
 	for _, c := range codes {
@@ -1067,5 +1166,490 @@ func TestSchoolSeasonSkipsWhenAlreadyDone(t *testing.T) {
 	}
 	if got := len(f.reportBodies) - before; got != 0 {
 		t.Errorf("已达标不该再上报，实际发了 %d 批", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 国服成长任务集（Sequential_Tasks_1 / _2 / _3）
+// ---------------------------------------------------------------------------
+
+// findEvent 在假上游收到的全部上报里找指定 eventCode 的第一条事件。
+func findEvent(t *testing.T, f *fakeUpstream, eventCode string) map[string]any {
+	t.Helper()
+	for _, batch := range f.reportBodies {
+		for _, e := range batch {
+			if e["eventCode"] == eventCode {
+				return e
+			}
+		}
+	}
+	t.Fatalf("没有发出 %s 事件", eventCode)
+	return nil
+}
+
+// countEvents 统计假上游收到的指定 eventCode 事件条数。
+func countEvents(f *fakeUpstream, eventCode string) int {
+	n := 0
+	for _, batch := range f.reportBodies {
+		for _, e := range batch {
+			if e["eventCode"] == eventCode {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// TestSequentialActionsRegistered 三个新码必须可查、且**不标 NeedsChat**。
+//
+// NeedsChat=true 会让界面提示「需要真实对话」，而这三个任务都是纯事件上报
+// （_3 只是把同一个事件按真人节奏重复 5 次）—— 标错会让用户以为必须自己
+// 去小程序里聊天。
+func TestSequentialActionsRegistered(t *testing.T) {
+	for _, code := range []string{sequentialChatCode, sequentialChat5Code, sequentialExpertCode} {
+		act := actionFor(code)
+		if act == nil {
+			t.Errorf("%s 未注册动作", code)
+			continue
+		}
+		if act.NeedsChat {
+			t.Errorf("%s 被标成 NeedsChat —— 它是事件上报，不需要用户真的去对话", code)
+		}
+		if act.Desc == "" {
+			t.Errorf("%s 缺 Desc（界面要展示）", code)
+		}
+	}
+}
+
+// TestSequentialChatOmitsActivityIDUnlikeSchoolSeason _1 的对话事件**必须不带** activityId。
+//
+// 这是本次移植里最容易写错、也最难排查的一处：_1 与 school_season 的判据事件
+// eventCode 相同（chat_request_send）、mp 指纹完全相同，服务端只靠
+// 「有没有 activityId」区分归属 —— 带上就计入校园日活动（成长任务集进度恒 0），
+// 不带才计入成长任务集。两种写法都返回 HTTP 200，失败时没有任何错误可看。
+//
+// 断言用 `_, ok := ev["activityId"]` 而不是比较空字符串：字段注释里写明
+// `"activityId":""` 与「没有该字段」在服务端是两种输入，只有 omitempty
+// 能让它整体消失。
+func TestSequentialChatOmitsActivityIDUnlikeSchoolSeason(t *testing.T) {
+	// 一侧：_1 不带。
+	f := newFakeUpstream().add("Sequential_Tasks_1", 0, 1, upstream.TaskAcceptAccepted)
+	if item := testRunner(f).RunOne(context.Background(), testAuth(), sequentialChatCode); item.Status != StatusDone {
+		t.Fatalf("status=%s msg=%s", item.Status, item.Message)
+	}
+	ev := findEvent(t, f, "chat_request_send")
+	for k, want := range map[string]any{
+		"source":     "mini_program",
+		"ideName":    "wx_app_cloud",
+		"ideType":    "WorkBuddy_MP",
+		"extName":    "workbuddy-mp",
+		"extVersion": "SaaS",
+		"mode":       "chat",
+	} {
+		if got := ev[k]; got != want {
+			t.Errorf("事件字段 %s = %v，want %v（mp 指纹缺一不可）", k, got, want)
+		}
+	}
+	if v, ok := ev["activityId"]; ok {
+		t.Errorf("Sequential_Tasks_1 的事件带了 activityId=%v —— 服务端会把它算进校园日活动，进度恒为 0", v)
+	}
+	if got, _ := ev["userId"].(string); got == "" {
+		t.Error("事件缺 userId —— 服务端会静默丢弃")
+	}
+
+	// 另一侧：school_season 必须带。两者放在同一个用例里对照，
+	// 任何「统一成一种形状」的改动都会立刻打破其中一侧。
+	f2 := newFakeUpstream().add("school_season", 0, 1, upstream.TaskAcceptAccepted)
+	if item := testRunner(f2).RunOne(context.Background(), testAuth(), "school_season"); item.Status != StatusDone {
+		t.Fatalf("school_season status=%s msg=%s", item.Status, item.Message)
+	}
+	if got := findEvent(t, f2, "chat_request_send")["activityId"]; got != upstream.SchoolSeasonActivityID {
+		t.Errorf("school_season 的 activityId = %v，want %s", got, upstream.SchoolSeasonActivityID)
+	}
+}
+
+// TestSequentialAcceptUsesMPPlatformHeader 报名小程序限定任务必须带
+// `X-Client-Platform: miniprogram`。
+//
+// 实测背景（2026-09-30，真实国服账号）：不带该头的报名返回 **HTTP 200 且
+// 业务 code=0**，只有逐条结果是 {"status":"error","message":"task not found"} ——
+// 从状态码和业务码都看不出失败。后果是任务停在「未报名」，后续上报的事件
+// 全部不归账，进度恒为 null。这正是本次移植前真实账号上的故障形态。
+func TestSequentialAcceptUsesMPPlatformHeader(t *testing.T) {
+	f := newFakeUpstream().add("Sequential_Tasks_1", 0, 1, upstream.TaskAcceptNotAccepted)
+	r := testRunner(f)
+
+	item := r.RunOne(context.Background(), testAuth(), sequentialChatCode)
+	if item.Status != StatusDone {
+		t.Fatalf("status=%s msg=%s", item.Status, item.Message)
+	}
+	if len(f.acceptPlatforms) != 1 || f.acceptPlatforms[0] != "miniprogram" {
+		t.Errorf("报名请求的 X-Client-Platform = %v，want [miniprogram]", f.acceptPlatforms)
+	}
+	// RunOne 会把整条链路走完（报名 → 上报 → 领奖），所以这里只能断言
+	// 「不再是未报名」；若报名没登记，状态会停在 not_accepted，上报也不会计分。
+	if t2 := f.tasks["Sequential_Tasks_1"]; t2 == nil || t2.acceptStatus == upstream.TaskAcceptNotAccepted {
+		t.Errorf("报名未登记：%+v", t2)
+	}
+}
+
+// TestAcceptTasksSplitsMPFromPlain 混合批次按码分组报名。
+//
+// 为什么不能给整批统一加 mp 头：批量报名通常混着普通任务与小程序任务，
+// 给普通任务加小程序头是**另一种输入**，其行为未经验证。所以按码拆成两次
+// 请求，各自带各自的口径。
+func TestAcceptTasksSplitsMPFromPlain(t *testing.T) {
+	f := newFakeUpstream().
+		add("chat_5", 0, 5, upstream.TaskAcceptNotAccepted).
+		add("Sequential_Tasks_1", 0, 1, upstream.TaskAcceptNotAccepted)
+	r := testRunner(f)
+
+	res, err := r.acceptTasks(testAuth(), []string{"chat_5", "Sequential_Tasks_1"})
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if len(f.acceptCalls) != 2 {
+		t.Fatalf("accept 请求数 = %d，want 2（普通 + 小程序各一次）：%v", len(f.acceptCalls), f.acceptCalls)
+	}
+	for i, want := range []string{"", "miniprogram"} {
+		if f.acceptPlatforms[i] != want {
+			t.Errorf("第 %d 次报名的 X-Client-Platform = %q，want %q", i+1, f.acceptPlatforms[i], want)
+		}
+	}
+	byCode := map[string]string{}
+	for _, one := range res {
+		byCode[one.Code] = one.Status
+	}
+	for _, code := range []string{"chat_5", "Sequential_Tasks_1"} {
+		if byCode[code] != upstream.TaskAcceptAccepted {
+			t.Errorf("%s 报名状态 = %q，want accepted（res=%v）", code, byCode[code], res)
+		}
+	}
+}
+
+// TestSequentialChatTargetFallbackWhenNoProgress 上游未下发 progress 时 target 兜底 1。
+//
+// 未报名（或报名刚生效）时上游把 progress 下发为 null，解析出来 target=0。
+// 若照 0 算差额就会「0 条上报、直接判定达标」，任务永远点不亮。
+func TestSequentialChatTargetFallbackWhenNoProgress(t *testing.T) {
+	f := newFakeUpstream().add("Sequential_Tasks_1", 0, 0, upstream.TaskAcceptNotAccepted)
+	r := testRunner(f)
+
+	// 直接调动作、绕过 RunOne 的报名，复刻「列表里还没有 progress」的形态。
+	before := &upstream.GrowthTask{
+		Code: sequentialChatCode, Title: "任务-Sequential_Tasks_1",
+		AcceptStatus: upstream.TaskAcceptNotAccepted,
+	}
+	msg, err := runSequentialChat(r, context.Background(), testAuth(), before)
+	if err != nil {
+		t.Fatalf("动作返回错误: %v", err)
+	}
+	if got := countEvents(f, "chat_request_send"); got != 1 {
+		t.Errorf("上报 %d 条，want 1（target 兜底 1）msg=%s", got, msg)
+	}
+}
+
+// TestSequentialActionsRejectMissingTask 三个动作在 before==nil 时都要报错。
+//
+// RunOne 在动作之前就会拦掉这种形态（StatusSkipped），所以这条守卫是防御性的；
+// 但它守的是「动作函数自己也能被安全地直接调用」，避免将来有别的调用方
+// 绕过 RunOne 时静默发出一条无归属的上报。
+func TestSequentialActionsRejectMissingTask(t *testing.T) {
+	f := newFakeUpstream()
+	r := testRunner(f)
+	acts := []struct {
+		code string
+		fn   func(*Runner, context.Context, *auth.Auth, *upstream.GrowthTask) (string, error)
+	}{
+		{sequentialChatCode, runSequentialChat},
+		{sequentialChat5Code, runSequentialChat5},
+		{sequentialExpertCode, runMiniExpert},
+	}
+	for _, tc := range acts {
+		if _, err := tc.fn(r, context.Background(), testAuth(), nil); err == nil {
+			t.Errorf("%s 在任务缺失时应返回错误", tc.code)
+		}
+	}
+	if len(f.reportBodies) != 0 {
+		t.Errorf("任务缺失时不该上报，实际发了 %d 批", len(f.reportBodies))
+	}
+}
+
+// TestSequentialChat5ProgressesAndClaims _3「5 次有效对话」端到端：
+// 按差额逐条上报 → 累加到 5/5 → 领奖 300 积分。
+//
+// 用 addTask 而不是 add：这个任务的真实奖励是 300 积分（不是默认的 100），
+// 写死会让「到账多少」失去意义（假上游已改成从任务本身取奖励值）。
+func TestSequentialChat5ProgressesAndClaims(t *testing.T) {
+	f := newFakeUpstream().addTask("Sequential_Tasks_3", 0, 5, upstream.TaskAcceptInProgress, 300, 5)
+	r := testRunner(f)
+
+	item := r.RunOne(context.Background(), testAuth(), sequentialChat5Code)
+	if item.Status != StatusDone {
+		t.Fatalf("status=%s msg=%s", item.Status, item.Message)
+	}
+	if got := countEvents(f, "chat_request_send"); got != 5 {
+		t.Errorf("上报 %d 条，want 5（target=5）", got)
+	}
+	if !item.Claimed || item.Credit != 300 || item.Energy != 5 {
+		t.Errorf("领奖结果 claimed=%v credit=%d energy=%d，want true/300/5",
+			item.Claimed, item.Credit, item.Energy)
+	}
+	if t2 := f.tasks["Sequential_Tasks_3"]; t2 == nil || t2.current < t2.target {
+		t.Errorf("进度未达标：%+v", t2)
+	}
+
+	// 每次上报的 conversationId 必须互不相同：服务端按会话去重，
+	// 复用同一个 id 会让「5 次对话」被算成 1 次。
+	ids := map[string]bool{}
+	for _, batch := range f.reportBodies {
+		for _, e := range batch {
+			if e["eventCode"] != "chat_request_send" {
+				continue
+			}
+			id, _ := e["conversationId"].(string)
+			if id == "" {
+				t.Error("上报缺 conversationId")
+				continue
+			}
+			if ids[id] {
+				t.Errorf("conversationId 重复：%s（会被服务端算作同一次对话）", id)
+			}
+			ids[id] = true
+		}
+	}
+	if len(ids) != 5 {
+		t.Errorf("不同 conversationId 有 %d 个，want 5", len(ids))
+	}
+}
+
+// TestSequentialChat5OnlyReportsTheGap 已有部分进度时只补差额。
+//
+// 这不是优化而是预算问题：_3 每条事件要等 45 秒（反作弊节奏），
+// 重报全部 5 条会白烧 3 分多钟 —— 而宿主给整轮的超时是 10 分钟
+//（cmd/server 的 growTaskTimeout）。
+func TestSequentialChat5OnlyReportsTheGap(t *testing.T) {
+	f := newFakeUpstream().addTask("Sequential_Tasks_3", 3, 5, upstream.TaskAcceptInProgress, 300, 5)
+	r := testRunner(f)
+
+	item := r.RunOne(context.Background(), testAuth(), sequentialChat5Code)
+	if item.Status != StatusDone {
+		t.Fatalf("status=%s msg=%s", item.Status, item.Message)
+	}
+	if got := countEvents(f, "chat_request_send"); got != 2 {
+		t.Errorf("上报 %d 条，want 2（3/5 → 只补 2 条）", got)
+	}
+	if !item.Claimed {
+		t.Errorf("补满后应领奖，item=%+v", item)
+	}
+}
+
+// TestMiniExpertReportsMarketExpert _2 的上报必须带**市场里真实的** ex_ 专家 id。
+//
+// 实测背景：专家 id 是服务端校验项 —— 编造的 id 照样返回 HTTP 200 但不计分，
+// 所以动作必须先用 MarketExpertList 取一个真 id（这里断言取的正是市场返回的
+// 第一个专家），而不是硬编码或留空。
+func TestMiniExpertReportsMarketExpert(t *testing.T) {
+	f := newFakeUpstream().add("Sequential_Tasks_2", 0, 1, upstream.TaskAcceptAccepted)
+	r := testRunner(f)
+
+	item := r.RunOne(context.Background(), testAuth(), sequentialExpertCode)
+	if item.Status != StatusDone {
+		t.Fatalf("status=%s msg=%s", item.Status, item.Message)
+	}
+	ev := findEvent(t, f, "expert_actual_use")
+	for k, want := range map[string]any{
+		"source":     "mini_program",
+		"ideName":    "wx_app_cloud",
+		"ideType":    "WorkBuddy_MP",
+		"extName":    "workbuddy-mp",
+		// extVersion 与对话事件的 SaaS 刻意不同：两个事件来自小程序内
+		// 不同 SDK 版本，统一反而会成为指纹异常。
+		"extVersion":     "2.2.8",
+		"type":           "send_message",
+		"characterCount": float64(12),
+		"id":             "ex_1",
+		"name":           "ex_1",
+		"expertTitle":    "专家一",
+		"expertType":     "agent",
+	} {
+		if got := ev[k]; got != want {
+			t.Errorf("事件字段 %s = %v，want %v", k, got, want)
+		}
+	}
+	if got, _ := ev["userId"].(string); got == "" {
+		t.Error("事件缺 userId —— 服务端会静默丢弃")
+	}
+	// 与 school 域的专家事件是两套口径：这两个字段不该出现。
+	for _, k := range []string{"activityId", "conversationId"} {
+		if v, ok := ev[k]; ok {
+			t.Errorf("mp 专家事件不该带 %s=%v（它与 school 域专家事件是两套口径）", k, v)
+		}
+	}
+}
+
+// TestMiniExpertSkipsWhenMarketUnavailable 市场拉不到时**整个任务不动作**。
+//
+// 这是「宁可不做」的守卫：判据事件的专家 id 必须真实存在，拿不到市场就发不出
+// 有效事件 —— 而发一条注定不计分的事件比什么都不做更糟：用户看到「已上报」，
+// 任务却永远点不亮。所以此时连上报都不该发。
+func TestMiniExpertSkipsWhenMarketUnavailable(t *testing.T) {
+	f := newFakeUpstream().add("Sequential_Tasks_2", 0, 1, upstream.TaskAcceptAccepted)
+	f.marketExpertFail = true
+	r := testRunner(f)
+
+	before := len(f.reportBodies)
+	item := r.RunOne(context.Background(), testAuth(), sequentialExpertCode)
+	if item.Status != StatusDone {
+		t.Fatalf("status=%s msg=%s", item.Status, item.Message)
+	}
+	if got := len(f.reportBodies) - before; got != 0 {
+		t.Errorf("市场不可用时发了 %d 批上报，want 0（宁可不做也不发注定不计分的事件）", got)
+	}
+	if !strings.Contains(item.Message, "专家市场不可用") {
+		t.Errorf("文案应说明市场不可用，got %q", item.Message)
+	}
+	if len(f.claimCalls) != 0 {
+		t.Errorf("未上报就领奖：%v", f.claimCalls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 日期锁任务（locked + unlock_at）
+// ---------------------------------------------------------------------------
+
+// lockedUnlockAt 复刻 2026-09-30 实测 Sequential_Tasks_2 的解锁时刻。
+const lockedUnlockAt = "2026-10-01T00:00:00+08:00"
+
+// lockedWantText 按 lockedText 的口径算出期望文案。
+//
+// 不写死 "2026-10-01 00:00"：lockedText 用 Local() 渲染，写死会在非 +08:00
+// 的机器上失败 —— 那是时区差异，不是缺陷。
+func lockedWantText(t *testing.T) string {
+	t.Helper()
+	ts, err := time.Parse(time.RFC3339, lockedUnlockAt)
+	if err != nil {
+		t.Fatalf("用例自身的解锁时刻写错了: %v", err)
+	}
+	return "尚未解锁（" + ts.Local().Format("2006-01-02 15:04") + " 开放）"
+}
+
+// TestLockedTaskIsSkippedNotRun 锁着的任务**不发任何事件**，判 skipped。
+//
+// 这是 2026-09-30 实测出来的真缺陷的回归钉：当时对 locked 的
+// Sequential_Tasks_2 执行 run，上游返回 **HTTP 200**、耗时 15.9s、
+// 报文是 `{"status":"done","message":"已上报小程序专家使用事件（福帮手）"}`，
+// 而进度 before/after 都是 not_accepted —— 事件被服务端静默丢弃。
+//
+// 只挡 Claimed()/Claimable() 是不够的：锁定是**第三种等待**，它既不是
+// 「做完了」也不是「现在能做」。光看状态码根本发现不了，所以必须断言
+// 「一条上报都没发」而不是断言返回值好看。
+func TestLockedTaskIsSkippedNotRun(t *testing.T) {
+	f := newFakeUpstream().addLocked(sequentialExpertCode, 0, 1, upstream.TaskAcceptAccepted, lockedUnlockAt)
+	r := testRunner(f)
+
+	item := r.RunOne(context.Background(), testAuth(), sequentialExpertCode)
+
+	if item.Status != StatusSkipped {
+		t.Fatalf("锁定任务 status=%s，want %s（不能报 done —— 那是假成功）", item.Status, StatusSkipped)
+	}
+	if got := len(f.reportBodies); got != 0 {
+		t.Errorf("锁定任务发了 %d 批上报，want 0（上游会静默丢弃，发了只会让人以为已完成）", got)
+	}
+	if got := len(f.claimCalls); got != 0 {
+		t.Errorf("锁定任务调了领奖：%v", got)
+	}
+	if !strings.Contains(item.Message, "尚未解锁") {
+		t.Errorf("文案应说明尚未解锁，got %q", item.Message)
+	}
+	// 解锁时刻必须透传出来，否则用户只知道「不能做」而不知道「等到什么时候」。
+	if want := lockedWantText(t); !strings.Contains(item.Message, want) {
+		t.Errorf("文案应带解锁时刻 %q，got %q", want, item.Message)
+	}
+}
+
+// TestLockedTaskSkipsAcceptToo 锁定任务连**报名**都不该走。
+//
+// NeedsAccept() 里已含 `&& !t.Locked`（上游 tasks.go），所以 RunOne 不会
+// 为锁定任务发报名请求。这条用例把该契约钉住：报名本身虽无害，但会给用户
+// 「已经开始做了」的错觉，而实际什么都推不动。
+func TestLockedTaskSkipsAcceptToo(t *testing.T) {
+	f := newFakeUpstream().addLocked(sequentialExpertCode, 0, 0, upstream.TaskAcceptNotAccepted, lockedUnlockAt)
+	r := testRunner(f)
+
+	item := r.RunOne(context.Background(), testAuth(), sequentialExpertCode)
+
+	if item.Status != StatusSkipped {
+		t.Fatalf("status=%s，want %s", item.Status, StatusSkipped)
+	}
+	if got := len(f.acceptCalls); got != 0 {
+		t.Errorf("对锁定任务发了 %d 次报名，want 0", got)
+	}
+}
+
+// TestPendingTasksExcludesLocked 锁定任务不进「一键完成」的作用范围。
+//
+// 这是缺陷的另一半：runAction 的守卫只管「被点到的那一项」，
+// 而 PendingTasks 决定「一键完成会点哪些」。漏了这里，RunAll 照样会
+// 对锁定任务发事件 —— 守卫形同虚设。
+func TestPendingTasksExcludesLocked(t *testing.T) {
+	f := newFakeUpstream().
+		addLocked(sequentialExpertCode, 0, 1, upstream.TaskAcceptAccepted, lockedUnlockAt).
+		add("chat_5", 0, 5, upstream.TaskAcceptNotAccepted)
+	r := testRunner(f)
+
+	pending, err := r.PendingTasks(context.Background(), testAuth())
+	if err != nil {
+		t.Fatalf("PendingTasks: %v", err)
+	}
+	for _, v := range pending {
+		if v.Code == sequentialExpertCode {
+			t.Errorf("锁定任务 %s 出现在待办里（一键完成会对它发事件）：%+v", v.Code, v)
+		}
+	}
+	// 反向断言：不能因为过滤把正常任务也滤掉了（否则这条用例可以靠「返回空」通过）。
+	var found bool
+	for _, v := range pending {
+		if v.Code == "chat_5" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("正常任务 chat_5 被误滤：%+v", pending)
+	}
+}
+
+// TestListTasksShowsUnlockTime 列表把锁定与解锁时刻透出给界面。
+//
+// 界面需要区分「等时间到」和「得自己去点」：两者都不可自动执行，
+// 但一个会自己变好，另一个永远不变。只看 status 字符串是分不出来的。
+func TestListTasksShowsUnlockTime(t *testing.T) {
+	f := newFakeUpstream().addLocked(sequentialExpertCode, 0, 0, upstream.TaskAcceptNotAccepted, lockedUnlockAt)
+	r := testRunner(f)
+
+	views, err := r.ListTasks(context.Background(), testAuth())
+	if err != nil {
+		t.Fatalf("ListTasks: %v", err)
+	}
+	var got *TaskView
+	for i := range views {
+		if views[i].Code == sequentialExpertCode {
+			got = &views[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("列表里没有 %s：%+v", sequentialExpertCode, views)
+	}
+	if !got.Locked {
+		t.Error("Locked 未透出（界面无法区分「等时间到」与「需人工」）")
+	}
+	if got.UnlockAt != lockedUnlockAt {
+		t.Errorf("UnlockAt = %q，want %q", got.UnlockAt, lockedUnlockAt)
+	}
+	if got.Status != ViewLocked {
+		t.Errorf("Status = %q，want %q", got.Status, ViewLocked)
+	}
+	if want := lockedWantText(t); got.StatusText != want {
+		t.Errorf("StatusText = %q，want %q", got.StatusText, want)
 	}
 }

@@ -1227,7 +1227,12 @@ function TokenStatsLoadingSkeleton() {
   );
 }
 
-export default function TokenStatsPage() {
+/**
+ * `embedded`：被「账号管理」页（AccountHubPage）的 WorkBuddy tab 以二级 tab 嵌进来时为 true ——
+ * 去掉最外层留白容器与页面级大标题，只保留「数据来源」切换与「刷新统计」入口。
+ * 默认 false 时行为与合并前**逐字一致**。
+ */
+export default function TokenStatsPage({ embedded = false }: { embedded?: boolean } = {}) {
   const [stats, setStats] = useState<TokenStatistics | null>(null);
   const [active, setActive] = useState<SourceKey>(readPreferredTokenSource);
   const [loading, setLoading] = useState(true);
@@ -1270,24 +1275,34 @@ export default function TokenStatsPage() {
   const source = stats?.sources.find((item) => item.source === active);
 
   return (
-    <div className="mx-auto w-full max-w-[1180px] min-w-0 px-4 py-6 sm:px-8 sm:py-9">
-      <header className="mb-10 flex min-w-0 flex-wrap items-start justify-between gap-4 sm:mb-12">
-        <div className="min-w-0">
-          {loading && !stats ? (
-            <div aria-hidden="true">
-              <Skeleton className="h-8 w-40" />
-              <Skeleton className="mt-2 h-5 w-64 max-w-full" />
-            </div>
-          ) : (
-            <>
-              <h1 className="text-[28px] font-semibold tracking-tight">Token 统计</h1>
-              <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-                当前数据更新于 {stats ? formatDateTime(stats.generatedAt) : "—"}
-              </p>
-            </>
-          )}
-        </div>
-        <div className="flex max-w-full flex-wrap items-center justify-end gap-2">
+    <div className={embedded ? "space-y-5" : "mx-auto w-full max-w-[1180px] min-w-0 px-4 py-6 sm:px-8 sm:py-9"}>
+      <header
+        className={
+          embedded
+            ? "mb-0 flex min-w-0 flex-wrap items-start justify-end gap-4"
+            : "mb-10 flex min-w-0 flex-wrap items-start justify-between gap-4 sm:mb-12"
+        }
+      >
+        {/* 嵌入时不再渲染页面级标题（账号管理页已有一份）；下面的「数据来源」切换与
+            刷新入口必须留着 —— 嵌入后它仍然要能切来源。 */}
+        {!embedded && (
+          <div className="min-w-0">
+            {loading && !stats ? (
+              <div aria-hidden="true">
+                <Skeleton className="h-8 w-40" />
+                <Skeleton className="mt-2 h-5 w-64 max-w-full" />
+              </div>
+            ) : (
+              <>
+                <h1 className="text-[28px] font-semibold tracking-tight">Token 统计</h1>
+                <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+                  当前数据更新于 {stats ? formatDateTime(stats.generatedAt) : "—"}
+                </p>
+              </>
+            )}
+          </div>
+        )}
+        <div className={"flex max-w-full flex-wrap items-center justify-end gap-2" + (embedded ? " ml-auto" : "")}>
           {loading && !stats ? (
             <Skeleton className="h-8 w-44 rounded-lg" aria-hidden="true" />
           ) : (

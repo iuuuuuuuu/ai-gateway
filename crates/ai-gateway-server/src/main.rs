@@ -152,6 +152,9 @@ async fn serve(args: &[String]) {
     }
 
     spawn_background_loops();
+    // 预热两个「首次要 spawn 子进程」的状态检测（`/api/status` 的 tasklist、
+    // `/api/codebuddy-cn-ide/status` 的 powershell），别让用户请求付这一笔。
+    api::warm_caches();
 
     axum::serve(listener, app).await.unwrap();
 }
