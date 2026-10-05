@@ -1,6 +1,6 @@
 # WorkBuddy Switch / AI Gateway — 项目状态与后续工作
 
-> 最后更新：2026-10-06（**1.0.28**：⑯ 流中途上游错误帧识别 / 记日志 / 计入账号健康度 + ⑰ 用量统计模型名大小写折叠）
+> 最后更新：2026-10-06（**1.0.29**：⑱ 桌面端接入应用内调度 —— 修复「Trae 每日签到从不自动执行」；并给 m02665「装完就卡死」定案：1.0.21 预热窗口导航死地址 ⇒ 渲染进程崩溃拖死主窗口，1.0.24 起已修，本版 A/B 三轮对照实证）
 > 本文件是**接手用**的持久状态说明，不随会话消失。
 
 ---
@@ -18,8 +18,8 @@
 | Go 参照实现 | `go-gateway/` | Go（**保留作对照，构建链已不依赖**） |
 
 - git 根 = `wt-port\`，分支 `migrate/aigw-v1.0.2`
-- 当前版本号 **1.0.28**（`tauri.conf.json` / `package.json` / `Cargo.toml` / `Cargo.lock` 已对齐；签名安装包已产出、解包核验、真机实测）
-  - 业主**实机安装的是 1.0.21**（`HKCU:\...\Uninstall\AI Gateway` ⇒ `InstallLocation=D:\APP\AI Gateway`，主程序 39,173,120 B）；1.0.22–1.0.28 **均未安装**，直接装 1.0.28 即可
+- 当前版本号 **1.0.29**（`tauri.conf.json` / `package.json` / `Cargo.toml` / `Cargo.lock` 已对齐；签名安装包已产出、解包核验、真机实测）
+  - 业主**实机安装的是 1.0.21**（`HKCU:\...\Uninstall\AI Gateway` ⇒ `InstallLocation=D:\APP\AI Gateway`，主程序 39,173,120 B）；1.0.22–1.0.29 **均未安装**，直接装 1.0.29 即可
   - ★ NSIS 同版本**不覆盖**（`installer.nsi:233-259` 用 `nsis_tauri_utils::SemverCompare` 比 `DisplayVersion`，相等走维护页）⇒ 升版本号是交付的硬前提
 
 ---
@@ -63,16 +63,24 @@
 | **1.0.26** | 平台面板互斥显示（★ 真产品缺陷：`present = forceMount || isSelected` ⇒ 非选中面板永不 `hidden`）+ 豆包单账号任务区 + 网关换新护栏 | ✅ 真机 PASS |
 | **1.0.27** | ⑰ 用量统计模型名**大小写折叠**（写入口径 `model_key_of` + 载入自愈 `merge_case_variants`）+ 计费行平台归属按计费键回填（`backfill_billing` 旧口径按 uid 形状猜，重启后分布会漂） | ✅ 真机 23/23 PASS（载入自愈 8→6）；★ 写入口径另测 **23/0**（见五节） |
 | **1.0.28** | ⑯ 流中途上游错误帧识别 / 记日志 / 计入账号健康度（`note_upstream_stream_error`）+ 空 product 归一化成 `workbuddy` | ✅ 真机 43/0（抓包）+ 50/0（GUI）+ 24/0（用量页） |
+| **1.0.29** | ⑱ **桌面端接入应用内调度**：`spawn_background_loops()` 新增第 7 个循环（启动 60s 后起，每 5 分钟一轮，`spawn_blocking` 里调 `apps_ops::run_in_app_due_tasks`），修复「Trae 每日签到从不自动执行」+ 每轮无条件打 `[调度] 检查完成…` 日志 + 护栏测试 | ✅ 真机：包内二进制实跑（`[调度] 检查完成：本轮执行 0 项`）+ debug 构建实触发（`[调度] Trae 每日签到 计划 00:05 成功（退出码 0）`，`in_app_schedule.json` = `{"trae-checkin":"2026-10-06"}`）+ GUI 50/0 + 用量页 24/0 |
 
 ### 交付物
 
 ```
-dist\AI Gateway_1.0.28_x64-setup.exe   14,573,805 B   （当前交付版）
+dist\AI Gateway_1.0.29_x64-setup.exe   14,575,327 B   （当前交付版）
+SHA256 1183B3321D32B2AAAA64975E5167EFEAF371665A544AC4CDFE6EE8A28F05EFC0
+  .sig  424 B  SHA256 2C13C378253B1507D327E040B563BBFA33835D5B3BDE63609A53E51B9E34CA14
+内嵌网关 13,629,440 B  SHA256 99AA2D33C7FF834BB1DC9B496A1306D474738FD92E14A0559BF7ECF0EC8981B6（与 1.0.28 同一份，未改网关）
+宿主 GUI 40,436,224 B  SHA256 FB4980625D8CC4701698B15104F0514D0E0A3144EBD3B0EC0A1A82D431ED5AC1
+包内 GUI 40,436,224 B  SHA256 E9079CE71DA98AB52462E184B3DC786E8BEFD53A97AEF667942AD34D665E4B5E
+  （与工作区产物只差 3 字节，偏移 33647120-33647122：BUNDLE_TYPE_VAR_UNK 对 BUNDLE_TYPE_VAR_NSS）
+（已 7-Zip 独立解包 + 从包内 GUI exe raw-inflate 出网关并与 embedded/gateway.exe 逐字节比对通过）
+
+历史（1.0.28）：
+dist\AI Gateway_1.0.28_x64-setup.exe   14,573,805 B
 SHA256 1EAC0F3D401A8797086DE3D45D2B47E43303D65CD5EC88CDDBB02CDFBD9822CA
   .sig  424 B  SHA256 C4F88F8173B66C5112E82F3422849B756B0658F417872D989EDFEA1543ECCA18  keyid 7e7ce64b6fc3a36f
-内嵌网关 13,629,440 B  SHA256 99AA2D33C7FF834BB1DC9B496A1306D474738FD92E14A0559BF7ECF0EC8981B6
-宿主 GUI 40,380,928 B  SHA256 C86353257E725C88EE79674A2D1DE82B8051C2F755BBE94E78AD9F40D6D5B189
-（已 7-Zip 独立解包 + 从包内 GUI exe raw-inflate 出网关并与 embedded/gateway.exe 逐字节比对通过）
 
 历史（1.0.27）：
 dist\AI Gateway_1.0.27_x64-setup.exe   14,557,116 B
@@ -99,9 +107,9 @@ SHA256 8331371362744B4A22D86F7E8C8974AEB33F7B77EC896BD39C0D4DF767701662
 ```
 
 ★ 权威文档（**最新版优先**）：
-- 交付汇总 **`test-bin\DELIVERY-1.0.28.md`**（八节，含全部实测数字、构建链、安装提示）
-- 发布说明 `.github\RELEASE_NOTES_1.0.28.md`
-- 历史：`DELIVERY-1.0.27.md` / `-1.0.26` / `-1.0.25` / `-1.0.24` / `-1.0.23` / `-1.0.21` / `-1.0.20`
+- 交付汇总 **`test-bin\DELIVERY-1.0.29.md`**（八节，含全部实测数字、A/B 卡死对照实验、构建链、安装提示）
+- 发布说明 `.github\RELEASE_NOTES_1.0.29.md`
+- 历史：`DELIVERY-1.0.28.md` / `-1.0.27` / `-1.0.26` / `-1.0.25` / `-1.0.24` / `-1.0.23` / `-1.0.21` / `-1.0.20`
 - ★ 1.0.28 的 **router crate 版本串仍是 v1.0.23**（刻意与 GUI 版本号解耦，不影响功能）
 
 ★ 注：Rust release 构建**不确定**（同一份源码两次构建 SHA256 不同，实测确认）
@@ -113,10 +121,10 @@ SHA256 8331371362744B4A22D86F7E8C8974AEB33F7B77EC896BD39C0D4DF767701662
 
 | 命令 | 基线 |
 |---|---|
-| `cargo test -p ai-gateway-router` | **1667 passed / 0 failed / 1 ignored**（1.0.28，`uitest\ut-16c.log`；1.0.20 时是 1633） |
-| `cargo test --workspace`（15 个 test 块累加） | **3006 passed / 0 failed / 6 ignored**（1.0.28，`uitest\ws-test-16b.log`，EXIT=0；1.0.27 是 3001、1.0.26 是 2988、1.0.23 是 2984） |
+| `cargo test -p ai-gateway-router` | **1667 passed / 0 failed / 1 ignored**（1.0.29，网关未改；1.0.20 时是 1633） |
+| `cargo test --workspace`（15 个 test 块累加） | **3007 passed / 0 failed / 6 ignored**（1.0.29，`uitest\ws-test-1029.log`，EXIT=0；1.0.28 是 3006、1.0.27 是 3001、1.0.26 是 2988） |
 | Trae 相关（`products::trae::` 128 + `modules::trae_agent::` 38 + `modules::trae_account::` 22） | **188 passed** |
-| `cargo test -p ai-gateway-core --lib` | **1235 passed / 0 failed / 4 ignored**（1.0.17 口径，尚未在新版重跑） |
+| `cargo test -p ai-gateway-core --lib` | **1265 passed / 0 failed / 4 ignored**（1.0.29 口径；1.0.17 时是 1235） |
 | `cargo test -p ai-gateway-server` | **28 passed / 0 failed**（1.0.20 口径） |
 | `cargo check -p ai-gateway-router --lib` | EXIT 0，**0 warnings** |
 | `cargo check -p ai-gateway-router --bin gateway` | EXIT 0，**0 warnings** |
