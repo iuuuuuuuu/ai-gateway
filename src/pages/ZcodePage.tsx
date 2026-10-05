@@ -19,7 +19,11 @@ import { ProductTasksConfigCard } from "@/components/product-tasks-config";
 // 「自定义平台支持的模型」入口暂时隐藏（用户要求）—— 组件保留，恢复时取消注释即可。
 // import { PlatformModelsConfigCard } from "@/components/platform-models-config";
 import { ZcodeAutoClaimScheduleCard } from "@/components/zcode-schedule-info";
-import { ProductAccountCard, ProductAccountGrid } from "@/components/product-account-card";
+import {
+  ProductAccountCard,
+  ProductAccountGrid,
+  type ProductAccountTask,
+} from "@/components/product-account-card";
 // 记录视图：任务执行记录 + 额度消耗明细（所有者 2026-09-20 要求）。
 import { AccountRecordsView } from "@/components/account-records-view";
 import { openInDefaultBrowser } from "@/lib/open-browser";
@@ -184,6 +188,54 @@ function displayQuotaOf(row: ZcodeAccountRow): { remaining: number; total: numbe
   return quotaTotalsOf(row);
 }
 
+/**
+ * 一个 ZCode 账号的「本账号任务」清单（所有者强约束 2026-10-04：
+ * 「账号上有个卡片，然后可以看到有多少任务、执行结果」，每个平台同一形态）。
+ *
+ * 与 Trae / Qoder / WorkBuddy 卡片的 `ProductAccountTask` **同一契约**：
+ * 四态都要显示（置灰）而不是隐藏 —— 藏掉一条会让用户以为这个功能不存在。
+ *
+ * ⚠ 「激活并领取套餐」判 `done` 的阈值 7 天必须与后端
+ * `multi_product_credit_patrol::warm_zcode_accounts` 的幂等窗口一致：
+ * 两边不一致时卡片会说「今日已完成」，而后台其实马上又要再报一次事件。
+ */
+function zcodeTasksOf(row: ZcodeAccountRow, nowMs: number): ProductAccountTask[] {
+  const warmedAt = row.warmedAt ?? 0;
+  const warmAgeMs = nowMs - warmedAt * 1000;
+  const warmFresh = warmedAt > 0 && warmAgeMs >= 0 && warmAgeMs < 7 * 24 * 3600 * 1000;
+  const warm: ProductAccountTask = warmFresh
+    ? {
+        id: "zcode-warm",
+        label: "激活并领取套餐",
+        state: "done",
+        reason: "7 天内已激活过；宿主启动时也会自动激活一次",
+      }
+    : {
+        id: "zcode-warm",
+        label: "激活并领取套餐",
+        state: "ready",
+        reason:
+          warmedAt > 0
+            ? "距上次激活已超过 7 天，可再报一次启动事件并领取新套餐"
+            : "从未激活过；网关启动时会自动激活一次，这里手动点只是立刻验证",
+      };
+  // 刷新额度与模型：卡片上的额度/模型本来就是这条链路读回来的，
+  // 没有凭证时它必然失败 ⇒ 用 blocked 说清「不是没这个任务，是条件不满足」。
+  const refresh: ProductAccountTask = row.hasCredential
+    ? {
+        id: "zcode-refresh",
+        label: "刷新额度与模型",
+        state: "ready",
+        reason: "重新拉一次余额与可用模型，并写回账号库",
+      }
+    : {
+        id: "zcode-refresh",
+        label: "刷新额度与模型",
+        state: "blocked",
+        reason: "该账号没有可用凭证（apiKey / JWT），先补凭证再刷新",
+      };
+  return [warm, refresh];
+}
 /**
  * ZCode 账号页。
  *
@@ -911,9 +963,17 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
                          */
                         warmedAt: row.warmedAt ?? 0,
                         hasCredential: row.hasCredential,
+                        // 本账号任务（所有者强约束）：卡片菜单里要能直接跑，
+                        // 而不是让用户去猜哪个按钮对应哪件事。
+                        tasks: zcodeTasksOf(row, now),
                         disabled: row.disabled,
                         variantLabel: providerLabel(row.provider),
                         variantKind: providerVariant(row.provider),
+                      }}
+                      onRunTask={(taskId) => {
+                        // 任务 id 即动作：与 Trae 卡片同款（菜单项本身就是动作入口）。
+                        if (taskId === "zcode-warm") void warmAccount(row);
+                        else if (taskId === "zcode-refresh") void refreshAccount(row);
                       }}
                       onRefresh={() => void refreshAccount(row)}
                       onWarm={() => void warmAccount(row)}

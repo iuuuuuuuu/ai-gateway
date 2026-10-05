@@ -2809,6 +2809,37 @@ export function doubaoRenew(syncOnly = false): Promise<{
   }>("doubao_renew", { syncOnly });
 }
 
+/**
+ * 只对**一个**账号跑续期探活（账号卡片上的「本账号任务」重跑）。
+ *
+ * 返回的是批量结果摊平后的单账号形态：顶层直接带 `status` / `message`，
+ * 前端不必再去 `results` 数组里按 userId 找。
+ */
+export function doubaoRenewOne(userId: string): Promise<{
+  uid: string;
+  ok: number;
+  expired: number;
+  skipped: number;
+  errors: number;
+  total: number;
+  status: string;
+  message: string;
+  results: { userId: string; name: string; status: string; message: string }[];
+  error?: string;
+}> {
+  return call<{
+    uid: string;
+    ok: number;
+    expired: number;
+    skipped: number;
+    errors: number;
+    total: number;
+    status: string;
+    message: string;
+    results: { userId: string; name: string; status: string; message: string }[];
+    error?: string;
+  }>("doubao_renew_one", { userId });
+}
 /** 会话与凭证诊断。 */
 export function doubaoDiagnose(): Promise<Record<string, unknown>> {
   return call<Record<string, unknown>>("doubao_diagnose");
@@ -2856,6 +2887,15 @@ export function doubaoQuotaBatch(): Promise<{
   }>("doubao_quota_batch");
 }
 
+/**
+ * 只巡检**一个**账号的额度（账号卡片上的「本账号任务」重跑）。
+ *
+ * 返回 `DoubaoQuotaView` 形态（与批量结果里的逐账号结果不同，
+ * 这里带完整的 windows/items，可直接喂给额度弹窗）。
+ */
+export function doubaoQuotaOne(userId: string): Promise<DoubaoQuotaView & { exhausted?: boolean }> {
+  return call<DoubaoQuotaView & { exhausted?: boolean }>("doubao_quota_one", { userId });
+}
 /** 账号会话探活。 */
 export function doubaoProbeAccount(
   userId: string,

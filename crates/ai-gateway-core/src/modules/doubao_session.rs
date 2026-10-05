@@ -323,121 +323,243 @@ impl RenewSummary {
     }
 }
 
+/// 续期端点的实际取值（可在「应用设置」里覆盖默认值）。
+fn renew_url() -> String {
+    config::app_setting_str("doubao_renew_url").unwrap_or_else(|| DEFAULT_RENEW_URL.to_string())
+}
+
+/// 探活端点的实际取值（可在「应用设置」里覆盖默认值）。
+fn probe_url() -> String {
+    config::app_setting_str("doubao_quota_url").unwrap_or_else(|| DEFAULT_PROBE_URL.to_string())
+}
+
+/// 单个账号续期所需的上下文（打包传递，避免函数参数膨胀）。
+struct RenewCtx<'a> {
+    probe_url: &'a str,
+    renew_url: &'a str,
+    sync_only: bool,
+    record: &'a (dyn Fn(&str, &str, &str, &str) + Sync),
+}
+
+/// 对一个账号跑「探活 → 保活」两段，把结论同时写进 summary 与任务记录。
+///
+/// 抽出来的唯一理由：账号卡片上的「本账号任务」要能只跑**这一个**账号
+/// （见 run_renewal_one），而批量与单账号必须走同一条判定链 ——
+/// 否则手动点一次的结果会和计划任务跑出来的不一致。
+async fn renew_one(summary: &mut RenewSummary, acc: &Value, ctx: &RenewCtx<'_>) {
+    let uid = acc.get("user_id").and_then(Value::as_str).unwrap_or("");
+    let name = acc
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(uid)
+        .to_string();
+    let sid = acc
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if sid.is_empty() {
+        summary.skipped += 1;
+        (ctx.record)(uid, &name, crate::modules::account_records::RESULT_SKIPPED, "未配置 sessionid");
+        summary.results.push(json!({
+            "userId": uid, "name": name, "status": "skip",
+            "message": "未配置 sessionid",
+        }));
+        return;
+    }
+    if ctx.sync_only {
+        summary.skipped += 1;
+        (ctx.record)(uid, &name, crate::modules::account_records::RESULT_SKIPPED, "仅诊断模式，未发起请求");
+        summary.results.push(json!({
+            "userId": uid, "name": name, "status": "skip",
+            "message": "仅诊断模式，未发起请求",
+        }));
+        return;
+    }
+
+    // 第一段：权威探活
+    let first = api_probe(&sid, ctx.probe_url).await;
+    match first.status {
+        ProbeStatus::Expired => {
+            summary.expired += 1;
+            let _ = doubao_account::mutate_account(uid, |obj| {
+                obj.insert("expired".to_string(), json!(true));
+            });
+            (ctx.record)(
+                uid,
+                &name,
+                crate::modules::account_records::RESULT_FAILED,
+                "会话已失效，请重新登录豆包并抓包更新凭证",
+            );
+            summary.results.push(json!({
+                "userId": uid, "name": name, "status": "expired",
+                "message": "会话已失效，请重新登录豆包并抓包更新凭证",
+            }));
+            return;
+        }
+        ProbeStatus::Ok => {}
+        ProbeStatus::Unknown | ProbeStatus::Error => {
+            summary.errors += 1;
+            (ctx.record)(
+                uid,
+                &name,
+                crate::modules::account_records::RESULT_FAILED,
+                &first.detail,
+            );
+            summary.results.push(json!({
+                "userId": uid, "name": name, "status": "error",
+                "message": first.detail,
+            }));
+            return;
+        }
+    }
+
+    // 第二段：保活 + 回收新凭证
+    let second = renew_probe(&sid, ctx.renew_url).await;
+    let now = config::utc_iso();
+    match second.status {
+        ProbeStatus::Ok => {
+            summary.ok += 1;
+            (ctx.record)(
+                uid,
+                &name,
+                crate::modules::account_records::RESULT_SUCCESS,
+                &second.detail,
+            );
+            let new_sid = second.new_session_id.clone();
+            let new_guard = second.new_sid_guard.clone();
+            let _ = doubao_account::mutate_account(uid, |obj| {
+                obj.insert("expired".to_string(), json!(false));
+                obj.insert("last_renew_at".to_string(), json!(now));
+                // 服务端下发新凭证时必须写回：滑动续期正是通过换新 sid 完成的，
+                // 不写回就等于续期白做（下次探活还是用旧的、更快过期的凭证）。
+                if let Some(sid) = new_sid {
+                    obj.insert("session_id".to_string(), json!(sid));
+                }
+                if let Some(guard) = new_guard {
+                    if let Some(expire) = parse_sid_guard(&guard) {
+                        obj.insert("session_expire_at".to_string(), json!(expire));
+                    }
+                    obj.insert("sid_guard".to_string(), json!(guard));
+                }
+            });
+            summary.results.push(json!({
+                "userId": uid, "name": name, "status": "ok",
+                "message": second.detail,
+            }));
+        }
+        ProbeStatus::Expired => {
+            summary.expired += 1;
+            let _ = doubao_account::mutate_account(uid, |obj| {
+                obj.insert("expired".to_string(), json!(true));
+            });
+            (ctx.record)(
+                uid,
+                &name,
+                crate::modules::account_records::RESULT_FAILED,
+                "保活时发现会话失效",
+            );
+            summary.results.push(json!({
+                "userId": uid, "name": name, "status": "expired",
+                "message": "保活时发现会话失效",
+            }));
+        }
+        ProbeStatus::Unknown | ProbeStatus::Error => {
+            summary.errors += 1;
+            (ctx.record)(
+                uid,
+                &name,
+                crate::modules::account_records::RESULT_FAILED,
+                &second.detail,
+            );
+            summary.results.push(json!({
+                "userId": uid, "name": name, "status": "error",
+                "message": second.detail,
+            }));
+        }
+    }
+    // 账号间隔，避免触发风控（只在真的打过请求之后等）
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+}
+
 /// 对所有持有凭证的账号跑一轮 HTTP 续期探活。
 ///
-/// `sync_only` 为真时只做诊断不发起请求。
+/// sync_only 为真时只做诊断不发起请求。
 pub async fn run_renewal(sync_only: bool) -> RenewSummary {
     let mut summary = RenewSummary::default();
-    let renew_url = config::app_setting_str("doubao_renew_url")
-        .unwrap_or_else(|| DEFAULT_RENEW_URL.to_string());
-    let probe_url = config::app_setting_str("doubao_quota_url")
-        .unwrap_or_else(|| DEFAULT_PROBE_URL.to_string());
+    let renew = renew_url();
+    let probe = probe_url();
+
+    // 任务留痕（所有者强约束「账号卡片上要能看到任务数与执行结果」）：
+    // 每个账号的每个出口都落一条 account_records，否则卡片上的「任务记录 · 消耗明细」
+    // 对豆包账号永远是空的 —— 这正是「看不到具体账号的任务执行结果」的成因。
+    // 注意：本函数被 4 个入口共用（Tauri 命令 / HTTP API / CLI 计划任务 / apps_ops 包装），
+    // 所以留痕写在这里：一处写好，四处生效。
+    let record_title = crate::modules::scheduler::TaskKind::DoubaoRenewHttp.label();
+    let record = |uid: &str, name: &str, result: &str, detail: &str| {
+        crate::modules::account_records::add_task_record(uid, name, record_title, result, detail);
+    };
+    let ctx = RenewCtx {
+        probe_url: &probe,
+        renew_url: &renew,
+        sync_only,
+        record: &record,
+    };
 
     for acc in doubao_account::load_accounts() {
-        let uid = acc.get("user_id").and_then(Value::as_str).unwrap_or("");
-        let name = acc
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(uid)
-            .to_string();
-        let sid = acc
-            .get("session_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if sid.is_empty() {
-            summary.skipped += 1;
-            summary.results.push(json!({
-                "userId": uid, "name": name, "status": "skip",
-                "message": "未配置 sessionid",
-            }));
-            continue;
-        }
-        if sync_only {
-            summary.skipped += 1;
-            summary.results.push(json!({
-                "userId": uid, "name": name, "status": "skip",
-                "message": "仅诊断模式，未发起请求",
-            }));
-            continue;
-        }
-
-        // 第一段：权威探活
-        let first = api_probe(&sid, &probe_url).await;
-        match first.status {
-            ProbeStatus::Expired => {
-                summary.expired += 1;
-                let _ = doubao_account::mutate_account(uid, |obj| {
-                    obj.insert("expired".to_string(), json!(true));
-                });
-                summary.results.push(json!({
-                    "userId": uid, "name": name, "status": "expired",
-                    "message": "会话已失效，请重新登录豆包并抓包更新凭证",
-                }));
-                continue;
-            }
-            ProbeStatus::Ok => {}
-            ProbeStatus::Unknown | ProbeStatus::Error => {
-                summary.errors += 1;
-                summary.results.push(json!({
-                    "userId": uid, "name": name, "status": "error",
-                    "message": first.detail,
-                }));
-                continue;
-            }
-        }
-
-        // 第二段：保活 + 回收新凭证
-        let second = renew_probe(&sid, &renew_url).await;
-        let now = config::utc_iso();
-        match second.status {
-            ProbeStatus::Ok => {
-                summary.ok += 1;
-                let new_sid = second.new_session_id.clone();
-                let new_guard = second.new_sid_guard.clone();
-                let _ = doubao_account::mutate_account(uid, |obj| {
-                    obj.insert("expired".to_string(), json!(false));
-                    obj.insert("last_renew_at".to_string(), json!(now));
-                    // 服务端下发新凭证时必须写回：滑动续期正是通过换新 sid 完成的，
-                    // 不写回就等于续期白做（下次探活还是用旧的、更快过期的凭证）。
-                    if let Some(sid) = new_sid {
-                        obj.insert("session_id".to_string(), json!(sid));
-                    }
-                    if let Some(guard) = new_guard {
-                        if let Some(expire) = parse_sid_guard(&guard) {
-                            obj.insert("session_expire_at".to_string(), json!(expire));
-                        }
-                        obj.insert("sid_guard".to_string(), json!(guard));
-                    }
-                });
-                summary.results.push(json!({
-                    "userId": uid, "name": name, "status": "ok",
-                    "message": second.detail,
-                }));
-            }
-            ProbeStatus::Expired => {
-                summary.expired += 1;
-                let _ = doubao_account::mutate_account(uid, |obj| {
-                    obj.insert("expired".to_string(), json!(true));
-                });
-                summary.results.push(json!({
-                    "userId": uid, "name": name, "status": "expired",
-                    "message": "保活时发现会话失效",
-                }));
-            }
-            ProbeStatus::Unknown | ProbeStatus::Error => {
-                summary.errors += 1;
-                summary.results.push(json!({
-                    "userId": uid, "name": name, "status": "error",
-                    "message": second.detail,
-                }));
-            }
-        }
-        // 账号间隔，避免触发风控
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        renew_one(&mut summary, &acc, &ctx).await;
     }
     summary
+}
+
+/// 只对**一个**账号跑续期探活，并把结论摊平到顶层。
+///
+/// 供账号卡片上的「本账号任务」重跑用：批量接口会连带打其它账号、还要等
+/// 每账号 500 ms 的防风控间隔，手动点一次不该有那种代价。
+pub async fn run_renewal_one(uid: &str, sync_only: bool) -> Value {
+    let Some(acc) = doubao_account::find_account(uid) else {
+        return json!({"ok": false, "error": "账号不存在"});
+    };
+    let mut summary = RenewSummary::default();
+    let renew = renew_url();
+    let probe = probe_url();
+    let record_title = crate::modules::scheduler::TaskKind::DoubaoRenewHttp.label();
+    let record = |uid: &str, name: &str, result: &str, detail: &str| {
+        crate::modules::account_records::add_task_record(uid, name, record_title, result, detail);
+    };
+    let ctx = RenewCtx {
+        probe_url: &probe,
+        renew_url: &renew,
+        sync_only,
+        record: &record,
+    };
+    renew_one(&mut summary, &acc, &ctx).await;
+
+    let mut out = summary.to_json();
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("uid".to_string(), json!(uid));
+        // 单账号时 results 里只有一条，摊平到顶层，前端不必再按数组查找
+        obj.insert(
+            "status".to_string(),
+            summary
+                .results
+                .first()
+                .and_then(|r| r.get("status"))
+                .cloned()
+                .unwrap_or_else(|| json!("skip")),
+        );
+        obj.insert(
+            "message".to_string(),
+            summary
+                .results
+                .first()
+                .and_then(|r| r.get("message"))
+                .cloned()
+                .unwrap_or_else(|| json!("")),
+        );
+    }
+    out
 }
 
 /// 诊断：检查各账号的凭证来源与可读性。
@@ -550,6 +672,50 @@ mod tests {
         assert_eq!(diag["accountsWithSession"], 1);
     }
 
+    /// 单账号续期：账号不存在时必须直接报错、且不产生任何记录。
+    ///
+    /// 卡片上的「本账号任务」是逐个账号点的，uid 传错（或账号已被删）
+    /// 不能静默变成「跑了一轮、什么都没发生」。
+    #[tokio::test]
+    async fn 单账号续期对不存在的账号直接报错() {
+        use crate::modules::account_records;
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("doubao_renew_one_missing");
+
+        let out = run_renewal_one("2593120869167228", false).await;
+        assert_eq!(out["ok"], json!(false));
+        assert_eq!(out["error"], json!("账号不存在"));
+        let all = account_records::query_records("", 0, 0, &[], 100);
+        assert_eq!(all["total"], json!(0), "账号不存在时不该写记录");
+    }
+
+    /// 单账号续期：缺凭证的账号要留一条 skip 记录并跳过。
+    ///
+    /// skip 也要留痕 —— 否则用户点了卡片上的任务，去「任务记录」里查，
+    /// 一片空白，完全看不出「为什么这个号什么都没发生」。
+    #[tokio::test]
+    async fn 单账号续期缺凭证时留痕并跳过() {
+        use crate::modules::account_records;
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("doubao_renew_one_nosid");
+        let _ = doubao_account::upsert_account("2593120869167228", Some("测试号"), None, true);
+
+        let out = run_renewal_one("2593120869167228", false).await;
+        assert_eq!(out["status"], json!("skip"));
+        assert_eq!(out["message"], json!("未配置 sessionid"));
+        assert_eq!(out["uid"], json!("2593120869167228"));
+
+        let one = account_records::query_records("2593120869167228", 0, 0, &[], 100);
+        let records = one["records"].as_array().expect("records 必须是数组");
+        assert_eq!(records.len(), 1, "只应查到该账号自己那一条");
+        assert_eq!(records[0]["kind"], json!(account_records::KIND_TASK));
+        assert_eq!(records[0]["result"], json!(account_records::RESULT_SKIPPED));
+        // 标题必须与计划任务的展示名逐字一致：卡片与计划任务说的是同一件事。
+        assert_eq!(
+            records[0]["title"],
+            json!(crate::modules::scheduler::TaskKind::DoubaoRenewHttp.label())
+        );
+    }
     #[test]
     fn 汇总_json_形态() {
         let mut s = RenewSummary::default();

@@ -694,6 +694,14 @@ pub async fn doubao_renew(sync_only: Option<bool>) -> Result<Value, String> {
     Ok(summary.to_json())
 }
 
+/// 只对**一个**账号跑续期探活（账号卡片上的「本账号任务」重跑）。
+///
+/// 与批量版的区别只在范围：批量会连带打其它账号、还要等每账号 500 ms 的
+/// 防风控间隔，手动点一次不该有那种代价。判定链完全共用（见 core 的 renew_one）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn doubao_renew_one(user_id: String) -> Result<Value, String> {
+    Ok(doubao_session::run_renewal_one(&user_id, false).await)
+}
 /// 会话与凭证诊断。
 #[tauri::command]
 pub async fn doubao_diagnose() -> Result<Value, String> {
@@ -726,6 +734,11 @@ pub async fn doubao_quota_batch() -> Result<Value, String> {
     Ok(doubao_quota::run_batch().await)
 }
 
+/// 只巡检**一个**账号的额度（账号卡片上的「本账号任务」重跑）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn doubao_quota_one(user_id: String) -> Result<Value, String> {
+    Ok(doubao_quota::run_batch_one(&user_id).await)
+}
 /// 账号会话探活。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn doubao_probe_account(user_id: String) -> Result<Value, String> {

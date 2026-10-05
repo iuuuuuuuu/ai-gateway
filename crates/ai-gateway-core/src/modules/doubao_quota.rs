@@ -358,6 +358,14 @@ pub async fn run_batch() -> Value {
     let mut exhausted: Vec<String> = Vec::new();
     let mut results: Vec<Value> = Vec::new();
 
+    // 任务留痕（所有者强约束「账号卡片上要能看到任务数与执行结果」）：
+    // 额度巡检过去一条记录都不写 ⇒ 卡片上的「任务记录 · 消耗明细」查不到巡检结果。
+    // ⚠ 本函数被 4 个入口共用（Tauri 命令 / HTTP API / CLI 计划任务 / apps_ops 包装）。
+    let record_title = crate::modules::scheduler::TaskKind::DoubaoQuota.label();
+    let record = |uid: &str, name: &str, result: &str, detail: &str| {
+        crate::modules::account_records::add_task_record(uid, name, record_title, result, detail);
+    };
+
     for acc in doubao_account::load_accounts() {
         let uid = acc.get("user_id").and_then(Value::as_str).unwrap_or("");
         let name = acc.get("name").and_then(Value::as_str).unwrap_or(uid).to_string();
@@ -367,6 +375,8 @@ pub async fn run_batch() -> Value {
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false);
         if !has_session {
+            // 也要留一条：否则「这个号为什么没有巡检结果」无从查起。
+            record(uid, &name, crate::modules::account_records::RESULT_SKIPPED, "未配置 sessionid");
             continue;
         }
 
@@ -390,6 +400,12 @@ pub async fn run_batch() -> Value {
                     &summary,
                     &parsed.windows,
                 );
+                let detail = if is_exhausted {
+                    format!("{summary}（有额度窗口已用尽）")
+                } else {
+                    summary.clone()
+                };
+                record(uid, &name, crate::modules::account_records::RESULT_SUCCESS, &detail);
                 results.push(json!({
                     "userId": uid, "name": name, "ok": true, "summary": summary,
                     "level": parsed.level, "expireAt": parsed.expire_at,
@@ -397,6 +413,7 @@ pub async fn run_batch() -> Value {
             }
             Err(e) => {
                 failed += 1;
+                record(uid, &name, crate::modules::account_records::RESULT_FAILED, &e);
                 results.push(json!({
                     "userId": uid, "name": name, "ok": false, "error": e,
                 }));
@@ -413,6 +430,62 @@ pub async fn run_batch() -> Value {
     })
 }
 
+/// 只查**一个**账号的额度（账号卡片上的「本账号任务」重跑）。
+///
+/// 与 `run_batch` 共用同一条 `fetch_single` 判定链与留痕口径，
+/// 只是不遍历账号池、不等待防风控间隔。
+pub async fn run_batch_one(uid: &str) -> Value {
+    let record_title = crate::modules::scheduler::TaskKind::DoubaoQuota.label();
+    let record = |uid: &str, name: &str, result: &str, detail: &str| {
+        crate::modules::account_records::add_task_record(uid, name, record_title, result, detail);
+    };
+    let Some(acc) = doubao_account::find_account(uid) else {
+        record(uid, uid, crate::modules::account_records::RESULT_FAILED, "账号不存在");
+        return json!({"ok": false, "error": "账号不存在"});
+    };
+    let name = acc.get("name").and_then(Value::as_str).unwrap_or(uid).to_string();
+    let has_session = acc
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !has_session {
+        record(uid, &name, crate::modules::account_records::RESULT_SKIPPED, "未配置 sessionid");
+        return json!({"ok": false, "error": "该账号未配置 sessionid"});
+    }
+    match fetch_single(uid).await {
+        Ok(parsed) => {
+            let summary = parsed.summary();
+            let is_exhausted = parsed
+                .windows
+                .iter()
+                .any(|w| w.get("exhausted").and_then(Value::as_bool).unwrap_or(false));
+            crate::modules::apps_ops::write_quota_cache(uid, &parsed);
+            let _ = crate::modules::doubao_health::record_quota(
+                true,
+                uid,
+                &parsed.level.clone().unwrap_or_default(),
+                &summary,
+                &parsed.windows,
+            );
+            let detail = if is_exhausted {
+                format!("{summary}（有额度窗口已用尽）")
+            } else {
+                summary.clone()
+            };
+            record(uid, &name, crate::modules::account_records::RESULT_SUCCESS, &detail);
+            let mut view = to_view(uid, &parsed);
+            if let Some(obj) = view.as_object_mut() {
+                obj.insert("exhausted".to_string(), json!(is_exhausted));
+            }
+            view
+        }
+        Err(e) => {
+            record(uid, &name, crate::modules::account_records::RESULT_FAILED, &e);
+            json!({"ok": false, "error": e})
+        }
+    }
+}
 /// 查询结果转前端形态。
 pub fn to_view(uid: &str, parsed: &ParsedQuota) -> Value {
     json!({
@@ -431,24 +504,55 @@ pub fn to_view(uid: &str, parsed: &ParsedQuota) -> Value {
 
 /// 会话探活（供界面「诊断」按钮）。
 pub async fn probe_account(uid: &str) -> Value {
+    // 任务留痕：探活同样是「本账号任务」，结果要能在卡片记录里查到。
+    // 标题与「额度巡检」区分开 —— 两者都会打同一个探活端点，混用会让用户看不懂。
+    const PROBE_TITLE: &str = "豆包会话探活";
     let Some(acc) = doubao_account::find_account(uid) else {
+        crate::modules::account_records::add_task_record(
+            uid,
+            uid,
+            PROBE_TITLE,
+            crate::modules::account_records::RESULT_FAILED,
+            "账号不存在",
+        );
         return json!({"ok": false, "error": "账号不存在"});
     };
+    let name = acc.get("name").and_then(Value::as_str).unwrap_or(uid).to_string();
     let sid = acc
         .get("session_id")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
     if sid.is_empty() {
+        crate::modules::account_records::add_task_record(
+            uid,
+            &name,
+            PROBE_TITLE,
+            crate::modules::account_records::RESULT_SKIPPED,
+            "该账号未配置 sessionid",
+        );
         return json!({"ok": false, "error": "该账号未配置 sessionid"});
     }
     let probe_url = config::app_setting_str("doubao_quota_url")
         .unwrap_or_else(|| doubao_session::DEFAULT_PROBE_URL.to_string());
     let result = doubao_session::api_probe(sid, &probe_url).await;
+    let ok = result.status == ProbeStatus::Ok;
+    let detail = result.detail.clone();
+    crate::modules::account_records::add_task_record(
+        uid,
+        &name,
+        PROBE_TITLE,
+        if ok {
+            crate::modules::account_records::RESULT_SUCCESS
+        } else {
+            crate::modules::account_records::RESULT_FAILED
+        },
+        &detail,
+    );
     json!({
-        "ok": result.status == ProbeStatus::Ok,
+        "ok": ok,
         "status": result.status.as_str(),
-        "detail": result.detail,
+        "detail": detail,
     })
 }
 
@@ -588,5 +692,37 @@ mod tests {
         assert_eq!(view["level"], "Pro");
         assert!(view["windows"].as_array().unwrap().len() == 2);
         assert!(view["summary"].as_str().unwrap().contains("当前时段"));
+    }
+
+    /// 无凭证的账号在批量巡检里也必须留痕。
+    ///
+    /// 原来这里是直接 `continue`，连 results 都不产生 ——
+    /// 卡片上的「任务记录」查不到这个号，用户完全无法区分
+    /// 「这个号没有凭证」和「这个号被漏掉了」。
+    #[tokio::test]
+    async fn 批量巡检对无凭证账号留痕() {
+        use crate::modules::account_records;
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("doubao_quota_batch_nosid");
+        let _ = doubao_account::upsert_account("2593120869167228", Some("测试号"), None, true);
+
+        let out = run_batch().await;
+        assert_eq!(out["ok"], json!(0));
+        assert_eq!(out["failed"], json!(0));
+        assert_eq!(
+            out["results"].as_array().map(|a| a.len()),
+            Some(0),
+            "无凭证的账号不该出现在 results 里（返回值形态保持不变）"
+        );
+
+        let one = account_records::query_records("2593120869167228", 0, 0, &[], 100);
+        let records = one["records"].as_array().expect("records 必须是数组");
+        assert_eq!(records.len(), 1, "只应查到该账号自己那一条");
+        assert_eq!(records[0]["kind"], json!(account_records::KIND_TASK));
+        assert_eq!(records[0]["result"], json!(account_records::RESULT_SKIPPED));
+        assert_eq!(
+            records[0]["title"],
+            json!(crate::modules::scheduler::TaskKind::DoubaoQuota.label())
+        );
     }
 }

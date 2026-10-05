@@ -30,6 +30,21 @@ pub fn has_embedded() -> bool {
     EMBEDDED_GZ.is_some_and(|d| !d.is_empty())
 }
 
+/// 当前构建「应当落地」的网关文件名（`gateway-<指纹>.exe`）。
+///
+/// 未内嵌网关（测试构建 / 用户自备 `gateway.exe`）时返回 `None`。
+///
+/// 宿主用它与「端口占用者的进程名」比对，判断正在跑的网关是不是本构建释放
+/// 出来的那一份 —— 这是升级后能否自动换掉旧网关的唯一判据：正在跑的进程读
+/// 不出它自己内嵌的指纹，但**文件名**里就带着指纹（见 `materialize`）。
+pub fn current_exe_name() -> Option<String> {
+    let gz = EMBEDDED_GZ?;
+    if gz.is_empty() {
+        return None;
+    }
+    Some(format!("gateway-{}.exe", fingerprint(gz)))
+}
+
 /// 内嵌数据的内容指纹（长度 + FNV-1a 哈希）。
 ///
 /// 用于缓存文件名：内容变化 → 指纹变化 → 落地到新文件，
@@ -120,6 +135,22 @@ mod tests {
         assert_eq!(a, fingerprint(b"hello"), "相同内容必须得到相同指纹");
         assert_ne!(a, fingerprint(b"hellp"), "内容不同必须得到不同指纹");
         assert_ne!(a, fingerprint(b"hello "), "长度不同必须得到不同指纹");
+    }
+
+    // 本构建「应当落地」的文件名必须由内嵌内容决定：宿主正是拿它去和
+    // 端口占用者的进程名比对，判断正在跑的是不是本版本的网关。
+    #[test]
+    fn current_exe_name_tracks_embedded_content() {
+        match EMBEDDED_GZ {
+            None => assert!(
+                current_exe_name().is_none(),
+                "未内嵌网关时不得给出文件名 —— 宿主会拿它去误判版本不一致"
+            ),
+            Some(gz) => {
+                let want = format!("gateway-{}.exe", fingerprint(gz));
+                assert_eq!(current_exe_name().as_deref(), Some(want.as_str()));
+            }
+        }
     }
 
     #[test]

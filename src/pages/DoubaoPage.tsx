@@ -2,21 +2,30 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   AlertTriangle,
+  CheckCircle2,
   Coins,
   Download,
+  Ellipsis,
   FileDown,
+  Info,
   KeyRound,
   Loader2,
   MessageSquare,
+  PlayCircle,
   Power,
   RefreshCw,
+  ScrollText,
   Stethoscope,
   Trash2,
   Upload,
   UserPlus,
 } from "lucide-react";
 
+// 记录视图：任务执行记录 + 额度消耗明细（所有者 2026-09-20 要求）。
+import { AccountRecordsView } from "@/components/account-records-view";
 import { AppEnvConfigCard } from "@/components/app-env-config-card";
+// 任务清单类型：与卡片菜单共用同一契约（四态 done/ready/blocked/detail）。
+import type { ProductAccountTask } from "@/components/product-account-card";
 import { DoubaoInsights } from "@/components/doubao-insights";
 import { DoubaoMark } from "@/components/product-marks";
 import { PlatformConfigButton, PlatformConfigDialog } from "@/components/platform-config-dialog";
@@ -32,6 +41,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
@@ -40,7 +57,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import * as api from "@/lib/api";
 import { SENSITIVE_STRING_INPUT_PROPS } from "@/lib/sensitive-input";
 import type { AppEnvStatus, DoubaoAccountView, DoubaoQuotaView } from "@/lib/api";
-import { cn } from "@/lib/utils";
+import { cn, firstVisibleText } from "@/lib/utils";
 
 /**
  * 「配置」弹窗里的应用环境条目：豆包客户端的安装路径。
@@ -50,6 +67,99 @@ import { cn } from "@/lib/utils";
  * 写成模块级常量而不是在组件里现建：它进了 `load` 的依赖数组。
  */
 const DOUBAO_ENV_KINDS = [{ kind: "Doubao", label: "豆包", hint: "Doubao.exe" }] as const;
+
+/**
+ * 一个豆包账号的「本账号任务」清单（所有者强约束 2026-10-04：
+ * 「账号上有个卡片，然后可以看到有多少任务、执行结果」，每个平台同一形态）。
+ *
+ * 与 Trae / Qoder / ZCode / WorkBuddy 卡片的 `ProductAccountTask` **同一契约**：
+ * 四态都要显示（置灰）而不是隐藏 —— 藏掉一条会让用户以为这个功能不存在。
+ *
+ * 任务 id 直接用**已有的**计划任务键（`scheduler::TaskKind` 的 cliKey），
+ * 不另起名字 —— 否则账号记录里的事件流与卡片上显示的会对不上。
+ *
+ * 状态判定（三个任务各自的数据源）：
+ *   · `doubao-renew`     凭证续期 —— 只对**单个账号**打上游探活；
+ *     `lastRenewAt` 是今天 ⇒ done，否则 ready。`hasSessionId=false` ⇒ blocked。
+ *   · `doubao-quota`     额度巡检 —— 单账号重查额度并写回账号库；
+ *     `quotaCheckedAt` 是今天 ⇒ done，否则 ready。`hasSessionId=false` ⇒ blocked。
+ *   · `doubao-keepalive` 会话保活 —— **全局任务**（后端 `doubao_keepalive`
+ *     不接 userId，`doubao_health::record_keepalive` 也不带 uid），
+ *     故这里如实标注「全局」并置为 detail：能点，但点它影响的是全部账号。
+ */
+function doubaoTasksOf(
+  account: DoubaoAccountView,
+  lastKeepaliveAt: string | null,
+  nowMs: number,
+): ProductAccountTask[] {
+  const today = utcDayKey(nowMs);
+  const hasSid = account.hasSessionId;
+  const renewDone = sameUtcDay(account.lastRenewAt, today);
+  const quotaDone = sameUtcDay(account.quotaCheckedAt, today);
+  const renew: ProductAccountTask = !hasSid
+    ? {
+        id: "doubao-renew",
+        label: "凭证续期（本账号）",
+        state: "blocked",
+        reason: "该账号没有 sessionid，先录入凭证再续期",
+      }
+    : {
+        id: "doubao-renew",
+        label: "凭证续期（本账号）",
+        state: renewDone ? "done" : "ready",
+        reason: renewDone
+          ? `今天已经续期过（${account.lastRenewAt}），再点只是重新探活一次`
+          : "向豆包上游发一次续期探活；成功会刷新 sessionid 与会话到期时间",
+      };
+  const quota: ProductAccountTask = !hasSid
+    ? {
+        id: "doubao-quota",
+        label: "额度巡检（本账号）",
+        state: "blocked",
+        reason: "该账号没有 sessionid，先录入凭证再查额度",
+      }
+    : {
+        id: "doubao-quota",
+        label: "额度巡检（本账号）",
+        state: quotaDone ? "done" : "ready",
+        reason: quotaDone
+          ? `今天已经巡检过（${account.quotaCheckedAt}）`
+          : account.quotaSummary || "重新查一次会员额度并写回账号库",
+      };
+  // 保活是全局动作（后端命令不接 userId），故用 detail 表达「能点，但作用域是全部账号」。
+  const keepalive: ProductAccountTask = {
+    id: "doubao-keepalive",
+    label: "会话保活（全部账号）",
+    state: "detail",
+    reason: lastKeepaliveAt
+      ? `全局任务，作用于全部账号；上次执行 ${lastKeepaliveAt}`
+      : "全局任务，作用于全部账号：启动豆包客户端触发服务端滑动续期",
+  };
+  return [renew, quota, keepalive];
+}
+
+/**
+ * 后端 `config::utc_iso()` 的形态是 `2026-10-05T16-54-22Z` —— 时分秒用短横线，
+ * 不是标准 ISO。`new Date()` 解析不了，故这里直接取 UTC 日期前缀比较。
+ */
+function utcDayKey(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+/** `utcIso` 与 `dayKey` 是否同一天（按 UTC 日期前缀）。空值 ⇒ false。 */
+function sameUtcDay(utcIso: string | null | undefined, dayKey: string): boolean {
+  if (!utcIso) return false;
+  return utcIso.slice(0, 10) === dayKey;
+}
+
+/** 任务组标题后缀。口径与 `components/product-account-card.tsx` 完全一致。 */
+function taskGroupSuffixOf(tasks: ProductAccountTask[]): string {
+  const runnable = tasks.filter((t) => t.state === "ready").length;
+  if (runnable > 0) return `（还有 ${runnable} 个可执行）`;
+  if (tasks.some((t) => t.state === "done")) return "（今日已完成）";
+  if (tasks.some((t) => t.state === "detail")) return "（无可领取项）";
+  return "（当前不可执行）";
+}
 
 /** 会话状态展示。 */
 function sessionBadge(account: DoubaoAccountView) {
@@ -219,6 +329,10 @@ export default function DoubaoPage({ embedded = false }: { embedded?: boolean } 
   const [diag, setDiag] = useState<Record<string, unknown> | null>(null);
   // 「配置」弹窗：应用环境（豆包客户端的安装路径）。
   const [configOpen, setConfigOpen] = useState(false);
+
+  // 账号记录弹窗（任务执行记录 + 额度消耗明细，所有者 2026-09-20 要求）。
+  // ZCode / Qoder 卡片用的是同一个 `AccountRecordsView`，这里保持一致。
+  const [recordsFor, setRecordsFor] = useState<DoubaoAccountView | null>(null);
 
   // 新增/编辑
   const [editOpen, setEditOpen] = useState(false);
@@ -451,6 +565,45 @@ export default function DoubaoPage({ embedded = false }: { embedded?: boolean } 
     }
   };
 
+  /**
+   * 账号卡片菜单里的「本账号任务」重跑（所有者强约束：可重跑 + 看得到执行结果）。
+   *
+   * 任务 id 就是后端 `scheduler::TaskKind` 的 cliKey —— 后端留痕写进
+   * `account_records.json` 的 title 与卡片上显示的逐字对应，
+   * 所以跑完必须 `await load()`：卡片状态与「任务记录」弹窗要当场反映出来，
+   * 否则用户点完看不出发生了什么（Trae 侧踩过这个坑）。
+   */
+  const runTask = async (account: DoubaoAccountView, taskId: string) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      if (taskId === "doubao-renew") {
+        const res = await api.doubaoRenewOne(account.userId);
+        const detail = res.message || res.status;
+        if (res.status === "ok") toast.success(`续期完成：${detail}`);
+        else if (res.status === "skip") toast.info(`已跳过：${detail}`);
+        else toast.warning(`续期未成功：${res.error ?? detail}`);
+      } else if (taskId === "doubao-quota") {
+        const res = await api.doubaoQuotaOne(account.userId);
+        if (res.ok) {
+          setQuota(res);
+          toast.success(`额度：${res.summary || res.level || "已更新"}`);
+        } else {
+          toast.warning(`额度巡检未成功：${res.summary || "上游未返回额度"}`);
+        }
+      } else if (taskId === "doubao-keepalive") {
+        // 全局任务：后端 `doubao_keepalive` 不接 userId，作用于全部账号。
+        const res = await api.doubaoKeepalive();
+        toast.success(res.message);
+      }
+      await load();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const doBackup = async (account: DoubaoAccountView) => {
     setBusy(true);
     try {
@@ -603,9 +756,9 @@ export default function DoubaoPage({ embedded = false }: { embedded?: boolean } 
               {accounts.map((account) => (
                 <div
                   key={account.userId}
-                  className="flex flex-wrap items-center gap-3 rounded-lg border border-border/60 bg-card px-4 py-3"
+                  className="flex flex-wrap items-start gap-3 rounded-lg border border-border/60 bg-card px-4 py-3"
                 >
-                  <DoubaoMark size={34} />
+                  <DoubaoMark size={34} className="mt-0.5 shrink-0" />
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="truncate text-sm font-medium">
@@ -639,6 +792,72 @@ export default function DoubaoPage({ embedded = false }: { embedded?: boolean } 
                     </div>
                   </div>
                   <div className="flex shrink-0 flex-wrap items-center gap-1">
+                    {/* 账号菜单：任务区 + 记录入口。
+                        DOM 契约（data-slot / data-task / data-state）与
+                        `components/product-account-card.tsx` **逐字一致**，
+                        好让 CDP 探针用同一个选择器扫全站。 */}
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="size-8 rounded-lg text-muted-foreground hover:text-foreground"
+                          aria-label={`管理账号 ${account.name ?? account.userId}`}
+                          title="更多账号操作"
+                        >
+                          <Ellipsis className="size-4" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="w-60">
+                        <DropdownMenuLabel className="text-xs">
+                          本账号任务{taskGroupSuffixOf(doubaoTasksOf(account, lastKeepaliveAt, Date.now()))}
+                        </DropdownMenuLabel>
+                        {doubaoTasksOf(account, lastKeepaliveAt, Date.now()).map((t) => (
+                          <DropdownMenuItem
+                            key={t.id}
+                            data-slot="product-task-item"
+                            data-task={t.id}
+                            data-state={t.state}
+                            disabled={busy || t.state !== "ready"}
+                            onSelect={() => {
+                              if (t.state === "ready") void runTask(account, t.id);
+                            }}
+                            title={t.reason}
+                            className="gap-2 text-xs"
+                          >
+                            {t.state === "done" ? (
+                              <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-600" />
+                            ) : t.state === "blocked" ? (
+                              <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                            ) : t.state === "detail" ? (
+                              <Info className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                            ) : (
+                              <PlayCircle className="h-3.5 w-3.5 shrink-0" />
+                            )}
+                            <span className="min-w-0 flex-1 truncate">{t.label}</span>
+                            {t.state === "done" && (
+                              <span className="shrink-0 text-[10px] text-muted-foreground">已完成</span>
+                            )}
+                            {t.state === "blocked" && (
+                              <span className="shrink-0 text-[10px] text-muted-foreground">不可用</span>
+                            )}
+                            {t.state === "detail" && (
+                              <span className="shrink-0 text-[10px] text-muted-foreground">仅详情</span>
+                            )}
+                          </DropdownMenuItem>
+                        ))}
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          data-slot="product-records-open"
+                          disabled={busy}
+                          onSelect={() => setRecordsFor(account)}
+                          className="gap-2 text-xs"
+                        >
+                          <ScrollText className="h-3.5 w-3.5" />
+                          任务记录 · 消耗明细
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <Button
@@ -860,6 +1079,25 @@ export default function DoubaoPage({ embedded = false }: { embedded?: boolean } 
         </Dialog>
 
         <QuotaDialog quota={quota} onClose={() => setQuota(null)} />
+
+        {/* 账号记录：任务执行记录 + 额度消耗明细（与 ZCode 页同一个视图）。 */}
+        <Dialog open={!!recordsFor} onOpenChange={(o) => !o && setRecordsFor(null)}>
+          <DialogContent className="sm:max-w-4xl">
+            <DialogHeader>
+              <DialogTitle>账号记录</DialogTitle>
+              <DialogDescription>
+                {recordsFor
+                  ? firstVisibleText(recordsFor.note, recordsFor.name, recordsFor.userId) ||
+                    recordsFor.userId
+                  : ""}
+                的会话续期、额度巡检与任务记录；可按日期区间筛选。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="min-h-0 max-h-[70vh] overflow-y-auto pr-1">
+              <AccountRecordsView accounts={[]} fixedAccountId={recordsFor?.userId} compact />
+            </div>
+          </DialogContent>
+        </Dialog>
 
         {/* 平台配置：豆包客户端的安装路径（原先在设置页的「应用环境」）。 */}
         <PlatformConfigDialog

@@ -42,10 +42,21 @@
  * 而不是切换页面，再切回来就又恢复初始状态了」。
  *
  * 这里的做法是 **lazy + keep-alive**：只有"访问过"的 tab 才带上 forceMount 常驻
- * 挂载（Radix 会把它渲染在 hidden 容器里），没访问过的仍是零成本 —— 若一上来就
- * 让五个页面全部常驻，五个页面的轮询 hook 会同时开跑，反而拖慢首屏。
+ * 挂载，没访问过的仍是零成本 —— 若一上来就让五个页面全部常驻，五个页面的轮询
+ * hook 会同时开跑，反而拖慢首屏。
  * 代价：常驻页面即使不可见，其定时器仍在跑（见各页面内的 useVisibilityInterval /
  * 静默轮询设计），因此 keep-alive 的范围刻意只限"用户真的打开过"的 tab。
+ *
+ * # ⚠⚠ forceMount **不会**隐藏面板（1.0.26 真机抓到，改之前必读）
+ * Radix 的 TabsContent 里是 `present = forceMount || isSelected`、`hidden = !present`
+ * —— forceMount 的语义是"**永远 present**"，于是非激活面板的 hidden 恒为 false：
+ * 面板不但常驻，而且**一直可见**。切 tab 后旧面板还占在原处（新面板被顶到它下面
+ * 数千像素处），用户看到的就是"标签已经选中 Qoder、画面还是 WorkBuddy"。
+ * 真机取证（隔离实例 /accounts/qoder）：外层 workbuddy 面板
+ * `data-state=inactive` 却 `hidden=false`、w=701 h=4471 仍然可见，Qoder 面板
+ * top=4733 被顶到它下面。
+ * ⇒ 凡是带 forceMount 的 TabsContent，都**必须自己补 hidden**（见本文件里
+ *   `hidden={active !== t.key}` 与 `hidden={picked !== "accounts"}` 两处）。
  */
 import { useEffect, useState, type ReactNode } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
@@ -159,24 +170,60 @@ function isWorkbuddyView(value: string | null): value is WorkbuddyView {
   return value !== null && (WORKBUDDY_VIEWS as string[]).indexOf(value) >= 0;
 }
 
+/**
+ * 三级视图的「最近一次点选」。点击当下同步写，不等路由。
+ *
+ * 为什么需要它：Radix 的 onValueChange 挂在 mousedown 上，而路由提交与 React 的
+ * 状态落地都可能滞后（真机实测：点击到 URL 生效 ~1.4 s、到 aria-selected 生效
+ * ~2.4 s）。这段时间里 URL 还是旧值，切平台标签就会把 `?view=credits` 丢掉
+ * （真机实测：切回 WorkBuddy 后停在了「Token 统计」）。
+ */
+let lastWorkbuddyView: WorkbuddyView | null = null;
+
+/**
+ * 平台标签切换时要带过去的查询串。
+ *
+ * ★ 读浏览器真实地址（window.location.search），**不读** useSearchParams()：
+ *   后者的值绑在渲染闭包里，路由还没提交时它是上一个视图的查询串 —— 真机实测
+ *   这条路径会把 `?view=credits` 丢掉。
+ */
+function hubQueryForTabSwitch(): string {
+  const p = new URLSearchParams(window.location.search);
+  // 三级视图以「最近一次点选」为准：URL 尚未跟上时也不会丢。
+  if (lastWorkbuddyView === "accounts") p.delete("view");
+  else if (lastWorkbuddyView !== null) p.set("view", lastWorkbuddyView);
+  return p.toString();
+}
+
 function WorkbuddyPanel() {
   const [searchParams, setSearchParams] = useSearchParams();
   // 非法 / 缺省值一律当「账号」——不把脏参数写回 URL（写回会造成一次多余的 history 记录）。
   const raw = searchParams.get("view");
   const view: WorkbuddyView = isWorkbuddyView(raw) ? raw : "accounts";
+  // ★ 乐观选中：点击当下先落到本地 state，不等 setSearchParams 走完一轮路由。
+  //   否则在「URL 还没提交」的那几百毫秒里，Radix 拿到的 value 仍是旧值，
+  //   点回刚切走的那个视图会被 useControllableState 的 `next === prop` 判定吞掉。
+  const [picked, setPicked] = useState<WorkbuddyView>(view);
+  useEffect(() => {
+    setPicked(view);
+  }, [view]);
   const [visited, setVisited] = useState<Set<WorkbuddyView>>(() => new Set<WorkbuddyView>([view]));
 
   return (
     <Tabs
-      value={view}
+      value={picked}
       onValueChange={(v) => {
         const next = v as WorkbuddyView;
+        setPicked(next);
+        lastWorkbuddyView = next;
         setVisited((p) => (p.has(next) ? p : new Set(p).add(next)));
         // replace：三级 tab 之间的切换不该往历史栈里塞记录，否则「后退」要在
         // 同一页的三个视图之间走三下才退得出去。
         setSearchParams(
-          (prev) => {
-            const p = new URLSearchParams(prev);
+          () => {
+            // 从浏览器真实地址起算（理由同 hubQueryForTabSwitch）：合并而不是重建，
+            // 这样 view 之外的参数一个都不会丢。
+            const p = new URLSearchParams(window.location.search);
             if (next === "accounts") p.delete("view");
             else p.set("view", next);
             return p;
@@ -202,6 +249,8 @@ function WorkbuddyPanel() {
         value="accounts"
         className="min-w-0"
         forceMount={visited.has("accounts") ? true : undefined}
+        // ★ 常驻 ≠ 隐藏：forceMount 会让 Radix 算出的 hidden 恒为 false（见文件头）。
+        hidden={picked !== "accounts"}
       >
         <AccountsPage embedded />
       </TabsContent>
@@ -210,6 +259,8 @@ function WorkbuddyPanel() {
         value="credits"
         className="min-w-0"
         forceMount={visited.has("credits") ? true : undefined}
+        // ★ 常驻 ≠ 隐藏：forceMount 会让 Radix 算出的 hidden 恒为 false（见文件头）。
+        hidden={picked !== "credits"}
       >
         <CreditStatsPage embedded />
       </TabsContent>
@@ -218,6 +269,8 @@ function WorkbuddyPanel() {
         value="tokens"
         className="min-w-0"
         forceMount={visited.has("tokens") ? true : undefined}
+        // ★ 常驻 ≠ 隐藏：forceMount 会让 Radix 算出的 hidden 恒为 false（见文件头）。
+        hidden={picked !== "tokens"}
       >
         <TokenStatsPage embedded />
       </TabsContent>
@@ -228,10 +281,20 @@ function WorkbuddyPanel() {
 export default function AccountHubPage() {
   const navigate = useNavigate();
   const { tab } = useParams<{ tab: string }>();
-  const [searchParams] = useSearchParams();
   // 非法 URL 段（手打 /accounts/xxx）一律回落到 workbuddy，并把 URL 归一化 ——
   // 用 replace 而不是 push：否则用户按"后退"会退回同一个脏地址，原地打转。
-  const active: AccountTab = isAccountTab(tab) ? tab : "workbuddy";
+  const routeTab: AccountTab = isAccountTab(tab) ? tab : "workbuddy";
+
+  // ★ 乐观选中（真机实测教训，改动前先读）：Radix TabsTrigger 的切标签动作挂在
+  //   mousedown 上，且受控模式下"传回与当前 prop 相同的值"会被
+  //   useControllableState 直接吞掉。而路由提交 + React 状态落地有可见滞后
+  //   （实测点击到 URL 生效 ~1.4 s、到 aria-selected 生效 ~2.4 s）。两者相乘
+  //   就会出现「点回刚离开的标签完全没反应，得再点一次」。
+  //   所以选中项先落本地 state，路由值随后对齐。
+  const [active, setActive] = useState<AccountTab>(routeTab);
+  useEffect(() => {
+    setActive(routeTab);
+  }, [routeTab]);
 
   useEffect(() => {
     if (tab !== undefined && !isAccountTab(tab)) navigate("/accounts/workbuddy", { replace: true });
@@ -298,13 +361,14 @@ export default function AccountHubPage() {
   };
 
   const handleTabChange = (value: string) => {
-    if (isAccountTab(value)) {
-      setVisited((prev) => (prev.has(value) ? prev : new Set(prev).add(value)));
-    }
+    if (!isAccountTab(value)) return;
+    setActive(value);
+    setVisited((prev) => (prev.has(value) ? prev : new Set(prev).add(value)));
     // ★ 带上当前查询串：WorkBuddy 的三级视图（`?view=credits`）属于「页面状态」的一部分，
     //   切到别的平台标签再切回来时必须还停在同一视图上 —— 否则「保持状态缓存」
     //   只对面板 DOM 成立、对用户看到的那一屏不成立。
-    const qs = searchParams.toString();
+    //   查询串的来源见 hubQueryForTabSwitch（读浏览器真实地址 + 最近一次点选）。
+    const qs = hubQueryForTabSwitch();
     navigate("/accounts/" + value + (qs ? "?" + qs : ""));
   };
 
@@ -378,6 +442,9 @@ export default function AccountHubPage() {
             className="min-w-0"
             // 访问过的 tab 常驻挂载（切走不卸载 ⇒ 状态不丢）；没访问过的照旧按需挂载。
             forceMount={visited.has(t.key) ? true : undefined}
+            // ★ 常驻 ≠ 隐藏：forceMount 会让 Radix 算出的 hidden 恒为 false，必须自己补，
+            //   否则切 tab 后旧平台面板仍可见（真机表现为「选中 Qoder 却还是 WorkBuddy」）。
+            hidden={active !== t.key}
           >
             <PlatformPanel tab={t.key} />
           </TabsContent>

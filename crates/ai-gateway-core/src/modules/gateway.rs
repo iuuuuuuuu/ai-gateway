@@ -3219,6 +3219,52 @@ fn should_adopt_gateway(port: u16, port_is_free: bool) -> bool {
     port > 0 && !port_is_free
 }
 
+/// 「是否要把端口上的网关换成本构建内嵌的那一份」的纯判定（便于单测）。
+///
+/// `holder` = 端口占用者的进程名，`cur` = 本构建应释放的文件名。
+/// 任一为 `None` 都返回 `false`（不动它）：
+///   * `cur` 为 `None` —— 本构建没有内嵌网关（测试构建 / 用户自备），
+///     无从比较，保持「认领即沿用」的旧行为；
+///   * `holder` 为 `None` —— 读不到占用者（tasklist 失败等），
+///     宁可沿用也不要凭猜测去杀一个健康进程。
+///
+/// 进程名形如 `gateway-<长度>-<FNV1a>`，指纹取自内嵌数据**内容** ⇒ 名字
+/// 相同就意味着内容逐字节相同，此时重启没有任何收益，只会白断一次正在服务
+/// 的连接。名字不同 ⇒ 跑的是别的版本 ⇒ 需要换新。
+fn needs_gateway_refresh(holder: Option<&str>, cur: Option<&str>) -> bool {
+    match (holder, cur) {
+        (Some(h), Some(c)) => !h.eq_ignore_ascii_case(c),
+        _ => false,
+    }
+}
+
+/// 端口上正在跑的网关是不是**本构建**释放出来的那一份。
+///
+/// ⚠ 调用前提：`adopt_running_gateway(port)` 已经确认「端口上确实是本程序
+/// 的网关」。对陌生进程（Docker 转发、别人的服务）不做任何判断。
+///
+/// # 为什么需要它（2026-10-05 业主实测，问题 ⑭）
+///
+/// 业主 1.0.21 启动时 `:7864` 上已有它**上一轮释放的** `gateway-<旧指纹>.exe`
+/// 在跑，`maybe_autostart()` 走 `adopt_running_gateway()` 认领后就再也
+/// 不会释放新版本内嵌的网关。后果：升级了 App，实际处理请求的仍是旧网关
+/// 二进制 —— 1.0.23（`f237786`）修好的「上游流中断归因」永远不生效，
+/// 业主看到的仍是旧文案 `error decoding response body`，而代码里那句
+/// 归因根本没有机会运行。实测该进程 SHA256 与 1.0.21 内嵌那份完全相同。
+fn gateway_needs_refresh(port: u16) -> bool {
+    // 只在「网关应当来自内嵌数据」时才管版本。`AI_GATEWAY_ROUTER_BIN`（手工指定）
+    // 与「同目录自备 gateway.exe」两种来源下，文件名本来就不带指纹，硬比会把
+    // 每一次启动都判成「需要换新」并反复重启 —— 那是比版本落后更糟的故障。
+    if gateway_source() != "embedded" {
+        return false;
+    }
+    let Some(cur) = crate::modules::gateway_embed::current_exe_name() else {
+        return false;
+    };
+    let holder = find_port_holder(port).map(|(_, name, _)| name);
+    needs_gateway_refresh(holder.as_deref(), Some(cur.as_str()))
+}
+
 /// 端口上是否已经跑着「本程序的网关」，但**不是本进程托管的那个**。
 ///
 /// 判据与 `gateway_status()` 用的完全一致：探活 + 身份校验（`probe_health`
@@ -3247,6 +3293,35 @@ async fn adopt_running_gateway(port: u16) -> bool {
         }
         _ => false,
     }
+}
+
+/// 网关子进程日志的单个文件上限；超过即轮转为 `gateway.log.1`。
+const MAX_ROUTER_LOG_BYTES: u64 = 4 * 1024 * 1024;
+
+/// 网关子进程日志文件（`<store>/gateway/gateway_data/gateway.log`）。
+fn router_log_file() -> PathBuf {
+    gateway_dir().join("gateway_data").join("gateway.log")
+}
+
+/// 以追加方式打开网关日志；超过 `MAX_ROUTER_LOG_BYTES` 时先轮转为
+/// `gateway.log.1`（只保留两份），再打开新的。
+///
+/// 返回 `(stdout, stderr)` 两个句柄 —— 同一个文件的两次 `try_clone`，
+/// 子进程侧是两个独立的写句柄，因此必须都带上 `append`，否则两个流会互相
+/// 覆盖对方的偏移。
+fn open_router_log() -> std::io::Result<(std::fs::File, std::fs::File)> {
+    let path = router_log_file();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if std::fs::metadata(&path).map(|m| m.len() > MAX_ROUTER_LOG_BYTES).unwrap_or(false) {
+        let old = path.with_extension("log.1");
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(&path, &old);
+    }
+    let out = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    let err = out.try_clone()?;
+    Ok((out, err))
 }
 
 /// 启动网关子进程。成功返回可访问基址。
@@ -3338,9 +3413,23 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
     let mut cmd = Command::new(&exe);
     cmd.arg("-config")
         .arg(&native_cfg)
-        .current_dir(gateway_dir())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .current_dir(gateway_dir());
+    // ★ 子进程输出落盘，而不是丢进 `Stdio::null()`。
+    //
+    // 历史教训：网关自己一直在 eprintln!，但宿主把 stdout/stderr 全丢进
+    // null，于是「上游流中断归因」「1113 误判」这类只出现在日志里的线索在
+    // 用户机器上一条都拿不到 —— 只能靠反复复现（2026-10-05 的 ⑭ 就是这样
+    // 耗掉了一整轮排查）。日志超过上限时轮转为 `gateway.log.1`，只保留
+    // 两份，不会无限增长。
+    match open_router_log() {
+        Ok((out, err)) => {
+            cmd.stdout(out).stderr(err);
+        }
+        Err(e) => {
+            eprintln!("[gateway] 网关日志文件不可用，回退为丢弃子进程输出: {e}");
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
     // 非 Windows 平台不需要抑制控制台窗口，保持默认行为。
     #[cfg(target_os = "windows")]
     {
@@ -4043,6 +4132,38 @@ pub async fn maybe_autostart() -> Option<Value> {
     // 「网关明明运行正常，App 却说启动失败」。判据与状态页完全一致。
     let port = port_of(cfg.get("listen").and_then(Value::as_str).unwrap_or(""));
     if adopt_running_gateway(port).await {
+        // ★ 认领之后还要再问一句「它是不是**本构建**的网关」。
+        //
+        // 认领本身是对的（它解决了「明明在跑却说启动失败」），但它顺带引入
+        // 了一个更隐蔽的后果：升级后端口上跑的还是上一版释放的网关二进制，
+        // 认领之后永远不会再释放新版 ⇒ 用户升级了 App，实际处理请求的仍是
+        // 旧网关，新版里的修复（如 1.0.23 的上游流中断归因）永远看不到。
+        // 2026-10-05 业主实测即为此：App 是 1.0.21，跑着的
+        // `gateway-4e52fa-….exe` 与 1.0.21 内嵌那份 SHA256 完全相同。
+        //
+        // 判据严格到「文件名（含内容指纹）必须一致」才算同一个（见
+        // `needs_gateway_refresh`）；确实不一致时才走串行重启入口换新 ——
+        // 那会短暂中断正在服务的请求，所以只在这一种情况下做。
+        // 读占用者要跑 netstat + tasklist + powershell（数百毫秒），
+        // 放到阻塞线程池里，别占着异步 worker。
+        let stale = tokio::task::spawn_blocking(move || gateway_needs_refresh(port))
+            .await
+            .unwrap_or(false);
+        if stale {
+            eprintln!("[gateway] 端口 {port} 上的网关不是本版本释放的，正在换成本版本内嵌的网关");
+            match restart_gateway_serialized().await {
+                Ok(_) => update_runtime_state("started", None),
+                Err(e) => {
+                    // 换新失败（旧进程杀不掉等）不能把状态写成 failed：
+                    // 端口上**确实**有一个健康的网关在服务，用户看到的应当是
+                    // 「运行中」，只是版本旧一点。失败原因只留在 last_error 之外
+                    // 的日志里，不制造「明明能用却报失败」的第二副面孔。
+                    eprintln!("[gateway] 换用本版本网关失败，继续沿用正在运行的那一个: {e}");
+                    update_runtime_state("started", None);
+                }
+            }
+            return None;
+        }
         update_runtime_state("started", None);
         return None;
     }
@@ -6826,6 +6947,69 @@ mod tests {
             claimed_pid_from_holder(ours),
             Some(33708),
             "本程序的网关必须被认领，否则「停止网关」停不掉它"
+        );
+    }
+
+    // 端口上跑着**别的版本**释放的网关时必须判「需要换新」—— 否则升级了 App，
+    // 实际处理请求的仍是旧网关二进制（问题 ⑭：1.0.23 修好的「上游流中断归因」
+    // 永远没有机会运行，用户看到的仍是旧文案）。
+    #[test]
+    fn needs_gateway_refresh_only_on_name_mismatch() {
+        let cur = "gateway-4e8729-6ca281c408920fd4.exe";
+        assert!(
+            needs_gateway_refresh(Some("gateway-4e52fa-ecd7924c953073e8.exe"), Some(cur)),
+            "名字不同 ⇒ 跑的是别的版本 ⇒ 必须换新"
+        );
+        assert!(
+            !needs_gateway_refresh(Some(cur), Some(cur)),
+            "名字相同 ⇒ 内容逐字节相同 ⇒ 重启毫无收益，只会白断一次连接"
+        );
+        assert!(
+            !needs_gateway_refresh(Some("GATEWAY-4E8729-6CA281C408920FD4.EXE"), Some(cur)),
+            "Windows 进程名大小写不敏感，比对不能因此判成「不同版本」"
+        );
+        assert!(
+            !needs_gateway_refresh(None, Some(cur)),
+            "读不到占用者（tasklist 失败等）时宁可沿用，也不能凭猜测去杀一个健康进程"
+        );
+        assert!(
+            !needs_gateway_refresh(Some("gateway.exe"), None),
+            "本构建没内嵌网关（用户自备 gateway.exe）时无从比较，保持「认领即沿用」"
+        );
+    }
+
+    // 网关子进程日志：两次启动必须**追加**到同一份文件（否则只能看到最后一次
+    // 启动的输出，历史现场照样丢），超过上限则轮转为 gateway.log.1。
+    #[test]
+    fn open_router_log_appends_and_rotates() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-log");
+        let path = router_log_file();
+        use std::io::Write as _;
+
+        {
+            let (mut out, _err) = open_router_log().expect("应能创建日志文件");
+            out.write_all(b"first\n").unwrap();
+        }
+        {
+            let (mut out, _err) = open_router_log().expect("第二次打开必须仍成功");
+            out.write_all(b"second\n").unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "first\nsecond\n",
+            "两次启动的输出都必须留在同一份日志里（追加，而不是每次截断）"
+        );
+
+        std::fs::write(&path, vec![b'x'; MAX_ROUTER_LOG_BYTES as usize + 1]).unwrap();
+        let (_out, _err) = open_router_log().expect("轮转后必须仍能打开");
+        assert!(
+            path.with_extension("log.1").is_file(),
+            "超过上限必须先轮转为 gateway.log.1，而不是把历史整段丢掉"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "轮转后新日志必须从空文件开始"
         );
     }
 
