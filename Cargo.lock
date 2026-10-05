@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "ai-gateway"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "ai-gateway-core",
  "bytes",

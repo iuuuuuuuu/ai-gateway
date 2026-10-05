@@ -337,6 +337,29 @@ impl Stats {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
+        // ★★ 模型名再按**大小写不敏感**归一（2026-10-05 所有者现场）。
+        //
+        // 所有者逐字：「一样的模型居然还分了两条记录」—— 他的截图里
+        // `GLM-5.3-Flash · ZCode`（11.0M / 98 次）与 `glm-5.3-flash · ZCode`
+        // （1.6K）并排两行。
+        //
+        // 根因：上游目录里的规范名是 `GLM-5.3-Flash`（`gateway_native_config.json`
+        // 的 zcode 模型表就是这个写法），而客户端（DSH 的 providers.json）发的是
+        // 小写 `zcode:glm-5.3-flash`。两者经 `bare_model_name` 去掉前缀后**逐字**
+        // 落键，于是同一个模型在 `models` / `account_models` / `billed` /
+        // `billing_meta` 四处各存了一份。
+        //
+        // 本仓其它**所有**模型比较都是大小写不敏感的（`forward.rs:434`
+        // `eq_ignore_ascii_case`、`model_allow.rs:74` 同款、`pool.rs` 一律
+        // `to_ascii_lowercase`、`capability.rs:833` 同款），**只有用量统计这一处**
+        // 逐字比较 —— 那是遗漏而不是设计：路由认它们是一个模型，账单却当成两个。
+        //
+        // 归一策略：**沿用已存在的那个拼写**（忽略大小写地找），找不到才用本次传来
+        // 的写法。这样 (a) 不再把新记录劈成两行；(b) 已落盘的历史由 `load()` 里的
+        // [`merge_case_variants`] 合并后，新记录并入幸存的拼写，界面上的名字不会在
+        // 两个写法之间来回跳。
+        let model_key = model_key_of(&inner, model);
+        let model = model_key.as_str();
         add_to(&mut inner.days, day, entry);
         add_to(nested(&mut inner.models, model), day, entry);
         add_to(nested(&mut inner.accounts, uid), day, entry);
@@ -619,7 +642,7 @@ fn load(path: &str) -> Inner {
         eprintln!("usage: {path} 版本 {} 高于当前支持，忽略", fs.version);
         return Inner::default();
     }
-    Inner {
+    let mut inner = Inner {
         days: fs.days,
         models: fs.models,
         accounts: fs.accounts,
@@ -631,7 +654,15 @@ fn load(path: &str) -> Inner {
             .map(|(k, v)| (k.clone(), Billing::from(v)))
             .collect(),
         billing_cycles: load_billing_cycles(fs.billing_cycles),
-    }
+    };
+    // ★★ 装载即治愈大小写分裂（2026-10-05 所有者现场：「一样的模型居然还分了两条
+    // 记录」）。老文件里 `GLM-5.3-Flash` 与 `glm-5.3-flash` 各存一份，这里合并成
+    // 一行；因为 `record_billed_core` 之后也用同一套归一，不会再裂开。
+    //
+    // ⚠ 这里**不**置 `dirty`：合并结果要等下一次真实记录（或既有 flush 路径）
+    // 才落盘。若在此强制 flush，只读打开面板的进程也会改写用户的账本文件。
+    merge_case_variants(&mut inner);
+    inner
 }
 
 /// 装载周期状态：**只做形状容错，不判断可信度**。
@@ -694,6 +725,227 @@ pub fn bare_model_name(model: &str) -> String {
     } else {
         picked.to_string()
     }
+}
+
+/// 大小写不敏感地找**已经存在**的模型键；找不到才用 `model` 本身的写法。
+///
+/// 2026-10-05 所有者现场：同一个模型被拆成 `GLM-5.3-Flash · ZCode`（11.0M /
+/// 98 次）与 `glm-5.3-flash · ZCode`（1.6K）两行。原话逐字：「一样的模型居然
+/// 还分了两条记录」。
+///
+/// 为什么是「沿用已有的写法」而不是「一律转小写」：模型的**显示名**要尽量稳定。
+/// 若一律转小写，历史里那份 `GLM-5.3-Flash` 会在界面改名，而 `/v1/models`
+/// 目录里仍是 `GLM-5.3-Flash` —— 两处对不上又多一个新困惑。沿用已有写法则
+/// 只在「首次见到该模型」时定型，之后不再变。
+///
+/// ⚠ 查找范围必须是 [`all_model_keys`] 那**四张表**，不能只看 `models`：
+/// 一份被截断/手改过的文件完全可能只在 `accountModels` 或 `billed` 里留下键
+/// （`load()` 正是残缺文件的入口）。若只看 `models`，写入路径就会用本次传来的
+/// 新写法落键，而装载治愈按旧写法合并 —— 两边打架，同一个模型又裂开。
+fn model_key_of(inner: &Inner, model: &str) -> String {
+    // ① 精确命中（任意一张表）——原样沿用，连大小写都不动。
+    if inner.models.contains_key(model)
+        || inner.billed.contains_key(model)
+        || inner.account_models.values().any(|m| m.contains_key(model))
+    {
+        return model.to_string();
+    }
+    // ② 忽略大小写命中（任意一张表）——沿用那个已存在的拼写。
+    for k in all_model_keys(inner) {
+        if k.eq_ignore_ascii_case(model) {
+            return k;
+        }
+    }
+    // ③ 全都没有：用本次写法定型。
+    model.to_string()
+}
+
+/// 收集四个映射里出现过的**所有**模型名（去重、排序）。
+///
+/// 为什么不能只看 `models`：`load()` 是「残缺文件」的入口 —— 一份被截断或
+/// 手改过的 `usage.json` 完全可能只在 `accountModels` 或 `billed` 里有键。
+/// 若规范名只从 `models` 推导，那些键就会原样留着，治愈只做了一半。
+fn all_model_keys(inner: &Inner) -> Vec<String> {
+    let mut keys: Vec<String> = inner.models.keys().cloned().collect();
+    for by_model in inner.account_models.values() {
+        keys.extend(by_model.keys().cloned());
+    }
+    keys.extend(inner.billed.keys().cloned());
+    for k in inner.billing_meta.keys() {
+        if let Some((name, _)) = k.split_once('\u{0}') {
+            keys.push(name.to_string());
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// 列出合并后**仍然**存在大小写变体的模型（正常情况下恒为空）。
+///
+/// 为什么要有它：`merge_case_variants` 的合并只按 `canon` 里有的键走，任何
+/// 遗漏（新加的第五张表、键被规范化过的映射）都会静默留下分裂。这里用与
+/// 治愈完全**独立**的判据（把所有键转小写后数重复）复核结果，只用于断言与
+/// 排障，不进生产路径。
+#[cfg(test)]
+fn leftover_case_variants(inner: &Inner) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut dup: Vec<String> = Vec::new();
+    for k in all_model_keys(inner) {
+        if !seen.insert(k.to_ascii_lowercase()) {
+            dup.push(k);
+        }
+    }
+    dup
+}
+
+/// 为每个「小写形态」挑一个规范拼写：**总 token 最多**者胜，其次记录数多者胜，
+/// 再平则取字典序小者（保证跨进程确定，不受 `HashMap` 迭代顺序影响）。
+///
+/// 为什么 token 量排在记录数前面 —— 用所有者 2026-10-05 的真实数据校验过：
+/// `GLM-5.3-Flash` = 21,278,353 输入 / 141 次，`glm-5.3-flash` = 10,833,442
+/// 输入 / 157 次。按记录数选会留下小写那份，而**上游目录里模型就叫
+/// `GLM-5.3-Flash`**（`gateway_native_config.json` 的 zcode 模型表），界面
+/// 显示名会与 `/v1/models` 对不上；按 token 量选则留下 `GLM-5.3-Flash`，
+/// 与目录一致。
+///
+/// 字典序兜底还有个顺带的好处：ASCII 里大写排在小写之前，所以当两个拼写的
+/// token 量恰好相等时，留下的仍是与目录一致的那个写法。
+///
+/// `keys` 里不在 `models` 的（残缺文件才有的情况）权重为 (0, 0)，
+/// 一定输给有真实计量的那个拼写。
+fn canonical_model_names(
+    models: &HashMap<String, HashMap<String, Counters>>,
+    keys: &[String],
+) -> HashMap<String, String> {
+    let mut best: HashMap<String, (String, i64, i64)> = HashMap::new();
+    for k in keys {
+        let (rec, tot) = match models.get(k) {
+            Some(series) => (
+                series.values().map(|c| c.records).sum(),
+                series
+                    .values()
+                    .map(|c| c.input + c.output + c.cache_write)
+                    .sum(),
+            ),
+            None => (0, 0),
+        };
+        let low = k.to_ascii_lowercase();
+        let better = match best.get(&low) {
+            None => true,
+            Some((prev, pr, pt)) => {
+                (tot, rec, std::cmp::Reverse(k.as_str()))
+                    > (*pt, *pr, std::cmp::Reverse(prev.as_str()))
+            }
+        };
+        if better {
+            best.insert(low, (k.clone(), rec, tot));
+        }
+    }
+    best.into_iter().map(|(l, (n, _, _))| (l, n)).collect()
+}
+
+/// 把「模型名 → 日期 → 计量」里只差大小写的键合并到规范键上（逐日相加）。
+fn fold_case_keys(
+    map: &mut HashMap<String, HashMap<String, Counters>>,
+    canon: &HashMap<String, String>,
+) {
+    for k in map.keys().cloned().collect::<Vec<String>>() {
+        let Some(c) = canon.get(&k.to_ascii_lowercase()) else {
+            continue;
+        };
+        if c == &k {
+            continue;
+        }
+        let Some(src) = map.remove(&k) else {
+            continue;
+        };
+        let dst = map.entry(c.clone()).or_default();
+        for (day, ctr) in src {
+            add_to(dst, &day, ctr);
+        }
+    }
+}
+
+/// 三层版（模型 → 计费键 → 日期）：先并模型名，再并计费键下的日期桶。
+fn fold_case_keys3(
+    map: &mut HashMap<String, HashMap<String, HashMap<String, Counters>>>,
+    canon: &HashMap<String, String>,
+) {
+    for k in map.keys().cloned().collect::<Vec<String>>() {
+        let Some(c) = canon.get(&k.to_ascii_lowercase()) else {
+            continue;
+        };
+        if c == &k {
+            continue;
+        }
+        let Some(src) = map.remove(&k) else {
+            continue;
+        };
+        let dst = map.entry(c.clone()).or_default();
+        for (sub, series) in src {
+            let slot = dst.entry(sub).or_default();
+            for (day, ctr) in series {
+                add_to(slot, &day, ctr);
+            }
+        }
+    }
+}
+
+/// `billingMeta` 的键是 `模型\x00计费键`，模型名归一后必须同步改键，
+/// 否则快照里按新键查不到归属（`snapshot` 里 `billing_meta.get(...)` 落空，
+/// 界面那一行就丢掉平台/倍率）。
+///
+/// ⚠ 合并时若两个旧键归到同一个新键（例如同一模型的两种拼写各自带了同一条
+/// 计费键），**保留已有的那条**、不互相覆盖：归属信息只增不减，先到者胜比
+/// 让 HashMap 迭代顺序决定谁活下来要可预期。真实数据里两者的归属本来就相同
+/// （都是 `zcode||?`），所以这一步在实际文件上是恒等的。
+fn fold_case_billing_meta(
+    map: &mut HashMap<String, Billing>,
+    canon: &HashMap<String, String>,
+) {
+    let items: Vec<(String, Billing)> = map.drain().collect();
+    for (k, v) in items {
+        let (name, rest) = match k.split_once('\u{0}') {
+            Some((m, r)) => (m.to_string(), r.to_string()),
+            None => (k.clone(), String::new()),
+        };
+        let name = canon
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or(name);
+        // ⚠ 分隔符用 `push` 拼而不是 `format!("...\u{0}...")`：`format!` 的
+        // 参数解析会先把 `{0}` 当成位置参数，`\u{0}` 转义在那里报
+        // `invalid character in unicode escape`。
+        let mut key = name;
+        key.push('\u{0}');
+        key.push_str(&rest);
+        map.entry(key).or_insert(v);
+    }
+}
+
+/// 装载时把历史上因大小写分裂的模型键**就地治愈**（2026-10-05）。
+///
+/// 只在 `load()` 里跑一次：此后 `record_billed_core` 的 [`model_key_of`] 保证
+/// 不会再产生新的分裂，下一次 `flush()` 就把合并结果落盘。
+///
+/// ⚠ 合并是**可加**的（日期桶逐日相加、记录数相加），因此不会丢用量 ——
+/// 两个拼写各自的用量都保留，只是从此归到同一行。
+fn merge_case_variants(inner: &mut Inner) {
+    let keys = all_model_keys(inner);
+    if keys.is_empty() {
+        return;
+    }
+    let canon = canonical_model_names(&inner.models, &keys);
+    if canon.is_empty() {
+        return;
+    }
+    fold_case_keys(&mut inner.models, &canon);
+    for by_model in inner.account_models.values_mut() {
+        fold_case_keys(by_model, &canon);
+    }
+    fold_case_keys3(&mut inner.billed, &canon);
+    fold_case_billing_meta(&mut inner.billing_meta, &canon);
 }
 
 /// 计费归属的稳定键。
@@ -939,7 +1191,20 @@ fn nested2<'a>(
 /// 是 1.7B / 4223 次，而同一模型的计费明细只有 3 次，因为计费归属此前只存在内存里，
 /// 网关一重启就清零。落盘只解决「今后」，已丢的归属靠这里回填。
 ///
-/// 依据是 uid 的**形态**本身带平台信息：
+/// # 判据的优先级：**先看计费键，再看 uid 形态**
+///
+/// 计费键本身就是按 `平台|区域|倍率` 造出来的（见 [`billing_key`]），所以键的
+/// 第一段**就是**那次请求的真实平台，比从 uid 形态反推可靠得多。
+///
+/// ★★★ 2026-10-05 修：这里原先**只用** uid 形态，而且是「一个 uid 命中了某模型，
+/// 就把该模型**所有**计费行都盖上这个 uid 的平台」。于是只要某模型被一个裸 UUID
+/// （= WorkBuddy）账号用过，它那些 `qoder||?` / `zcode||?` 的行会被一起写成
+/// `workbuddy`；而 `account_models` 是 `HashMap`，**哪个 uid 先被迭代到是不确定的**
+/// —— 实测同一个 `usage.json` 连起 4 次，`product` 的分布分别是
+/// 9/1、8/2、9/1、10/0（`workbuddy`/`zcode`），界面上那几行「· Qoder」「· ZCode」
+/// 会随网关重启变来变去。键前缀是**逐行**属性，改用它之后结果与迭代顺序无关。
+///
+/// 依据是 uid 的**形态**本身带平台信息（仅在键没有前缀时兜底）：
 /// - `zcode-xxxx` → `zcode`
 /// - `qoder-xxxx` → `qoder`
 /// - 裸 UUID → `workbuddy`（WorkBuddy 在 auth 层用**空串**表示产品，落进 usage
@@ -953,9 +1218,8 @@ fn backfill_billing(
     model_billing: &mut serde_json::Map<String, serde_json::Value>,
 ) {
     for (uid, by_model) in account_models {
-        let Some(product) = product_from_uid(uid) else {
-            continue;
-        };
+        // uid 形态只作兜底（键没有平台前缀时）。★ 不再拿它当主判据 —— 见函数文档。
+        let uid_product = product_from_uid(uid);
         for (model, series) in by_model {
             if sum_days(series, cutoff).is_empty() {
                 continue;
@@ -973,9 +1237,26 @@ fn backfill_billing(
                     .and_then(|v| v.as_str())
                     .map(|s| s.is_empty())
                     .unwrap_or(true);
-                if missing {
-                    obj.insert("product".into(), serde_json::json!(product));
+                if !missing {
+                    continue;
                 }
+                // ★★ 主判据：计费键的第一段就是那次请求的真实平台。
+                //    必须先把键拷成 owned，`obj` 下面还要可变借用。
+                let key = obj
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let from_key = key.split('|').next().unwrap_or_default();
+                let product = if from_key.is_empty() {
+                    match uid_product {
+                        Some(p) => p,
+                        None => continue,
+                    }
+                } else {
+                    from_key
+                };
+                obj.insert("product".into(), serde_json::json!(product));
             }
         }
     }
@@ -2952,5 +3233,395 @@ mod tests {
         let p = s.cycle_of("u1").expect("可推进的边界应收敛出结果");
         assert!(p.next_reset_ms > now, "未收敛到未来");
         assert!(p.known, "可推进时应报 known");
+    }
+
+    // ---------- 模型名大小写归一（2026-10-05 所有者现场） ----------
+
+    /// 所有者逐字：「一样的模型居然还分了两条记录」。他的截图里
+    /// `GLM-5.3-Flash · ZCode`（11.0M / 98 次）与 `glm-5.3-flash · ZCode`
+    /// （1.6K）并排两行 —— 其实是同一个模型。
+    ///
+    /// 这里复刻真实数据的形状：上游目录规范名 `GLM-5.3-Flash`（token 量大）
+    /// 与客户端发来的小写 `glm-5.3-flash`（次数略多）各记一份，治愈后必须
+    /// **只剩一行**，且留下的拼写与目录一致。
+    #[test]
+    fn load_heals_case_split_model_keys() {
+        let dir = std::env::temp_dir().join(format!("wbswg-casefold-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("usage.json");
+        let path_s = path.to_string_lossy().to_string();
+
+        // 手工写一份「分裂」的文件：正是所有者现场的形状。
+        let split = serde_json::json!({
+            "version": 1,
+            "days": { "2026-10-05": { "input": 300, "output": 10, "records": 2 } },
+            "models": {
+                // 目录拼写：输入大得多（21,278,353），但次数少（141）
+                "GLM-5.3-Flash": { "2026-10-05": { "input": 21_000_000, "output": 80_000, "records": 141 } },
+                // 客户端拼写：输入小（10,833,442），次数多（157）
+                "glm-5.3-flash": { "2026-10-05": { "input": 10_000_000, "output": 200_000, "records": 157 } }
+            },
+            "accounts": { "zcode-1b2941c020ef": { "2026-10-05": { "input": 300, "records": 2 } } },
+            "accountModels": {
+                "zcode-1b2941c020ef": {
+                    "GLM-5.3-Flash": { "2026-10-05": { "input": 200, "records": 94 } },
+                    "glm-5.3-flash": { "2026-10-05": { "input": 100, "records": 1 } }
+                }
+            },
+            "billed": {
+                "GLM-5.3-Flash": { "zcode||?": { "2026-10-05": { "input": 200, "records": 94 } } },
+                "glm-5.3-flash": { "zcode||?": { "2026-10-05": { "input": 100, "records": 1 } } }
+            },
+            "billingMeta": {
+                "GLM-5.3-Flash\u{0}zcode||?": { "product": "zcode", "region": "", "has_multiplier": false },
+                "glm-5.3-flash\u{0}zcode||?": { "product": "zcode", "region": "", "has_multiplier": false }
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&split).unwrap()).unwrap();
+
+        let s = Stats::new(&path_s);
+        let snap = s.snapshot(0);
+
+        // ① 只剩一行，且用的是目录拼写（token 量大者胜）。
+        let models = snap["models"].as_array().unwrap();
+        let keys: Vec<&str> = models.iter().filter_map(|m| m["key"].as_str()).collect();
+        assert_eq!(keys, vec!["GLM-5.3-Flash"], "两个拼写必须合并成一行：{keys:?}");
+        // ② 用量是**相加**的，不是丢弃其中一份。
+        assert_eq!(models[0]["input"], json!(31_000_000));
+        assert_eq!(models[0]["output"], json!(280_000));
+        assert_eq!(models[0]["records"], json!(298), "141 + 157");
+        // ③ accountModels 也并了（否则按账号收窄时又裂开）。
+        let am = &snap["accountModels"]["zcode-1b2941c020ef"];
+        assert_eq!(am.as_object().unwrap().len(), 1, "账号维度也必须只剩一个键");
+        assert_eq!(am["GLM-5.3-Flash"]["input"], json!(300));
+        assert_eq!(am["GLM-5.3-Flash"]["records"], json!(95), "94 + 1");
+        // ④ 计费表并了，且归属还在（billingMeta 的键改了名，快照里查得到）。
+        let mb = snap["modelBilling"]["GLM-5.3-Flash"].as_array().unwrap();
+        assert_eq!(mb.len(), 1);
+        assert_eq!(mb[0]["product"], json!("zcode"), "归一后仍要能查到归属");
+        assert_eq!(mb[0]["input"], json!(300));
+        // 旧拼写在计费表里必须消失。
+        assert!(snap["modelBilling"].get("glm-5.3-flash").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 治愈只在装载时做，且**不置 dirty** —— 只读打开面板的进程不得改写账本。
+    #[test]
+    fn load_heal_does_not_mark_dirty() {
+        let dir = std::env::temp_dir().join(format!("wbswg-healdirty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("usage.json");
+        let path_s = path.to_string_lossy().to_string();
+        let split = serde_json::json!({
+            "version": 1,
+            "models": {
+                "GLM-5.3-Flash": { "2026-10-05": { "input": 10, "records": 1 } },
+                "glm-5.3-flash": { "2026-10-05": { "input": 20, "records": 2 } }
+            }
+        });
+        let bytes = serde_json::to_vec(&split).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let s = Stats::new(&path_s);
+        s.flush(); // 没有 dirty 时应是 no-op
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(after, bytes, "装载治愈不得自行落盘（文件字节应原样不动）");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// ★★★ 回归（2026-10-05 补）：**写入路径**也必须查全部四张表，不能只看 `models`。
+    ///
+    /// 反例形状：文件里 `models` 根本没有该模型（只在 `accountModels` 里有旧拼写），
+    /// 此时若 `model_key_of` 只看 `models`，就会用本次传来的**新写法**落键 —— 而
+    /// 装载治愈只认 `accountModels` 里的旧写法，两边各写一份，同一个模型又裂开。
+    #[test]
+    fn record_key_lookup_covers_tables_missing_from_models() {
+        let mut inner = Inner::default();
+        inner.account_models.insert(
+            "u1".into(),
+            [("GLM-5.3-Flash".to_string(), HashMap::new())]
+                .into_iter()
+                .collect(),
+        );
+        // 只用「小写」写法写入：必须沿用它，而不是新造一个 `glm-5.3-flash`。
+        assert_eq!(model_key_of(&inner, "glm-5.3-flash"), "GLM-5.3-Flash");
+        // `billed` 里的键同样要认。
+        let mut inner2 = Inner::default();
+        inner2.billed.insert("GLM-5.3".into(), HashMap::new());
+        assert_eq!(model_key_of(&inner2, "glm-5.3"), "GLM-5.3");
+        // 四张表都没有时才用本次写法。
+        assert_eq!(model_key_of(&Inner::default(), "GLM-5.3"), "GLM-5.3");
+    }
+
+    /// 治愈后**不得**再残留任何大小写变体（用独立判据复核，防止新表被漏掉）。
+    #[test]
+    fn heal_leaves_no_leftover_case_variants() {
+        let mut inner = Inner::default();
+        inner.models.insert(
+            "GLM-5.3-Flash".into(),
+            HashMap::from([("d".into(), Counters { input: 9, records: 1, ..Default::default() })]),
+        );
+        inner.models.insert(
+            "glm-5.3-flash".into(),
+            HashMap::from([("d".into(), Counters { input: 1, records: 1, ..Default::default() })]),
+        );
+        inner.account_models.insert(
+            "u1".into(),
+            [("glm-5.3-flash".to_string(), HashMap::new())]
+                .into_iter()
+                .collect(),
+        );
+        inner.billed.insert("GLM-5.3-Flash".into(), HashMap::new());
+        inner.billing_meta.insert(
+            "glm-5.3-flash\u{0}zcode||?".into(),
+            Billing { product: "zcode".into(), ..Default::default() },
+        );
+        merge_case_variants(&mut inner);
+        assert!(
+            leftover_case_variants(&inner).is_empty(),
+            "合并后仍有大小写变体：{:?}",
+            leftover_case_variants(&inner)
+        );
+        assert_eq!(inner.models["GLM-5.3-Flash"]["d"].input, 10, "9 + 1");
+    }
+
+    /// `model_key_of`：沿用**已存在**的拼写，而不是把新记录写成另一种大小写。
+    #[test]
+    fn record_reuses_existing_case_spelling() {
+        let s = Stats::new("");
+        s.record_at("u1", "GLM-5.3-Flash", "2026-10-05", Counters { input: 100, ..Default::default() });
+        // 客户端发小写：必须并进上面那一行，不能新开一行。
+        s.record_at("u1", "glm-5.3-flash", "2026-10-05", Counters { input: 1, ..Default::default() });
+        s.record_at("u1", "GLM-5.3-FLASH", "2026-10-05", Counters { input: 2, ..Default::default() });
+        let snap = s.snapshot(0);
+        let models = snap["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1, "三种大小写必须归成一行");
+        assert_eq!(models[0]["key"], json!("GLM-5.3-Flash"), "沿用首次出现的拼写");
+        assert_eq!(models[0]["input"], json!(103));
+    }
+
+    /// 前缀 + 大小写同时出现（`zcode:glm-5.3-flash` 对 `GLM-5.3-Flash`）。
+    #[test]
+    fn bare_then_case_fold_compose() {
+        let s = Stats::new("");
+        s.record_at("u1", "GLM-5.3-Flash", "2026-10-05", Counters { input: 100, ..Default::default() });
+        s.record_at("u1", "zcode:glm-5.3-flash", "2026-10-05", Counters { input: 1, ..Default::default() });
+        let snap = s.snapshot(0);
+        let models = snap["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1, "先剥前缀、再折大小写");
+        assert_eq!(models[0]["key"], json!("GLM-5.3-Flash"));
+    }
+
+    /// 残缺文件：模型键只出现在 `accountModels` / `billingMeta` 里也要治。
+    #[test]
+    fn heal_covers_keys_missing_from_models() {
+        let mut inner = Inner::default();
+        inner.account_models.insert(
+            "u1".into(),
+            [
+                ("GLM-5.3-Flash".to_string(), HashMap::from([("d".to_string(), Counters { input: 5, ..Default::default() })])),
+                ("glm-5.3-flash".to_string(), HashMap::from([("d".to_string(), Counters { input: 7, ..Default::default() })])),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        inner.billing_meta.insert(
+            "glm-5.3-flash\u{0}zcode||?".to_string(),
+            Billing { product: "zcode".into(), ..Default::default() },
+        );
+        merge_case_variants(&mut inner);
+        let by_model = inner.account_models.get("u1").unwrap();
+        assert_eq!(by_model.len(), 1, "只出现在 accountModels 的键也要合并");
+        assert_eq!(by_model["GLM-5.3-Flash"]["d"].input, 12, "5 + 7");
+        assert!(
+            inner.billing_meta.contains_key("GLM-5.3-Flash\u{0}zcode||?"),
+            "billingMeta 的键必须跟着改名"
+        );
+    }
+
+    /// 大小写不同的模型**不得**被误并（`Auto` 与 `auto` 只差大小写但同属一个
+    /// 小写形态 —— 这是有意的：它们本来就该是一行）。真正要防的是「不同模型」
+    /// 被并：这里断言折叠只按大小写，不做任何模糊匹配。
+    #[test]
+    fn case_fold_is_not_fuzzy_matching() {
+        let s = Stats::new("");
+        s.record_at("u1", "glm-5.3-flash", "2026-10-05", Counters { input: 1, ..Default::default() });
+        s.record_at("u1", "glm-5.3", "2026-10-05", Counters { input: 2, ..Default::default() });
+        let snap = s.snapshot(0);
+        let models = snap["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2, "`-flash` 与不带 `-flash` 是两个模型，不能并");
+    }
+
+    /// ★★★ **所有者真机数据回归**（默认忽略；用环境变量指到他的账本才跑）。
+    ///
+    /// ```text
+    /// $env:WBSWG_REAL_USAGE = "C:\Users\<user>\.wb-switch\gateway\gateway_data\usage.json"
+    /// cargo test -p ai-gateway-router --lib usage::tests::heal_real_usage_file -- --ignored --nocapture
+    /// ```
+    ///
+    /// 为什么要有这一条：合成数据的形状是我猜的，而这一条直接吃**他的**文件。
+    /// 断言写法上刻意不硬编码数字（他的用量每天都在涨），而是「把原文件里所有
+    /// 只差大小写的键加起来」再比对治愈结果 —— 这样断言既严格又不会明天就红。
+    #[test]
+    #[ignore = "需要 WBSWG_REAL_USAGE 指向真实 usage.json"]
+    fn heal_real_usage_file() {
+        let Ok(src) = std::env::var("WBSWG_REAL_USAGE") else {
+            return;
+        };
+        let raw = std::fs::read(&src).expect("读取真实 usage.json");
+        let before: serde_json::Value = serde_json::from_slice(&raw).expect("解析真实 usage.json");
+
+        // ① 先算出「按大小写折叠后，每个小写形态的合计」。
+        let mut want: HashMap<String, (i64, i64, i64)> = HashMap::new();
+        for (k, series) in before["models"].as_object().expect("models 必须是对象") {
+            let mut t = (0i64, 0i64, 0i64);
+            for c in series.as_object().unwrap().values() {
+                t.0 += c["input"].as_i64().unwrap_or(0);
+                t.1 += c["output"].as_i64().unwrap_or(0);
+                t.2 += c["records"].as_i64().unwrap_or(0);
+            }
+            let e = want.entry(k.to_ascii_lowercase()).or_default();
+            e.0 += t.0;
+            e.1 += t.1;
+            e.2 += t.2;
+        }
+        let split_before = want.len();
+        let raw_keys = before["models"].as_object().unwrap().len();
+        println!("原文件模型键 {raw_keys} 个 → 折叠后 {split_before} 个");
+
+        // ② 走真实装载路径（`Stats::new` 会 `load()`）。
+        let s = Stats::new(src.clone());
+        let snap = s.snapshot(0);
+        let models = snap["models"].as_array().unwrap();
+
+        // ③ 每个小写形态恰好一行。
+        assert_eq!(
+            models.len(),
+            split_before,
+            "治愈后模型行数应等于折叠后的形态数：{:?}",
+            models.iter().map(|m| m["key"].clone()).collect::<Vec<_>>()
+        );
+        // ④ 逐行核对：合计必须与手工折叠完全一致（不丢、不重）。
+        for m in models {
+            let key = m["key"].as_str().unwrap();
+            let (i, o, r) = want[key.to_ascii_lowercase().as_str()];
+            assert_eq!(m["input"].as_i64().unwrap(), i, "{key} 输入量对不上");
+            assert_eq!(m["output"].as_i64().unwrap(), o, "{key} 输出量对不上");
+            assert_eq!(m["records"].as_i64().unwrap(), r, "{key} 记录数对不上");
+        }
+        // ⑤ `modelBilling` 里不得再有两个只差大小写的键。
+        if let Some(mb) = snap["modelBilling"].as_object() {
+            let mut seen: HashMap<String, String> = HashMap::new();
+            for k in mb.keys() {
+                if let Some(prev) = seen.insert(k.to_ascii_lowercase(), k.clone()) {
+                    panic!("modelBilling 仍有大小写分裂：{prev} / {k}");
+                }
+            }
+        }
+        // ⑥ 原文件必须**没被改写**（装载不得落盘）。
+        assert_eq!(std::fs::read(&src).unwrap(), raw, "装载治愈不得改写原文件");
+    }
+
+    // ---------- 计费归属回填：键前缀优先（2026-10-05 真机现场） ----------
+
+    /// ★★★ 回填的判据必须是**计费键的第一段**，不能是「某个用过该模型的 uid 的形态」。
+    ///
+    /// 现场（pkg1027 真机）：`GLM-5.3` 的两行标签在界面上是「· WorkBuddy」，而它们的
+    /// 计费键明明是 `zcode||?` 与 `qoder||?`。根因是 `billing_meta` 里那两条的
+    /// `product` 是空串（早期记录），回填时被「该模型有裸 UUID 账号用过 ⇒ 算 workbuddy」
+    /// 覆盖；而 `account_models` 是 HashMap，谁先迭代到**不确定** —— 实测同一份文件
+    /// 连起 4 次，`product` 分布是 9/1、8/2、9/1、10/0。
+    ///
+    /// 这里把两种账号都放进 `account_models`，并让裸 UUID **先**出现：修好后结果
+    /// 与迭代顺序无关，且必须由键前缀决定。
+    #[test]
+    fn backfill_prefers_billing_key_over_uid_shape() {
+        let dir = std::env::temp_dir().join(format!("wbswg-backfill-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("usage.json");
+        let path_s = path.to_string_lossy().to_string();
+
+        // 手工造文件：`m` 有两条计费行（zcode / qoder），meta 的 product 都是空串；
+        // 而 `accountModels` 里既有裸 UUID（WorkBuddy）又有 zcode- 账号。
+        let file = serde_json::json!({
+            "version": 1,
+            "models": { "m": { "2026-10-05": { "input": 30, "records": 2 } } },
+            "accountModels": {
+                // ★ 裸 UUID 放前面：旧实现在 HashMap 迭代顺序下会先命中它。
+                "019f1772-4976-7393-b4d4-b93ab04b7fe7": { "m": { "2026-10-05": { "input": 20, "records": 1 } } },
+                "zcode-1b2941c020ef": { "m": { "2026-10-05": { "input": 10, "records": 1 } } },
+            },
+            "billed": {
+                "m": {
+                    "zcode||?": { "2026-10-05": { "input": 10, "records": 1 } },
+                    "qoder||?": { "2026-10-05": { "input": 20, "records": 1 } },
+                },
+            },
+            "billingMeta": {
+                "m\u{0}zcode||?": { "product": "", "region": "", "has_multiplier": false },
+                "m\u{0}qoder||?": { "product": "", "region": "", "has_multiplier": false },
+            },
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+
+        let s = Stats::new(&path_s);
+        let snap = s.snapshot(0);
+        let groups = snap["modelBilling"]["m"].as_array().unwrap();
+        let mut got: Vec<(String, String)> = groups
+            .iter()
+            .map(|g| {
+                (
+                    g["key"].as_str().unwrap().to_string(),
+                    g["product"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("qoder||?".to_string(), "qoder".to_string()),
+                ("zcode||?".to_string(), "zcode".to_string()),
+            ],
+            "回填必须由计费键前缀决定，而不是由某个用过该模型的 uid 形态决定"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 键**没有**平台前缀（空串）时，仍按 uid 形态兜底 —— 回填不能因此失效。
+    #[test]
+    fn backfill_falls_back_to_uid_shape_when_key_has_no_product() {
+        let dir = std::env::temp_dir().join(format!("wbswg-backfill-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("usage.json");
+        let path_s = path.to_string_lossy().to_string();
+
+        let file = serde_json::json!({
+            "version": 1,
+            "models": { "m": { "2026-10-05": { "input": 10, "records": 1 } } },
+            "accountModels": {
+                "zcode-1b2941c020ef": { "m": { "2026-10-05": { "input": 10, "records": 1 } } },
+            },
+            // 键的第一段是空串（老数据 / 平台未声明的调用点）。
+            "billed": { "m": { "||?": { "2026-10-05": { "input": 10, "records": 1 } } } },
+            "billingMeta": {
+                "m\u{0}||?": { "product": "", "region": "", "has_multiplier": false },
+            },
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+
+        let s = Stats::new(&path_s);
+        let snap = s.snapshot(0);
+        let groups = snap["modelBilling"]["m"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0]["product"],
+            serde_json::json!("zcode"),
+            "键没有平台前缀时仍应按 uid 形态兜底"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
