@@ -1,6 +1,6 @@
 # WorkBuddy Switch / AI Gateway — 项目状态与后续工作
 
-> 最后更新：2026-10-04（**1.0.20**：①–⑩ 全量修复 —— 含 ⑨ Trae 是否已签到看不见、⑩ 启动期卡顿 / Trae 官方 icon）
+> 最后更新：2026-10-06（**1.0.28**：⑯ 流中途上游错误帧识别 / 记日志 / 计入账号健康度 + ⑰ 用量统计模型名大小写折叠）
 > 本文件是**接手用**的持久状态说明，不随会话消失。
 
 ---
@@ -18,13 +18,13 @@
 | Go 参照实现 | `go-gateway/` | Go（**保留作对照，构建链已不依赖**） |
 
 - git 根 = `wt-port\`，分支 `migrate/aigw-v1.0.2`
-- 当前版本号 **1.0.20**（`tauri.conf.json` / `package.json` / `Cargo.toml` / `npm/` 五个平台包已对齐；签名安装包已产出并解包核验）
-  - 上一个已发布版本 **1.0.19**（已被业主安装：`HKCU:\...\Uninstall\AI Gateway` ⇒ `DisplayVersion=1.0.19`、`InstallLocation=D:\APP\AI Gateway`）
+- 当前版本号 **1.0.28**（`tauri.conf.json` / `package.json` / `Cargo.toml` / `Cargo.lock` 已对齐；签名安装包已产出、解包核验、真机实测）
+  - 业主**实机安装的是 1.0.21**（`HKCU:\...\Uninstall\AI Gateway` ⇒ `InstallLocation=D:\APP\AI Gateway`，主程序 39,173,120 B）；1.0.22–1.0.28 **均未安装**，直接装 1.0.28 即可
   - ★ NSIS 同版本**不覆盖**（`installer.nsi:233-259` 用 `nsis_tauri_utils::SemverCompare` 比 `DisplayVersion`，相等走维护页）⇒ 升版本号是交付的硬前提
 
 ---
 
-## 二、当前进展（2026-10-04）
+## 二、当前进展（2026-10-06）
 
 ### 已完成的四组重点
 
@@ -51,9 +51,34 @@
 | ⑨ Trae 卡片官方 icon（⑩-1） | 两张官方 PNG + `product-marks.tsx:144-163 TraeMark(variant)` | ✅ 交付包前端渲染 5 张 trae 图，全部 512×512、`size-full object-cover` |
 | ⑩ 启动期卡顿（⑩-2，m13819 + m14110） | 前端限流 4 并发 + `/api/credits/batch` + `warm_caches()` + `CHECKIN_STATUS_CONCURRENCY=6` | ✅ A/B：API **167 ⇒ 45**、最慢 **27,412 ms ⇒ 2,717 ms**、longtask **0** |
 
+### 1.0.21 → 1.0.28（2026-10-04 → 10-06，业主逐条上报，全部真机实测后交付）
+
+| 版本 | 内容 | 状态 |
+|---|---|---|
+| **1.0.21** | 平台路由开关并入标签（②）+ 账号卡片统一任务区（③）+ 首启静默修复（①） | ✅ 真机 PASS（业主实机装的**就是这一版**） |
+| **1.0.22** | 设置页各平台配置拆到对应 tab（⑤）+ 积分/Token 并入 WorkBuddy tab（④） | ✅ 真机 PASS |
+| **1.0.23** | ZCode 1113 误判硬冷却（⑪）+ 流式中断归因（⑫）+ 跨账号任务队列漏跑（⑬）+ ⑦ 消耗记录恢复（20 天 / 15.3 万条） | ✅ 真机 PASS |
+| **1.0.24** | 启动卡顿（⑩b）：预热窗口改走 `/blank` + 验证码池预热闸门 | ✅ 真机 PASS |
+| **1.0.25** | 页面切换保持状态缓存（⑥）：ErrorBoundary key 改 resetKey + 三级视图入 URL | ✅ 真机 PASS |
+| **1.0.26** | 平台面板互斥显示（★ 真产品缺陷：`present = forceMount || isSelected` ⇒ 非选中面板永不 `hidden`）+ 豆包单账号任务区 + 网关换新护栏 | ✅ 真机 PASS |
+| **1.0.27** | ⑰ 用量统计模型名**大小写折叠**（写入口径 `model_key_of` + 载入自愈 `merge_case_variants`）+ 计费行平台归属按计费键回填（`backfill_billing` 旧口径按 uid 形状猜，重启后分布会漂） | ✅ 真机 23/23 PASS |
+| **1.0.28** | ⑯ 流中途上游错误帧识别 / 记日志 / 计入账号健康度（`note_upstream_stream_error`）+ 空 product 归一化成 `workbuddy` | ✅ 真机 43/0（抓包）+ 50/0（GUI）+ 24/0（用量页） |
+
 ### 交付物
 
 ```
+dist\AI Gateway_1.0.28_x64-setup.exe   14,573,805 B   （当前交付版）
+SHA256 1EAC0F3D401A8797086DE3D45D2B47E43303D65CD5EC88CDDBB02CDFBD9822CA
+  .sig  424 B  SHA256 C4F88F8173B66C5112E82F3422849B756B0658F417872D989EDFEA1543ECCA18  keyid 7e7ce64b6fc3a36f
+内嵌网关 13,629,440 B  SHA256 99AA2D33C7FF834BB1DC9B496A1306D474738FD92E14A0559BF7ECF0EC8981B6
+宿主 GUI 40,380,928 B  SHA256 C86353257E725C88EE79674A2D1DE82B8051C2F755BBE94E78AD9F40D6D5B189
+（已 7-Zip 独立解包 + 从包内 GUI exe raw-inflate 出网关并与 embedded/gateway.exe 逐字节比对通过）
+
+历史（1.0.27）：
+dist\AI Gateway_1.0.27_x64-setup.exe   14,557,116 B
+SHA256 A5DB6F5C69DE5673E6A3A47D41535F90C94010FC4B57443E9E028FCF67F46098
+
+历史（1.0.20）：
 dist\AI Gateway_1.0.20_x64-setup.exe   14,406,438 B   （2026-10-04 02:50:31 UTC）
 SHA256 691454CB0096A9116D7FBC963C1ED6874C0A4FD964C01C263EA2E2AD0E2A1DD6
   .sig  424 B  SHA256 F307273CCAFFE6D53037602CFE2C1A2104977B2A6E0E442B9F3E8B324B77DD22  keyid 7e7ce64b6fc3a36f
@@ -73,10 +98,11 @@ SHA256 8331371362744B4A22D86F7E8C8974AEB33F7B77EC896BD39C0D4DF767701662
   SHA256 4CBF382F925D9FD40F905707E313141BBA580A28E20FEB09464272A3C152F10A
 ```
 
-★ 权威文档：
-- 发布说明 `.github\RELEASE_NOTES_1.0.20.md`
-- 交付汇总 **`test-bin\DELIVERY-1.0.20.md`**（701 行，含全部实测数字与「仍未验证面」）
-- 历史：`.github\RELEASE_NOTES_1.0.17.md` / `test-bin\DELIVERY-1.0.17.md`
+★ 权威文档（**最新版优先**）：
+- 交付汇总 **`test-bin\DELIVERY-1.0.28.md`**（八节，含全部实测数字、构建链、安装提示）
+- 发布说明 `.github\RELEASE_NOTES_1.0.28.md`
+- 历史：`DELIVERY-1.0.27.md` / `-1.0.26` / `-1.0.25` / `-1.0.24` / `-1.0.23` / `-1.0.21` / `-1.0.20`
+- ★ 1.0.28 的 **router crate 版本串仍是 v1.0.23**（刻意与 GUI 版本号解耦，不影响功能）
 
 ★ 注：Rust release 构建**不确定**（同一份源码两次构建 SHA256 不同，实测确认）
 ⇒ 网关指纹**只在同一次构建链内可比**，跨次构建不能按哈希比对。
@@ -87,21 +113,21 @@ SHA256 8331371362744B4A22D86F7E8C8974AEB33F7B77EC896BD39C0D4DF767701662
 
 | 命令 | 基线 |
 |---|---|
-| `cargo test -p ai-gateway-router --lib --offline` | **1633 passed / 0 failed**（1.0.20；11133 后是 1603） |
-| `cargo test -p ai-gateway-core --lib --offline` | **1235 passed / 0 failed / 4 ignored**（58.59 s）（1.0.17 时是 1212 / 133.82 s） |
-| `cargo test -p ai-gateway-server --offline` | **28 passed / 0 failed** |
-| `cargo test --workspace --offline`（15 个 test 块累加） | **2943 passed / 0 failed / 5 ignored / 0 errors**（1.0.20，`test-bin\workspace-test-1020.log`，EXIT=0；1.0.17 时是 2882） |
+| `cargo test -p ai-gateway-router` | **1667 passed / 0 failed / 1 ignored**（1.0.28，`uitest\ut-16c.log`；1.0.20 时是 1633） |
+| `cargo test --workspace`（15 个 test 块累加） | **3006 passed / 0 failed / 6 ignored**（1.0.28，`uitest\ws-test-16b.log`，EXIT=0；1.0.27 是 3001、1.0.26 是 2988、1.0.23 是 2984） |
 | Trae 相关（`products::trae::` 128 + `modules::trae_agent::` 38 + `modules::trae_account::` 22） | **188 passed** |
-| `cargo test --workspace --lib --offline`（1.0.14 时的旧口径） | 2619 passed / 0 failed |
-| `cargo check -p ai-gateway-router --lib --offline` | EXIT 0，**0 warnings** |
-| `cargo check -p ai-gateway-router --bin gateway --offline` | EXIT 0，**0 warnings** |
-| `cargo check --workspace --all-targets --profile test --offline` | EXIT 0 |
+| `cargo test -p ai-gateway-core --lib` | **1235 passed / 0 failed / 4 ignored**（1.0.17 口径，尚未在新版重跑） |
+| `cargo test -p ai-gateway-server` | **28 passed / 0 failed**（1.0.20 口径） |
+| `cargo check -p ai-gateway-router --lib` | EXIT 0，**0 warnings** |
+| `cargo check -p ai-gateway-router --bin gateway` | EXIT 0，**0 warnings** |
+| `cargo check --workspace --all-targets --profile test` | EXIT 0 |
 
 ★ `cargo` 不在默认 PATH：
 ```powershell
 $env:PATH = "C:\Users\iuuuuuuuu\.cargo\bin;$env:PATH"
 ```
-★ crates.io 不可达 ⇒ 所有 cargo 命令加 `--offline`。
+★ ★★★ **绝对不许加 `--offline`**（2026-10-05 作废旧说法）：本机 cargo 的 registry 缓存是**空的**，加 `--offline` 会直接 `error: no matching package named 'aes' found`。
+`wt-port\.cargo\config.toml` 已配 `sparse+https://rsproxy.cn/index/` 源，**联网正常构建**即可。
 
 ---
 
@@ -164,6 +190,32 @@ bin 只调用它。范例：`products/product_tasks.rs`、`products/qoder/billin
   还会触发网关重启（我踩过一次：把所有者 `:7864` 的 pid 从 24900 换成了 42576）。
   正确做法：独立目录 + `serve --port 5799x --no-open`，并验证目录里**只有日志与 exe**。
 
+### 7. ★★★ 真机断言脚本自身的两个缺陷（2026-10-06，都伪装成「产品缺陷」）
+
+**(a) CDP 注入落进 `about:blank` 上下文（竞态）**
+Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导航**到 `http://tauri.localhost/`。
+`Runtime.evaluate` 落在**当时**的默认执行上下文，而导航会触发 `Runtime.executionContextsCleared`，
+把旧上下文连同注入的 `window.__vc` / `window.__g10` 一起丢弃 ⇒ 注入「成功」（返回 `VC_OK`）却永远读不到，
+表现为「一整排断言全红、全都是 helper undefined」。
+**修法**（`uitest\verify-usage-casefold.cjs` / `verify-hub-real.cjs`）：
+① 注入前 `Page.addScriptToEvaluateOnNewDocument({source: HELPER})`；
+② 等上下文稳定（`location.href` 含 `tauri.localhost` 且连续两次相同，上限 30 s）；
+③ 注入后带重试（≤15 × 200 ms）直到 `typeof window.__vc === 'object'`；
+④ **必须为「注入本身」加一条断言**（否则注入失败会被后续断言掩盖成产品缺陷）。
+
+**(b) 期望值写死成日历常量**
+`verify-hub-real.cjs` 原来写 `const expectMap = { 'trae-checkin': 'done', 'zcode-warm': 'done', … }`。
+`trae-checkin` 只在「今天已经签过到」时是 `done` —— 跨过午夜、或换一个今天还没签到的实例，
+这条断言必然变红，而产品渲染完全正确（`TraePage.tsx:175-201`：`success`/`already`/`checked_in` ⇒ `done`；
+`skip` ⇒ `blocked`；`not_checked_in`/`fail`/缺键 ⇒ `ready`）。历史那几次 50/50 PASS 只是恰好跑在「今日已签」那天。
+`zcode-warm` 同样是日历相关的（`ZcodePage.tsx:202-238` 的 7 天窗口），只是窗口长、暂时不会红。
+**规矩：真机断言的期望值一律从真机数据推，不许写死。**
+做法：`trae-checkin` 读 `trae_checkin_results.json` 的**今日**条目（本机时区，与 `trae_checkin_results.rs:26 today_key()` 同口径）；
+`zcode-warm` 读 `zcode\accounts.json` 的 `warmedAt` 是否落在 7 天窗口内；`trae-credits-snapshot` 产品恒为 `ready`。
+数据读不到、或同一平台多账号推导结果不一致 ⇒ 返回 `null` ⇒ **不断言**（宁可少一条，也不产生假 FAIL）；
+并且**惰性求值**（断言那一刻才读盘），避免宿主 `refresh_today()` 期间改写当天状态造成假红。
+（探针的 `AI_GATEWAY_HOME` 来自 `gate-hub-real.ps1` 里的 `$env:`，会随子进程继承到 Node。）
+
 ---
 
 ## 五、已知未验证面（如实记录）
@@ -193,7 +245,7 @@ bin 只调用它。范例：`products/product_tasks.rs`、`products/qoder/billin
   而主程序 `ai-gateway.exe` 与所有者正在跑的实例同名，会连带打掉 `:7864`
 - **绝不按进程名杀进程** —— 只允许 **PID + ExecutablePath 双条件**
 - **绝不运行**共享目录里的可执行文件（**哪怕 `--version`**）
-- **绝不 commit / push / 提 PR**，除非所有者明确要求
+- **绝不 push / 绝不提 PR**（三个 remote `aigw` / `fork` / `origin` 一个都不许碰）；**本地 commit 允许且鼓励**，每完成一个可交付单元就落一次 commit，消息用 `git commit -F <临时文件>`（PS 命令行多 `-m` + 中文会被拆词）
 - 所有者服务 `:7864`（网关）/ `:3080`（DSH GUI）**必须保持在线**
 - 公开仓库 ⇒ 被 git 跟踪的文件里**不得有真实 token / UID / deviceMid**
 - 改完**必须自己跑实测**（真实启动实例 + 真实发请求），编译通过/单测绿都**不算**
