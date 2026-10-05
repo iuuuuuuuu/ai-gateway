@@ -241,6 +241,20 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 并且**惰性求值**（断言那一刻才读盘），避免宿主 `refresh_today()` 期间改写当天状态造成假红。
 （探针的 `AI_GATEWAY_HOME` 来自 `gate-hub-real.ps1` 里的 `$env:`，会随子进程继承到 Node。）
 
+### 9. ★★ 卡死类缺陷的可复现判别式 = WebView2 的 `Target.targetCrashed` 计数（2026-10-06 定案）
+
+「界面卡死但网关正常」这类问题**不能用「响应/不响应」当指标**：主窗口是否卡住取决于崩溃时刻是否撞上探针的 1500ms 超时线，
+同一装置在首轮命中、后两轮不命中（`uitest/ab-freeze-rep.log` REP 2/3 命中，REP 1 未命中）。**稳定可重复的指标是 CDP 事件流里的 `Target.targetCrashed` 计数**：
+1.0.21 臂三轮**每轮恰好 1 次**（预热窗口导航到死地址后 1.80 / 1.82 / 1.98 秒），1.0.29 臂三轮**全 0**。
+复现命令（回归可复用）：
+```powershell
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File uitest\ab-freeze-rep.ps1 -Reps 3 -Secs 150 *>&1 | Out-File -Encoding utf8 uitest\ab-freeze-rep.log
+& 'C:\Users\iuuuuuuuu\.nvmd\versions\26.0.0\node.exe' uitest\ab-analyze.cjs
+```
+`uitest/ab-analyze.cjs` 逐轮打印 samples / maxRt / TIMEOUT / FREEZE / crashes / 崩溃 target 的 URL 轨迹 / 预热窗口 URL。
+★ 装置要点：两臂二进制都取自各自**正式安装包**，只用 `uitest/patch-identifier.cjs` 改 identifier 区间（⇒ 两臂都是全新 WebView2 profile，排除「profile 已预热」）；
+`Clear-Arm` 只按 `.Path -like '*iso-owner-1021*'` 杀进程（绝不按进程名）。
+
 ---
 
 ## 五、已知未验证面（如实记录）
