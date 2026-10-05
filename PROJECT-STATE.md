@@ -162,6 +162,7 @@ $env:PATH = "C:\Users\iuuuuuuuu\.cargo\bin;$env:PATH"
 所以**绝不要**直接运行共享目录里的可执行文件（哪怕只是读版本号）；
 要跑就先 `Copy-Item` 到自己的目录。
 
+★ 2026-10-05 更正：业主的网关进程名现在是 `gateway-4e52fa-ecd7924c953073e8.exe`（13,607,424 B，1.0.21 血统），旧记的 `gateway-4e8a56-9affe6e7f02852f9.exe` 已不在运行。
 ★ 2026-10-04 修正一条旧说法：**NSIS 模板确实会按进程名杀**。`installer.nsi:641` 与 `:768` 两处 `!insertmacro CheckIfAppIsRunning "ai-gateway.exe" "AI Gateway"`，
 宏体在 `target\release\nsis\x64\utils.nsh`，内部走 `nsis_tauri_utils::FindProcessCurrentUser` + `KillProcessCurrentUser`（**按可执行文件名**）。
 所以「安装前先退出桌面版」是必须的提醒，而且这也**再次确认了「绝不运行安装包」这条规矩**。
@@ -190,7 +191,23 @@ bin 只调用它。范例：`products/product_tasks.rs`、`products/qoder/billin
   还会触发网关重启（我踩过一次：把所有者 `:7864` 的 pid 从 24900 换成了 42576）。
   正确做法：独立目录 + `serve --port 5799x --no-open`，并验证目录里**只有日志与 exe**。
 
-### 7. ★★★ 真机断言脚本自身的两个缺陷（2026-10-06，都伪装成「产品缺陷」）
+### 7. `gateway_embed` 的「FNV-1a」用的是写错一位的质数（只影响文件名，不是缺陷）
+`crates/ai-gateway-core/src/modules/gateway_embed.rs:52 fn fingerprint(data: &[u8]) -> String` 逐字：
+```rust
+let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+for b in data { hash ^= *b as u64; hash = hash.wrapping_mul(0x1000_0000_01b3); }
+format!("{:x}-{:x}", data.len(), hash)
+```
+标准 FNV-1a 64 位质数是 `0x100000001b3`，源码里是 **`0x1000_0000_01b3`（多一个 0）**。
+⇒ 落地文件名是 `gateway-<hex(gzip载荷长度)>-<hex(该变体质数哈希)>.exe`。
+★ **长度段是 gzip 载荷长度，不是解压后的 exe 长度**：1.0.28 真机文件名 `gateway-4eaf37-29d0aea8025e7f09.exe`，
+`0x4eaf37` = 5,156,663（宿主 exe 偏移 25237210 起的 gzip 载荷），而解压后的 exe 是 13,629,440 字节（`0xcff1a0`）。
+我用 node BigInt 复算证明：变体质数 ⇒ `29d0aea8025e7f09`（命中），标准质数 ⇒ `a8419ca8025e7f09`（不命中）。
+影响：指纹只用于缓存文件名与 `cleanup_old()` 的保留判定（`:80` / `:117`），仍然稳定且对内容敏感 ⇒
+**不修**（改质数会让所有用户的落地文件名变化、触发一次无谓重写）。
+写断言脚本时**照源码口径复算**，别自作主张用解压后长度（我因此在 `uitest\verify-1028-deployed-gw.cjs` 上吃过一次假红）。
+
+### 8. ★★★ 真机断言脚本自身的两个缺陷（2026-10-06，都伪装成「产品缺陷」）
 
 **(a) CDP 注入落进 `about:blank` 上下文（竞态）**
 Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导航**到 `http://tauri.localhost/`。
@@ -236,6 +253,7 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 | `ai-gateway-server` 启动横幅版本串 | ⚠ 仍打印 `ai-gateway v1.0.19`（该 crate 自己的版本常量没跟升），**不影响功能**，已写进交付说明第四节 |
 | ⑯ 的日志行**在业主实机可见** | ⚠ 要等 1.0.28 装上。业主那台是 1.0.21 血统，`start_gateway` 那时还把子进程 stdout/stderr 丢进 `Stdio::null()`（重定向是 1.0.26 `bceedf5` 才加的），所以 `.wb-switch\gateway\gateway_data\` 里**没有** `gateway.log` 是预期行为，不是缺陷。已在 1.0.28 隔离实例上验证：包内宿主解出的网关 13,629,440 B / `99AA2D33…`，`gateway_data\gateway.log` 112,615 B / 837 行 |
 | ⑯ 的**最终二进制**真机终验 | ✅ 已做（2026-10-06）：三轮 q16 抓包 `pass=43 fail=0`（`uitest\q16-verify2.log`，与 `uitest\verify-q16.log` 逐字节一致） |
+| **交付包自证**：真机上解出的网关 == 工作区产物 | ✅ 已做（2026-10-06）：`uitest\verify-1028-deployed-gw.cjs` **5/5 PASS**。1.0.28 隔离实例里宿主自己写下的 `home\gateway\bin\gateway-4eaf37-29d0aea8025e7f09.exe` 13,629,440 B / `99AA2D33…` 与 `wt-port\target\release\gateway.exe`、`crates\ai-gateway-core\embedded\gateway.exe` **三者逐字节相同**；落地文件名亦按 `gateway_embed.rs:52` 口径复算命中（见四·7） |
 | 11133 修复的**覆盖边界** | ⚠ `prepare_body` 只覆盖默认上游（workbuddy/cmb 族）与 Qoder；**Trae / ZCode 各有独立适配器、不经此处**。Trae 已在源头修掉；**ZCode 侧未修**（`products/zcode/translate.rs:157` 同样 `unwrap_or("")`），但其上游是 Anthropic 形状（不回 11133）、池里只有 2 个模型、会话里无 ZCode 流量 ⇒ 已知残余风险 |
 
 ---
