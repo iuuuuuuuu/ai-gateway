@@ -1375,8 +1375,20 @@ pub async fn forward_chat(
         if !friendly.is_empty() {
             msg = friendly;
         } else if let Some(t) = &last_transport_err {
-            let _ = t;
-            msg = "无法连接上游（网络超时 / 连接被拒）：请检查本机网络或代理设置后重试".to_string();
+            // ★ 传输层的原文必须留给客户端（2026-10-05）：过去这里是 `let _ = t;`
+            // 把它整条丢掉，只给一句中文提示。结果是「网络类报错」全都长成一个样，
+            // 业主无法分辨到底是超时、连接被拒、DNS 失败还是 TLS 中断 —— 现场那次
+            // 「失败原因：Internal Network Failure」正是这类需要原文才能归因的报错。
+            // 中文提示仍然打头（可操作），原文附在后面（可归因）。
+            // ★ 必须过 client_safe_message 闸门：原文可能夹带上游响应体片段，
+            // 里面若出现裸 401/403 会被 DSH 判成 AUTH 而不再重试。
+            let detail = crate::clienttext::client_safe_message(t);
+            let detail = detail.trim();
+            msg = if detail.is_empty() {
+                "无法连接上游（网络超时 / 连接被拒）：请检查本机网络或代理设置后重试".to_string()
+            } else {
+                format!("无法连接上游（网络超时 / 连接被拒）：请检查本机网络或代理设置后重试（{detail}）")
+            };
         } else if let Some(e) = &last_err {
             msg = format!("{msg}: {e}");
         }

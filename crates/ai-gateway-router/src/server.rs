@@ -2751,6 +2751,143 @@ fn is_tail_block(text: &str) -> bool {
     text.ends_with("data: [DONE]\n\n")
 }
 
+/// 上游错误帧的日志/熔断判据里的 message 长度上限（超出截断，避免把整段上游
+/// JSON 灌进日志）。
+const UPSTREAM_ERROR_LOG_LIMIT: usize = 240;
+
+/// `SseFramesIter::finish`（`crate::upstream::sse`）在**空流**时补的那帧的文案。
+///
+/// 它长得和上游自己发的 error 帧一模一样（`{"error":{"message":…,"type":"upstream_error"}}`），
+/// 但它是**我们**合成的：纯空流的情形 `forward` 的首帧探测已经报过、并按同一套
+/// 503→上游故障策略罚过账号，这里必须排除，否则日志会指错人
+/// （写成「上游在流中下发」）并重复喂一次熔断。
+const EMPTY_UPSTREAM_STREAM_MSG: &str = "empty upstream stream";
+
+/// 从一帧（或若干帧拼成的文本）里提取「上游自己下发的错误」的说明文字。
+///
+/// ★★ 为什么必须单独有这个判据：`forward` 侧只在**首帧**上探测错误
+/// （`sse::probe_first_frame` + `is_upstream_error_frame`），流中段的 error 帧
+/// 从来没有人看过。而上游（尤其第三方中转）恰恰喜欢在 HTTP 200 的流中间发
+/// `data: {"error":{…}}` —— 见 `crate::upstream::sse` 的模块文档，`error` 帧是
+/// **唯一**被允许原样透传的例外。
+///
+/// 返回 `None` 表示这一帧不是错误帧（正常内容帧、注释行、`[DONE]` 收尾块都算）。
+/// 多帧同现时按出现顺序去重后用 `；` 连接。
+fn upstream_error_frame_message(text: &str) -> Option<String> {
+    let mut msgs: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (bad, msg) = crate::upstream::sse::is_upstream_error_frame(line);
+        if !bad {
+            continue;
+        }
+        // ★ 排除**我们自己**补的帧：截断收尾帧（`chat_stream_error_frame`）与空流
+        // 收尾帧（`SseFramesIter::finish`）都长得像上游 error 帧，把它们当成上游
+        // 发的错误会重复喂熔断，也会让日志指错人。
+        if msg.contains(UPSTREAM_TRUNCATED_MSG)
+            || msg.contains("upstream_stream_truncated")
+            || msg == EMPTY_UPSTREAM_STREAM_MSG
+        {
+            continue;
+        }
+        let msg = msg.trim().to_string();
+        if msg.is_empty() || msgs.iter().any(|m| *m == msg) {
+            continue;
+        }
+        msgs.push(msg);
+    }
+    if msgs.is_empty() {
+        return None;
+    }
+    let mut joined = msgs.join("；");
+    if joined.chars().count() > UPSTREAM_ERROR_LOG_LIMIT {
+        joined = joined.chars().take(UPSTREAM_ERROR_LOG_LIMIT).collect();
+        joined.push('…');
+    }
+    Some(joined)
+}
+
+/// 上游在**流中间**下发了错误帧时：记一条日志，并按「上游故障」给该账号喂一次熔断。
+///
+/// ★★ 这是 ⑯（业主现场「失败原因：Internal Network Failure」，2026-10-05）落下的
+/// 可观测入口。那条文案的真实来源已定案：上游 SSE 里发了
+/// `{"error":"Internal Network Failure"}`，OpenAI SDK 的
+/// `APIError.makeMessage(undefined, error, undefined)` 在 `error.message` 缺失时
+/// 走 `JSON.stringify(error)`，于是把该串（**带引号**）当成错误消息抛给 DSH。
+/// 我们过去既不记日志也不罚账号 —— 因为 `forward` 在拿到 200 响应头时就先
+/// `note_success` 并把响应交给这里了，流里发生什么它根本不知道。
+///
+/// ★ 与 `forward.rs` 首帧探测保持**同一套语义**：都按 503 分类
+/// （`classify(503, msg)` 落到 `ErrKind::Server` ⇒ `pool.note_error`），ZCode 额外
+/// 先过 `zcode::errors::classify` 认业务码 1113。绝不写 `until`/`reason`：
+/// 这是「上游坏了」，不是「账号被冷却」，界面上不能显示成账号问题。
+///
+/// 客户端可见的字节**不受影响**（调用方照旧原样透传这一帧），
+/// 所以这条路径对现有行为是零回归面。
+fn note_upstream_stream_error(
+    state: &Arc<AppState>,
+    uid: &str,
+    product: &str,
+    model: &str,
+    msg: &str,
+) {
+    eprintln!(
+        "chat uid={} product={} model={}: 上游在流中下发错误帧：{}（按 503 上游故障分类）",
+        uid,
+        product_label_for_log(product),
+        model,
+        msg
+    );
+    let kind = upstream_stream_error_kind(product, msg);
+    let mut pool = match state.pool.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    crate::forward::apply_error_policy(&mut pool, uid, model, kind, msg, state.soft_cooldown);
+}
+
+/// 日志里展示的产品名：空串归一成 `workbuddy`。
+///
+/// ★★ 为什么必须归一：池里的 `ChatResult::Stream.product` 对 WorkBuddy 是**空串**
+/// （见 `forward.rs` 的 `product: String` 文档「`""` = WorkBuddy」），而
+/// `record_usage`（本文件上方）与 `product_of()` 都把它当 `workbuddy`。照原样打日志
+/// 会得到 `product=` —— 真机抓包时这一行看起来像「产品字段丢了」，同一次请求在
+/// 用量统计里记的却是 `workbuddy`，两处口径不一致会让排查的人先怀疑数据错乱。
+fn product_label_for_log(product: &str) -> &str {
+    if product.is_empty() {
+        crate::auth::PRODUCT_WORKBUDDY
+    } else {
+        product
+    }
+}
+
+/// 上游流中错误帧该归成哪一类（[`note_upstream_stream_error`] 的分类部分，单独
+/// 抽出来是为了能被单测直接钉住，不必为了断言分类去构造整个 `AppState`）。
+///
+/// 固定按 `503` 送入分类器：能走到这里的错误帧，HTTP 状态**一定**是 200（否则
+/// 早就被 `forward` 的首帧探测拦下了），唯一可依据的信号就是这帧的文案，
+/// 而「上游在流中途报错」在语义上就是一次上游故障。
+///
+/// ZCode 多一层：它的业务码 1113（余额不足或无可用资源包）必须归
+/// `NoResourcePack`（只软冷却 + 封模型），**不能**当成账号额度耗尽 —— 见
+/// `products::zcode::errors` 的模块文档。
+fn upstream_stream_error_kind(
+    product: &str,
+    msg: &str,
+) -> crate::upstream::classify::ErrKind {
+    if product == crate::auth::PRODUCT_ZCODE {
+        match crate::products::zcode::errors::classify(503, msg) {
+            crate::products::zcode::errors::ErrKind::NoResourcePack => {
+                return crate::upstream::classify::ErrKind::NoResourcePack
+            }
+            _ => {}
+        }
+    }
+    crate::upstream::classify::classify(503, msg)
+}
+
 /// 把上游 SSE 响应包成 `text/event-stream`，逐帧规范化后流式透传。
 ///
 /// 空流（0 有效帧）时补一帧 error 与 `[DONE]`，与 Go 侧 `upstream.Stream` 一致。
@@ -2797,6 +2934,20 @@ fn chat_stream_response(
                                 }
                             }
                         }
+                    }
+                    // ★★ 上游在流中间下发 error 帧（HTTP 仍是 200，只是帧里带 error）：
+                    // 这是**唯一**能看见「上游自己报错」的地方 —— forward 侧的首帧探测
+                    // 只审第一帧，流中段的错误帧谁都不看，过去连一条日志都没有。
+                    // 业主现场（2026-10-05）「失败原因：Internal Network Failure」就是
+                    // 这么来的：上游 SSE 里发了 {"error":"Internal Network Failure"}，
+                    // OpenAI SDK 的 APIError.makeMessage(undefined, error, undefined) 在
+                    // error.message 缺失时走 JSON.stringify(error)，把它（带引号）当成
+                    // 错误消息抛给 DSH，DSH 原样显示。
+                    // 这里不改客户端可见的字节（下面照旧透传），只补两件事：
+                    //   ① eprintln 记一条，下次报障能直接从 gateway.log 读出真凶；
+                    //   ② 按「上游故障」给该账号喂一次熔断，而不是当成功记。
+                    if let Some(msg) = upstream_error_frame_message(&text) {
+                        note_upstream_stream_error(&state_ref, &uid, &product, &model, &msg);
                     }
                     // ★ 上游吐过内容却没按约定写 [DONE]：迭代器会替它补一帧
                     // [DONE] 保证客户端能收尾，但补出来的 [DONE] 会掩盖「回答被
@@ -4611,6 +4762,131 @@ mod chat_stream_error_tests {
         let err_at = body.find("upstream_stream_truncated").expect("error 帧丢了");
         let done_at = body.rfind("data: [DONE]").expect("缺少收尾");
         assert!(err_at < done_at, "error 帧必须排在 [DONE] 之前：{body}");
+    }
+
+    /// ★★★ 2026-10-05 业主现场（⑯）：「失败原因：Internal Network Failure」的真身。
+    ///
+    /// 上游在 HTTP 200 的流**中间**发 `data: {"error":"Internal Network Failure"}`。
+    /// 网关把它原样透传，OpenAI SDK 的 `APIError.makeMessage(undefined, error, undefined)`
+    /// 在 `error.message` 缺失时走 `JSON.stringify(error)`，于是 DSH 显示的是
+    /// **带引号**的 `"Internal Network Failure"`（引号是 JSON 序列化加上的，
+    /// 不是上游发的）。我们自己的判据只做识别与日志，保留上游原文（裸串）更好读。
+    /// 这条用例把「认出这帧」钉死：过去没有任何地方看得见它，也就无从归因。
+    #[test]
+    fn upstream_error_frame_is_recognized_in_mid_stream() {
+        // ① 上游 error 字段是**字符串**：这是 ⑯ 现场的形态。
+        //    判据返回上游原文（裸串）；DSH 看到的引号是 OpenAI SDK 的 JSON 序列化加的。
+        let line = "data: {\"error\":\"Internal Network Failure\"}\n\n";
+        assert_eq!(
+            upstream_error_frame_message(line).as_deref(),
+            Some("Internal Network Failure"),
+            "上游 error 字符串必须被认出来，且文本与上游逐字一致"
+        );
+        // ② 上游 error 字段是对象、带 message：ZCode 3007 / WorkBuddy 11128 的常见形态。
+        let line = "data: {\"error\":{\"code\":\"3012\",\"message\":\"unusual activity\"}}\n\n";
+        assert_eq!(
+            upstream_error_frame_message(line).as_deref(),
+            Some("unusual activity")
+        );
+        // ③ 一帧里同现两次（不同 message）⇒ 去重后按出现顺序用「；」连接。
+        let line = concat!(
+            "data: {\"error\":\"a\"}\n\n",
+            "data: {\"error\":\"b\"}\n\n",
+            "data: {\"error\":\"a\"}\n\n",
+        );
+        assert_eq!(upstream_error_frame_message(line).as_deref(), Some("a；b"));
+    }
+
+    /// 正常内容帧、注释行、`[DONE]` 收尾块都不能被误判成「上游报错」。
+    #[test]
+    fn normal_frames_are_not_upstream_errors() {
+        for ok in [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: [DONE]\n\n",
+            ": keep-alive\n\n",
+            "\n",
+        ] {
+            assert_eq!(upstream_error_frame_message(ok), None, "误判了正常帧：{ok:?}");
+        }
+    }
+
+    /// ★ 我们自己补的两帧**不算**上游错误：算的话会重复喂熔断、日志还会指错人。
+    #[test]
+    fn our_own_terminating_frames_are_not_counted_as_upstream_errors() {
+        // 截断收尾帧（chat_stream_error_frame 的产物）。
+        let ours = chat_stream_error_frame(UPSTREAM_TRUNCATED_MSG);
+        assert_eq!(upstream_error_frame_message(&ours), None, "{ours}");
+        // 空流收尾帧（SseFramesIter::finish 的产物）。
+        let empty = "data: {\"error\":{\"message\":\"empty upstream stream\",\"type\":\"upstream_error\"}}\n\ndata: [DONE]\n\n";
+        assert_eq!(upstream_error_frame_message(empty), None, "{empty}");
+    }
+
+    /// ★★ 分类必须落成「上游故障」（`ErrKind::Server` ⇒ `pool.note_error`），
+    /// **绝不能**落成额度/冷却类：那会把「上游坏了」显示成「账号被冷却」。
+    ///
+    /// 这条也顺手钉死 ⑯ 现场那串：它既不含任何额度关键词，也不含 1113，
+    /// 所以归 `Server`，与 `forward` 首帧探测的语义一致（同样按 503 分类）。
+    #[test]
+    fn upstream_error_frames_classify_as_upstream_fault() {
+        use crate::upstream::classify::ErrKind;
+        let z = crate::auth::PRODUCT_ZCODE;
+        for msg in [
+            "Internal Network Failure",
+            "unusual activity",
+            "upstream 502",
+            "code=10605",
+        ] {
+            assert_eq!(
+                upstream_stream_error_kind(z, msg),
+                ErrKind::Server,
+                "{msg:?} 必须归上游故障（否则界面会显示成账号冷却）"
+            );
+        }
+        // ZCode 业务码 1113：只软冷却 + 封模型，不能当成账号额度耗尽。
+        let body = "{\"error\":{\"code\":\"1113\",\"message\":\"余额不足或无可用资源包,请充值。\"}}";
+        assert_eq!(
+            upstream_stream_error_kind(z, body),
+            ErrKind::NoResourcePack,
+            "1113 必须走 NoResourcePack（软冷却 + 只封模型）"
+        );
+        assert_ne!(upstream_stream_error_kind(z, body), ErrKind::HardCredit);
+        // ★ ZCode 那一层**不是**摆设：只有业务码、没有中文文案的 1113，通用分类器
+        //   认不出来（它的 1113 判据带 429 门控，见 `classify::is_zcode_no_resource_pack`），
+        //   只能靠 ZCode 自己的分类器兜住。
+        let code_only = "{\"error\":{\"code\":\"1113\"}}";
+        assert_eq!(
+            crate::upstream::classify::classify(503, code_only),
+            ErrKind::Server,
+            "通用分类器对纯业务码 1113 只会给出上游故障（这正是 ZCode 层存在的理由）"
+        );
+        assert_eq!(
+            upstream_stream_error_kind(z, code_only),
+            ErrKind::NoResourcePack,
+            "ZCode 账号遇到纯业务码 1113 必须归 NoResourcePack"
+        );
+        // 反过来：同一帧在非 ZCode 产品上**不**走 ZCode 分类器。
+        assert_eq!(
+            upstream_stream_error_kind(crate::auth::PRODUCT_WORKBUDDY, code_only),
+            ErrKind::Server,
+            "1113 是 ZCode 的业务码，别让它影响其它产品"
+        );
+    }
+
+    /// ★★ 2026-10-05 真机抓包发现的日志口径缺陷：WorkBuddy 账号的
+    /// `ChatResult::Stream.product` 是**空串**（`forward.rs` 里 `product` 的文档
+    /// 「`""` = WorkBuddy」），照原样打日志会得到 `product= model=…`。
+    ///
+    /// 这一行是业主报障时唯一能看出「谁供的」的地方，产品字段空着就等于没有；
+    /// 而且同一次请求在用量统计里记的是 `workbuddy`（`record_usage` 会把空串
+    /// 归一成 [`crate::auth::PRODUCT_WORKBUDDY`]）⇒ 两处口径必须一致。
+    #[test]
+    fn log_product_label_normalizes_empty_to_workbuddy() {
+        assert_eq!(product_label_for_log(""), crate::auth::PRODUCT_WORKBUDDY);
+        assert_eq!(product_label_for_log(""), "workbuddy");
+        // 非空一律原样透传，别把 Qoder/ZCode/Trae 也改写成 workbuddy。
+        assert_eq!(product_label_for_log(crate::auth::PRODUCT_ZCODE), "zcode");
+        assert_eq!(product_label_for_log(crate::auth::PRODUCT_QODER), "qoder");
+        assert_eq!(product_label_for_log(crate::auth::PRODUCT_TRAE), "trae");
     }
 }
 
