@@ -385,6 +385,9 @@ async fn run_server(app: tauri::AppHandle) -> Result<(), String> {
 ///  - /page    给**求解窗口**用 —— 不要令牌，因为它就是被我们自己导航过去的；
 ///              且页面在 WebView 沙箱里拿不到令牌（那在宿主内存中）
 ///  - /result  给**求解窗口**用 —— 不要令牌，但**校验窗口存在**（见其实现）
+///  - /blank   给**预热窗口**用 —— 不要令牌，只返回一张拉 SDK 的空白页；
+///              它没有任何输入，也不回写状态，加令牌只会给预热路径添一条
+///              可能失败的依赖（预热失败不该影响功能）。
 ///
 /// 不给 /page 与 /result 加令牌的理由：它们的请求方是**我们自己开的窗口**，
 /// 而令牌若写进页面就等于公开（页面内容可被审计）。真正防滥用的门槛放在
@@ -396,6 +399,7 @@ async fn handle_request(
     let path = req.uri().path().to_string();
     match path.as_str() {
         SOLVER_PAGE_PATH => handle_page(req).await,
+        BLANK_PATH => handle_blank(req).await,
         SOLVER_RESULT_PATH => handle_result(app, req).await,
         _ => handle_solve(app, req).await,
     }
@@ -414,6 +418,28 @@ async fn handle_page(
         // 求解页每次都要最新：它含"要怎么求解"的逻辑，缓存住会让升级后行为不一致。
         .header("cache-control", "no-store")
         .body(Full::new(Bytes::from(SOLVER_HTML)))
+        .unwrap())
+}
+
+/// `/blank` —— 返回预热页 HTML（给常驻的预热窗口加载）。
+///
+/// 见 `BLANK_PATH` 的长注释：这个路由存在的唯一理由是让预热窗口导航到一个
+/// **一定有服务器在听**的地址 —— 旧实现指向 `http://127.0.0.1/`（无人监听），
+/// 会让该渲染进程崩溃并拖住主窗口 2.4~6.4 秒。
+///
+/// 与 `/page` 一样**不缓存**：内容虽然恒定，但 `no-store` 在这里的代价是零
+///（就一张几 KB 的静态页），而「预热页被缓存住」会引入一类难查的时序差异。
+async fn handle_blank(
+    req: hyper::Request<hyper::body::Incoming>,
+) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, std::convert::Infallible> {
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    let _ = req;
+    Ok(hyper::Response::builder()
+        .status(200)
+        .header("content-type", "text/html; charset=utf-8")
+        .header("cache-control", "no-store")
+        .body(Full::new(Bytes::from(BLANK_HTML)))
         .unwrap())
 }
 
@@ -629,6 +655,45 @@ async fn handle_solve(
 /// 净效果：少一层易错的桥（IPC + 注入），多一条直路（同源 HTTP）。
 const SOLVER_PAGE_PATH: &str = "/page";
 const SOLVER_RESULT_PATH: &str = "/result";
+
+/// 预热窗口加载的**同源空白页**路径。
+///
+/// # 为什么需要它（2026-10-05 实测定位）
+///
+/// 预热窗口原本导航到 `http://127.0.0.1/` —— **一个没有服务器在听的地址**。
+/// 实锤证据（`uitest/warmA-warm.json` + `uitest/port80-warm.json` 的 A/B）：
+///
+///  - 该导航让预热窗口的渲染进程**崩掉**（`Target.targetCrashed errorCode=3`），
+///    且崩溃是**异步**的：导航后约 6 秒才发生；
+///  - 崩溃期间**主窗口渲染进程被拖住 2.4~6.4 秒**（主页面通道最大单次停顿
+///    6426 ms、>300ms 共 62 次）—— 这正是所有者反馈的「启动后要等好久才能点」；
+///  - 同一个构建，只要在 80 端口起一个真实服务（`uitest/port80-server.cjs`），
+///    停顿立刻变成 **最大 256 ms、0 次超 300ms、0 次崩溃**。
+///
+/// 所以根因不是「建窗口」也不是「加载 SDK」，而是**导航到一个连不上的地址**。
+/// 换成宿主自己的求解服务上的这个空白路由后：
+///
+///  - 服务器**一定在听**（就是本进程的 hyper 服务），不会 `ERR_CONNECTION_REFUSED`；
+///  - 与求解页**同源**（`http://127.0.0.1:{port}`），SDK 的 HTTP 缓存照样命中；
+///  - 仍然保留「窗口常驻」的设计意图（见 `do_warmup` 的注释）。
+const BLANK_PATH: &str = "/blank";
+
+/// 预热窗口的页面 HTML。
+///
+/// 只做一件事：`<script src>` 官方 SDK，把它拉进 WebView2 的 HTTP 缓存
+///（首次求解要下载 225KB SDK + 450KB pe 字节码，那才是首次对话慢的主因）。
+/// **不 init、不求解** —— 预热阶段还没有 scene/region/prefix（那是上游随请求
+/// 下发的运营参数），且无谓的验证请求本身是风控关注点。
+///
+/// # 为什么不再用 `document.write` 灌页面
+///
+/// 旧实现是「导航到死地址 + eval `document.open/write/close`」。`document.write`
+/// 会替换整个文档，且与导航是竞态（AGENTS.md 已记录此坑）。现在页面由宿主
+/// 服务直接返回，`<script src>` 写在静态 HTML 里 —— 不需要任何注入，也就没有
+/// 「注入被冲掉」的失败模式。
+const BLANK_HTML: &str = r##"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>warmup</title></head>
+<body><script src="https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"></script></body></html>"##;
 ///
 /// # ⚠ 性能：这里是首次对话 29 秒的主要来源（2026-09-21 所有者反馈）
 ///
@@ -832,12 +897,27 @@ fn do_warmup(app: &tauri::AppHandle) -> Result<(), String> {
     use tauri::{WebviewUrl, WebviewWindowBuilder};
 
     let t0 = std::time::Instant::now();
-    let win = WebviewWindowBuilder::new(
+
+    // ⚠ 必须指向**本进程的求解服务**，不能再用 `http://127.0.0.1/`。
+    //
+    // 见 `BLANK_PATH` 的注释：指向无人监听的地址会让这个渲染进程崩掉
+    //（`Target.targetCrashed errorCode=3`），并连带把主窗口渲染进程拖住
+    // 2.4~6.4 秒 —— 那就是所有者反馈的「启动后要等好久才能点」。
+    //
+    // 端口为 0（服务还没起来）时直接放弃预热：预热只是优化，不值得为它
+    // 退回那个会崩的地址。
+    let port = app
+        .try_state::<CaptchaWebviewState>()
+        .and_then(|s| s.port.lock().ok().map(|p| *p))
+        .unwrap_or(0);
+    if port == 0 {
+        return Err("求解服务尚未就绪（端口未知），跳过预热".into());
+    }
+    let url = format!("http://127.0.0.1:{port}{BLANK_PATH}");
+    let _win = WebviewWindowBuilder::new(
         app,
         "captcha-warmup",
-        WebviewUrl::External(
-            "http://127.0.0.1/".parse().map_err(|e| format!("URL 解析失败: {e}"))?,
-        ),
+        WebviewUrl::External(url.parse().map_err(|e| format!("URL 解析失败: {e}"))?),
     )
     .title("captcha-warmup")
     .visible(false)
@@ -847,38 +927,17 @@ fn do_warmup(app: &tauri::AppHandle) -> Result<(), String> {
     .build()
     .map_err(|e| format!("创建预热窗口失败: {e}"))?;
 
-    // 只加载 SDK 本身（不 init、不求解）。
+    // 页面（含 SDK 的 `<script src>`）由 `/blank` 直接返回，**不需要任何注入**。
     //
-    // # 为什么连页面一起 write 进去，而不是只 appendChild 一个 script
+    // 旧实现是「导航到死地址 + eval `document.open/write/close` 灌页面」，
+    // 那条路有两个坑（见 `BLANK_HTML` 与 `BLANK_PATH` 的注释）：
     //
-    // 窗口 URL 是 `http://127.0.0.1/`（**一个没有服务器在听的地址**），
-    // 导航会失败，此时 `document.head` / `document.body` 未必存在 ——
-    // 直接 `document.head.appendChild` 会抛异常，预热就白做了。
+    //  - `document.write` 会替换整个文档，和导航是竞态，注入可能被冲掉；
+    //  - 更要命的是那个地址连不上，会让渲染进程崩掉并拖住主窗口。
     //
-    // 与求解窗口同一手法：用 `document.open/write/close` 铺一个最小页面，
-    // 再把 SDK 的 script 标签写进去（写 HTML 里的 `<script src>` 会真的发起请求）。
-    //
-    // 为什么不连 init 一起做：init 会真的发起一次验证（产生上游请求），
-    // 而预热阶段我们还没有 scene/region/prefix（那是上游下发的运营参数，
-    // 网关拿到后才会随请求传过来）。且无谓的验证请求本身就是风控关注点。
-    //
-    // 只把 SDK 拉进 HTTP 缓存，就足以消掉"首次下载"那段成本。
-    let js = r##"
-      (function(){
-        try {
-          document.open();
-          document.write('<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>' +
-            '<script src="https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"><\/script>' +
-            '</body></html>');
-          document.close();
-        } catch (e) {}
-      })();
-    "##;
-    win.eval(js)
-        .map_err(|e| format!("注入预热脚本失败: {e}"))?;
-
+    // 现在页面在服务器端就绪，`win.eval` 这一步可以整个删掉。
     log_info(&format!(
-        "预热窗口已创建（{:?}）—— 官方 SDK 开始进缓存，后续求解无需再等待下载",
+        "预热窗口已创建（{:?}）url={url} —— 官方 SDK 开始进缓存，后续求解无需再等待下载",
         t0.elapsed()
     ));
     // 窗口**不关**：它常驻以保留渲染环境与缓存预热效果。

@@ -88,6 +88,22 @@ pub const CAPTCHA_POOL_MAX: usize = 8;
 /// 25s 足以覆盖冷启动那一次，又不会让请求长挂。
 pub const CAPTCHA_WAIT_FOR_REFILL: Duration = Duration::from_secs(25);
 
+/// 建池后**延迟多久**才允许预热补货。
+///
+/// ★ 为什么要延迟（2026-10-05 ⑩b 真机实测结论）：网关进程一起来就
+/// `set_external_solver`，若立刻预热，`refill_to(CAPTCHA_POOL_TARGET)` 会连解 3 个
+/// param；而**每次求解都要宿主 GUI 新建一个 WebView2 求解窗口**
+/// （`src-tauri/src/captcha_webview.rs` 的一次性求解窗口，实测每轮 1.1~2.8 秒）。
+/// 这三轮恰好压在启动后 2~7 秒 —— 正是所有者反馈「刚启动的时候并发很多请求导致的
+/// 卡顿，要等一段时间之后才能恢复」的那个窗口
+/// （隔离实例日志：求解窗口 id=1/2/3 分别建在 t=2.1s / 3.4s / 6.2s）。
+/// 延迟到 15 秒后，首屏（主窗口首帧实测 t≈1.3s）早已画完，预热不再和它抢 WebView2。
+///
+/// 代价可忽略：这 15 秒内如果真有 ZCode 对话，走的是现场求解兜底
+/// （[`CaptchaSolver::solve`] 池里没有就 `solve_once`），功能不受影响，只是那一次
+/// 不预取而已。
+pub const CAPTCHA_POOL_WARMUP_DELAY: Duration = Duration::from_secs(15);
+
 /// 熔断时长。
 ///
 /// ★ 语义是**兜底熔断**，不是"上游限流冷却"（见文件头第 2 条）。
@@ -134,10 +150,25 @@ struct PooledParam {
 }
 
 /// 池的内部状态（单锁保护）。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PoolState {
     items: VecDeque<PooledParam>,
     refilling: bool,
+    /// 预热是否已经**真正跑过**一次（解出过至少一条）。
+    warmed: bool,
+    /// 建池时刻 —— 启动闸门用它算「预热延迟」是否已过。
+    born: Instant,
+}
+
+impl Default for PoolState {
+    fn default() -> Self {
+        Self {
+            items: VecDeque::new(),
+            refilling: false,
+            warmed: false,
+            born: Instant::now(),
+        }
+    }
 }
 
 type SolveFuture = Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
@@ -183,20 +214,31 @@ impl CaptchaPool {
         lock(&self.state).refilling
     }
 
+    /// 测试钩子：把池标成「预热已跑过」，越过启动闸门
+    /// （[`CAPTCHA_POOL_WARMUP_DELAY`]），以便单测直接验证补货本身的行为。
+    #[cfg(test)]
+    fn bypass_warmup_gate(&self) {
+        lock(&self.state).warmed = true;
+    }
+
     /// 取一个未过期的 param（取不到返回空串）。
     ///
     /// 步骤与 Go 一致：① 先**原地清掉过期项** ② 取队首（FIFO）③ 若低于水位则
     /// **异步**触发补货（不阻塞当前请求）。
     pub fn take(self: &Arc<Self>, now: Instant) -> String {
-        let (out, low) = {
+        let (out, low, warm_ok) = {
             let mut st = lock(&self.state);
             st.items
                 .retain(|it| now.saturating_duration_since(it.born) < CAPTCHA_PARAM_TTL);
             let out = st.items.pop_front().map(|it| it.param).unwrap_or_default();
             let low = st.items.len() < CAPTCHA_POOL_TARGET;
-            (out, low)
+            // ★ 启动闸门：建池后的 CAPTCHA_POOL_WARMUP_DELAY 内不许拉起补货
+            //（除非预热已经跑过）。一次补货 = 连解 3 个 = 宿主 GUI 新建 3 个
+            // WebView2 窗口，压在启动那几秒上就会把首屏拖住（见常量文档）。
+            let warm_ok = st.warmed || st.born.elapsed() >= CAPTCHA_POOL_WARMUP_DELAY;
+            (out, low, warm_ok)
         };
-        if low {
+        if low && warm_ok {
             self.refill_async();
         }
         out
@@ -255,6 +297,25 @@ impl CaptchaPool {
         });
     }
 
+    /// `delay` 之后触发一次补货（单飞语义与 [`CaptchaPool::refill_async`] 相同）。
+    ///
+    /// ★ 延迟是在 tokio 运行时里**睡着**，不占线程；拿不到运行时（非 async 上下文）
+    /// 就退化成立即补货，避免静默丢掉预热。
+    pub fn refill_after(self: &Arc<Self>, delay: Duration) {
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                self.refill_async();
+                return;
+            }
+        };
+        let me = self.clone();
+        handle.spawn(async move {
+            tokio::time::sleep(delay).await;
+            me.refill_async();
+        });
+    }
+
     /// 补货到 `target` 条为止。失败即停（**不再连续撞**）。
     pub async fn refill_to(self: &Arc<Self>, target: usize) {
         loop {
@@ -270,6 +331,7 @@ impl CaptchaPool {
                 return;
             }
             let mut st = lock(&self.state);
+            st.warmed = true;
             if st.items.len() < CAPTCHA_POOL_MAX {
                 st.items.push_back(PooledParam {
                     param,
@@ -387,8 +449,9 @@ impl CaptchaSolver {
 
     /// 配置外部（宿主 WebView2）求解服务。
     ///
-    /// 非空 URL ⇒ 建池并**立即预热**（池的目标就是预先备好外部环境的产物，
-    /// 避免请求路径上等 0.9 秒）。
+    /// 非空 URL ⇒ 建池，并在 [`CAPTCHA_POOL_WARMUP_DELAY`] 之后预热（池的目标就是
+    /// 预先备好外部环境的产物，避免请求路径上等 0.9 秒）。★ 延迟是给启动让路：
+    /// 网关起来的那几秒宿主 GUI 正在建主窗口，此时去要 3 个验证码窗口会把首屏拖住。
     pub fn set_external_solver(self: &Arc<Self>, url: &str, token: &str) {
         let url = url.trim().to_string();
         let token = token.trim().to_string();
@@ -412,7 +475,10 @@ impl CaptchaSolver {
         let pool = Arc::new(CaptchaPool::new(solve));
         *slot = Some(pool.clone());
         drop(slot);
-        pool.refill_async();
+        // ★ 不在这里同步预热（见 CAPTCHA_POOL_WARMUP_DELAY）：此刻宿主 GUI 正忙着
+        // 建主窗口，一次求解就要它新建一个 WebView2 窗口。池照旧立刻建好
+        // （has_pool() 立即为真），补货由延迟任务在启动稳定后拉起。
+        pool.refill_after(CAPTCHA_POOL_WARMUP_DELAY);
     }
 
     /// 是否已配置外部求解服务。
@@ -1379,6 +1445,11 @@ mod tests {
             c.fetch_add(1, Ordering::Relaxed);
             Box::pin(async { Err("求解器不可用".to_string()) })
         }));
+        // ★ 越过启动闸门：本测试要钉的是「池空 ⇒ take 会真的去解一次」，
+        // 而闸门（CAPTCHA_POOL_WARMUP_DELAY）会在建池后 15 秒内**故意**挡掉
+        // 这条自动补货路径 —— 那是启动期不让宿主 GUI 连建 3 个 WebView2 窗口，
+        // 与「求解失败如何收敛」是两件事，故这里显式放行。
+        pool.bypass_warmup_gate();
         let started = Instant::now();
         let got = pool.take_or_wait(Duration::from_millis(300)).await;
         assert!(got.is_empty(), "补货失败时不该返回垃圾值");
@@ -1415,6 +1486,52 @@ mod tests {
         assert!(pool.refilling());
         let got = pool.take_or_wait(Duration::from_secs(3)).await;
         assert_eq!(got, "ready", "后台已在解时应当等它，而不是再起一个");
+    }
+
+    #[tokio::test]
+    async fn pool_warmup_is_gated_after_creation() {
+        // ★ 启动闸门（2026-10-05 ⑩b 真机实测）：网关进程一起来就会配外部求解器；
+        // 若当场预热，`refill_to(CAPTCHA_POOL_TARGET)` 会连解 3 个 param，而每次求解
+        // 都要宿主 GUI **新建一个 WebView2 求解窗口**（实测每轮 1.1~2.8 秒），
+        // 恰好压在启动后 2~7 秒 ⇒ 首屏卡顿。故建池后的
+        // `CAPTCHA_POOL_WARMUP_DELAY` 内，`take()` 的自动补货必须被挡住。
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let pool = pool_with(Arc::new(move || {
+            c.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move { Ok("late".to_string()) })
+        }));
+
+        // ① 冷池 + 闸门未过：take 拿空串，且一次求解都不许发生。
+        assert!(pool.take(Instant::now()).is_empty());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "闸门未过时不该有任何人去求解（那会要宿主新建 WebView2 窗口）"
+        );
+        assert!(!pool.refilling(), "闸门未过时不该有补货在跑");
+
+        // ② 显式补货（请求路径上的真实需要）不受闸门限制，照常解出 param。
+        pool.refill_async();
+        assert!(pool.refilling());
+        let got = pool.take_or_wait(Duration::from_secs(3)).await;
+        assert_eq!(got, "late", "显式补货必须照常工作");
+        assert!(calls.load(Ordering::Relaxed) >= 1);
+
+        // ③ 预热跑过一次之后，闸门自动放行（take 再次触发补货不再被挡）。
+        let before = calls.load(Ordering::Relaxed);
+        let _ = pool.take(Instant::now());
+        for _ in 0..50 {
+            if calls.load(Ordering::Relaxed) > before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            calls.load(Ordering::Relaxed) > before,
+            "预热已跑过 ⇒ 闸门必须放行后续补货"
+        );
     }
 
     // -- 入口文件与可用性 ---------------------------------------------------
