@@ -61,7 +61,7 @@
 | **1.0.24** | 启动卡顿（⑩b）：预热窗口改走 `/blank` + 验证码池预热闸门 | ✅ 真机 PASS |
 | **1.0.25** | 页面切换保持状态缓存（⑥）：ErrorBoundary key 改 resetKey + 三级视图入 URL | ✅ 真机 PASS |
 | **1.0.26** | 平台面板互斥显示（★ 真产品缺陷：`present = forceMount || isSelected` ⇒ 非选中面板永不 `hidden`）+ 豆包单账号任务区 + 网关换新护栏 | ✅ 真机 PASS |
-| **1.0.27** | ⑰ 用量统计模型名**大小写折叠**（写入口径 `model_key_of` + 载入自愈 `merge_case_variants`）+ 计费行平台归属按计费键回填（`backfill_billing` 旧口径按 uid 形状猜，重启后分布会漂） | ✅ 真机 23/23 PASS |
+| **1.0.27** | ⑰ 用量统计模型名**大小写折叠**（写入口径 `model_key_of` + 载入自愈 `merge_case_variants`）+ 计费行平台归属按计费键回填（`backfill_billing` 旧口径按 uid 形状猜，重启后分布会漂） | ✅ 真机 23/23 PASS（载入自愈 8→6）；★ 写入口径另测 **23/0**（见五节） |
 | **1.0.28** | ⑯ 流中途上游错误帧识别 / 记日志 / 计入账号健康度（`note_upstream_stream_error`）+ 空 product 归一化成 `workbuddy` | ✅ 真机 43/0（抓包）+ 50/0（GUI）+ 24/0（用量页） |
 
 ### 交付物
@@ -255,6 +255,7 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 | ⑯ 的**最终二进制**真机终验 | ✅ 已做（2026-10-06）：三轮 q16 抓包 `pass=43 fail=0`（`uitest\q16-verify2.log`，与 `uitest\verify-q16.log` 逐字节一致） |
 | **交付包自证**：真机上解出的网关 == 工作区产物 | ✅ 已做（2026-10-06）：`uitest\verify-1028-deployed-gw.cjs` **5/5 PASS**。1.0.28 隔离实例里宿主自己写下的 `home\gateway\bin\gateway-4eaf37-29d0aea8025e7f09.exe` 13,629,440 B / `99AA2D33…` 与 `wt-port\target\release\gateway.exe`、`crates\ai-gateway-core\embedded\gateway.exe` **三者逐字节相同**；落地文件名亦按 `gateway_embed.rs:52` 口径复算命中（见四·7） |
 | ⑮ **旧网关自动换新**（业主装 1.0.28 后 `:7864` 上那个 1.0.21 路由器会不会被换掉） | ✅ 已做（2026-10-06，1.0.28 隔离实例）：`uitest\gate-14-refresh.ps1 -Tag g14pkg1028b … -NewName 'gateway-4eaf37-29d0aea8025e7f09.exe'` ⇒ **`VERDICT_14_FIXED=True`**。旧 1.0.21 路由器（`gateway-4e52fa-ecd7924c953073e8.exe`，PID 74824）先占住 `:7874`，新 GUI 起来后 **7 秒**内完成识别/结束/替换，`HOLDER_AFTER` = 新名字，`OLD_ROUTER_ALIVE_AFTER=False`，`BIN_AFTER` 只剩新那一个（`cleanup_old` 生效），`CFG_LAST_STATUS=started` 且无 `last_error`。日志 `uitest\g14pkg1028b-run.log`；证据行 `test-bin\pkg1028\runs\g14pkg1028b.gui.err.log`（`[gateway] 端口 7874 上的网关不是本版本释放的，正在换成本版本内嵌的网关` / `已结束占用端口 7874 的网关进程 (PID 74824)`） |
+| ⑰ **写入口径**（`model_key_of`：先大写定型、再写小写是否沿用既有拼写） | ✅ 已做（2026-10-06）：`uitest\q17-run.ps1` 两轮（A 大写 `GLM-5.3-Flash` → B 小写 `glm-5.3-flash`，假上游发一帧 `usage:{11,5,cache 3/2}`）⇒ `node uitest\verify-q17-usage.cjs` **`pass=23 fail=0` / `VERDICT=PASS`**。四张表（`models`/`accountModels`/`billed`/`billingMeta`）**始终只有 1 个模型名**，`11/5/3/2/1` ⇒ `22/10/6/4/2` 累加同一行；计费键 = `workbuddy|cn|?`；`billingMeta` 无第二条 |
 | 11133 修复的**覆盖边界** | ⚠ `prepare_body` 只覆盖默认上游（workbuddy/cmb 族）与 Qoder；**Trae / ZCode 各有独立适配器、不经此处**。Trae 已在源头修掉；**ZCode 侧未修**（`products/zcode/translate.rs:157` 同样 `unwrap_or("")`），但其上游是 Anthropic 形状（不回 11133）、池里只有 2 个模型、会话里无 ZCode 流量 ⇒ 已知残余风险 |
 
 ---
