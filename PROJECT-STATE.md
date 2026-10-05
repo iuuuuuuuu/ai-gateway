@@ -299,5 +299,6 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 | 可编排 mock 上游 | `crates\ai-gateway-router\src\testing\`（task-32） | 线上故障形态固化 |
 | 不触网 runner 测试范例 | `crates\ai-gateway-router\src\products\product_tasks.rs` | 早退路径测试 |
 | 假上游范例 | `crates\ai-gateway-router\src\upstream\tasks.rs` 测试模块 | `std::net::TcpListener` |
+| 用量写入口径装置 | `uitest\q17-run.ps1` + `uitest\verify-q17-usage.cjs`（复用 `q16-ab.ps1 -Mode usage -Model <名>`） | 两轮真机：先大写定型、再写小写，断言四张表不裂（23/0）。假上游 `usage` 模式发一帧 `usage:{11,5,cache 3/2}` —— **不带 usage 的帧完全不计账** |
 | 侦察报告 | `test-bin\recon\REPORT-{qoder,zcode,trae}.md` | 外部仓库功能清单 |
 | 解包比对脚本思路 | `DELIVERY-1.0.14.md` 第四节 | 验证安装包内容而**不安装** |
