@@ -2849,6 +2849,55 @@ mod tests {
         }
     }
 
+    /// ★ 桌面端必须有**调用方**，否则上面那五个测试全绿也没有任何意义。
+    ///
+    /// 这是 2026-10-06 定案的缺陷：`run_in_app_due_tasks` 自 fc418ae
+    /// （2026-09-15「计划任务双轨调度」）起就存在，逻辑与单测都齐，但**只有
+    /// HTTP API 在调它**（`POST /api/in-app-schedule/run`）—— 桌面端
+    /// `spawn_background_loops` 里从来没有这个循环。于是「应用内调度」这条轨
+    /// 在桌面端从未真正跑过：Trae 每日签到只能靠用户手点卡片上的按钮，
+    /// 而业主机上 `in_app_schedule.json` / `trae_cooldowns.json` 等文件
+    /// 全不存在、事件流里 trae 记录 0 条，正是这一缺口的证据。
+    ///
+    /// 与 `travel.rs` 的 `manual_travel_path_has_no_gate` 同型：测的是
+    /// 「代码还连着没有」，因为断链的失败模式是**静默**的 —— 界面照常显示
+    /// 「应用内调度仍然生效」，只是永远不触发。
+    #[test]
+    fn 桌面端后台循环必须调用应用内调度() {
+        // ⚠ 运行时读文件而不是 `include_str!`：后者嵌进编译产物、只靠 mtime
+        // 失效（同 `gateway_restart_goes_through_serialized_entry` 的教训）。
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../src-tauri/src/lib.rs"
+        );
+        let raw = std::fs::read_to_string(path).expect("读不到 src-tauri/src/lib.rs");
+        // 本仓库 .rs 是 CRLF，跨行匹配前必须归一化
+        let src = raw.replace("\r\n", "\n");
+
+        // 只认 `spawn_background_loops` 的**函数体**：写在别处的调用不算
+        // —— 那正是本次修复前的反例（函数存在、单测齐备，桌面端从不调用）。
+        let start = src
+            .find("fn spawn_background_loops()")
+            .expect("src-tauri/src/lib.rs 里应有 spawn_background_loops");
+        let body = &src[start..];
+        // 函数内所有右花括号都有缩进，故列 0 的 `}` 必是本函数的结尾
+        let end = body.find("\n}\n").expect("应能找到 spawn_background_loops 的结尾");
+        let fn_body = &body[..end];
+
+        assert!(
+            fn_body.contains("modules::apps_ops::run_in_app_due_tasks"),
+            "桌面端后台循环必须在 spawn_background_loops 里调用 \
+             apps_ops::run_in_app_due_tasks —— 否则「应用内调度」在桌面端永远不触发，\
+             Trae 每日签到就只能靠用户手点（业主报「Trae 签到失败」的根因）"
+        );
+        // 必须在 blocking 线程里调：`cli_task::run_cli_task` 内部会自建 tokio
+        // 运行时并 block_on，直接在 async 上下文里调用会 panic。
+        assert!(
+            fn_body.contains("spawn_blocking"),
+            "应用内调度会同步阻塞（内部自建 runtime + block_on），必须放进 spawn_blocking"
+        );
+    }
+
     #[test]
     fn 版本探测按优先级读取并保留来源() {        let iso = config::test_isolation::Isolated::new("apps_ops_version");
         let dir = iso.dir().to_path_buf();

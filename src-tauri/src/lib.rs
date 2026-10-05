@@ -88,6 +88,72 @@ fn spawn_background_loops() {
         }
     });
 
+    // 应用内调度：Trae 每日签到（08:30）/ 豆包会话保活（09:10）/ 豆包额度巡检（21:00）。
+    //
+    // # 为什么必须有这个循环（2026-10-06 定位）
+    //
+    // `apps_ops::run_in_app_due_tasks` 自 fc418ae（2026-09-15「计划任务双轨调度」）
+    // 起就存在，但**只在 HTTP API 暴露**（`POST /api/in-app-schedule/run`）——
+    // 桌面端从不调用它，于是「应用内调度」这条轨在桌面端**从未真正跑过**。
+    //
+    // 后果是可复现的：schtasks 那条轨注册需要管理员权限（用户多半没注册），
+    // 而这条轨没接线 ⇒ **Trae 每日签到在桌面端从来没有自动发生过**，只能靠用户
+    // 手点卡片上的「立即签到」。业主机上 `in_app_schedule.json` 与三个 Trae
+    // 冷却/忙等文件**全部不存在**、事件流里 trae 记录 0 条，正是这一缺口的证据；
+    // 而同一台机器上 WorkBuddy 的自动签到（上面那个循环）是照跑的 —— 于是用户
+    // 看到的是「WorkBuddy 自己签了，Trae 从来不签」=「Trae 签到失败」。
+    //
+    // 设置页那句「应用内调度仍然生效，两者互补」在本循环接线之前是**假的**。
+    //
+    // 复用 `run_in_app_due_tasks` 而不是另写一份 Trae 专用循环：任务的触发点、
+    // 「今天是否已跑」的记账、失败留待重试的语义都在它里面（且有单测覆盖），
+    // 两条轨（schtasks / 应用内）指向同一个 `cli_task`，行为完全一致。
+    tauri::async_runtime::spawn(async move {
+        // 先等一会：启动瞬间是账号同步、签到核验、网关拉起最密集的时刻，
+        // 再挤一个网络任务只会拖慢首启（业主为此报过「首启 5 分钟无响应」）。
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        loop {
+            // 任务内部会自建 tokio runtime 并同步 block_on（见 `cli_task::run_cli_task`），
+            // 直接在这里调用会 panic（不能在运行时线程里再建运行时）——
+            // 必须挪到 blocking 线程。
+            let ran = tauri::async_runtime::spawn_blocking(modules::apps_ops::run_in_app_due_tasks)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("[调度] 应用内调度任务异常结束: {e}");
+                    serde_json::json!({ "ran": [] })
+                });
+            let items = ran
+                .get("ran")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for item in &items {
+                let label = item.get("label").and_then(|v| v.as_str()).unwrap_or("");
+                let at = item.get("scheduledAt").and_then(|v| v.as_str()).unwrap_or("");
+                let ok = item.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                let code = item.get("exitCode").and_then(|v| v.as_i64()).unwrap_or(-1);
+                // 失败不打「已执行」——它会被下一轮重试，这里只是让日志能自证跑过。
+                eprintln!(
+                    "[调度] {} 计划 {} ⇒ {}（退出码 {code}）",
+                    label,
+                    at,
+                    if ok { "成功" } else { "失败，将在下一轮重试" }
+                );
+            }
+            // 每轮都打一行（哪怕一项都没跑）：这是「桌面端的调度循环还活着」的
+            // 唯一可观测证据 —— 只在有任务时才打日志的话，「没到点」与
+            // 「循环没接线」在日志上长得一模一样，正是本次缺陷藏了半个多月的原因。
+            eprintln!(
+                "[调度] 检查完成：本轮执行 {} 项（{}）",
+                items.len(),
+                ran.get("checkedAt").and_then(|v| v.as_str()).unwrap_or("")
+            );
+            // 触发点粒度是分钟，周期取 5 分钟：到点后最多晚 5 分钟执行，
+            // 而「今天是否已跑」由状态文件记账，重复进入也不会重复执行。
+            tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+        }
+    });
+
     // 派猫猫旅行：启动即派发，之后周期性补派（并重试 no-buddy / 瞬时错误）。
     tauri::async_runtime::spawn(async move {
         let _ = modules::travel::run_travel_cycle().await;
@@ -131,6 +197,13 @@ fn spawn_background_loops() {
         }
     });
 
+    // 自动轮换 + WorkBuddy 每日保活（下面那个 30s tick 循环）。
+    //
+    // ⚠ 这里的 `run_keepalive_cycle` 是 **WorkBuddy 的 token 刷新**（见
+    // `refresh.rs` 模块头：避免服务端清理闲置 refresh 会话导致 12153
+    // invalid_grant），**与豆包无关** —— 豆包是「启动客户端再关掉」的
+    // 客户端级滑动续期，走 `cli_task` 的 `doubao-keepalive`，由上面的
+    // 应用内调度循环负责。两者同名不同物，别把其中一个删掉当成去重。
     tauri::async_runtime::spawn(async move {
         let mut last_keepalive_day = String::new();
         let mut last_rotate_at: i64 = 0;
