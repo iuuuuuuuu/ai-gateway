@@ -18,12 +18,32 @@ const MAIN_WINDOW_LABEL: &str = "main";
 /// 托盘悬停提示：用产品显示名而不是可执行文件名，用户看到的是品牌名。
 const DEFAULT_TOOLTIP: &str = "AI Gateway";
 const CHECKIN_TOOLTIP_RESTORE_SECS: u64 = 8;
+/// 等待前端首帧上报的最长时间；超时后无条件显示主窗口（见
+/// [`setup_startup_visibility`] 的兜底分支）。
+///
+/// 取 10 s 的依据：实测冷启动前端首帧约 1 s（`uitest/run-coldstart.ps1`），
+/// 慢机器 + 大账号库最坏也就几秒；10 s 足够覆盖，又不至于让异常场景
+/// （脚本报错、资源缺失）把窗口藏到用户以为程序没起来。
+const FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 系统自启注册的启动参数：仅携带该精确参数的启动进入静默托盘模式。
 pub const SILENT_STARTUP_ARG: &str = "--hidden";
 
 static LIGHTWEIGHT_MODE: AtomicBool = AtomicBool::new(false);
+/// 本次启动是否为静默（`--hidden`，即系统自启）。
+///
+/// # 为什么需要这个标志（2026-10-05 实测回归）
+///
+/// [`mark_frontend_ready`] 是「前端首帧已画完，窗口可以显示了」的信号，
+/// 但它对**静默启动**不成立 —— 自启动的全部意义就是不弹窗。
+/// 旧版 silent 分支不调用任何 show，所以没这个问题；⑩b 把
+/// 「前端就绪 ⇒ 显示窗口」接进 [`mark_frontend_ready`] 之后，
+/// 静默启动也会在首帧画完时把窗口弹出来（iso 实例实测：`--hidden` 下
+/// t≈0.9 s 主窗口 `vis=False → True`）。故此处显式记住本次启动是否静默。
+static STARTUP_SILENT: AtomicBool = AtomicBool::new(false);
 static CHECKIN_BUSY: AtomicBool = AtomicBool::new(false);
+/// 前端首帧是否已上报（见 [`mark_frontend_ready`]）。
+static FRONTEND_READY: AtomicBool = AtomicBool::new(false);
 static TOOLTIP_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static DOCK_ICON_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -75,23 +95,93 @@ pub fn is_silent_startup(args: impl IntoIterator<Item = impl AsRef<str>>) -> boo
 /// `main` 窗口由 `tauri.conf.json` 配置创建为不可见，此处做出第一次
 /// show / hide 决策，静默启动不会先闪出主窗口：
 ///
-/// - 普通启动（无 `--hidden`）：走既有 `show_main_window` 路径，
-///   先恢复 Regular / Dock，再 show / unminimize / focus。
+/// - 普通启动（无 `--hidden`）：**只恢复 Dock / 任务栏入口，窗口先不 show**，
+///   等前端首帧上报（[`mark_frontend_ready`]）再显示。
 /// - 静默启动（`--hidden`）：窗口保持隐藏，隐藏 Dock / 任务栏入口，
 ///   只保留托盘；不设置 `LIGHTWEIGHT_MODE`（WebView 仍然存在）。
 ///
 /// 之后从托盘「打开主界面」仍走 `show_main_window`，与隐藏窗口完全一致。
+///
+/// # 为什么普通启动不在这里 show（2026-10-05）
+///
+/// 所有者反馈：「每次启动都要响应好长时间，如果直接点击就会无响应」。
+/// 根因不是 Rust 主线程（实测 `Tauri Window` / `WRY_WEBVIEW` 全程不挂起），
+/// 而是 **WebView2 浏览器进程**：窗口一 show，桌面上就出现一个真实窗口，
+/// 此时渲染进程还在建环境、下载 SDK、编译 1.5MB 的 JS 包，
+/// 用户点上去 → Windows 判定消息队列无响应 → 标题栏出现「未响应」灰屏，
+/// 而这段时间的长短完全由机器与数据量决定（业主机器上曾到分钟级）。
+///
+/// 窗口晚 1 秒出现，比出现后卡 1 分钟体验好得多；启动过程本身不受影响
+/// （后台循环、网关自动启动都在 setup 里照常跑，与窗口可见性无关）。
 pub fn setup_startup_visibility<R: Runtime>(app: &AppHandle<R>, silent: bool) {
+    STARTUP_SILENT.store(silent, Ordering::Release);
+    eprintln!("[tray] 启动可见性 silent={silent} t={}ms", crate::elapsed_ms());
     if silent {
         apply_dock_visible(app, false);
         emit_main_window_visible(app, false);
-    } else {
-        show_main_window(app);
+        return;
     }
+    // 先把 Dock / 任务栏入口恢复，让用户在「窗口还没画出来」时也有可点的图标。
+    apply_dock_visible(app, true);
+    emit_main_window_visible(app, false);
+    // 兜底：前端若因异常没上报（脚本报错、资源缺失、WebView2 初始化失败），
+    // 不能把窗口永久藏住 —— 超时后无条件显示，行为退回到旧版。
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(FRONTEND_READY_TIMEOUT).await;
+        if !FRONTEND_READY.load(Ordering::Acquire) {
+            show_main_window(&handle);
+        }
+    });
 }
 
 fn emit_main_window_visible<R: Runtime>(app: &AppHandle<R>, visible: bool) {
     let _ = app.emit("main-window-visible", visible);
+}
+
+/// 前端首帧已绘制完成（`main.tsx` 在双 `requestAnimationFrame` 后 invoke）。
+///
+/// 这是**唯一**的「可以显示主窗口了」信号：它由真正画完界面的那一侧发出，
+/// 所以主窗口不会在 WebView2 还在建环境时暴露给用户点击。
+pub fn mark_frontend_ready<R: Runtime>(app: &AppHandle<R>) {
+    // 启动耗时可观测：这条与下面的「显示主窗口」之差，就是 ⑩b 闸门真正推迟的时间。
+    eprintln!(
+        "[tray] 前端首帧已就绪 t={}ms 窗口可见={:?} 静默={}",
+        crate::elapsed_ms(),
+        app.get_webview_window(MAIN_WINDOW_LABEL)
+            .and_then(|w| w.is_visible().ok()),
+        STARTUP_SILENT.load(Ordering::Acquire)
+    );
+    FRONTEND_READY.store(true, Ordering::Release);
+    // 静默启动（`--hidden`）不在这里显示窗口：自启动的语义就是「只进托盘」。
+    // 用户此时若想打开，走托盘菜单或再启动一次（两者都不经这里）。
+    if STARTUP_SILENT.load(Ordering::Acquire) {
+        return;
+    }
+    // 用 request_ 而不是 show_：页面重载（热更新、轻量模式恢复后的重建窗口）
+    // 会再次上报，此时窗口往往已经可见，不该被 set_focus 抢走前台焦点。
+    request_main_window_show(app);
+}
+
+/// 前端首帧是否已上报。供启动期的「后来者」排队等待（见
+/// `captcha_webview::warmup_prefetch`：它要等主窗口画完再建第二个 WebView2）。
+pub fn frontend_ready_flag() -> bool {
+    FRONTEND_READY.load(Ordering::Acquire)
+}
+
+/// 需要主窗口可见时统一走这里（托盘点击、第二个实例启动、前端就绪）。
+///
+/// 与 [`show_main_window`] 的区别：**已经可见时什么都不做**。
+/// 前端每次加载都会上报一次 `frontend_ready`，若每次都 `show()` +
+/// `unminimize()` + `set_focus()`，用户最小化窗口后切回页面就会被强行拉回
+/// 前台（页面重载、热更新、切标签页重挂载都会触发）。
+pub fn request_main_window_show<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        if window.is_visible().unwrap_or(false) {
+            return;
+        }
+    }
+    show_main_window(app);
 }
 
 /// Keep the tray process alive when the last window is destroyed (lightweight mode).
@@ -123,6 +213,7 @@ fn should_keep_tray_alive(code: Option<i32>) -> bool {
 }
 
 fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
+    eprintln!("[tray] 显示主窗口 t={}ms", crate::elapsed_ms());
     // Recreate if the WebView is gone even when the flag is already false
     // (e.g. destroy() completed after a failed lightweight toggle).
     if LIGHTWEIGHT_MODE.load(Ordering::Acquire)
@@ -273,6 +364,14 @@ fn enter_lightweight<R: Runtime>(app: &AppHandle<R>) {
     refresh_tray_menu(app);
 }
 
+/// 退出轻量模式：必要时重建 `main` 窗口，然后交给 [`show_main_window`] 显示。
+///
+/// ⚠ 显示动作刻意**不在这里重复实现**（2026-10-05）：本函数历史上自带一段裸的
+/// `show / unminimize / set_focus`，与 [`show_main_window`] 是两份并行逻辑 ——
+/// 任何显示策略调整（例如「等前端首帧再显示」）都必须同时改两处，漏一处就会出现
+/// 「从托盘打开是等首帧、从轻量模式恢复却是立刻显示」这类不一致。
+/// 现在统一收敛到 [`show_main_window`]，它自己会处理 `LIGHTWEIGHT_MODE` 与
+/// 窗口缺失的情况（本函数已把窗口建好，走进去就是普通显示分支）。
 fn exit_lightweight<R: Runtime>(app: &AppHandle<R>) {
     // Regular / dock first so a from_config window is not created while Accessory.
     apply_dock_visible(app, true);
@@ -300,13 +399,9 @@ fn exit_lightweight<R: Runtime>(app: &AppHandle<R>) {
     }
     // Window exists now: Windows skip_taskbar was a no-op before recreate.
     apply_dock_visible(app, true);
-    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-    }
-    emit_main_window_visible(app, true);
     LIGHTWEIGHT_MODE.store(false, Ordering::Release);
+    // 显示交给唯一入口（它会再 apply_dock_visible + show/unminimize/focus + emit）。
+    show_main_window(app);
     refresh_tray_menu(app);
 }
 

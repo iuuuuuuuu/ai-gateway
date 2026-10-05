@@ -17,15 +17,41 @@
 //! 由 [`crate::modules::trae_device`] 确定性派生。
 
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
 
 use crate::modules::config;
 use crate::modules::trae_account::{self, JwtInfo};
+use crate::modules::trae_checkin_results;
 use crate::modules::trae_device::{self, DeviceEntry};
+use crate::modules::trae_realm;
 
-const SIGNIN_URL: &str = "https://api.trae.cn/trae/api/v2/ug/checkin_credits/claim";
-const STATUS_URL: &str = "https://api.trae.cn/trae/api/v2/ug/checkin_credits/status";
+/// 签到领取路径（host 随区域走，见 [`signin_url`]）。
+const SIGNIN_PATH: &str = "/trae/api/v2/ug/checkin_credits/claim";
+/// 签到状态查询路径（host 随区域走，见 [`status_url`]）。
+const STATUS_PATH: &str = "/trae/api/v2/ug/checkin_credits/status";
+
+/// 按账号所在区域拼出签到领取端点。
+///
+/// ★ host 必须随 realm 走：国内版 https://api.trae.cn，国际版
+/// https://growsg-normal.trae.ai （见 [`trae_realm::auth_host`]）。硬编码国内 host
+/// 会让国际号签到必然 401 —— 与 trae_credits.rs 同源的问题，那边已修，这里补齐。
+fn signin_url(realm: trae_realm::Realm) -> String {
+    format!("{}{}", trae_realm::auth_host(realm), SIGNIN_PATH)
+}
+
+/// 按账号所在区域拼出签到状态端点。
+fn status_url(realm: trae_realm::Realm) -> String {
+    format!("{}{}", trae_realm::auth_host(realm), STATUS_PATH)
+}
+
+/// 只按 uid 查区域（拿不到账号记录时退回 [`trae_realm::DEFAULT_REALM`]）。
+fn realm_for_uid(uid: &str) -> trae_realm::Realm {
+    trae_account::find_account(uid)
+        .map(|acc| trae_account::account_realm(&acc).realm)
+        .unwrap_or(trae_realm::DEFAULT_REALM)
+}
 
 /// JWT 剩余有效期低于该值（小时）时写入告警。
 const EXPIRY_WARN_HOURS: f64 = 24.0;
@@ -33,6 +59,26 @@ const EXPIRY_WARN_HOURS: f64 = 24.0;
 const RETRY_GAP_SECS: u64 = 1;
 /// 单次请求超时。
 const REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// 上游「too many users」业务码。
+///
+/// 它与 `1005`（套餐限制）语义完全不同：1005 是「这个账号今天领不到了」，
+/// 9074 是「服务端此刻忙不过来」。因此 9074 **不得**进账号冷却表 ——
+/// 见 [`ErrorKind::UpstreamBusy`]。
+pub const CODE_UPSTREAM_BUSY: i64 = 9074;
+
+/// 9074 的基础退避秒数。
+pub const CHECKIN_9074_RETRY_SECS: i64 = 60;
+
+/// 9074 退避上限（1 小时）。
+pub const CHECKIN_9074_MAX_BACKOFF_SECS: i64 = 3600;
+
+/// 指数退避的指数帽。
+///
+/// 加帽是为了让长时间的 9074 连击收敛在**分钟级**而不是顶到上限：
+/// `60 * 2^3 = 480s`。不加帽时连续 6 次就顶到 3600s，当天剩余时间可能
+/// 一次都轮不上 —— 而 9074 只是「上游忙」，晚一点再试本来就该成功。
+pub const CHECKIN_9074_BACKOFF_EXPONENT_CAP: u32 = 3;
 
 /// claim 响应中疑似「本次奖励」的候选字段（按优先级排列）。
 ///
@@ -74,12 +120,22 @@ pub enum ErrorKind {
     Client,
     /// 业务错误码（HTTP 200 但 code != 0），冷却 5 分钟。
     BusinessError,
+    /// 上游容量信号（`code == 9074`，"too many users, retry later"）。
+    ///
+    /// **这不是对账号的惩罚**：账号本身完全健康，只是服务端此刻忙。
+    /// 因此它**不落账号冷却表**（[`cooldown_until`] 不会为它返回截止时间），
+    /// 而是走独立的、可跨重启的退避窗口 —— 见 [`busy_until`] 与
+    /// [`register_upstream_busy`]。把 9074 当成 `BusinessError` 会让一个
+    /// 好账号在 5 分钟里被 `run_round` 直接跳过，且界面上显示成「失败」。
+    UpstreamBusy,
     /// 网络异常（请求未发出或超时）—— 不落冷却。
     Unknown,
 }
 
 impl ErrorKind {
-    pub fn as_str(&self) -> &'static str {
+    // `const fn`：允许在常量上下文里取值（例如 `NON_RETRYABLE_KINDS`）。
+    // 失败类型必须只有一个真源，调用方手写字符串字面量已经出过一次事故。
+    pub const fn as_str(&self) -> &'static str {
         match self {
             ErrorKind::PlanLimit => "PlanLimit",
             ErrorKind::SoftRate => "SoftRate",
@@ -88,6 +144,7 @@ impl ErrorKind {
             ErrorKind::Server => "Server",
             ErrorKind::Client => "Client",
             ErrorKind::BusinessError => "BusinessError",
+            ErrorKind::UpstreamBusy => "UpstreamBusy",
             ErrorKind::Unknown => "Unknown",
         }
     }
@@ -102,6 +159,9 @@ impl ErrorKind {
             ErrorKind::NotFound => Some(now + 60),
             ErrorKind::Server | ErrorKind::Client => Some(now + 600),
             ErrorKind::BusinessError => Some(now + 300),
+            // ★ 9074 刻意不在这里：账号是健康的，只是上游忙。
+            // 走 `busy_until` 这条独立通道（见该函数注释）。
+            ErrorKind::UpstreamBusy => None,
             ErrorKind::Unknown => None,
         }
     }
@@ -109,6 +169,12 @@ impl ErrorKind {
 
 /// 按 HTTP 状态与业务码分类失败。
 pub fn classify_error(http_status: i32, code: Option<i64>) -> ErrorKind {
+    // ★ 9074 先判：它是**上游容量信号**，优先级高于承载它的 HTTP 状态。
+    // 上游在不同版本下用过 200 / 429 / 503 承载它，只要 code 是 9074，
+    // 语义就是「服务端忙，稍后再来」而不是「这个账号有问题」。
+    if code == Some(CODE_UPSTREAM_BUSY) {
+        return ErrorKind::UpstreamBusy;
+    }
     if http_status == 200 {
         return match code {
             Some(1005) => ErrorKind::PlanLimit,
@@ -138,6 +204,7 @@ pub struct AccountOutcome {
     pub message: String,
     pub credits: Option<i64>,
     pub delta: Option<i64>,
+    /// 失败类型（[`ErrorKind::as_str`]）。`skip` 也会带上冷却原因的类型。
     pub error_type: Option<String>,
     pub cooldown_until: Option<i64>,
 }
@@ -153,6 +220,24 @@ pub struct RoundSummary {
 }
 
 impl RoundSummary {
+    /// 按当前 `outcomes` 的最终状态重算四个计数。
+    ///
+    /// 重试轮会用新结果覆盖旧结果，覆盖后必须重算 —— 否则计数会与逐条结果
+    /// 对不上（界面上出现「失败 3 / 成功 2」但列表里只有 4 条）。
+    pub fn recount(&mut self) {        self.ok = 0;
+        self.already = 0;
+        self.failed = 0;
+        self.skipped = 0;
+        for o in &self.outcomes {
+            match o.status {
+                "success" => self.ok += 1,
+                "already" => self.already += 1,
+                "skip" => self.skipped += 1,
+                _ => self.failed += 1,
+            }
+        }
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "ok": self.ok,
@@ -289,17 +374,24 @@ struct StatusOutcome {
     checked_in: Option<bool>,
     credits: Option<i64>,
     message: String,
+    /// 上游以 9074 回应了**这次探测**（"too many users"）。
+    ///
+    /// 与「预检失败」区分开：探测被限流不代表账号不能签到，claim 端点
+    /// 与 status 端点是**独立限流**的。调用方据此只推迟 status 探测，
+    /// 不得据此放弃 claim。
+    busy: bool,
 }
 
 /// 预检今日是否已签。
-async fn status_check(jwt: &str, dev: &DeviceEntry) -> StatusOutcome {
+async fn status_check(jwt: &str, dev: &DeviceEntry, realm: trae_realm::Realm) -> StatusOutcome {
     let none = |message: &str| StatusOutcome {
         ok: false,
         checked_in: None,
         credits: None,
         message: message.to_string(),
+        busy: false,
     };
-    let (status, body, raw) = http_post(jwt, dev, STATUS_URL).await;
+    let (status, body, raw) = http_post(jwt, dev, &status_url(realm)).await;
     if status == 0 {
         return none(if raw.is_empty() { "网络异常" } else { &raw });
     }
@@ -310,6 +402,7 @@ async fn status_check(jwt: &str, dev: &DeviceEntry) -> StatusOutcome {
             checked_in: None,
             credits: None,
             message: format!("非 JSON 响应: {head}"),
+            busy: false,
         };
     };
     // code 只取**顶层**：向下挖会把嵌套对象里的无关业务码当成响应码
@@ -324,6 +417,8 @@ async fn status_check(jwt: &str, dev: &DeviceEntry) -> StatusOutcome {
             checked_in: None,
             credits: None,
             message: format!("[{code:?}] {message}"),
+            // 9074 = 上游忙，不是账号问题
+            busy: code == Some(CODE_UPSTREAM_BUSY),
         };
     }
     let checked_in = find_payload_field(&data, "checked_in")
@@ -335,13 +430,86 @@ async fn status_check(jwt: &str, dev: &DeviceEntry) -> StatusOutcome {
         checked_in,
         credits,
         message: "查询成功".to_string(),
+        busy: false,
+    }
+}
+
+/// JWT 探活结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JwtLiveness {
+    /// 服务端明确接受该 JWT
+    Alive,
+    /// 服务端明确拒绝（401 / 业务码 1001）—— 需要重新登录
+    Dead(String),
+    /// 探不出来（网络异常 / 代理未启动 / 响应无法解析）
+    ///
+    /// **必须与 `Dead` 区分**：把网络问题当成失效会把一批好账号标成需要重登，
+    /// 用户按提示去重登却发现账号本来是好的。
+    Unknown(String),
+}
+
+impl JwtLiveness {
+    pub fn is_dead(&self) -> bool {
+        matches!(self, JwtLiveness::Dead(_))
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            JwtLiveness::Alive => "JWT 有效",
+            JwtLiveness::Dead(m) | JwtLiveness::Unknown(m) => m,
+        }
+    }
+}
+
+/// 服务端「JWT 已失效」的业务码（抓包固化）。
+const CODE_SESSION_DEAD: i64 = 1001;
+
+/// 探一次 JWT 是否还能用（切换账号前的预检）。
+///
+/// 复用签到 status 接口：它是唯一一个「无副作用且必然校验登录态」的端点，
+/// 单独为此发明一个探测请求既没必要也更容易被风控注意到。
+///
+/// **失败放行**（返回 `Unknown` 而不是 `Dead`）：调用方据此只给警告、不阻断切换。
+/// 硬阻断会锁死「需要重新登录才能修好的账号」—— 而重新登录的入口恰恰就在切换
+/// 流程里，形成死锁。
+pub async fn probe_jwt_alive(
+    jwt: &str,
+    dev: &DeviceEntry,
+    realm: trae_realm::Realm,
+) -> JwtLiveness {
+    let jwt = jwt.trim();
+    if jwt.is_empty() {
+        return JwtLiveness::Dead("JWT 为空".to_string());
+    }
+    let (status, body, raw) = http_post(jwt, dev, &status_url(realm)).await;
+    if status == 0 {
+        return JwtLiveness::Unknown(if raw.is_empty() {
+            "探活失败：网络异常".to_string()
+        } else {
+            format!("探活失败：{raw}")
+        });
+    }
+    if status == 401 {
+        return JwtLiveness::Dead("JWT 已失效（HTTP 401），需要重新登录".to_string());
+    }
+    let Some(data) = body.filter(|b| b.is_object()) else {
+        let head: String = raw.chars().take(200).collect();
+        return JwtLiveness::Unknown(format!("探活失败：非 JSON 响应 {head}"));
+    };
+    match data.get("code").and_then(Value::as_i64) {
+        Some(CODE_SESSION_DEAD) => {
+            let detail = find_payload_field(&data, "message")
+                .and_then(Value::as_str)
+                .unwrap_or("登录态失效");
+            JwtLiveness::Dead(format!("JWT 已失效（业务码 {CODE_SESSION_DEAD}：{detail}）"))
+        }
+        // 其他非 0 业务码（如套餐用尽 1005）说明**登录态本身有效**，只是业务受限
+        Some(c) if c != 0 => JwtLiveness::Alive,
+        _ => JwtLiveness::Alive,
     }
 }
 
 /// 从 claim 响应解析本次奖励积分。
-///
-/// 只接受**正数**：零值占位字段（很多响应会带 `reward: 0`）会遮蔽后面真正的字段，
-/// 若允许 0 通过就会把「签到得了 50 分」记成 0 分。
 fn parse_claim_reward(data: &Value) -> Option<i64> {
     let scopes = unwrap_scopes(data);
     // 内层优先：越深越接近真实业务数据
@@ -358,19 +526,24 @@ fn parse_claim_reward(data: &Value) -> Option<i64> {
 }
 
 /// 执行一次 claim（不重试）。
-async fn signin_request(jwt: &str, dev: &DeviceEntry) -> (i32, Option<Value>, String) {
-    http_post(jwt, dev, SIGNIN_URL).await
+async fn signin_request(
+    jwt: &str,
+    dev: &DeviceEntry,
+    realm: trae_realm::Realm,
+) -> (i32, Option<Value>, String) {
+    http_post(jwt, dev, &signin_url(realm)).await
 }
 
 /// 带重试的 claim：**只**在网络异常时重试。
 async fn signin_with_retry(
     jwt: &str,
     dev: &DeviceEntry,
+    realm: trae_realm::Realm,
     retry: u32,
 ) -> (i32, Option<Value>, String) {
     let mut attempt = 0u32;
     loop {
-        let (status, body, raw) = signin_request(jwt, dev).await;
+        let (status, body, raw) = signin_request(jwt, dev, realm).await;
         // 业务失败不重试：服务端已经明确拒绝，再打一次只会再失败一次并加重风控
         if status != 0 || attempt >= retry {
             return (status, body, raw);
@@ -385,6 +558,7 @@ async fn resolve_claim_credits(
     claim_body: Option<&Value>,
     jwt: &str,
     dev: &DeviceEntry,
+    realm: trae_realm::Realm,
     credits_before: Option<i64>,
 ) -> (Option<i64>, Option<i64>) {
     // 第一层：claim 响应自身的奖励字段（接口返回为准）
@@ -392,7 +566,7 @@ async fn resolve_claim_credits(
         return (Some(reward), credits_before);
     }
     // 第二层：复查余额差值
-    let after = status_check(jwt, dev).await;
+    let after = status_check(jwt, dev, realm).await;
     if after.ok {
         if let (Some(before), Some(after_credits)) = (credits_before, after.credits) {
             let delta = after_credits - before;
@@ -411,6 +585,7 @@ pub async fn checkin_account(
     jwt: &str,
     uid: &str,
     name: &str,
+    realm: trae_realm::Realm,
     retry: u32,
 ) -> AccountOutcome {
     let mut outcome = AccountOutcome {
@@ -438,14 +613,39 @@ pub async fn checkin_account(
         }
     }
     let dev = trae_device::resolve_device(uid);
+    let now = config::now_secs();
 
-    // 1. status 预检
-    let pre = status_check(jwt, &dev).await;
+    // 1. status 预检（**独立限流**：claim 侧的 9074 退避不影响这里）
+    //
+    // 为什么预检不被 claim 退避挡住：两个端点在上游是分开限流的，claim 吃 9074
+    // 时 status 往往照常返回 code=0。若因为 claim 忙就连状态都不查，界面会一直
+    // 停在过期的「未签到」，用户看到的是假信息。
+    let mut pre = StatusOutcome {
+        ok: false,
+        checked_in: None,
+        credits: None,
+        message: String::new(),
+        busy: false,
+    };
+    let status_wait = status_busy_remaining(uid, now);
+    if status_wait > 0 {
+        // status 侧 9074 冷却中（仅内存）：本轮不探测，但**继续走 claim**
+        pre.message = format!("status 探测冷却中（剩余 {status_wait}s）");
+    } else {
+        pre = status_check(jwt, &dev, realm).await;
+        if pre.busy {
+            // status 端点自己吃了 9074：只推迟**探测**，不动 claim 的可用性
+            mark_status_busy(uid, config::now_secs(), CHECKIN_9074_RETRY_SECS);
+        }
+    }
     if pre.ok && pre.checked_in == Some(true) {
         outcome.status = "already";
         outcome.credits = pre.credits;
         outcome.delta = Some(0);
         outcome.message = format!("{}今日已签到", outcome.message);
+        // 今日已完成：残留的 9074 退避只会让下一轮做无谓的跳过，清掉
+        clear_upstream_busy(uid);
+        clear_status_busy(uid);
         return outcome;
     }
     // 预检失败不阻断 claim（预检只是优化，claim 才是权威），但要把原因带上 ——
@@ -455,8 +655,26 @@ pub async fn checkin_account(
     }
     let credits_before = pre.credits;
 
-    // 2. claim
-    let (status, body, raw) = signin_with_retry(jwt, &dev, retry).await;
+    // 2. claim —— 先看 9074 退避窗口
+    //
+    // ★ 这里返回 `skip` 而不是 `fail`：账号是健康的，只是**这一次**没去打上游。
+    // 而且 `run_round` 的冷却跳过发生在更外层（会连 status 都不查），本窗口
+    // 刻意**不**进那张表，所以账号仍会正常出现在每轮结果里。
+    if let Some(until) = busy_until(uid) {
+        if until > now {
+            outcome.status = "skip";
+            outcome.error_type = Some(ErrorKind::UpstreamBusy.as_str().to_string());
+            outcome.message = format!(
+                "{}上游繁忙退避中（剩余 {}s），本轮未发起 claim",
+                outcome.message,
+                until - now
+            );
+            // ★ 不写 trae_cooldowns.json ⇒ `cooldown_until(uid)` 仍是 None
+            return outcome;
+        }
+    }
+
+    let (status, body, raw) = signin_with_retry(jwt, &dev, realm, retry).await;
     let code = body.as_ref().and_then(|b| b.get("code")).and_then(Value::as_i64);
     outcome.code = code;
 
@@ -466,15 +684,24 @@ pub async fn checkin_account(
         outcome.error_type = Some(ErrorKind::Unknown.as_str().to_string());
         return outcome;
     }
-    let business_ok = code.is_none_or(|c| c == 0);
-    if status == 200 && business_ok {
-        let (delta, credits) = resolve_claim_credits(body.as_ref(), jwt, &dev, credits_before).await;
+
+    // ★ 成功判定：**必须 code == 0**，HTTP 200 本身不算成功。
+    //
+    // 上游确实出现过「HTTP 200 但 code 非 0（或缺失）」的响应；只认状态码会把
+    // 这类响应记成签到成功，账号从此不再重试，用户当天实际一分没领到却看到
+    // 「签到成功」。缺失 code 归到 `Unknown`（不落冷却）而不是直接判失败，
+    // 是为了在「上游真的不返回 code」这种未知形态下仍能继续重试而不是永久卡死。
+    if status == 200 && code == Some(0) {
+        let (delta, credits) =
+            resolve_claim_credits(body.as_ref(), jwt, &dev, realm, credits_before).await;
         outcome.status = "success";
         outcome.delta = delta;
         outcome.credits = credits;
         let reward_text = delta.map(|d| format!("获得 {d} 积分")).unwrap_or_default();
         outcome.message = format!("{}签到成功 {reward_text}", outcome.message);
         clear_cooldown(uid);
+        clear_upstream_busy(uid);
+        clear_status_busy(uid);
         record_credits_history(uid, credits, delta);
         return outcome;
     }
@@ -486,14 +713,33 @@ pub async fn checkin_account(
         .and_then(|b| find_payload_field(b, "message"))
         .and_then(Value::as_str)
         .map(str::to_string)
-        .unwrap_or_else(|| raw.chars().take(200).collect());
+        .unwrap_or_else(|| {
+            if status == 200 && code.is_none() {
+                "HTTP 200 但响应缺少 code 字段，无法确认签到成功".to_string()
+            } else {
+                raw.chars().take(200).collect()
+            }
+        });
     outcome.message = format!("{}{}", outcome.message, message);
     outcome.error_type = Some(kind.as_str().to_string());
-    let now = config::now_secs();
-    if let Some(until) = kind.cooldown_until(now) {
-        save_cooldown(uid, kind.as_str(), until, &message);
-        outcome.cooldown_until = Some(until);
+
+    // ★ 9074 单独处理：**不落账号冷却**，只推进独立退避窗口。
+    //
+    // 为什么不能走 `register_failure`：那条路径会往 `trae_cooldowns.json` 写记录，
+    // 于是 `cooldown_until(uid)` 变成 Some、`all_cooldowns()` 里出现该账号、
+    // `run_round` 下一轮直接跳过 —— 界面上这个账号就变成「冷却中/不健康」了。
+    // 但 9074 的含义是「服务端此刻忙」，与这个账号的健康状况无关。
+    if kind == ErrorKind::UpstreamBusy {
+        let backoff = register_upstream_busy(uid, now);
+        outcome.cooldown_until = None;
+        outcome.message = format!(
+            "{}（上游繁忙 9074：账号本身正常，仅本次 claim 推迟，{}s 后可重试）",
+            outcome.message, backoff
+        );
+        return outcome;
     }
+
+    outcome.cooldown_until = register_failure(uid, &kind, now, &message);
     outcome
 }
 
@@ -504,30 +750,44 @@ pub async fn run_round(accounts: &[Value], retry: u32) -> RoundSummary {
         let uid = acc.get("user_id").and_then(Value::as_str).unwrap_or("");
         let name = trae_account::display_name(acc);
         let jwt = acc.get("jwt").and_then(Value::as_str).unwrap_or("");
+        // 区域随账号走：国际号必须打国际 host，否则签到必然 401
+        let realm = trae_account::account_realm(acc).realm;
 
         // 冷却中的账号跳过（避免对已判定失效/限流的账号持续打请求）
         if let Some(until) = cooldown_until(uid) {
             if until > config::now_secs() {
                 summary.skipped += 1;
+                // 跳过必须带出**原因**：只写「冷却中」等于把真正的失败原因
+                // （套餐限制 / 会话失效 / 限流…）吞掉，用户在结果区只看到「跳过」，
+                // 无从判断该重新登录、还是明天再来。
+                let (kind, reason) = cooldown_info(uid);
+                let kind = kind.unwrap_or_else(|| ErrorKind::Unknown.as_str().to_string());
+                let message = match reason {
+                    Some(reason) => format!("{COOLDOWN_SKIP_MSG}（{kind}：{reason}）"),
+                    None => COOLDOWN_SKIP_MSG.to_string(),
+                };
                 summary.outcomes.push(AccountOutcome {
                     user_id: uid.to_string(),
                     name,
                     status: "skip",
                     code: None,
-                    message: "冷却中，本轮跳过".to_string(),
+                    message,
                     credits: None,
                     delta: None,
-                    error_type: None,
+                    error_type: Some(kind),
                     cooldown_until: Some(until),
                 });
                 continue;
             }
         }
 
-        let outcome = checkin_account(jwt, uid, &name, retry).await;
+        let outcome = checkin_account(jwt, uid, &name, realm, retry).await;
         match outcome.status {
             "success" => summary.ok += 1,
             "already" => summary.already += 1,
+            // 本轮没打上游（冷却中 / 9074 退避中）→ 计 skip 而不是 failed。
+            // 计成失败会让「签到失败数」把根本没尝试的账号也算进去。
+            "skip" => summary.skipped += 1,
             _ => summary.failed += 1,
         }
         summary.outcomes.push(outcome);
@@ -535,6 +795,105 @@ pub async fn run_round(accounts: &[Value], retry: u32) -> RoundSummary {
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     }
     summary
+}
+
+// ---------------------------------------------------------------------------
+// 「今天签到了吗」—— 只查状态、不发 claim
+// ---------------------------------------------------------------------------
+
+/// 单个账号「今天签到了吗」的查询结果。
+///
+/// ★ 三态是刻意的：`checked_in == None` 表示**没问到**（网络异常 / 上游 9074 /
+/// status 侧冷却中），不是「未签到」。界面上必须区分这两者，否则一次网络抖动
+/// 就会把已经签过的账号画成「未签到」，用户会重复去点签到。
+pub struct TodayStatus {
+    /// `Some(true)` 已签 / `Some(false)` 未签 / `None` 没问到。
+    pub checked_in: Option<bool>,
+    /// 上游返回的当前积分（仅当 status 端点给了才填）。
+    pub credits: Option<i64>,
+    /// 人类可读说明（失败时带原因）。
+    pub message: String,
+    /// 是否真的从上游拿到了可用答复。
+    pub ok: bool,
+}
+
+/// 查单个账号今天的签到状态（**只读**，不触发 claim）。
+///
+/// 与 `checkin_account` 的区别：那个会真去打 claim，这个只问上游「签了没」。
+/// 界面每次打开都想知道当天状态，但**绝不能**为了显示状态去签到。
+pub async fn today_status(jwt: &str, uid: &str) -> TodayStatus {
+    let realm = realm_for_uid(uid);
+    let mut out = TodayStatus {
+        checked_in: None,
+        credits: None,
+        message: String::new(),
+        ok: false,
+    };
+    if jwt.trim().is_empty() {
+        out.message = "未配置 JWT".to_string();
+        return out;
+    }
+    let dev = trae_device::resolve_device(uid);
+    let now = config::now_secs();
+
+    // 与 checkin_account 共用同一张 status 侧 9074 冷却表：既然刚被上游拒过，
+    // 这里再打一次只会把 9074 拖得更久。
+    let wait = status_busy_remaining(uid, now);
+    if wait > 0 {
+        out.message = format!("status 探测冷却中（剩余 {wait}s）");
+        return out;
+    }
+
+    let st = status_check(jwt, &dev, realm).await;
+    if st.busy {
+        mark_status_busy(uid, config::now_secs(), CHECKIN_9074_RETRY_SECS);
+    }
+    out.ok = st.ok;
+    out.checked_in = st.checked_in;
+    out.credits = st.credits;
+    out.message = st.message;
+    out
+}
+
+/// 把**所有** Trae 账号的今日签到状态刷进落库表，返回拿到确定状态的账号数。
+///
+/// 为什么需要它：落库表 `trae_checkin_results.json` 过去只有「一键签到」这一个
+/// 写入方，于是「用户今天早就签过了、只是没在界面上点签到」这种情况下表里是空
+/// 的，界面就永远显示不出「已签到」。这里用上游 status 端点补一次只读探测，把
+/// **上游确认过**的答案落库 —— 拿不到答案的账号**不写**，缺键在界面上仍是
+/// 「不知道」而不是「未签到」。
+///
+/// 串行执行（与 `trae_credits::refresh_all_pay_status` 一致）：core 没有 `futures`
+/// 依赖，且账号间隔本就是风控要求。
+pub async fn refresh_today() -> usize {
+    let accounts = trae_account::load_accounts();
+    let mut confirmed: Vec<(String, String, String)> = Vec::new();
+    for acc in &accounts {
+        let uid = acc.get("user_id").and_then(Value::as_str).unwrap_or("");
+        if uid.is_empty() {
+            continue;
+        }
+        let jwt = acc.get("jwt").and_then(Value::as_str).unwrap_or("");
+        if jwt.trim().is_empty() {
+            continue;
+        }
+        let st = today_status(jwt, uid).await;
+        if let Some(checked) = st.checked_in {
+            confirmed.push((
+                uid.to_string(),
+                trae_account::display_name(acc),
+                if checked { "checked_in" } else { "not_checked_in" }.to_string(),
+            ));
+        }
+        // 账号间隔，避免触发风控（与 run_round 同量级，略短：这里只是查询）
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let count = confirmed.len();
+    // ★ 用 record_probe_today 而不是 record_today：探针只是「今天签没签」的只读结论，
+    // 不能覆盖当天真实的跑签结果 —— 一次 fail 被随手上报的 not_checked_in 抹掉，
+    // 就等于把失败藏起来了。空输入也不会建出空日期条目（内部先判空）。
+    trae_checkin_results::record_probe_today(confirmed);
+    count
 }
 
 // ---------------------------------------------------------------------------
@@ -562,23 +921,78 @@ fn save_cooldowns(map: &serde_json::Map<String, Value>) {
     let _ = config::atomic_write(&path, &content);
 }
 
-/// 账号当前冷却截止时间（无冷却返回 `None`）。
-pub fn cooldown_until(uid: &str) -> Option<i64> {
-    load_cooldowns()
-        .get(uid)?
-        .get("until")
-        .and_then(Value::as_i64)
+/// 需要「连续失败若干次」才真正落冷却的失败类型（瞬时故障）。
+///
+/// 为什么这两类要特殊对待：5xx 与普通 4xx 通常是服务端抖动或网关瞬时拒绝，
+/// 单次失败就给账号坐 10 分钟冷板凳，会让整批签到里偶发的一次抖动直接吞掉该账号
+/// 当天的签到机会（而且用户看到的是「冷却中」，看不出只是抖动）。上游的实测结论
+/// 是连续 3 次才算真故障。
+pub const TRANSIENT_TRIP_KINDS: [&str; 2] =
+    [ErrorKind::Server.as_str(), ErrorKind::Client.as_str()];
+
+/// 瞬时故障连续几次才落冷却。
+pub const TRANSIENT_FAILS_TO_TRIP: i64 = 3;
+
+/// 只计数、不落冷却时的 `until` 占位值。
+///
+/// 用 0 而不是「不写记录」：`error_count` 需要跨轮次保留才能数到 3。
+/// 同时 [`cooldown_until`] 会把 `<= 0` 视作「无冷却」，
+/// 于是 `run_round` / 抓包代理都不会误跳过一个只是在计数的账号。
+const COUNT_ONLY_UNTIL: i64 = 0;
+
+/// 冷却中账号被跳过时的固定前缀。
+///
+/// 抽成常量：这段文案既上界面又被单测锚定，散落的字面量改一处漏一处。
+const COOLDOWN_SKIP_MSG: &str = "冷却中，本轮跳过";
+
+/// 账号当前冷却的**原因**（失败类型、可读原因）。
+///
+/// 冷却中的账号在 [`run_round`] 里被跳过。跳过结果如果只写「冷却中」，用户就
+/// 永远看不到**为什么**——真正的失败原因（套餐限制 / 会话失效 / 限流…）被冷却
+/// 机制吞掉了，界面上只剩一个「跳过」。这里把落冷却时写下的 `type` / `reason`
+/// 带出来，让跳过结果自己说明原因。
+pub fn cooldown_info(uid: &str) -> (Option<String>, Option<String>) {
+    let Some(rec) = load_cooldowns().get(uid).cloned() else {
+        return (None, None);
+    };
+    let kind = rec.get("type").and_then(Value::as_str).map(str::to_string);
+    let reason = rec
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    (kind, reason)
 }
 
-/// 记录冷却。
-pub fn save_cooldown(uid: &str, kind: &str, until: i64, reason: &str) {
-    let mut map = load_cooldowns();
-    let error_count = map
+/// 账号当前冷却截止时间（无冷却返回 `None`）。
+///
+/// `until <= 0` 是「只计数未落冷却」的占位记录，必须返回 `None`，
+/// 否则调用方（`run_round`、抓包代理）会把账号当成冷却中而跳过。
+pub fn cooldown_until(uid: &str) -> Option<i64> {
+    let until = load_cooldowns()
+        .get(uid)?
+        .get("until")
+        .and_then(Value::as_i64)?;
+    if until <= COUNT_ONLY_UNTIL {
+        None
+    } else {
+        Some(until)
+    }
+}
+
+/// 当前连续失败次数（供界面展示与判断是否即将落冷却）。
+pub fn error_count(uid: &str) -> i64 {
+    load_cooldowns()
         .get(uid)
         .and_then(|v| v.get("error_count"))
         .and_then(Value::as_i64)
         .unwrap_or(0)
-        + 1;
+}
+
+/// 写一条冷却/计数记录。
+fn write_cooldown(uid: &str, kind: &str, until: i64, reason: &str, error_count: i64) {
+    let mut map = load_cooldowns();
     map.insert(
         uid.to_string(),
         json!({
@@ -591,17 +1005,223 @@ pub fn save_cooldown(uid: &str, kind: &str, until: i64, reason: &str) {
     save_cooldowns(&map);
 }
 
-/// 清除冷却（签到成功后调用）。
-pub fn clear_cooldown(uid: &str) {
+/// 记录一次失败，并决定是否真的落冷却。
+///
+/// 返回**生效**的冷却截止时间；`None` 表示「只计数、不落冷却」
+/// （瞬时故障尚未达到 [`TRANSIENT_FAILS_TO_TRIP`]）。
+pub fn register_failure(uid: &str, kind: &ErrorKind, now: i64, reason: &str) -> Option<i64> {
+    let planned = kind.cooldown_until(now)?;
+    let kind_str = kind.as_str();
+
+    if !TRANSIENT_TRIP_KINDS.contains(&kind_str) {
+        // 非瞬时故障（会话失效 / 套餐限制 / 限流 / 接口不存在 / 业务错误）：
+        // 语义明确，立刻落冷却。保留累计次数供排查。
+        let next = error_count(uid) + 1;
+        write_cooldown(uid, kind_str, planned, reason, next);
+        return Some(planned);
+    }
+
+    let count = error_count(uid) + 1;
+    if count < TRANSIENT_FAILS_TO_TRIP {
+        // 只计数：until 占位 0，cooldown_until 会返回 None，下一个账号继续跑
+        write_cooldown(uid, kind_str, COUNT_ONLY_UNTIL, reason, count);
+        return None;
+    }
+    // 连续到阈值：落冷却并把计数清零，避免恢复后一次抖动又立刻冷板凳
+    write_cooldown(uid, kind_str, planned, reason, 0);
+    Some(planned)
+}
+
+/// 记录冷却（**低层写入**，不参与「连续失败计数」判定）。
+///
+/// 业务判定请用 [`register_failure`]；此函数保留给需要无条件写入冷板凳的场景
+/// （以及既有测试），它会无条件累加 `error_count`。
+pub fn save_cooldown(uid: &str, kind: &str, until: i64, reason: &str) {
+    let next = error_count(uid) + 1;
+    write_cooldown(uid, kind, until, reason, next);
+}
+
+/// 清除冷却（签到成功后调用）。返回是否真的移除了记录。
+///
+/// 返回值让调用方能在「确实清掉了一条」时才打日志；同时**无条件移除**整条记录，
+/// 避免只计数（`until == 0`）的残留记录被漏清 —— 那种记录虽然不阻塞签到，
+/// 但会让下一次瞬时失败直接数到阈值。
+pub fn clear_cooldown(uid: &str) -> bool {
     let mut map = load_cooldowns();
     if map.remove(uid).is_some() {
         save_cooldowns(&map);
+        true
+    } else {
+        false
     }
+}
+
+/// 清除**全部**账号的冷却记录，返回清掉的条数。
+///
+/// 界面上的「全部清除冷却」用于一键恢复：比如换网络环境后整批账号都被限流，
+/// 逐条点太慢。返回条数让界面能如实说「已清除 N 条」而不是笼统的「操作成功」。
+pub fn clear_all_cooldowns() -> usize {
+    let count = load_cooldowns().len();
+    if count > 0 {
+        save_cooldowns(&serde_json::Map::new());
+    }
+    count
 }
 
 /// 全部冷却记录（供界面展示）。
 pub fn all_cooldowns() -> Value {
     Value::Object(load_cooldowns())
+}
+
+// ---------------------------------------------------------------------------
+// 9074 退避表（`<store_dir>/trae_busy.json`）
+// ---------------------------------------------------------------------------
+
+/// 9074 退避状态文件。
+///
+/// **刻意与 `trae_cooldowns.json` 分开**：那张表语义是「这个账号现在别用」，
+/// 会被 [`cooldown_until`] / `all_cooldowns()` / `run_round` 当成账号不健康，
+/// 界面上也会显示成「冷却中」。而 9074 只是「上游此刻忙」，账号本身没问题 ——
+/// 混进去就会让一批好账号在界面上看起来像坏了。
+fn busy_file() -> std::path::PathBuf {
+    config::store_dir().join("trae_busy.json")
+}
+
+fn load_busy() -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(busy_file())
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn save_busy(map: &serde_json::Map<String, Value>) {
+    let path = busy_file();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let content = serde_json::to_string_pretty(&Value::Object(map.clone())).unwrap_or_default();
+    let _ = config::atomic_write(&path, &content);
+}
+
+/// 该账号连续吃到的 9074 次数。
+pub fn busy_streak(uid: &str) -> i64 {
+    load_busy()
+        .get(uid)
+        .and_then(|v| v.get("count"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+}
+
+/// 9074 退避的截止时间戳（秒）；`None` 表示当前没有退避。
+///
+/// ★ **这不是账号冷却**。调用方只应据此推迟 **claim**，不得据此把账号
+/// 标成 unhealthy / cooling，也不得据此跳过 status 预检。
+pub fn busy_until(uid: &str) -> Option<i64> {
+    let until = load_busy()
+        .get(uid)?
+        .get("until")
+        .and_then(Value::as_i64)?;
+    (until > 0).then_some(until)
+}
+
+/// 计算下一次 9074 的退避秒数（纯函数，便于测试）。
+///
+/// `backoff = base * 2^min(count, CAP)`，再夹到 `[base, MAX]`。
+///
+/// 为什么加指数帽：9074 是上游容量信号而不是对账号的惩罚，且每次重试本来就
+/// 会带上不同的设备指纹。不加帽时 `60 * 2^6 = 3840 > 3600` 就顶到上限，
+/// 一个当天还没签上的账号会被一路推到小时级，很可能当天再也轮不上。
+/// 加帽后最坏是 `60 * 2^3 = 480s`（8 分钟），仍在「当天还能重试很多次」的范围。
+pub fn next_busy_backoff(count: i64) -> i64 {
+    let base = CHECKIN_9074_RETRY_SECS;
+    let exponent = count.clamp(0, CHECKIN_9074_BACKOFF_EXPONENT_CAP as i64) as u32;
+    let backoff = base.saturating_mul(1i64 << exponent);
+    backoff.clamp(base, CHECKIN_9074_MAX_BACKOFF_SECS.max(base))
+}
+
+/// 记录一次 9074，返回本次退避秒数。
+///
+/// **持久化**（跨重启生效）：上游的容量窗口不会因为我们重启就消失，
+/// 重启后立刻重打只会再吃一次 9074。这与 status 侧的仅内存冷却相反 ——
+/// 见 [`status_busy_remaining`]。
+pub fn register_upstream_busy(uid: &str, now: i64) -> i64 {
+    let count = busy_streak(uid) + 1;
+    let backoff = next_busy_backoff(count - 1);
+    let mut map = load_busy();
+    map.insert(
+        uid.to_string(),
+        json!({
+            "until": now + backoff,
+            "count": count,
+            "backoff": backoff,
+        }),
+    );
+    save_busy(&map);
+    backoff
+}
+
+/// 清除 9074 退避（claim 成功或已确认今日签到时调用）。
+pub fn clear_upstream_busy(uid: &str) -> bool {
+    let mut map = load_busy();
+    if map.remove(uid).is_some() {
+        save_busy(&map);
+        true
+    } else {
+        false
+    }
+}
+
+/// 全部 9074 退避记录（供界面展示与排查）。
+pub fn all_busy() -> Value {
+    Value::Object(load_busy())
+}
+
+// ---------------------------------------------------------------------------
+// status 侧 9074 冷却（**仅内存**，刻意不持久化）
+// ---------------------------------------------------------------------------
+
+static STATUS_BUSY_UNTIL: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+
+fn status_busy_until() -> &'static Mutex<HashMap<String, i64>> {
+    STATUS_BUSY_UNTIL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 标记 status 端点在 `now` 起 `secs` 秒内不要再打。
+///
+/// **仅内存**，这是刻意的：claim 侧的 9074 常见且必须跨重启保留，
+/// 而 status 侧的 9074 罕见 —— 它只说明**探测**这一个动作被限流了。
+/// 若也落盘，一次偶发就会把该账号的签到预检锁很久（甚至跨重启），
+/// 表现成「账号明明能签，界面却一直说查不到状态」。
+pub fn mark_status_busy(uid: &str, now: i64, secs: i64) {
+    let mut map = status_busy_until()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.insert(uid.to_string(), now + secs.max(1));
+}
+
+/// status 侧 9074 的剩余秒数；`0` 表示可以探测。
+pub fn status_busy_remaining(uid: &str, now: i64) -> i64 {
+    let mut map = status_busy_until()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match map.get(uid) {
+        Some(&until) if until > now => until - now,
+        Some(_) => {
+            map.remove(uid);
+            0
+        }
+        None => 0,
+    }
+}
+
+/// 清除 status 侧冷却（仅内存）。
+pub fn clear_status_busy(uid: &str) -> bool {
+    status_busy_until()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(uid)
+        .is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -674,6 +1294,204 @@ mod tests {
         assert_eq!(classify_error(400, None), ErrorKind::Client);
         assert_eq!(classify_error(403, None), ErrorKind::Client);
         assert_eq!(classify_error(0, None), ErrorKind::Unknown);
+    }
+
+    /// 9074 必须独立分类，且在**任何** HTTP 状态码下都优先命中。
+    ///
+    /// 上游用过 200 / 429 / 503 三种承载方式；若漏判成 `BusinessError`，
+    /// 账号会被写进冷却表（界面上变成「冷却中」），而它其实完全健康。
+    #[test]
+    fn 上游繁忙码独立分类且跨状态码优先() {
+        assert_eq!(classify_error(200, Some(9074)), ErrorKind::UpstreamBusy);
+        assert_eq!(
+            classify_error(429, Some(9074)),
+            ErrorKind::UpstreamBusy,
+            "429 承载的 9074 仍是容量信号，不得降级成 SoftRate"
+        );
+        assert_eq!(
+            classify_error(503, Some(9074)),
+            ErrorKind::UpstreamBusy,
+            "503 承载的 9074 不得降级成 Server（那会冷却账号 10 分钟）"
+        );
+        assert_eq!(classify_error(500, Some(9074)), ErrorKind::UpstreamBusy);
+        assert_eq!(classify_error(0, Some(9074)), ErrorKind::UpstreamBusy);
+        // 分类名要能被前端与重试筛选看到
+        assert_eq!(ErrorKind::UpstreamBusy.as_str(), "UpstreamBusy");
+    }
+
+    /// ★ 核心回归：9074 **不得**让账号落冷却。
+    ///
+    /// 这是「9074 是上游容量信号，不是对账号的惩罚」这条语义的可执行断言。
+    #[test]
+    fn 上游繁忙不落账号冷却() {
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae-busy-nocool");
+        let uid = "u-busy-nocool";
+        let now = 1_700_000_000;
+
+        // 即使连打 10 次 9074，账号冷却表也必须始终为空
+        for i in 0..10 {
+            assert_eq!(
+                ErrorKind::UpstreamBusy.cooldown_until(now),
+                None,
+                "第 {i} 次：UpstreamBusy 不得产生冷却截止时间"
+            );
+            register_upstream_busy(uid, now);
+            assert_eq!(
+                cooldown_until(uid),
+                None,
+                "第 {i} 次：9074 后 cooldown_until 必须仍是 None —— \
+                 否则 run_round 会跳过该账号、界面会显示成「冷却中」"
+            );
+            assert_eq!(
+                error_count(uid),
+                0,
+                "第 {i} 次：9074 不得累加 error_count（那是瞬时故障的三振计数）"
+            );
+        }
+        // 也不得出现在 all_cooldowns() 里（界面据此渲染「冷却中」）
+        assert!(
+            all_cooldowns().get(uid).is_none(),
+            "9074 的账号不得出现在冷却表里"
+        );
+        // 但它确实产生了退避，且走的是独立通道
+        assert!(busy_until(uid).is_some(), "9074 必须产生退避窗口");
+        assert_eq!(busy_streak(uid), 10, "退避连击次数应被记录");
+    }
+
+    /// 退避序列：60 → 120 → 240 → 480（加帽），并在上限内收敛。
+    #[test]
+    fn 上游繁忙退避按指数增长并加帽() {
+        assert_eq!(next_busy_backoff(0), 60, "首次 60s");
+        assert_eq!(next_busy_backoff(1), 120);
+        assert_eq!(next_busy_backoff(2), 240);
+        assert_eq!(next_busy_backoff(3), 480, "指数帽 3 ⇒ 60*2^3");
+        // 超过帽子后不再翻倍：这是「当天还能重试很多次」的关键
+        assert_eq!(next_busy_backoff(4), 480);
+        assert_eq!(next_busy_backoff(9), 480);
+        assert_eq!(next_busy_backoff(100), 480);
+        // 负数/异常输入夹到 base，不 panic
+        assert_eq!(next_busy_backoff(-5), 60);
+        // 任何输入都不得超过上限
+        for c in 0..200 {
+            let b = next_busy_backoff(c);
+            assert!(
+                (CHECKIN_9074_RETRY_SECS..=CHECKIN_9074_MAX_BACKOFF_SECS).contains(&b),
+                "count={c} 的退避 {b} 越界"
+            );
+        }
+    }
+
+    /// 退避窗口**持久化**（跨重启生效），且能被成功/已签清除。
+    #[test]
+    fn 上游繁忙退避持久化并可清除() {
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae-busy-persist");
+        let uid = "u-busy-persist";
+        let now = 1_700_000_000;
+
+        assert_eq!(busy_until(uid), None);
+        assert_eq!(busy_streak(uid), 0);
+
+        let b1 = register_upstream_busy(uid, now);
+        assert_eq!(b1, 60);
+        assert_eq!(busy_until(uid), Some(now + 60));
+        assert_eq!(busy_streak(uid), 1);
+
+        let b2 = register_upstream_busy(uid, now);
+        assert_eq!(b2, 120, "第二次退避翻倍");
+        assert_eq!(busy_until(uid), Some(now + 120));
+        assert_eq!(busy_streak(uid), 2);
+
+        // 落盘：重新读一次文件仍能看到（模拟重启后 load_busy）
+        let raw = std::fs::read_to_string(busy_file()).expect("退避状态必须落盘");
+        assert!(raw.contains(uid), "落盘内容应含该账号");
+        assert!(
+            raw.contains("\"count\": 2") || raw.contains("\"count\":2"),
+            "落盘内容应含连击次数：{raw}"
+        );
+
+        // 清一次
+        assert!(clear_upstream_busy(uid), "有记录时应返回 true");
+        assert_eq!(busy_until(uid), None);
+        assert_eq!(busy_streak(uid), 0);
+        assert!(!clear_upstream_busy(uid), "无记录时返回 false");
+    }
+
+    /// 退避表与冷却表是**两张独立的表**，互不污染。
+    #[test]
+    fn 上游繁忙与账号冷却互不污染() {
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae-busy-separate");
+        let now = 1_700_000_000;
+
+        // 同一个账号先吃 9074，再吃一次真 5xx
+        register_upstream_busy("u-mix", now);
+        assert!(busy_until("u-mix").is_some());
+        assert_eq!(cooldown_until("u-mix"), None);
+
+        // 5xx 的三振计数**不得**被 9074 的连击污染：这里第 1 次 5xx 只计数
+        assert_eq!(
+            register_failure("u-mix", &ErrorKind::Server, now, "500"),
+            None,
+            "9074 的连击不得把 5xx 直接推到三振阈值"
+        );
+        assert_eq!(error_count("u-mix"), 1);
+
+        // 两个方向：清冷却不影响退避
+        register_upstream_busy("u-mix", now);
+        clear_cooldown("u-mix");
+        assert!(busy_until("u-mix").is_some(), "清冷却不得清掉退避窗口");
+        clear_upstream_busy("u-mix");
+        assert!(busy_until("u-mix").is_none());
+    }
+
+    /// status 侧 9074 冷却：**仅内存**、可查询剩余、到期自动清除。
+    #[test]
+    fn 状态探测冷却仅内存且到期自动清除() {
+        let uid = "u-status-busy";
+        let now = 1_700_000_000;
+
+        assert_eq!(status_busy_remaining(uid, now), 0, "初始可探测");
+        mark_status_busy(uid, now, 60);
+        assert_eq!(status_busy_remaining(uid, now), 60);
+        assert_eq!(status_busy_remaining(uid, now + 59), 1);
+        assert_eq!(status_busy_remaining(uid, now + 60), 0, "到期即可探测");
+        // 到期后记录被顺手清掉
+        assert_eq!(status_busy_remaining(uid, now + 61), 0);
+
+        // ★ 仅内存：status 侧冷却**不得**进任何持久化通道。
+        //
+        // 断言方式刻意不写成「文件不存在」——`trae_busy.json` 是 claim 侧
+        // 正常会写的文件，同进程其它测试也会产生它，那样断言会假红。
+        // 真正要钉住的是：标记 status 冷却**不会**在持久化通道里留下任何痕迹。
+        let streak_before = busy_streak(uid);
+        let until_before = busy_until(uid);
+        mark_status_busy(uid, now, 120);
+        assert_eq!(
+            busy_streak(uid),
+            streak_before,
+            "status 侧冷却不得改动 claim 侧的持久化连击计数"
+        );
+        assert_eq!(
+            busy_until(uid),
+            until_before,
+            "status 侧冷却不得改动 claim 侧的持久化退避窗口"
+        );
+        assert_eq!(
+            cooldown_until(uid),
+            None,
+            "status 侧冷却同样不得进账号冷却表"
+        );
+
+        mark_status_busy(uid, now, 30);
+        assert!(clear_status_busy(uid));
+        assert_eq!(status_busy_remaining(uid, now), 0);
+        assert!(!clear_status_busy(uid), "无记录时返回 false");
+        // secs <= 0 也要至少挡住 1 秒，避免退化成「完全不挡」
+        mark_status_busy("u-status-min", now, 0);
+        assert_eq!(status_busy_remaining("u-status-min", now), 1);
+        clear_status_busy("u-status-min");
     }
 
     #[test]
@@ -754,6 +1572,135 @@ mod tests {
         assert_eq!(cooldown_until(uid), None);
     }
 
+    /// G5 核心回归：单次 5xx 不得让账号坐 10 分钟冷板凳。
+    #[test]
+    fn 瞬时故障连续三次才落冷却() {
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae-trip");
+        let uid = "u-trip";
+        let now = 1_700_000_000;
+
+        // 第 1、2 次：只计数，不落冷却
+        for expected in 1..TRANSIENT_FAILS_TO_TRIP {
+            let until = register_failure(uid, &ErrorKind::Server, now, "500");
+            assert_eq!(until, None, "第 {expected} 次瞬时失败不应落冷却");
+            assert_eq!(error_count(uid), expected);
+            assert_eq!(
+                cooldown_until(uid),
+                None,
+                "只计数状态不得被当成冷却中，否则 run_round 会跳过该账号"
+            );
+        }
+
+        // 第 3 次：落冷却并清零计数
+        let until = register_failure(uid, &ErrorKind::Server, now, "500").unwrap();
+        assert_eq!(until, now + 600);
+        assert_eq!(cooldown_until(uid), Some(now + 600));
+        assert_eq!(
+            error_count(uid),
+            0,
+            "落冷却后计数清零，避免恢复后一次抖动立刻再次冷板凳"
+        );
+    }
+
+    #[test]
+    fn 瞬时故障中途成功会重新计数() {
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae-trip-reset");
+        let uid = "u-reset";
+        let now = 1_700_000_000;
+
+        register_failure(uid, &ErrorKind::Server, now, "500");
+        register_failure(uid, &ErrorKind::Client, now, "400");
+        assert_eq!(error_count(uid), 2);
+        // 签到成功 → 清记录
+        assert!(clear_cooldown(uid));
+        assert_eq!(error_count(uid), 0);
+        // 再次失败从 1 重新数，不会一次就落冷却
+        assert_eq!(register_failure(uid, &ErrorKind::Server, now, "500"), None);
+        assert_eq!(error_count(uid), 1);
+    }
+
+    /// 非瞬时故障语义不变：一次就落冷却。
+    #[test]
+    fn 非瞬时故障一次即落冷却() {
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae-trip-direct");
+        let now = 1_700_000_000;
+
+        for (uid, kind, want) in [
+            ("u-dead", ErrorKind::SessionDead, 9_999_999_999),
+            ("u-plan", ErrorKind::PlanLimit, now + 43_200),
+            ("u-rate", ErrorKind::SoftRate, now + 60),
+            ("u-404", ErrorKind::NotFound, now + 60),
+            ("u-biz", ErrorKind::BusinessError, now + 300),
+        ] {
+            assert_eq!(
+                register_failure(uid, &kind, now, "x"),
+                Some(want),
+                "{uid} 应一次即落冷却"
+            );
+            assert_eq!(cooldown_until(uid), Some(want));
+        }
+
+        // Unknown 不落冷却
+        assert_eq!(register_failure("u-unk", &ErrorKind::Unknown, now, "x"), None);
+        assert_eq!(cooldown_until("u-unk"), None);
+    }
+
+    #[test]
+    fn 冷却中的账号在计数状态下不被跳过() {
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae-skip");
+        let uid = "u-skip";
+        let now = config::now_secs();
+
+        // 计数状态：cooldown_until 返回 None → run_round 不会跳过
+        register_failure(uid, &ErrorKind::Server, now, "500");
+        assert_eq!(cooldown_until(uid), None);
+
+        // 真冷却：返回 Some 且在未来 → run_round 会跳过
+        register_failure(uid, &ErrorKind::Server, now, "500");
+        register_failure(uid, &ErrorKind::Server, now, "500");
+        let until = cooldown_until(uid).expect("第三次应落冷却");
+        assert!(until > now);
+    }
+
+    /// 网络异常必须归到 `Unknown`（放行）而不是 `Dead`（判失效）：
+    /// 代理没启动时把整批账号标成「需要重登」，用户按提示重登会发现账号本来是好的。
+    #[test]
+    fn 探活分类区分失效与探不出来() {
+        let dead = JwtLiveness::Dead("401".into());
+        let unknown = JwtLiveness::Unknown("网络异常".into());
+        assert!(dead.is_dead());
+        assert!(!unknown.is_dead(), "探不出来不得当作失效");
+        assert_eq!(JwtLiveness::Alive.message(), "JWT 有效");
+        assert!(!JwtLiveness::Alive.is_dead());
+    }
+
+    /// 空 JWT 无需发请求即可判定失效。
+    #[tokio::test]
+    async fn 空_jwt_探活直接判失效() {
+        let dev = trae_device::derive_device("u-probe");
+        let r = probe_jwt_alive("   ", &dev, trae_realm::Realm::Cn).await;
+        assert!(r.is_dead());
+        assert!(r.message().contains("为空"), "{}", r.message());
+    }
+
+    #[test]
+    fn 清除计数残留记录() {        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae-clear-count");
+        let uid = "u-count";
+        register_failure(uid, &ErrorKind::Server, config::now_secs(), "500");
+        assert_eq!(error_count(uid), 1);
+        assert!(
+            clear_cooldown(uid),
+            "只计数记录也必须能被清掉，否则会累积到阈值"
+        );
+        assert_eq!(error_count(uid), 0);
+        assert!(!clear_cooldown(uid), "无记录时返回 false");
+    }
+
     #[test]
     fn 汇总计数与_json_形态() {
         let mut s = RoundSummary::default();
@@ -795,7 +1742,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let outcome = rt.block_on(checkin_account("", "u1", "测试", 0));
+        let outcome = rt.block_on(checkin_account("", "u1", "测试", trae_realm::Realm::Cn, 0));
         assert_eq!(outcome.status, "fail");
         assert_eq!(outcome.message, "未配置 JWT");
         assert_eq!(outcome.error_type.as_deref(), Some("SessionDead"));
@@ -806,5 +1753,142 @@ mod tests {
         assert_eq!(random_hex(32).len(), 32);
         assert_eq!(random_hex(16).len(), 16);
         assert!(random_hex(32).chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// 造一条指定状态的结果（只为测计数，其余字段给占位值）。
+    fn outcome(uid: &str, status: &'static str) -> AccountOutcome {
+        AccountOutcome {
+            user_id: uid.to_string(),
+            name: uid.to_string(),
+            status,
+            code: None,
+            message: String::new(),
+            credits: None,
+            delta: None,
+            error_type: None,
+            cooldown_until: None,
+        }
+    }
+
+    #[test]
+    fn 重算计数与逐条结果一致() {
+        let mut summary = RoundSummary {
+            outcomes: vec![
+                outcome("a", "success"),
+                outcome("b", "already"),
+                outcome("c", "fail"),
+                outcome("d", "skip"),
+                outcome("e", "fail"),
+            ],
+            // 故意给一组错计数：recount 必须把它们纠正过来
+            ok: 99,
+            already: 99,
+            failed: 99,
+            skipped: 99,
+        };
+        summary.recount();
+        assert_eq!(summary.ok, 1);
+        assert_eq!(summary.already, 1);
+        assert_eq!(summary.failed, 2);
+        assert_eq!(summary.skipped, 1);
+        // 总数必须等于逐条结果数，否则界面会出现「失败 3 但只有 4 条」
+        assert_eq!(summary.ok + summary.already + summary.failed + summary.skipped, 5);
+    }
+
+    #[test]
+    fn 重试覆盖后计数不会重复累加() {
+        // 场景：首轮 a 失败、b 成功；重试轮 a 成功。
+        // 覆盖式替换后必须是「成功 2 / 失败 0」，而不是「成功 1 / 失败 1」。
+        let mut summary = RoundSummary {
+            outcomes: vec![outcome("a", "fail"), outcome("b", "success")],
+            ok: 1,
+            already: 0,
+            failed: 1,
+            skipped: 0,
+        };
+        let slot = summary.outcomes.iter_mut().find(|o| o.user_id == "a").unwrap();
+        *slot = outcome("a", "success");
+        summary.recount();
+        assert_eq!(summary.ok, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.to_json()["total"], json!(2));
+    }
+
+    #[test]
+    fn 重算空结果全为零() {
+        let mut summary = RoundSummary::default();
+        summary.recount();
+        assert_eq!(summary.ok + summary.already + summary.failed + summary.skipped, 0);
+    }
+
+    /// 冷却中跳过的账号必须带出**原因**，不能只写「冷却中」。
+    ///
+    /// 实测事故：PlanLimit(1005) 失败后立刻落 12 小时冷却，30 秒后的重试轮只能
+    /// 跳过；跳过结果不带原因时，界面上就只剩「冷却中，本轮跳过」，用户既看不到
+    /// 「今日签到奖励已领完」，也无从判断该重新登录还是明天再来。
+    #[test]
+    fn 冷却中的账号也要带出失败原因() {
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae_checkin_skip_reason");
+        let uid = "2593120869167228";
+        save_cooldown(
+            uid,
+            ErrorKind::PlanLimit.as_str(),
+            config::now_secs() + 3600,
+            "今日签到奖励已领完",
+        );
+
+        let (kind, reason) = cooldown_info(uid);
+        assert_eq!(kind.as_deref(), Some("PlanLimit"));
+        assert_eq!(reason.as_deref(), Some("今日签到奖励已领完"));
+
+        let accounts = vec![json!({ "user_id": uid, "jwt": "jwt" })];
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let summary = rt.block_on(run_round(&accounts, 0));
+        assert_eq!(summary.skipped, 1, "冷却中的账号应计入 skip");
+        assert_eq!(summary.failed, 0, "冷却不是失败");
+        let o = &summary.outcomes[0];
+        assert_eq!(o.status, "skip");
+        assert_eq!(
+            o.error_type.as_deref(),
+            Some("PlanLimit"),
+            "跳过必须带上失败类型，否则界面无法解释为什么跳过"
+        );
+        assert!(
+            o.message.starts_with(COOLDOWN_SKIP_MSG),
+            "消息仍以固定前缀开头（前端文案与既有断言都依赖它）：{}",
+            o.message
+        );
+        assert!(
+            o.message.contains("今日签到奖励已领完"),
+            "真实原因必须可见：{}",
+            o.message
+        );
+        assert!(o.cooldown_until.is_some(), "跳过要带出冷却截止时间");
+    }
+
+    #[test]
+    fn 没有冷却记录时不编造跳过原因() {
+        use crate::modules::config::test_isolation::Isolated;
+        let _iso = Isolated::new("trae_checkin_skip_no_reason");
+        assert_eq!(cooldown_info("nobody"), (None, None));
+        // 只计数、还没落冷却的记录（until == 0）：读取能拿到类型，但它不是冷却中
+        write_cooldown("u-count", ErrorKind::Server.as_str(), COUNT_ONLY_UNTIL, "网关 502", 1);
+        assert!(cooldown_until("u-count").is_none(), "until<=0 不算冷却");
+        assert_eq!(cooldown_info("u-count").0.as_deref(), Some("Server"));
+    }
+
+    /// 瞬时故障名单也必须取自 [`ErrorKind::as_str`]：写死字符串就会重演
+    /// 「`Business` / `AlreadyChecked` 这种不存在的类型名静默失效」的事故。
+    #[test]
+    fn 瞬时故障名单与错误类型真源对齐() {
+        assert_eq!(
+            TRANSIENT_TRIP_KINDS,
+            [ErrorKind::Server.as_str(), ErrorKind::Client.as_str()]
+        );
+        assert!(!TRANSIENT_TRIP_KINDS.contains(&ErrorKind::PlanLimit.as_str()));
     }
 }

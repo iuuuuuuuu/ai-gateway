@@ -184,7 +184,14 @@ function displayQuotaOf(row: ZcodeAccountRow): { remaining: number; total: numbe
   return quotaTotalsOf(row);
 }
 
-export default function ZcodePage() {
+/**
+ * ZCode 账号页。
+ *
+ * `embedded`：被「账号管理」页（AccountHubPage）以 tab 内容嵌进来时为 true ——
+ * 去掉最外层留白容器与页面级大标题，只保留「配置」入口与全部内容。
+ * 默认 false 时行为与合并前**逐字一致**。
+ */
+export default function ZcodePage({ embedded = false }: { embedded?: boolean } = {}) {
   const [rows, setRows] = useState<ZcodeAccountRow[]>([]);
   const [orphans, setOrphans] = useState<string[]>([]);
   const [summary, setSummary] = useState<ZcodeSummary | null>(null);
@@ -497,6 +504,71 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
     [refresh],
   );
 
+  /**
+   * 激活一个账号（**写操作**）：报官方激活事件 + 领取上游给出的所有套餐。
+   *
+   * ## 为什么需要它
+   *
+   * 刚导入的账号在上游看来「从未活动过」：额度查得到、模型列得出，但活动套餐
+   * 要么拿不到 offer、要么被判异常活动。官方客户端在用户**首次启动**时会报两个
+   * 激活事件（`app_launch` / `app_daily_active`）—— 后端复刻的就是那个行为。
+   *
+   * ## 触发时机（2026-10-05 起有两个入口）
+   *
+   * 1. 这里 —— 用户点账号卡片的「激活」菜单项；
+   * 2. 宿主**启动后每账号一次**的自动激活（`multi_product_credit_patrol::`
+   *    `warm_zcode_accounts`）。它带幂等标记（账号库的 `warmedAt`，距上次
+   *    超过 7 天才再报一次），所以「刚导入还没激活」的账号会自己好起来。
+   *
+   * ## ⚠ 但**仍然**不要把它挪进定时器
+   *
+   * 定时自动「激活 + 领取」会让账号表现出非人类的活动模式，而上游正是按活动
+   * 模式判风控的。故这里只有用户点菜单才会走到 —— 不要把它挪进 `useEffect`、
+   * 定时器或"刷新全部"的批量循环里。
+   *
+   * ## ⚠ 为什么要把三个阶段分开提示
+   *
+   * `events` / `claim` / `skipped` **空串 = 该阶段成功**（口径见后端 `WarmReport`）。
+   * 三者对应**完全不同**的下一步动作：
+   *   · `events` 非空 → 激活事件根本没发出去（凭证/JWT 问题），**后面没领**
+   *   · `skipped` 非空 → 事件发了，但上游没给可领套餐（不是错误）
+   *   · `claim` 非空 → 领取过程部分失败
+   * 压平成一句「激活成功/失败」会把用户该做什么这件事丢掉。
+   */
+  const warmAccount = useCallback(
+    async (row: ZcodeAccountRow) => {
+      setBusy(`warm:${row.uid}`);
+      try {
+        const r = await api.zcodeWarmAccount(row.uid);
+        // 三阶段分别判断，顺序即语义（事件没发出去时后面根本不会执行）
+        if (r.events) {
+          toast.error(`激活事件未发出：${r.events}`, { duration: 10000 });
+        } else if (r.skipped) {
+          // 事件已发，但没执行领取 —— 这是**正常状态**（如上游没有活动），用 info 口径
+          toast.success(`激活事件已发出；${r.skipped}`, { duration: 8000 });
+        } else if (r.claim) {
+          toast.error(`激活事件已发出；领取失败：${r.claim}`, { duration: 10000 });
+        } else {
+          const n = r.claimed.length;
+          toast.success(
+            n > 0 ? `激活完成，已领取 ${n} 个套餐` : r.message || "激活完成",
+            { duration: 8000 },
+          );
+        }
+        // 激活后的刷新失败**不影响激活本身** —— 单独提一句，不当作失败
+        if (r.refreshError) {
+          toast.error(`激活已完成，但刷新账号信息失败：${r.refreshError}`);
+        }
+        void refresh();
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : String(e));
+      } finally {
+        setBusy(null);
+      }
+    },
+    [refresh],
+  );
+
   const toggleDisabled = useCallback(async (row: ZcodeAccountRow) => {
     setBusy(row.uid);
     try {
@@ -555,16 +627,19 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
 
   return (
     <TooltipProvider delayDuration={200}>
-      <div className="w-full space-y-6 px-5 py-6 sm:px-8 sm:py-8">
-        <header className="mb-6">
-          <div className="flex items-start gap-3">
-            <ZcodeMark size={34} className="mt-0.5" />
-            <div className="min-w-0 flex-1">
-              <h1 className="text-[28px] font-semibold tracking-tight">ZCode 账号</h1>
-              <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                管理 ZCode（Z.AI / 智谱 GLM 编码套餐）账号，与 WorkBuddy、Qoder 一起参与网关路由。
-              </p>
-            </div>
+      <div className={embedded ? "space-y-5" : "w-full space-y-6 px-5 py-6 sm:px-8 sm:py-8"}>
+        {/* 嵌入时不再渲染页面级标题（账号管理页已有一份），但「配置」入口必须留着。 */}
+        <header className={embedded ? undefined : "mb-6"}>
+          <div className={cn("flex items-start gap-3", embedded && "justify-end")}>
+            {!embedded && <ZcodeMark size={34} className="mt-0.5" />}
+            {!embedded && (
+              <div className="min-w-0 flex-1">
+                <h1 className="text-[28px] font-semibold tracking-tight">ZCode 账号</h1>
+                <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                  管理 ZCode（Z.AI / 智谱 GLM 编码套餐）账号，与 WorkBuddy、Qoder 一起参与网关路由。
+                </p>
+              </div>
+            )}
             {/* ZCode 平台配置入口（2026-09-22 新增）。 */}
             <PlatformConfigButton
               className="mt-1 shrink-0"
@@ -751,11 +826,13 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
                       busyKey={
                         busy === `refresh:${row.uid}`
                           ? "refresh"
-                          : busy === row.uid
-                            ? "toggle"
-                            : busy === `delete:${row.uid}`
-                              ? "delete"
-                              : null
+                          : busy === `warm:${row.uid}`
+                            ? "warm"
+                            : busy === row.uid
+                              ? "toggle"
+                              : busy === `delete:${row.uid}`
+                                ? "delete"
+                                : null
                       }
                       data={{
                         uid: row.uid,
@@ -820,12 +897,27 @@ const [recordsFor, setRecordsFor] = useState<ZcodeAccountRow | null>(null);
                         // 临近到期转橙（同 WorkBuddy：额度的问题是"快过期用不完"）
                         usageWarn: exp.urgent,
                         models: row.models,
+                        /*
+                         * 激活状态（2026-10-05）。
+                         *
+                         * 宿主**启动后会对每个账号自动激活一次**（幂等：距上次
+                         * ≥ 7 天才重报），所以用户不需要自己点菜单 —— 但界面
+                         * 必须把这件事说出来，否则他会以为「没点就没激活」而
+                         * 重复点（那是**写**操作，重复发事件正是风控关注的行为）。
+                         *
+                         * ⚠ 传 0 与不传**不同**：0 = 从未激活（要提示会自动激活），
+                         * 不传 = 本产品没有激活能力（不渲染徽章）。老账号记录没有
+                         * 这个键 ⇒ 后端补 0 ⇒ 会显示「从未激活」，正是期望行为。
+                         */
+                        warmedAt: row.warmedAt ?? 0,
                         hasCredential: row.hasCredential,
                         disabled: row.disabled,
                         variantLabel: providerLabel(row.provider),
                         variantKind: providerVariant(row.provider),
                       }}
                       onRefresh={() => void refreshAccount(row)}
+                      onWarm={() => void warmAccount(row)}
+                      warmAutoNote="网关启动后会自动激活一次（距上次超过 7 天才重报）；这里手动点只是立刻验证。"
                       onViewRecords={() => setRecordsFor(row)}
                       onEditNote={() => {
                         setEditTarget(row);

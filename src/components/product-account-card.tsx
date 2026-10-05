@@ -31,7 +31,7 @@
  *
  * 这样两个产品页与 WorkBuddy 账号页放在一起时，用户不必重新学一遍。
  */
-import { Loader2, RefreshCw, Trash2, Pencil, AlertTriangle, CheckCircle2, Clock3, Ellipsis, Info, PlayCircle, ScrollText } from "lucide-react";
+import { Loader2, RefreshCw, Trash2, Pencil, AlertTriangle, Ban, CheckCircle2, Clock3, Ellipsis, Info, PlayCircle, ScrollText, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -46,6 +46,17 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn, firstVisibleText } from "@/lib/utils";
+
+/**
+ * 激活时刻的短标签（形如 10-05 09:12）。
+ *
+ * 只到分钟：卡片上空间有限，秒没有信息量。用本地时间 —— 用户看的是自己的钟。
+ */
+function warmStamp(sec: number): string {
+  const d = new Date(sec * 1000);
+  const p = (x: number) => String(x).padStart(2, "0");
+  return p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
 
 /** 卡片要展示的账号数据（两个产品归一到这里）。 */
 export interface ProductAccountCardData {
@@ -89,6 +100,23 @@ export interface ProductAccountCardData {
   modelCount?: number;
   /** 模型名列表，供悬浮显示。 */
   models?: string[];
+  /**
+   * 最近一次「激活」的时刻（Unix 秒）；0 或 undefined = 从未激活。
+   *
+   * # 为什么卡片要显示它
+   *
+   * 宿主**启动后会对每个账号自动激活一次**（幂等：距上次 ≥ 7 天才重报）。
+   * 界面上若无痕迹，用户看到「激活」菜单项会以为必须自己点一次 ——
+   * 于是要么白点（重复发事件），要么以为功能没生效。
+   *
+   * 两种显示：
+   *   · 0 / undefined → 灰色「从未激活」+ 说明「网关启动时会自动激活」
+   *   · 非 0          → 「已激活 10-05 09:12」+ 说明下次重报的条件
+   *
+   * ⚠ 只在**确实实现了激活**的产品上传（当前只有 ZCode）——
+   * 不传就完全不渲染这个徽章，不会出现"永远显示从未激活"的假信号。
+   */
+  warmedAt?: number;
   /** 凭证文件是否存在；false = 网关里不可用。 */
   hasCredential: boolean;
   /** 用户手动禁用（不接流量）。 */
@@ -242,6 +270,25 @@ interface Props {
   onEditNote?: () => void;
   onToggleDisabled?: () => void;
   onDelete?: () => void;
+  /**
+   * 「激活」按钮：报官方激活事件 + 领取上游给出的套餐。
+   *
+   * ⚠ **这是写操作**，故做成**可选 prop**：只有实现了该能力的产品页才传它
+   *（当前只有 ZCode）。传了才渲染按钮 —— 不传就完全不存在，
+   * 不会出现"点了没反应"的摆设。
+   *
+   * ⚠ 与 `onRefresh` 的语义差别要说清：刷新是**读**（查额度/模型），
+   * 激活是**写**（以账号身份向上游发事件与领取请求）。故文案与图标都不同，
+   * 且**绝不**把两者合并成一个按钮 —— 用户点"刷新"时不该意外触发写操作。
+   */
+  onWarm?: () => void;
+  /**
+   * 「激活」自动入口的说明文案（悬浮在激活徽章上）。
+   *
+   * 与 onWarm 配套：传了它才说明本产品的激活**有**自动入口，
+   * 徽章 tooltip 才会写「无需手动点」。不传则只说激活时刻，不承诺自动。
+   */
+  warmAutoNote?: string;
   /** 执行某个任务（来自卡片上的任务菜单）。 */
   onRunTask?: (taskId: string) => void;
   /**
@@ -266,12 +313,15 @@ export function ProductAccountCard({
   onEditNote,
   onToggleDisabled,
   onDelete,
+  onWarm,
+  warmAutoNote,
   onRunTask,
   onViewRecords,
   compact = false,
 }: Props) {
   const name = firstVisibleText(data.nickname) || "（未命名）";
   const refreshing = busyKey === "refresh";
+  const warming = busyKey === "warm";
   const toggling = busyKey === "toggle";
   const deleting = busyKey === "delete";
   const tasks = data.tasks || [];
@@ -465,6 +515,27 @@ export function ProductAccountCard({
                 </DropdownMenuItem>
               )}
 
+              {/* 「激活」入口 —— **写操作**，与上面的「刷新」刻意分开。
+                  复刻官方客户端首次启动时的两个动作（报 app_launch /
+                  app_daily_active、领上游给出的套餐），让刚导入的账号在上游
+                  看来「活动过」而不是「从未出现过」。
+
+                  ⚠ 与「刷新额度与模型」分开成两项是刻意的：刷新是读、激活是写。
+                  合并会让用户点"刷新"时意外触发写操作。
+
+                  ⚠ 卡片上写清"会向上游发请求"，不让用户以为它只是本地动作。 */}
+              {onWarm && (
+                <DropdownMenuItem
+                  data-slot="product-warm-open"
+                  disabled={warming}
+                  onSelect={() => onWarm()}
+                  className="gap-2 text-xs"
+                >
+                  <Sparkles className={cn("h-3.5 w-3.5", warming && "animate-pulse")} />
+                  {warming ? "激活中…" : "激活（上报启动事件并领取套餐）"}
+                </DropdownMenuItem>
+              )}
+
               {/* 「记录」入口 —— 任务执行记录 + 积分/额度消耗明细。
                   所有者 2026-09-20：「zcode和qoder都无法查看任务执行记录,
                   和积分消耗明细,都一起修复了」。
@@ -496,14 +567,17 @@ export function ProductAccountCard({
                   onSelect={() => onToggleDisabled()}
                   className="gap-2 text-xs"
                 >
+                  {/* 文案与 WorkBuddy 卡片（account-card.tsx）逐字一致：禁用的只是
+                      「进网关账号池的资格」，签到 / 上报等养号任务照跑，
+                      所以强调「不进入账号池」而不是「停用账号」。 */}
                   {toggling ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
                   ) : data.disabled ? (
                     <CheckCircle2 className="h-3.5 w-3.5" />
                   ) : (
-                    <AlertTriangle className="h-3.5 w-3.5" />
+                    <Ban className="h-3.5 w-3.5" />
                   )}
-                  {data.disabled ? "恢复参与路由" : "停止接流量"}
+                  {data.disabled ? "启用（重新加入账号池）" : "禁用（不进入账号池）"}
                 </DropdownMenuItem>
               )}
 
@@ -560,15 +634,54 @@ export function ProductAccountCard({
             </TooltipContent>
           </Tooltip>
         ) : data.disabled ? (
+          /* 与 WorkBuddy 卡片同款「已禁用」徽标（红框 + Ban 图标）：这是
+             「这个号当前不接流量」的最强信号，措辞必须与别处一致，
+             否则用户会以为是「账号被停用」而不是「不参与选号」。 */
           <Tooltip>
             <TooltipTrigger asChild>
-              <Badge variant="outline">已停用</Badge>
+              <Badge variant="outline" className="gap-1 border-destructive/40 text-destructive">
+                <Ban className="size-3 shrink-0" />
+                已禁用
+              </Badge>
             </TooltipTrigger>
-            <TooltipContent>不参与网关选号；凭证与额度信息仍然保留</TooltipContent>
+            <TooltipContent>已禁用：不进入网关账号池（签到等养号任务仍在运行）</TooltipContent>
           </Tooltip>
         ) : (
           <Badge variant="secondary">正常</Badge>
         )}
+
+        {/* 激活状态 —— 「网关启动时会自动激活」必须在界面上留痕。
+            没有它，用户看到菜单里的「激活」会以为必须自己点一次，
+            于是重复发事件（写操作，上游按活动模式判风控）。 */}
+        {data.warmedAt !== undefined &&
+          (data.warmedAt > 0 ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Badge
+                  variant="outline"
+                  className="gap-1 border-emerald-500/40 text-emerald-700 dark:text-emerald-400"
+                >
+                  <Sparkles className="size-3 shrink-0" />
+                  已激活 {warmStamp(data.warmedAt)}
+                </Badge>
+              </TooltipTrigger>
+              <TooltipContent>
+                {warmAutoNote ?? "最近一次激活：" + new Date(data.warmedAt * 1000).toLocaleString()}
+              </TooltipContent>
+            </Tooltip>
+          ) : (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Badge variant="outline" className="gap-1 text-muted-foreground">
+                  <Sparkles className="size-3 shrink-0" />
+                  从未激活
+                </Badge>
+              </TooltipTrigger>
+              <TooltipContent>
+                {warmAutoNote ?? "还没有向官方上报过启动事件"}
+              </TooltipContent>
+            </Tooltip>
+          ))}
 
         {data.note && (
           <Badge variant="outline" className="chip-note max-w-[12rem] gap-1" title={`备注：${data.note}`}>

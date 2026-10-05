@@ -510,7 +510,14 @@ function accountLabel(input: { uid: string; nickname?: string; note?: string }):
 }
 
 
-export default function QoderPage() {
+/**
+ * Qoder 账号页。
+ *
+ * `embedded`：被「账号管理」页（AccountHubPage）以 tab 内容嵌进来时为 true ——
+ * 去掉最外层留白容器与页面级大标题，只保留「配置」入口与全部内容。
+ * 默认 false 时行为与合并前**逐字一致**。
+ */
+export default function QoderPage({ embedded = false }: { embedded?: boolean } = {}) {
   const [rows, setRows] = useState<QoderAccountRow[]>([]);
   const [orphans, setOrphans] = useState<string[]>([]);
   const [summary, setSummary] = useState<QoderSummary | null>(null);
@@ -1227,16 +1234,20 @@ const [recordsFor, setRecordsFor] = useState<QoderAccountRow | null>(null);
 
   return (
     <TooltipProvider delayDuration={200}>
-      <div className="w-full space-y-6 px-5 py-6 sm:px-8 sm:py-8">
-        <header className="mb-6">
-          <div className="flex items-start gap-3">
-            <QoderMark size={34} className="mt-0.5" />
-            <div className="min-w-0 flex-1">
-              <h1 className="text-[28px] font-semibold tracking-tight">Qoder 账号</h1>
-              <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                管理 Qoder 账号的登录态、额度与到期时间，并与 WorkBuddy 账号一起参与网关路由。
-              </p>
-            </div>
+      <div className={embedded ? "space-y-5" : "w-full space-y-6 px-5 py-6 sm:px-8 sm:py-8"}>
+        {/* 嵌入时不再渲染页面级标题（账号管理页已有一份），但「配置」入口必须留着 ——
+            它是这个平台唯一的配置入口，藏起来用户就找不到了。 */}
+        <header className={embedded ? undefined : "mb-6"}>
+          <div className={cn("flex items-start gap-3", embedded && "justify-end")}>
+            {!embedded && <QoderMark size={34} className="mt-0.5" />}
+            {!embedded && (
+              <div className="min-w-0 flex-1">
+                <h1 className="text-[28px] font-semibold tracking-tight">Qoder 账号</h1>
+                <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                  管理 Qoder 账号的登录态、额度与到期时间，并与 WorkBuddy 账号一起参与网关路由。
+                </p>
+              </div>
+            )}
             {/* Qoder 平台配置入口（2026-09-22 新增）。
                 收进弹窗而不是平铺：配置是"偶尔改的"，
                 平铺会把下面的账号列表挤到很远处。 */}

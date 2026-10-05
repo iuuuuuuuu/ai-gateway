@@ -4,6 +4,9 @@ mod commands;
 mod commands_apps;
 // 本地 MITM 代理的命令层（系统代理编排 + 事件转发）
 mod commands_proxy;
+// Trae OAuth 回环回调：在本机 17388 起一个只有一条路由的 HTTP 服务，
+// 浏览器授权后重定向回来即完成登录（另有「手动粘贴回调地址」兜底）。
+mod oauth_loopback;
 // ZCode 验证码求解：用宿主自带的 WebView2 跑阿里云官方 SDK。
 //
 // 为什么需要它：ZCode 对话通道要求 `X-Aliyun-Captcha-Verify-Param`，
@@ -34,6 +37,23 @@ pub(crate) fn is_screenshot_demo() -> bool {
 /// 不引入 `rand` 依赖：本仓库没用到它，而为 16 字节随机值加一个 crate
 /// 不值得。改用系统时间 + 进程 id + 地址熵混哈希 —— 对"防误用"这个
 /// 威胁模型足够（对手是同机的普通用户进程，不是密码学攻击者）。
+/// 进程启动时刻，用于把「启动 → 首帧 → 窗口可见」的耗时打进同一时钟。
+///
+/// # 为什么必须进程内计时（2026-10-05 实测教训）
+///
+/// 验证「窗口是否真的等前端画完才显示」，需要比较两个时刻：进程启动、窗口 show。
+/// 若用外部探针各自记 t0，跨进程对时误差可达 1 秒 —— 正好和要测的延迟同量级，
+/// 据此曾得出「窗口早于首帧 0.4 秒显示」的**错误结论**。进程内计时没有对时问题。
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// 距进程启动的毫秒数（run 之前恒为 0）。
+pub fn elapsed_ms() -> u128 {
+    PROCESS_START
+        .get()
+        .map(|t| t.elapsed().as_millis())
+        .unwrap_or(0)
+}
+
 fn random_token() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -152,6 +172,7 @@ fn spawn_background_loops() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = PROCESS_START.set(std::time::Instant::now());
     let mut builder = tauri::Builder::default();
 
     // 单实例保护：必须最先注册，让第二个实例在做任何事之前就退出。
@@ -171,11 +192,10 @@ pub fn run() {
             if tray::is_silent_startup(args.iter()) {
                 return;
             }
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
+            // 统一走 tray 的显示入口：它会处理轻量模式 / 窗口已被销毁 /
+            // 「已经可见就什么都不做」三种情况（此处历史上是裸的
+            // show / unminimize / set_focus，与托盘菜单是两份并行逻辑）。
+            tray::request_main_window_show(app);
         }));
     }
 
@@ -376,6 +396,8 @@ pub fn run() {
             commands::set_platform_models,
             // 同一份白名单的只读快照（含逐条禁用清单），供界面初始化。
             commands::get_platform_models,
+    commands::set_platform_enabled,
+    commands::get_platform_enabled,
             commands::set_allowed_model,
             commands::start_gateway,
             commands::stop_gateway,
@@ -406,6 +428,7 @@ pub fn run() {
             commands_apps::trae_list_accounts,
             commands_apps::trae_add_account,
             commands_apps::trae_delete_account,
+            commands_apps::trae_update_account,
             commands_apps::trae_discover_accounts,
             commands_apps::trae_entitlement,
             commands_apps::trae_device_info,
@@ -463,6 +486,13 @@ pub fn run() {
         commands_apps::zcode_scan_local,
         commands_apps::zcode_import_scanned,
         commands_apps::zcode_refresh_account,
+            // 激活（写操作）：报官方激活事件 + 领上游给出的套餐。
+            // ⚠ 只在界面上由用户点按钮触发，**不挂任何定时器** —— 理由见该命令的注释。
+            commands_apps::zcode_warm_account,
+            // 本机 AI CLI 登录额度查询（Codex / Claude / Antigravity / Grok / Kimi）
+            commands::get_cli_quotas,
+            commands::refresh_cli_quota,
+            commands::get_cli_quota_status,
             commands_apps::zcode_login_start,
             commands_apps::zcode_login_poll,
             // ---- 本地 MITM 代理（设备身份隔离 + 凭证抓取） ----
@@ -478,6 +508,46 @@ pub fn run() {
             commands_proxy::proxy_parse_upstream,
         commands_proxy::proxy_test_upstream,
         commands_proxy::proxy_probe_nodes,
+            // ---- 账号分组（Trae / 豆包 分域） ----
+            commands_apps::groups_list,
+            commands_apps::group_create,
+            commands_apps::group_update,
+            commands_apps::group_delete,
+            commands_apps::group_move,
+            // ---- Trae 积分：明细 / 趋势 / 快照 / 用量 ----
+            commands_apps::trae_credit_detail,
+            commands_apps::trae_credits_stats,
+            commands_apps::trae_credits_snapshot,
+            commands_apps::trae_usage_history,
+            commands_apps::trae_checkin_trends,
+            commands_apps::trae_checkin_status,
+            commands_apps::trae_checkin_refresh,
+            // ---- Trae 账号导入导出 ----
+            commands_apps::trae_export_accounts,
+            commands_apps::trae_preview_import,
+            commands_apps::trae_import_accounts,
+            // ---- 抓包日志查询（本地 MITM 代理的记录） ----
+            commands_apps::proxy_logs_list,
+            commands_apps::proxy_log_detail,
+            commands_apps::proxy_logs_overview,
+            commands_apps::proxy_logs_clear,
+            // ---- Trae OAuth 回环回调（浏览器授权 → 本机 17388 收码） ----
+            oauth_loopback::oauth_start_loopback,
+            oauth_loopback::oauth_stop_loopback,
+            oauth_loopback::oauth_login_url,
+            oauth_loopback::oauth_submit_callback,
+            oauth_loopback::oauth_pending,
+            oauth_loopback::oauth_cancel,
+            // 诊断「浏览器打不开授权页」（系统代理不通时会这样）
+            oauth_loopback::oauth_diagnose_network,
+            // ---- 启动时序：前端首帧就绪后显示主窗口（见 tray.rs 的
+            // `setup_startup_visibility` 与 `mark_frontend_ready`） ----
+            // ⚠ 必须带 `#[cfg(desktop)]`：`generate_handler!` 会把这里每个
+            // 条目上的外层属性原样转发到生成的 match 臂上（tauri-macros
+            // `command/handler.rs` 的 `attrs` 收集），所以移动端不会去引用
+            // 一个不存在的模块。
+            #[cfg(desktop)]
+            commands::frontend_ready,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

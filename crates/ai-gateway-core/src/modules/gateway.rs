@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::modules::account;
@@ -160,6 +160,17 @@ pub fn default_gateway_config() -> Value {
         // 删掉一个模型**删不掉**它（仍可能被接口返回那份放行）。用户要的
         // "禁用" 是一个独立于并集的**否决项**，网关侧先于并集判定。
         "platform_models_disabled": {},
+        // 「平台 → 是否**参加兼容网关路由**」总开关（账号页每个平台标签上的那个开关）。
+        //
+        // ★ 语义 = 账号级 `no_route` 的**平台级版本**（所有者原话「关闭平台只是不
+        // 参与兼容网关,并不是不执行任务请注意」）：只把该平台的账号从**选号**里排除，
+        // 签到 / 上报 / 成长任务 / 额度巡检**照常运行**。
+        //
+        // ⚠ 它与 `platform_models` / `platform_models_disabled` **不是同一件事**：
+        // 那两份回答「这个平台允许跑哪些模型」，本键回答「这个平台参不参加路由」。
+        //
+        // 空对象 = 所有平台都参加（老配置缺这个键，升级后行为逐字不变）。
+        "platform_enabled": {},
         "last_status": null,
         "last_error": null,
         // ---- 4 个自动养号任务的排程（写进网关的 schedule 块，见 write_native_config）----
@@ -413,11 +424,15 @@ static LAST_FINGERPRINT: Mutex<Option<String>> = Mutex::new(None);
 /// 返回是否发生了变化。这样新增账号能自动进入网关凭证目录，
 /// 用户不必手动点「立即同步」。
 pub fn sync_if_changed() -> bool {
+    // Trae 有**自己的**账号库与指纹，且必须放在下面那句提前 return 之前：
+    // WorkBuddy 指纹未变时就会直接返回，放在后面等于「Trae 只有在 WorkBuddy
+    // 也变了时才同步」，新增一个 Trae 账号永远不会进网关。
+    let trae_pushed = crate::modules::trae_account::export_if_changed();
     let fp = accounts_fingerprint();
     {
         let guard = LAST_FINGERPRINT.lock().unwrap();
         if guard.as_deref() == Some(fp.as_str()) {
-            return false;
+            return trae_pushed;
         }
     }
     match export_accounts_to_gateway() {
@@ -530,6 +545,15 @@ pub fn task_label(task: &str) -> &'static str {
         "nightowl" => "夜猫子任务",
         "school" => "开学季活动",
         "trial" => "trial 加油包",
+        // Trae 每日签到不是「养号任务」，但走的是同一条进度链路
+        // （写记录 → 按标题数进度）。文案必须与
+        // apps_ops::record_checkin_task_records 写进记录里的 title 逐字一致，
+        // 否则 processedIds 恒为空且不会有任何报错。
+        "trae-checkin" => "Trae 每日签到",
+        // 积分日快照不写账号记录（它只写 trae_credits_history.json），
+        // 但计划任务与界面都按同一个键引用它；这里补上映射，免得
+        // 运行态标签落进下面的兜底值「养号任务」而驴唇不对马嘴。
+        "trae-credits-snapshot" => "Trae 积分日快照",
         _ => "养号任务",
     }
 }
@@ -1045,7 +1069,6 @@ pub fn sync_auth_to_accounts() -> Result<Vec<String>, String> {
 // ---------------------------------------------------------------------------
 
 static GATEWAY_PROC: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
-static GATEWAY_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// 网关**重启**的互斥锁（2026-09-22 补，修一个真实的竞态）。
 ///
@@ -1074,7 +1097,7 @@ static GATEWAY_RUNNING: AtomicBool = AtomicBool::new(false);
 ///
 ///	后台线程：stop_gateway()   ← 关掉旧的
 ///	用户线程：stop_gateway()   ← 关了空 slot（no-op）
-///	后台线程：start_gateway()  ← 起新的，GATEWAY_RUNNING = true
+///	后台线程：start_gateway()  ← 起新的，proc_slot() = Some(child)
 ///	用户线程：start_gateway()  ← 看到 true ⇒ **返回「网关已在运行」**
 ///
 /// 用户看到的是「网关已在运行」这个**自相矛盾**的提示（他刚点了重启），
@@ -1283,9 +1306,52 @@ fn attach_child_to_job(child: &Child) {
     }
 }
 
-/// 网关是否在运行（本进程视角）。
+/// 网关是否在运行。
+///
+/// # 为什么不能只看内存标志（2026-10-03 修，问题 ⑦）
+///
+/// 原实现只读一个 `AtomicBool`，而那个标志**只**在 `start_gateway` 成功
+/// 与 `stop_gateway` 里改写。于是只要网关不是由本进程正常停止的
+/// （任务管理器强杀、`taskkill`、崩溃、被外部脚本替换），标志就会永远
+/// 停在 `true` 而进程早已不在。后果是连锁的：
+///
+///   1. `start_gateway` 直接返回「网关已在运行」⇒ 界面点「启动网关」
+///      永远失败（旧宿主下还是**空体** 400，连原因都看不到）；
+///   2. `gateway_status` 认为在跑 ⇒ 探活失败 ⇒ `running=true,
+///      reachable=false`，页面显示「已启动」却永远拿不到账号池；
+///   3. `inspect_port` 的 `inUseByGateway` 误报 ⇒ 端口明明空着却显示
+///      「当前网关正在使用」，连「结束占用进程」入口都被一起藏掉；
+///   4. `maybe_autostart` 认为已在跑 ⇒ 开机自启静默失效。
+///
+/// 现在真值只有一个来源：`proc_slot()` 里那个子进程是否还活着。
 pub fn is_running() -> bool {
-    GATEWAY_RUNNING.load(Ordering::SeqCst)
+    child_alive()
+}
+
+/// 子进程存活判定，顺带回收已退出的句柄（见 `is_running` 的说明）。
+///
+/// 判定与清理是**同一次动作**：子进程已退出时当场把槽位清空，
+/// 不留「标志说在跑、句柄已失效」的中间态。
+///
+/// `try_wait()` 出错时按「还活着」保守取值（与 `process_alive` 同口径）——
+/// 宁可让用户多点一次「停止网关」，也不要把真在跑的网关判成没跑。
+fn child_alive() -> bool {
+    // 中毒的锁也要能用：这里存的是「哪个子进程」，没有需要保持一致性的
+    // 复合数据，取回内部值即可（否则一个测试的 panic 会永久毒死整条路径）。
+    let mut slot = proc_slot().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(child) = slot.as_mut() else {
+        return false;
+    };
+    match child.try_wait() {
+        // 仍在运行
+        Ok(None) => true,
+        // 已退出：槽位立刻清空，之后 is_running() 恒为 false
+        Ok(Some(_)) => {
+            *slot = None;
+            false
+        }
+        Err(_) => true,
+    }
 }
 
 /// 从监听地址解析端口，兼容多种写法：
@@ -1321,7 +1387,7 @@ pub fn is_port_available(port: u16) -> bool {
 pub fn find_free_port(start: u16, span: u16) -> Option<u16> {
     let begin = start.max(1024);
     for p in begin..begin.saturating_add(span.max(1)) {
-        if port_free(p) {
+        if port_free_fast(p) {
             return Some(p);
         }
     }
@@ -1343,13 +1409,31 @@ pub fn find_free_port(start: u16, span: u16) -> Option<u16> {
 pub fn inspect_port(port: u16) -> Value {
     // 注意：若网关自身正跑在该端口上，这里会判定为「被占用」。
     // 调用方（前端）需结合 status.running 判断，避免误报。
-    let available = port > 0 && port_free(port);
+    // ★ 走**热路径变体**：本函数在页面挂载时就会被调用，保守的 300ms
+    // 预算会让每次调用白烧 600ms（实测 612~652ms）。展示用的「端口可用」
+    // 判定不需要那么保守 —— 真正决定能不能启动的预检在 `start_gateway` 里。
+    let available = port > 0 && port_free_fast(port);
+    // 「网关正在使用该端口」有两个来源（问题 ⑦ 的第三副面孔）：
+    //   1. 本进程托管的子进程正跑在这个端口上（真值来自 `proc_slot()`）；
+    //   2. 本进程没托管，但 `gateway_status()` 刚刚探活确认过端口上是我们的网关
+    //      —— 宿主重启后子进程句柄就丢了、或网关是上一次运行 / 手工启动留下的。
+    // 第 2 种情况以前判不出来：状态页显示「运行中」，端口那一行却写「已被占用」，
+    // 于是「启动网关」按钮被 `portState.tone === "bad"` 禁掉，
+    // 用户既启动不了也停不掉（2026-10-03 实测的死角）。这里必须跟着状态页改口。
+    let hosted = is_running();
+    let claimed = !hosted && claimed_recently(port);
     json!({
         "port": port,
         "available": available,
         "reserved": port > 0 && port < 1024,
-        "inUseByGateway": is_running() && port_of(&load_gateway_config()
-            .get("listen").and_then(Value::as_str).unwrap_or("")) == port,
+        "inUseByGateway": if hosted {
+            port_of(&load_gateway_config()
+                .get("listen").and_then(Value::as_str).unwrap_or("")) == port
+        } else {
+            // 认领本身就带端口，不再看配置 —— 认领之后用户可能已经改了端口输入框，
+            // 拿配置去比对会把「确实在用的端口」误判成别人的。
+            claimed
+        },
         "suggest": if available { Value::Null } else {
             find_free_port(port.saturating_add(1), 50).map(|p| json!(p)).unwrap_or(Value::Null)
         },
@@ -2776,6 +2860,7 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
             // 这里以宿主的真实目录为准，Go 侧拿到的一定是有效的。
             "qoder_auth_dir": crate::modules::qoder_account::auth_dir().to_string_lossy(),
             "zcode_auth_dir": crate::modules::zcode_account::auth_dir().to_string_lossy(),
+            "trae_auth_dir": crate::modules::trae_account::auth_dir().to_string_lossy(),
             // 凭证目录**热加载**（新增账号免重启）。
             //
             // 为什么显式写出而不是靠 Go 侧缺省：本仓库的风格是
@@ -2820,6 +2905,14 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
             //
             // 空对象 = 没有禁用项（老配置缺这个键，升级后行为逐字不变）。
             "platform_models_disabled": platform_models_disabled_for_gateway(),
+            // 「平台 → 是否参加兼容网关路由」总开关。
+            //
+            // ⚠ 必须下发到网关：判据在池里（`Pool::platform_enabled`），宿主侧的那份
+            // 只用于界面回显。
+            //
+            // 语义 = `no_route` 的平台级版本：不选号，但**不打断养号任务**。
+            // 空对象 = 所有平台都参加（老配置缺这个键，升级后行为逐字不变）。
+            "platform_enabled": platform_enabled_for_gateway(),
             // ZCode 验证码求解器。
             //
             // 求解器（solver.js + happy-dom）由 Tauri 作为**资源**随包分发，
@@ -2909,6 +3002,21 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// 「启动前端口预检」用的连接探测预算（保守）。
+///
+/// 300ms 是给「判定端口可用」留的余量：这类判定错了会让网关子进程绑定失败，
+/// 而健康探测又打到**别人的**服务上，最终报一个虚假的「启动成功」。
+const LISTENER_PROBE_BUDGET_MS: u64 = 300;
+
+/// 热路径（页面挂载即调用 / 转发前可达性检查）用的连接探测预算。
+///
+/// ★ 为什么必须另立一个小值：TcpStream::connect_timeout 对**无人监听**的
+/// 回环端口会**吃满整个预算**（实测 2026-10-03：预算 300ms 实测 306/307/316ms；
+/// 50ms 实测 59ms；10ms 实测 16ms），而「端口空闲」恰好是最常见的判定结果，
+/// 于是 300ms 的预算会被稳定花掉。实测 /api/gateway/port-check 每次
+/// 612~652ms、growth_task 早退判据 619ms，都是这么来的。
+const PROBE_BUDGET_MS: u64 = 30;
+
 /// 本地端口是否空闲。
 ///
 /// 启动前必须预检：网关只在启动时绑定端口，若端口已被占用（例如另一个网关
@@ -2941,8 +3049,45 @@ fn port_free(port: u16) -> bool {
     !has_listener(port)
 }
 
+/// `port_free` 的**热路径变体**：两个维度相同，但连接探测只给
+/// `PROBE_BUDGET_MS`（30ms）。
+///
+/// 用途（都是「页面一挂载 / 转发前就会调」的场合）：
+///   * `inspect_port`（前端端口检测，挂载即调）与 `find_free_port`；
+///   * `gateway_status` 的认领探活门。
+///
+/// 实测差距：`{port:57890}` 这类调用从 612~652ms 降到 ~30ms；
+/// 而 `find_free_port` 最坏 50 个候选从 15s 降到 1.5s。
+///
+/// 代价：30ms 预算对「已绑定但尚未 accept」的监听者判定更弱（300ms 更保险）。
+/// 这个退化只影响**展示用**的「端口是否可用」，真正决定能不能启动的
+/// 预检（`start_gateway`）仍然用保守的 `port_free`。
+fn port_free_fast(port: u16) -> bool {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
+
+    if TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))).is_err() {
+        return false;
+    }
+    match TcpListener::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))) {
+        Ok(l) => drop(l),
+        // 系统未启用 IPv6 不算占用
+        Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {}
+        Err(_) => return false,
+    }
+    !has_listener_with_budget(port, PROBE_BUDGET_MS)
+}
+
 /// 主动连接探测：127.0.0.1 或 [::1] 上有服务应答即认为端口被占用。
 fn has_listener(port: u16) -> bool {
+    has_listener_with_budget(port, LISTENER_PROBE_BUDGET_MS)
+}
+
+/// 同上，但可指定单次连接探测的预算（实测数据见 `PROBE_BUDGET_MS`）。
+///
+/// 拆出这个变体是因为**同一个语义有两种成本要求**：启动前预检要保守
+/// （300ms），而页面挂载就会调的热路径不能白烧 600ms。预算只影响
+/// 「没人应答时等多久」，不影响有人应答的判定（应答是微秒级的）。
+fn has_listener_with_budget(port: u16, budget_ms: u64) -> bool {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
     use std::time::Duration;
 
@@ -2951,11 +3096,49 @@ fn has_listener(port: u16) -> bool {
         SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
     ];
     for addr in probes {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(budget_ms)).is_ok() {
             return true;
         }
     }
     false
+}
+
+/// 本地网关是否**可达** —— 零进程派生、零上游请求的最快判据。
+///
+/// 判据 = 对 `127.0.0.1:port` / `[::1]:port` 各做一次**极短预算**的 TCP 连接：
+/// 有人应答即可达（微秒级返回）；没人应答最坏 2 × `PROBE_BUDGET_MS`。
+///
+/// # 为什么需要它
+///
+/// 宿主里有若干「转发给本机网关」的调用（`growth_task` 等），目标端口没人
+/// 监听时 reqwest 要先做完连接尝试才失败 —— 实测 `growth_task` 在网关没跑时
+/// **每次烧 2531ms**，而账号页启动时会按账号逐个拉成长任务清单，19 个账号
+/// 就是几十秒的纯等待，界面表现为「点了没反应」。
+///
+/// # 为什么**不是** `!port_free(port) && has_listener(port)`（第一版，已废弃）
+///
+/// `port_free` / `has_listener` 用的是 300ms 预算 —— 那是给「启动前端口预检」
+/// 用的，要求「判定端口可用」足够保守（见 `port_free` 注释里的 Docker/wslrelay
+/// 与 TIME_WAIT 两条教训）。但把 600ms 的判据放进热路径等于没修：实测
+/// 改造后 `growth_task` 在网关没跑时每次仍是 **619ms**，与改造前的 2531ms
+/// 相比只省 4 倍，而账号页是按账号逐个拉的（27 个账号仍是十几秒）。
+///
+/// 更关键的是**判据语义不同**：这里要回答的是「我能不能跟它说上话」，
+/// 不是「这个端口是不是空闲」。没人应答一次 TCP 连接 ⇒ 后面的 POST 必然
+/// 也连不上，直接判不可达就是对的；TIME_WAIT 之类的「假占用」在这个问题下
+/// **不影响结论**，所以不需要 `port_free` 那一层保守判定。
+///
+/// # 实测（2026-10-03，本机 Windows）
+///
+/// `TcpStream::connect_timeout` 对**无人监听**的回环端口会**吃满整个预算**：
+/// 预算 300ms ⇒ 306/307/316ms；预算 50ms ⇒ 59ms；预算 10ms ⇒ 16ms。
+/// 所以预算必须小 —— 取 30ms 时最坏 2 × 30ms，实测单次判据 ≈ 60ms。
+/// 有人监听时是 0ms（实测开放端口 57890 → 0ms，本判据瞬时返回）。
+///
+/// ⚠ 不要用 `claimed_gateway_pid()` 代替：那个会派生
+/// netstat/tasklist/powershell，见 `:3321` 的禁令。
+fn gateway_reachable(port: u16) -> bool {
+    port > 0 && has_listener_with_budget(port, PROBE_BUDGET_MS)
 }
 
 /// 探测网关健康（HTTP /healthz）。
@@ -3028,8 +3211,49 @@ pub async fn probe_health(port: u16, timeout_ms: u64) -> Result<Value, String> {
     }
 }
 
+/// 是否需要尝试「认领端口上已有的网关」（纯判定，便于单测）。
+///
+/// 端口为 0（配置里既没有 `listen` 也没有 `port`）或端口空闲时都不必探活 ——
+/// 这条路径挂在启动流程上，白烧一次 1.2 秒的网络等待没有意义。
+fn should_adopt_gateway(port: u16, port_is_free: bool) -> bool {
+    port > 0 && !port_is_free
+}
+
+/// 端口上是否已经跑着「本程序的网关」，但**不是本进程托管的那个**。
+///
+/// 判据与 `gateway_status()` 用的完全一致：探活 + 身份校验（`probe_health`
+/// 比对 `X-Service`）。确认后顺带 `note_claimed_gateway(port)`，让跑在同步
+/// 路径上的端口检测（`inspect_port`）也能认出它是自己人。
+///
+/// # 为什么需要它（2026-10-04 业主实测）
+///
+/// 业主的网关是**手工启动**（或上一次运行遗留）的：端口上一切正常，但宿主
+/// 的 `proc_slot()` 里没有它的句柄，`is_running()` 恒为 false。此时
+/// `maybe_autostart()` 会判定「网关没在跑」并再起一个进程，`start_gateway`
+/// 的端口预检随即报「端口已被占用」，`update_runtime_state("failed", ...)`
+/// 把这条错误写进 `gateway_config.json` —— 用户看到的就是「网关明明运行
+/// 正常，App 却说启动失败」，而状态页（走 `gateway_status`）同时显示「运行中」。
+/// 两个界面必须基于同一份事实，所以这里复用同一道判据。
+///
+/// 空端口 / 端口空闲时直接返回 false：不白烧一次 1.2 秒的探活。
+async fn adopt_running_gateway(port: u16) -> bool {
+    if !should_adopt_gateway(port, port_free_fast(port)) {
+        return false;
+    }
+    match probe_health(port, 1200).await {
+        Ok(h) if h.get("identity_ok").and_then(Value::as_bool) == Some(true) => {
+            note_claimed_gateway(port);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// 启动网关子进程。成功返回可访问基址。
 pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
+    // `is_running()` 会顺手清掉已退出的子进程句柄 —— 所以这里问的是
+    // 「此刻真的有网关在跑吗」，而不是「曾经启动过吗」（问题 ⑦：
+    // 网关被外部杀掉后，旧实现永远停在这句「网关已在运行」上）。
     if is_running() {
         return Err("网关已在运行".to_string());
     }
@@ -3042,6 +3266,14 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
 
     // 先把账号库导出为网关凭证，保证启动即能加载到账号
     let (count, _) = export_accounts_to_gateway()?;
+
+    // Trae 的凭证目录同样要在启动前写好（网关的账号池是**扫描凭证目录**建立的）。
+    //
+    // ⚠ 失败**不阻断启动**：Trae 只是多产品路由里的一员，它的目录写失败不应
+    //   连带 WorkBuddy 也起不来（与后台同步循环同口径，只打日志）。
+    if let Err(e) = crate::modules::trae_account::export_accounts_to_gateway() {
+        eprintln!("[gateway] 导出 Trae 凭证失败: {e}");
+    }
     if count == 0 {
         // 区分「本来就没有账号」与「账号都在需重登状态」：后者不给出提示的话，
         // 用户只会看到「账号库为空」，完全不知道去重新登录就能恢复。
@@ -3121,7 +3353,8 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
     if !port_free(port) {
         return Err(format!(
             "端口 {port} 已被占用（可能已有网关或其他服务在监听）。请在配置中改用其他端口，\
-             或先停止占用该端口的程序。"
+             或先停止占用该端口的程序；若占用者正是本程序之前启动、仍留在后台的网关，\
+             可先点「停止网关」再启动。"
         ));
     }
 
@@ -3129,7 +3362,6 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
     // 立即纳入 Job：之后父进程意外结束也会被系统连带终止，避免孤儿进程占端口。
     attach_child_to_job(&child);
     *proc_slot().lock().unwrap() = Some(child);
-    GATEWAY_RUNNING.store(true, Ordering::SeqCst);
 
     // 等待端口就绪（最多 20s）
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -3141,7 +3373,6 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
             if let Some(child) = slot.as_mut() {
                 if let Ok(Some(status)) = child.try_wait() {
                     *slot = None;
-                    GATEWAY_RUNNING.store(false, Ordering::SeqCst);
                     return Err(format!(
                         "网关启动后立即退出（退出码 {:?}）。常见原因：端口被占用、\
                          配置无效或账号凭证不可读。",
@@ -3175,10 +3406,167 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
     Err(format!("网关启动超时（端口 {port}）：{last_err}"))
 }
 
+/// 「端口上那个网关不是本进程托管的」—— 由 `gateway_status()` 探活确认后的认领记录。
+///
+/// # 为什么需要它（问题 ⑦ 的第二/三副面孔）
+///
+/// 宿主与网关是**两个进程**。宿主重启（或崩溃后重启）时，上一轮留下的网关
+/// 子进程可能还活得好好的：它占着端口、正常服务，但宿主的 `proc_slot()` 里
+/// **没有它的句柄**（Windows 上「已经跑起来的进程」无法事后加入 Job Object，
+/// 见 `attach_child_to_job` 的注释）。于是：
+///
+///   * 状态页的探活（`gateway_status()`）能凭 `/healthz` 的 `X-Service` 把它认回来，
+///     显示「运行中」—— 这是对的；
+///   * 端口检测（`inspect_port()`）只看 `proc_slot()`，判不出它是自己人，
+///     于是报「已被占用」，「启动网关」按钮被禁用、「停止网关」按钮又不显示
+///     —— 用户**既启动不了也停不掉**（2026-10-03 实测死角）。
+///
+/// 两者必须在同一份事实上达成一致，所以这里记下「刚刚确认过：端口 P 上是我们的网关」。
+///
+/// # 为什么是「时间戳 + 端口」而不是缓存一个 bool
+///
+/// 探活是异步的（`gateway_status()` 每 5 秒一轮），端口检测跑在**同步 Tauri
+/// 命令**里，不能在这里反向发起探活 —— 那要 spawn 进程 / 建连接，正是
+/// `inspect_port` 明令禁止的（会把主线程卡住）。所以只**单向**地读一个
+/// 刚刚被写下的结论：状态页先跑、端口检测后跑（前端是 5 秒轮询 + 350ms 防抖，
+/// 依赖项含 `status.running`），读到的一定是本轮的结论。
+///
+/// 过期时间取 10 秒：够覆盖一次「状态轮询 → 端口检测」的间隔，又短到
+/// 「网关被手动关掉后」不会一直报「当前网关正在使用」。
+static CLAIMED_GATEWAY_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 被认领的网关监听端口（0 = 没有认领过）。
+static CLAIMED_GATEWAY_PORT: AtomicU64 = AtomicU64::new(0);
+
+/// 认领结论的有效期。
+const CLAIM_TTL_MS: u64 = 10_000;
+
+/// 记下「端口 `port` 上确实是本程序的网关」这一结论（由 `gateway_status()` 在
+/// 探活 + 身份校验通过后调用）。
+fn note_claimed_gateway(port: u16) {
+    if port == 0 {
+        return;
+    }
+    // 先写端口再写时间戳：读侧先看时间戳，看到「新鲜」时端口必然已经写好。
+    CLAIMED_GATEWAY_PORT.store(u64::from(port), Ordering::SeqCst);
+    CLAIMED_GATEWAY_AT_MS.store(now_ms().max(0) as u64, Ordering::SeqCst);
+}
+
+/// 端口 `port` 是否刚刚被确认「跑着本程序的网关」。
+fn claimed_recently(port: u16) -> bool {
+    if port == 0 || CLAIMED_GATEWAY_PORT.load(Ordering::SeqCst) != u64::from(port) {
+        return false;
+    }
+    let at = CLAIMED_GATEWAY_AT_MS.load(Ordering::SeqCst);
+    if at == 0 {
+        return false;
+    }
+    let now = now_ms().max(0) as u64;
+    // 时钟回拨（NTP 校正）时 `now < at`：宁可认「刚认领过」，也不要因为
+    // 一个负数差值把结论作废 —— 那会退回「启动不了也停不掉」的死角。
+    now.saturating_sub(at) <= CLAIM_TTL_MS
+}
+
+/// 端口上「确实是我们的网关、但不是本进程启动的」那个进程的 PID。
+///
+/// 用于「停止网关」：宿主没托管它，就不能只回一句 `{"stopped": false}` ——
+/// 用户点了停止、端口上却什么都没发生，只会以为是程序坏了。
+///
+/// 判据是**两道**，缺一不可：
+///   1. 端口真的被占用（空闲时绝不查进程，更绝不杀）；
+///   2. 占用者的进程名/路径符合本项目的特征（`is_our_process`）。
+/// 第三方服务即便占着同一个端口也不会被这里杀掉。
+///
+/// ⚠ 本函数会 spawn `netstat` / `tasklist` / `powershell`，**禁止**在
+/// `inspect_port` 那种同步热路径上调用（见 `inspect_port` 的注释）。
+fn claimed_gateway_pid(port: u16) -> Option<u32> {
+    if port == 0 || port_free(port) {
+        return None;
+    }
+    // 绝不认领**本进程自己**：这里返回的 PID 会被拿去 taskkill，认错了就是自杀。
+    // 正常情况下宿主不会监听业务端口，但这条防线不能靠「正常情况下」。
+    let pid = claimed_pid_from_holder(find_port_holder(port))?;
+    if pid == std::process::id() {
+        return None;
+    }
+    Some(pid)
+}
+
+/// 从「端口占用者」里挑出本程序的网关（纯函数）。
+///
+/// 拆出来是为了**能在单测里构造反例**：真跑一遍 `find_port_holder` 时，
+/// 占用者必然是测试进程自己，而它的 exe 路径就在
+/// `crates/ai-gateway-core/target/...` 下、含 `ai-gateway` 字样，
+/// 于是 `is_our_process` 恒为真，「不是自己人 ⇒ 不杀」这条分支永远测不到。
+fn claimed_pid_from_holder(holder: Option<(u32, String, String)>) -> Option<u32> {
+    let (pid, name, path) = holder?;
+    if is_our_process(&name, &path) {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
 /// 停止网关子进程。
 pub fn stop_gateway() -> Value {
+    let hosted = stop_hosted_child();
+
+    // 宿主没托管它，但端口上可能**确实**有本程序的网关在跑：上一轮运行留下的
+    // 子进程、或用户手工启动的那一个（问题 ⑦ 的第三副面孔 —— 宿主重启后
+    // 子进程句柄就丢了，而网关自己还活着）。
+    //
+    // 这种情况只回 {"stopped": false} 是错的：用户点了「停止网关」，端口上什么
+    // 都没发生，退出程序后它还占着端口，下次启动直接撞「端口已被占用」。
+    // 2026-10-03 实测：手工启动的网关 pid 32368 占着 7874，stop 返回
+    // {"stopped": false}，进程活着 —— 这正是死角。
+    if hosted.is_none() {
+        let port = port_of(
+            load_gateway_config()
+                .get("listen")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
+        if let Some(pid) = claimed_gateway_pid(port) {
+            // 认领记录立刻作废：已经停了，端口检测不该再说「当前网关正在使用」。
+            CLAIMED_GATEWAY_PORT.store(0, Ordering::SeqCst);
+            CLAIMED_GATEWAY_AT_MS.store(0, Ordering::SeqCst);
+            if let Err(e) = terminate_process(pid) {
+                // 杀不掉（权限不足等）必须如实报「没停掉」：前端会显示已停止，
+                // 而端口上还跑着服务 —— 那比一句错误难排查得多。
+                eprintln!("[gateway] 结束占用端口 {port} 的网关进程 (PID {pid}) 失败: {e}");
+                return json!({ "stopped": false });
+            }
+            eprintln!("[gateway] 已结束占用端口 {port} 的网关进程 (PID {pid})");
+            // 等端口真正释放：进程退出与端口释放之间有短暂窗口，
+            // 立刻返回会让紧接着的「启动」撞上「端口已被占用」。
+            for _ in 0..30 {
+                if port_free(port) {
+                    return json!({ "stopped": true });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            eprintln!("[gateway] 网关进程 {pid} 已结束，但端口 {port} 仍被占用（可能未完全退出）");
+            return json!({ "stopped": true });
+        }
+    }
+
+    json!({ "stopped": hosted.is_some() })
+}
+
+/// 终止**本进程托管**的网关子进程，返回它的 PID（没托管则 `None`）。
+///
+/// 只做「槽位里的子进程」这一段。`stop_gateway()` 在它之后还要处理
+/// 「端口上确实有我们的网关、但不是本进程托管的」那种情况；
+/// 测试辅助 `clear_proc_slot_for_test()` 只需要这一段 —— 它绝不能顺手去
+/// 杀端口上的进程（单测进程自己可能正监听着那个端口，而它的路径含
+/// `ai-gateway` 字样，会被当成「自己人」杀掉测试进程本身）。
+///
+/// ⚠ 锁的作用域**只包住内存操作**：`MutexGuard` 不是 `Send`，它若活到
+/// 函数尾部而调用链上出现 `.await`，整个函数就得变成 async —— 而
+/// `stop_gateway()` 有四个同步调用方（Tauri 命令 / 托盘退出 / 测试辅助）。
+fn stop_hosted_child() -> Option<u32> {
     let mut slot = proc_slot().lock().unwrap();
-    let stopped = match slot.as_mut() {
+    let pid = match slot.as_mut() {
         Some(child) => {
             let pid = child.id();
             // **优先用 Job Object 终止**（上游 `7966c578` 的修复）。
@@ -3228,15 +3616,14 @@ pub fn stop_gateway() -> Value {
             // ⚠ 用**带超时**的 wait：进程若因任何原因没退，
             // 这里绝不能无限等下去（那正是 mac 卡死的直接原因）。
             wait_child_with_timeout(child, STOP_WAIT_TIMEOUT);
-            true
+            Some(pid)
         }
-        None => false,
+        None => None,
     };
     // 进程已终止，标志复位：下一次启动若 assign 失败，仍能正确回退。
     GATEWAY_IN_JOB.store(false, Ordering::SeqCst);
     *slot = None;
-    GATEWAY_RUNNING.store(false, Ordering::SeqCst);
-    json!({ "stopped": stopped })
+    pid
 }
 
 /// 停止网关时等待子进程退出的上限。
@@ -3345,6 +3732,30 @@ fn wait_child_with_timeout(child: &mut std::process::Child, timeout: std::time::
             Err(_) => return,
         }
     }
+}
+
+/// 把「本进程托管的网关子进程」这一状态复位到「没有」——仅测试使用。
+///
+/// # 为什么测试不能直接写 `GATEWAY_RUNNING`（问题 ⑦）
+///
+/// 那个内存标志已废弃：现在 `is_running()` 的唯一真值是 `proc_slot()` 里的
+/// 子进程是否还活着。测试若继续写标志，要么写了没用（读不到），
+/// 要么把「真值来源」重新搅成两个 —— 那正是 ⑦ 的成因。
+///
+/// 这里收掉的是**本进程托管**的那个子进程（走 `stop_hosted_child()`），
+/// 所以测试结束后既没有残留子进程，也没有「标志说在跑、进程已没了」的中间态。
+///
+/// ⚠ 刻意**不**调 `stop_gateway()`：它还会去杀「端口上那个确实是我们
+/// 的网关、但不是本进程托管的」进程。单测进程自己就可能正监听着某个端口，
+/// 而它的 exe 路径在 `crates/ai-gateway-core/target/...` 下、含
+/// `ai-gateway` 字样 ⇒ 被 `is_our_process` 认成「自己人」，
+/// 于是测试会把**自己**杀掉（那不是理论风险：本函数的注释就是被这条规则逼出来的）。
+/// 清槽位只该清槽位，杀端口占用者要由用户显式触发。
+///
+/// 生产构建下用不到它，故整体 `#[cfg(test)]`，不污染发布产物。
+#[cfg(test)]
+fn clear_proc_slot_for_test() {
+    stop_hosted_child();
 }
 
 /// 「指定账号」下拉里的单个账号条目。
@@ -3461,7 +3872,23 @@ pub async fn gateway_status() -> Value {
     let listen = cfg.get("listen").and_then(Value::as_str).unwrap_or(":7863");
     let port = port_of(listen);
     let exe = resolve_gateway_exe();
-    let running = is_running();
+    let mut running = is_running();
+
+    // 本进程没托管网关，但端口上可能**确实**有本程序的网关在跑
+    // （问题 ⑦ 的第二副面孔：宿主重启后子进程句柄就丢了，而网关自己还活着）。
+    // 那种情况不能报「未运行」—— 界面会显示「启动网关」，用户一点就撞上端口占用。
+    // 这里按「探活 + 身份校验」把它认回来（`probe_health` 会比对 X-Service）。
+    //
+    // 只在端口被占用时才探活：没跑网关时省掉一次 1.2 秒的网络等待。
+    // ★ 同样走热路径变体：本函数被三个页面轮询（实测 1.2~2.3 秒/发），
+    // 网关没跑时保守预检会再添 300ms；有人应答的判定不受预算影响。
+    // 记下「端口 P 上确实是我们的网关」：端口检测（inspect_port）跑在
+    // 同步路径上、不允许探活，只能读这里写下的结论。没有这一步，
+    // 状态页说「运行中」而端口那行说「已被占用」，「启动网关」被禁用、
+    // 「停止网关」又不显示 —— 用户既启动不了也停不掉。
+    if !running && adopt_running_gateway(port).await {
+        running = true;
+    }
 
     let mut health = Value::Null;
     let mut pool = Value::Null;
@@ -3573,7 +4000,7 @@ pub async fn gateway_status() -> Value {
             .filter_map(pinned_account_option)
             .collect::<Vec<Value>>(),
         "exeSource": gateway_source(),
-        "portAvailable": port_free(port),
+        "portAvailable": port_free_fast(port),
         "authDir": gateway_auth_dir().to_string_lossy(),
         "accountsInLibrary": account_count,
         // 正在执行的养号任务（含进度）。所有者明确要求「账号卡片上要能看到
@@ -3608,6 +4035,14 @@ pub async fn maybe_autostart() -> Option<Value> {
     }
     // 已在运行（如上次退出未清理干净）时不重复启动，但仍同步一次运行态。
     if is_running() {
+        update_runtime_state("started", None);
+        return None;
+    }
+    // 宿主没托管、但端口上确实是本程序的网关时，同样不能重复启动：
+    // 那必然撞上端口占用，把 last_status 写成 failed，用户看到的是
+    // 「网关明明运行正常，App 却说启动失败」。判据与状态页完全一致。
+    let port = port_of(cfg.get("listen").and_then(Value::as_str).unwrap_or(""));
+    if adopt_running_gateway(port).await {
         update_runtime_state("started", None);
         return None;
     }
@@ -4117,6 +4552,98 @@ pub async fn set_platform_models(raw: &Value, disabled: Option<&Value>) -> Value
     })
 }
 
+/// 读「平台 → 是否参加兼容网关路由」总开关（已归一化）。
+///
+/// 空对象 = 所有平台都参加（老配置缺这个键，升级后行为逐字不变）。
+fn platform_enabled_for_gateway() -> Value {
+    let cfg = load_gateway_config();
+    let Some(raw) = cfg.get("platform_enabled") else {
+        return json!({});
+    };
+    platform_enabled_normalized(raw)
+}
+
+/// 只读导出：当前「平台 → 是否参加兼容网关路由」（已归一化）。
+pub fn platform_enabled() -> Value {
+    platform_enabled_for_gateway()
+}
+
+/// 只读导出：一次性返回界面初始化所需的平台开关快照。
+///
+/// 返回：`{"platformEnabled": {"qoder": false}}`
+///
+/// ★ 键名用 `platformEnabled`（驼峰）与 `platform_models` 那组的返回风格保持一致，
+/// 前端 `api.ts` 与 Tauri 命令都按这个键名取值。
+pub fn platform_enabled_state() -> Value {
+    json!({ "platformEnabled": platform_enabled_for_gateway() })
+}
+
+/// 归一化「平台 → 是否参加路由」总开关（抽成纯函数便于测试）。
+///
+/// 规则（与 Go 侧 `Config` 的归一化、以及 `Pool::set_platform_enabled` **必须一致**，
+/// 否则会出现"宿主说关了、网关说开着"这类两侧不一致）：
+///
+///	· 平台名 trim + 小写；空平台名跳过
+///	· 值不是布尔 ⇒ 跳过（不猜）
+///	· **只保留显式 `false` 的项** —— `true` 与「键不存在」同义，
+///	  写进配置文件只会让"全量还是增量"难以分辨
+pub fn platform_enabled_normalized(raw: &Value) -> Value {
+    let Some(outer) = raw.as_object() else {
+        return json!({});
+    };
+    let mut out = serde_json::Map::new();
+    for (plat, v) in outer {
+        let plat = plat.trim().to_lowercase();
+        if plat.is_empty() {
+            continue;
+        }
+        let Some(on) = v.as_bool() else { continue };
+        if !on {
+            out.insert(plat, json!(false));
+        }
+    }
+    Value::Object(out)
+}
+
+/// 保存「平台 → 是否参加兼容网关路由」总开关。
+///
+/// # 为什么**不重启**网关（与 `set_platform_models` 的关键区别）
+///
+/// 这个开关在账号页是**随手点**的，而 `set_platform_models` 那条路是"写配置 →
+/// 重启网关"—— 每次点击都会掐断正在跑的请求，用户会看到「点一下开关，流式回答
+/// 断了」。故本键刻意放进 `cfgwatch::DynamicConfig` 的**热更新面**：
+/// 写盘后用 `resync_native_config()` 重写网关配置文件（**只写文件、不重启**），
+/// 网关的配置监视器（默认 5s 一轮）读入后立刻生效。
+///
+/// 返回值里的 `reloaded` 恒为 `false`，语义是「**没有**重启网关」——
+/// 与 `set_platform_models` 的 `reloaded: true` 恰好相反，前端据此提示
+/// 「已生效（无需重启）」而不是「网关正在重启…」。
+///
+/// # 语义（业主原话）
+///
+/// 「关闭平台只是不参与兼容网关,并不是不执行任务请注意」—— 只把该平台的账号从
+/// **选号**里排除；签到 / 上报 / 成长任务 / 额度巡检**照常运行**。
+pub async fn set_platform_enabled(raw: &Value) -> Value {
+    let normalized = platform_enabled_normalized(raw);
+
+    if let Err(e) = save_gateway_config(&json!({ "platform_enabled": normalized.clone() })) {
+        return json!({ "ok": false, "error": e });
+    }
+
+    // ★ 只重写网关配置文件（触发热加载），**不重启**网关。
+    // 写失败不算致命：配置已落盘，下次网关重启/重同步时会自然带上新值。
+    if let Err(e) = resync_native_config() {
+        eprintln!("[platform_enabled] 重写网关配置文件失败（配置已落盘，稍后重启网关仍会生效）：{e}");
+    }
+
+    json!({
+        "ok": true,
+        // 恒 false：本键走热加载，**没有**重启网关。前端据此区分提示文案。
+        "reloaded": false,
+        "platformEnabled": normalized,
+    })
+}
+
 /// 切换工作模式（自动 / 手动 / 轮转）并**立即生效**。
 ///
 /// 为什么需要这个专用入口：`save_gateway_config` 只写配置文件，
@@ -4500,12 +5027,29 @@ pub async fn growth_task(action: &str, account_id: &str, task_code: &str) -> Val
         });
     }
 
+    let cfg = load_gateway_config();
+    let port = cfg.get("port").and_then(Value::as_u64).unwrap_or(7863) as u16;
+
+    // 纯清单查询（list）在网关没起来时**直接返回**，不建 HTTP 客户端、不发请求：
+    //
+    //   * 旧实现先取 busy guard 再连 `127.0.0.1:{port}`，端口没人监听时连接被拒
+    //     之前会先烧 1~2.5 秒（实测 2531ms）。账号页启动时按账号逐个拉清单
+    //     （`fetchGrowthTasksMap`），19 个账号就是几十秒的纯等待 —— 这正是
+    //     业主说的「启动后要等一段时间才能点」的主要来源之一。
+    //   * `TaskBusyGuard::acquire` 会写 `TASK_RUNTIME`（见 `:619`/`:633`）⇒
+    //     纯 list 也会让界面显示「正在跑成长任务」，是观测假象。提前返回
+    //     必须在 acquire **之前**，才能同时修掉这条。
+    //
+    // 只有 list 走捷径：run / run-all 是真的要执行任务，必须由网关侧回报，
+    // 也要照旧用 busy guard 推迟自动同步重启（`SYNC_RESTART_PENDING`）。
+    if action == "list" && !gateway_reachable(port) {
+        return json!({ "ok": false, "error": "无法连接网关，请先启动网关" });
+    }
+
     // 与 run_task_now 同理：全程持有，Drop 即复位。
     // 这同时也让自动同步在成长任务期间推迟重启（见 SYNC_RESTART_PENDING）。
     let _busy = TaskBusyGuard::acquire("growth");
 
-    let cfg = load_gateway_config();
-    let port = cfg.get("port").and_then(Value::as_u64).unwrap_or(7863) as u16;
     let api_key = cfg
         .get("api_key")
         .and_then(Value::as_str)
@@ -4711,12 +5255,19 @@ mod tests {
             }
         }
 
-        // 允许两处：
-        //   1. `stop_gateway` **自身的定义**里那一次（它自己不能调自己，
-        //      实际是定义体内没有；这里指 `stop_gateway` 这个 pub fn 的行号附近）
-        //   2. `restart_gateway_serialized` 内部持锁后调的那一次
+        // 允许两处（都必须是「先确认是本进程托管的子进程」才动手的场景）：
+        //   1. `restart_gateway_serialized` 内部持锁后调的那一次 —— 用户可见的
+        //      重启路径唯一的入口；
+        //   2. `start_gateway` 就绪等待超时后的回滚（起不来就把半成品收掉）。
         //
-        // 判据不是"数到 2 就通过"，而是**精确核对行号归属** ——
+        // ⚠ 这里**曾经**有第三处：测试辅助 `clear_proc_slot_for_test` 调
+        //   `stop_gateway()` 把槽位复位。现在 `stop_gateway()` 多了一层
+        //   「端口上那个确实是我们的网关、但不是本进程托管的」处理，而**测试进程
+        //   自己**就可能是那个占用者（它的 exe 路径含 `ai-gateway` 字样），
+        //   于是「清个槽位」会把测试自己杀掉。改为调 `stop_hosted_child()`：
+        //   它只收本进程托管的子进程，语义恰好就是「复位槽位」。
+        //
+        // 判据不是"数到 3 就通过"，而是**精确核对行号归属** ——
         // 否则将来有人再插一处、又恰好删掉别处，总数不变就漏过去了。
         let expected: Vec<usize> = offenders
             .iter()
@@ -4739,8 +5290,8 @@ mod tests {
         assert_eq!(
             offenders.len(),
             2,
-            "裸的 `stop_gateway()` 只应出现在两处（`restart_gateway_serialized` 内部\
-             与 `stop_gateway` 自身的定义/调用点），实际 {} 处：{:?}\n\n\
+            "裸的 `stop_gateway()` 只应出现在两处（`restart_gateway_serialized` 内部、\
+             `start_gateway` 的超时回滚），实际 {} 处：{:?}\n\n\
              任何新的重启调用点都必须走 `restart_gateway_serialized()`，\
              不要自己写 stop+start —— 两个调用方交错时，后到的那个会撞上\
              `start_gateway` 的 `is_running()` 检查并返回「网关已在运行」，\
@@ -5061,6 +5612,22 @@ mod tests {
         assert_eq!(after_runtime["api_key"], "sk-user", "api_key 不应被运行态更新清空");
         assert_eq!(after_runtime["auto_start"], true, "自动启动设置不应丢失");
         assert_eq!(after_runtime["last_status"], "started");
+    }
+
+    // 回归保护：端口空闲（或端口为 0）时不得去「认领」端口上的网关。
+    //
+    // 这条判定挂在启动流程上：业主的网关是手工启动 / 上次运行遗留的，
+    // 宿主没托管它，`is_running()` 为假 —— 若不加这一步，`maybe_autostart`
+    // 会再起一个进程，撞上端口占用并把 `last_status` 写成 failed，
+    // 而状态页同时显示「运行中」（走的是同一道探活判据）。
+    #[test]
+    fn adopt_gateway_only_probes_occupied_ports() {
+        assert!(!super::should_adopt_gateway(0, false), "端口 0 不该探活");
+        assert!(!super::should_adopt_gateway(7864, true), "空闲端口不该探活");
+        assert!(
+            super::should_adopt_gateway(7864, false),
+            "被占用的端口必须探活后才能判断是不是自家网关"
+        );
     }
 
     #[test]
@@ -5439,7 +6006,7 @@ mod tests {
              账号页里加好的 Qoder / ZCode 账号永远不参与选号"
         );
 
-        for key in ["qoder_auth_dir", "zcode_auth_dir"] {
+        for key in ["qoder_auth_dir", "zcode_auth_dir", "trae_auth_dir"] {
             let v = pool[key].as_str().unwrap_or("");
             assert!(
                 !v.trim().is_empty(),
@@ -5954,6 +6521,98 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // 网关「在不在跑」的真值判定（问题 ⑦）
+    //
+    // 旧实现读一个内存 `AtomicBool`，网关被外部杀掉后它永远停在 true，
+    // 于是「启动网关」返回「网关已在运行」、状态页显示「已启动」却拿不到
+    // 账号池、连「结束占用进程」入口都被 `inUseByGateway` 误报藏掉。
+    // 现在真值只有一个来源：`proc_slot()` 里的子进程是否还活着。
+    // -----------------------------------------------------------------------
+
+    /// 起一个「假装是网关」的常驻子进程，放进 `proc_slot()`。
+    ///
+    /// 用 `ping -n 30` 而不是 `sleep`：它在 Windows / macOS / Linux 上都能
+    /// 跑，且**不需要**我们的网关二进制（单测不该依赖构建产物）。
+    /// 与 `job_object_kills_child_when_handle_closes` 用的是同一个手法。
+    fn spawn_fake_gateway_child() -> std::process::Child {
+        #[cfg(windows)]
+        let (program, args) = ("cmd", vec!["/C", "ping", "-n", "30", "127.0.0.1"]);
+        #[cfg(not(windows))]
+        let (program, args) = ("sleep", vec!["30"]);
+        std::process::Command::new(program)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fake gateway child")
+    }
+
+    /// 把假网关子进程放进槽位，并在测试结束时无论如何都收掉它。
+    ///
+    /// 断言失败会 panic，`Drop` 仍然会跑 —— 这是必要的：
+    /// 漏掉的 `ping` 会让后续用例看到「槽里有个不属于它的子进程」。
+    struct FakeGatewayChild(Option<std::process::Child>);
+
+    impl Drop for FakeGatewayChild {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            clear_proc_slot_for_test();
+        }
+    }
+
+    /// 放进槽位并返回守卫（守卫活着期间 `is_running()` 应为真）。
+    fn install_fake_gateway() -> FakeGatewayChild {
+        let child = spawn_fake_gateway_child();
+        *proc_slot().lock().unwrap() = Some(child);
+        FakeGatewayChild(None)
+    }
+
+    // 空槽位必须报「没在跑」—— 这正是网关被外部杀掉后的状态。
+    #[test]
+    fn is_running_is_false_without_child() {
+        let _serial = sync_state_lock();
+        reset_sync_globals();
+        assert!(
+            !is_running(),
+            "槽位为空时不得报「在跑」（问题 ⑦：外部杀进程后旧实现恒为真）"
+        );
+        reset_sync_globals();
+    }
+
+    // 子进程活着 ⇒ 在跑；进程退出 ⇒ 立刻不再报在跑（而不是等某处调 stop）。
+    #[test]
+    fn is_running_follows_child_lifecycle() {
+        let _serial = sync_state_lock();
+        reset_sync_globals();
+
+        let _guard = install_fake_gateway();
+        assert!(is_running(), "槽里有存活子进程时应报「在跑」");
+
+        // 模拟「网关被外部杀掉」：只杀进程，不经过 stop_gateway()。
+        {
+            let mut slot = proc_slot().lock().unwrap();
+            let child = slot.as_mut().expect("槽里应当有子进程");
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        assert!(
+            !is_running(),
+            "子进程已退出时必须立刻不再报「在跑」，否则 start_gateway 会一直返回\
+             「网关已在运行」"
+        );
+        // 判定与回收是同一次动作：槽位应已被清空，不留失效句柄
+        assert!(
+            proc_slot().lock().unwrap().is_none(),
+            "发现子进程已退出时应顺手清空槽位"
+        );
+        reset_sync_globals();
+    }
+
+    // -----------------------------------------------------------------------
     // 端口占用者识别与清理
     //
     // 真实链路（起进程占端口 → 识别 → 结束）已由 uitest/verify-port-kill.cjs
@@ -6104,6 +6763,173 @@ mod tests {
         }
 
         drop(listener);
+    }
+
+    // -----------------------------------------------------------------------
+    // 宿主没托管、但端口上确实是我们的网关（问题 ⑦ 的第三副面孔）
+    //
+    // 实测现场（2026-10-03）：宿主进程不知道那个网关的存在（手工启动 / 上一轮
+    // 运行留下的），于是「停止网关」回 `{"stopped": false}` 什么也不做，
+    // 端口检测又报「已被占用」⇒ 「启动网关」被禁用、「停止网关」按钮不显示，
+    // 用户**既启动不了也停不掉**。
+    // -----------------------------------------------------------------------
+
+    // 端口空闲时绝不返回 PID —— 后面紧接着就是 taskkill，这里错一次就是误杀。
+    #[test]
+    fn claimed_gateway_pid_is_none_for_free_port() {
+        let port = 59_876u16;
+        if !port_free(port) {
+            return; // 环境异常（真被占用），跳过而不是误报
+        }
+        assert_eq!(
+            claimed_gateway_pid(port),
+            None,
+            "空闲端口上不该有「我们的网关」，更不该给出可以拿去杀的 PID"
+        );
+    }
+
+    // 端口 0 无意义：必须直接短路，不能落到 find_port_holder 上去。
+    #[test]
+    fn claimed_gateway_pid_rejects_zero_port() {
+        assert_eq!(claimed_gateway_pid(0), None);
+    }
+
+    // 占用者不是自己人 ⇒ 不认领、不杀。
+    //
+    // 用注入的占用者而不是真跑 find_port_holder：真跑时占用者必然是测试进程
+    // 自己，而它的路径含 `ai-gateway` 字样 ⇒ `is_our_process` 恒真，
+    // 这条分支永远测不到（这正是把它拆成纯函数的原因）。
+    #[test]
+    fn claimed_pid_ignores_foreign_holder() {
+        let foreign = Some((
+            4242u32,
+            "nginx.exe".to_string(),
+            r"C:\nginx\nginx.exe".to_string(),
+        ));
+        assert_eq!(
+            claimed_pid_from_holder(foreign),
+            None,
+            "第三方进程占着端口也不能被当成本程序的网关 —— 否则「停止网关」会去杀它"
+        );
+        assert_eq!(claimed_pid_from_holder(None), None);
+    }
+
+    // 占用者是我们的网关 ⇒ 认领，并把它自己的 PID 原样带出来。
+    #[test]
+    fn claimed_pid_accepts_own_gateway() {
+        let ours = Some((
+            33708u32,
+            "gateway-35538d-2c4b5c2ff3726ad1.exe".to_string(),
+            r"C:\Users\x\.wb-switch\gateway\bin\gateway-35538d.exe".to_string(),
+        ));
+        assert_eq!(
+            claimed_pid_from_holder(ours),
+            Some(33708),
+            "本程序的网关必须被认领，否则「停止网关」停不掉它"
+        );
+    }
+
+    // 认领记录：状态页探活通过后写、端口检测读；过期（TTL）后必须失效。
+    #[test]
+    fn claimed_gateway_recency_follows_ttl() {
+        let _serial = sync_state_lock();
+        let port = 59_877u16;
+
+        reset_claim_globals();
+        assert!(
+            !claimed_recently(port),
+            "没有认领过时不得说「端口上跑着我们的网关」"
+        );
+        assert!(
+            !claimed_recently(0),
+            "端口 0 是「没有认领」的哨兵值，不能与任何真实认领混为一谈"
+        );
+
+        note_claimed_gateway(port);
+        assert!(
+            claimed_recently(port),
+            "刚探活确认过，端口检测必须认得出它是自己人（否则按钮又是「启动不了、停不掉」）"
+        );
+        assert!(
+            !claimed_recently(port + 1),
+            "认领必须带端口：另一个端口上不能跟着变成「当前网关正在使用」"
+        );
+
+        // 过期：把时间戳挪到 TTL 之前
+        CLAIMED_GATEWAY_AT_MS.store(
+            (now_ms().max(0) as u64).saturating_sub(CLAIM_TTL_MS + 1),
+            Ordering::SeqCst,
+        );
+        assert!(
+            !claimed_recently(port),
+            "过了有效期还认领，会把「网关早被手动关掉」的端口一直说成「当前网关正在使用」"
+        );
+
+        reset_claim_globals();
+    }
+
+    // 时钟回拨（NTP 校正 / 用户改系统时间）时不能把结论算成「很久以前」：
+    // 那会让「启动不了、停不掉」的死角在每次校时后重现。宁可认「刚认领过」。
+    #[test]
+    fn claimed_gateway_recency_survives_clock_rollback() {
+        let _serial = sync_state_lock();
+        let port = 59_878u16;
+
+        reset_claim_globals();
+        note_claimed_gateway(port);
+        CLAIMED_GATEWAY_AT_MS.store(
+            (now_ms().max(0) as u64).saturating_add(60_000),
+            Ordering::SeqCst,
+        );
+        assert!(
+            claimed_recently(port),
+            "时间戳比现在还晚（时钟回拨）时必须保守认作「刚认领过」，而不是作废"
+        );
+
+        reset_claim_globals();
+    }
+
+    // 「停止网关」在**没有托管子进程**时，绝不能去杀一个不是我们网关的占用者。
+    //
+    // 这条是上面那些认领判定的安全侧：认错人 ⇒ 用户点一下「停止网关」就杀掉
+    // 了别人的服务。用真实的占用者（本测试进程）跑完整链路 —— 它必须被
+    // 「不是自己人」挡住，返回 `{"stopped": false}`，并且端口仍然在监听。
+    #[cfg(windows)]
+    #[test]
+    fn stop_gateway_leaves_foreign_listener_alone() {
+        let _serial = sync_state_lock();
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-stop-foreign");
+
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let port = match listener.local_addr() {
+            Ok(a) => a.port(),
+            Err(_) => return,
+        };
+        // 配置里的 listen 指到这个端口：stop_gateway() 正是从这里取端口，
+        // 不指过来的话它根本不会去看这个端口（也就测不到这条防线）。
+        let _ = save_gateway_config(&json!({ "port": port, "listen": format!(":{port}") }));
+
+        reset_claim_globals();
+        let r = stop_gateway();
+
+        assert_eq!(
+            r.get("stopped").and_then(Value::as_bool),
+            Some(false),
+            "宿主没托管任何子进程、端口占用者又不是我们的网关时，必须如实回「没停掉」，\
+             实际: {r}"
+        );
+        assert!(
+            !port_free(port),
+            "更关键的是：认错人的话「停止网关」会把别人的服务杀掉。端口 {port} \
+             必须仍在监听（本测试进程还活着就是这条断言的证明）"
+        );
+
+        drop(listener);
+        reset_claim_globals();
+        reset_sync_globals();
     }
 
     /// 非 Windows（macOS/Linux）上「查不到占用者」仍然是**可能**的，但不再是
@@ -6975,7 +7801,7 @@ p42\ncjava\nf9\nn*:8080\n";
     /// 串行化「碰进程级全局静态」的测试。
     ///
     /// `TASK_BUSY_COUNT` / `SYNC_DEFER_ROUNDS` / `SYNC_RESTART_PENDING` /
-    /// `GATEWAY_RUNNING` 都是 `static`，而 cargo 默认**多线程**跑测试 ——
+    /// `GATEWAY_PROC` 都是 `static`，而 cargo 默认**多线程**跑测试 ——
     /// 不串行化就会看到彼此写到一半的状态（表现为看似随机的失败，
     /// 与 `config::test_isolation` 需要全局锁是同一个原因）。
     fn sync_state_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -6985,12 +7811,25 @@ p42\ncjava\nf9\nn*:8080\n";
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    /// 复位「认领了端口上的网关」这份跨调用状态。
+    ///
+    /// 它是**进程级 static**，而 cargo 默认多线程跑测试：不复位就会串味 ——
+    /// 一个测试认领了端口 59_877，另一个测试的 `inspect_port()` 会莫名其妙
+    /// 报「当前网关正在使用」。
+    fn reset_claim_globals() {
+        CLAIMED_GATEWAY_PORT.store(0, Ordering::SeqCst);
+        CLAIMED_GATEWAY_AT_MS.store(0, Ordering::SeqCst);
+    }
+
     /// 复位忙标志相关的全局状态，让每个测试从干净状态开始。
     fn reset_sync_globals() {
         TASK_BUSY_COUNT.store(0, Ordering::SeqCst);
         SYNC_DEFER_ROUNDS.store(0, Ordering::SeqCst);
         SYNC_RESTART_PENDING.store(false, Ordering::SeqCst);
-        GATEWAY_RUNNING.store(false, Ordering::SeqCst);
+        // 问题 ⑦ 后，「网关在跑」的真值来自 `proc_slot()` 的子进程而不是内存
+        // 标志；清状态必须走真路径，否则测试之间会互相看到对方的子进程。
+        clear_proc_slot_for_test();
+        reset_claim_globals();
         *TASK_RUNTIME.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
@@ -7042,14 +7881,15 @@ p42\ncjava\nf9\nn*:8080\n";
     // 核心回归：任务在执行时，自动同步**不得**调 stop_gateway/start_gateway。
     //
     // 断言方式是看 `apply_pending_restart` 的动作：Defer 分支只累加计数，
-    // 不碰网关进程。这里刻意把 GATEWAY_RUNNING 置真 —— 否则会走
-    // 「网关没在跑 → Idle」，测不到忙时的分支。
+    // 不碰网关进程。这里刻意**放一个真实存活的子进程**进槽位 —— 问题 ⑦ 之后
+    // 「网关在跑」的真值来自 `proc_slot()`，再写内存标志已经无效；
+    // 没有它就会走「网关没在跑 → Idle」，测不到忙时的分支。
     #[test]
     fn auto_sync_defers_while_task_running() {
         let _serial = sync_state_lock();
         reset_sync_globals();
 
-        GATEWAY_RUNNING.store(true, Ordering::SeqCst);
+        let _fake_gateway = install_fake_gateway();
         SYNC_RESTART_PENDING.store(true, Ordering::SeqCst);
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -7236,6 +8076,15 @@ p42\ncjava\nf9\nn*:8080\n";
         assert_eq!(task_label("school"), "开学季活动");
         assert_eq!(task_label("  activity  "), "活跃上报", "应容忍首尾空白");
         assert_eq!(task_label("nope"), "养号任务");
+        // Trae 签到与 scheduler::TaskKind::TraeCheckin.label() 必须同文案：
+        // 一边改一边忘，账号卡片上的「本轮已跑」标记就静默失效。
+        assert_eq!(task_label("trae-checkin"), "Trae 每日签到");
+        assert_eq!(task_label("trae-credits-snapshot"), "Trae 积分日快照");
+        assert_eq!(
+            task_label("trae-checkin"),
+            crate::modules::scheduler::TaskKind::TraeCheckin.label(),
+            "task_label 与 TaskKind::label 必须同文案"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7922,6 +8771,116 @@ p42\ncjava\nf9\nn*:8080\n";
             native.pointer("/pool/platform_models"),
             Some(&json!({ "qoder": { "cn": ["qwen3.8-flash"] } })),
             "platform_models 必须与新增的键并存"
+        );
+    }
+
+
+    // ------------------------------------------------------------------
+    // platform_enabled：「平台 → 是否参加兼容网关路由」总开关
+    //
+    // ★ 语义（业主原话）：「关闭平台只是不参与兼容网关,并不是不执行任务请注意」
+    // 关掉的只是**选号**，签到 / 上报 / 成长任务 / 额度巡检照跑。
+    // 它与 platform_models / platform_models_disabled 都不是同一件事：
+    // 那两者管「哪些模型能走」，本键管「这个平台的账号参不参加路由」。
+    // ------------------------------------------------------------------
+
+    /// 只保留显式 `false`：`true` 与「键不存在」同义，不写进配置。
+    #[test]
+    fn platform_enabled_keeps_only_explicit_false() {
+        let out = super::platform_enabled_normalized(&json!({
+            "  QoDer  ": false,
+            "workbuddy": true,
+            "trae": "false",
+            "": false,
+            "zcode": false,
+        }));
+        assert_eq!(
+            out,
+            json!({ "qoder": false, "zcode": false }),
+            "只留显式 false；true / 非布尔 / 空平台名都要丢掉\
+             （true 写进去只会让「全量还是增量」难以分辨）"
+        );
+    }
+
+    /// 畸形输入一律退化成「所有平台都参加」，绝不 panic、绝不放行成"全关"。
+    #[test]
+    fn platform_enabled_malformed_input_means_all_on() {
+        for bad in [json!(null), json!([]), json!("nope"), json!(42)] {
+            assert_eq!(
+                super::platform_enabled_normalized(&bad),
+                json!({}),
+                "非对象输入应返回空对象 = 所有平台都参加，输入 {bad}"
+            );
+        }
+        assert_eq!(super::platform_enabled_normalized(&json!({})), json!({}));
+    }
+
+    /// `platform_enabled` 必须出现在 `write_native_config` 的输出里
+    /// —— 这是「下发到网关」的全部依据。
+    ///
+    /// 与 `native_config_carries_platform_models_disabled` 同源的缺陷背景：
+    /// `write_native_config` 每次启动网关都**全量重写** native config。
+    /// 漏写这个键 ⇒ Go 侧读到的是「缺键 = 所有平台都参加」⇒ 用户关掉的平台
+    /// 在**下一次重启网关后**自己开回来，而界面上还显示着"已关闭"。
+    #[test]
+    fn native_config_carries_platform_enabled() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-plat-enabled-native");
+
+        // 与 platform_models* 同款：native config 的值由 `*_for_gateway()` 从
+        // **磁盘**读，故必须先落盘。
+        super::save_gateway_config(&json!({
+            "platform_enabled": { "  QoDer ": false, "workbuddy": true },
+        }))
+        .expect("save config");
+
+        let path = super::write_native_config(&json!({ "mode": "balance" })).expect("write native");
+        let native: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+
+        assert_eq!(
+            native.pointer("/pool/platform_enabled"),
+            Some(&json!({ "qoder": false })),
+            "平台总开关必须写进 native config 的 pool 块下发给网关，\
+             否则 Go 侧的判据永远是空的（关掉的平台会自己开回来）"
+        );
+        // 邻居照旧（确认新增没有把 platform_models* 挤掉）
+        assert!(
+            native.pointer("/pool/platform_models").is_some(),
+            "platform_models 必须与新增的键并存"
+        );
+        assert!(
+            native.pointer("/pool/platform_models_disabled").is_some(),
+            "platform_models_disabled 必须与新增的键并存"
+        );
+    }
+
+    /// `set_platform_enabled` 是**整键替换**，且**不重启**网关。
+    #[test]
+    fn set_platform_enabled_replaces_whole_key_without_restart() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-plat-enabled-set");
+        let rt = test_rt();
+
+        let out = rt.block_on(super::set_platform_enabled(&json!({ " QoDer ": false })));
+        assert_eq!(out.get("ok").and_then(Value::as_bool), Some(true), "{out}");
+        assert_eq!(
+            out.get("reloaded").and_then(Value::as_bool),
+            Some(false),
+            "本键走热加载，reloaded 必须恒为 false —— 前端据此提示「已生效（无需重启）」"
+        );
+        assert_eq!(
+            super::load_gateway_config().pointer("/platform_enabled"),
+            Some(&json!({ "qoder": false })),
+            "落盘的必须是归一化后的形状"
+        );
+
+        // 再写一次（只传 true / 空）⇒ 整键被替换成 {}，旧项不能残留
+        let out = rt.block_on(super::set_platform_enabled(&json!({ "qoder": true })));
+        assert_eq!(out.get("ok").and_then(Value::as_bool), Some(true), "{out}");
+        assert_eq!(
+            super::load_gateway_config().pointer("/platform_enabled"),
+            Some(&json!({})),
+            "整键替换：把 qoder 打开后，磁盘上不该还留着旧的 false\
+             （否则用户点「打开」后网关仍然不选它的号）"
         );
     }
 

@@ -12,6 +12,26 @@ use ai_gateway_core::modules::{
     process, refresh, rotate, session, switch, token_stats, travel, update,
 };
 
+/// 前端首帧已绘制（`main.tsx` 在双 `requestAnimationFrame` 后调用）。
+///
+/// 主窗口由 `tauri.conf.json` 创建为不可见，普通启动时也不再立刻 show ——
+/// 就是为了等这个信号。详见 `tray.rs` 的 `setup_startup_visibility`：
+/// 窗口一出现就允许点击，而那时 WebView2 可能还在建环境，
+/// 用户点上去会被 Windows 判成「未响应」。
+///
+/// 前端**不必**等这个 invoke 成功：它只是把窗口提前显示出来，
+/// 失败时 10 s 兜底同样会显示（见 `FRONTEND_READY_TIMEOUT`）。
+#[tauri::command]
+pub fn frontend_ready(app: tauri::AppHandle) {
+    // `tray` 模块只在桌面端编译（见 lib.rs 的 `#[cfg(desktop)] mod tray;`），
+    // 移动端没有「主窗口被托盘逻辑藏起来」这回事，保留空实现，
+    // 让前端那份 invoke 在两端都能安全调用（前端也不看返回值）。
+    #[cfg(desktop)]
+    crate::tray::mark_frontend_ready(&app);
+    #[cfg(not(desktop))]
+    let _ = app;
+}
+
 #[derive(Serialize)]
 pub struct AppStatus {
     running: bool,
@@ -1198,6 +1218,41 @@ pub fn get_platform_models() -> Result<Value, String> {
     Ok(ai_gateway_core::modules::gateway::platform_models_state())
 }
 
+/// 保存「平台 → 是否参加兼容网关路由」总开关。
+///
+/// ★ 语义（业主原话）「关闭平台只是不参与兼容网关,并不是不执行任务请注意」：
+/// 只把该平台的账号从**选号**里排除；签到 / 上报 / 成长任务 / 额度巡检照常运行。
+///
+/// `enabled` 里**只放显式 `false` 的项**：`true` 与「键不存在」同义，
+/// 界面"打开开关"就是把这个键从对象里删掉。
+///
+/// ★ 与 `set_platform_models` 的关键区别：**不重启网关**。该键在
+/// `cfgwatch::DynamicConfig` 的热更新面里，写盘后由网关的配置监视器读入生效，
+/// 所以返回的 `reloaded` 恒为 `false`（= 没有重启）。
+#[tauri::command]
+pub async fn set_platform_enabled(enabled: Value) -> Result<Value, String> {
+    let result = ai_gateway_core::modules::gateway::set_platform_enabled(&enabled).await;
+    if result.get("ok").and_then(Value::as_bool) == Some(false) {
+        let msg = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("设置平台路由开关失败")
+            .to_string();
+        return Err(msg);
+    }
+    Ok(result)
+}
+
+/// 读取「平台 → 是否参加兼容网关路由」总开关（已归一化）。
+///
+/// 返回：`{"platformEnabled":{"qoder":false}}`
+///
+/// 只读：不写配置、不重启网关。
+#[tauri::command]
+pub fn get_platform_enabled() -> Result<Value, String> {
+    Ok(ai_gateway_core::modules::gateway::platform_enabled_state())
+}
+
 /// 启动网关；传 port 时先保存再启动（前端「选端口 → 启动」一步完成）。
 #[tauri::command]
 pub async fn start_gateway(port: Option<u16>) -> Result<Value, String> {
@@ -1402,6 +1457,61 @@ pub fn list_agent_backups(target: String) -> Result<Value, String> {
     Ok(json!({
         "backups": ai_gateway_core::modules::agent_import::list_backups(&target),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// 本机 AI CLI 登录额度查询（Codex / Claude / Antigravity / Grok / Kimi）
+// ---------------------------------------------------------------------------
+
+/// 查询全部 provider 的本机账号额度。
+///
+/// `refresh = true` 强制重查；缺省返回上次结果（含磁盘缓存）。
+///
+/// **未登录的 provider 也会出现在结果里**（`loggedIn: false` + 可操作提示），
+/// 界面据此按 provider 分组展示 —— 未登录是正常状态，不是错误。
+#[tauri::command]
+pub async fn get_cli_quotas(refresh: Option<bool>) -> Result<Value, String> {
+    let views = ai_gateway_core::modules::cli_quota::fetch_all(refresh.unwrap_or(false)).await;
+    Ok(json!({ "accounts": views }))
+}
+
+/// 刷新单个 provider 的额度（界面上的单卡片刷新）。
+///
+/// 未检测到本机登录态时返回 `{ ok: false, error }` 而**不是** Err ——
+/// 「这台机器没装/没登录这个 CLI」是常态，不该让前端把它当异常处理。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn refresh_cli_quota(provider: String) -> Result<Value, String> {
+    let provider = ai_gateway_core::modules::cli_quota::CliProvider::parse(&provider)
+        .ok_or_else(|| format!("未知的 provider: {provider}"))?;
+    match ai_gateway_core::modules::cli_quota::fetch_provider(provider, true).await {
+        Some(view) => Ok(json!({ "ok": true, "account": view })),
+        None => Ok(json!({
+            "ok": false,
+            "error": format!("未检测到本机登录态：{}", provider.login_hint()),
+        })),
+    }
+}
+
+/// 探测本机各 CLI 的登录态（**不触网**、不查额度）。
+///
+/// 与 [`get_cli_quotas`] 分开：登录态是本地文件/凭据读取（毫秒级），额度查询要打
+/// 上游（秒级）。界面先用它把「已登录 / 未登录」渲染出来，再让用户决定要不要
+/// 真正查询 —— 否则首屏会被 5 次网络往返拖住。
+#[tauri::command]
+pub async fn get_cli_quota_status() -> Result<Value, String> {
+    let statuses: Vec<Value> =
+        ai_gateway_core::modules::cli_quota::credentials::discover_all()
+            .into_iter()
+            .map(|(provider, credential)| {
+                json!({
+                    "provider": provider.id(),
+                    "label": provider.label(),
+                    "loggedIn": credential.is_some(),
+                    "loginHint": provider.login_hint(),
+                })
+            })
+            .collect();
+    Ok(json!({ "providers": statuses }))
 }
 
 /// 默认模型：优先取网关模型列表的第一项，失败时回退到静态表首项。

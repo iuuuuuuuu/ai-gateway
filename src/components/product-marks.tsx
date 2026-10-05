@@ -3,6 +3,8 @@ import workbuddyIcon from "@/assets/workbuddy-official-icon.png";
 import codebuddyCnIdeIcon from "@/assets/codebuddy-cn-ide-icon.png";
 import qoderIcon from "@/assets/qoder-official-icon.png";
 import zcodeIcon from "@/assets/zcode-official-icon.png";
+import traeWorkIcon from "@/assets/trae-work-official-icon.png";
+import traeCnIcon from "@/assets/trae-cn-official-icon.png";
 
 const appIconUrl = `${import.meta.env.BASE_URL}icon-transparent.png`;
 
@@ -104,10 +106,40 @@ export function StatusDot({ on, className }: { on: boolean; className?: string }
 }
 
 /**
- * Trae 系（Trae Work / Trae）图标。
+ * Trae 系（Trae Work / Trae）图标 —— **官方应用图标**（2026-09-22 改为官方资源）。
  *
- * 用矢量字形而不是位图：官方图标是受版权保护的美术资源，本仓库不内置；
- * 且两个 Trae 应用只需按配色区分，矢量在任何缩放下都清晰。
+ * # 为什么改了（此前是自绘的「横杠 + 竖杆」矢量字形）
+ *
+ * 所有者原话：
+ *
+ *	「zcode后面不还是一个闪电小卡片么?还不是官方的logo  qoder也一样」
+ *
+ * 此前的注释写着「用矢量字形而不是位图：官方图标是受版权保护的美术资源，
+ * 本仓库不内置」—— **那个理由是错的/过期的**：仓库里早就有官方资源
+ *（`workbuddy-official-icon.png`、`qoder-official-icon.png`、
+ * `zcode-official-icon.png`），本组件自身就在用它们。
+ * 而且自绘的实心渐变块当水印时会显出一整块色斑
+ *（见 `product-account-card.tsx` 的说明），官方图标才压得住。
+ *
+ * # 来源
+ *
+ * 从**本机已安装的官方客户端 exe** 的 RT_GROUP_ICON / RT_ICON 资源里提取
+ *（取 256×256 那一档）：
+ *
+ *	work 变体：D:\APP\TRAE SOLO CN\TRAE SOLO CN.exe   白底 + 黑字形
+ *	cn   变体：D:\APP\Trae CN\Trae CN.exe             黑底 #1A1B1D + 薄荷绿 #32F08C
+ *
+ * # ⚠ 为什么这里是 `size-full` 而不是既有的 `size-[118%]`
+ *
+ * 既有三个官方 png（WorkBuddy / Qoder / ZCode）都自带约 9~11% 透明边距，
+ * 所以那几个 mark 要先放大到 118% 再居中裁剪，把透明圈裁掉。
+ * Trae 这两张**形态不同**：它们是**满幅不透明的圆角方块**，零透明边距
+ *（alpha≥200 时 bbox 几乎满幅 x[0,511] y[0,511]），
+ * 四角圆弧半径约 111px/512 ≈ 21.7%。
+ * 对它们再用 118% 居中放大只会**白白裁掉图标本体**，
+ * 故用 `size-full object-cover` 直接铺满；
+ * span 的 `rounded-[22%]` 正好对上图标自带的圆角半径。
+ * 底色由图片自带，所以**不再叠任何渐变/底色类**。
  */
 export function TraeMark({
   size = 32,
@@ -117,19 +149,15 @@ export function TraeMark({
   return (
     <span
       aria-hidden
-      className={cn(
-        "inline-flex shrink-0 items-center justify-center rounded-[22%] text-white shadow-sm",
-        variant === "work"
-          ? "bg-gradient-to-br from-indigo-500 to-violet-600"
-          : "bg-gradient-to-br from-sky-500 to-cyan-600",
-        className,
-      )}
+      className={cn("relative inline-flex shrink-0 overflow-hidden rounded-[22%]", className)}
       style={{ width: size, height: size }}
     >
-      <svg viewBox="0 0 24 24" fill="none" className="size-[62%]" aria-hidden="true">
-        <path d="M4.5 7h15" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" />
-        <path d="M12 7v11" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" />
-      </svg>
+      {/* 满幅不透明图：直接铺满，不要 118% 居中放大（理由见上方注释）。 */}
+      <img
+        src={variant === "work" ? traeWorkIcon : traeCnIcon}
+        alt=""
+        className="size-full object-cover"
+      />
     </span>
   );
 }

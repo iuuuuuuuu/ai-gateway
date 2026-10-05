@@ -12,6 +12,9 @@ import type {
   CheckinConfig,
   CheckinLog,
   CheckinResult,
+  CliQuotaAccount,
+  CliQuotaProvider,
+  CliQuotaStatusItem,
   CreditExpiry,
   CreditStatistics,
   TokenStatistics,
@@ -58,9 +61,41 @@ import { screenshotDemoResponse } from "./screenshot-demo";
 /**
  * 双通道适配层：
  * - 桌面 App（Tauri）：`invoke` 调用 Rust commands
- * - webui（浏览器）：HTTP fetch 调用本地 ai-gateway 服务（127.0.0.1）
+ * - webui（浏览器）：HTTP fetch 调用本地 ai-gateway 服务（同源）
  */
-const API_BASE = "http://127.0.0.1:57890";
+
+/** ai-gateway 服务端（`crates/ai-gateway-server`）的默认监听端口。 */
+const DEFAULT_API_PORT = 57890;
+const DEFAULT_API_BASE = `http://127.0.0.1:${DEFAULT_API_PORT}`;
+
+/**
+ * webui 模式下的 HTTP 基址。
+ *
+ * 页面本身由 ai-gateway 服务内嵌提供（`api.rs` 用 RustEmbed 把 `dist/` 打进
+ * 二进制，`GET /` 就是页面），所以**同源**才是正确基址：
+ * `ai-gateway serve --port 57900` 时页面在 57900，接口也在 57900。
+ *
+ * 这里曾写死 `http://127.0.0.1:57890`（即上面的默认端口）。一旦用 `--port`
+ * 换端口，页面照旧能打开，但所有数据请求都打到 57890 —— 界面只剩
+ * 「无法读取网关状态 / 无法连接 ai-gateway 服务」，看着像后端坏了，实际是
+ * 前端打错了地址。改为运行时取当前页面的源即可，默认端口只在拿不到源时兜底。
+ *
+ * 桌面端（Tauri）不会走这条分支：`call()` 先判 `isWebui()`，桌面端直接 invoke。
+ * `file://` 预览、`about:blank` 等场景 `location.origin` 是 `"null"`，此时退回默认端口。
+ *
+ * 纯浏览器 `npm run dev`（Vite 开发服务器，14200）调试时源是 14200，可用
+ * `VITE_API_BASE` 显式指定后端地址。
+ */
+function resolveApiBase(): string {
+  const fromEnv = import.meta.env.VITE_API_BASE;
+  if (typeof fromEnv === "string" && fromEnv.trim()) return fromEnv.trim().replace(/\/+$/, "");
+  if (typeof window === "undefined") return DEFAULT_API_BASE;
+  const origin = window.location?.origin;
+  if (!origin || origin === "null" || !/^https?:\/\//i.test(origin)) return DEFAULT_API_BASE;
+  return origin.replace(/\/+$/, "");
+}
+
+const API_BASE = resolveApiBase();
 
 const DEMO_READ_COMMANDS = new Set([
   "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_checkin_status",
@@ -88,6 +123,36 @@ const DEMO_READ_COMMANDS = new Set([
   "get_gateway_config", "get_gateway_status",
   // 三平台「配置」弹窗里的「可用的模型」表单要读它
   "get_platform_models",
+  // 统一账号页的「参加兼容网关路由」开关要读它（只读）。
+  // 写开关的 set_platform_enabled 刻意不登记 —— 演示模式不该产生副作用，
+  // 与 refresh_cli_quota / trae_checkin_refresh 同理。
+  // ⚠ 登记即须在 screenshot-demo.ts 配 case，两处齐改。
+  "get_platform_enabled",
+  // 本机 AI CLI 额度查询页（额度查询）
+  //
+  // 只登记两条**只读**命令：`get_cli_quotas`（含磁盘缓存）与
+  // `get_cli_quota_status`（纯本地读凭证、不触网）。
+  // `refresh_cli_quota` **刻意不登记** —— 它会对上游发真实请求，
+  // 演示模式下不该产生任何外部副作用。
+  "get_cli_quotas", "get_cli_quota_status",
+  // Trae 分组 / 积分 / 签到趋势 / 用量、抓包日志（与 PR#2 的登记范围逐条对齐）
+  //
+  // ⚠ 登记白名单与写演示数据**必须同时做**。只登记不写数据时，`call()`
+  // 放行后落到 `screenshotDemoResponse` 的 `default` 分支抛
+  // 「演示模式缺少只读数据」—— 页面空白，看起来像"功能没做"。
+  // 这个坑本项目已经踩过一次（见上面 Qoder/ZCode 那段注释）。
+  //
+  // 只登记**读取类**：`group_create/update/delete`、`oauth_*`、
+  // `proxy_logs_clear`、`trae_credits_snapshot`、`trae_export/import/preview`
+  // 一律不登记 —— 它们是写操作或会返回明文凭证，演示模式不该"看起来能跑"。
+  "groups_list",
+  "trae_credit_detail", "trae_credits_stats", "trae_checkin_trends", "trae_checkin_status",
+  "trae_usage_history",
+  // `trae_checkin_refresh` **刻意不登记** —— 它会逐账号探测上游 status 端点，
+  // 演示模式下不该产生任何外部请求（与 `trae_credits_snapshot` 同理）。
+  "proxy_logs_list", "proxy_log_detail", "proxy_logs_overview",
+  // 豆包运维健康史（DoubaoInsights 的数据源）。只读，登记即须配套 demo 数据。
+  "doubao_history",
 ]);
 
 export function isDemoMode(): boolean {
@@ -142,6 +207,7 @@ const ROUTES: Record<string, Route> = {
   copy_sessions: { method: "POST", path: "/api/sessions/copy" },
   get_checkin_status: { method: "GET", path: "/api/checkin/status" },
   get_credit_expiry: { method: "POST", path: "/api/credits" },
+  get_credit_expiry_batch: { method: "GET", path: "/api/credits/batch" },
   get_credit_statistics: { method: "GET", path: "/api/credits/stats" },
   get_token_statistics: { method: "GET", path: "/api/token-stats" },
   checkin: { method: "POST", path: "/api/checkin" },
@@ -193,6 +259,16 @@ const ROUTES: Record<string, Route> = {
   // 同样**必须**注册：漏了在 webui 下是静默失败（详见上一条注释）。
   get_platform_models: { method: "GET", path: "/api/gateway/platform-models" },
   set_platform_models: { method: "POST", path: "/api/gateway/platform-models" },
+  // 「平台 → 是否参加兼容网关路由」开关（统一账号页）。
+  //
+  // ⚠ 同样必须注册：漏了在 webui 下是静默失败 —— 点平台开关毫无反应、
+  // 不报错、也没有请求发出（与上面两条同型，本项目踩过）。
+  //
+  // 语义（业主 m01323）：关闭平台只是不参与兼容网关，并不是不执行任务
+  // ⇒ 关掉的平台不参与选号，但签到 / 上报 / 成长任务 / 额度巡检照跑。
+  // 故它不是账号级的 disabled（那个是「账号已死」），网关侧另有配置键。
+  get_platform_enabled: { method: "GET", path: "/api/gateway/platform-enabled" },
+  set_platform_enabled: { method: "POST", path: "/api/gateway/platform-enabled" },
   start_gateway: { method: "POST", path: "/api/gateway/start" },
   check_gateway_port: { method: "POST", path: "/api/gateway/port-check" },
   kill_gateway_port_holder: { method: "POST", path: "/api/gateway/port-kill" },
@@ -227,6 +303,11 @@ const ROUTES: Record<string, Route> = {
   trae_list_accounts: { method: "GET", path: "/api/trae/accounts" },
   trae_add_account: { method: "POST", path: "/api/trae/accounts/add" },
   trae_delete_account: { method: "POST", path: "/api/trae/accounts/delete" },
+  // Trae 账号的部分更新（启用 / 禁用；后端也支持改名与换 JWT）。
+  //
+  // 与 add 分开是刻意的：add 必须带 JWT 才能新建，而「启用 / 禁用」
+  // 只改一个布尔；复用 add 会把 JWT 语义搅进来。
+  trae_update_account: { method: "POST", path: "/api/trae/accounts/update" },
   trae_discover_accounts: { method: "GET", path: "/api/trae/discover" },
   trae_entitlement: { method: "GET", path: "/api/trae/entitlement" },
   trae_device_info: { method: "GET", path: "/api/trae/device" },
@@ -250,10 +331,13 @@ const ROUTES: Record<string, Route> = {
   doubao_restore_chatdata: { method: "POST", path: "/api/doubao/chatdata/restore" },
   doubao_chatdata_info: { method: "GET", path: "/api/doubao/chatdata/info" },
   doubao_export_chats: { method: "POST", path: "/api/doubao/chats/export" },
+  // 豆包运维健康史（事件 + 额度趋势 + 健康计数）。只读，无副作用。
+  doubao_history: { method: "GET", path: "/api/doubao/history" },
   get_app_settings: { method: "GET", path: "/api/apps/settings" },
   // ---- 本地 MITM 代理 ----
   proxy_config: { method: "GET", path: "/api/proxy/config" },
   proxy_status: { method: "GET", path: "/api/proxy/status" },
+  proxy_check: { method: "GET", path: "/api/proxy/check" },
   proxy_start: { method: "POST", path: "/api/proxy/start" },
   proxy_stop: { method: "POST", path: "/api/proxy/stop" },
   proxy_cert_status: { method: "GET", path: "/api/proxy/cert" },
@@ -294,6 +378,10 @@ const ROUTES: Record<string, Route> = {
   zcode_scan_local: { method: "POST", path: "/api/zcode/scan-local" },
   zcode_import_scanned: { method: "POST", path: "/api/zcode/import-scanned" },
   zcode_refresh_account: { method: "POST", path: "/api/zcode/refresh-account" },
+  // 激活（写操作）：报官方激活事件 + 领上游给出的套餐。
+  // ⚠ 只在用户点按钮时调用，**不进任何轮询** —— 理由见 zcodeWarmAccount 的注释。
+  // 宿主启动时的自动激活不走这里（它直接调后端），故这里保持纯手动。
+  zcode_warm_account: { method: "POST", path: "/api/zcode/warm-account" },
   qoder_refresh_account: { method: "POST", path: "/api/qoder/refresh-account" },
   qoder_campaigns: { method: "POST", path: "/api/qoder/campaigns" },
   // 批量：所有账号的活动 / 一键领取（活动是每账号专属的）
@@ -302,6 +390,43 @@ const ROUTES: Record<string, Route> = {
   qoder_claim_campaign: { method: "POST", path: "/api/qoder/claim-campaign" },
   zcode_login_start: { method: "POST", path: "/api/zcode/login/start" },
   zcode_login_poll: { method: "POST", path: "/api/zcode/login/poll" },
+  // 本机 AI CLI 额度查询（与 PR#2 的 `src/api.rs` 路由逐条对齐）
+  get_cli_quotas: { method: "GET", path: "/api/cli-quota" },
+  refresh_cli_quota: { method: "POST", path: "/api/cli-quota/refresh" },
+  get_cli_quota_status: { method: "GET", path: "/api/cli-quota/status" },
+  // ---- Trae 账号分组 ----
+  groups_list: { method: "GET", path: "/api/groups" },
+  group_create: { method: "POST", path: "/api/groups/create" },
+  group_update: { method: "POST", path: "/api/groups/update" },
+  group_delete: { method: "POST", path: "/api/groups/delete" },
+  group_move: { method: "POST", path: "/api/groups/move" },
+  // ---- Trae OAuth 的三条手动路径 ----
+  oauth_login_url: { method: "POST", path: "/api/trae/oauth/login-url" },
+  oauth_submit_callback: { method: "POST", path: "/api/trae/oauth/callback" },
+  oauth_cancel: { method: "POST", path: "/api/trae/oauth/cancel" },
+  // ⚠ `oauth_start_loopback` / `oauth_stop_loopback` **刻意不登记**：
+  // 它们是 Tauri 专属命令（本机回环监听器由 `src-tauri/src/oauth_loopback.rs`
+  // 起 axum 服务收回调），上游 PR#2 也没有对应 HTTP 路由。
+  // 登记了会让 webui 打到不存在的路径 —— 与 `set_model_platforms` 那种
+  // "漏登记"是相反方向的坑。webui 下调用它们会在 `httpCall` 的 `!route`
+  // 分支明确报错，这正是想要的行为（桌面专属能力就该在浏览器里说清）。
+  // ---- Trae 积分 / 用量 / 签到趋势 ----
+  trae_credit_detail: { method: "GET", path: "/api/trae/credits/detail" },
+  trae_credits_stats: { method: "GET", path: "/api/trae/credits/stats" },
+  trae_credits_snapshot: { method: "POST", path: "/api/trae/credits/snapshot" },
+  trae_checkin_trends: { method: "GET", path: "/api/trae/checkin/trends" },
+  trae_checkin_status: { method: "GET", path: "/api/trae/checkin/status" },
+  trae_checkin_refresh: { method: "POST", path: "/api/trae/checkin/refresh" },
+  trae_usage_history: { method: "GET", path: "/api/trae/usage-history" },
+  // ---- Trae 账号导入导出 ----
+  trae_export_accounts: { method: "POST", path: "/api/trae/export" },
+  trae_preview_import: { method: "POST", path: "/api/trae/import/preview" },
+  trae_import_accounts: { method: "POST", path: "/api/trae/import" },
+  // ---- 抓包日志 ----
+  proxy_logs_list: { method: "GET", path: "/api/proxy/logs" },
+  proxy_log_detail: { method: "GET", path: "/api/proxy/logs/detail" },
+  proxy_logs_overview: { method: "GET", path: "/api/proxy/logs/overview" },
+  proxy_logs_clear: { method: "POST", path: "/api/proxy/logs/clear" },
 };
 
 function queryString(args?: Record<string, unknown>): string {
@@ -592,8 +717,93 @@ export async function getCheckinStatus(accountId: string): Promise<{
   return call("get_checkin_status", { accountId });
 }
 
+/**
+ * 今日签到状态的**批量**读取；返回 `null` 表示本端没有批量通道。
+ *
+ * # 为什么必须有这个函数（2026-10-03 实测）
+ *
+ * webui 的 `GET /api/checkin/status` 是**批量**接口 —— 服务端
+ * （`crates/ai-gateway-server/src/api.rs:1378`）遍历**全部**账号、逐个串行
+ * 打上游，再把整张表返回。上面的 `getCheckinStatus(accountId)` 走的是
+ * 「整批拉一次 → `find` 出自己那一条」，单个账号用它没问题。
+ *
+ * 但账号页是**按账号循环**调用的（`fetchTodayCheckinMap`）⇒ 27 个账号
+ * 就是 **27 次全量请求**，每次 8–27 秒（上游限流时第二次更慢），
+ * 在途 4 并发。实测启动后 30 秒窗口内 `/api/checkin/status` 累计占用
+ * 80 秒，期间页面上任何操作都在排队 —— 这正是所有者反馈的
+ * 「每次启动都要响应好长时间，要等一段时间之后才能恢复」。
+ *
+ * 故新增本函数：**一次请求换一张按 id 索引的表**。调用方拿 map 按 id 取用，
+ * 语义与逐个调用完全一致（拉不到的账号**不出现在 map 里**，由调用方保留原值）。
+ *
+ * 桌面端（Tauri）没有批量命令（`get_checkin_status` 收 `account_id`），
+ * 这里返回 `null`，调用方自行退回逐个调用 —— 桌面端是本地调用，没有这个问题。
+ */
+export async function getCheckinStatusMap(): Promise<Record<
+  string,
+  { ok: boolean; todayCheckedIn: boolean; error?: string; raw?: unknown }
+> | null> {
+  // 演示模式：没有对应的假数据，交回调用方走逐个路径（那里有 case）。
+  if (demoModeEnabled) return null;
+  if (!isWebui()) return null;
+  const all = await httpCall<{
+    accounts: {
+      accountId: string;
+      ok: boolean;
+      todayCheckedIn: boolean;
+      error?: string;
+      raw?: unknown;
+    }[];
+  }>("get_checkin_status");
+  const map: Record<
+    string,
+    { ok: boolean; todayCheckedIn: boolean; error?: string; raw?: unknown }
+  > = {};
+  for (const one of all.accounts ?? []) {
+    if (!one || !one.accountId) continue;
+    map[one.accountId] = {
+      ok: one.ok,
+      todayCheckedIn: one.todayCheckedIn,
+      error: one.error,
+      raw: one.raw,
+    };
+  }
+  return map;
+}
+
 export function getCreditExpiry(accountId: string): Promise<CreditExpiry> {
   return call("get_credit_expiry", { accountId });
+}
+
+/**
+ * 积分与到期时间的**批量**读取；返回 `null` 表示本端没有批量通道。
+ *
+ * # 为什么必须有这个函数（2026-10-03 实测，问题 ⑩-2 的最后一个热路径）
+ *
+ * `stores/accounts.ts:122` `loadCredits` 是**按账号循环**调 `getCreditExpiry`
+ * 的：27 个账号、前端 4 并发，而每个账号在上游要 3~4 次往返（实测 0.4~0.8 s）
+ * ⇒ 累计 11~22 秒的上游流量全压在启动那一刻。前端那个 4 并发挡得住 WebView2
+ * 主线程，挡不住上游总量。
+ *
+ * 服务端 `GET /api/credits/batch` 一次把全部账号查完（4 并发），本函数把结果
+ * 按 id 索引。语义与逐个调用一致：**拉不到的账号不出现在 map 里**，
+ * 由调用方保留原值。
+ *
+ * 桌面端（Tauri）没有对应的批量命令，这里返回 `null`，调用方退回逐个调用 ——
+ * 桌面端是本地 IPC，没有这个问题。
+ */
+export async function getCreditExpiryMap(): Promise<Record<string, CreditExpiry> | null> {
+  // 演示模式：没有对应的假数据，交回调用方走逐个路径（那里有 case）。
+  if (demoModeEnabled) return null;
+  if (!isWebui()) return null;
+  const all = await httpCall<{ accounts: CreditExpiry[] }>("get_credit_expiry_batch");
+  const map: Record<string, CreditExpiry> = {};
+  for (const one of all.accounts ?? []) {
+    const id = one?.accountId;
+    if (!id) continue;
+    map[id] = one;
+  }
+  return map;
 }
 
 export function getCreditStatistics(refresh = false): Promise<CreditStatistics> {
@@ -764,6 +974,50 @@ export async function getTravelStatus(accountId: string): Promise<TravelStatus> 
       : { label: "untraveled", rewardCredit: null, locationName: null, arriveAt: null };
   }
   return call("get_travel_status", { accountId });
+}
+
+/**
+ * 今日旅行状态的**批量**读取；返回 `null` 表示本端没有批量通道。
+ *
+ * 与 `getCheckinStatusMap` 同一回事（见那里的长注释）：webui 的
+ * `GET /api/travel/status`（`crates/ai-gateway-server/src/api.rs:1584`）也是
+ * 批量接口，而 `getTravelStatus(accountId)` 是「整批拉一次 → find」，
+ * 账号页按账号循环调用时就是 N 次全量请求。
+ *
+ * 旅行接口本身很便宜（实测空闲 9 ms，只读本地文件、不碰上游），
+ * 但风暴里它 15 次累计占用 83 秒（中位 4.6 秒）—— 那些时间全花在
+ * **排队**上：重接口把宿主/浏览器的连接与在途额度占满后，便宜接口也得等。
+ * 所以它必须与签到一起改成批量，才能把启动期的请求条数真正压下来。
+ *
+ * `message` / `skip` 与单个版本一样必须带出（原因见上面的注释）。
+ */
+export async function getTravelStatusMap(): Promise<Record<string, TravelStatus> | null> {
+  if (demoModeEnabled) return null;
+  if (!isWebui()) return null;
+  const all = await httpCall<{
+    accounts: {
+      accountId: string;
+      label: TravelStatus["label"];
+      rewardCredit: number | null;
+      locationName?: string | null;
+      arriveAt?: number | null;
+      message?: string | null;
+      skip?: string | null;
+    }[];
+  }>("get_travel_status");
+  const map: Record<string, TravelStatus> = {};
+  for (const one of all.accounts ?? []) {
+    if (!one || !one.accountId) continue;
+    map[one.accountId] = {
+      label: one.label,
+      rewardCredit: one.rewardCredit,
+      locationName: one.locationName ?? null,
+      arriveAt: one.arriveAt ?? null,
+      message: one.message ?? null,
+      skip: one.skip ?? null,
+    };
+  }
+  return map;
 }
 
 export function getAutoTravelConfig(): Promise<TravelConfig> {
@@ -1181,6 +1435,60 @@ export function setPlatformModels(
 }
 
 // ---------------------------------------------------------------------------
+// 平台 → 是否参加兼容网关路由
+// ---------------------------------------------------------------------------
+
+/**
+ * 参加兼容网关路由的平台（小写稳定标识）。
+ *
+ * 与网关侧的产品标识同义（ProductOf）。**豆包不在其中** ——
+ * 它不是路由平台（无产品模块、账号不进网关池），故统一账号页的
+ * 豆包 tab 上不显示这个开关。
+ */
+export type RoutingPlatform = "workbuddy" | "qoder" | "zcode" | "trae";
+
+/**
+ * get_platform_enabled 的返回：平台键 → 是否参加路由。
+ *
+ * ⚠ **键缺失 = 参加**（不是"未知"）。后端刻意只写显式关掉的那些键，
+ * 这样新增平台时默认就是参加，不会因为老配置文件里没有它而被当成关闭。
+ * 判断一律用 platformEnabled[p] !== false，**别用** !!platformEnabled[p]
+ * —— 后者会把"没配过"读成"关掉了"。
+ */
+export interface PlatformEnabledState {
+  platformEnabled: Record<string, boolean>;
+}
+
+/** 读取各平台是否参加兼容网关路由。 */
+export function getPlatformEnabled(): Promise<PlatformEnabledState> {
+  return call<PlatformEnabledState>("get_platform_enabled");
+}
+
+/**
+ * 写入「平台 → 是否参加兼容网关路由」。
+ *
+ * ## 语义（业主原话，别理解错）
+ *
+ * 关闭平台**只是不参与兼容网关**，并不是不执行任务 —— 签到、上报、
+ * 成长任务、额度巡检**照跑**。故它**不是**账号级的 disabled
+ * （那个是"这个号已死，任务也跳过"），网关侧是独立的一个配置键。
+ *
+ * ## 传参
+ *
+ * 传的是**整键替换**的那份 map：调用方要么传全部平台，要么只传
+ * 要改的那个键（后端按 merge 处理 —— 键缺失 = 不动该键，
+ * 故不要用 false 去"补全"没打算动的平台）。
+ */
+export function setPlatformEnabled(
+  enabled: Record<string, boolean>,
+): Promise<{ ok: boolean; reloaded?: boolean; platformEnabled: Record<string, boolean> }> {
+  return call<{ ok: boolean; reloaded?: boolean; platformEnabled: Record<string, boolean> }>(
+    "set_platform_enabled",
+    { enabled },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // 一键导入：接入本机 AI 客户端
 // ---------------------------------------------------------------------------
 
@@ -1365,7 +1673,15 @@ export function deleteSnapshot(
   return call<{ ok: boolean }>("delete_snapshot", { targetApp, userId });
 }
 
-/** Trae 账号（JWT 已脱敏）。 */
+/**
+ * Trae 账号（JWT 已脱敏）。
+ *
+ * 字段清单与 `crates/ai-gateway-core/src/modules/trae_account.rs` 的
+ * `pub fn account_meta(acc: &Value) -> Value` 逐字对齐（22 个键）。
+ *
+ * 可空字段一律声明成 `| null`：后端**刻意**用 null 而不是 0 表示「不知道」，
+ * 界面才能区分「没查过」与「确实是 0」——把 null 当成 0 会把没查过的账号画成零积分。
+ */
 export interface TraeAccountMeta {
   userId: string;
   name: string;
@@ -1374,11 +1690,46 @@ export interface TraeAccountMeta {
   jwtStatus: "ok" | "warn" | "expired" | "unknown";
   jwtExpHours: number | null;
   jwtExpTimestamp: number | null;
+  /** 区域：`"cn"` 国内版 / `"sg"` 国际版。 */
+  realm?: string | null;
+  /** 区域中文标签（后端 `Realm::label()`）。 */
+  realmLabel?: string | null;
+  /** 区域判定的依据来源（`trae_realm::RealmEvidence`）。 */
+  realmEvidence?: string | null;
+  /** 区域是否为实测判定；false = 兜底推断。 */
+  realmDetected?: boolean | null;
   hasRefreshToken: boolean;
   refreshTokenInvalid: boolean;
   refreshTokenFails: number;
+  refreshTokenExpiresAt?: string | null;
+  refreshedAt?: string | null;
+  /** 有非空 refresh token 且未被标记失效 —— 即「能否自动续期」。 */
+  canRefresh?: boolean | null;
   deviceIdMasked: string;
+  /** 付费身份（来自客户端发现痕迹），未发现时为 null。 */
+  payIdentity?: string | null;
+  /** 套餐到期时间。 */
+  payExpireAt?: string | null;
+  /**
+   * 积分总额。★ Trae 侧**从来没有写入点**（`qoder_account.rs` / `zcode_account.rs`
+   * 才有 `credits_total = n`），故实际恒为 null；要真实数字请读
+   * `traeCreditsStats().accounts[].credits`（本地采样历史，不连上游）。
+   */
+  creditsTotal?: number | null;
+  creditsUpdatedAt?: string | null;
+  /** 所属分组 id。 */
+  group?: string | null;
   cooldown?: { type?: string; until?: number; reason?: string; error_count?: number };
+  /**
+   * 是否被禁用（不进入网关账号池）。
+   *
+   * ⚠ 三态：`undefined` = 后端还没补这个键（老版本返回）⇒ 界面按"未禁用"
+   * 显示即可，**不要**把它当成 false 之外的东西 —— 但也不能反过来把
+   * undefined 当"确定启用"，故这里声明成可选而不是 `boolean`。
+   * 与账号级 disabled 同义：禁用只影响"进不进网关选号池"，
+   * 签到等养号任务照跑。
+   */
+  disabled?: boolean;
 }
 
 /** Trae 账号列表。 */
@@ -1402,6 +1753,33 @@ export function traeAddAccount(args: {
 /** 删除 Trae 账号。 */
 export function traeDeleteAccount(userId: string): Promise<{ ok: boolean }> {
   return call<{ ok: boolean }>("trae_delete_account", { userId });
+}
+
+/**
+ * 部分更新 Trae 账号（启用 / 禁用；后端也支持改名与换 JWT）。
+ *
+ * ## ⚠ 必须显式构造 args
+ *
+ * 后端每个字段都是"键缺失 = 不动"，而 `disabled: false` 是**明确启用** ——
+ * 两者语义相反。若写成 `{ userId, ...patch }`，patch 里没提到的键
+ * 确实不会出现（对象展开天然如此），但一旦有人图省事写成
+ * `{ userId, disabled: patch.disabled }`，就会把"不改"变成"设成 undefined"，
+ * 在后端那边可能被读成 false（= 禁用）。所以这里逐键判断，
+ * 让「缺失」永远保持缺失。
+ *
+ * 现有调用点只有统一账号页的 Trae 卡片开关（传 `{ disabled }`）。
+ */
+export function traeUpdateAccount(
+  userId: string,
+  patch: { name?: string; jwt?: string; refreshToken?: string; disabled?: boolean },
+): Promise<{ ok: boolean; account: TraeAccountMeta }> {
+  return call<{ ok: boolean; account: TraeAccountMeta }>("trae_update_account", {
+    userId,
+    ...(patch.name === undefined ? {} : { name: patch.name }),
+    ...(patch.jwt === undefined ? {} : { jwt: patch.jwt }),
+    ...(patch.refreshToken === undefined ? {} : { refreshToken: patch.refreshToken }),
+    ...(patch.disabled === undefined ? {} : { disabled: patch.disabled }),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1920,6 +2298,23 @@ export interface ZcodeAccount {
       unitType: string;
     }>;
   }>;
+  /**
+   * 最近一次「激活」（上报官方启动事件 + 领取套餐）的时刻（Unix 秒）；
+   * 0 = 从未激活。
+   *
+   * # 为什么界面需要它
+   *
+   * 宿主**启动后会对每个账号自动激活一次**（幂等：距上次 ≥ 7 天才再报一次），
+   * 所以「刚导入但还没激活」的账号会自己好起来。界面据此把状态说清楚，
+   * 而不是让用户看到一个按钮猜它要不要点：
+   *
+   *   · 0        → 「从未激活」+ 提示「网关启动时会自动激活」
+   *   · 非 0    → 显示激活时刻，用户知道不必再点
+   *
+   * ⚠ 老账号记录没有这个键 ⇒ 后端补 0 ⇒ 升级后第一次启动会被认作
+   * 「从未激活」并激活一次，这正是期望行为（见后端 `warmed_at` 的说明）。
+   */
+  warmedAt?: number;
 }
 
 /** 列表项：账号 + 凭证是否存在。 */
@@ -2108,6 +2503,66 @@ export function zcodeImportScanned(indices: number[]): Promise<ZcodeImportScanne
 /** 刷新 ZCode 账号的额度 / 到期 / 支持模型（形状与 Qoder 侧相同）。 */
 export function zcodeRefreshAccount(uid: string): Promise<RefreshAccountResult> {
   return call<RefreshAccountResult>("zcode_refresh_account", { uid });
+}
+
+/**
+ * 激活 ZCode 账号（**写操作**）：报官方激活事件 + 领取上游给出的所有套餐。
+ *
+ * 复刻官方客户端**首次启动**时做的两件事（`app_launch` / `app_daily_active`），
+ * 让刚导入的账号在上游看来「活动过」，而不是「从未出现过」。
+ *
+ * # 触发时机（两个入口）
+ *
+ * 1. 用户点账号卡片的「激活」菜单项（本函数）；
+ * 2. 宿主**启动后每账号一次**的自动激活（Rust 侧
+ *    `multi_product_credit_patrol::warm_zcode_accounts`，幂等标记 = 账号库的
+ *    `warmedAt`，距上次超过 7 天才再报一次）。
+ *
+ * # ⚠ 但**仍然**不要把它放进 `useEffect` / 定时器 / 批量流程里
+ *
+ * 理由不是"礼貌"，而是：**高频**自动「激活 + 领取」会让账号表现出非人类的
+ * 活动模式，而上游正是按活动模式判风控的 —— 那会把本来好好的账号推进风控。
+ * 自动入口刻意做成"每次启动最多一次"，不是"每隔几分钟一次"。
+ *
+ * # ⚠ 三个阶段字段要分开显示，不要压平成一句话
+ *
+ * `events` / `claim` / `skipped` **空串 = 该阶段成功**（口径见 Go 侧 `WarmReport`）：
+ * - `events` 非空 → 激活事件就没发出去，**后面根本没领**
+ * - `skipped` 非空 → 事件发了，但没执行领取（上游没给可领套餐等）
+ * - `claim` 非空 → 领取过程部分失败
+ * - 三个都空且 `claimed` 非空 → 真的领到了
+ *
+ * 压平成「激活成功/失败」会丢掉「事件到底发了没」这个关键区分 —— 而它决定了
+ * 用户下一步该做什么（事件没发是凭证/JWT 问题，没套餐是上游没活动）。
+ */
+export function zcodeWarmAccount(uid: string): Promise<{
+  status: "ok";
+  uid: string;
+  /** 激活事件阶段的结果，**空串 = 成功**。 */
+  events: string;
+  /** 领取阶段的结果，**空串 = 成功**。 */
+  claim: string;
+  /** 未执行领取的原因（空串 = 已执行或无需执行）。 */
+  skipped: string;
+  /** 逐个套餐的领取明细。 */
+  plans: Array<{
+    planId: string;
+    name?: string;
+    priority?: number;
+    ok: boolean;
+    alreadyClaimed?: boolean;
+    message?: string;
+  }>;
+  /** 成功领到的套餐 id（含此前已领过的）。 */
+  claimed: string[];
+  /** 后端拼的汇总句，供直接展示。 */
+  message: string;
+  /** 激活后刷新得到的账号视图（激活的收益要刷新才可见）。 */
+  account?: ZcodeAccount | null;
+  /** 激活后的刷新失败原因（**不影响激活本身已成功**）。 */
+  refreshError?: string | null;
+}> {
+  return call("zcode_warm_account", { uid });
 }
 
 /** 发起 ZCode 登录（OAuth 设备流，备选路径）。 */
@@ -2738,4 +3193,651 @@ export function taskUnregister(kind: string): Promise<{ ok: boolean }> {
 /** 立即执行一次任务（不依赖计划任务，用于验证配置）。 */
 export function taskRunNow(kind: string): Promise<{ ok: boolean; exitCode: number }> {
   return call<{ ok: boolean; exitCode: number }>("task_run_now", { kind });
+}
+
+// ---------------------------------------------------------------------------
+// 本机 AI CLI 登录额度查询（Codex / Claude / Antigravity / Grok / Kimi）
+// ---------------------------------------------------------------------------
+
+/**
+ * 查询全部 provider 的本机账号额度。
+ *
+ * `refresh = false`（默认）时读**磁盘缓存**，不打上游；界面首屏用这个，
+ * 避免打开页面就产生 5 次网络往返。
+ *
+ * **未登录的 provider 也会出现在结果里**（`loggedIn: false` + 可操作提示），
+ * 界面据此按 provider 分组展示，而不是整块消失。
+ */
+export function getCliQuotas(refresh = false): Promise<{ accounts: CliQuotaAccount[] }> {
+  return call<{ accounts: CliQuotaAccount[] }>("get_cli_quotas", { refresh });
+}
+
+/**
+ * 只刷新一个 provider 的额度（界面上的单卡片刷新）。
+ *
+ * ⚠ 这个调用会**真的打上游**。失败时返回 `{ ok: false, error }` 而不是抛异常
+ * —— 单个 provider 查不到额度是常态（没登录、上游改了口径），不该让整页崩。
+ */
+export function refreshCliQuota(
+  provider: CliQuotaProvider,
+): Promise<{ ok: boolean; account?: CliQuotaAccount; error?: string }> {
+  return call<{ ok: boolean; account?: CliQuotaAccount; error?: string }>("refresh_cli_quota", {
+    provider,
+  });
+}
+
+/**
+ * 探测本机各 CLI 的登录态（**不触网**、不查额度）。
+ *
+ * 与 [`getCliQuotas`] 分开：登录态是本地文件/凭据读取（毫秒级），额度查询要打
+ * 上游（秒级）。界面先用它把「已登录 / 未登录」渲染出来，再让用户决定要不要
+ * 真正查询 —— 否则首屏会被 5 次网络往返拖住。
+ */
+export function getCliQuotaStatus(): Promise<{ providers: CliQuotaStatusItem[] }> {
+  return call<{ providers: CliQuotaStatusItem[] }>("get_cli_quota_status");
+}
+
+// ---------------------------------------------------------------------------
+// Trae / 豆包 分组、积分、用量、签到趋势、OAuth 回环、抓包日志
+//
+// 以下类型与函数自上游 PR#2（aigw-fork 0697b89）原样并入，参数名与返回形状
+// 与 `src-tauri` 命令层、`crates/ai-gateway-server` 的 HTTP 路由逐条对齐 ——
+// 改形状必须三边同改。类型定义在 api.ts（而非 types.ts）是因为组件用
+// `api.XxxType` 命名空间取值，只放在 types.ts 里取不到。
+// ---------------------------------------------------------------------------
+
+// ---- 类型 ----
+
+/** 单个权益包。 */
+export interface TraeCreditPack {
+  name: string;
+  remaining: number;
+  total: number;
+  expireAt: string | null;
+}
+
+/** 三条积分账（IDE 积分 / 权益包 / 付费身份）。 */
+export interface TraeCreditDetail {
+  userId: string;
+  /** IDE 侧可用积分总数。 */
+  total: number | null;
+  /**
+   * 权益包列表。
+   *
+   * ★ 恒为数组，**永不为 `null`** —— 后端在拿不到权益包时下发 `[]`。
+   * 这里若写成 `TraeCreditPack[] | null`，消费方（`CreditCell`）就会有人
+   * 忘了判空而直接 `.length`，把「拿不到权益包」变成整页白屏。
+   * 契约由 `crates/ai-gateway-core/src/modules/trae_credits.rs`
+   * 的 `fetch_credit_detail` 保证。
+   */
+  packs: TraeCreditPack[];
+  payIdentity: string | null;
+  payExpireAt: string | null;
+  /** 逐来源错误（部分失败时仍返回已拿到的数据）。恒为数组，理由同 `packs`。 */
+  errors: string[];
+}
+
+/** 一天的积分汇总（`null` = 这天没有采到数据，与「积分归零」不同）。 */
+export interface TraeCreditsDay {
+  date: string;
+  total: number | null;
+  consumed: number | null;
+}
+
+/** 单个账号的最新积分快照。 */
+export interface TraeCreditsAccount {
+  userId: string;
+  name: string;
+  credits: number | null;
+  updatedAt: string | null;
+}
+
+/** 积分趋势统计。 */
+export interface TraeCreditsStats {
+  days: number;
+  daily: TraeCreditsDay[];
+  summary: {
+    latestTotal: number | null;
+    firstTotal: number | null;
+    /** 区间内消耗合计（仅统计有数据的天）。 */
+    consumed: number | null;
+    /** 实际采到数据的天数 —— 据此判断趋势可不可信。 */
+    observedDays: number;
+    /** 首末总量差（`null` = 数据不足）。 */
+    change: number | null;
+  };
+  accounts: TraeCreditsAccount[];
+}
+
+/** 一天的签到汇总。 */
+export interface TraeCheckinTrendPoint {
+  date: string;
+  ok: number;
+  already: number;
+  failed: number;
+  /** 冷却中跳过（本轮没打上游）；不计入 `total`，也不进成功率的分母。 */
+  skipped: number;
+  total: number;
+  /** 成功率百分比；「已签到」算成功。 */
+  successRate: number | null;
+}
+
+/** 签到成功率趋势。 */
+export interface TraeCheckinTrends {
+  days: number;
+  /** 只含实际有记录的日期（不补 0 高度的柱子）。 */
+  points: TraeCheckinTrendPoint[];
+  summary: {
+    ok: number;
+    already: number;
+    failed: number;
+    /** 冷却中跳过；不计入 `total`，也不进成功率的分母。 */
+    skipped: number;
+    total: number;
+    observedDays: number;
+    /** 区间成功率；无样本时为 `null`（不是 0）。 */
+    successRate: number | null;
+  };
+}
+
+/** 单个账号「今天签到了吗」。 */
+export interface TraeCheckinToday {
+  /** `true` 已签 / `false` 未签 / `null` **没问到**（网络异常或上游繁忙）。 */
+  checkedIn: boolean | null;
+  /** 落库用的原始状态串（success/already/checked_in/not_checked_in/fail）。 */
+  status: string;
+  name: string;
+  /** 落库时间（ISO）。 */
+  updatedAt: string;
+}
+
+/** 今日签到状态表。 */
+export interface TraeCheckinTodayMap {
+  /** 本地日期（YYYY-MM-DD）。 */
+  date: string;
+  /** uid → 状态。★ 缺键表示「不知道」，不是「未签到」。 */
+  accounts: Record<string, TraeCheckinToday>;
+}
+
+/** 单日积分消耗（官方会话级用量聚合）。 */
+export interface TraeUsageDay {
+  date: string;
+  credits: number;
+  sessions: number;
+  /** 模型 → 当日扣费。 */
+  models: Record<string, number>;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+}
+
+/** 单个账号的消耗历史。 */
+export interface TraeUsageAccount {
+  userId: string;
+  name: string;
+  ok: boolean;
+  /** 拉取失败时的说明（有缓存时为「展示的是缓存」）。 */
+  error: string | null;
+  daily: TraeUsageDay[];
+  totalCredits: number;
+  sessions: number;
+  /** 模型消耗排行（按扣费降序）。 */
+  models: { model: string; credits: number }[];
+}
+
+/** 积分消耗历史。 */
+export interface TraeUsageHistory {
+  fetchedAt: number;
+  /** true = 纯缓存读取，本次没有发起网络请求。 */
+  cached: boolean;
+  accounts: TraeUsageAccount[];
+}
+
+/** Trae 账号导出结果（`text` 含明文 JWT 与 refresh_token）。 */
+export interface TraeExportResult {
+  ok: boolean;
+  count: number;
+  text: string;
+}
+
+/** 导入预览里的一项账号。 */
+export interface TraeImportPreviewItem {
+  userId: string;
+  name: string;
+  hasRefreshToken: boolean;
+  /** 账号库里已有同 uid —— 导入会覆盖它。 */
+  willOverwrite: boolean;
+}
+
+/** 授权 URL 响应。 */
+export interface TraeOAuthLoginUrl {
+  url: string;
+  state: string;
+  redirectUri: string;
+  port: number;
+}
+
+/** 登录完成事件负载（桌面宿主通过 `oauth-login-done` 推送）。 */
+export interface TraeOAuthDoneEvent {
+  ok: boolean;
+  message: string;
+  userId: string | null;
+}
+
+/** 抓包日志的一条摘要（列表用，不含正文）。 */
+export interface ProxyLogEntry {
+  /** `文件名:条目序号`，详情接口按它定位。 */
+  id: string;
+  timestamp: string;
+  /** `HTTP GET` / `WebSocket` 这类展示用形态。 */
+  method: string;
+  host: string;
+  path: string;
+  /** 响应状态；取不到时为 `-`。 */
+  status: string;
+  size: number;
+  /** SSE 汇总里的模型名（非流式请求没有这个字段）。 */
+  sseModel?: string;
+  /** SSE token 用量摘要，形如 `p:120 c:340 t:460`。 */
+  sseTokens?: string;
+}
+
+/** 抓包日志目录概况。 */
+export interface ProxyLogsOverview {
+  dir: string;
+  fileCount: number;
+  totalBytes: number;
+  oldest: string | null;
+  newest: string | null;
+}
+
+export interface ProxyLogQuery {
+  keyword?: string;
+  /** `YYYY-MM-DD HH:MM:SS`，含端点。 */
+  startTime?: string;
+  endTime?: string;
+  offset?: number;
+  limit?: number;
+}
+
+export interface ProxyLogList {
+  entries: ProxyLogEntry[];
+  /** 过滤后的**总数**（不是本页条数），用于分页。 */
+  total: number;
+}
+
+/** 一个分组及其成员。 */
+export interface AccountGroup {
+  id: string;
+  name: string;
+  color: string;
+  order: number;
+  count: number;
+  uids: string[];
+}
+
+/** 分组所属应用。 */
+export type GroupApp = "Trae" | "Doubao";
+
+/** 分组视图。 */
+export interface GroupsView {
+  app: GroupApp;
+  groups: AccountGroup[];
+  /** uid → groupId（只含仍然存在的分组）。 */
+  membership: Record<string, string>;
+}
+
+/** 豆包运维历史事件。 */
+export interface DoubaoHealthEvent {
+  at: string;
+  kind: "keepalive" | "renew" | "quota";
+  ok: boolean;
+  uid?: string | null;
+  level?: string | null;
+  summary?: string;
+  windows?: { name?: string; usedPercent?: number; exhausted?: boolean; resetAt?: string }[];
+}
+
+/** 豆包运维健康史的完整返回体。 */
+export interface DoubaoHistory {
+  events: DoubaoHealthEvent[];
+  trend: { date: string; usedPercent: number; level: string | null; uid: string | null }[];
+  health: {
+    days: number;
+    keepalive: number;
+    renew: number;
+    quota: number;
+    ok: number;
+    failed: number;
+    lastKeepaliveAt: string | null;
+  };
+  /** 调用方请求的天数。与 `health.days` 可能不同：健康计数按固定窗口统计，
+   *  而事件/趋势按请求天数截取，故两个值都要下发，界面不能拿一个当另一个用。 */
+  requestedDays: number;
+}
+
+/** 豆包运维健康史（事件 + 额度趋势 + 健康计数）。 */
+export function doubaoHistory(days = 30): Promise<DoubaoHistory> {
+  return call<DoubaoHistory>("doubao_history", { days });
+}
+
+// ---- 分组 ----
+
+/** 某应用的分组列表。 */
+export function groupsList(app: GroupApp): Promise<GroupsView> {
+  return call<GroupsView>("groups_list", { app });
+}
+
+/** 新建分组。 */
+export function groupCreate(
+  app: GroupApp,
+  name: string,
+  color = "slate",
+): Promise<{ ok: boolean; id: string; groups: GroupsView }> {
+  return call<{ ok: boolean; id: string; groups: GroupsView }>("group_create", {
+    app,
+    name,
+    color,
+  });
+}
+
+/** 更新分组（只改传入的字段）。 */
+export function groupUpdate(args: {
+  app: GroupApp;
+  id: string;
+  name?: string;
+  color?: string;
+  order?: number;
+}): Promise<{ ok: boolean; groups: GroupsView }> {
+  return call<{ ok: boolean; groups: GroupsView }>("group_update", {
+    app: args.app,
+    id: args.id,
+    name: args.name ?? null,
+    color: args.color ?? null,
+    order: args.order ?? null,
+  });
+}
+
+/** 删除分组（连带清掉成员映射）。 */
+export function groupDelete(
+  app: GroupApp,
+  id: string,
+): Promise<{ ok: boolean; groups: GroupsView }> {
+  return call<{ ok: boolean; groups: GroupsView }>("group_delete", { app, id });
+}
+
+/**
+ * 把账号移入/移出分组（`groupId` 为空 = 移出）。
+ *
+ * ⚠ `groupId` 必须**显式**传 `null` 而不是省略：后端 `apps_api.rs:645` 把
+ * 「字段缺失」与「字段为 null」都当作移出，但省略字段会让请求体里少一个键，
+ * 与参考实现的线格式不一致（`test-bin/recon/pr2-api/api.ts:1414` 也是显式传）。
+ */
+export function groupMove(
+  app: GroupApp,
+  userId: string,
+  groupId: string | null,
+): Promise<{ ok: boolean; groups: GroupsView }> {
+  return call<{ ok: boolean; groups: GroupsView }>("group_move", {
+    app,
+    userId,
+    groupId,
+  });
+}
+
+// ---- Trae OAuth（回环 + 手动回调）----
+
+/**
+ * 签发 OAuth 授权 URL。
+ *
+ * 调用后应立刻在浏览器打开 `url`（桌面宿主还会先启动 17388 回环监听）。
+ */
+export function oauthLoginUrl(accountName?: string): Promise<TraeOAuthLoginUrl> {
+  return call<TraeOAuthLoginUrl>("oauth_login_url", { accountName: accountName ?? null });
+}
+
+/**
+ * 启动本机回环监听器（桌面专属）。
+ *
+ * 端口被占用时抛错 —— 此时界面应降级为「手动粘贴回调地址」，
+ * 而不是让用户对着一个永远等不到回调的弹窗发呆。
+ */
+export function oauthStartLoopback(accountName?: string): Promise<{
+  ok: boolean;
+  port: number;
+  redirectUri: string;
+  idleTimeoutSecs: number;
+}> {
+  return call("oauth_start_loopback", { accountName: accountName ?? null });
+}
+
+/** 停止本机回环监听器（桌面专属；未启动时幂等成功）。 */
+export function oauthStopLoopback(): Promise<{ ok: boolean }> {
+  return call("oauth_stop_loopback");
+}
+
+/** 放弃当前登录会话。 */
+export function oauthCancel(): Promise<{ ok: boolean }> {
+  return call("oauth_cancel");
+}
+
+/**
+ * 当前是否仍在等待 OAuth 回调（桌面专属）。
+ *
+ * 界面重开弹窗时用它判断「后端是否还有一个未完成的会话」——
+ * 直接假定没有会让用户重开后拿到一个 state 已经对不上的登录。
+ *
+ * ⚠ 与 `oauthStartLoopback` / `oauthStopLoopback` 同类：**没有 ROUTES 条目**。
+ * 上游 PR#2 同样只有 Tauri 命令、没有 HTTP 路由，webui 下调它会在
+ * `httpCall` 的 `!route` 分支明确报错 —— 桌面专属能力就该这样表现。
+ */
+export function oauthPending(): Promise<{ pending: boolean }> {
+  return call("oauth_pending");
+}
+
+/**
+ * 诊断「浏览器打不开授权页」（桌面专属）。
+ *
+ * # 为什么需要它（2026-10-02 所有者现场）
+ *
+ * 所有者报告「浏览器会打开，但是访问超时」。实测定位到**系统代理不通**：
+ *
+ * ```text
+ * 系统代理 ProxyServer = 127.0.0.1:9000（Reqable）
+ * trae.cn 经该代理 → 超时 20s
+ * trae.cn 直连     → 200 / 0.39s
+ * ```
+ *
+ * 浏览器默认「使用系统代理设置」，于是授权页打不开 —— 与本产品无关，
+ * 但用户看到的只是「超时」，无从判断原因。这条命令把**实测事实**摆出来。
+ *
+ * 同时它会认出 `ProxyOverride` 里的 `<-loopback>` 记号 ——
+ * 那个记号让 `127.0.0.1` 的回调**也走代理**，对 OAuth 回环是致命的。
+ *
+ * ⚠ **只读**：只做 TCP 探测 + 读注册表，不改用户任何设置。
+ */
+export interface OAuthNetworkProbe {
+  ok: boolean;
+  ms: number;
+  via?: string;
+  status?: number;
+  error?: string;
+}
+
+export interface OAuthNetworkDiagnosis {
+  proxyEnabled: boolean;
+  proxyServer: string;
+  proxyOverride: string;
+  loopbackAlsoProxied: boolean;
+  direct: OAuthNetworkProbe;
+  viaProxy: OAuthNetworkProbe & { skipped?: boolean };
+  advice: string;
+}
+
+export function oauthDiagnoseNetwork(): Promise<OAuthNetworkDiagnosis> {
+  return call("oauth_diagnose_network");
+}
+
+/**
+ * 手动提交浏览器回调 URL（兜底路径）。
+ *
+ * 端口被占用、自动收尾失败、或用户在别的浏览器里完成授权时都靠这条路径。
+ */
+export function oauthSubmitCallback(
+  callbackUrl: string,
+  accountName?: string,
+): Promise<{ ok: boolean; userId: string; message: string }> {
+  return call("oauth_submit_callback", { callbackUrl, accountName: accountName ?? null });
+}
+
+// ---- Trae 积分 / 用量 / 签到趋势 ----
+
+/**
+ * 读取某账号的三条积分账。
+ *
+ * ★ 在这里（数据进入前端的**唯一入口**）把两个数组字段钉成数组。
+ * 起因是一个真实的崩溃：后端曾经把 `packs` 下发成 `null`（拿不到权益包时），
+ * 而 `CreditCell` 直接读 `detail.packs.length` ⇒
+ * `TypeError: Cannot read properties of null (reading 'length')`，
+ * 整个 Trae 账号页被错误边界接住变成一页报错。
+ *
+ * 后端契约已经修好（恒下发 `[]`），这里再做一层**入口归一化**：
+ * 只要旧版网关还在跑、或者将来又有人改了后端字段形状，
+ * 界面最多是少显示一块内容，不会整页崩掉。
+ * 这与本仓库「前端不能假设后端一定给对」的既有口径一致。
+ */
+export async function traeCreditDetail(userId: string): Promise<TraeCreditDetail> {
+  const raw = await call<TraeCreditDetail>("trae_credit_detail", { userId });
+  return {
+    ...raw,
+    packs: Array.isArray(raw?.packs) ? raw.packs : [],
+    errors: Array.isArray(raw?.errors) ? raw.errors : [],
+  };
+}
+
+/** 积分趋势统计（`daily` 按天补齐，缺天为 null）。 */
+export function traeCreditsStats(days = 30): Promise<TraeCreditsStats> {
+  return call<TraeCreditsStats>("trae_credits_stats", { days });
+}
+
+/** 签到成功率趋势（同 uid 同天只记最终态）。 */
+export function traeCheckinTrends(days = 30): Promise<TraeCheckinTrends> {
+  return call<TraeCheckinTrends>("trae_checkin_trends", { days });
+}
+
+/**
+ * 今日各账号的签到状态（本地落库快照，**零网络请求**）。
+ *
+ * ★ 只读本地表：每次刷新页面调它都不会打上游。要让表变新，调
+ * [`traeCheckinRefresh`]（那才会逐账号探测上游 status 端点）。
+ */
+export function traeCheckinStatus(): Promise<TraeCheckinTodayMap> {
+  return call<TraeCheckinTodayMap>("trae_checkin_status");
+}
+
+/**
+ * 主动刷新今日签到状态（逐账号只读探测上游，返回被确认的账号数）。
+ *
+ * 界面在挂载时**静默**调用一次：用户没点过签到、但当天其实早已签过的情况下，
+ * 靠它才能把「已签到」徽标显示出来。失败不该打扰用户（返回 `updated: 0` 即可）。
+ */
+export function traeCheckinRefresh(): Promise<{ updated: number }> {
+  return call<{ updated: number }>("trae_checkin_refresh");
+}
+
+/**
+ * 积分消耗历史（官方会话级用量）。
+ *
+ * 与 `traeCreditsStats` 的口径不同：那个是**余额差值**推算，会被签到补发干扰；
+ * 这个是接口返回的**真实扣费**，能按模型拆分。两个都看才能分清「消耗」与「补发」。
+ *
+ * `fresh = false` 时零网络请求，只回缓存。
+ */
+export function traeUsageHistory(fresh = true): Promise<TraeUsageHistory> {
+  return call<TraeUsageHistory>("trae_usage_history", { fresh });
+}
+
+/**
+ * 立即采样一次积分快照。
+ *
+ * `userIds` 省略 / 空数组 ⇒ 采样**全部** Trae 账号（设置页的「立即采样」）；
+ * 给了 uid 列表 ⇒ 只采样这些账号，供账号卡片上的「本账号任务 · 积分日快照」
+ * 按单个账号执行。
+ */
+export function traeCreditsSnapshot(userIds?: string[]): Promise<{
+  ok: boolean;
+  sampled: number;
+  failed: number;
+  errors: string[];
+}> {
+  return call("trae_credits_snapshot", {
+    userIds: userIds && userIds.length > 0 ? userIds : null,
+  });
+}
+
+// ---- Trae 账号导入导出 ----
+
+/**
+ * 导出 Trae 账号。
+ *
+ * 不传 `userIds` 即导出全部。返回的 `text` 含**明文凭证**，
+ * 界面必须明确提示用户妥善保管。
+ */
+export function traeExportAccounts(userIds?: string[]): Promise<TraeExportResult> {
+  return call<TraeExportResult>("trae_export_accounts", { userIds: userIds ?? null });
+}
+
+/** 预览 Trae 账号导入文件（不落库）。 */
+export function traePreviewImport(fileText: string): Promise<{
+  ok: boolean;
+  count: number;
+  exportedAt: string | null;
+  accounts: TraeImportPreviewItem[];
+}> {
+  return call("trae_preview_import", { fileText });
+}
+
+/** 导入 Trae 账号（同 uid 覆盖，其余追加）。 */
+export function traeImportAccounts(fileText: string): Promise<{
+  ok: boolean;
+  added: number;
+  updated: number;
+  skipped: number;
+}> {
+  return call("trae_import_accounts", { fileText });
+}
+
+// ---- 抓包日志 ----
+
+/** 列出抓包日志条目（时间倒序，新的在前）。 */
+export function proxyLogsList(query: ProxyLogQuery = {}): Promise<ProxyLogList> {
+  return call<ProxyLogList>("proxy_logs_list", {
+    keyword: query.keyword ?? null,
+    startTime: query.startTime ?? null,
+    endTime: query.endTime ?? null,
+    offset: query.offset ?? 0,
+    limit: query.limit ?? 50,
+  });
+}
+
+/** 取单条日志的完整正文。 */
+export async function proxyLogDetail(id: string): Promise<string> {
+  const res = await call<{ content: string }>("proxy_log_detail", { id });
+  return res.content;
+}
+
+/** 日志目录概况（文件数 / 体积 / 日期范围）。 */
+export function proxyLogsOverview(): Promise<ProxyLogsOverview> {
+  return call<ProxyLogsOverview>("proxy_logs_overview");
+}
+
+/**
+ * 删除抓包日志。
+ *
+ * `keepDays` 有值时只删该天数以前的；不传则全删。
+ */
+export function proxyLogsClear(keepDays?: number): Promise<{ removed: number }> {
+  return call<{ removed: number }>("proxy_logs_clear", {
+    keepDays: keepDays ?? null,
+  });
 }
