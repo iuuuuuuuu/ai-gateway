@@ -233,10 +233,14 @@ function Layout() {
             · 包在 main 外 ⇒ 出错时连左侧导航一起消失（2026-10-01 的真实白屏
               就是这样：点「兼容网关」后整页空白，用户连切页自救都做不到）；
             · 包在这里 ⇒ 只有**内容区**被替换成错误页，导航仍在，用户能切走。
-          另加 `key`：切换路由时重置边界，避免上一个页面的错误状态粘住新页面
+          另传 `resetKey`：切换路由时重置边界，避免上一个页面的错误状态粘住新页面
           （React 的错误边界状态不会因 children 变化自动清除）。
+          ★★ 注意是 **prop** 不是 `key`：写成 `key={location.pathname}` 会让 React 在每次
+          路由变化时卸载重建整个内容子树 —— 「账号管理」的五个平台标签各是一个路由，
+          于是 keep-alive（`visited` + `forceMount`）被反复清零，业主报的
+          「页面切换保持状态缓存」实测失效。改用 prop 后只有**出错时**才复位。
         */}
-        <ErrorBoundary key={location.pathname}>
+        <ErrorBoundary resetKey={location.pathname}>
           <Outlet />
         </ErrorBoundary>
       </main>

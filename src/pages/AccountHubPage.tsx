@@ -48,7 +48,7 @@
  * 静默轮询设计），因此 keep-alive 的范围刻意只限"用户真的打开过"的 tab。
  */
 import { useEffect, useState, type ReactNode } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { Ban, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -148,10 +148,23 @@ type WorkbuddyView = "accounts" | "credits" | "tokens";
  *
  * keep-alive 与外面那层同法（见文件头）：只有访问过的视图才 forceMount 常驻，
  * 没访问过的按需挂载 —— 统计页各自带请求，一上来全部常驻会白打一轮接口。
+ *
+ * ★ 三级 tab 停在哪一页也**跟着 URL 走**（`?view=`）：它是「页面状态」的一部分，
+ *   只放在组件 state 里的话，点一次平台标签（= 一次路由跳转）就回到「账号」。
+ *   同一个 `view` 参数由整个页面共享：切到 Qoder 再切回来，仍停在「积分统计」。
  */
+const WORKBUDDY_VIEWS: WorkbuddyView[] = ["accounts", "credits", "tokens"];
+
+function isWorkbuddyView(value: string | null): value is WorkbuddyView {
+  return value !== null && (WORKBUDDY_VIEWS as string[]).indexOf(value) >= 0;
+}
+
 function WorkbuddyPanel() {
-  const [view, setView] = useState<WorkbuddyView>("accounts");
-  const [visited, setVisited] = useState<Set<WorkbuddyView>>(() => new Set<WorkbuddyView>(["accounts"]));
+  const [searchParams, setSearchParams] = useSearchParams();
+  // 非法 / 缺省值一律当「账号」——不把脏参数写回 URL（写回会造成一次多余的 history 记录）。
+  const raw = searchParams.get("view");
+  const view: WorkbuddyView = isWorkbuddyView(raw) ? raw : "accounts";
+  const [visited, setVisited] = useState<Set<WorkbuddyView>>(() => new Set<WorkbuddyView>([view]));
 
   return (
     <Tabs
@@ -159,7 +172,17 @@ function WorkbuddyPanel() {
       onValueChange={(v) => {
         const next = v as WorkbuddyView;
         setVisited((p) => (p.has(next) ? p : new Set(p).add(next)));
-        setView(next);
+        // replace：三级 tab 之间的切换不该往历史栈里塞记录，否则「后退」要在
+        // 同一页的三个视图之间走三下才退得出去。
+        setSearchParams(
+          (prev) => {
+            const p = new URLSearchParams(prev);
+            if (next === "accounts") p.delete("view");
+            else p.set("view", next);
+            return p;
+          },
+          { replace: true },
+        );
       }}
     >
       <TabsList className="h-auto flex-wrap border border-border bg-transparent">
@@ -205,6 +228,7 @@ function WorkbuddyPanel() {
 export default function AccountHubPage() {
   const navigate = useNavigate();
   const { tab } = useParams<{ tab: string }>();
+  const [searchParams] = useSearchParams();
   // 非法 URL 段（手打 /accounts/xxx）一律回落到 workbuddy，并把 URL 归一化 ——
   // 用 replace 而不是 push：否则用户按"后退"会退回同一个脏地址，原地打转。
   const active: AccountTab = isAccountTab(tab) ? tab : "workbuddy";
@@ -277,7 +301,11 @@ export default function AccountHubPage() {
     if (isAccountTab(value)) {
       setVisited((prev) => (prev.has(value) ? prev : new Set(prev).add(value)));
     }
-    navigate("/accounts/" + value);
+    // ★ 带上当前查询串：WorkBuddy 的三级视图（`?view=credits`）属于「页面状态」的一部分，
+    //   切到别的平台标签再切回来时必须还停在同一视图上 —— 否则「保持状态缓存」
+    //   只对面板 DOM 成立、对用户看到的那一屏不成立。
+    const qs = searchParams.toString();
+    navigate("/accounts/" + value + (qs ? "?" + qs : ""));
   };
 
   return (

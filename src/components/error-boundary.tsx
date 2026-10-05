@@ -30,6 +30,25 @@ import { Component, type ErrorInfo, type ReactNode } from "react";
  */
 interface Props {
   children: ReactNode;
+  /**
+   * ★★ 路由变化信号（本仓库里传的是 `location.pathname`）。
+   *
+   * # 为什么不用 `key`（2026-10-05 实测事故）
+   *
+   * 原先调用方写的是 `<ErrorBoundary key={location.pathname}>`。`key` 一变，
+   * React 就**卸载整棵子树再重新挂载** —— 目的（重置边界状态）达到了，代价是
+   * 边界内所有页面组件的实例与 DOM 全部销毁重建。
+   *
+   * 这在「账号管理」里是硬伤：五个平台标签各自是一个路由（`/accounts/trae`…），
+   * 点一次标签就换一次 `key` ⇒ `AccountHubPage` 的 `visited` 状态被重置、
+   * `forceMount` 保活的面板整个消失 ⇒ 业主要求的「页面切换保持状态缓存不重置」
+   * 在主路径上完全不生效（CDP 实测：打了 expando 的面板在切标签后从 DOM 消失）。
+   *
+   * 改成普通 prop 后：路由变化仍会在**出错时**把边界重置回 children
+   * （见 `componentDidUpdate`），而不出错时**不产生任何额外渲染**，
+   * 子树照旧被 React 复用。
+   */
+  resetKey?: unknown;
 }
 
 interface State {
@@ -48,6 +67,19 @@ export class ErrorBoundary extends Component<Props, State> {
     this.setState({ info });
     // 同时打到控制台：开发时用 DevTools 能直接看到完整栈。
     console.error("[ErrorBoundary] 渲染期异常：", error, info.componentStack);
+  }
+
+  /**
+   * ★ 仅在「已经出错」时因路由变化而复位。
+   *
+   * 不写成 `getDerivedStateFromProps`：那会让每次父组件渲染都多走一次派生状态计算；
+   * 这里只在 `resetKey` 真的变了且当前处于错误态时才 `setState`，正常路径零开销。
+   * 复用 `reset()` 也保证了与「重试」按钮完全相同的语义。
+   */
+  componentDidUpdate(prevProps: Props) {
+    if (prevProps.resetKey !== this.props.resetKey && this.state.error) {
+      this.reset();
+    }
   }
 
   private reset = () => {
