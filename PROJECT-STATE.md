@@ -1,6 +1,8 @@
 # WorkBuddy Switch / AI Gateway — 项目状态与后续工作
 
-> 最后更新：2026-10-06（**1.0.30**：⑲ 一次性修完业主最后报的四件事 —— ① 切手动模式/改模型白名单删光 Trae 网关凭证（uid 空间用错，且不自愈）；② 后台任务跑完前端不刷新（轮询 hook 只在窗口可见/聚焦时跑）；③ 后台拉客户端会弹窗（改为默认隐藏 + 设置页开关）；④ ZCode 断流文案透传 reqwest 原文。并顺带修掉「豆包保活失败仍记为当天已完成」的记账缺陷）
+> 最后更新：2026-10-06（**1.0.31**：⑳ 合入上游 6 项可用更新（账号字段类型归一 / 状态出口统一 / 静态模型表并集 30 条 + 两侧快照测试 / 剩余天数向上取整 / 轻量模式残留清零 / 上下文超长码别名 4028）；㉑ 排查 `deepseek-v4.1-flash` 截断报障 —— 定位到业主文案用的是网关合成帧（**a** completion event），补齐「上游未发 [DONE]」分支的日志留痕（此前**一条都没有**），并用假上游 6 模式矩阵复现（`test-bin\mock-chat\`）；㉒ 新增 `GET /api/gateway/log` + 网关页日志面板；㉓ 额外产出**非客户端纯部署**单文件产物 `wt-port\dist-single\ai-gateway.exe`，并修掉 `build-single.ps1` 的静默死亡 bug。详见 `test-bin\DELIVERY-1.0.31.md`）
+>
+> 上一版：2026-10-06（**1.0.30**：⑲ 一次性修完业主最后报的四件事 —— ① 切手动模式/改模型白名单删光 Trae 网关凭证（uid 空间用错，且不自愈）；② 后台任务跑完前端不刷新（轮询 hook 只在窗口可见/聚焦时跑）；③ 后台拉客户端会弹窗（改为默认隐藏 + 设置页开关）；④ ZCode 断流文案透传 reqwest 原文。并顺带修掉「豆包保活失败仍记为当天已完成」的记账缺陷）
 > 本文件是**接手用**的持久状态说明，不随会话消失。
 
 ---
@@ -17,9 +19,9 @@
 | **网关** | `crates/ai-gateway-router/` | **Rust（2026-10 从 Go 全量重写）** |
 | Go 参照实现 | `go-gateway/` | Go（**保留作对照，构建链已不依赖**） |
 
-- git 根 = `wt-port\`，分支 `migrate/aigw-v1.0.2`
-- 当前版本号 **1.0.30**（`tauri.conf.json` / `package.json` / `Cargo.toml` / `Cargo.lock` 已对齐；签名安装包已产出、解包核验、真机实测）
-  - 业主**实机安装的是 1.0.21**（`HKCU:\...\Uninstall\AI Gateway` ⇒ `InstallLocation=D:\APP\AI Gateway`，主程序 39,173,120 B）；1.0.22–1.0.30 **均未安装**，直接装 1.0.30 即可（跳过版本里的修复全在 1.0.30 内）
+- git 根 = `wt-port\`，主分支 `main`（2026-10-06 由 `migrate/aigw-v1.0.2` 改名而来；原上游陈旧线 `224919a` 改名 `archive/origin-main` 留档。详见第九节）
+- 当前版本号 **1.0.31**（`tauri.conf.json` / `package.json` / `Cargo.toml` / `Cargo.lock` 已对齐；签名安装包已产出、解包核验、真机实测）
+  - 业主**实机安装的是 1.0.21**（`HKCU:\...\Uninstall\AI Gateway` ⇒ `InstallLocation=D:\APP\AI Gateway`，主程序 39,173,120 B）；1.0.22–1.0.31 **均未安装**，直接装 1.0.31 即可（跳过版本里的修复全在 1.0.31 内）
   - ★ NSIS 同版本**不覆盖**（`installer.nsi:233-259` 用 `nsis_tauri_utils::SemverCompare` 比 `DisplayVersion`，相等走维护页）⇒ 升版本号是交付的硬前提
 
 ---
@@ -51,7 +53,7 @@
 | ⑨ Trae 卡片官方 icon（⑩-1） | 两张官方 PNG + `product-marks.tsx:144-163 TraeMark(variant)` | ✅ 交付包前端渲染 5 张 trae 图，全部 512×512、`size-full object-cover` |
 | ⑩ 启动期卡顿（⑩-2，m13819 + m14110） | 前端限流 4 并发 + `/api/credits/batch` + `warm_caches()` + `CHECKIN_STATUS_CONCURRENCY=6` | ✅ A/B：API **167 ⇒ 45**、最慢 **27,412 ms ⇒ 2,717 ms**、longtask **0** |
 
-### 1.0.21 → 1.0.30（2026-10-04 → 10-06，业主逐条上报，全部真机实测后交付）
+### 1.0.21 → 1.0.31（2026-10-04 → 10-06，业主逐条上报，全部真机实测后交付）
 
 | 版本 | 内容 | 状态 |
 |---|---|---|
@@ -64,12 +66,30 @@
 | **1.0.27** | ⑰ 用量统计模型名**大小写折叠**（写入口径 `model_key_of` + 载入自愈 `merge_case_variants`）+ 计费行平台归属按计费键回填（`backfill_billing` 旧口径按 uid 形状猜，重启后分布会漂） | ✅ 真机 23/23 PASS（载入自愈 8→6）；★ 写入口径另测 **23/0**（见五节） |
 | **1.0.28** | ⑯ 流中途上游错误帧识别 / 记日志 / 计入账号健康度（`note_upstream_stream_error`）+ 空 product 归一化成 `workbuddy` | ✅ 真机 43/0（抓包）+ 50/0（GUI）+ 24/0（用量页） |
 | **1.0.29** | ⑱ **桌面端接入应用内调度**：`spawn_background_loops()` 新增第 7 个循环（启动 60s 后起，每 5 分钟一轮，`spawn_blocking` 里调 `apps_ops::run_in_app_due_tasks`），修复「Trae 每日签到从不自动执行」+ 每轮无条件打 `[调度] 检查完成…` 日志 + 护栏测试 | ✅ 真机：包内二进制实跑（`[调度] 检查完成：本轮执行 0 项`）+ debug 构建实触发（`[调度] Trae 每日签到 计划 00:05 成功（退出码 0）`，`in_app_schedule.json` = `{"trae-checkin":"2026-10-06"}`）+ GUI 50/0 + 用量页 24/0 |
+| **1.0.31** | ⑳ **合入上游 6 项可用更新**（`account.rs` 新增 `display_string()` / `current_account_view()` 把 `id/uid/email/nickname/enterpriseName/needsReloginReason/note/domain/phoneNumber/accountType` 一律归一成字符串或 `null`，杜绝上游 JSON 结构体透传 UI 导致 React 崩页；四处状态出口统一；`gateway.rs static_models()` 与网关侧静态表取并集 **30 条** + 两侧快照测试锁死；`rotate.rs` 剩余天数向上取整；`tray.rs` 显式清 `LIGHTWEIGHT_MODE`；`classify.rs` 增补 `4028`）+ ㉑ **截断留痕**（`server.rs` 补 `sent_bytes` 与「上游未发 [DONE]」分支 eprintln，此前该分支**零日志**）+ ㉒ **`GET /api/gateway/log` + 网关页日志面板**（`router_log_path()` / `read_router_log_tail()` / `gateway_status().logFile/.logBytes` / `read_gateway_log` / `reveal_gateway_log`）+ ㉓ **非客户端纯部署产物** `dist-single\ai-gateway.exe`（27,274,752 B，纯 CLI 无 GUI） | ✅ 单测 core **1285/0/4**、router **1669/0/1**；假上游 6 模式矩阵 6/6；隔离实例真机端到端 200；交付包解包核验 `FileVersion=1.0.31` + 新符号命中；约束④全程成立（业主 :7864/:57890 未动） |
 | **1.0.30** | ⑲ **业主最后四件事一次修完**：① Trae 网关凭证被清空（`trae_account.rs` 的 `active_uids()` 把 **WorkBuddy 的 uid 勾选名单**当成 Trae 的过滤条件，两套 uid 空间交集恒空 ⇒ `export_accounts_to_dir` 清理循环删光 `trae-*.json`，且切回 balance 不自愈；改恒 `None` 不过滤）+ ② 后台任务完成事件（`lib.rs` 调度循环 `emit("background-task-done")` + 新增 `src/lib/use-background-task-refresh.ts`，Trae/豆包页按前缀监听 `dsh:background-task-done`）+ ③ 后台拉客户端隐藏窗口（`Action::hides_client_window()` 只对 `KeepAlive` 为真 + `CLIENT_HIDE_WINDOW_KEY` 默认 `true` + 设置→后台运行勾选框）+ ④ 顺带修「豆包保活失败仍记账」（`cli_task.rs` 失败改返 `Err`、只在成功时写时间戳、空池短路） | ✅ 真机：包内二进制 reqB **三臂 A/B/C**（修复前记账 / 修复后不记账 / 空池短路）+ reqC **GUI 勾选框↔磁盘往返** + reqD **48/48**（三种断流形态，用包内反解出的网关）+ workspace **3011/0/6** |
 
 ### 交付物
 
 ```
-dist\AI Gateway_1.0.30_x64-setup.exe   14,545,639 B   （当前交付版）
+当前交付版（1.0.31）：
+
+dist\AI Gateway_1.0.31_x64-setup.exe   14,586,903 B   （含 GUI 客户端）
+SHA256 1FB28395FE386E160482BC6BEC1A2417809755C24B3521C125F56ABBEAADA2A5
+  .sig  424 B  SHA256 2EB97D23E783DCB1AC0D87B444773624C654E2A5CAFC89B50776CB16E14E9BE6  keyid 7e7ce64b6fc3a36f
+内嵌网关 13,723,136 B  SHA256 5B5D23ECFC66E32875BA28D9D106D40044BB559AAC9672FA28DAC4B2C840C6C9
+宿主 GUI 27,274,752 B  SHA256 9FAA831BC3362C90976A8957B0AE67557A4E3A242D6FB8C220A44336D138669C
+包内 GUI 40,104,960 B  SHA256 0147D56D0D2B3FCE97194B464CF637A39D5441B492143E9E2099068502C847A5
+  （NSIS 打包后重排 PE 布局，与工作区产物**不是**逐字节关系；核对方式改为 FileVersion + 新增符号）
+
+★ 非客户端纯部署（本版新增，仅网关/服务端，无 GUI/WebView/安装器）：
+
+wt-port\dist-single\ai-gateway.exe   27,274,752 B
+SHA256 9FAA831BC3362C90976A8957B0AE67557A4E3A242D6FB8C220A44336D138669C
+  （与 target\release\ai-gateway.exe 逐字节一致；启动：`ai-gateway.exe serve --port 57890`）
+
+历史（1.0.30）：
+dist\AI Gateway_1.0.30_x64-setup.exe   14,545,639 B
 SHA256 7307D32175869D5EBB32300FA520F5B03915327DF94E7B79BE1E5C6BD1F82BD0
   .sig  424 B  SHA256 AA5EC776288085F7E8916602237BA0B22E3A6A17E7FAC1C157377FD5ECD25AAF  keyid 7e7ce64b6fc3a36f
 内嵌网关 13,629,440 B  SHA256 F7575803A1F2BD26048C0804AB8B2F776CD4C3DE07DE238DEEE084158B01D917
@@ -119,8 +139,9 @@ SHA256 8331371362744B4A22D86F7E8C8974AEB33F7B77EC896BD39C0D4DF767701662
 ```
 
 ★ 权威文档（**最新版优先**）：
-- 交付汇总 **`test-bin\DELIVERY-1.0.30.md`**（九节，含包内二进制三臂 reqB 对照、reqC GUI 往返、reqD 三形态 48/48、包内反解网关比对、构建链、安装提示、**本轮未验证面如实记录**）
-- 发布说明 `.github\RELEASE_NOTES_1.0.30.md`
+- 交付汇总 **`test-bin\DELIVERY-1.0.31.md`**（八节，含上游 6 项合入明细与**未合入理由**、截断双文案生产者归因判据、假上游 6 模式复现矩阵、纯部署产物真机实测、`build-single.ps1` 静默死亡 bug、**本轮未验证面**）
+- 上一版汇总：`test-bin\DELIVERY-1.0.30.md`（九节，含包内二进制三臂 reqB 对照、reqC GUI 往返、reqD 三形态 48/48、包内反解网关比对、构建链、安装提示、**本轮未验证面如实记录**）
+- 发布说明 `.github\RELEASE_NOTES_1.0.31.md`（当前）／历史 `.github\RELEASE_NOTES_1.0.30.md`
 - 历史：`DELIVERY-1.0.29.md` / `-1.0.28` / `-1.0.27` / `-1.0.26` / `-1.0.25` / `-1.0.24` / `-1.0.23` / `-1.0.21` / `-1.0.20`
 - ★ 1.0.28 的 **router crate 版本串仍是 v1.0.23**（刻意与 GUI 版本号解耦，不影响功能）
 
@@ -133,10 +154,10 @@ SHA256 8331371362744B4A22D86F7E8C8974AEB33F7B77EC896BD39C0D4DF767701662
 
 | 命令 | 基线 |
 |---|---|
-| `cargo test -p ai-gateway-router` | **1667 passed / 0 failed / 1 ignored**（1.0.30，网关未改；1.0.20 时是 1633） |
-| `cargo test --workspace`（15 个 test 块累加） | **3011 passed / 0 failed / 6 ignored**（1.0.30，`uitest\ws-test-1030.log`，EXIT=0；1.0.29 是 3007、1.0.28 是 3006、1.0.27 是 3001、1.0.26 是 2988） |
+| `cargo test -p ai-gateway-router` | **1669 passed / 0 failed / 1 ignored**（1.0.31；1.0.30 是 1667、1.0.20 时是 1633） |
+| `cargo test --workspace`（15 个 test 块累加） | **3029 passed / 0 failed / 6 ignored**（1.0.31，`uitest\ws-test-1031.log`，EXIT=0；1.0.30 是 3011、1.0.29 是 3007、1.0.28 是 3006、1.0.27 是 3001、1.0.26 是 2988） |
 | Trae 相关（`products::trae::` 128 + `modules::trae_agent::` 38 + `modules::trae_account::` 22） | **188 passed** |
-| `cargo test -p ai-gateway-core --lib` | **1275 passed / 0 failed / 4 ignored**（1.0.30 口径；1.0.29 是 1265、1.0.17 时是 1235） |
+| `cargo test -p ai-gateway-core --lib` | **1285 passed / 0 failed / 4 ignored**（1.0.31 口径；1.0.30 是 1275、1.0.29 是 1265、1.0.17 时是 1235） |
 | `cargo test -p ai-gateway-server` | **28 passed / 0 failed**（1.0.20 口径） |
 | `cargo check -p ai-gateway-router --lib` | EXIT 0，**0 warnings** |
 | `cargo check -p ai-gateway-router --bin gateway` | EXIT 0，**0 warnings** |
@@ -280,7 +301,7 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 | Qoder OAuth `ready` 分支 | ❌ 未在真机走到（需人工点浏览器授权） |
 | DST 异常时区的月步进 | ❌ 未在本机复现（依赖真实 tzdata 瞬间）；防御逻辑已实现并测试 |
 | 11133 的 **Trae 侧修复**（丢弃空名 tool-call） | ❌ 无法用真实上游复现 —— 实测 Trae 既不吐结构化 `tool_calls`、也不校验 tool 配对（污染历史探针返回 200，整流日志 0 命中）⇒ 只有单测覆盖（2 条） |
-| 11133 修复版**部署到所有者 `:7864`** | ❌ 未部署（业主实机仍是 **1.0.21** 血统，主程序 39,173,120 B）⇒ 装 1.0.30 即覆盖 |
+| 11133 修复版**部署到所有者 `:7864`** | ❌ 未部署（业主实机仍是 **1.0.21** 血统，主程序 39,173,120 B）⇒ 装 1.0.31 即覆盖 |
 | **GUI 侧实测**（托盘 / 单实例 / 自动更新 / 开机自启） | ❌ **设计上做不了**：桌面版第一个注册的插件是 `tauri-plugin-single-instance`，互斥量 `com.momo0410.aigateway-sim`；只要业主的 `D:\APP\AI Gateway\ai-gateway.exe` 在跑，我启动解包出来的 GUI exe 只会 `exit(0)` 并聚焦他的窗口，预热/托管/托盘全不跑 |
 | **Trae SG / 国际版分支** | ❌ 无真实 SG 账号可测，只有单测覆盖（业主账号 JWT 无 `iss` ⇒ `RealmEvidence::Default` ⇒ 界面「国内版（推断）」） |
 | ② 裸名路由的**本机 A/B 复现** | ⚠ 未能复现差异（旧/新网关对裸名都返回 WorkBuddy）—— 该兜底清单在 1.0.19 已存在；只能靠源码 + 单测 + Trae-only 池对照 |
@@ -340,3 +361,55 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 | 用量写入口径装置 | `uitest\q17-run.ps1` + `uitest\verify-q17-usage.cjs`（复用 `q16-ab.ps1 -Mode usage -Model <名>`） | 两轮真机：先大写定型、再写小写，断言四张表不裂（23/0）。假上游 `usage` 模式发一帧 `usage:{11,5,cache 3/2}` —— **不带 usage 的帧完全不计账** |
 | 侦察报告 | `test-bin\recon\REPORT-{qoder,zcode,trae}.md` | 外部仓库功能清单 |
 | 解包比对脚本思路 | `DELIVERY-1.0.14.md` 第四节 | 验证安装包内容而**不安装** |
+
+---
+
+## 九、分支形态与版本谱系（2026-10-06 落地）
+
+### 9.1 分支改名
+
+本仓库**不再叫 `migrate/aigw-v1.0.2`**（那是「从 Go 网关迁到 Rust 网关」时期的名字，迁移早完成了）。现在的形态：
+
+| 分支 | 指向 | 说明 |
+|---|---|---|
+| **`main`** | `9ce3ba5`（v1.0.31） | **本仓库唯一开发主线**。由 `migrate/aigw-v1.0.2` 原地改名而来，全部 187 个提交、42 个 tag 都在这条线上。**无上游追踪**（`branch.main.remote` 为空）—— 有意如此，避免误 `git pull` 把上游陈旧线拉进来 |
+| `archive/origin-main` | `224919a` | 原 `main` 改名留档。它是 `origin/main`（`iuuuuuuuu/workbuddy-switch-gateway`）那条**陈旧且独立**的血统，与主线 `merge-base` 停在 `117643f`（v0.7.0 那代）。保留只是为了「还能查到那一版长什么样」，不再参与开发 |
+
+★ 改名是纯本地操作，**没有 push、没有改 remote**。`archive/origin-main` 仍带着 `branch.archive/origin-main.remote=origin` 的追踪配置（改名不会清），但没有任何脚本/工作流依赖分支名，所以不构成风险。
+
+### 9.2 版本号 ↔ tag 谱系（补 tag 后）
+
+本仓库此前 **v1.0.11 起全部没有 tag**，「版本 ↔ 提交」只存在于提交信息和文档里。2026-10-06 补了 10 个 annotated tag：
+
+| tag | 提交 | 备注 |
+|---|---|---|
+| `v1.0.21` | `3d5a1be` | 该版本当时 `tauri.conf.json` 写 1.0.21、`package.json` 仍写 1.0.10（**两文件历史上不同步**，tag 只保证 tauri.conf.json） |
+| `v1.0.23` | `920c024` | |
+| `v1.0.24` | `206f19f` | |
+| `v1.0.25` | `14dc950` | |
+| `v1.0.26` | `f2f7489` | |
+| `v1.0.27` | `c86aea6` | |
+| `v1.0.28` | `37f5028` | |
+| `v1.0.29` | `6e426f9` | |
+| `v1.0.30` | `811b179` | |
+| `v1.0.31` | `9ce3ba5` | 当前 HEAD |
+
+打 tag 的规则：**版本号提交 V 的父提交**（= 该版本工作的最后一个提交；1.0.31 是 HEAD）。tag 是 annotated，带消息（说明为什么标这个提交、交付包路径）。本地 tag 总数 **32 → 42**。
+
+★ **`v1.0.11`–`v1.0.20`、`v1.0.22` 永远打不了 tag** —— 这些版本号在**任何提交的 `package.json` / `tauri.conf.json` 里都从未出现过**（`git log --all -S` 全空）。它们是**交付编号**：包做出来了、`dist\` 里有 exe、文档里写了，但当时没改版本号文件。⇒ 查这些版本只能靠 `dist\AI Gateway_<ver>_x64-setup.exe` 与 `test-bin\DELIVERY-<ver>.md`。
+
+### 9.3 分发通道现状（三条，都是本仓库自己的）
+
+| 通道 | 地址 | 现状 |
+|---|---|---|
+| 桌面端自动更新 | `https://github.com/iuuuuuuuu/ai-gateway/releases/latest/download/latest.json` | ⚠ **停在 1.0.10**（2026-09-28）。1.0.11 起从未发过 GitHub Release ⇒ **所有 1.0.11+ 用户不会收到自动更新**，只能手动装 |
+| npm | `npm/` 子目录的 `ai-gateway` 包（`optionalDependencies` 5 个平台包） | 未发布过 |
+| 直接发安装包 | `D:\WishProject\WorkbuddySwitchAPi\dist\` | 1.0.7 – 1.0.31 全套都在（每版含 `.sig`），**比 GitHub Release 完整** |
+
+`src-tauri/tauri.conf.json:53-57` 的 updater `endpoints` 指向 `iuuuuuuuu/ai-gateway`（remote 名 `fork`），签名公钥 keyid `6FA3C36F4BE67C7E`；**本地构建用的是另一把**（keyid `7e7ce64b6fc3a36f`，`keys\ai-gateway-updater.key`）⇒ 若要让自动更新真正生效，必须用**与 `tauri.conf.json` 公钥配对的那把私钥**发布，否则客户端校验失败。
+
+### 9.4 没做的事（有意）
+
+- **没有 push**、没有开 PR、没有建新仓库。凭据现状：`GITHUB_TOKEN`/`GH_TOKEN` 未设置，`gh` CLI 不存在，只有 Windows 凭据管理器里的 `git:https://github.com`（且本机 curl 出口当前不通）⇒ 远端动作做不了也做不稳。
+- **没有合并 `main` 的最后一个提交**：`archive/origin-main` 相对主线只有 1 个提交（`224919a`「修复负载均衡只用到少数账号与长对话 unexpected EOF」），改动全在 `go-gateway/`（已不参与构建的 Go 参照）+ 版本行 + README 15 行 ⇒ 无移植价值。
+- **`origin` / `upstream` / `aigw` 三个 remote 未删**，留作历史参照。其中 `upstream`(`momo0410/workbuddy-switch-gateway`) 与 `aigw`(`momo0410/ai-gateway`) 已 404。
