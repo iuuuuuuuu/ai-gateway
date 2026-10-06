@@ -130,3 +130,12 @@ SHA256 1FB28395FE386E160482BC6BEC1A2417809755C24B3521C125F56ABBEAADA2A5
 
 > **自动更新通道**：此前 `latest.json` 停在 **1.0.10**（2026-09-28），1.0.11–1.0.30 从未发过 GitHub Release ⇒ 那批用户一直收不到更新提示。本版已正式发 Release 并上传 `latest.json`。**但仓库随后按业主 m26011 转为 private，而 updater 是匿名拉取，所以该通道目前对客户端是 404 —— 详见第八节。**
 
+**发布后的复核（实测，不是推断）**
+
+- 远端 `main` = 本地 HEAD（`7fafc42`），远端 tag = **42** = 本地 tag；
+- Release 正文已同步更正（旧版里「通道已恢复」的说法不成立，已删除）；
+- 转私有之后，走 API + token 把资产真下下来核对：`remoteBytes=14586903`，SHA256 `1FB28395FE386E160482BC6BEC1A2417809755C24B3521C125F56ABBEAADA2A5` ⇒ 与本地 `dist\AI Gateway_1.0.31_x64-setup.exe` **逐字节一致**；
+- `git diff --name-only 9ce3ba5..HEAD` 里**没有任何非 `.md` 文件** ⇒ 版本提交之后只改了文档，**这 5 个资产与版本提交构建出来的东西一致，不需要重发**。
+
+**另外**：推送时 GitHub 提示本仓库默认分支有 3 条 Dependabot 告警（1 high / 2 moderate）—— `source-map-js`（`package-lock.json`，索引化 source-map 段偏移导致的事件循环拒绝服务）、`rustls`（`Cargo.lock`，TLS 1.3 握手跨加密层级被错误接受）、`glib`（`Cargo.lock`，`VariantStrIter` 的迭代器实现不可靠）。三条都在**依赖锁文件**里，不在本项目自写代码里；本版交付物未因此改动，建议作为独立任务处理（先升依赖，再重跑 `cargo test --workspace` + 真机验证）。
+

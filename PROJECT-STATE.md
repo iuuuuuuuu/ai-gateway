@@ -453,7 +453,7 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 
 | 项 | 结果 |
 |---|---|
-| `main` | 远端 `001c40a8d039858e13d95665903f6bc3e0c71be8` = 本地 HEAD，`rev-list --left-right --count fork/main...HEAD` = `0 0` |
+| `main` | 首推 `001c40a8d039858e13d95665903f6bc3e0c71be8`；随后文档提交 `7fafc428c45a6b183c1a003cada642481b13efe6` 也已推送 ⇒ 远端 `main` = 本地 HEAD，`rev-list --left-right --count fork/main...HEAD` = `0 0` |
 | tag | 本地 **42** = 远端 **42**（补推的 11 个：`v1.0.4` `v1.0.21` `v1.0.23`–`v1.0.31`；同名不同 SHA 的冲突 **0 个**） |
 | 远端分支 | `main`=001c40a、`migrate/aigw-v1.0.2`=5a05b35、`feat/tasks-and-dual-realm`=92fcc21、`fix/migrate-merge-instead-of-skip`=add8b52 |
 | Release | `v1.0.31`，id `404503791`，`draft=False prerelease=False`，`releases/latest` 已指向它 |
@@ -469,6 +469,28 @@ Release 的 5 个资产（上传前安装包**改名为 updater 约定名** `ai-
 | `latest-windows-x86_64.json` | 1524 | 615001430 |
 
 ★ **updater 清单里 `signature` 字段 = `.sig` 文件内容逐字**（`.sig` 本身已是 base64 文本）⇒ **直接原样填入，不要解码、不要二次 base64**。1.0.31 清单只发 `windows-x86_64-nsis` + `windows-x86_64` 两个键（本轮仅出 Windows 资产）。
+
+**发布后复核（实测）**
+
+| 检查 | 结果 |
+|---|---|
+| 远端 `main` | `7fafc428c45a6b183c1a003cada642481b13efe6` = 本地 HEAD |
+| 远端 tag 数 | **42**（与本地一致） |
+| Release 正文 | `bodyLen=6295`，含第八节（转私有说明），旧版「通道已恢复」措辞已消失 |
+| 资产可下载性（**转私有后**，走 API + token） | `curl.exe -sL -H 'Authorization: Bearer <tok>' -H 'Accept: application/octet-stream' -o <out> https://api.github.com/repos/iuuuuuuuu/ai-gateway/releases/assets/615002270` ⇒ `curl_exit=0`，`remoteBytes=14586903`，SHA256 `1FB28395FE386E160482BC6BEC1A2417809755C24B3521C125F56ABBEAADA2A5` ⇒ 与本地 `dist\AI Gateway_1.0.31_x64-setup.exe` **逐字节一致** |
+| 资产内容与代码的对应 | `git diff --name-only 9ce3ba5..HEAD` 里**没有任何非 `.md` 文件** ⇒ 版本提交之后只改文档，**Release 资产不需要重发** |
+
+★ 坑：`Invoke-WebRequest -MaximumRedirection 0` 想读 302 的 `Location` 会直接抛 `Operation is not valid due to the current state of the object`；把 token 写进 curl 的 `--config` 文件会被 curl 当配置指令解析（`unknown option`）。**直接 `curl.exe -H <auth> -L -o <out> <api-url>` 最省事。**
+
+**顺带：Dependabot 告警 3 条**（推送时 GitHub 提示，与本次交付无关）
+
+| 严重度 | 包 | 清单 | 摘要 |
+|---|---|---|---|
+| high | `source-map-js` | `package-lock.json` | 索引化 source-map 段偏移导致事件循环拒绝服务 |
+| medium | `rustls` | `Cargo.lock` | TLS 1.3 握手消息被错误地跨加密层级接受 |
+| medium | `glib` | `Cargo.lock` | `VariantStrIter` 的 `Iterator`/`DoubleEndedIterator` 实现不可靠 |
+
+三者都在依赖锁文件里，不在自写代码里；本版交付物未因此改动（如需处理应作为独立任务：先升依赖，再重跑 `cargo test --workspace` + 真机验证）。
 
 **转私有（m26011）与其代价**
 
