@@ -1,6 +1,6 @@
 # WorkBuddy Switch / AI Gateway — 项目状态与后续工作
 
-> 最后更新：2026-10-06（**1.0.31**：⑳ 合入上游 6 项可用更新（账号字段类型归一 / 状态出口统一 / 静态模型表并集 30 条 + 两侧快照测试 / 剩余天数向上取整 / 轻量模式残留清零 / 上下文超长码别名 4028）；㉑ 排查 `deepseek-v4.1-flash` 截断报障 —— 定位到业主文案用的是网关合成帧（**a** completion event），补齐「上游未发 [DONE]」分支的日志留痕（此前**一条都没有**），并用假上游 6 模式矩阵复现（`test-bin\mock-chat\`）；㉒ 新增 `GET /api/gateway/log` + 网关页日志面板；㉓ 额外产出**非客户端纯部署**单文件产物 `wt-port\dist-single\ai-gateway.exe`，并修掉 `build-single.ps1` 的静默死亡 bug。详见 `test-bin\DELIVERY-1.0.31.md`）
+> 最后更新：2026-10-06（**1.0.31**：⑳ 合入上游 6 项可用更新（账号字段类型归一 / 状态出口统一 / 静态模型表并集 30 条 + 两侧快照测试 / 剩余天数向上取整 / 轻量模式残留清零 / 上下文超长码别名 4028）；㉑ 排查 `deepseek-v4.1-flash` 截断报障 —— 定位到业主文案用的是网关合成帧（**a** completion event），补齐「上游未发 [DONE]」分支的日志留痕（此前**一条都没有**），并用假上游 6 模式矩阵复现（`test-bin\mock-chat\`）；㉒ 对齐上游 `1c8bfed` 已有的网关日志查看入口（`GET /api/gateway/log` + 网关页日志面板；上游按行数取，本仓库按字节取，因为日志里有超长单行 JSON）；㉓ 额外产出**非客户端纯部署**单文件产物 `wt-port\dist-single\ai-gateway.exe`，并修掉 `build-single.ps1` 的静默死亡 bug。详见 `test-bin\DELIVERY-1.0.31.md`）
 >
 > 上一版：2026-10-06（**1.0.30**：⑲ 一次性修完业主最后报的四件事 —— ① 切手动模式/改模型白名单删光 Trae 网关凭证（uid 空间用错，且不自愈）；② 后台任务跑完前端不刷新（轮询 hook 只在窗口可见/聚焦时跑）；③ 后台拉客户端会弹窗（改为默认隐藏 + 设置页开关）；④ ZCode 断流文案透传 reqwest 原文。并顺带修掉「豆包保活失败仍记为当天已完成」的记账缺陷）
 > 本文件是**接手用**的持久状态说明，不随会话消失。
@@ -66,7 +66,7 @@
 | **1.0.27** | ⑰ 用量统计模型名**大小写折叠**（写入口径 `model_key_of` + 载入自愈 `merge_case_variants`）+ 计费行平台归属按计费键回填（`backfill_billing` 旧口径按 uid 形状猜，重启后分布会漂） | ✅ 真机 23/23 PASS（载入自愈 8→6）；★ 写入口径另测 **23/0**（见五节） |
 | **1.0.28** | ⑯ 流中途上游错误帧识别 / 记日志 / 计入账号健康度（`note_upstream_stream_error`）+ 空 product 归一化成 `workbuddy` | ✅ 真机 43/0（抓包）+ 50/0（GUI）+ 24/0（用量页） |
 | **1.0.29** | ⑱ **桌面端接入应用内调度**：`spawn_background_loops()` 新增第 7 个循环（启动 60s 后起，每 5 分钟一轮，`spawn_blocking` 里调 `apps_ops::run_in_app_due_tasks`），修复「Trae 每日签到从不自动执行」+ 每轮无条件打 `[调度] 检查完成…` 日志 + 护栏测试 | ✅ 真机：包内二进制实跑（`[调度] 检查完成：本轮执行 0 项`）+ debug 构建实触发（`[调度] Trae 每日签到 计划 00:05 成功（退出码 0）`，`in_app_schedule.json` = `{"trae-checkin":"2026-10-06"}`）+ GUI 50/0 + 用量页 24/0 |
-| **1.0.31** | ⑳ **合入上游 6 项可用更新**（`account.rs` 新增 `display_string()` / `current_account_view()` 把 `id/uid/email/nickname/enterpriseName/needsReloginReason/note/domain/phoneNumber/accountType` 一律归一成字符串或 `null`，杜绝上游 JSON 结构体透传 UI 导致 React 崩页；四处状态出口统一；`gateway.rs static_models()` 与网关侧静态表取并集 **30 条** + 两侧快照测试锁死；`rotate.rs` 剩余天数向上取整；`tray.rs` 显式清 `LIGHTWEIGHT_MODE`；`classify.rs` 增补 `4028`）+ ㉑ **截断留痕**（`server.rs` 补 `sent_bytes` 与「上游未发 [DONE]」分支 eprintln，此前该分支**零日志**）+ ㉒ **`GET /api/gateway/log` + 网关页日志面板**（`router_log_path()` / `read_router_log_tail()` / `gateway_status().logFile/.logBytes` / `read_gateway_log` / `reveal_gateway_log`）+ ㉓ **非客户端纯部署产物** `dist-single\ai-gateway.exe`（27,274,752 B，纯 CLI 无 GUI） | ✅ 单测 core **1285/0/4**、router **1669/0/1**；假上游 6 模式矩阵 6/6；隔离实例真机端到端 200；交付包解包核验 `FileVersion=1.0.31` + 新符号命中；约束④全程成立（业主 :7864/:57890 未动） |
+| **1.0.31** | ⑳ **合入上游 6 项可用更新**（`account.rs` 新增 `display_string()` / `current_account_view()` 把 `id/uid/email/nickname/enterpriseName/needsReloginReason/note/domain/phoneNumber/accountType` 一律归一成字符串或 `null`，杜绝上游 JSON 结构体透传 UI 导致 React 崩页；四处状态出口统一；`gateway.rs static_models()` 与网关侧静态表取并集 **30 条** + 两侧快照测试锁死；`rotate.rs` 剩余天数向上取整；`tray.rs` 显式清 `LIGHTWEIGHT_MODE`；`classify.rs` 增补 `4028`）+ ㉑ **截断留痕**（`server.rs` 补 `sent_bytes` 与「上游未发 [DONE]」分支 eprintln，此前该分支**零日志**）+ ㉒ **对齐上游 `1c8bfed` 的网关日志查看入口**（`router_log_path()` / `read_router_log_tail()` / `gateway_status().logFile/.logBytes` / `read_gateway_log` / `reveal_gateway_log`；上游同款命令按行数取，本仓库按字节取）+ ㉓ **非客户端纯部署产物** `dist-single\ai-gateway.exe`（27,274,752 B，纯 CLI 无 GUI） | ✅ 单测 core **1285/0/4**、router **1669/0/1**；假上游 6 模式矩阵 6/6；隔离实例真机端到端 200；交付包解包核验 `FileVersion=1.0.31` + 新符号命中；约束④全程成立（业主 :7864/:57890 未动） |
 | **1.0.30** | ⑲ **业主最后四件事一次修完**：① Trae 网关凭证被清空（`trae_account.rs` 的 `active_uids()` 把 **WorkBuddy 的 uid 勾选名单**当成 Trae 的过滤条件，两套 uid 空间交集恒空 ⇒ `export_accounts_to_dir` 清理循环删光 `trae-*.json`，且切回 balance 不自愈；改恒 `None` 不过滤）+ ② 后台任务完成事件（`lib.rs` 调度循环 `emit("background-task-done")` + 新增 `src/lib/use-background-task-refresh.ts`，Trae/豆包页按前缀监听 `dsh:background-task-done`）+ ③ 后台拉客户端隐藏窗口（`Action::hides_client_window()` 只对 `KeepAlive` 为真 + `CLIENT_HIDE_WINDOW_KEY` 默认 `true` + 设置→后台运行勾选框）+ ④ 顺带修「豆包保活失败仍记账」（`cli_task.rs` 失败改返 `Err`、只在成功时写时间戳、空池短路） | ✅ 真机：包内二进制 reqB **三臂 A/B/C**（修复前记账 / 修复后不记账 / 空池短路）+ reqC **GUI 勾选框↔磁盘往返** + reqD **48/48**（三种断流形态，用包内反解出的网关）+ workspace **3011/0/6** |
 
 ### 交付物
@@ -414,3 +414,23 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 - **没有 push**、没有开 PR、没有建新仓库。凭据现状：`GITHUB_TOKEN`/`GH_TOKEN` 未设置，`gh` CLI 不存在，只有 Windows 凭据管理器里的 `git:https://github.com`（且本机 curl 出口当前不通）⇒ 远端动作做不了也做不稳。
 - **没有合并 `main` 的最后一个提交**：`archive/origin-main` 相对主线只有 1 个提交（`224919a`「修复负载均衡只用到少数账号与长对话 unexpected EOF」），改动全在 `go-gateway/`（已不参与构建的 Go 参照）+ 版本行 + README 15 行 ⇒ 无移植价值。
 - **`origin` / `upstream` / `aigw` 三个 remote 未删**，留作历史参照。其中 `upstream`(`momo0410/workbuddy-switch-gateway`) 与 `aigw`(`momo0410/ai-gateway`) 已 404。
+
+### 9.5 上游仓库存活现状（2026-10-06 核查）
+
+业主问过「两个都 404 是什么意思」，这里留一份可直接引用的核查结论。**判存活必须走 `api.github.com`**：本机 `curl` 对 `github.com/<owner>` 的 HTML 页面一律返回 `000`（出口不通），但 API 完全可用。
+
+| 仓库 | HTTP | 事实 |
+|---|---|---|
+| `momo0410/ai-gateway` | **404** | 本仓库的**直接上游**。已删/改私有。账号本身还在（`api.github.com/users/momo0410` = 200，5 个公开仓库全是无关项目，还在活跃）⇒ 是仓库没了，不是人没了 |
+| `momo0410/workbuddy-switch-gateway` | **404** | 同上（remote 名 `upstream`） |
+| `Sliverkiss/workbuddy2api` | **404** | 血统链第二层，也已删。但本地 `ref-sliverkiss` 已 fetch 到 `b08f518`（2026-09-19） |
+| `moshouhot/workbuddy-switch-gateway` | 200 | 血统链第三层，是 `origin` 的 **parent**；本地已有其全部（`git cherry -v HEAD d815cef` 零输出） |
+| `changexbc/workbuddy-switch` | 200 | 血统链最底层，**仍在更新**（pushed 2026-10-04） |
+| `linguo2625469/workbuddy2api-panel` | 200 | 面板参考仓库，**今天还在更新**（pushed 2026-10-06） |
+
+**对我们零影响**：本地 5 个 worktree / 42 个 tag / 全部历史都在；`fork`（`iuuuuuuuu/ai-gateway`）是 `"fork": false` 的**独立仓库**，不依赖 `momo0410` 存活；updater endpoints 指向它，自动更新通道不受 404 影响（只是停在 1.0.10，见 9.3）。
+
+**祖先关系实测**（`git merge-base --is-ancestor`）：`moshouhot/main` 是 HEAD 的祖先（`..HEAD` 273 个提交，反向 0）；`momo0410-aigw/main` 也是 HEAD 的祖先（170 / 0）；`origin/main` 与 HEAD **互不为祖先**（那条是独立血统）；`upstream/main` 与 HEAD 有 6 个未合提交（全是 2026-09-16/17 旧货，逐条判定不需要合：supportsImages / 思考等级 / 账号备注 / 两次版本 bump 本地都已有等价或更强实现）。
+
+★ 全量备份：`merge-backup\after-upstream-404.bundle`（37,188,040 B，84 refs，`git bundle verify` = 完整历史）。此前三个 bundle 都**不含当前 HEAD**。
+
