@@ -843,6 +843,53 @@ pub struct Pool {
     product_model_set: HashMap<String, HashSet<String>>,
     /// 网关自己补的兜底清单（只影响「不排除」）。
     product_model_fallback_set: HashMap<String, HashSet<String>>,
+    /// 「产品 → 上游**实测**存在的模型集合」（运行期从真值刷新，见
+    /// `[Pool::observe_product_models`]）。
+    ///
+    /// # 为什么要有第三份清单（2026-10-06 所有者现场）
+    ///
+    /// 业主报「用 `space-bunny` 报 503 `no_healthy_account`，可这个模型
+    /// WorkBuddy 明明有」。根因不在上游：`space-bunny` 是 **WorkBuddy 国服
+    /// 真实模型**（网关自己的 `/debug/capability` 里 `dynamic_cn_ids` 就有它），
+    /// 但它**不在**静态兜底清单里（`server.rs::static_workbuddy_model_ids`
+    /// 那 30 条是 2026-09-18 的快照）⇒ `product_may_serve` 判「兜底未命中」
+    /// ⇒ 27 个账号全被排除 ⇒ `pick_earliest_expiry` 只收冷却中的号 ⇒ 一个都
+    /// 挑不出 ⇒ 503。
+    ///
+    /// ⇒ 两手一起上：① 兜底未命中**只降级、不灭绝**（见
+    /// `[Pool::pick_for_model_any`]）；② 把每次拉到的上游真值记在这里，让清单
+    /// **自愈** —— 新模型名不必等发版更新静态表。
+    ///
+    /// # 与另外两份的分工（三档语义，缺一不可）
+    ///
+    /// - `product_model_set`（宿主清单，**可信**）→ 参与「不排除」+「声明」竞争
+    /// - `product_model_fallback_set`（网关静态兜底，**猜测**）→ 只参与
+    ///   「不排除」；未命中只是**降级**到最后一档
+    /// - 本字段（上游**实测**，最可信）→ 只参与「不排除」
+    ///
+    /// ⚠ **绝不**把实测真值合并进 `product_model_set`：那会把 workbuddy 变成
+    /// 「声明方」，与 2026-09-21 的 qoder 事故同型（19 个 WorkBuddy 账号压倒
+    /// 1 个 qoder 账号 ⇒ 11102）。
+    product_model_observed_set: HashMap<String, HashSet<String>>,
+    /// 「产品 → **已经拉到过真值**的区域集合」（见 [`Pool::observe_product_models_in_region`]）。
+    ///
+    /// 只在**两区都拉到过**时，才敢拿下面那张表去收紧区域 —— 一区没拉到就说
+    /// 「另一个区没有这个模型」会把整批账号误杀（区域路由最忌讳的一类误判）。
+    product_truth_regions: HashMap<String, HashSet<Region>>,
+    /// 「产品 → 模型 → 在哪些区域**见过**它」（上游真值的区域维度）。
+    ///
+    /// # 为什么必须记区域（2026-10-06 真机实测）
+    ///
+    /// 上一轮修复只记了「这个产品有哪些模型名」—— **没有区域**。于是
+    /// `space-bunny`（只在国服）与 12 个国际版账号照样匹配：裸名选号走
+    /// [`Pool::pick_for_model_any`] 最后那句 `pick_inner(..., RegionFilter::Any, ...)`，
+    /// 区域不限 ⇒ 抽到国际版号 ⇒ 上游回 400
+    /// `model [space-bunny] service info not found`。
+    ///
+    /// 真机证据（隔离实例 :17864）：`/debug/capability` 的 `dynamic_cn_ids` **有**
+    /// `space-bunny`、`dynamic_intl_ids` **没有**；而 `国服:space-bunny` 恒 200、
+    /// `国际版:space-bunny` 恒 400。
+    product_model_regions: HashMap<String, HashMap<String, HashSet<Region>>>,
     /// 「平台 → 区域 → 允许的模型」用户白名单（已归一化）。
     platform_models: HashMap<String, HashMap<String, HashSet<String>>>,
     /// 「平台 → 区域 → **禁用**的模型」否决项（已归一化）。
@@ -911,6 +958,9 @@ impl Pool {
             cost_weight: 0.3,
             product_model_set: HashMap::new(),
             product_model_fallback_set: HashMap::new(),
+            product_model_observed_set: HashMap::new(),
+            product_truth_regions: HashMap::new(),
+            product_model_regions: HashMap::new(),
             platform_models: HashMap::new(),
             platform_models_disabled: HashMap::new(),
             model_platforms: HashMap::new(),
@@ -1036,6 +1086,176 @@ impl Pool {
     /// - `set_product_models_fallback` 网关兜底（猜测）→ **只**参与「不排除」
     pub fn set_product_models_fallback(&mut self, by_product: &HashMap<String, Vec<String>>) {
         self.product_model_fallback_set = normalize_product_models(by_product);
+    }
+
+    /// 用上游**实测**的模型清单刷新某产品的「观测集」（只增不减）。
+    ///
+    /// 调用点：`[crate::server`] 的 `/v1/models` —— 那里本来就已经按区域拉了一次
+    /// 上游真值（`[crate::server::region_snapshot`]`），顺手把它喂进池子是**零额外
+    /// 请求**的。宿主与客户端都会定期打这个接口（宿主用它判断模型计费），
+    /// 因此观测集在正常使用下始终新鲜。
+    ///
+    /// # 为什么只增不减
+    ///
+    /// 上游清单会随版本增删，但「删」几乎总是「这次没拉到」或「该账号所在区域
+    /// 没有」的误判。观测集只用来**放宽**（`[Pool::product_may_serve`]`），少一条会
+    /// 立刻变成「排除」，多一条的代价只是「试一次」—— 两边不对称，故取宽。
+    ///
+    /// ⚠ 只对**已经有兜底清单**的产品生效：没有兜底清单的产品本来就「不排除」，
+    /// 给它记观测集白占内存。
+    pub fn observe_product_models(&mut self, product: &str, ids: &[String]) {
+        let plat = product.trim().to_ascii_lowercase();
+        if plat.is_empty() || ids.is_empty() {
+            return;
+        }
+        let has_fallback = self
+            .product_model_fallback_set
+            .get(&plat)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !has_fallback {
+            return;
+        }
+        let set = self.product_model_observed_set.entry(plat).or_default();
+        for id in ids {
+            let k = id.trim().to_ascii_lowercase();
+            if !k.is_empty() {
+                set.insert(k);
+            }
+        }
+    }
+
+    /// 用上游真值按**区域**记录某产品在某区见过哪些模型。
+    ///
+    /// 与 `[Pool::observe_product_models`] 的分工：那个只回答「这个产品有没有这个
+    /// 模型」（放宽用），本函数回答「**哪个区**有」（收紧用）。两者都只增不减。
+    ///
+    /// # 为什么必须两区都拉到过才敢用（`product_truth_regions`）
+    ///
+    /// 「国际版清单里没有 `space-bunny`」只有在**国际版清单确实拉到了**时才
+    /// 成立。若国际版这次拉失败（无账号 / 上游抖动 / 退避窗口），把「没见到」当成
+    /// 「没有」会把 12 个国际版账号连同它们真正支持的模型一起误杀 —— 那比原缺陷
+    /// 更糟（原缺陷只是 400，误杀会变成整批 503）。故用 `truth_regions` 记「拉到过」
+    /// 的区域，只有**两区都在里面**时 `[Pool::model_region_hint`] 才敢给结论。
+    pub fn observe_product_models_in_region(
+        &mut self,
+        product: &str,
+        region: Region,
+        ids: &[String],
+    ) {
+        if region == Region::Any {
+            return;
+        }
+        let plat = product.trim().to_ascii_lowercase();
+        if plat.is_empty() || ids.is_empty() {
+            return;
+        }
+        let has_fallback = self
+            .product_model_fallback_set
+            .get(&plat)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !has_fallback {
+            return;
+        }
+        self.product_truth_regions
+            .entry(plat.clone())
+            .or_default()
+            .insert(region);
+        let by_model = self.product_model_regions.entry(plat).or_default();
+        for id in ids {
+            let k = id.trim().to_ascii_lowercase();
+            if !k.is_empty() {
+                by_model.entry(k).or_default().insert(region);
+            }
+        }
+    }
+
+    /// 上游真值给出的「该模型只在一个区域存在」结论（收紧区域用）。
+    ///
+    /// 返回 `Some(region)` 当且仅当：
+    ///
+    /// 1. 该产品**两区**的清单都拉到过（`product_truth_regions` 含 CN 与 Intl）；
+    /// 2. 该模型**恰好**在其中一个区域的清单里出现过。
+    ///
+    /// 其余一切情况返回 `None`（= 不约束区域，保持既有行为）：
+    ///
+    /// - 一区或两区没拉到 ⇒ 数据不全，不能下结论；
+    /// - 两区都见过 ⇒ 本来就不需要约束；
+    /// - 两区都没见过 ⇒ 这个模型名不在真值里（可能只有静态表或只有兜底清单），
+    ///   区域维度无从谈起 —— 交给产品维度的判据去管。
+    ///
+    /// # 为什么判据是「恰好一区」而不是「含某区」
+    ///
+    /// 同名模型在两区是**不同后端**（`glm-5.3` 国服能读图、国际版不能），
+    /// 两区都见过时强行指定任一区都会白丢一半额度，且没有任何依据说哪个更好。
+    pub fn model_region_hint(&self, product: &str, model: &str) -> Option<Region> {
+        if model.is_empty() || !self.multi_product_on {
+            return None;
+        }
+        let seen = self.product_truth_regions.get(product)?;
+        if !(seen.contains(&Region::CN) && seen.contains(&Region::Intl)) {
+            return None;
+        }
+        let regions = self
+            .product_model_regions
+            .get(product)?
+            .get(&model.trim().to_ascii_lowercase())?;
+        if regions.len() != 1 {
+            return None;
+        }
+        regions.iter().next().copied()
+    }
+
+    /// 「该产品**确定**不能服务该模型」—— 即 `[Pool::pick_for_model_any`] 里
+    /// `scoped`（永久排除）那一档的判据。
+    ///
+    /// 与 `[Pool::product_may_serve`] 的区别只有一点，但正是 2026-10-06 修复的核心：
+    /// **静态兜底清单未命中不算「确定」**。
+    ///
+    /// `product_may_serve` 对「有兜底清单但未命中」返回 `false`（那是对的，
+    /// 它回答的是「有没有依据说它能服务」），可这个 `false` 有两种完全不同的
+    /// 成因：
+    ///
+    /// 1. 宿主清单**已知**且不含它 ⇒ **确定**没有（Trae 之于
+    ///    `deepseek-v4.1-flash`：宿主下发的 trae 清单可信）；
+    /// 2. 只是静态兜底清单没跟上 ⇒ 上游新上的模型（`space-bunny`）必然落这里。
+    ///
+    /// 旧代码把两者一视同仁地扔进 `scoped`，于是第 2 种会**灭绝**整个产品
+    /// —— 27 个账号全被排除，报 503「所有账号不可用」。
+    pub fn product_definitely_lacks_model(&self, product: &str, model: &str) -> bool {
+        if model.is_empty() || !self.multi_product_on {
+            return false;
+        }
+        if self.product_may_serve(product, model) {
+            return false;
+        }
+        // 只有**宿主清单**（可信来源）说「没有」才算确定。实测观测集不算 ——
+        // 它可能只覆盖了一个区域，拿它当否定会误杀另一个区域独有的模型。
+        let (_, known) = self.product_offers_model(product, model);
+        known
+    }
+
+    /// 报告三份清单里**有没有任何一份**包含该模型（= 有没有依据说它能服务）。
+    ///
+    /// 只用于诊断与降级分档，不参与「声明」竞争。
+    pub fn product_model_known_anywhere(&self, product: &str, model: &str) -> bool {
+        if model.is_empty() {
+            return true;
+        }
+        let key = model.trim().to_ascii_lowercase();
+        for src in [
+            &self.product_model_set,
+            &self.product_model_observed_set,
+            &self.product_model_fallback_set,
+        ] {
+            if let Some(set) = src.get(product) {
+                if set.contains(&key) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// 报告某产品是否提供该模型。
@@ -1424,6 +1644,15 @@ impl Pool {
             .get(product)
             .filter(|fb| !fb.is_empty());
         let fallback = fb.map(|fb| fb.contains(&key)).unwrap_or(false);
+        // ★ 来源 4：上游**实测**集（2026-10-06 新增，见 [Pool::observe_product_models]）。
+        //
+        // 它比兜底清单**强**：兜底是人工快照（会过时，`space-bunny` 就是漏网的
+        // 那一个），实测是真值。命中即放行 —— 这不需要任何猜测。
+        let observed = self
+            .product_model_observed_set
+            .get(product)
+            .map(|s| s.contains(&key))
+            .unwrap_or(false);
         let (offers, known) = self.product_offers_model(product, model);
         if !known {
             // ★ 宿主清单未知，但网关补过兜底清单 ⇒ **以兜底清单为准**：
@@ -1440,12 +1669,16 @@ impl Pool {
             //
             // 关键区别：**「不知道」≠「能满足」**。兜底清单是网关**已知的更多
             // 可能性**，比「完全不知道」更有信息量，故此时以它为准。
+            // ★ 实测集优先于兜底清单：它证明上游**此刻**确实有这个模型。
+            if observed {
+                return true;
+            }
             if let Some(fb) = fb {
                 return fb.contains(&key);
             }
             return true; // 连兜底清单都没有 → 真不知道 → 不排除
         }
-        offers || fallback
+        offers || fallback || observed
     }
 
     /// 判断某产品是否**明确声明**提供该模型（无前缀选号时的两轮排除用）。
@@ -2346,6 +2579,12 @@ impl Pool {
         let mut declared: Vec<String> = Vec::new();
         let mut unknown: Vec<String> = Vec::new();
         let mut scoped: Vec<String> = tried.to_vec();
+        // ★ 第三档（2026-10-06）：**只**因为「网关静态兜底清单没跟上」而被排除的号。
+        //
+        // 与 `scoped` 必须分开：`scoped` 里还混着 `tried`（本次已试过），一旦
+        // 把它们一起放行，就会在一次请求内重复打同一个号。本档只承载「清单猜测
+        // 落空」这一种原因 —— 它们其实是健康的、只是我们**没听说过**这个模型名。
+        let mut guess_excluded: Vec<String> = Vec::new();
 
         for e in self.entries.iter() {
             let uid = e.a.uid.clone();
@@ -2365,9 +2604,12 @@ impl Pool {
             }
             if self.product_declares_model(&product, model) {
                 declared.push(uid);
-            } else if !self.product_may_serve(&product, model) {
-                // 有清单且明确没有 → 确定排除
+            } else if self.product_definitely_lacks_model(&product, model) {
+                // 宿主清单**已知**且明确没有 → 确定排除（Trae 事故那一档，必须保留）
                 scoped.push(uid);
+            } else if !self.product_may_serve(&product, model) {
+                // ★ 仅「静态兜底清单未命中」→ **只降级，不灭绝**（2026-10-06 修复）
+                guess_excluded.push(uid);
             } else {
                 // 清单未知（或该产品不参与多产品约束）→ 兜底候选
                 unknown.push(uid);
@@ -2391,6 +2633,50 @@ impl Pool {
         }
 
         // declared 为空 ⇒ 没有任何产品明确声明提供它，此时才放开到 unknown。
+        //
+        // ⚠ 这一支必须**把 guess_excluded 挡在外面**。它们与 unknown 是两种性质：
+        // unknown 里有「网关的猜测**说它可能有**」（兜底清单命中）或「完全没信息」，
+        // 而 guess_excluded 是「网关的猜测**说它没有**」。混在一起抽签就等于把
+        // 猜测当成了中性 —— 2026-10-03 的事故正是这个形状：Trae 的兜底清单里
+        // 确实没有 `deepseek-v4.1-flash`，而 WorkBuddy 的兜底清单里有它；
+        // 若两者平等竞争，19 个 WorkBuddy 账号也可能输给 1 个 Trae 账号，
+        // 用户看到「上游 Trae 没有模型」（回归测试
+        // `trae_fallback_excludes_a_model_trae_does_not_offer` 钉住这条）。
+        let mut pref = scoped.clone();
+        pref.extend(guess_excluded.iter().cloned());
+        if let Some(a) = self.pick_inner(&pref, model, RegionFilter::Any, "", true) {
+            return Some(a);
+        }
+
+        // ★★ 最后一档（2026-10-06 所有者现场）：连「有依据」的号都挑不出来时，
+        // 才允许拿「只是我们没听说过这个模型名」的号试一次。
+        //
+        // # 为什么必须有这一档
+        //
+        // 业主用 `space-bunny`（WorkBuddy 国服**真实**模型，网关自己的
+        // `/debug/capability` 里就列着它）发请求，得到的是
+        // `503 no_healthy_account / all accounts unavailable (cooling/disabled)`
+        // —— 而 27 个账号一个都没坏。链条：静态兜底清单（2026-09-18 快照）里
+        // 没有这个模型名 ⇒ 判定「未命中」⇒ 全池进 `scoped` ⇒ `pick_inner` 候选
+        // 为空 ⇒ 全冷却兜底 `pick_earliest_expiry` **只收冷却中的号** ⇒ `None`。
+        //
+        // # 为什么安全
+        //
+        // ① 它排在**最后**：声明方（`declared`）与非猜测候选（`unknown`）都优先，
+        //    正常路径根本走不到这里 ⇒ 2026-09-21 的 qoder 事故（声明方被 WorkBuddy
+        //    的猜测清单淹没 ⇒ 11102）不会被重新引入。
+        // ② 宿主清单**已知**且明确没有的产品**不在这里**（它们进了 `scoped`）
+        //    ⇒ Trae 保护原样保留：`deepseek-v4.1-flash` 不会被路由到 Trae。
+        // ③ `tried` 仍被排除（见本函数开头），一次请求内不会重复打同一个号。
+        // ④ 兜底**仍然**尊重健康、在途、模型冷却、平台开关、no_route（`pick_inner`
+        //    与 `pick_earliest_expiry` 各自的排除集不变）。
+        //
+        // 取舍：宁可拿一个「我们以为它没有、其实可能有」的号试一次 —— 成了就是
+        // 成功，不成也只会得到**真实的上游错误**，比「所有账号不可用」这种把人
+        // 引向账号池的误导文案有用得多。
+        if guess_excluded.is_empty() {
+            return None;
+        }
         self.pick_inner(&scoped, model, RegionFilter::Any, "", true)
     }
 
@@ -2597,6 +2883,44 @@ impl Pool {
             if !self.platform_enabled(product) {
                 return None;
             }
+        } else {
+            // ★ 落点 F（2026-10-06）：**空产品**（裸模型名）时的粘性路径同样要过
+            // 「这个号所属产品确定没有这个模型」这一闸。
+            //
+            // 现场（业主日志 2026-10-06 17:3x）：`gpt-6-astra` 与 `space-bunny`
+            // **先后落到同一个 Trae 账号** `trae-2593120869167228` 上，然后双双报
+            // 「上游 Trae 国内版没有模型 …（清单 0 个）」。成因就是这里：产品为空
+            // 时旧代码直接退化成 `pick_by_uid_for_model_region`，只查健康/在途/
+            // 模型冷却，**完全不看产品能不能服务该模型** —— 于是一个此前被绑过
+            // 的 Trae 号，在裸名请求里会被反复复用。
+            //
+            // ⚠ 判据用 `product_definitely_lacks_model` 而**不是**
+            // `product_may_serve`：后者会把「静态兜底清单没跟上」也算成「不能服务」
+            // ⇒ 绑过号的会话在 `space-bunny` 这类新模型上永远解绑，白丢粘性。
+            let &idx = self.by_uid.get(uid)?;
+            let owner = self.entries[idx].a.product_of().to_string();
+            if self.product_definitely_lacks_model(&owner, model) {
+                return None;
+            }
+            // ★ 落点 J（2026-10-06）：区域维度同样要过 —— 会话绑定的号可能在
+            // 该模型并不存在的那个区。
+            //
+            // 为什么用「已观测到只在另一区」这种软判据而不是直接 `return None`：
+            // 粘性绑定是**成本优化**（少一次选号），不是正确性来源。绑错区只会让
+            // 这一个请求拿 400，然后下面 `acct.is_none()` 分支会解绑并重新选号；
+            // 但若判据本身有噪声（真值只拉到一区），解绑会白丢粘性。故只在
+            // `model_region_hint` 给出**确定结论**且与账号区域不符时才拒绝。
+            //
+            // ⚠ 只在用户**没有**指定区域时生效（`region == Region::Any`）：用户写
+            // 了 `国际版:` 就是明确指令，那时该由下面 pick_by_uid_for_model_region
+            // 的区域判据负责，不该被这里的软判据抢先。
+            if region == Region::Any {
+                if let Some(hint) = self.model_region_hint(&owner, model) {
+                    if region_of(&self.entries[idx].a) != hint {
+                        return None;
+                    }
+                }
+            }
         }
         self.pick_by_uid_for_model_region(uid, model, region)
     }
@@ -2667,6 +2991,38 @@ impl Pool {
             if !self.platform_enabled(&e.a.product_of()) {
                 continue;
             }
+            // ★★ 落点 G（2026-10-06）：裸名请求（`product` 为空）也必须过
+            // 「该号所属产品**确定**不提供该模型」这一闸。
+            //
+            // # 为什么必须有它
+            //
+            // 选号的**所有**入口最终都汇到这里，而此前只有裸名路径
+            // （`pick_for_model_any`）做了产品两轮排除。于是同一类缺陷从三条缝里
+            // 漏出来，业主现场三条全中：
+            //
+            // 1. 区域偏好路径 —— `pick_for_model_region` 第一段直接调本函数且
+            //    产品参数为空（带图片的请求正是走这条路）⇒ `space-bunny` 落到
+            //    Trae 号上，报「上游 Trae 国内版没有模型 space-bunny（清单 0 个）」。
+            // 2. 严格区域路径（`required = true`）—— 同一句调用。
+            // 3. 粘性直取 —— 见 `pick_by_uid_for_model_product_region` 的落点 F。
+            //
+            // # 判据为什么是「确定」而不是「不排除」
+            //
+            // 用 `product_may_serve` 会把「静态兜底清单没跟上」也算成不能服务，
+            // 于是上游新上的模型（`space-bunny`）在任何路径上都选不出号 ——
+            // 那正是本次要修的 503。`product_definitely_lacks_model` 只在**宿主清单
+            // 已知且不含它**时为真，Trae 保护（Trae 之于 `deepseek-v4.1-flash`）
+            // 原样保留。
+            //
+            // ⚠ 只在 `product` 为空时生效：显式产品前缀（`trae:xxx`）是用户的
+            // **明确指令**，设计上「根本不查清单」（见 `products/trae/dispatch.rs` 的
+            // 「显式请求…兜底是安全的」）。清单不全不该让显式请求失效。
+            if product.is_empty()
+                && !model.is_empty()
+                && self.product_definitely_lacks_model(&e.a.product_of(), model)
+            {
+                continue;
+            }
             // 平台白名单（「模型 → 允许的平台」）：配了且不含该平台 → 排除。
             // 记进 excluded_by_platform 供兜底 —— 「宁可回退一个平台不符但能用的
             // 账号，也不要让本来能成功的请求 503」。
@@ -2695,6 +3051,45 @@ impl Pool {
                 .filter(|&i| region_of(&self.entries[i].a) == r)
                 .collect(),
         };
+
+        // ★★ 落点 I（2026-10-06 真机实测）：裸名（区域不限）时，用**上游真值**
+        // 排除「我们确知它不在这个区」的账号。
+        //
+        // # 现场
+        //
+        // `space-bunny` 是 WorkBuddy **国服**真实模型（隔离实例 :17864 的
+        // `/debug/capability` 里 `dynamic_cn_ids` 有它、`dynamic_intl_ids` 没有），
+        // 而裸名请求走 `RegionFilter::Any` ⇒ 12 个国际版账号也在候选里
+        // ⇒ 抽到国际版号 ⇒ 上游回 400 `model [space-bunny] service info not found`。
+        // 业主最初看到的 503 已被上一轮修复消除，但**症状只是从「全池不可用」
+        // 变成了「一半概率打到错区域」** —— 这一档才是真正的收口。
+        //
+        // # 为什么只排除「有结论且不符」的，而不是「只留结论区」
+        //
+        // 结论只对**该产品**成立（`model_region_hint` 按产品查）。别的产品
+        //（qoder 声明的同名模型）没有结论时不该被牵连 —— 那会把它们一起误杀。
+        //
+        // # 为什么收紧后为空就退回原集合
+        //
+        // 收紧的目标区可能整批在冷却（或全被 tried 排除）。此时若直接返回空，
+        // 调用方会报「所有账号不可用」—— 又是把人引向账号池的误导文案。宁可
+        // 拿一个错区的号试一次，让他看到**真实的上游错误**（与全冷却兜底同一取舍）。
+        if region == RegionFilter::Any && self.multi_product_on && !model.is_empty() {
+            let narrowed: Vec<usize> = cands
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    let e = &self.entries[i];
+                    match self.model_region_hint(e.a.product_of(), model) {
+                        Some(r) => region_of(&e.a) == r,
+                        None => true, // 没有结论 ⇒ 不牵连
+                    }
+                })
+                .collect();
+            if !narrowed.is_empty() {
+                cands = narrowed;
+            }
+        }
 
         if cands.is_empty() {
             if !allow_fallback {
@@ -4182,6 +4577,348 @@ mod tests {
         assert!(
             !p.product_declares_model("trae", "deepseek-v4.1-flash"),
             "Trae 既没声明也没兜底这个模型"
+        );
+    }
+
+    /// ★★★ 真实事故回归（所有者 2026-10-06）：裸名 `space-bunny` 报
+    /// `503 no_healthy_account / all accounts unavailable (cooling/disabled)`。
+    ///
+    /// # 现场形状（逐条取自业主机器的真实配置）
+    ///
+    /// - 宿主下发的 `product_models` **只有** qoder / zcode 两个键（workbuddy 缺 ——
+    ///   宿主那份 workbuddy 清单来自「限制使用的模型」白名单，默认为空 ⇒ 不写）；
+    /// - 网关补的静态兜底清单是 2026-09-18 的快照，**没有** `space-bunny`
+    ///   （它是上游后加的 WorkBuddy 国服真实模型，网关自己的 `/debug/capability`
+    ///   的 `dynamic_cn_ids` 里就列着它）；
+    /// - 池里 4 个 workbuddy 号**全部健康**。
+    ///
+    /// 旧行为链：兜底未命中 ⇒ 判「不能服务」⇒ 全池进 `scoped` ⇒ `pick_inner` 候选
+    /// 为空 ⇒ 全冷却兜底 `pick_earliest_expiry` **只收冷却中的号** ⇒ `None` ⇒ 503。
+    /// 新行为：猜测未命中**只降级**，健康号仍能被选中。
+    #[test]
+    fn bare_model_missing_from_static_fallback_still_reaches_healthy_accounts() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        for i in 0..4 {
+            p.add(mk_product(&format!("wb{i}"), "workbuddy"));
+        }
+        p.add(mk_product("qd1", "qoder"));
+        // 宿主清单：只有 qoder / zcode（业主机器上的真实形状）
+        let mut pm: HashMap<String, Vec<String>> = HashMap::new();
+        pm.insert("qoder".into(), vec!["Qwen3.8-Flash".into()]);
+        pm.insert("zcode".into(), vec!["zcode:glm-5".into()]);
+        p.set_product_models(&pm);
+        // 静态兜底：workbuddy 有清单，但**不含** space-bunny（快照落后于上游）
+        let mut fb: HashMap<String, Vec<String>> = HashMap::new();
+        fb.insert("workbuddy".into(), vec!["glm-5.3".into()]);
+        p.set_product_models_fallback(&fb);
+
+        assert!(
+            !p.product_may_serve("workbuddy", "space-bunny"),
+            "前提：静态兜底清单确实没有它（这正是现场）"
+        );
+        assert!(
+            !p.product_definitely_lacks_model("workbuddy", "space-bunny"),
+            "★ 兜底未命中不是「确定没有」—— 判成确定就会把整池灭绝"
+        );
+
+        // ★ 这条断言就是本次修复：旧代码在这里拿到 None（503）。
+        for _ in 0..200 {
+            let a = p.pick_for_model_any("space-bunny", &[]).unwrap();
+            assert_eq!(
+                a.product_of(),
+                "workbuddy",
+                "必须落到 workbuddy 号上，绝不能选 qoder（它确定没有这个模型）"
+            );
+        }
+
+        // 观测集拿到真值后，「未命中」这一档整个消失（清单自愈）。
+        p.observe_product_models("workbuddy", &["space-bunny".to_string()]);
+        assert!(
+            p.product_may_serve("workbuddy", "space-bunny"),
+            "实测真值命中 ⇒ 直接放行，不再需要靠降级"
+        );
+    }
+
+    /// ★ 观测集（上游实测真值）命中即放行，但**绝不算「声明」** ——
+    /// 否则 WorkBuddy 会与声明方 qoder 平等竞争，重演 2026-09-21 的 11102。
+    #[test]
+    fn observed_live_models_relax_exclusion_but_never_declare() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        p.add(mk_product("wb1", "workbuddy"));
+        p.add(mk_product("qd1", "qoder"));
+        let mut pm: HashMap<String, Vec<String>> = HashMap::new();
+        pm.insert("qoder".into(), vec!["space-bunny".into()]);
+        p.set_product_models(&pm);
+        let mut fb: HashMap<String, Vec<String>> = HashMap::new();
+        fb.insert("workbuddy".into(), vec!["glm-5.3".into()]);
+        p.set_product_models_fallback(&fb);
+        // 大小写不敏感（上游与客户端写法不一）
+        p.observe_product_models("workbuddy", &["SPACE-BUNNY".to_string()]);
+
+        assert!(p.product_may_serve("workbuddy", "space-bunny"), "实测命中 ⇒ 不排除");
+        assert!(
+            !p.product_declares_model("workbuddy", "space-bunny"),
+            "★ 观测集只放宽「不排除」，绝不参与「声明」"
+        );
+        assert!(p.product_declares_model("qoder", "space-bunny"));
+        // 声明方唯一 ⇒ 只能选 qoder：观测集不得把 workbuddy 拉进竞争。
+        for _ in 0..100 {
+            assert_eq!(p.pick_for_model_any("space-bunny", &[]).unwrap().uid, "qd1");
+        }
+    }
+
+    /// 观测集只在**已经有兜底清单**的产品上建立，且只增不减。
+    #[test]
+    fn observe_product_models_needs_an_existing_fallback_list() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        // 没有兜底清单的产品本来就不排除 ⇒ 记观测集没有意义
+        p.observe_product_models("workbuddy", &["space-bunny".to_string()]);
+        assert!(!p.product_model_known_anywhere("workbuddy", "space-bunny"));
+
+        let mut fb: HashMap<String, Vec<String>> = HashMap::new();
+        fb.insert("workbuddy".into(), vec!["glm-5.3".into()]);
+        p.set_product_models_fallback(&fb);
+        p.observe_product_models("workbuddy", &[" Space-Bunny ".to_string()]);
+        assert!(
+            p.product_model_known_anywhere("workbuddy", "space-bunny"),
+            "trim + 小写后必须命中"
+        );
+        assert!(
+            p.product_model_known_anywhere("workbuddy", "glm-5.3"),
+            "兜底清单里的也算「有依据」"
+        );
+        assert!(!p.product_model_known_anywhere("workbuddy", "nope"));
+    }
+
+    /// ★ 新判据不得削弱 Trae 保护：**宿主清单已知且不含它** ⇒ 仍然「确定没有」。
+    ///
+    /// 这是与「兜底清单未命中」的分界线：前者可信（Trae 保护靠它），后者是猜测
+    /// （`space-bunny` 事故靠它降级）。
+    #[test]
+    fn product_definitely_lacks_model_keeps_host_list_authoritative() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        let mut pm: HashMap<String, Vec<String>> = HashMap::new();
+        pm.insert("trae".into(), vec!["glm-5.2".into()]);
+        p.set_product_models(&pm);
+        assert!(
+            p.product_definitely_lacks_model("trae", "deepseek-v4.1-flash"),
+            "宿主清单已知且没有它 ⇒ 确定没有（Trae 保护）"
+        );
+        assert!(!p.product_definitely_lacks_model("trae", "glm-5.2"));
+
+        // 宿主清单**未知** + 兜底清单未命中 ⇒ 只是猜测 ⇒ 不是「确定」
+        let mut fb: HashMap<String, Vec<String>> = HashMap::new();
+        fb.insert("workbuddy".into(), vec!["glm-5.3".into()]);
+        p.set_product_models_fallback(&fb);
+        assert!(!p.product_definitely_lacks_model("workbuddy", "space-bunny"));
+        assert!(!p.product_definitely_lacks_model("workbuddy", "nope"));
+        // 宿主清单已知且没有它 ⇒ 又回到「确定」
+        let mut pm2: HashMap<String, Vec<String>> = HashMap::new();
+        pm2.insert("workbuddy".into(), vec!["glm-5.3".into()]);
+        p.set_product_models(&pm2);
+        assert!(p.product_definitely_lacks_model("workbuddy", "nope"));
+    }
+
+    /// ★★ 裸名请求的**所有**入口都要过产品确定性排除 —— 区域偏好/严格区域路径
+    ///（带图片的请求走这两条）此前会绕过它。
+    ///
+    /// 业主现场：`space-bunny` 落到 Trae 号上，日志逐字
+    /// 「上游 Trae 国内版没有模型 `space-bunny`（清单 0 个），请求侧错误」。
+    #[test]
+    fn bare_region_pick_never_crosses_to_a_product_that_lacks_the_model() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        // 唯一能服务 space-bunny 的 WorkBuddy 号在国际版；国服只剩 Trae 号。
+        let mut wb = mk_product("wb1", "workbuddy");
+        wb.domain = "https://www.workbuddy.ai".into();
+        p.add(wb);
+        p.add(mk_product("tr1", "trae"));
+        // 宿主清单给了 trae（已知且不含 space-bunny）⇒ 确定排除
+        let mut pm: HashMap<String, Vec<String>> = HashMap::new();
+        pm.insert("trae".into(), crate::server::static_trae_model_ids());
+        p.set_product_models(&pm);
+        let mut fb: HashMap<String, Vec<String>> = HashMap::new();
+        fb.insert("workbuddy".into(), vec!["glm-5.3".into()]);
+        p.set_product_models_fallback(&fb);
+
+        assert!(
+            p.pick_for_model_region("space-bunny", &[], Region::CN, true).is_none(),
+            "国服只剩 Trae 号 ⇒ 必须报「缺国服账号」，绝不能打到 Trae 上"
+        );
+        assert!(
+            p.pick_for_model_region("space-bunny", &[], Region::CN, false)
+                .map(|a| a.product_of().to_string())
+                .as_deref()
+                == Some("workbuddy"),
+            "偏好路径放开到全池时也只能落到 workbuddy"
+        );
+    }
+
+    /// 造一个**指定区域**的账号（区域由 `domain` 推：`.ai` ⇒ 国际版，其余 ⇒ 国服）。
+    fn mk_region(uid: &str, product: &str, region: Region) -> Auth {
+        let domain = match region {
+            Region::Intl => "https://www.workbuddy.ai",
+            _ => "https://copilot.tencent.com",
+        };
+        Auth {
+            uid: uid.into(),
+            access_token: format!("at-{uid}"),
+            product: product.into(),
+            domain: domain.into(),
+            ..Default::default()
+        }
+    }
+
+    /// ★★★ 真实事故回归（所有者 2026-10-06 真机）：裸名 `space-bunny` 选中**错区域**的号。
+    ///
+    /// # 现场（隔离实例 :17864 实测）
+    ///
+    /// 上一轮修复消除了 503，但症状变成「一半概率打到错区」：
+    ///
+    /// ```text
+    /// space-bunny              → 400 model_not_in_region（上游原文
+    ///                             "model [space-bunny] service info not found"）
+    /// 国服:space-bunny          → 200
+    /// 国际版:space-bunny        → 400 同上
+    /// ```
+    ///
+    /// 而 `/debug/capability` 显示 `dynamic_cn_ids` **有** `space-bunny`、
+    /// `dynamic_intl_ids` **没有** ⇒ 真值早已足够，只是没被用来约束区域。
+    ///
+    /// 修法：把真值按区记进 `product_model_regions`，裸名（区域不限）时排除
+    /// 「确知它不在该区」的账号（`pick_inner` 落点 I）。
+    #[test]
+    fn bare_model_only_in_cn_never_picks_an_intl_account() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        // 1 个国服号 + 12 个国际版号（业主机器上的真实形状：15 国服 / 12 国际）
+        p.add(mk_region("cn1", "workbuddy", Region::CN));
+        for i in 0..12 {
+            p.add(mk_region(&format!("intl{i}"), "workbuddy", Region::Intl));
+        }
+        // 静态兜底清单**没有** space-bunny（2026-09-18 快照）—— 这正是缺陷前提。
+        let mut fb: HashMap<String, Vec<String>> = HashMap::new();
+        fb.insert("workbuddy".into(), vec!["glm-5.3".into()]);
+        p.set_product_models_fallback(&fb);
+        // 两区真值都拉到过：国服有 space-bunny，国际版没有。
+        p.observe_product_models_in_region(
+            "workbuddy",
+            Region::CN,
+            &["space-bunny".to_string(), "glm-5.3".to_string()],
+        );
+        p.observe_product_models_in_region(
+            "workbuddy",
+            Region::Intl,
+            // `glm-5.3` 两区都有（业主真值里确实如此）—— 用来钉「两区都见过 ⇒ 不约束」。
+            &["default-model".to_string(), "glm-5.3".to_string()],
+        );
+
+        assert_eq!(
+            p.model_region_hint("workbuddy", "space-bunny"),
+            Some(Region::CN),
+            "两区真值都在 ⇒ 必须给出「只在国服」的结论"
+        );
+        assert_eq!(
+            p.model_region_hint("workbuddy", "glm-5.3"),
+            None,
+            "两区都见过 ⇒ 不给结论（强行指定会白丢一半额度）"
+        );
+
+        // ★ 这条断言就是本轮修复：旧代码会有一半概率抽到 intl*。
+        for _ in 0..300 {
+            let a = p.pick_for_model_any("space-bunny", &[]).unwrap();
+            assert_eq!(a.uid, "cn1", "只在国服的模型绝不能选中国际版账号");
+        }
+
+        // 用户**显式**指定国际版时，以用户为准（软判据不得压过明确指令）：
+        // 国服号被区域过滤掉后仍应选出国际版号，而不是报「没有账号」。
+        assert!(
+            p.pick_for_model_region("space-bunny", &[], Region::Intl, false).is_some(),
+            "显式区域前缀优先于真值推断"
+        );
+    }
+
+    /// ★ 真值只拉到一区时**不得**收紧区域 —— 否则会把另一区的账号整批误杀。
+    ///
+    /// 现场对应：国际版那次拉取失败（无账号 / 上游抖动 / 退避窗口），
+    /// 「国际版清单里没有 space-bunny」是**未知**而不是**没有**。
+    #[test]
+    fn region_hint_requires_both_regions_fetched() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        p.add(mk_region("cn1", "workbuddy", Region::CN));
+        p.add(mk_region("intl1", "workbuddy", Region::Intl));
+        let mut fb: HashMap<String, Vec<String>> = HashMap::new();
+        fb.insert("workbuddy".into(), vec!["glm-5.3".into()]);
+        p.set_product_models_fallback(&fb);
+        // 只拉到国服
+        p.observe_product_models_in_region("workbuddy", Region::CN, &["space-bunny".to_string()]);
+        assert_eq!(
+            p.model_region_hint("workbuddy", "space-bunny"),
+            None,
+            "只有一区真值 ⇒ 不能下结论"
+        );
+        // 国际版号仍必须能被选中（这正是「不误杀」）
+        let mut saw_intl = false;
+        for _ in 0..200 {
+            if p.pick_for_model_any("space-bunny", &[]).unwrap().uid == "intl1" {
+                saw_intl = true;
+                break;
+            }
+        }
+        assert!(saw_intl, "一区真值不足时不得把另一区排除干净");
+    }
+
+    /// 区域收紧**只在没有任何目标区候选时才失效**（退回原集合），不得变成「全池不可用」。
+    ///
+    /// 业主机器上国服号可能整批冷却 —— 那时若直接返回空，用户会看到
+    /// 「所有账号不可用」，又被引向账号池。
+    #[test]
+    fn region_narrowing_falls_back_when_target_region_is_unavailable() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        p.add(mk_region("cn1", "workbuddy", Region::CN));
+        p.add(mk_region("intl1", "workbuddy", Region::Intl));
+        let mut fb: HashMap<String, Vec<String>> = HashMap::new();
+        fb.insert("workbuddy".into(), vec!["glm-5.3".into()]);
+        p.set_product_models_fallback(&fb);
+        p.observe_product_models_in_region("workbuddy", Region::CN, &["space-bunny".to_string()]);
+        p.observe_product_models_in_region("workbuddy", Region::Intl, &["glm-5.3".to_string()]);
+        // 国服号禁用 ⇒ 目标区没号可挑
+        p.disable("cn1", "session dead");
+        let got = p.pick_for_model_any("space-bunny", &[]);
+        assert!(
+            got.is_some(),
+            "目标区没号时宁可退回全池试一次，也不能报「所有账号不可用」"
+        );
+    }
+
+    /// 粘性路径同样要过区域闸（会话绑定号可能在模型并不存在的那个区）。
+    #[test]
+    fn sticky_pick_rejects_an_account_in_the_wrong_region() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        p.add(mk_region("cn1", "workbuddy", Region::CN));
+        p.add(mk_region("intl1", "workbuddy", Region::Intl));
+        let mut fb: HashMap<String, Vec<String>> = HashMap::new();
+        fb.insert("workbuddy".into(), vec!["glm-5.3".into()]);
+        p.set_product_models_fallback(&fb);
+        p.observe_product_models_in_region("workbuddy", Region::CN, &["space-bunny".to_string()]);
+        p.observe_product_models_in_region("workbuddy", Region::Intl, &["glm-5.3".to_string()]);
+
+        assert!(
+            p.pick_by_uid_for_model_product_region("intl1", "space-bunny", Region::Any, "")
+                .is_none(),
+            "绑定在国际版号上的会话，遇到只在国服的模型必须解绑重选"
+        );
+        assert!(
+            p.pick_by_uid_for_model_product_region("cn1", "space-bunny", Region::Any, "")
+                .is_some(),
+            "区域相符时粘性照常命中"
         );
     }
 }

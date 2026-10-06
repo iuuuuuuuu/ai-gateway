@@ -1,8 +1,10 @@
 # WorkBuddy Switch / AI Gateway — 项目状态与后续工作
 
-> 最后更新：2026-10-06（**1.0.31**：⑳ 合入上游 6 项可用更新（账号字段类型归一 / 状态出口统一 / 静态模型表并集 30 条 + 两侧快照测试 / 剩余天数向上取整 / 轻量模式残留清零 / 上下文超长码别名 4028）；㉑ 排查 `deepseek-v4.1-flash` 截断报障 —— 定位到业主文案用的是网关合成帧（**a** completion event），补齐「上游未发 [DONE]」分支的日志留痕（此前**一条都没有**），并用假上游 6 模式矩阵复现（`test-bin\mock-chat\`）；㉒ 对齐上游 `1c8bfed` 已有的网关日志查看入口（`GET /api/gateway/log` + 网关页日志面板；上游按行数取，本仓库按字节取，因为日志里有超长单行 JSON）；㉓ 额外产出**非客户端纯部署**单文件产物 `wt-port\dist-single\ai-gateway.exe`，并修掉 `build-single.ps1` 的静默死亡 bug。详见 `test-bin\DELIVERY-1.0.31.md`）
+> 最后更新：2026-10-06（**1.0.32**：㉔ 修业主报障「裸名 `space-bunny` ⇒ 503 `no_healthy_account`」—— 根因是把「静态兜底清单里没有」当成了「平台确定不提供」（业主的 `pool.product_models` 只有 qoder/zcode，workbuddy 走快照兜底，而 `space-bunny` 是快照之后上线的）⇒ 新增**上游实测清单**（每次拉 `/v1/models` 都刷新；只放宽「不排除」，**永不**参与「声明」）+ 区分「猜测 vs 事实」（只有宿主清单能说「确定没有」）+ 裸名三档严格分层；㉕ 顺带修「裸名选到没有该模型的区域账号 ⇒ 400 `model_not_in_region`」（新增区域维度实测集 + 区域收紧，只在「区域不限 + 两区都拉过 + 恰好一区见过」时生效，收紧后为空则退回原集合）；㉖ 回答业主提问「这个模型的最大输出是多少」（`space-bunny`：`max_output_tokens=128000`、`context_length=1000000`、effort 五档 low/medium/high/xhigh/max、`text+image`、仅国服）。实测：**包内网关**隔离实例裸名 **20/20 全 200**（业主 `:7864` 同请求是 503）、workspace **3038/0/6**、签名端到端验签 **VALID**。详见 `test-bin\DELIVERY-1.0.32.md`）
 >
-> 上一版：2026-10-06（**1.0.30**：⑲ 一次性修完业主最后报的四件事 —— ① 切手动模式/改模型白名单删光 Trae 网关凭证（uid 空间用错，且不自愈）；② 后台任务跑完前端不刷新（轮询 hook 只在窗口可见/聚焦时跑）；③ 后台拉客户端会弹窗（改为默认隐藏 + 设置页开关）；④ ZCode 断流文案透传 reqwest 原文。并顺带修掉「豆包保活失败仍记为当天已完成」的记账缺陷）
+> 上一版：2026-10-06（**1.0.31**：⑳ 合入上游 6 项可用更新（账号字段类型归一 / 状态出口统一 / 静态模型表并集 30 条 + 两侧快照测试 / 剩余天数向上取整 / 轻量模式残留清零 / 上下文超长码别名 4028）；㉑ 排查 `deepseek-v4.1-flash` 截断报障 —— 定位到业主文案用的是网关合成帧（**a** completion event），补齐「上游未发 [DONE]」分支的日志留痕（此前**一条都没有**），并用假上游 6 模式矩阵复现（`test-bin\mock-chat\`）；㉒ 对齐上游 `1c8bfed` 已有的网关日志查看入口（`GET /api/gateway/log` + 网关页日志面板；上游按行数取，本仓库按字节取，因为日志里有超长单行 JSON）；㉓ 额外产出**非客户端纯部署**单文件产物 `wt-port\dist-single\ai-gateway.exe`，并修掉 `build-single.ps1` 的静默死亡 bug。详见 `test-bin\DELIVERY-1.0.31.md`）
+>
+> 更早：2026-10-06（**1.0.30**：⑲ 一次性修完业主最后报的四件事 —— ① 切手动模式/改模型白名单删光 Trae 网关凭证（uid 空间用错，且不自愈）；② 后台任务跑完前端不刷新（轮询 hook 只在窗口可见/聚焦时跑）；③ 后台拉客户端会弹窗（改为默认隐藏 + 设置页开关）；④ ZCode 断流文案透传 reqwest 原文。并顺带修掉「豆包保活失败仍记为当天已完成」的记账缺陷）
 > 本文件是**接手用**的持久状态说明，不随会话消失。
 
 ---
@@ -21,8 +23,8 @@
 
 - git 根 = `wt-port\`，主分支 `main`（2026-10-06 由 `migrate/aigw-v1.0.2` 改名而来；原上游陈旧线 `224919a` 改名 `archive/origin-main` 留档。详见第九节）
 - 远端 **`fork` = `https://github.com/iuuuuuuuu/ai-gateway`**：2026-10-06 已推送 `main` + 42 tag，并发布 Release `v1.0.31`。★ 该仓库同日按业主 m26011 **已转为 private**（匿名访问 404，自动更新通道因此失效，详见 9.6）
-- 当前版本号 **1.0.31**（`tauri.conf.json` / `package.json` / `Cargo.toml` / `Cargo.lock` 已对齐；签名安装包已产出、解包核验、真机实测）
-  - 业主**实机安装的是 1.0.21**（`HKCU:\...\Uninstall\AI Gateway` ⇒ `InstallLocation=D:\APP\AI Gateway`，主程序 39,173,120 B）；1.0.22–1.0.31 **均未安装**，直接装 1.0.31 即可（跳过版本里的修复全在 1.0.31 内）
+- 当前版本号 **1.0.32**（`tauri.conf.json` / `package.json` / `Cargo.toml` / `Cargo.lock` 已对齐；签名安装包已产出、解包核验、**包内网关**隔离实例真机实测）
+  - 业主**实机安装的是 1.0.21**（`HKCU:\...\Uninstall\AI Gateway` ⇒ `InstallLocation=D:\APP\AI Gateway`，主程序 39,173,120 B）；1.0.22–1.0.32 **均未安装**，直接装 1.0.32 即可（跳过版本里的修复全在 1.0.32 内）
   - ★ NSIS 同版本**不覆盖**（`installer.nsi:233-259` 用 `nsis_tauri_utils::SemverCompare` 比 `DisplayVersion`，相等走维护页）⇒ 升版本号是交付的硬前提
 
 ---
@@ -54,10 +56,11 @@
 | ⑨ Trae 卡片官方 icon（⑩-1） | 两张官方 PNG + `product-marks.tsx:144-163 TraeMark(variant)` | ✅ 交付包前端渲染 5 张 trae 图，全部 512×512、`size-full object-cover` |
 | ⑩ 启动期卡顿（⑩-2，m13819 + m14110） | 前端限流 4 并发 + `/api/credits/batch` + `warm_caches()` + `CHECKIN_STATUS_CONCURRENCY=6` | ✅ A/B：API **167 ⇒ 45**、最慢 **27,412 ms ⇒ 2,717 ms**、longtask **0** |
 
-### 1.0.21 → 1.0.31（2026-10-04 → 10-06，业主逐条上报，全部真机实测后交付）
+### 1.0.21 → 1.0.32（2026-10-04 → 10-06，业主逐条上报，全部真机实测后交付）
 
 | 版本 | 内容 | 状态 |
 |---|---|---|
+| **1.0.32** | ㉔ **裸名 `space-bunny` ⇒ 503 `no_healthy_account`**（业主报障）：网关把「静态兜底清单里没有」当成「平台确定不提供」⇒ 27 个 WorkBuddy 账号**全被排除** ⇒ 候选集空 ⇒ 上游侧回落到最通用的 503 文案。修法：新增**上游实测清单** `product_model_observed_set`（`pool.rs:1106 observe_product_models`，每次 `GET /v1/models` / `/v1/models/regions` 刷新，调用点在 `server.rs:678` / `:729` / `:1725`；只放宽「不排除」，**永不**参与「声明」——避免重演 2026-09-21 qoder 抢号）+ 新增 `product_definitely_lacks_model`（`pool.rs:1226`，**只有宿主声明清单**能说「确定没有」）+ `pick_for_model_any`（`pool.rs:2575`）三档严格分层（①有平台声明 ⇒ `scoped+unknown`，挑不到直接 `None`；②无声明 ⇒ `scoped+guess_excluded`；③ `guess_excluded` 为空才 `None`）+ 落点 **F/G**（`:2887` / `:2994`）。㉕ 顺带修**裸名选到错区账号**（⇒ 400 `model_not_in_region`）：新增 `observe_product_models_in_region`（`:1140`）+ `model_region_hint`（`:1192`，要求两区都拉过且恰好一区见过）+ 落点 **I/J**（`:3055` / `:2905`）。㉖ 回答「最大输出」：`space-bunny` = `max_output_tokens 128000` / `context_length 1000000`。 | ✅ 单测 router **1678/0/1**、workspace **3038/0/6**（+9 全是本次新单测）；**包内网关**（`inst-1032-unpack\embedded-gateway.exe`，逐字节拷到隔离实例 `:17866`）裸名 `space-bunny` **20/20 全 200** + 正向/反向/sticky 全 200 + `国际版:space-bunny` 400（预期）；签名端到端验签 VALID；约束④全程成立（业主 `:7864` / `:3080` / `:58354` 未动） |
 | **1.0.21** | 平台路由开关并入标签（②）+ 账号卡片统一任务区（③）+ 首启静默修复（①） | ✅ 真机 PASS（业主实机装的**就是这一版**） |
 | **1.0.22** | 设置页各平台配置拆到对应 tab（⑤）+ 积分/Token 并入 WorkBuddy tab（④） | ✅ 真机 PASS |
 | **1.0.23** | ZCode 1113 误判硬冷却（⑪）+ 流式中断归因（⑫）+ 跨账号任务队列漏跑（⑬）+ ⑦ 消耗记录恢复（20 天 / 15.3 万条） | ✅ 真机 PASS |
@@ -73,22 +76,37 @@
 ### 交付物
 
 ```
-当前交付版（1.0.31）：
+当前交付版（1.0.32）：
 
-dist\AI Gateway_1.0.31_x64-setup.exe   14,586,903 B   （含 GUI 客户端）
+dist\AI Gateway_1.0.32_x64-setup.exe   14,598,416 B   （含 GUI 客户端）
+SHA256 BD07D32CC0CA69845CF0504C5905C03BCD1832FAA9F3109F606676EBFEA55A38
+  .sig  424 B  SHA256 FAE936C8FE1F60221895AAC4677F4DD396EDC548445C1621092C6033FC55BA84  keyid 7e7ce64b6fc3a36f
+内嵌网关 13,778,944 B  SHA256 CEA67DE06FEDC8CA6126BB4E476AB26826DAA38354C77D9C76EFE20737CF755D
+  （= crates\ai-gateway-core\embedded\gateway.exe = target\release\gateway.exe，三者逐字节相同）
+包内 GUI 40,051,712 B  SHA256 2F96C28FD3CF2DD9BBBD823AD87012F39880C78763B06431E77100AE4A533C3D
+  （`test-bin\inst-1032-unpack\ai-gateway.exe`；NSIS 打包后重排 PE 布局，与工作区产物**不是**逐字节关系；
+   核对方式 = FileVersion/ProductVersion + 包内 Tauri 命令名（`read_gateway_log`/`reveal_gateway_log`/`logBytes` 全命中）
+   ★ 工作区**不留**宿主 GUI 独立副本（`src-tauri\target` 已被清理）⇒ 引用宿主 GUI 哈希只能用包内这一份）
+  ★ 与 1.0.31 对照：安装包 +11,513 B、内嵌网关 +55,808 B
+
+★ 非客户端纯部署（仅网关/服务端，无 GUI/WebView/安装器）：
+
+dist\ai-gateway_1.0.32_server-x64.exe   27,063,808 B
+SHA256 1788241A21F5803BD8345F690EAE477EEDE37B1AE174B3F32A97A7F1021110A2
+  （构建产物在 wt-port\dist-single\ai-gateway.exe，与 target\release\ai-gateway.exe 逐字节一致；
+   已拷到 dist\ 与安装包并列交付；启动：`ai-gateway_1.0.32_server-x64.exe serve --port 57890`）
+  ★ 与 1.0.31 对照 −210,944 B
+
+历史（1.0.31）：
+dist\AI Gateway_1.0.31_x64-setup.exe   14,586,903 B
 SHA256 1FB28395FE386E160482BC6BEC1A2417809755C24B3521C125F56ABBEAADA2A5
   .sig  424 B  SHA256 2EB97D23E783DCB1AC0D87B444773624C654E2A5CAFC89B50776CB16E14E9BE6  keyid 7e7ce64b6fc3a36f
 内嵌网关 13,723,136 B  SHA256 5B5D23ECFC66E32875BA28D9D106D40044BB559AAC9672FA28DAC4B2C840C6C9
-宿主 GUI 27,274,752 B  SHA256 9FAA831BC3362C90976A8957B0AE67557A4E3A242D6FB8C220A44336D138669C
 包内 GUI 40,104,960 B  SHA256 0147D56D0D2B3FCE97194B464CF637A39D5441B492143E9E2099068502C847A5
-  （NSIS 打包后重排 PE 布局，与工作区产物**不是**逐字节关系；核对方式改为 FileVersion + 新增符号）
-
-★ 非客户端纯部署（本版新增，仅网关/服务端，无 GUI/WebView/安装器）：
-
+  ★ 更正（2026-10-06）：此处原写「宿主 GUI 27,274,752 B / 9FAA831B…」，与下方 server 版逐字节重复，系笔误；
+    工作区不留宿主 GUI 独立副本（`src-tauri\target` 已清理）⇒ 1.0.31 宿主 GUI 的权威值只有包内那一份
 dist\ai-gateway_1.0.31_server-x64.exe   27,274,752 B
 SHA256 9FAA831BC3362C90976A8957B0AE67557A4E3A242D6FB8C220A44336D138669C
-  （构建产物在 wt-port\dist-single\ai-gateway.exe，与 target\release\ai-gateway.exe 逐字节一致；
-   已拷到 dist\ 与安装包并列交付；启动：`ai-gateway_1.0.31_server-x64.exe serve --port 57890`）
 
 历史（1.0.30）：
 dist\AI Gateway_1.0.30_x64-setup.exe   14,545,639 B
@@ -141,9 +159,9 @@ SHA256 8331371362744B4A22D86F7E8C8974AEB33F7B77EC896BD39C0D4DF767701662
 ```
 
 ★ 权威文档（**最新版优先**）：
-- 交付汇总 **`test-bin\DELIVERY-1.0.31.md`**（八节，含上游 6 项合入明细与**未合入理由**、截断双文案生产者归因判据、假上游 6 模式复现矩阵、纯部署产物真机实测、`build-single.ps1` 静默死亡 bug、**本轮未验证面**）
-- 上一版汇总：`test-bin\DELIVERY-1.0.30.md`（九节，含包内二进制三臂 reqB 对照、reqC GUI 往返、reqD 三形态 48/48、包内反解网关比对、构建链、安装提示、**本轮未验证面如实记录**）
-- 发布说明 `.github\RELEASE_NOTES_1.0.31.md`（当前）／历史 `.github\RELEASE_NOTES_1.0.30.md`
+- 交付汇总 **`test-bin\DELIVERY-1.0.32.md`**（九节，含根因与三层修复、落点 A–J 全表、九个新单测、**包内网关**隔离实例 20/20 实测、探针自身的两个坑、解包核验的**方法论更正**（Rust release 剥符号 ⇒ 不能靠字符串证明「新代码进包」）、验签的两个结构坑、`build-single.ps1` 必须 `-SkipFrontend`、**本轮未验证面**、收尾清理）
+- 上一版汇总：`test-bin\DELIVERY-1.0.31.md`（八节，含上游 6 项合入明细与**未合入理由**、截断双文案生产者归因判据、假上游 6 模式复现矩阵、纯部署产物真机实测、`build-single.ps1` 静默死亡 bug）
+- 发布说明 `.github\RELEASE_NOTES_1.0.32.md`（当前）／历史 `.github\RELEASE_NOTES_1.0.31.md` / `.github\RELEASE_NOTES_1.0.30.md`
 - 历史：`DELIVERY-1.0.29.md` / `-1.0.28` / `-1.0.27` / `-1.0.26` / `-1.0.25` / `-1.0.24` / `-1.0.23` / `-1.0.21` / `-1.0.20`
 - ★ 1.0.28 的 **router crate 版本串仍是 v1.0.23**（刻意与 GUI 版本号解耦，不影响功能）
 
@@ -156,10 +174,11 @@ SHA256 8331371362744B4A22D86F7E8C8974AEB33F7B77EC896BD39C0D4DF767701662
 
 | 命令 | 基线 |
 |---|---|
-| `cargo test -p ai-gateway-router` | **1669 passed / 0 failed / 1 ignored**（1.0.31；1.0.30 是 1667、1.0.20 时是 1633） |
-| `cargo test --workspace`（15 个 test 块累加） | **3029 passed / 0 failed / 6 ignored**（1.0.31，`uitest\ws-test-1031.log`，EXIT=0；1.0.30 是 3011、1.0.29 是 3007、1.0.28 是 3006、1.0.27 是 3001、1.0.26 是 2988） |
+| `cargo test -p ai-gateway-router` | **1678 passed / 0 failed / 1 ignored**（1.0.32；1.0.31 是 1669、1.0.30 是 1667、1.0.20 时是 1633） |
+| `cargo test --workspace`（15 个 test 块累加） | **3038 passed / 0 failed / 6 ignored**（1.0.32，`uitest\ws-test-1032.log`，EXIT=0；1.0.31 是 3029、1.0.30 是 3011、1.0.29 是 3007、1.0.28 是 3006、1.0.27 是 3001、1.0.26 是 2988） |
+| ★ 1.0.32 的 **+9** | 全部是本次新增的 `pool.rs` 单测（上游实测集 4 条 + 区域收敛 5 条，行号 `:4599` / `:4646` / `:4674` / `:4701` / `:4732` / `:4795` / `:4850` / `:4881` / `:4902`） |
 | Trae 相关（`products::trae::` 128 + `modules::trae_agent::` 38 + `modules::trae_account::` 22） | **188 passed** |
-| `cargo test -p ai-gateway-core --lib` | **1285 passed / 0 failed / 4 ignored**（1.0.31 口径；1.0.30 是 1275、1.0.29 是 1265、1.0.17 时是 1235） |
+| `cargo test -p ai-gateway-core --lib` | **1285 passed / 0 failed / 4 ignored**（1.0.32 口径，与 1.0.31 相同；1.0.30 是 1275、1.0.29 是 1265、1.0.17 时是 1235） |
 | `cargo test -p ai-gateway-server` | **28 passed / 0 failed**（1.0.20 口径） |
 | `cargo check -p ai-gateway-router --lib` | EXIT 0，**0 warnings** |
 | `cargo check -p ai-gateway-router --bin gateway` | EXIT 0，**0 warnings** |
@@ -303,7 +322,11 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 | Qoder OAuth `ready` 分支 | ❌ 未在真机走到（需人工点浏览器授权） |
 | DST 异常时区的月步进 | ❌ 未在本机复现（依赖真实 tzdata 瞬间）；防御逻辑已实现并测试 |
 | 11133 的 **Trae 侧修复**（丢弃空名 tool-call） | ❌ 无法用真实上游复现 —— 实测 Trae 既不吐结构化 `tool_calls`、也不校验 tool 配对（污染历史探针返回 200，整流日志 0 命中）⇒ 只有单测覆盖（2 条） |
-| 11133 修复版**部署到所有者 `:7864`** | ❌ 未部署（业主实机仍是 **1.0.21** 血统，主程序 39,173,120 B）⇒ 装 1.0.31 即覆盖 |
+| 11133 修复版**部署到所有者 `:7864`** | ❌ 未部署（业主实机仍是 **1.0.21** 血统，主程序 39,173,120 B）⇒ 装 1.0.32 即覆盖 |
+| **1.0.32 的安装包本体未在业主实机安装** | ❌ 约束④（业主不在电脑旁、且禁止在业主实例存活时运行安装器）⇒ 本版全部真机证据来自**包内网关**（`inst-1032-unpack\embedded-gateway.exe` 逐字节拷到隔离实例 `:17866`），**不是**安装后的客户端 |
+| 1.0.32 的「上游实测集自动跟随」 | ⚠ 本机无法验证：若腾讯以后在**国际版**上线 `space-bunny`，网关会自动放开（实测集每次拉 `/v1/models` 都刷新）⇒ 只能等上游变化 |
+| 1.0.32 隔离实例的额度刷新 | ⚠ `credit-refresh <uid>: upstream client (http 403): {"code":10085,"msg":"请求不合法，如有疑问请联系客服","requestId":"…"}` × 33 行（同一批账号副本被上游限流），**不影响对话** |
+| 1.0.32 的**宿主 GUI 独立副本** | ⚠ 工作区已无 `src-tauri\target`（构建后清理）⇒ 宿主 GUI 的哈希/版本只能从**包内** `inst-1032-unpack\ai-gateway.exe` 取证 |
 | **GUI 侧实测**（托盘 / 单实例 / 自动更新 / 开机自启） | ❌ **设计上做不了**：桌面版第一个注册的插件是 `tauri-plugin-single-instance`，互斥量 `com.momo0410.aigateway-sim`；只要业主的 `D:\APP\AI Gateway\ai-gateway.exe` 在跑，我启动解包出来的 GUI exe 只会 `exit(0)` 并聚焦他的窗口，预热/托管/托盘全不跑 |
 | **Trae SG / 国际版分支** | ❌ 无真实 SG 账号可测，只有单测覆盖（业主账号 JWT 无 `iss` ⇒ `RealmEvidence::Default` ⇒ 界面「国内版（推断）」） |
 | ② 裸名路由的**本机 A/B 复现** | ⚠ 未能复现差异（旧/新网关对裸名都返回 WorkBuddy）—— 该兜底清单在 1.0.19 已存在；只能靠源码 + 单测 + Trae-only 池对照 |
@@ -394,7 +417,7 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 | `v1.0.28` | `37f5028` | |
 | `v1.0.29` | `6e426f9` | |
 | `v1.0.30` | `811b179` | |
-| `v1.0.31` | `9ce3ba5` | tag 之后又落了 3 个提交（`e2f70d5` 仓库形态文档 → `ab2351d` 交付路径 → `001c40a` 出处更正），**tag 有意停在版本提交上**；现 HEAD = `001c40a` |
+| `v1.0.31` | `9ce3ba5` | tag 之后又落了 4 个提交（`e2f70d5` 仓库形态文档 → `ab2351d` 交付路径 → `001c40a` 出处更正 → `c1ae06a` 发布后复核），**tag 有意停在版本提交上**；现 HEAD = `c1ae06a`（`git describe` = `v1.0.31-5-gc1ae06a`） |
 
 打 tag 的规则：**版本号提交 V 的父提交**（= 该版本工作的最后一个提交；1.0.31 是 HEAD）。tag 是 annotated，带消息（说明为什么标这个提交、交付包路径）。本地 tag 总数 **32 → 42**。
 
@@ -404,9 +427,9 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 
 | 通道 | 地址 | 现状 |
 |---|---|---|
-| 桌面端自动更新 | `https://github.com/iuuuuuuuu/ai-gateway/releases/latest/download/latest.json` | 2026-10-06 **已发 v1.0.31 Release**（id `404503791`，5 资产，`releases/latest` 已指向它）。但**仓库同日按业主 m26011 转为 private** ⇒ 匿名拉取 **404**，该通道**目前对客户端失效**（详见 9.6） |
+| 桌面端自动更新 | `https://github.com/iuuuuuuuu/ai-gateway/releases/latest/download/latest.json` | 2026-10-06 **已发 v1.0.31 Release**（id `404503791`，5 资产，`releases/latest` 已指向它）。但**仓库同日按业主 m26011 转为 private** ⇒ 匿名拉取 **404**，该通道**目前对客户端失效**（详见 9.6）。★ 1.0.32 的 Release **尚未发布**（本轮推送时补发） |
 | npm | `npm/` 子目录的 `ai-gateway` 包（`optionalDependencies` 5 个平台包） | 未发布过 |
-| 直接发安装包 | `D:\WishProject\WorkbuddySwitchAPi\dist\` | 1.0.7 – 1.0.31 全套都在（每版含 `.sig`），**比 GitHub Release 完整** |
+| 直接发安装包 | `D:\WishProject\WorkbuddySwitchAPi\dist\` | 1.0.7 – 1.0.32 全套都在（每版含 `.sig`），**比 GitHub Release 完整** |
 
 ★★ **更正（2026-10-06，密码学实测）**：本节此前写「签名私钥与 `tauri.conf.json` 配置的公钥不配对」，**该结论是错的**。
 

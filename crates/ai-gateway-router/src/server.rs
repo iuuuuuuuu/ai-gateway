@@ -661,6 +661,21 @@ async fn models(
     }
 
     let (fetched, has_account) = region_snapshot(&state).await;
+    // ★★ 顺手把刚拉到的上游**真值**喂进池子（2026-10-06 修复）。
+    //
+    // # 为什么落在这里
+    //
+    // ① 真值**已经**拉好了（上一行），喂给池子是零额外请求 —— 网关其余地方再想
+    //    拿同一份真值都得重新发一轮上游请求，那些都不该进选号热路径。
+    // ② 这个接口是宿主与客户端的**常规**动作（宿主读它判断模型计费），所以观测集
+    //    在正常使用下始终新鲜，不需要新加定时任务。
+    //
+    // # 喂的是谁的真值
+    //
+    // `region_snapshot` 只探 **WorkBuddy** 账号（`models_cache.rs` 的模块文档记着
+    // Qoder 混入导致整区被判未知的事故），故这里的清单只属于 workbuddy ——
+    // **绝不能**把它当成 trae/qoder/zcode 的清单（那正是 11102 的成因）。
+    observe_live_workbuddy_models(&state, &fetched);
     // ★ 走 `DynamicState` 而不是启动快照：宿主新增/刷新账号后会重写配置里的
     // `pool.product_models`，热重载把它带进来（否则这里永远缺 Qoder / ZCode 的渠道）。
     let product_models =
@@ -706,6 +721,12 @@ async fn models_regions(State(state): State<Arc<AppState>>, headers: HeaderMap) 
         return r;
     }
     let (fetched, _has_account) = region_snapshot(&state).await;
+    // ★ 与 `/v1/models` 同一口径：顺手把真值喂进池子。
+    //
+    // 不接的后果很具体：只读这个接口的客户端（或只点「刷新模型列表」走这条的界面）
+    // 会让观测集**永远为空** ⇒ 裸名选号拿不到区域结论 ⇒ 又回到「一半概率打错区」。
+    // 两个接口都拉同一份 `region_snapshot`，接在这里零额外请求。
+    observe_live_workbuddy_models(&state, &fetched);
     let regions = vec![
         region_view(&state, Region::CN, &fetched),
         region_view(&state, Region::Intl, &fetched),
@@ -1638,6 +1659,72 @@ async fn region_snapshot(
         fetched.insert(region, if infos.is_empty() { None } else { Some(infos) });
     }
     (fetched, has_account)
+}
+
+/// 把 `/v1/models` 刚拉到的上游真值喂进池子的「观测集」。
+///
+/// # 为什么需要它（2026-10-06 所有者现场）
+///
+/// 业主用 `space-bunny` 报 503 `no_healthy_account`，可这个模型 WorkBuddy 明明
+/// 有 —— 网关自己的 `/debug/capability` 的 `dynamic_cn_ids` 里就列着它。原因是
+/// 选号用的**静态**兜底清单（`static_workbuddy_model_ids`，2026-09-18 快照）没跟上
+/// 上游的新模型，于是「兜底未命中」被判成「不能服务」⇒ 全池排除 ⇒ 503。
+///
+/// 这里把每次拉到的真值记下来，让清单**自愈**：上游上新模型后，只要宿主或客户端
+/// 访问过一次 `/v1/models`，该模型就进入观测集，不再需要等我们发版更新静态表。
+///
+/// # 只喂 workbuddy
+///
+/// `region_snapshot` 的探测账号**只**取 `product_of() == workbuddy`
+///（`models_cache.rs::probe_accounts_in_region` 的模块文档记着 Qoder 混入导致整个
+/// 区域被判未知的事故）。把这份清单记到别的产品名下会让 `Qwen3.8-Flash` 之类
+/// 的跨产品请求落到 WorkBuddy 上 ⇒ 11102，正是兜底清单存在的意义。
+///
+/// # 为什么在锁内只做纯内存插入
+///
+/// `std::sync::MutexGuard` 不能跨 `await`；本函数全程同步、无网络请求，持锁时间
+/// 与一次 `set_product_models` 同级。
+fn observe_live_workbuddy_models(
+    state: &AppState,
+    fetched: &HashMap<Region, Option<Vec<crate::upstream::ModelInfo>>>,
+) {
+    // 先按区各自成组，再喂给池子 —— **不能**两区合并成一锅。
+    //
+    // 合并会让「有哪些模型名」正确、但「在哪个区存在」永远丢失，于是裸名请求
+    // 可以选中错区的账号（`space-bunny` 只在国服，却抽到国际版号 ⇒ 上游 400
+    // `model [space-bunny] service info not found`）。区域维度有两个用途：
+    // ① `observe_product_models` 放宽「不排除」；② `observe_product_models_in_region` 收紧选号区域。
+    let mut ids: Vec<String> = Vec::new();
+    let mut per_region: Vec<(Region, Vec<String>)> = Vec::new();
+    for region in [Region::CN, Region::Intl] {
+        let mut one: Vec<String> = Vec::new();
+        if let Some(Some(infos)) = fetched.get(&region) {
+            for mi in infos {
+                if !mi.id.is_empty() {
+                    ids.push(mi.id.clone());
+                    one.push(mi.id.clone());
+                }
+            }
+        }
+        per_region.push((region, one));
+    }
+    if ids.is_empty() {
+        // 两区都没拉到（无账号 / 上游失败 / 退避窗口内）⇒ 保持既有观测集不动。
+        // ⚠ 绝不能在这里「清空」观测集：拉不到 ≠ 上游没有。
+        return;
+    }
+    let mut pool = match state.pool.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    pool.observe_product_models(crate::auth::PRODUCT_WORKBUDDY, &ids);
+    // ★ 只有**拉到过**的区域才记进 `product_truth_regions`：一区失败时把「没见到」
+    // 当成「没有」会把另一区的账号整批误杀（见 `Pool::observe_product_models_in_region`）。
+    for (region, one) in per_region {
+        if !one.is_empty() {
+            pool.observe_product_models_in_region(crate::auth::PRODUCT_WORKBUDDY, region, &one);
+        }
+    }
 }
 
 /// 该产品**实际有账号**的区域（用于生成 `qoder:国服:xxx` 这类三段组合名）。
