@@ -84,9 +84,10 @@ SHA256 1FB28395FE386E160482BC6BEC1A2417809755C24B3521C125F56ABBEAADA2A5
 
 ★ 非客户端纯部署（本版新增，仅网关/服务端，无 GUI/WebView/安装器）：
 
-wt-port\dist-single\ai-gateway.exe   27,274,752 B
+dist\ai-gateway_1.0.31_server-x64.exe   27,274,752 B
 SHA256 9FAA831BC3362C90976A8957B0AE67557A4E3A242D6FB8C220A44336D138669C
-  （与 target\release\ai-gateway.exe 逐字节一致；启动：`ai-gateway.exe serve --port 57890`）
+  （构建产物在 wt-port\dist-single\ai-gateway.exe，与 target\release\ai-gateway.exe 逐字节一致；
+   已拷到 dist\ 与安装包并列交付；启动：`ai-gateway_1.0.31_server-x64.exe serve --port 57890`）
 
 历史（1.0.30）：
 dist\AI Gateway_1.0.30_x64-setup.exe   14,545,639 B

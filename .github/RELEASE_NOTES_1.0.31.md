@@ -54,10 +54,12 @@ data: [DONE]
 ## 三、本版新增：非客户端纯部署产物
 
 ```
-wt-port\dist-single\ai-gateway.exe   27,274,752 B
+dist\ai-gateway_1.0.31_server-x64.exe   27,274,752 B
 SHA256 9FAA831BC3362C90976A8957B0AE67557A4E3A242D6FB8C220A44336D138669C
+  （构建产物原名 wt-port\dist-single\ai-gateway.exe，与 target\release\ai-gateway.exe 逐字节一致）
 
-启动：ai-gateway.exe serve --port 57890
+启动：ai-gateway_1.0.31_server-x64.exe serve --port 57890
+账号管理: http://127.0.0.1:57890/
 账号管理: http://127.0.0.1:57890/
 ```
 
