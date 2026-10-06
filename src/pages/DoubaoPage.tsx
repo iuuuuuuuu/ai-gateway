@@ -56,6 +56,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
 import { SENSITIVE_STRING_INPUT_PROPS } from "@/lib/sensitive-input";
+import {
+  BACKGROUND_TASK_DONE_DOM_EVENT,
+  type BackgroundTaskDone,
+} from "@/lib/use-background-task-refresh";
 import type { AppEnvStatus, DoubaoAccountView, DoubaoQuotaView } from "@/lib/api";
 import { cn, firstVisibleText } from "@/lib/utils";
 
@@ -370,6 +374,21 @@ export default function DoubaoPage({ embedded = false }: { embedded?: boolean } 
 
   useEffect(() => {
     void load();
+  }, [load]);
+
+  // 后台任务跑完 → 立刻刷新本页（账号列表 + 健康史 + 上次保活时间）。
+  //
+  // 豆包侧的后台任务是「会话保活」「额度巡检」「续期巡检」，跑完会改
+  // `lastKeepaliveAt` 与健康史；不刷新的话窗口收进托盘时用户看到的一直是
+  // 上一次的结果（本页也是 keep-alive 的 tab，不重新挂载）。
+  useEffect(() => {
+    const onDone = (event: Event) => {
+      const detail = (event as CustomEvent<BackgroundTaskDone>).detail;
+      if (!detail?.kind?.startsWith("doubao")) return;
+      void load();
+    };
+    window.addEventListener(BACKGROUND_TASK_DONE_DOM_EVENT, onDone);
+    return () => window.removeEventListener(BACKGROUND_TASK_DONE_DOM_EVENT, onDone);
   }, [load]);
 
   // 抓包凭证自动回写：每 20 秒轮询一次。

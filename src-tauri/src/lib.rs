@@ -71,7 +71,11 @@ fn random_token() -> String {
 }
 
 /// 后台循环：自动签到启动即核验、每 30 分钟补签；自动轮换每 30 秒检查；每天一次保活。
-fn spawn_background_loops() {
+///
+/// 参数是 `AppHandle`：应用内调度跑完后要往前端 emit `background-task-done`，
+/// 界面才能把「后台已经签到过了」显示出来（见下面那个循环里的注释）。
+fn spawn_background_loops(app: tauri::AppHandle) {
+    use tauri::Emitter;
     tauri::async_runtime::spawn(async move {
         if let Err(error) = modules::config::compact_checkin_logs() {
             eprintln!("[签到] 历史日志整理失败: {error}");
@@ -138,6 +142,24 @@ fn spawn_background_loops() {
                     label,
                     at,
                     if ok { "成功" } else { "失败，将在下一轮重试" }
+                );
+                // ★ 通知前端：后台任务真的跑完了。
+                //
+                // 没有这条事件时，业主把窗口收进托盘/最小化，后台签到成功、
+                // 界面却一直停在「未签到」——`useWorkbuddyStatusRefresh` 只在
+                // 窗口可见且聚焦时才轮询，隐藏状态下前端**完全不刷新**。
+                // 前端 `useBackgroundTaskRefresh` 收到后按 kind 刷新对应页面。
+                // emit 失败（窗口已关）不影响任务本身，故忽略返回值。
+                let _ = app.emit(
+                    "background-task-done",
+                    serde_json::json!({
+                        "kind": item.get("kind").and_then(|v| v.as_str()).unwrap_or(""),
+                        "label": label,
+                        "ok": ok,
+                        "exitCode": code,
+                        "scheduledAt": at,
+                        "at": ran.get("checkedAt").and_then(|v| v.as_str()).unwrap_or(""),
+                    }),
                 );
             }
             // 每轮都打一行（哪怕一项都没跑）：这是「桌面端的调度循环还活着」的
@@ -379,7 +401,7 @@ pub fn run() {
 
             // README 截图模式只渲染前端虚构数据，禁止读取账号后执行签到、轮换或保活。
             if !is_screenshot_demo() {
-                spawn_background_loops();
+                spawn_background_loops(app.handle().clone());
                 // 网关「随 App 启动」：读 auto_start，为真则在此拉起网关子进程。
                 //
                 // 必须放在 setup 里（事件循环之前）：用户勾选后重启 App 就该看到网关跑起来，

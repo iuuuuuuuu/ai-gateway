@@ -245,6 +245,9 @@ pub fn stop_app(sess: &Session, sink: &dyn ProgressSink) -> Result<(), String> {
 ///
 /// 注意：单实例客户端（Electron 系）**忽略**新实例的命令行参数 —— 必须确保
 /// 旧实例已退出，否则 `--proxy-server` 不会生效（表现为「一键以账号打开」没走代理）。
+///
+/// `sess.hide_window` 为真时，spawn 之后把该进程的顶层窗口藏起来（见
+/// [`hide_started_window`]）。
 pub fn start_app(sess: &Session, sink: &dyn ProgressSink) -> Result<(), String> {
     let prof = &sess.prof;
     if is_running(sess) {
@@ -281,10 +284,80 @@ pub fn start_app(sess: &Session, sink: &dyn ProgressSink) -> Result<(), String> 
             exe.display()
         ));
     }
-    cmd.spawn()
+    let child = cmd
+        .spawn()
         .map_err(|e| format!("启动 {} 失败（{}）: {e}", prof.app_name, exe.display()))?;
+    let pid = child.id();
+    // 子进程句柄交还给系统：客户端要活到本次动作之外，这里不能持有它。
+    drop(child);
+    if sess.hide_window {
+        hide_started_window(pid, prof, sink);
+    }
     sink.step("start", StepStatus::Ok, &format!("{} 已启动", prof.app_name));
     Ok(())
+}
+
+/// 隐藏刚启动客户端的窗口，并等到「藏干净了」为止。
+///
+/// 为什么要**等**、不能 spawn 完就走：窗口是客户端进程启动之后才创建的
+/// （Chromium 系先起 browser 进程，再建主窗口），spawn 那一刻这个 pid
+/// 一个顶层窗口都还没有。只能轮询。
+///
+/// 为什么要等「**没有可见窗口**」而不是「隐藏数 > 0」：客户端建窗口时会先
+/// 显示再调整（实测会短暂出现一个可见窗口），只等第一个可见窗口会在它之后
+/// 又冒出第二个可见窗口时漏掉 —— 表现为后台任务把客户端窗口弹到用户脸上。
+fn hide_started_window(pid: u32, prof: &AppProfile, sink: &dyn ProgressSink) {
+    const DEADLINE: Duration = Duration::from_secs(20);
+    const STEP: Duration = Duration::from_millis(120);
+    // 窗口出现的宽限期：到点还没有任何顶层窗口就不再等（客户端可能压根没界面，
+    // 或已在别处失败）—— 白等 20 秒只会拖长保活动作。
+    const APPEAR_GRACE: Duration = Duration::from_secs(8);
+
+    let started = Instant::now();
+    let mut hidden = 0usize;
+    // 判据是「出现过**可见**窗口」，不是「出现过任何顶层窗口」。
+    //
+    // ★ 2026-10-06 真机实测踩到的坑：Chromium / GDI 系客户端在创建主窗口**之前**
+    // 就会挂出一批不可见的顶层辅助窗口（`Default IME`、`MSCTFIME UI`、
+    // `GDI+ Window`）。用「有顶层窗口就算出现过」的话，第一次轮询（spawn 后 ~50ms）
+    // 就命中这些辅助窗口、又看不到可见窗口，于是立刻判定「已经藏干净了」并退出 ——
+    // 而真正的主窗口 200ms 后才显示出来，全程无人隐藏。实测日志：窗口从 t=0.27s
+    // 一直 `vis=True` 到保活结束，且因为 hidden=0 连一条步骤都没留。
+    let mut seen_visible = false;
+    loop {
+        if process::has_visible_window(pid) {
+            seen_visible = true;
+        }
+        hidden += process::hide_process_windows(pid);
+        // 出现过可见窗口、现在又没有可见窗口 ⇒ 藏干净了。
+        if seen_visible && !process::has_visible_window(pid) {
+            break;
+        }
+        if started.elapsed() >= DEADLINE {
+            break;
+        }
+        // 一直没出现过可见窗口：可能客户端本来就无界面，别白等满超时。
+        if !seen_visible && started.elapsed() >= APPEAR_GRACE {
+            break;
+        }
+        std::thread::sleep(STEP);
+    }
+
+    if hidden > 0 {
+        sink.step(
+            "start",
+            StepStatus::Info,
+            &format!("已在后台隐藏 {} 的 {} 个窗口", prof.app_name, hidden),
+        );
+    } else if !seen_visible {
+        // 不算失败：客户端可能还在建窗口，或本来就无界面。留一条 info 便于排查
+        // 「后台任务把窗口弹出来了」这类反馈。
+        sink.step(
+            "start",
+            StepStatus::Info,
+            &format!("{} 未出现可见窗口，无需隐藏", prof.app_name),
+        );
+    }
 }
 
 /// 路径是否指向该档案的 exe（大小写不敏感，用于防串台）。
@@ -295,7 +368,9 @@ pub fn path_is_app_exe(path: &Path, prof: &AppProfile) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::{Action, RunArgs};
     use crate::modules::app_profile::{profile_for, TargetApp};
+    use crate::modules::config;
 
     fn prof() -> AppProfile {
         profile_for(TargetApp::TraeWork, Path::new("C:\\store"))
@@ -351,6 +426,116 @@ mod tests {
         // 不相关进程不能误命中
         assert!(!hits("TRAE SOLO CN", "TRAE SOLO.exe"));
         assert!(!hits("Trae", "Trae CN.exe"));
+    }
+
+    /// 需求 C：窗口隐藏开关必须只对「无人值守」的动作生效。
+    ///
+    /// 判据集中在 [`Action::hides_client_window`]，而 [`Session::new`] 在它之上
+    /// 再与用户设置求与。两条都不能退化：
+    ///   * 若 KeepAlive 不再隐藏 → 计划任务到点仍会把客户端窗口弹到用户脸上（原始缺陷）；
+    ///   * 若 LaunchOnly / Switch 也开始隐藏 → 用户亲手点的「打开客户端」会看不见窗口。
+    #[test]
+    fn 只有保活动作会隐藏客户端窗口() {
+        assert!(Action::KeepAlive.hides_client_window());
+        for action in [
+            Action::Switch,
+            Action::SaveCurrentLogin,
+            Action::BackupCurrent,
+            Action::RestoreOnly,
+            Action::ResetDeviceIds,
+            Action::LaunchOnly,
+        ] {
+            assert!(
+                !action.hides_client_window(),
+                "{} 是用户亲手触发的动作，不该隐藏窗口",
+                action.as_str()
+            );
+        }
+    }
+
+    /// 需求 C：设置页的开关要真的改变保活会话的隐藏行为。
+    ///
+    /// 用 `Isolated` 换掉 AI_GATEWAY_HOME，避免读写用户真实的 app_settings.json；
+    /// 键值本身用 `config::set_app_setting` 走正式写盘路径，不是直接造 JSON。
+    #[test]
+    fn 隐藏开关决定保活会话是否隐藏窗口() {
+        let _iso = config::test_isolation::Isolated::new("hide-window-setting");
+        let args = RunArgs {
+            action: Action::KeepAlive,
+            target_app: TargetApp::Doubao,
+            user_id: None,
+            proxy_port: None,
+            include_indexeddb: false,
+            expected_current_uid: String::new(),
+            store_dir: config::store_dir(),
+        };
+
+        // 未设置过 → 取默认值（默认隐藏，否则后台保活会把窗口弹到桌面）
+        assert!(
+            config::CLIENT_HIDE_WINDOW_DEFAULT,
+            "默认值必须是隐藏：后台保活弹窗是原始缺陷"
+        );
+        assert!(Session::new(&args).hide_window, "未设置过时应取默认值（隐藏）");
+
+        // 用户在设置页关掉开关
+        config::set_app_setting(config::CLIENT_HIDE_WINDOW_KEY, serde_json::json!(false)).unwrap();
+        assert!(
+            !Session::new(&args).hide_window,
+            "关掉开关后保活不得再隐藏窗口"
+        );
+
+        // 打开回来
+        config::set_app_setting(config::CLIENT_HIDE_WINDOW_KEY, serde_json::json!(true)).unwrap();
+        assert!(Session::new(&args).hide_window);
+
+        // 非保活动作永远不隐藏，哪怕开关是开的
+        let launch = RunArgs {
+            action: Action::LaunchOnly,
+            target_app: TargetApp::Doubao,
+            user_id: None,
+            proxy_port: None,
+            include_indexeddb: false,
+            expected_current_uid: String::new(),
+            store_dir: config::store_dir(),
+        };
+        assert!(
+            !Session::new(&launch).hide_window,
+            "「打开客户端」是用户亲手点的，窗口必须可见"
+        );
+    }
+
+    /// 需求 C 回归守卫：隐藏循环不能再用「有顶层窗口」当出现过窗口的判据。
+    ///
+    /// 真机实测（2026-10-06）证明这是**唯一**会让隐藏完全失效的写法：客户端在
+    /// 主窗口之前先挂出 `Default IME` / `MSCTFIME UI` / `GDI+ Window` 这批不可见
+    /// 顶层窗口，循环第一轮就误判「已经藏干净」并退出，主窗口随后照常弹出来。
+    /// 当时的表现是：窗口全程 `vis=True`，而日志里连「已隐藏」都没留一条。
+    ///
+    /// 这类「代码看着对、跑起来完全没生效」的缺陷单测抓不到（真实窗口只有真机有），
+    /// 所以这里退回源码锚点：钉住 `hide_started_window` 用的是 `has_visible_window`。
+    #[test]
+    fn 隐藏循环必须以可见窗口为判据() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/modules/switcher/proc.rs"
+        ))
+        .expect("应能读到本文件源码");
+        let src = src.replace("\r\n", "\n");
+        let head = src
+            .find("fn hide_started_window(")
+            .expect("hide_started_window 必须存在");
+        let body = &src[head..];
+        let end = body.find("\n}\n").expect("函数体应当闭合");
+        let body = &body[..end];
+
+        assert!(
+            body.contains("has_visible_window"),
+            "隐藏循环必须用 has_visible_window 判断窗口是否已藏干净"
+        );
+        assert!(
+            !body.contains("has_top_level_window"),
+            "不要用 has_top_level_window 当「出现过窗口」的判据：不可见的辅助窗口会让循环立刻退出"
+        );
     }
 
     /// `proc_names` 里的每一项都必须能匹配到自己的「带后缀」形态。

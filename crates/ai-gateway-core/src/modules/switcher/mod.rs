@@ -66,6 +66,17 @@ impl Action {
             Action::LaunchOnly => "LaunchOnly",
         }
     }
+
+    /// 这个动作启动客户端时是否应当隐藏它的窗口（需求 C）。
+    ///
+    /// 只有 [`Action::KeepAlive`] 为真 —— 它是**无人值守**路径：计划任务到点
+    /// 拉起客户端刷新会话，窗口弹到桌面上只会打断用户正在做的事。
+    ///
+    /// 其余动作都是用户刚刚亲手点的（打开客户端 / 切换账号 / 保存登录态），
+    /// 窗口正是他要看的，藏起来等于把功能做没了。
+    pub fn hides_client_window(self) -> bool {
+        matches!(self, Action::KeepAlive)
+    }
 }
 
 /// 会写盘的动作（`LaunchOnly` 不在其中）。
@@ -190,10 +201,22 @@ pub struct Session {
     /// 启动时注入的代理端口。
     pub launch_proxy_port: Option<u16>,
     pub include_indexeddb: bool,
+    /// 启动客户端后是否隐藏它的窗口（需求 C）。
+    ///
+    /// 在 [`Session::new`] 里一次算好：那里是唯一的构造点，能同时看到
+    /// `args.action`（要不要隐藏）与设置项（用户要不要隐藏）。
+    pub hide_window: bool,
 }
 
 impl Session {
     pub fn new(args: &RunArgs) -> Self {
+        // 两个条件都满足才隐藏：动作本身是无人值守的后台动作，且用户在设置页
+        // 没有关掉「后台运行时隐藏客户端窗口」（键见 config::CLIENT_HIDE_WINDOW_KEY）。
+        let hide_window = args.action.hides_client_window()
+            && config::app_setting_bool(
+                config::CLIENT_HIDE_WINDOW_KEY,
+                config::CLIENT_HIDE_WINDOW_DEFAULT,
+            );
         Self {
             prof: profile_for(args.target_app, &args.store_dir),
             store_dir: args.store_dir.clone(),
@@ -201,6 +224,7 @@ impl Session {
             last_restored_count: -1,
             launch_proxy_port: args.proxy_port.filter(|p| *p > 0),
             include_indexeddb: args.include_indexeddb,
+            hide_window,
         }
     }
 

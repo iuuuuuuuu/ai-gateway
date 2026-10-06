@@ -1271,6 +1271,9 @@ export default function SettingsPage() {
         <div className="mb-6 break-inside-avoid">
           <RecordRetentionCard />
         </div>
+        <div className="mb-6 break-inside-avoid">
+          <BackgroundRunCard />
+        </div>
         {api.isDesktop() || api.isDemoMode() ? (
           <div className="mb-6 break-inside-avoid">
             <StartupCard />
@@ -1283,6 +1286,88 @@ export default function SettingsPage() {
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * 后台运行：无人值守的任务（签到 / 保活）拉起客户端时要不要隐藏它的窗口。
+ *
+ * 为什么需要这个开关：计划任务到点会自动拉起客户端刷新登录态，
+ * 窗口直接弹到桌面上会打断用户正在做的事。默认隐藏，
+ * 需要盯着它跑（排查登录失败等）时再打开。
+ *
+ * 为什么用勾选而不是拨动开关：与页面其它开关一致（见 AGENTS.md 的
+ * UI Component Policy —— 所有者要求「都改为勾选而不是手写」）。
+ */
+function BackgroundRunCard() {
+  const [hidden, setHidden] = useState<boolean | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      try {
+        const settings = await api.getAppSettings();
+        // 未写过这个键时后端返回 undefined —— 与后端默认值保持一致（隐藏）。
+        if (alive) setHidden(settings.client_hide_window !== false);
+      } catch (e) {
+        if (alive) setMsg({ type: "err", text: api.asError(e) });
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  async function toggle(next: boolean) {
+    const previous = hidden;
+    setHidden(next);
+    setSaving(true);
+    setMsg(null);
+    try {
+      const saved = await api.saveAppSettings({ client_hide_window: next });
+      // 用后端回读的权威值刷新，避免界面与真实行为不一致
+      setHidden(saved.client_hide_window !== false);
+    } catch (e) {
+      setHidden(previous);
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <SettingsGroup id="settings-background" title="后台运行">
+      <SettingsFieldRow
+        label="后台任务运行时隐藏客户端窗口"
+        description="签到与保活会在后台自动打开客户端，隐藏窗口可避免打断你正在做的事。关闭后可以看到它启动的窗口（排查登录失败时用）。"
+      >
+        {hidden === null ? (
+          <span className="text-xs text-muted-foreground">加载中…</span>
+        ) : (
+          <Checkbox
+            id="background-hide-window"
+            checked={hidden}
+            disabled={saving}
+            onCheckedChange={(checked) => void toggle(checked === true)}
+            aria-label="后台任务运行时隐藏客户端窗口"
+          />
+        )}
+      </SettingsFieldRow>
+      {msg && (
+        <SettingsRow>
+          <div
+            className={cn(
+              "text-xs",
+              msg.type === "ok" ? "text-emerald-600 dark:text-emerald-500" : "text-destructive",
+            )}
+          >
+            {msg.text}
+          </div>
+        </SettingsRow>
+      )}
+    </SettingsGroup>
   );
 }
 

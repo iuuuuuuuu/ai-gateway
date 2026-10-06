@@ -692,22 +692,28 @@ fn select_export_uids(candidates: &[String], only: &Option<Vec<String>>) -> Vec<
     }
 }
 
-/// 当前工作模式下应当导出的 uid 集合；None = 全部。
+/// 当前工作模式下应当导出的 uid 集合；恒为 None（不过滤，全部导出）。
 ///
-/// 复用 gateway 的模式判定（同一份配置，不另立一套）。
+/// ★ 这里**必须**恒返回 None，绝不能跟随网关的手动模式 —— 2026-10 业主实测
+///   的「切到手动模式后 Trae 账号全掉」就是这么来的：
 ///
-/// ★ 这里**不过滤 disabled**：禁用只表示「别把流量路由给它」，标记由
+///   1. `gateway::manual_uids()` 是 **WorkBuddy 的 uid**（账号管理页勾选的那批，
+///      是 WorkBuddy 侧的 16 位数字 uid），而 Trae 的 uid 是 Trae 自己的
+///      `user_id`，两套 uid 空间**交集恒为空**；
+///   2. 交集为空 ⇒ `picked` 为空 ⇒ `export_accounts_to_dir` 的清理循环会把
+///      `trae-*.json` **全部删掉**（网关的池是扫描凭证目录建立的，宿主
+///      `trae_accounts.json` 它根本不读 ⇒ 池当场变空，Trae 请求全部失败）；
+///   3. 而且不会自愈：切回 balance 只走 `start_gateway` 里那次直调，
+///      `export_if_changed` 的指纹没被更新，重启前一直不补回来。
+///
+///   Trae 侧也没有「手动模式」这个界面概念（网关页的勾选列表只列 WorkBuddy
+///   账号），所以过滤在这里没有任何意义，只有破坏性。
+///
+/// ★ 这里同样**不过滤 disabled**：禁用只表示「别把流量路由给它」，标记由
 ///   account.no_route 下传（见 build_credential_text），账号本身仍要导出 ——
 ///   否则网关的池里没有它，而池是唯一能遍历到它的地方，表现为「禁用后任务全停」。
 fn active_uids() -> Option<Vec<String>> {
-    if matches!(
-        crate::modules::gateway::gateway_mode(),
-        crate::modules::gateway::GatewayMode::Manual
-    ) {
-        Some(crate::modules::gateway::manual_uids())
-    } else {
-        None
-    }
+    None
 }
 
 /// 把一条账号记录渲染成网关凭证。
@@ -1277,24 +1283,80 @@ mod tests {
     }
 
     #[test]
-    fn 切到手动模式时会清掉不在名单里的凭证() {
-        let dir = tmp_dir("manual");
-        let (n, _) = export_accounts_to_dir(&dir, &[acc("1001", "j"), acc("2002", "j")], None).unwrap();
-        assert_eq!(n, 2);
+    fn 手动模式不得把_WorkBuddy_的勾选名单当成_Trae_的过滤条件() {
+        // 业主实测：切到手动模式后 Trae 账号全掉。成因是 active_uids() 把
+        // gateway::manual_uids()（**WorkBuddy** 的 uid）当成 Trae 的过滤名单，
+        // 两套 uid 空间交集恒空 ⇒ picked 为空 ⇒ 清理循环把 trae-*.json 全删。
+        // 所以 active_uids() 必须恒为 None（不过滤），这条测试直接钉住它。
+        use crate::modules::config::test_isolation::Isolated;
+        use crate::modules::gateway;
+        let _iso = Isolated::new("trae-manual-none");
 
-        let (n, changed) =
-            export_accounts_to_dir(&dir, &[acc("1001", "j"), acc("2002", "j")], Some(vec!["1001".to_string()]))
-                .unwrap();
-        assert_eq!(n, 1, "只导出勾选的账号");
+        gateway::save_gateway_config(&json!({
+            "mode": "manual",
+            "manual_uids": ["1000000000000000"],
+        }))
+        .unwrap();
+        assert_eq!(gateway::gateway_mode(), gateway::GatewayMode::Manual);
+        assert!(
+            active_uids().is_none(),
+            "Trae 的 uid 空间与 WorkBuddy 不同，手动模式的勾选名单绝不能用来过滤 Trae 凭证"
+        );
+
+        gateway::save_gateway_config(&json!({ "mode": "balance" })).unwrap();
+        assert!(active_uids().is_none());
+    }
+
+    #[test]
+    fn 网关切到手动模式后_Trae_凭证仍在() {
+        // 端到端钉住 active_uids()：直接走真实入口 export_accounts_to_gateway()，
+        // 让「谁把 manual_uids 接进来」这种回归在配置层面就炸出来。
+        use crate::modules::config::test_isolation::Isolated;
+        use crate::modules::gateway;
+        let _iso = Isolated::new("trae-manual-keep");
+
+        save_accounts(&[acc("1001", "j"), acc("2002", "j")]).unwrap();
+        let (n, _) = export_accounts_to_gateway().unwrap();
+        assert_eq!(n, 2);
+        assert!(auth_dir().join("trae-1001.json").is_file());
+
+        // 业主的触发路径：界面切手动模式时写进配置的 manual_uids 是 WorkBuddy 的 uid。
+        gateway::save_gateway_config(&json!({
+            "mode": "manual",
+            "manual_uids": ["1000000000000000"],
+        }))
+        .unwrap();
+        assert_eq!(gateway::gateway_mode(), gateway::GatewayMode::Manual);
+
+        let (n, changed) = export_accounts_to_gateway().unwrap();
+        assert_eq!(n, 2, "手动模式不得减少导出的 Trae 账号：{changed:?}");
+        assert!(
+            auth_dir().join("trae-1001.json").is_file(),
+            "Trae 凭证被手动模式删了：{changed:?}"
+        );
+        assert!(
+            auth_dir().join("trae-2002.json").is_file(),
+            "Trae 凭证被手动模式删了：{changed:?}"
+        );
+    }
+
+    #[test]
+    fn 导出参数只在同一_uid_空间内筛账号() {
+        // export_accounts_to_dir 的 only 参数本身仍按「交集」工作（WorkBuddy 侧同名
+        // 函数语义必须一致）；生产链路里 Trae 永远传 None（见 active_uids）。
+        let dir = tmp_dir("same-space");
+        let (n, _) = export_accounts_to_dir(&dir, &[acc("1001", "j"), acc("2002", "j")], None).unwrap();
+        assert_eq!(n, 2, "先按不过滤导出两个，才能验到「筛掉的那个会被删」");
+        let (n, changed) = export_accounts_to_dir(
+            &dir,
+            &[acc("1001", "j"), acc("2002", "j")],
+            Some(vec!["1001".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(n, 1, "同一 uid 空间内的名单仍要生效");
         assert!(dir.join("trae-1001.json").is_file());
-        assert!(
-            !dir.join("trae-2002.json").is_file(),
-            "未勾选的账号必须从网关目录删除，否则网关仍会把流量路由过去"
-        );
-        assert!(
-            changed.contains(&"removed:trae-2002.json".to_string()),
-            "删除必须出现在变化清单里：网关要靠它决定是否重启：{changed:?}"
-        );
+        assert!(!dir.join("trae-2002.json").is_file());
+        assert!(changed.contains(&"removed:trae-2002.json".to_string()));
     }
 
     #[test]

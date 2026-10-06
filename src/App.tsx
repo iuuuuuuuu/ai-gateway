@@ -24,6 +24,7 @@ import { demoModeEnabled, pagesDemoHostingEnabled } from "@/lib/demo-mode";
 import { useCreditAutoRefresh } from "@/lib/use-credit-auto-refresh";
 import { useVisibilityInterval } from "@/lib/use-visibility-interval";
 import { useWorkbuddyStatusRefresh } from "@/lib/use-workbuddy-status-refresh";
+import { useBackgroundTaskRefresh } from "@/lib/use-background-task-refresh";
 import { useAccountsStore } from "@/stores/accounts";
 
 function UpdateCenter({ running }: { running: boolean | undefined }) {
@@ -102,6 +103,8 @@ function Layout() {
     api.isDesktop() && typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
   useCreditAutoRefresh();
   useWorkbuddyStatusRefresh();
+  // 后台任务（应用内调度）跑完就刷状态：与窗口可见性无关，见该 hook 的注释。
+  useBackgroundTaskRefresh();
 
   return (
     <div className="flex h-screen min-h-0 overflow-hidden bg-background">

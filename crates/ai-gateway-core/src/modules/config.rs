@@ -163,6 +163,13 @@ pub const CHECKIN_LOG_MAX_RECORDS: usize = 500;
 /// 设置项键名（app_settings.json 里的一项）。
 pub const RECORD_RETENTION_KEY: &str = "recordRetentionDays";
 
+/// 「后台启动客户端时隐藏窗口」的键名（app_settings.json 里的一项）。
+pub const CLIENT_HIDE_WINDOW_KEY: &str = "client_hide_window";
+
+/// 默认隐藏。后台计划任务（签到 / 保活）拉起客户端时窗口会弹到桌面上
+/// 打断用户当前操作；隐藏才是期望行为，需要看着它跑时再到设置页关掉。
+pub const CLIENT_HIDE_WINDOW_DEFAULT: bool = true;
+
 /// 默认保留天数。所有者要求 60 天（此前积分快照硬编码 90 天）。
 pub const RECORD_RETENTION_DEFAULT_DAYS: i64 = 60;
 

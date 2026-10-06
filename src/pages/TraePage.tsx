@@ -66,6 +66,10 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import * as api from "@/lib/api";
 import { formatCredit } from "@/lib/credit-package-composition";
 import { SENSITIVE_STRING_INPUT_PROPS } from "@/lib/sensitive-input";
+import {
+  BACKGROUND_TASK_DONE_DOM_EVENT,
+  type BackgroundTaskDone,
+} from "@/lib/use-background-task-refresh";
 import type {
   AccountGroup,
   AppEnvStatus,
@@ -1085,6 +1089,25 @@ export default function TraePage({ embedded = false }: { embedded?: boolean } = 
       setLoading(false);
     }
   }, [activeApp.kind]);
+
+  // 后台签到跑完 → 立刻刷新本页（今日状态 + 账号列表 + 趋势图）。
+  //
+  // 事件由宿主 `spawn_background_loops` emit、`useBackgroundTaskRefresh` 转成
+  // DOM 事件（那个 hook 挂在根组件上，永不卸载）。本页是 keep-alive 的 tab：
+  // 常驻之后 `load`/`loadToday` 只在依赖变化时跑，没有这条订阅，后台签到成功
+  // 后用户切回本页看到的仍是「未签到」。
+  useEffect(() => {
+    const onDone = (event: Event) => {
+      const detail = (event as CustomEvent<BackgroundTaskDone>).detail;
+      if (!detail?.kind?.startsWith("trae")) return;
+      void load();
+      void loadToday();
+      // 趋势图是签到的结果视图，与手动签到后一样要重取一次
+      setCheckinTrendKey((k) => k + 1);
+    };
+    window.addEventListener(BACKGROUND_TASK_DONE_DOM_EVENT, onDone);
+    return () => window.removeEventListener(BACKGROUND_TASK_DONE_DOM_EVENT, onDone);
+  }, [load, loadToday]);
 
   useEffect(() => {
     setLoading(true);

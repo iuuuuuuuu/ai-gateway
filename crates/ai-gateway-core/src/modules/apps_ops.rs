@@ -2876,8 +2876,10 @@ mod tests {
 
         // 只认 `spawn_background_loops` 的**函数体**：写在别处的调用不算
         // —— 那正是本次修复前的反例（函数存在、单测齐备，桌面端从不调用）。
+        // 只匹配函数名前缀、不写死参数表：这个函数需要 `AppHandle` 才能 emit
+        // 事件，签名变过一次，写死签名会让守卫测试在**改名参数**时假红。
         let start = src
-            .find("fn spawn_background_loops()")
+            .find("fn spawn_background_loops(")
             .expect("src-tauri/src/lib.rs 里应有 spawn_background_loops");
         let body = &src[start..];
         // 函数内所有右花括号都有缩进，故列 0 的 `}` 必是本函数的结尾
@@ -2895,6 +2897,13 @@ mod tests {
         assert!(
             fn_body.contains("spawn_blocking"),
             "应用内调度会同步阻塞（内部自建 runtime + block_on），必须放进 spawn_blocking"
+        );
+        // 跑完必须通知前端：业主明确要求「后台签到成功或者任务执行完成当然要
+        // 刷新状态了」。没有这条 emit，窗口收进托盘后界面永远停在旧状态 ——
+        // 前端那两个轮询 hook 都只在窗口可见且聚焦时才跑。
+        assert!(
+            fn_body.contains("background-task-done"),
+            "应用内调度跑完必须 emit background-task-done，否则后台签到成功后界面不刷新"
         );
     }
 

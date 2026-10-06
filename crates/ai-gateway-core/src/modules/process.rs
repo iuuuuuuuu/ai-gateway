@@ -1232,20 +1232,34 @@ pub fn close_workbuddy(region: Region, timeout_secs: i64) -> Result<(), String> 
 pub fn request_graceful_close(pid: u32) {
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::Foundation::{BOOL, LPARAM, TRUE};
+        use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
         use windows::Win32::UI::WindowsAndMessaging::{
-            EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE,
+            EnumWindows, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible,
+            PostMessageW, WM_CLOSE,
         };
 
         struct Ctx {
             pid: u32,
         }
 
-        unsafe extern "system" fn enum_proc(hwnd: windows::Win32::Foundation::HWND, lparam: LPARAM) -> BOOL {
+        /// 窗口是否带标题。
+        ///
+        /// 标题由窗口所属进程自己维护，隐藏只改 `WS_VISIBLE`，不动标题 ——
+        /// 所以它是「这是一个真实顶层窗口」的判据，也是隐藏态下唯一可用的判据。
+        unsafe fn has_window_title(hwnd: HWND) -> bool {
+            GetWindowTextLengthW(hwnd) > 0
+        }
+
+        unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
             let ctx = &*(lparam.0 as *const Ctx);
             let mut window_pid: u32 = 0;
             GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
-            if window_pid == ctx.pid && IsWindowVisible(hwnd).as_bool() {
+            // 2026-10-06 放宽（需求 C「后台启停客户端隐藏窗口」）：原来只认「可见」窗口。
+            // 窗口一旦被隐藏（后台保活路径会主动隐藏它，见 `hide_process_windows`），
+            // `IsWindowVisible` 恒为 false ⇒ WM_CLOSE 永远发不出去 ⇒ 落到 `taskkill /F`
+            // ⇒ 正是上面 doc 描述的那个「切换后账号没变」的 WAL 回放缺陷。
+            // 改成「可见 **或** 有标题」：有标题就说明它是个真实顶层窗口，藏没藏都该收到关闭请求。
+            if window_pid == ctx.pid && (IsWindowVisible(hwnd).as_bool() || has_window_title(hwnd)) {
                 // 传裸 HWND 而不是 Option<HWND>：windows 0.58 的 Param 只对 HWND 实现。
                 // wparam/lparam 必须显式标注类型，否则 Param 有多个候选实现无法推断。
                 let _ = PostMessageW(
@@ -1269,6 +1283,138 @@ pub fn request_graceful_close(pid: u32) {
     #[cfg(not(target_os = "windows"))]
     {
         let _ = pid;
+    }
+}
+
+/// 把某个 PID 的顶层窗口藏起来（`ShowWindow(SW_HIDE)`），返回实际隐藏的窗口数。
+///
+/// 为什么是「先启动、再按 pid 隐藏」而不是「启动时带 `SW_HIDE` 启动信息一步到位」：
+/// 实测 Chromium / Electron 壳客户端在创建主窗口时会自己调 `ShowWindow`，
+/// 而 `SW_SHOW` 系列的语义是「不管当前是什么状态，一律显示」—— 进程启动参数
+/// 给的隐藏状态会被它自己那一次调用永久覆盖。唯一稳的时机是窗口**已经存在**之后。
+///
+/// 返回 0 表示该 pid 此刻还没有顶层窗口（刚 spawn 的客户端通常如此），
+/// 调用方应当重试而不是判定失败 —— 见 `switcher::proc::start_app` 的轮询。
+///
+/// 非 Windows 平台恒返回 0（本项目桌面端只发布 Windows）。
+pub fn hide_process_windows(pid: u32) -> usize {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GetWindowThreadProcessId, IsWindowVisible, ShowWindow, SW_HIDE,
+        };
+
+        struct Ctx {
+            pid: u32,
+            hidden: usize,
+        }
+
+        unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let ctx = &mut *(lparam.0 as *mut Ctx);
+            let mut window_pid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
+            // 只对「当前可见」的下手：`ShowWindow` 每次都会发 `WM_SHOWWINDOW`，
+            // 对已经藏着的窗口重复调用纯属噪音，而且会把计数虚高。
+            if window_pid == ctx.pid && IsWindowVisible(hwnd).as_bool() {
+                // 返回值是「此前是否可见」的状态位，这里不需要它（windows crate
+                // 给该函数标了 #[must_use]，所以要显式丢掉）。
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                ctx.hidden += 1;
+            }
+            TRUE
+        }
+
+        let mut ctx = Ctx { pid, hidden: 0 };
+        unsafe {
+            let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut Ctx as isize));
+        }
+        ctx.hidden
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = pid;
+        0
+    }
+}
+
+/// 该 PID 此刻是否有可见的顶层窗口。
+///
+/// 与 [`has_top_level_window`] 的区别就是「可见」这一个条件：调用方要判断
+/// 「窗口出现了没有」用后者，要判断「藏干净了没有」用前者。
+pub fn has_visible_window(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
+        };
+
+        struct Ctx {
+            pid: u32,
+            found: bool,
+        }
+
+        unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let ctx = &mut *(lparam.0 as *mut Ctx);
+            let mut window_pid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
+            if window_pid == ctx.pid && IsWindowVisible(hwnd).as_bool() {
+                ctx.found = true;
+                return windows::Win32::Foundation::FALSE; // 找到一个就够，提前收工
+            }
+            TRUE
+        }
+
+        let mut ctx = Ctx { pid, found: false };
+        unsafe {
+            let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut Ctx as isize));
+        }
+        ctx.found
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// 该 PID 此刻是否有任何顶层窗口（可见或隐藏都算）。
+///
+/// 「窗口出现了没有」必须用这个而不是 [`has_visible_window`]：客户端可能自己
+/// 以隐藏态创建窗口，只认「可见」会一直等不到，白等满超时。
+pub fn has_top_level_window(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
+        use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId};
+
+        struct Ctx {
+            pid: u32,
+            found: bool,
+        }
+
+        unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let ctx = &mut *(lparam.0 as *mut Ctx);
+            let mut window_pid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
+            if window_pid == ctx.pid {
+                ctx.found = true;
+                return windows::Win32::Foundation::FALSE;
+            }
+            TRUE
+        }
+
+        let mut ctx = Ctx { pid, found: false };
+        unsafe {
+            let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut Ctx as isize));
+        }
+        ctx.found
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = pid;
+        false
     }
 }
 
@@ -1726,6 +1872,24 @@ D:\Program Files\WorkBuddy\Uninstall.exe
         assert_eq!(parse_ps_row("   "), None);
         assert_eq!(parse_ps_row("1235"), None); // 无 args
         assert_eq!(parse_ps_row("not-a-pid /x"), None);
+    }
+
+    /// 需求 C：隐藏原语对「本来就没有窗口的 PID」必须安静返回 0。
+    ///
+    /// 「窗口真的被藏起来」只能靠真机验证（测试进程自己没有顶层窗口），
+    /// 但这条守住了最容易写错的边界：`EnumWindows` 回调里的 pid 比较写反、
+    /// 或把别的进程的窗口算进目标头上，都会让这里的计数不为 0。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn 没有窗口的进程隐藏数为零() {
+        // 0 = System Idle、4 = System：两者都没有顶层窗口。
+        assert_eq!(hide_process_windows(0), 0, "无效 pid 不该藏到任何窗口");
+        assert_eq!(hide_process_windows(4), 0, "System 进程没有顶层窗口");
+        assert!(!has_visible_window(4));
+        assert!(!has_top_level_window(4));
+        // 发关闭请求也不能炸（内部同样是 EnumWindows 遍历）
+        request_graceful_close(4);
+        request_graceful_close(0);
     }
 
     #[cfg(target_os = "macos")]
