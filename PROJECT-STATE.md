@@ -20,6 +20,7 @@
 | Go 参照实现 | `go-gateway/` | Go（**保留作对照，构建链已不依赖**） |
 
 - git 根 = `wt-port\`，主分支 `main`（2026-10-06 由 `migrate/aigw-v1.0.2` 改名而来；原上游陈旧线 `224919a` 改名 `archive/origin-main` 留档。详见第九节）
+- 远端 **`fork` = `https://github.com/iuuuuuuuu/ai-gateway`**：2026-10-06 已推送 `main` + 42 tag，并发布 Release `v1.0.31`。★ 该仓库同日按业主 m26011 **已转为 private**（匿名访问 404，自动更新通道因此失效，详见 9.6）
 - 当前版本号 **1.0.31**（`tauri.conf.json` / `package.json` / `Cargo.toml` / `Cargo.lock` 已对齐；签名安装包已产出、解包核验、真机实测）
   - 业主**实机安装的是 1.0.21**（`HKCU:\...\Uninstall\AI Gateway` ⇒ `InstallLocation=D:\APP\AI Gateway`，主程序 39,173,120 B）；1.0.22–1.0.31 **均未安装**，直接装 1.0.31 即可（跳过版本里的修复全在 1.0.31 内）
   - ★ NSIS 同版本**不覆盖**（`installer.nsi:233-259` 用 `nsis_tauri_utils::SemverCompare` 比 `DisplayVersion`，相等走维护页）⇒ 升版本号是交付的硬前提
@@ -327,7 +328,7 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
   而主程序 `ai-gateway.exe` 与所有者正在跑的实例同名，会连带打掉 `:7864`
 - **绝不按进程名杀进程** —— 只允许 **PID + ExecutablePath 双条件**
 - **绝不运行**共享目录里的可执行文件（**哪怕 `--version`**）
-- **绝不 push / 绝不提 PR**（三个 remote `aigw` / `fork` / `origin` 一个都不许碰）；**本地 commit 允许且鼓励**，每完成一个可交付单元就落一次 commit，消息用 `git commit -F <临时文件>`（PS 命令行多 `-m` + 中文会被拆词）
+- **push 需业主显式授权**：2026-10-06 业主 m26008「发布推送吧」授权后，**只允许推 `fork`（`iuuuuuuuu/ai-gateway`）**；`aigw` / `origin` / `upstream` 三个 remote **仍然不许碰**（其中 `aigw`/`upstream` 已 404）。**本地 commit 允许且鼓励**，每完成一个可交付单元就落一次 commit，消息用 `git commit -F <临时文件>`（PS 命令行多 `-m` + 中文会被拆词）
 - 所有者服务 `:7864`（网关）/ `:3080`（DSH GUI）**必须保持在线**
 - 公开仓库 ⇒ 被 git 跟踪的文件里**不得有真实 token / UID / deviceMid**
 - 改完**必须自己跑实测**（真实启动实例 + 真实发请求），编译通过/单测绿都**不算**
@@ -376,7 +377,7 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 | **`main`** | `9ce3ba5`（v1.0.31） | **本仓库唯一开发主线**。由 `migrate/aigw-v1.0.2` 原地改名而来，全部 187 个提交、42 个 tag 都在这条线上。**无上游追踪**（`branch.main.remote` 为空）—— 有意如此，避免误 `git pull` 把上游陈旧线拉进来 |
 | `archive/origin-main` | `224919a` | 原 `main` 改名留档。它是 `origin/main`（`iuuuuuuuu/workbuddy-switch-gateway`）那条**陈旧且独立**的血统，与主线 `merge-base` 停在 `117643f`（v0.7.0 那代）。保留只是为了「还能查到那一版长什么样」，不再参与开发 |
 
-★ 改名是纯本地操作，**没有 push、没有改 remote**。`archive/origin-main` 仍带着 `branch.archive/origin-main.remote=origin` 的追踪配置（改名不会清），但没有任何脚本/工作流依赖分支名，所以不构成风险。
+★ 改名当时是纯本地操作（**没有 push、没有改 remote**）。（2026-10-06 之后 `main` 已按业主 m26008 授权推送到 `fork`，见 9.6。）`archive/origin-main` 仍带着 `branch.archive/origin-main.remote=origin` 的追踪配置（改名不会清），但没有任何脚本/工作流依赖分支名，所以不构成风险。
 
 ### 9.2 版本号 ↔ tag 谱系（补 tag 后）
 
@@ -393,7 +394,7 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 | `v1.0.28` | `37f5028` | |
 | `v1.0.29` | `6e426f9` | |
 | `v1.0.30` | `811b179` | |
-| `v1.0.31` | `9ce3ba5` | 当前 HEAD |
+| `v1.0.31` | `9ce3ba5` | tag 之后又落了 3 个提交（`e2f70d5` 仓库形态文档 → `ab2351d` 交付路径 → `001c40a` 出处更正），**tag 有意停在版本提交上**；现 HEAD = `001c40a` |
 
 打 tag 的规则：**版本号提交 V 的父提交**（= 该版本工作的最后一个提交；1.0.31 是 HEAD）。tag 是 annotated，带消息（说明为什么标这个提交、交付包路径）。本地 tag 总数 **32 → 42**。
 
@@ -403,15 +404,25 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 
 | 通道 | 地址 | 现状 |
 |---|---|---|
-| 桌面端自动更新 | `https://github.com/iuuuuuuuu/ai-gateway/releases/latest/download/latest.json` | ⚠ **停在 1.0.10**（2026-09-28）。1.0.11 起从未发过 GitHub Release ⇒ **所有 1.0.11+ 用户不会收到自动更新**，只能手动装 |
+| 桌面端自动更新 | `https://github.com/iuuuuuuuu/ai-gateway/releases/latest/download/latest.json` | 2026-10-06 **已发 v1.0.31 Release**（id `404503791`，5 资产，`releases/latest` 已指向它）。但**仓库同日按业主 m26011 转为 private** ⇒ 匿名拉取 **404**，该通道**目前对客户端失效**（详见 9.6） |
 | npm | `npm/` 子目录的 `ai-gateway` 包（`optionalDependencies` 5 个平台包） | 未发布过 |
 | 直接发安装包 | `D:\WishProject\WorkbuddySwitchAPi\dist\` | 1.0.7 – 1.0.31 全套都在（每版含 `.sig`），**比 GitHub Release 完整** |
 
-`src-tauri/tauri.conf.json:53-57` 的 updater `endpoints` 指向 `iuuuuuuuu/ai-gateway`（remote 名 `fork`），签名公钥 keyid `6FA3C36F4BE67C7E`；**本地构建用的是另一把**（keyid `7e7ce64b6fc3a36f`，`keys\ai-gateway-updater.key`）⇒ 若要让自动更新真正生效，必须用**与 `tauri.conf.json` 公钥配对的那把私钥**发布，否则客户端校验失败。
+★★ **更正（2026-10-06，密码学实测）**：本节此前写「签名私钥与 `tauri.conf.json` 配置的公钥不配对」，**该结论是错的**。
+
+- `keys\ai-gateway-updater.key.pub` 解出的公钥 blob 与 `src-tauri/tauri.conf.json:53` 的 `plugins.updater.pubkey` base64 解码后的 blob **逐字节相同**（`IDENTICAL_TO_KEY_PUB = true`），keyid 两边都是同一 8 字节 `7e7ce64b6fc3a36f`。
+- 此前误判的根源：**minisign 显示 keyid 用大端**（`6FA3C36F4BE67C7E`，就是 `.key.pub` 注释行里印的那个），而文档里抄的是**原始字节序**（`7e7ce64b6fc3a36f`）⇒ 同一把钥匙的两个写法被当成了两把。
+- 端到端验证（Node `crypto.verify`，Ed25519）：`dist\AI Gateway_1.0.31_x64-setup.exe` 的签名 **VALID = true**，公钥取 `keys\ai-gateway-updater.key.pub`；`trusted comment` 的全局签名也 **VALID = true**。
+- 细节：minisign 签名 alg 字段是 `ED`（**预哈希** BLAKE2b-512），所以必须 `verify(blake2b512(file), sig)` 才对 —— 直接对文件原始字节验签会得到 false，**这是正常的，不代表签名坏**。
+
+⇒ 结论：**本地构建用的就是 `tauri.conf.json` 里配的那把**，签名链路完全自洽，无需换钥匙。
 
 ### 9.4 没做的事（有意）
 
-- **没有 push**、没有开 PR、没有建新仓库。凭据现状：`GITHUB_TOKEN`/`GH_TOKEN` 未设置，`gh` CLI 不存在，只有 Windows 凭据管理器里的 `git:https://github.com`（且本机 curl 出口当前不通）⇒ 远端动作做不了也做不稳。
+- ~~**没有 push**~~ → **2026-10-06 已 push**（业主 m26008「发布推送吧」授权）。见 9.6：`main` + 42 tag + v1.0.31 Release 全部落到 `fork`。
+  - 凭据真相：`GITHUB_TOKEN`/`GH_TOKEN` 未设置、`gh` CLI 不存在，但 **Windows 凭据管理器里有可用 token** —— `cmdkey /list` 的 `LegacyGeneric:target=git:https://github.com`（user `iuuuuuuuu`，secret 40 字符、前缀 `gho_`）。用 `advapi32.dll` 的 `CredRead` P/Invoke 读出来即可（脚本 `.scratch\ghtoken.ps1`）。**scopes = `gist, repo, workflow`** ⇒ 能 push / 建 Release / 改可见性，但**没有 `delete_repo`**。
+  - ★ `git credential fill` 走管道会报 `refusing to work with credential missing protocol field`；`git push --dry-run` 在重定向 stdio 下**会卡死 70 s** 等交互提示 ⇒ 只能直接读凭据管理器。
+- **仍然没有开 PR、没有建新仓库**（业主 m24376-2 授权自主决定，结论是继续自研本仓库）。
 - **没有合并 `main` 的最后一个提交**：`archive/origin-main` 相对主线只有 1 个提交（`224919a`「修复负载均衡只用到少数账号与长对话 unexpected EOF」），改动全在 `go-gateway/`（已不参与构建的 Go 参照）+ 版本行 + README 15 行 ⇒ 无移植价值。
 - **`origin` / `upstream` / `aigw` 三个 remote 未删**，留作历史参照。其中 `upstream`(`momo0410/workbuddy-switch-gateway`) 与 `aigw`(`momo0410/ai-gateway`) 已 404。
 
@@ -428,9 +439,48 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 | `changexbc/workbuddy-switch` | 200 | 血统链最底层，**仍在更新**（pushed 2026-10-04） |
 | `linguo2625469/workbuddy2api-panel` | 200 | 面板参考仓库，**今天还在更新**（pushed 2026-10-06） |
 
-**对我们零影响**：本地 5 个 worktree / 42 个 tag / 全部历史都在；`fork`（`iuuuuuuuu/ai-gateway`）是 `"fork": false` 的**独立仓库**，不依赖 `momo0410` 存活；updater endpoints 指向它，自动更新通道不受 404 影响（只是停在 1.0.10，见 9.3）。
+**对我们零影响**：本地 5 个 worktree / 42 个 tag / 全部历史都在；`fork`（`iuuuuuuuu/ai-gateway`）是 `"fork": false` 的**独立仓库**，不依赖 `momo0410` 存活。updater endpoints 指向它 ⇒ 上游 404 **不影响**我们的自动更新通道（该通道的问题另有其因：2026-10-06 前是停在 1.0.10，之后是仓库转私有，见 9.3 / 9.6）。
 
 **祖先关系实测**（`git merge-base --is-ancestor`）：`moshouhot/main` 是 HEAD 的祖先（`..HEAD` 273 个提交，反向 0）；`momo0410-aigw/main` 也是 HEAD 的祖先（170 / 0）；`origin/main` 与 HEAD **互不为祖先**（那条是独立血统）；`upstream/main` 与 HEAD 有 6 个未合提交（全是 2026-09-16/17 旧货，逐条判定不需要合：supportsImages / 思考等级 / 账号备注 / 两次版本 bump 本地都已有等价或更强实现）。
 
 ★ 全量备份：`merge-backup\after-upstream-404.bundle`（37,188,040 B，84 refs，`git bundle verify` = 完整历史）。此前三个 bundle 都**不含当前 HEAD**。
+
+### 9.6 远端落地与转私有（2026-10-06，业主 m26008 / m26011）
+
+业主两条指令：m26008「发布推送吧」、m26011「然后把我们的仓库也改为私有」。以下全部为**实测结果**。
+
+**推送（目标只有 `fork` = `iuuuuuuuu/ai-gateway`）**
+
+| 项 | 结果 |
+|---|---|
+| `main` | 远端 `001c40a8d039858e13d95665903f6bc3e0c71be8` = 本地 HEAD，`rev-list --left-right --count fork/main...HEAD` = `0 0` |
+| tag | 本地 **42** = 远端 **42**（补推的 11 个：`v1.0.4` `v1.0.21` `v1.0.23`–`v1.0.31`；同名不同 SHA 的冲突 **0 个**） |
+| 远端分支 | `main`=001c40a、`migrate/aigw-v1.0.2`=5a05b35、`feat/tasks-and-dual-realm`=92fcc21、`fix/migrate-merge-instead-of-skip`=add8b52 |
+| Release | `v1.0.31`，id `404503791`，`draft=False prerelease=False`，`releases/latest` 已指向它 |
+
+Release 的 5 个资产（上传前安装包**改名为 updater 约定名** `ai-gateway-windows-x86_64-setup.exe`，因为 updater 按清单里的 `url` 取文件）：
+
+| asset | bytes | assetId |
+|---|---|---|
+| `ai-gateway-windows-x86_64-setup.exe` | 14586903 | 615002270 |
+| `ai-gateway-windows-x86_64-setup.exe.sig` | 424 | 615001400 |
+| `ai-gateway_1.0.31_server-x64.exe` | 27274752 | 615001836 |
+| `latest.json` | 1524 | 615001242 |
+| `latest-windows-x86_64.json` | 1524 | 615001430 |
+
+★ **updater 清单里 `signature` 字段 = `.sig` 文件内容逐字**（`.sig` 本身已是 base64 文本）⇒ **直接原样填入，不要解码、不要二次 base64**。1.0.31 清单只发 `windows-x86_64-nsis` + `windows-x86_64` 两个键（本轮仅出 Windows 资产）。
+
+**转私有（m26011）与其代价**
+
+| 项 | 结果 |
+|---|---|
+| 执行 | `PATCH /repos/iuuuuuuuu/ai-gateway` body `{"private":true}` ⇒ `private=True visibility=private`（BEFORE 快照存 `.scratch\rel31\repo-before-private.json`） |
+| 带 token | 正常，`releases/tags/v1.0.31` 仍见 5 资产 |
+| 匿名 | `releases/latest/download/latest.json` / `api.github.com/.../releases` / 仓库页 **全部 404** |
+
+★★ **代价（必须知道）**：`tauri-plugin-updater` 是**匿名 HTTP 拉取、不带任何凭据**，所以转私有后 **桌面端自动更新彻底失效** —— 包括业主自己桌面那版（`D:\APP\AI Gateway\ai-gateway.exe`，端点写死 `https://github.com/iuuuuuuuu/ai-gateway/releases/latest/download/latest.json`）。这不是配置问题，**加 `Authorization` 头也救不了**。要恢复只有两条路：**改回 public**，或**把 `endpoints` 换成别的托管点**（自建静态站 / 对象存储 / 另一公开仓库）。
+
+对照实测（用业主已有的私有仓库）：`mnemon-memory-sync` 的 `releases/latest/download/latest.json` 匿名 = **404**，而同期的 `ai-gateway`（当时 public）= **302**。⇒ 这不是猜测，是同一台机器上的 A/B。
+
+**为什么转私有对安全没有实质收益**：全量扫描 850 个 tracked 文件，`gho_[A-Za-z0-9]{20,}` / `Bearer [A-Za-z0-9._-]{40,}` / `sk-[A-Za-z0-9]{16,}` **命中均为 0** ⇒ 仓库里本来就没有真 token / API key。命中的 email 与 GUID 全是测试占位（`user@example.com` 一类、`00000000-0000-4000-8000-000000000001` 一类）。
 
