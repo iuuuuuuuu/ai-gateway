@@ -294,6 +294,69 @@ pub fn set_account_disabled(account_id: &str, disabled: bool) -> Result<Value, S
     Ok(updated)
 }
 
+/// 把任意形态的入参收敛成**可直接渲染的字符串**（不可渲染则 `null`）。
+///
+/// # 为什么需要它（真实缺陷，不是假想）
+///
+/// 上游 0.8.15 修过一次「账号页白屏」：`account_meta` 的展示字段是**裸透传**
+///（`acc.get("x")`），一旦账号库里某个字段不是字符串 —— 例如历史遗留的
+/// 加密信封对象 `{"v":1,"data":"…"}` —— 这个对象就会一路穿过 IPC 到达前端，
+/// 而 React 的子节点渲染遇到普通对象会直接抛
+/// `Objects are not valid as a React child`，整页白屏。
+///
+/// 本仓库没有加密信封，但**同一个形状的缺陷依然存在**：只要库里任何一个
+/// 展示字段不是字符串（手改过的账号库、导入的第三方账号库、上游换了字段类型），
+/// 同样的白屏就会复现。上游的修法是「阻断信封对象」，这里是**更彻底的一条**：
+/// 无论入参是什么形态，出参只有两种 —— 非空字符串，或 `null`。
+///
+/// 语义：
+/// * 字符串 → `trim()` 后非空则原样返回，空白串归一成 `null`；
+/// * 数字 / 布尔 → 其字面量文本（`"13800138000"` / `"true"`）；
+/// * 对象 / 数组 / `null` / 缺失 → `null`（**绝不透传结构体**）。
+///
+/// ⚠ 缺失字段必须返回 `null` 而不是空串：界面据此渲染成「—」，
+/// 而空串会被当成「有值但是空的」。这条口径由
+/// `account_meta_tolerates_missing_optional_fields` 守着。
+pub fn display_string(v: Option<&Value>) -> Value {
+    match v {
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Value::Null
+            } else {
+                Value::String(trimmed.to_string())
+            }
+        }
+        Some(Value::Number(n)) => Value::String(n.to_string()),
+        Some(Value::Bool(b)) => Value::String(if *b { "true" } else { "false" }.to_string()),
+        // 对象/数组/显式 null/缺失：结构体不得进入界面渲染树。
+        _ => Value::Null,
+    }
+}
+
+/// 当前登录账号的展示三元组（uid / 昵称 / 邮箱），全部经 [`display_string`] 出码。
+///
+/// 入参是 `auth_file::read_auth_file()` 的返回值：`None` 表示没登录（返回
+/// `None`），`Some` 但缺 `account` 时按「三字段全 null」返回 —— 与三条通道
+/// 改动前的语义逐字一致，只是不再裸透传。
+///
+/// # 为什么要有这个函数
+///
+/// 「当前账号」此前在**三处**各写了一遍同样的 JSON 拼装：
+/// 桌面端 `src-tauri/src/commands.rs` 的 `build_app_status`、
+/// 独立服务端 `crates/ai-gateway-server/src/api.rs` 的 `api_status`、
+/// 以及 CLI `crates/ai-gateway-server/src/main.rs` 的 `print_status`。
+/// 三份拷贝意味着同一个白屏缺陷要修三次，且极易漏掉一处 —— 收敛到这一处。
+pub fn current_account_view(auth: Option<&Value>) -> Option<Value> {
+    let auth = auth?;
+    let acct = auth.get("account").cloned().unwrap_or_else(|| json!({}));
+    Some(json!({
+        "uid": display_string(acct.get("uid")),
+        "nickname": display_string(acct.get("nickname")),
+        "email": display_string(acct.get("email")),
+    }))
+}
+
 /// 账号的展示元数据（不泄露 token）。对照 server.py `account_meta`。
 pub fn account_meta(acc: &Value) -> Value {
     // 区域由 domain 后缀推导（国服 .cn / 国际版 .ai），供界面区分展示。
@@ -304,11 +367,17 @@ pub fn account_meta(acc: &Value) -> Value {
             crate::modules::config::Region::Cn => "cn",
             crate::modules::config::Region::Intl => "intl",
         },
-        "id": acc.get("id"),
-        "uid": acc.get("uid"),
-        "email": acc.get("email"),
-        "nickname": acc.get("nickname"),
-        "enterpriseName": acc.get("enterpriseName"),
+        // 展示字段一律经 `display_string` 出码：库里若是对象/数组（历史遗留、
+        // 手工编辑、导入的第三方账号库），裸透传会让 React 子节点渲染直接抛
+        // `Objects are not valid as a React child`，整页白屏。
+        "id": display_string(acc.get("id")),
+        "uid": display_string(acc.get("uid")),
+        "email": display_string(acc.get("email")),
+        "nickname": display_string(acc.get("nickname")),
+        "enterpriseName": display_string(acc.get("enterpriseName")),
+        // 时间戳刻意**不**字符串化：生产写入就是数字毫秒（auth_file.rs），
+        // 前端 `account-card.tsx` 的 `fmt()` 带 `typeof ts === "number"` 守卫，
+        // 改成字符串反而会让「Token 到期」等四行全部渲染成空。
         "expiresAt": acc.get("expiresAt"),
         "refreshExpiresAt": acc.get("refreshExpiresAt"),
         "refreshedAt": acc.get("refreshedAt"),
@@ -322,26 +391,18 @@ pub fn account_meta(acc: &Value) -> Value {
         // 原始标记仍单独透出：排查时要能区分「库里记了什么」（事实）
         // 与「判定结论是什么」（结论），二者不一致正是误报的证据。
         "needsReloginRaw": acc.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true),
-        "needsReloginReason": acc.get("needs_relogin_reason"),
+        "needsReloginReason": display_string(acc.get("needs_relogin_reason")),
         // 备注：用户自定义标签，用于认出「这是谁的号」。
-        "note": acc.get("note"),
+        "note": display_string(acc.get("note")),
         // 用户手动禁用：不进网关账号池（其它自动任务照跑）。
         "disabled": account_disabled(acc),
         // 原始域名（如 www.workbuddy.ai / copilot.tencent.com）：
         // 区域标签只给「国服/国际版」，排查问题时常需要看确切域名。
-        "domain": acc.get("domain"),
+        "domain": display_string(acc.get("domain")),
         // 手机号（国服账号的真实身份线索，邮箱常为空）。
-        "phoneNumber": acc
-            .get("profile_raw")
-            .and_then(|p| p.get("phoneNumber"))
-            .cloned()
-            .unwrap_or(Value::Null),
+        "phoneNumber": display_string(acc.get("profile_raw").and_then(|p| p.get("phoneNumber"))),
         // 账号类型（personal / enterprise）：影响可用模型与额度口径。
-        "accountType": acc
-            .get("profile_raw")
-            .and_then(|p| p.get("type"))
-            .cloned()
-            .unwrap_or(Value::Null),
+        "accountType": display_string(acc.get("profile_raw").and_then(|p| p.get("type"))),
         // 所属平台（workbuddy / qoder / zcode）。
         //
         // # 为什么必须透出（所有者 2026-09-28：「平台…区分不明显」）
@@ -656,6 +717,94 @@ mod tests {
             account_meta(&real)["needsRelogin"], true,
             "服务端明确拒绝才是真的需重登"
         );
+    }
+
+    /// 展示字段必须**只出字符串或 null**：结构体一旦透传到界面就是整页白屏。
+    ///
+    /// # 守的是什么（上游 0.8.14 / 0.8.15 的「账号页白屏」同类缺陷）
+    ///
+    /// React 渲染子节点时遇到普通对象会直接抛
+    /// `Objects are not valid as a React child`，而账号卡片的备注、昵称、
+    /// 域名等都是直接插值的 —— 库里任何一个字段变成对象，整个账号页就白屏。
+    /// 上游是「阻断加密信封对象」，这里是更彻底的一条：不管入参什么形态，
+    /// 出参只有字符串或 null。
+    #[test]
+    fn account_meta_never_passes_structures_to_the_ui() {
+    let acc = json!({
+        "id": "a1",
+        "uid": "u1",
+        // 历史遗留 / 手工编辑 / 第三方导入都可能出现下面这些形态：
+        "note": {"v": 1, "data": "…"},
+        "nickname": ["x"],
+        "domain": {"kind": "object"},
+        "email": 12345,
+        "needs_relogin_reason": {"nested": true},
+        "profile_raw": { "phoneNumber": {"obj": 1}, "type": 42 },
+    });
+    let meta = account_meta(&acc);
+    for key in [
+        "note",
+        "nickname",
+        "domain",
+        "email",
+        "needsReloginReason",
+        "phoneNumber",
+        "accountType",
+    ] {
+        let v = &meta[key];
+        assert!(
+            v.is_null() || v.is_string(),
+            "{key} 只允许字符串或 null，实际 {v} —— 结构体会让前端整页白屏"
+        );
+    }
+    // 数字/布尔要能显示出来（不能因为「不是字符串」就丢掉）。
+    assert_eq!(meta["email"], "12345", "数字字段要转成字面量文本");
+    assert_eq!(meta["accountType"], "42", "profile_raw.type 是数字也要显示");
+    // 对象/数组一律变 null，而不是被 JSON 序列化成一坨文本塞给界面。
+    assert!(meta["note"].is_null(), "对象备注不得透传");
+    assert!(meta["nickname"].is_null(), "数组昵称不得透传");
+    assert!(meta["domain"].is_null());
+    assert!(meta["phoneNumber"].is_null());
+}
+
+    /// `display_string` 的语义边界（它是上面那条测试的实现底座）。
+    #[test]
+    fn display_string_normalizes_every_shape() {
+        assert_eq!(display_string(Some(&json!("  a  "))), json!("a"), "去首尾空白");
+        assert_eq!(display_string(Some(&json!("   "))), Value::Null, "纯空白视为无值");
+        assert_eq!(display_string(Some(&json!(0))), json!("0"));
+        assert_eq!(display_string(Some(&json!(true))), json!("true"));
+        assert_eq!(display_string(Some(&json!(false))), json!("false"));
+        assert!(display_string(Some(&json!({}))).is_null());
+        assert!(display_string(Some(&json!([]))).is_null());
+        assert!(display_string(Some(&Value::Null)).is_null());
+        assert!(display_string(None).is_null(), "缺失字段必须是 null 而非空串");
+    }
+
+    /// 「当前账号」三条通道共用的视图：任何形态都只出字符串/null。
+    #[test]
+    fn current_account_view_is_string_safe() {
+        // 没登录：None 原样透出（界面据此显示「未登录」）。
+        assert!(current_account_view(None).is_none());
+        // 登录但 account 缺失：三字段全 null，不 panic、不伪造。
+        let empty = current_account_view(Some(&json!({}))).expect("Some 应返回 Some");
+        assert!(empty["uid"].is_null() && empty["nickname"].is_null() && empty["email"].is_null());
+        // 正常账号。
+        let ok = current_account_view(Some(&json!({
+            "account": {"uid": "u1", "nickname": "小明", "email": "a@b.c"}
+        })))
+        .unwrap();
+        assert_eq!(ok["uid"], "u1");
+        assert_eq!(ok["nickname"], "小明");
+        assert_eq!(ok["email"], "a@b.c");
+        // ★ 真凶形态：auth 文件被写坏 / 上游改了字段类型。
+        let broken = current_account_view(Some(&json!({
+            "account": {"uid": {"v": 1}, "nickname": ["x"], "email": 7}
+        })))
+        .unwrap();
+        assert!(broken["uid"].is_null(), "对象 uid 不得透传");
+        assert!(broken["nickname"].is_null(), "数组昵称不得透传");
+        assert_eq!(broken["email"], "7");
     }
 
     /// 字段缺失时不应 panic，也不应伪造值（界面渲染成「—」）。

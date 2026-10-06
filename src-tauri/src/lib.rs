@@ -474,6 +474,8 @@ pub fn run() {
             commands::set_launch_at_login_enabled,
             // 兼容网关
             commands::get_gateway_status,
+    commands::read_gateway_log,
+    commands::reveal_gateway_log,
             commands::get_gateway_config,
             commands::save_gateway_config,
             commands::run_gateway_task,

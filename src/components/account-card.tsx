@@ -33,6 +33,27 @@ const AVATAR_TONES = [
   "bg-teal-100 text-teal-800",
 ] as const;
 
+/**
+ * 展示字段的**第二道防线**：任何形态都只出字符串。
+ *
+ * ## 为什么后端已经保证、前端还要再兜一层
+ *
+ * React 渲染子节点时遇到普通对象会直接抛
+ * `Objects are not valid as a React child`，而账号卡片里的备注/昵称/
+ * 域名都是直接插值的 —— 库里任何一个字段变成对象，整页白屏。
+ * Rust 侧 `account::display_string` 已经只出字符串或 null（见那边的注释），
+ * 但账号数据还有别的来源：演示模式、本地导入、旧版本留下的 localStorage
+ * 缓存、以及未来新增的 status 通道。多一层 `String()` 的成本是零。
+ *
+ * 对象/数组刻意返回空串（渲染成「—」）而不是 `[object Object]`：
+ * 后者会把「数据坏了」伪装成「有个值」，反而更难排查。
+ */
+function displayText(v: unknown): string {
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  return "";
+}
+
 function avatarTone(name: string) {
   let hash = 0;
   for (let i = 0; i < name.length; i += 1) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
@@ -84,12 +105,16 @@ function creditResources(credit?: CreditExpiry): CreditResource[] {
 }
 
 function accountIdentity(account: AccountMeta): string {
-  if (account.email) {
-    const [local, domain] = account.email.split("@");
-    if (!domain) return account.email;
+  // displayText：这些字段正常是字符串，但库坏了 / 第三方导入时可能是对象，
+  // 直接插值会让整张卡片白屏（见 displayText 的注释）。
+  const email = displayText(account.email);
+  const uid = displayText(account.uid);
+  if (email) {
+    const [local, domain] = email.split("@");
+    if (!domain) return email;
     return `${local.slice(0, 1)}${"*".repeat(Math.max(3, local.length - 1))}@${domain}`;
   }
-  return account.uid ? `UID · ${account.uid}` : `ID · ${account.id}`;
+  return uid ? `UID · ${uid}` : `ID · ${displayText(account.id)}`;
 }
 
 /**
@@ -106,23 +131,23 @@ function accountDetailRows(account: AccountMeta): [string, string, string?][] {
   const fmt = (ts: number | null | undefined) =>
     typeof ts === "number" && ts > 0 ? new Date(ts).toLocaleString("zh-CN") : "";
   return [
-    ["备注", account.note ?? "", "你自己填的标签，用于区分这是谁的号"],
-    ["昵称", account.nickname ?? ""],
-    ["邮箱", account.email ?? "", "国际版账号通常靠它辨认"],
-    ["手机号", account.phoneNumber ?? "", "国服账号的邮箱常为空，手机号是主要线索"],
-    ["UID", account.uid ?? ""],
-    ["账号 ID", account.id, "本地账号库的主键（与上游 UID 不同）"],
-    ["所属区域", account.region ?? "", "由登录域名推导：国服 / 国际版"],
-    ["登录域名", account.domain ?? "", "排查问题时的确切域名，比区域标签更具体"],
-    ["账号类型", account.accountType === "personal" ? "个人版" : account.accountType === "enterprise" ? "企业版" : (account.accountType ?? "")],
-    ["企业 / 组织", account.enterpriseName ?? ""],
+    ["备注", displayText(account.note), "你自己填的标签，用于区分这是谁的号"],
+    ["昵称", displayText(account.nickname)],
+    ["邮箱", displayText(account.email), "国际版账号通常靠它辨认"],
+    ["手机号", displayText(account.phoneNumber), "国服账号的邮箱常为空，手机号是主要线索"],
+    ["UID", displayText(account.uid)],
+    ["账号 ID", displayText(account.id), "本地账号库的主键（与上游 UID 不同）"],
+    ["所属区域", displayText(account.region), "由登录域名推导：国服 / 国际版"],
+    ["登录域名", displayText(account.domain), "排查问题时的确切域名，比区域标签更具体"],
+    ["账号类型", account.accountType === "personal" ? "个人版" : account.accountType === "enterprise" ? "企业版" : displayText(account.accountType)],
+    ["企业 / 组织", displayText(account.enterpriseName)],
     ["Token 到期", fmt(account.expiresAt)],
     ["Refresh 到期", fmt(account.refreshExpiresAt), "超过此时间需重新登录"],
     ["上次刷新", fmt(account.refreshedAt)],
     ["加入时间", fmt(account.createdAt)],
     // 仅在异常时出现，避免平时多一行无意义的「正常」。
     ...(account.needsRelogin
-      ? ([["状态", `需重新登录${account.needsReloginReason ? `（${account.needsReloginReason}）` : ""}`]] as [string, string, string?][])
+      ? ([["状态", `需重新登录${account.needsReloginReason ? `（${displayText(account.needsReloginReason)}）` : ""}`]] as [string, string, string?][])
       : []),
   ];
 }
@@ -406,7 +431,7 @@ type TaskAvailability = {
 /** 账号是否为国际版。只认 regionKey；它缺失时回退到域名后缀（与后端口径一致）。 */
 function isIntlAccount(account: AccountMeta): boolean {
   if (account.regionKey) return account.regionKey === "intl";
-  return (account.domain ?? "").trim().toLowerCase().endsWith(".ai");
+  return displayText(account.domain).trim().toLowerCase().endsWith(".ai");
 }
 
 /** 当前是否处于夜猫时段（23:00–08:00 CST），与 Go 侧 `withinNightWindow` 同口径。 */
@@ -899,7 +924,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
   const [detailOpen, setDetailOpen] = useState(false);
   /** 账号记录弹窗：任务 / 积分 / Token 三类事件，带日期筛选。 */
   const [recordsOpen, setRecordsOpen] = useState(false);
-  const name = firstVisibleText(account.nickname) || account.uid || "未命名账号";
+  const name = firstVisibleText(displayText(account.nickname)) || displayText(account.uid) || "未命名账号";
   /** 需重新登录时的报警内容；账号仍能自愈（access token 过期）时为 null。
    *  判定口径集中在 `@/lib/account-expiry`，与兼容网关页共用同一套。 */
   const reloginAlarm = accountReloginAlarm(account);
@@ -979,14 +1004,14 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
           宽度上限：宽松 12rem，紧凑收到 7.5rem（120px）——紧凑列宽只有约 300px，
           而头部一行的「不可压缩」需求算下来已超 452px（详见下方 compact 头部注释），
           备注若不收窄会把三个产品按钮挤出可视区。超出部分省略号 + 悬停看全文。 */}
-      {account.note ? (
+      {displayText(account.note) ? (
         <Badge
           variant="outline"
           className={cn(chipClass, "chip-note gap-1", compact ? "max-w-[7.5rem]" : "max-w-[12rem]")}
-          title={`备注：${account.note}`}
+          title={`备注：${displayText(account.note)}`}
         >
           <PencilLine className="size-3 shrink-0" />
-          <span className="truncate">{account.note}</span>
+          <span className="truncate">{displayText(account.note)}</span>
         </Badge>
       ) : null}
       {platformChip(account)}
@@ -1325,7 +1350,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                     因此给一个自定义标签。文案随是否已有备注变化，避免用户以为要重填。 */}
                 <DropdownMenuItem onSelect={() => setNoteOpen(true)}>
                   <PencilLine />
-                  {account.note ? "修改备注" : "添加备注"}
+                  {displayText(account.note) ? "修改备注" : "添加备注"}
                 </DropdownMenuItem>
                 <DropdownMenuItem onSelect={() => setDetailOpen(true)}>
                   <Info />
@@ -1467,7 +1492,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
             <div className={cn("flex size-12 shrink-0 items-center justify-center rounded-full text-base font-semibold ring-4 ring-white/65", avatarClass)}>{name.charAt(0).toUpperCase()}</div>
             <div className="min-w-0 flex-1">
               <h3 className="truncate text-sm font-semibold leading-5" title={name}>{name}</h3>
-              <p className="mt-0.5 truncate text-xs leading-5 text-muted-foreground" title={account.email || account.uid || account.id}>{accountIdentity(account)}</p>
+              <p className="mt-0.5 truncate text-xs leading-5 text-muted-foreground" title={displayText(account.email) || displayText(account.uid) || displayText(account.id)}>{accountIdentity(account)}</p>
               <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5">{statusChips}</div>
             </div>
           </div>
@@ -1612,7 +1637,9 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
       <Dialog
         open={noteOpen}
         onOpenChange={(open) => {
-          if (open) setNoteDraft(account.note ?? "");
+          // displayText 而不是 `account.note ?? ""`：备注一旦是对象，
+          // 直接喂给受控 Input 会把对象转成 "[object Object]" 并留在输入框里。
+          if (open) setNoteDraft(displayText(account.note));
           setNoteOpen(open);
         }}
       >
@@ -1642,7 +1669,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
             <Button variant="outline" onClick={() => setNoteOpen(false)} disabled={noteSaving}>
               取消
             </Button>
-            <Button onClick={() => void submitNote()} disabled={noteSaving || noteDraft.trim() === (account.note ?? "")}>
+            <Button onClick={() => void submitNote()} disabled={noteSaving || noteDraft.trim() === displayText(account.note)}>
               {noteSaving ? <Loader2 className="animate-spin" /> : <Save />}
               保存
             </Button>

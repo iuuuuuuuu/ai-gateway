@@ -2111,6 +2111,75 @@ mod tests {
         assert_eq!(static_model_ids(Region::Intl).len(), 20);
     }
 
+    /// 静态表内容快照：宿主侧（`ai-gateway-core` 的 `static_models()`）
+    /// 是**照抄**这两张表的并集，任何一侧改动都必须同步。
+    ///
+    /// # 为什么要有它（2026-10-06）
+    ///
+    /// core 的 `/v1/models` 回退清单此前是手工维护的另一份拷贝，已经与
+    /// 这两张表分叉：缺 `hy3`/`glm-5.1`/`kimi-k2.7`（网关没启动时选不到），
+    /// 多 `deepseek-v4-flash`/`glm-4.7`/`hunyuan-chat`（已下线，选了必 11102）。
+    /// 两侧刻意不共享代码（网关不依赖 core，理由见 router 的 Cargo.toml），
+    /// 于是用**内容快照**互相钉住：这里钉住本表，core 那边钉住并集。
+    ///
+    /// ⚠ 本测试**只读**，不改表；改表的人必须同时改 core 那张。
+    #[test]
+    fn static_tables_content_snapshot() {
+        assert_eq!(
+            static_model_ids(Region::CN),
+            vec![
+                "auto",
+                "hy4-preview",
+                "hy3",
+                "hy3-x",
+                "deepseek-v4.1-flash",
+                "deepseek-v4-pro",
+                "glm-5.3",
+                "glm-5.3-flash",
+                "glm-5.2",
+                "glm-5.1",
+                "glm-5v-turbo",
+                "minimax-m3",
+                "kimi-k3-1",
+                "kimi-k2.8-preview",
+                "kimi-k2.7",
+                "kimi-k2.6",
+            ],
+            "国服静态表变了：core 的 static_models() 前 16 条必须同步"
+        );
+        assert_eq!(
+            static_model_ids(Region::Intl),
+            vec![
+                "default-model",
+                "fast-model",
+                "balanced-model",
+                "primary-model",
+                "deep-model",
+                "hy4-preview-f",
+                "hy3",
+                "deepseek-v4.1-flash",
+                "gpt-6-astra",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gemini-3.5-flash",
+                "glm-5.3",
+                "glm-5.2",
+                "kimi-k3",
+                "kimi-k2.8-preview",
+                "kimi-k2.6",
+            ],
+            "国际版静态表变了：core 的 static_models() 后 14 条必须同步"
+        );
+        // 两表重叠恰好 6 个 ⇒ 并集 30（core 那张表的条目数断言依赖这个数）。
+        let cn = static_model_ids(Region::CN);
+        let intl = static_model_ids(Region::Intl);
+        let overlap = cn.iter().filter(|id| intl.contains(id)).count();
+        assert_eq!(overlap, 6, "两表重叠数变了 ⇒ core 并集条目数（30）也要改");
+    }
+
     #[test]
     fn static_models_intl_has_no_cn_only_model() {
         let intl = static_model_ids(Region::Intl);

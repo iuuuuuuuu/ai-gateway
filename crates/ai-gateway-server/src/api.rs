@@ -233,6 +233,7 @@ pub fn router() -> Router {
         .route("/api/gateway/restart", post(api_gateway_restart))
         .route("/api/gateway/models", get(api_gateway_models))
         .route("/api/gateway/usage", get(api_gateway_usage))
+        .route("/api/gateway/log", get(api_gateway_log))
         .route("/api/gateway/task-run", post(api_gateway_task_run))
         .route("/api/gateway/growth-task", post(api_gateway_growth_task))
         // ---- 一键导入：接入本机 AI 客户端 ----
@@ -572,14 +573,8 @@ fn json_err(e: String, code: StatusCode) -> Response {
 
 async fn api_status() -> Response {
     let auth = auth_file::read_auth_file();
-    let current = auth.as_ref().and_then(|a| {
-        let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        Some(json!({
-            "uid": acct.get("uid"),
-            "nickname": acct.get("nickname"),
-            "email": acct.get("email"),
-        }))
-    });
+    // 与桌面端 `build_app_status` 共用同一处实现（见那里的注释）。
+    let current = account::current_account_view(auth.as_ref());
     json_ok(json!({
         "running": cached_workbuddy_running(),
         "authFile": auth_file::auth_file_path().to_string_lossy(),
@@ -595,8 +590,10 @@ async fn api_accounts() -> Response {
             .iter()
             .map(account::account_meta)
             .collect::<Vec<_>>(),
-        "current": auth_file::read_auth_file()
-            .and_then(|a| a.get("account").and_then(|x| x.get("uid")).and_then(|x| x.as_str()).map(String::from)),
+        // 这里刻意只取 uid：账号页用它与列表比对来标记「当前」。
+        // 走 `display_string` 保证「库里是对象」时不会把结构体塞进 JSON。
+        "current": account::current_account_view(auth_file::read_auth_file().as_ref())
+            .and_then(|v| v.get("uid").and_then(|x| x.as_str()).map(String::from)),
     }))
 }
 
@@ -2108,6 +2105,19 @@ mod tests {
 /// GET /api/gateway/status —— 网关运行态 + 账号池详情 + 可执行文件探测结果。
 async fn api_gateway_status() -> Response {
     json_ok(ai_gateway_core::modules::gateway::gateway_status().await)
+}
+
+/// GET /api/gateway/log?bytes=N —— 读网关日志尾部（移植上游 0.8.9 的查看入口）。
+///
+/// 默认 64 KB：够看最近的几百行，又不会把 4 MB 的日志整个塞进浏览器。
+/// 上限 1 MB —— 再大就该直接打开文件而不是在网页里看。
+async fn api_gateway_log(Query(q): Query<HashMap<String, String>>) -> Response {
+    let bytes = q
+        .get("bytes")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64 * 1024)
+        .clamp(1024, 1024 * 1024);
+    json_ok(ai_gateway_core::modules::gateway::read_router_log_tail(bytes))
 }
 
 /// GET /api/gateway/config —— 读取网关配置（含可执行文件是否存在）。

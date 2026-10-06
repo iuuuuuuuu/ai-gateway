@@ -23,6 +23,9 @@ static ROTATE_RUNNING: AtomicBool = AtomicBool::new(false);
 static LAST_CHECK_AT: AtomicI64 = AtomicI64::new(0);
 static LAST_SWITCH_AT: AtomicI64 = AtomicI64::new(0);
 
+/// 一天的毫秒数（向上取整算「还剩几天」用）。
+const DAY_MS: i64 = 24 * 3600_000;
+
 /// 单个账号的积分候选（从 get_credit_expiry 提取，不携带 token）。
 #[derive(Debug, Clone)]
 pub struct Candidate {
@@ -120,9 +123,16 @@ pub fn decide_target(
     if let Some(target_ts) = target.soonest_expire_at {
         let remaining_ms = target_ts - now_ms();
         if remaining_ms > min_urgency_ms {
+            // 天数必须**向上取整**：整除会把 1.9 天显示成「还剩 1 天」，
+            // 用户按这句话规划就会以为还有整整一天可用（实际不到两天里
+            // 最短的那个数）。向上取整的语义是「最多还要等这么多天」——
+            // 与 `min_urgency_ms` 的判定方向一致（阈值是「早于这个时间就切」）。
+            //
+            // 与上游 0.8.11 的修法同义（上游是 `Math.ceil(ms / 86400000)`），
+            // 这里用整数运算避免浮点误差：`(a + b - 1) / b` 就是向上取整。
             return Decision::Skip(format!(
                 "所有账号到期都还早（最紧迫的还剩 {} 天），无需切换",
-                remaining_ms / (24 * 3600_000)
+                (remaining_ms + DAY_MS - 1) / DAY_MS
             ));
         }
     }
@@ -569,5 +579,39 @@ mod tests {
             decide_target(&candidates, Some("a"), None, 0, GAP, URG, None, GUARD, 5.0),
             Decision::Switch("b".to_string())
         );
+    }
+
+    /// 提示文案里的「还剩几天」必须**向上取整**（对齐上游 0.8.11）。
+    ///
+    /// # 守的是什么
+    ///
+    /// 整除会把 1.9 天说成「还剩 1 天」。用户看到这句话会按「还有整整一天」
+    /// 规划，而实际上不到两天里最短的那个数 —— 提示比事实**偏乐观**。
+    /// 向上取整的语义是「最多还要等这么多天」，与「早于阈值才切」的方向一致。
+    ///
+    /// 边界：恰好整天不得进位（1.0 天仍是 1 天）；多 1 毫秒就要进位到 2 天。
+    #[test]
+    fn remaining_days_round_up_not_truncate() {
+        let now = now_ms();
+        // 阈值取 0：让「都还早」这条分支必定命中（remaining_ms > 0）。
+        let days_for = |ms: i64| -> String {
+            let candidates = vec![cand("a", Some(now + ms), 100.0, true)];
+            match decide_target(&candidates, None, None, 0, GAP, 0, None, GUARD, 0.0) {
+                Decision::Skip(msg) => msg,
+                other => panic!("应当 Skip，实际 {other:?}"),
+            }
+        };
+        // 1 天整 ⇒ 「还剩 1 天」（不得进位成 2）。
+        let one = days_for(DAY_MS);
+        assert!(one.contains("还剩 1 天"), "整天不得进位，实际：{one}");
+        // 1 天多 1 毫秒 ⇒ 「还剩 2 天」（旧实现给的是 1 天）。
+        let over = days_for(DAY_MS + 1);
+        assert!(
+            over.contains("还剩 2 天"),
+            "不足两天必须说 2 天（向上取整），实际：{over}"
+        );
+        // 1.9 天 ⇒ 2 天（旧实现给 1 天，正是本次要修的偏差）。
+        let almost_two = days_for(DAY_MS * 19 / 10);
+        assert!(almost_two.contains("还剩 2 天"), "实际：{almost_two}");
     }
 }

@@ -9,8 +9,6 @@
 
 mod api;
 
-use serde_json::json;
-
 use ai_gateway_core::modules::{
     account, auth_file, checkin, config, process, refresh, rotate, travel, update,
 };
@@ -86,14 +84,8 @@ fn spawn_background_loops() {
 
 fn print_status() {
     let auth = auth_file::read_auth_file();
-    let current = auth.as_ref().and_then(|a| {
-        let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        Some(json!({
-            "uid": acct.get("uid"),
-            "nickname": acct.get("nickname"),
-            "email": acct.get("email"),
-        }))
-    });
+    // 与桌面端 / 服务端共用同一处实现（见 `account::current_account_view`）。
+    let current = account::current_account_view(auth.as_ref());
     let running = process::is_workbuddy_running();
     println!("ai-gateway v{}", update::APP_VERSION);
     println!("WorkBuddy 运行中: {}", if running { "是" } else { "否" });

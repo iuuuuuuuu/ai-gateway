@@ -74,8 +74,23 @@ try {
 
     # ---- 3) Rust 编译（内嵌网关 + 前端）----
     Write-Host "==> [3/4] 编译 Rust 主体" -ForegroundColor Cyan
-    cargo build -p ai-gateway-server --release
-    if ($LASTEXITCODE -ne 0) { throw "Rust 构建失败" }
+    # ⚠ cargo 会把**普通进度信息**写到 stderr（"Compiling …"、"Finished …"）。
+    # PowerShell 5.1 在 `$ErrorActionPreference = 'Stop'` 下会把原生命令的 stderr
+    # 当成**致命错误**并当场中止脚本 —— 于是永远走不到下一行的 $LASTEXITCODE
+    # 判断，表现是「跑到 [3/4] 就没声了，也没有任何报错」（2026-10-06 实测：
+    # dist-single/ 根本没生成，而日志里连一句失败都没有）。
+    # 故这一段临时把 stderr 当普通输出流，并**只**用 $LASTEXITCODE 判成败。
+    # 与 scripts/build-gateway.ps1:191-202 是同一处理，改一处请同步另一处。
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        cargo build -p ai-gateway-server --release 2>&1 |
+            ForEach-Object { Write-Host "    $_" }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if ($code -ne 0) { throw "Rust 构建失败（cargo build exit $code）" }
 
     # ---- 4) 输出 ----
     Write-Host "==> [4/4] 拷贝产物" -ForegroundColor Cyan

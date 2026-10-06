@@ -2917,6 +2917,9 @@ fn chat_stream_response(
         // ★ 同上：名额守卫随生成器 drop，客户端断连也会归还名额。
         let mut guard = InFlightGuard::new(Arc::clone(&state_ref.pool), &uid);
         let mut last_usage: Option<Value> = None;
+        // 已透传给客户端的字节数：截断/断流日志要靠它区分「一个字都没出」
+        // 与「吐了大半才断」—— 两者的排查方向完全不同。
+        let mut sent_bytes: usize = 0;
         while let Some(item) = frames.next_frame().await {
             match item {
                 Ok(text) => {
@@ -2970,11 +2973,30 @@ fn chat_stream_response(
                         // 不能再把 `text` 透传出去 —— 否则响应体里会出现两个
                         // `data: [DONE]`（实测过一次，客户端读到第一个就把这轮标成
                         // 正常完成，后面的 error 被丢掉）。
+                        //
+                        // ★ 必须留痕（2026-10-06 补）：这条分支此前**一条日志都没有**，
+                        // 于是「用户报 upstream stream ended before a completion event」
+                        // 时，gateway.log 里查不到任何痕迹，只能靠猜是网关合成的帧
+                        // 还是客户端自己合成的（DSH 的 ACP 代理会合成**逐字相同**的
+                        // 文案，见业主 2026-10-06 的 flash 报障）。
+                        // 判据就靠这一行：日志里有它 ⇒ 是网关判定的上游截断。
+                        eprintln!(
+                            "chat uid={} product={} model={}: 上游未发 [DONE] 就结束，\
+                             已向客户端补发 error 帧 code=upstream_stream_truncated\
+                             （已收 {} 个有效帧 / {} 字节，saw_done={}）",
+                            uid,
+                            product_label_for_log(&product),
+                            model,
+                            frames.valid_frames(),
+                            sent_bytes,
+                            frames.saw_done(),
+                        );
                         yield Ok::<_, std::io::Error>(chat_stream_error_frame(
                             UPSTREAM_TRUNCATED_MSG,
                         ));
                         continue;
                     }
+                    sent_bytes += text.len();
                     yield Ok::<_, std::io::Error>(text);
                 }
                 Err(e) => {
@@ -2986,6 +3008,18 @@ fn chat_stream_response(
                     // may be incomplete」，用户看到的是「会话中断」而拿不到真实原因。
                     // 改为发一帧 OpenAI 协议 error + [DONE]，让流在协议层正常收尾，
                     // 客户端按明确的错误码自动换账号重试（实测重试能拿到完整回答）。
+                    // 与上面那条分支同理：这是「传输层断流」而不是「上游没写 [DONE]」，
+                    // 两者客户端看到的现象一样，但排查方向完全不同，必须分别留痕。
+                    eprintln!(
+                        "chat uid={} product={} model={}: 上游流读取失败：{e}\
+                         （已收 {} 个有效帧 / {} 字节，saw_done={}）",
+                        uid,
+                        product_label_for_log(&product),
+                        model,
+                        frames.valid_frames(),
+                        sent_bytes,
+                        frames.saw_done(),
+                    );
                     yield Ok::<_, std::io::Error>(chat_stream_error_frame(&format!(
                         "upstream stream ended before the completion event: {e}"
                     )));

@@ -1133,8 +1133,29 @@ export interface GatewayStatus {
    * 只有一个按钮转圈，看不到在跑什么、跑到哪、哪些账号在跑。
    */
   taskRuntime?: GatewayTaskRuntime;
+  /**
+   * 网关子进程日志的绝对路径（<store>/gateway/gateway_data/gateway.log）。
+   *
+   * 只是路径，**正文不进 status** —— 这个接口被三个页面高频轮询，
+   * 塞 4 MB 正文会把每次刷新都变成一次大传输。看正文走 `readGatewayLog`。
+   */
+  logFile?: string;
+  /** 日志文件当前字节数（文件不存在 = 0）。 */
+  logBytes?: number;
   health: { reachable?: boolean; healthy?: boolean; detail?: unknown } | null;
   pool: GatewayPool | null;
+}
+
+/** 网关日志尾部（`read_gateway_log` 的返回）。 */
+export interface GatewayLogResult {
+  /** 日志文件绝对路径。 */
+  path: string;
+  /** 文件总字节数（可能大于 text 的长度）。 */
+  bytes: number;
+  /** 日志正文（最多 max_bytes，按行对齐；文件不存在时为空串）。 */
+  text: string;
+  /** true = 文件比 text 长，前面还有内容被截掉了。 */
+  truncated: boolean;
 }
 
 /**

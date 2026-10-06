@@ -164,6 +164,123 @@ function Stat({
   );
 }
 
+function formatLogBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+  const value = bytes / 1024 ** i;
+  return `${value >= 10 || i === 0 ? Math.round(value) : value.toFixed(1)} ${units[i]}`;
+}
+
+/**
+ * 网关日志面板（移植上游 0.8.9 的「日志落盘 + 查看入口」后半）。
+ *
+ * ## 为什么需要它
+ *
+ * 网关把每次请求与错误写进 `<store>/gateway/gateway_data/gateway.log`，
+ * 但此前只能自己去文件夹里翻 —— 而这恰恰是「这次对话为什么断流」
+ * 需要**当场**看的。这里把「看尾部 → 打开文件」接上。
+ *
+ * 为什么是**尾部**：日志上限 4 MB，一次拉全量会卡住界面；用户要看的
+ * 永远是「刚才那次请求」。
+ */
+function GatewayLogPanel({ status }: { status: GatewayStatus | null }) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState("");
+  const [meta, setMeta] = useState<{ bytes: number; truncated: boolean; path: string } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await api.readGatewayLog();
+      setText(res.text || "（日志还是空的）");
+      setMeta({ bytes: res.bytes, truncated: res.truncated, path: res.path });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const reveal = useCallback(async () => {
+    try {
+      const res = await api.revealGatewayLog();
+      if (!res.ok) toast.error(res.error || "打开失败");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  return (
+    <Row>
+      <div className="min-w-0">
+        <div className="text-[13px]">网关日志</div>
+        <div className="mt-0.5 break-all font-mono text-[11px] text-muted-foreground">
+          {status?.logFile || "—"}
+        </div>
+        <div className="mt-0.5 text-[11px] text-muted-foreground">
+          断流、上游错误帧、账号冷却都会记在这里（超过 4 MB 自动轮转）
+        </div>
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        <Badge variant="secondary" className="text-[10px] tabular-nums">
+          {formatLogBytes(status?.logBytes ?? 0)}
+        </Badge>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => {
+            setOpen(true);
+            void load();
+          }}
+        >
+          查看日志
+        </Button>
+        <Button size="sm" variant="ghost" onClick={() => void reveal()}>
+          打开所在文件夹
+        </Button>
+      </div>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="sm:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>网关日志</DialogTitle>
+            <DialogDescription>
+              {meta
+                ? `共 ${formatLogBytes(meta.bytes)}${meta.truncated ? "，下面只显示最后 64 KB" : ""}`
+                : "读取中…"}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[60vh] overflow-auto rounded-lg border bg-muted/40 px-3 py-2">
+            {loading ? (
+              <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
+                <Loader2 className="size-3.5 animate-spin" />
+                正在读取…
+              </div>
+            ) : error ? (
+              <div className="py-4 text-xs text-destructive">{error}</div>
+            ) : (
+              <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed">
+                {text}
+              </pre>
+            )}
+          </div>
+          <DialogFooter>
+            <Button size="sm" variant="outline" onClick={() => void load()} disabled={loading}>
+              刷新
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => void reveal()}>
+              打开所在文件夹
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </Row>
+  );
+}
+
 /** 网关 Token 用量的统计范围选项。 */
 type UsageRangeKey = "today" | "7d" | "30d" | "all";
 
@@ -5785,6 +5902,7 @@ ANTHROPIC_AUTH_TOKEN=${apiKey || "<你的 api_key>"}`}</code>
             {status?.exeFound ? "已就绪" : "缺失"}
           </Badge>
         </Row>
+        <GatewayLogPanel status={status} />
       </Section>
     </div>
     {/*

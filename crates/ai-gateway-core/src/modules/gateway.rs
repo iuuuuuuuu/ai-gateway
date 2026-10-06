@@ -2203,7 +2203,7 @@ fn product_models_for_gateway() -> Value {
     //
     // 我试了两条**都会让事情更糟**的路，记录下来免得重复踩：
     //
-    //	① 换成 `static_models()`（内置 14 个模型）
+    //	① 换成 `static_models()`（当时内置 14 个模型；现已对齐网关静态表，共 30 个）
     //	   ⇒ WorkBuddy 实际提供 **31** 个，另外 17 个
     //	     （`glm-5.1` / `hy3` / `kimi-k2.8-preview` / `gpt-5.5` …）
     //	     会被**误排除** —— 那些模型本来能用，改完反而不能用了。
@@ -3303,6 +3303,60 @@ fn router_log_file() -> PathBuf {
     gateway_dir().join("gateway_data").join("gateway.log")
 }
 
+/// 网关日志文件的绝对路径（供界面「打开日志」用）。
+///
+/// 与 [`router_log_file`] 是同一个文件，区别只在**可见性**：那个是私有的
+/// 写侧入口，这个是对外只读的查询入口（移植上游 0.8.9 的日志查看能力）。
+pub fn router_log_path() -> PathBuf {
+    router_log_file()
+}
+
+/// 读网关日志**尾部**（最多 `max_bytes` 字节），供界面内嵌查看。
+///
+/// # 为什么读尾不读头
+///
+/// 网关日志单文件上限 4 MB（[`MAX_ROUTER_LOG_BYTES`]），一次全量读进界面
+/// 既慢又没人看；用户点「查看日志」想看的一定是**刚刚发生的事**。
+/// 因此从文件尾部按 `max_bytes` 截一段，并且**丢掉第一行** —— 从中间切
+/// 会得到一个半行，显示成乱码反而误导（同 `tail` 的观感）。
+///
+/// 返回 `{"path":…, "bytes":<文件总长>, "text":…, "truncated":<是否截断>}`。
+/// 文件不存在（网关从未启动过）时返回空文本而不是报错：
+/// 「没有日志」是正常状态，不该让界面弹一个红框。
+pub fn read_router_log_tail(max_bytes: usize) -> Value {
+    let path = router_log_file();
+    let total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let limit = max_bytes.max(1024) as u64;
+    let mut text = String::new();
+    if total > 0 {
+        if let Ok(mut f) = std::fs::File::open(&path) {
+            use std::io::{Read, Seek, SeekFrom};
+            let start = total.saturating_sub(limit);
+            if f.seek(SeekFrom::Start(start)).is_ok() {
+                let mut buf = Vec::with_capacity(limit as usize);
+                if f.read_to_end(&mut buf).is_ok() {
+                    // 从中间切入时首行是半截的，丢掉它（整体读满时不动）。
+                    let raw = String::from_utf8_lossy(&buf).to_string();
+                    text = if start > 0 {
+                        match raw.find('\n') {
+                            Some(i) => raw[i + 1..].to_string(),
+                            None => String::new(),
+                        }
+                    } else {
+                        raw
+                    };
+                }
+            }
+        }
+    }
+    json!({
+        "path": path.to_string_lossy(),
+        "bytes": total,
+        "text": text,
+        "truncated": total > limit,
+    })
+}
+
 /// 以追加方式打开网关日志；超过 `MAX_ROUTER_LOG_BYTES` 时先轮转为
 /// `gateway.log.1`（只保留两份），再打开新的。
 ///
@@ -4099,6 +4153,11 @@ pub async fn gateway_status() -> Value {
         // 随 status 一起透出（而不是新开一个接口）：账号卡片所在的列表页
         // 与网关页都在轮询 status，复用同一次请求不会引入第二套轮询。
         "taskRuntime": task_runtime(),
+        // 网关日志的位置与大小（移植上游 0.8.9 的「日志查看入口」）。
+        // 只给路径与字节数，**不**把日志正文塞进 status —— 这个接口被三个
+        // 页面高频轮询，4 MB 的日志会让每次轮询都变成一次磁盘全读。
+        "logFile": router_log_file().to_string_lossy(),
+        "logBytes": std::fs::metadata(router_log_file()).map(|m| m.len()).unwrap_or(0),
         "config": cfg,
         "health": health,
         "pool": pool,
@@ -4921,22 +4980,61 @@ async fn fetch_models_impl(force_refresh: bool) -> Vec<Value> {
 ///
 /// 取自上游已知的常用模型；运行中的网关会返回更权威的动态列表，
 /// 此处仅保证「未启动时也能选」。
+///
+/// # 口径必须与网关侧同源（2026-10-06 修正）
+///
+/// 这张表此前是**手工维护的一份独立拷贝**，与网关侧
+/// capability.rs 的 STATIC_MODELS_CN / STATIC_MODELS_INTL（/v1/models
+/// 的兜底真值）已经分叉成两个口径，两侧都不对：
+///
+/// * 缺了上游**真实存在**的 hy3 / hy3-x / glm-5.1 / glm-5v-turbo
+///   / kimi-k2.7 / kimi-k2.8-preview，以及国际版一整套 gpt-*、
+///   default-model 等 ⇒ 网关没启动时，用户在「单一模型」下拉里
+///   **根本选不到**这些模型；
+/// * 多了**早已下线**的历史名 deepseek-v4-flash / deepseek-v3-2-volc
+///   / glm-4.7 / kimi-k2.5 / hunyuan-chat ⇒ 选了就必然被上游
+///   11102 拒绝（与 2026-09-21「国际版 hy4-preview」是同一类缺陷：
+///   清单里出现调不到的模型）。
+///
+/// 现在改为**逐字对齐**网关侧两张静态表的并集（国服表在前、国际版在后、
+/// 按首次出现去重），与 server::static_workbuddy_model_ids() 完全一致。
+/// 两侧各有一条内容快照测试守着，任一侧漂移都会立刻失败。
 fn static_models() -> Vec<Value> {
     const IDS: &[&str] = &[
+        // —— 国服静态表（capability.rs STATIC_MODELS_CN，16 个）——
+        "auto",
+        "hy4-preview",
+        "hy3",
+        "hy3-x",
         "deepseek-v4.1-flash",
-        "deepseek-v4-flash",
         "deepseek-v4-pro",
-        "deepseek-v3-2-volc",
         "glm-5.3",
         "glm-5.3-flash",
         "glm-5.2",
-        "glm-4.7",
-        "kimi-k3-1",
-        "kimi-k2.5",
+        "glm-5.1",
+        "glm-5v-turbo",
         "minimax-m3",
-        "hunyuan-chat",
+        "kimi-k3-1",
+        "kimi-k2.8-preview",
+        "kimi-k2.7",
+        "kimi-k2.6",
+        // —— 国际版静态表（capability.rs STATIC_MODELS_INTL，20 个）——
+        // 与国服重复的 6 个（hy3 / deepseek-v4.1-flash / glm-5.3 / glm-5.2
+        // / kimi-k2.8-preview / kimi-k2.6）此处不重复列出。
+        "default-model",
+        "fast-model",
+        "balanced-model",
+        "primary-model",
+        "deep-model",
+        "hy4-preview-f",
+        "gpt-6-astra",
         "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
         "gemini-3.5-flash",
+        "kimi-k3",
     ];
     IDS.iter()
         .map(|id| json!({ "id": id, "object": "model", "owned_by": "workbuddy" }))
@@ -5429,6 +5527,126 @@ mod tests {
             expected.len(),
             expected
         );
+    }
+
+    /// 网关日志尾部读取：只出文本，且必须能容忍「文件不存在」。
+    ///
+    /// # 守的是什么
+    ///
+    /// 网关从未启动过时 `<store>/gateway/gateway_data/gateway.log` 不存在，
+    /// 「查看日志」是用户**第一次**排查问题时会点的按钮 —— 它不能因为
+    /// 「还没有日志」就报错或 panic，那会把「没问题」显示成「出错了」。
+    ///
+    /// ⚠ 本测试**不**碰真实 store 目录（那会读到业主正在写的网关日志）：
+    /// 只验证「路径形状 + 不存在时不 panic」这两条与内容无关的性质。
+    #[test]
+    fn router_log_path_and_tail_are_safe_without_file() {
+        let path = router_log_path();
+        assert!(
+            path.to_string_lossy().ends_with("gateway_data\\gateway.log")
+                || path.to_string_lossy().ends_with("gateway_data/gateway.log"),
+            "日志路径必须是 <store>/gateway/gateway_data/gateway.log，实际 {path:?}"
+        );
+        // 即使文件存在也只看结构：text 必须是字符串、bytes 必须是数字。
+        let v = read_router_log_tail(4096);
+        assert!(v["text"].is_string(), "text 必须是字符串（无日志时为空串）");
+        assert!(v["bytes"].is_u64(), "bytes 必须是数字");
+        assert!(v["path"].is_string());
+        assert!(v["truncated"].is_boolean());
+    }
+
+    /// 内置回退清单必须与网关侧静态表**同源**（2026-10-06）。
+    ///
+    /// # 为什么用快照断言而不是「读网关侧那张表」
+    ///
+    /// 网关（`ai-gateway-router`）**刻意不依赖** core（core 内嵌了网关自己的
+    /// 压缩副本，依赖会形成回环并把宿主全套重依赖拖进网关，见
+    /// `crates/ai-gateway-router/Cargo.toml` 顶部注释），所以这里无法直接
+    /// `use` 到 `capability::STATIC_MODELS_CN`。两侧各钉一条内容快照，
+    /// 任一侧漂移都会在各自 crate 的测试里立刻失败 —— 这是「不引入新 crate」
+    /// 前提下的最强约束。
+    ///
+    /// 守的真实缺陷：这张表曾经缺 `hy3`/`glm-5.1`/`kimi-k2.7` 等**真实存在**
+    /// 的模型（网关没启动时用户在下拉里选不到），却含 `deepseek-v4-flash`/
+    /// `glm-4.7`/`hunyuan-chat` 等**已下线**的名字（选了必被上游 11102 拒绝）。
+    #[test]
+    fn static_models_snapshot_matches_gateway_union() {
+        let ids: Vec<String> = static_models()
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        // 国服表 16 + 国际版表 20 − 两表重叠 6（hy3 / deepseek-v4.1-flash /
+        // glm-5.3 / glm-5.2 / kimi-k2.8-preview / kimi-k2.6）= 30。
+        assert_eq!(
+            ids.len(),
+            30,
+            "内置回退清单条目数变了（应为 30 = 国服 16 + 国际版 20 − 重叠 6）。\n\
+             改了这里就必须同步改 crates/ai-gateway-router/src/capability.rs 的\n\
+             STATIC_MODELS_CN / STATIC_MODELS_INTL，以及 server.rs 的\n\
+             static_workbuddy_model_ids()。"
+        );
+        // 国服优先：前 16 个必须与国服表逐字同序。
+        assert_eq!(
+            &ids[..16],
+            &[
+                "auto",
+                "hy4-preview",
+                "hy3",
+                "hy3-x",
+                "deepseek-v4.1-flash",
+                "deepseek-v4-pro",
+                "glm-5.3",
+                "glm-5.3-flash",
+                "glm-5.2",
+                "glm-5.1",
+                "glm-5v-turbo",
+                "minimax-m3",
+                "kimi-k3-1",
+                "kimi-k2.8-preview",
+                "kimi-k2.7",
+                "kimi-k2.6",
+            ],
+            "前 16 条必须与 capability.rs 的 STATIC_MODELS_CN 逐字同序"
+        );
+        // 国际版追加段（与国服重叠的 6 个已去重）。
+        assert_eq!(
+            &ids[16..],
+            &[
+                "default-model",
+                "fast-model",
+                "balanced-model",
+                "primary-model",
+                "deep-model",
+                "hy4-preview-f",
+                "gpt-6-astra",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gemini-3.5-flash",
+                "kimi-k3",
+            ],
+            "后 14 条必须与 capability.rs 的 STATIC_MODELS_INTL 去重后逐字同序"
+        );
+        // 已下线的历史名一个都不许回来。
+        for gone in [
+            "deepseek-v4-flash",
+            "deepseek-v3-2-volc",
+            "glm-4.7",
+            "kimi-k2.5",
+            "hunyuan-chat",
+        ] {
+            assert!(
+                !ids.iter().any(|id| id == gone),
+                "{gone} 早已下线，出现在回退清单里会让用户选了必失败"
+            );
+        }
+        // 条目形状必须与 /v1/models 的静态兜底一致。
+        for m in static_models() {
+            assert_eq!(m["object"], "model");
+            assert_eq!(m["owned_by"], "workbuddy");
+        }
     }
 
     /// 求解器目录必须在 **NSIS 安装后的真实布局** 里能找到。

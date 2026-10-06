@@ -48,11 +48,13 @@ pub fn preview_accounts(text: &str) -> Result<Value, String> {
         .iter()
         .enumerate()
         .map(|(index, item)| {
+            // 预览同样只出字符串：导入文件是外部输入，字段形态完全不受控，
+            // 一个对象就能让「导入账号」弹窗白屏（与 `account_meta` 同一条理由）。
             json!({
                 "index": index,
-                "uid": item.get("uid"),
-                "nickname": item.get("nickname"),
-                "email": item.get("email"),
+                "uid": account::display_string(item.get("uid")),
+                "nickname": account::display_string(item.get("nickname")),
+                "email": account::display_string(item.get("email")),
                 "hasToken": account::get_str(item, "access_token").is_some(),
             })
         })

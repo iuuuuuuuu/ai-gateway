@@ -10,7 +10,7 @@
 //! 3. body 命中 hardMarkers（小写 + 中文原文双通道）→ 硬冷却
 //! 4. body 命中 sessionDeadMarkers → 禁用
 //! 5. `429` → 模型级限流（6004）优先，否则软冷却
-//! 6. 上下文超长（11115）→ 请求侧错误，换号无用
+//! 6. 上下文超长（11115 / 4028）→ 请求侧错误，换号无用
 //! 7. 请求被拒（11155 思维链缺失）→ 请求侧错误，原地重试后立即失败
 //! 8. 思考档位被拒 → 请求侧错误
 //! 9. 模型不在这条通道上（11102）→ 请求侧错误
@@ -68,7 +68,7 @@ pub enum ErrKind {
     /// 与 [`ErrKind::SoftRate`] 的区别是该账号其他模型仍然可用 ——
     /// 上游文案明确写着「您也可以切换其他模型继续使用」。
     ModelRate,
-    /// 请求上下文超出模型窗口（400 code=11115）。
+    /// 请求上下文超出模型窗口（400 code=11115 / 4028）。
     ///
     /// **请求侧**错误：同一请求体发给任何账号都会同样失败，换号无用。
     ContextTooLong,
@@ -236,7 +236,30 @@ const MODEL_RATE_MARKERS: &[&str] = &["超出频率限制", "切换其他模型"
 const MODEL_RATE_CODE: i64 = 6004;
 
 /// 上游「上下文超长」的业务码。
+///
+/// ★ 与 [`CONTEXT_TOO_LONG_CODE_ALT`] 是**同一类语义、不同码值**：上游按模型/版本
+/// 下发不同码，只认一个就会漏判。
 const CONTEXT_TOO_LONG_CODE: i64 = 11115;
+
+/// 上游「上下文超长」的另一个业务码（hy3 等模型上实测）。
+///
+/// 实测响应（2026-09-20，prompt 100001 tokens > 100000 maximum）：
+///
+/// ```text
+/// 400 {"code":4028,"msg":"prompt is too long: 100001 tokens > 100000 maximum", ...}
+/// ```
+///
+/// ★ 该样本里 `extError.code` 并不存在，文案是唯一还站得住的另一路信号 ——
+/// 也就是说在登记本码之前，「4028 + 上游换措辞」的组合会被漏判成普通 4xx
+/// 并逐号轮转。另一个值得记住的数字：只超了 1 个 token（100001 > 100000）
+/// 就拒绝，说明窗口边界是硬限制，不存在「超一点点会放行」的余地。
+///
+/// 移植来源：上游 `momo0410/workbuddy-switch-gateway` 的 `1c8bfed`
+/// （登记 4028 业务码，Refs #27）。
+const CONTEXT_TOO_LONG_CODE_ALT: i64 = 4028;
+
+/// 全部已登记的「上下文超长」业务码（上游按模型/版本下发不同码）。
+const CONTEXT_TOO_LONG_CODES: &[i64] = &[CONTEXT_TOO_LONG_CODE, CONTEXT_TOO_LONG_CODE_ALT];
 
 /// 上下文超长的判定文案（中英双通道兜底）。
 ///
@@ -367,14 +390,16 @@ fn is_zcode_no_resource_pack(status: u16, body: &str) -> bool {
 
 /// 报告上游响应是否为「请求上下文超出模型窗口」。
 ///
-/// 三路判定，任一命中即成立：业务码 11115、`extError.code=context_length_exceeded`、
-/// 或真实文案关键词。
+/// 三路判定，任一命中即成立：业务码（[`CONTEXT_TOO_LONG_CODES`]，11115 / 4028）、
+/// `extError.code=context_length_exceeded`、或真实文案关键词。
 ///
 /// **不按 status 门控**：上游以 400 为主，但判定依据是业务语义而非状态码，
 /// 上游若改用 413 也能识别。
 pub fn is_context_too_long(body: &str) -> bool {
-    if envelope_code(body) == Some(CONTEXT_TOO_LONG_CODE) {
-        return true;
+    if let Some(code) = envelope_code(body) {
+        if CONTEXT_TOO_LONG_CODES.contains(&code) {
+            return true;
+        }
     }
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         if v.get("extError")
@@ -752,7 +777,7 @@ pub fn server_status_label(status: u16) -> String {
 /// 把上游统一信封里的 `msg` 与多语言 `displayMsg` 提炼成一条**保留原文**
 /// 的客户端消息（`<msg>（<displayMsg>）`，两者皆缺时回退原始 body）。
 ///
-/// 11115 / 11140 / 11155 等请求侧拒绝共用同一个信封形状，因此共用本函数。
+/// 11115 / 4028 / 11140 / 11155 等请求侧拒绝共用同一个信封形状，因此共用本函数。
 fn envelope_display_message(body: &str) -> String {
     let v = serde_json::from_str::<serde_json::Value>(body).unwrap_or(serde_json::Value::Null);
     let primary = v
@@ -1016,6 +1041,35 @@ mod tests {
             classify(400, "prompt is too long"),
             ErrKind::ContextTooLong
         );
+    }
+
+    /// ★ 4028：hy3 等模型上实测的**另一个**「上下文超长」业务码。
+    ///
+    /// 移植来源：上游 `momo0410/workbuddy-switch-gateway` 的 `1c8bfed`（Refs #27）。
+    /// 那个现场的关键差异是：业务码是 4028 而非 11115，且**不含** `extError.code`
+    /// ——另外两路信号都不成立，此前能判对纯粹靠 msg 里的 `prompt is too long`
+    /// 文案兜底；一旦上游换成别的措辞就会漏判。所以本测试的**主断言是剥掉文案**、
+    /// 只剩业务码的那一条。
+    #[test]
+    fn context_too_long_detection_alt_code_4028() {
+        // 现场样本（逐字）
+        let body = r#"{"code":4028,"msg":"prompt is too long: 100001 tokens > 100000 maximum"}"#;
+        assert_eq!(classify(400, body), ErrKind::ContextTooLong);
+        assert!(is_context_too_long(body));
+
+        // ★ 剥掉文案，只剩业务码 —— 这是「4028 已正式登记」的唯一证明。
+        let bare = r#"{"code":4028,"msg":"上游换了个措辞"}"#;
+        assert!(
+            is_context_too_long(bare),
+            "仅凭 4028 业务码必须判为上下文超长（4028 未被登记？）"
+        );
+        assert_eq!(classify(400, bare), ErrKind::ContextTooLong);
+
+        // 11115 不得因为引入 4028 而失效（同一个码表，逐个都要成立）
+        assert!(is_context_too_long(r#"{"code":11115,"msg":"x"}"#));
+
+        // 反例：相邻但未登记的码不得被误判（精确匹配，不是前缀匹配）
+        assert!(!is_context_too_long(r#"{"code":4029,"msg":"something else"}"#));
     }
 
     /// 上下文超长的消息必须**保留上游原文**，否则客户端认不出溢出、无法自动压缩。

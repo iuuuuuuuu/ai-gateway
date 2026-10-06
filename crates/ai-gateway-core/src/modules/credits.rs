@@ -8,7 +8,7 @@ use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
-use crate::modules::account::{account_display_name, build_auth_headers};
+use crate::modules::account::{account_display_name, build_auth_headers, get_str};
 use crate::modules::config::{
     http_request, load_checkin_config, now_ms, WORKBUDDY_API_ENDPOINT, WORKBUDDY_API_ENDPOINT_INTL,
 };
@@ -20,6 +20,13 @@ const WORKBUDDY_WEB_ENDPOINT: &str = "https://www.workbuddy.cn";
 const RESOURCE_SUMMARY_PATH: &str = "/billing/meter/get-user-resource-summary";
 const RESOURCE_PAID_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-paid-packages";
 const RESOURCE_FREE_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-free-packages";
+/// 企业版套餐额度接口：不走 package 列表，直接返回周期内的总额度与剩余额度。
+///
+/// 移植自上游 `momo0410/workbuddy-switch-gateway` 的 `dcbb191`
+///（feat(credits): 支持企业版账号额度查询并与个人版口径归一化，PR #33）。
+/// 企业账号走这个端点，响应形状与个人版的 package 列表完全不同，因此下面
+/// 把结果**归一化**成与个人版 package 同构的资源项，调用方无需分支。
+const ENTERPRISE_USER_USAGE_PATH: &str = "/billing/meter/get-enterprise-user-usage";
 const PRODUCT_CODE: &str = "p_tcaca";
 const EXPIRING_SOON_DAYS: i64 = 7;
 
@@ -248,6 +255,84 @@ fn resource_summary(raw: &Value, now: i64) -> Value {
     })
 }
 
+/// 账号的企业空间 ID。
+///
+/// 移植自上游 `dcbb191`。它是唯一能直接驱动 `X-Enterprise-Id` 请求头的字段
+///（见 `account::build_auth_headers`），两条登录路径都会落盘，因此最可信。
+pub fn enterprise_id(account: &Value) -> Option<String> {
+    get_str(account, "enterpriseId").or_else(|| get_str(account, "enterprise_id"))
+}
+
+/// 账号类型字符串（personal / enterprise）。OAuth 扫码登录不落 `type`，
+/// 此时账号库只有 `profile_raw.type`；导入路径则可能写入顶层 `accountType`。
+fn account_type(account: &Value) -> Option<String> {
+    get_str(account, "accountType")
+        .or_else(|| get_str(account, "account_type"))
+        .or_else(|| {
+            account
+                .get("profile_raw")
+                .and_then(|profile| get_str(profile, "type"))
+        })
+}
+
+/// 是否为走「企业版额度」口径的账号。
+///
+/// 判定顺序按可靠性排列：`enterpriseId` 最可信，`accountType == "enterprise"`
+/// 次之。注意**不能反推** —— `accountType` 为 null 仅表示该账号未经导入路径
+/// 采集，不代表个人版。
+///
+/// 刻意不使用 `isCurrentOneIdEnterprise`：该字段由导出凭证时的
+/// `setdefault` 恒定写成 `false`（见 `auth_file.rs`），并非上游真实值，
+/// 用它判断会把所有企业账号误判为个人版。
+fn is_enterprise_account(account: &Value) -> bool {
+    enterprise_id(account).is_some()
+        || account_type(account).is_some_and(|value| value.eq_ignore_ascii_case("enterprise"))
+}
+
+/// 把企业版额度响应归一化成与 `resource_summary` 同构的单个资源项。
+///
+/// 上游形状是扁平的单周期额度（`data.credit` / `limitNum` / `cycleEndTime`），
+/// 与个人版的 package 列表完全不同；这里翻译成统一的
+/// `{total, remaining, used, expireAt, ...}`，让 `credit_result`、本地快照与
+/// 前端无需感知两种口径的差异。
+fn enterprise_resource_summary(response: &Value, now: i64) -> Option<Value> {
+    let data = response.get("data").filter(|value| value.is_object())?;
+    let total = parse_number(data.get("limitNum")).unwrap_or(0.0).max(0.0);
+    let remaining = parse_number(data.get("credit")).unwrap_or(0.0).max(0.0);
+    let used = (total - remaining).max(0.0);
+    let expire_at = parse_timestamp_ms(
+        first_value(
+            data,
+            &[
+                "cycleEndTime",
+                "CycleEndTime",
+                "cycleResetTime",
+                "CycleResetTime",
+            ],
+        )
+        .cloned()
+        .as_ref(),
+    );
+    let expired = expire_at.map(|value| value <= now).unwrap_or(false);
+    let expiring_soon = expire_at
+        .map(|value| value > now && value - now <= EXPIRING_SOON_DAYS * 24 * 3600 * 1000)
+        .unwrap_or(false);
+
+    Some(json!({
+        "packageCode": "enterprise-usage",
+        "packageName": "企业版额度",
+        "total": total,
+        "remaining": remaining,
+        "used": used,
+        "status": 0,
+        "expireAt": expire_at,
+        "expired": expired,
+        "expiringSoon": expiring_soon,
+        "cycleStartTime": first_value(data, &["cycleStartTime", "CycleStartTime"]),
+        "cycleEndTime": first_value(data, &["cycleEndTime", "CycleEndTime"]),
+    }))
+}
+
 fn response_error(response: &Value) -> String {
     let nested = response.get("data").filter(|value| value.is_object());
     let code = response_code(response).unwrap_or(-1);
@@ -346,7 +431,7 @@ pub async fn authenticated_post(account: &Value, url: &str, body: Value) -> Valu
 }
 
 async fn post_with_account(account: &Value, url: &str, body: Value) -> Value {
-    let headers = resource_auth_headers(account, request_origin(url));
+    let headers = resource_auth_headers(account, request_origin(url), url);
     let response = http_request(url, "POST", Some(body.clone()), Some(&headers)).await;
     if is_transport_error(&response) {
         http_request(url, "POST", Some(body), Some(&headers)).await
@@ -365,9 +450,23 @@ fn request_origin(url: &str) -> &'static str {
     }
 }
 
+/// 与请求接口配套的 Web 路径。
+///
+/// 企业版额度接口由「用量」页调用（Referer `/profile/usage`），其余资源接口
+/// 属于「套餐用量」页（`/profile/plans-usage`）。**Referer 与接口不匹配时
+/// 上游会按未知客户端处理**，所以这里必须跟着端点走。
+fn reference_path(url: &str) -> &'static str {
+    if url.contains(ENTERPRISE_USER_USAGE_PATH) {
+        "/profile/usage"
+    } else {
+        "/profile/plans-usage"
+    }
+}
+
 fn resource_auth_headers(
     account: &Value,
     origin: &str,
+    url: &str,
 ) -> std::collections::HashMap<String, String> {
     let mut headers = build_auth_headers(account);
     // WorkBuddy 用户中心的 Axios 拦截器始终携带该头。桌面端使用同一组
@@ -380,7 +479,7 @@ fn resource_auth_headers(
     headers.insert("Origin".to_string(), origin.to_string());
     headers.insert(
         "Referer".to_string(),
-        format!("{origin}/profile/plans-usage"),
+        format!("{origin}{}", reference_path(url)),
     );
     headers
 }
@@ -527,6 +626,51 @@ async fn fetch_new_resource_responses(account: &Value) -> NewResourceResponses {
         paid,
         free,
         refresh_attempted: true,
+    }
+}
+
+/// 企业版额度接口的完整 URL。
+fn enterprise_user_usage_url(account: &Value) -> String {
+    new_resource_url(account, ENTERPRISE_USER_USAGE_PATH)
+}
+
+struct EnterpriseUsageResponse {
+    account: Value,
+    response: Value,
+}
+
+/// 企业版账号的额度查询：单次 POST（body `{}`），401 时只刷新一次并重试。
+///
+/// 与个人版的三路并行不同，企业接口只有这一个端点，因此不需要
+/// `refresh_attempted` 那套「只重试失败分支」的编排。
+async fn fetch_enterprise_usage(account: &Value) -> EnterpriseUsageResponse {
+    let config = load_checkin_config();
+    let working_account = ensure_fresh_token(account.clone(), &config).await;
+    let url = enterprise_user_usage_url(&working_account);
+    let body = json!({});
+    let response = post_with_account(&working_account, &url, body.clone()).await;
+    if !is_unauthorized(&response) {
+        return EnterpriseUsageResponse {
+            account: working_account,
+            response,
+        };
+    }
+
+    let can_refresh = working_account
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.trim().is_empty());
+    if !can_refresh {
+        return EnterpriseUsageResponse {
+            account: working_account,
+            response,
+        };
+    }
+    let refreshed = refresh_account_token(working_account).await;
+    let response = post_with_account(&refreshed, &url, body).await;
+    EnterpriseUsageResponse {
+        account: refreshed,
+        response,
     }
 }
 
@@ -734,9 +878,34 @@ fn credit_result(account: &Value, resources: Vec<Value>, now: i64) -> Value {
 }
 
 /// 查询单账号的积分资源及到期时间。
+///
+/// 企业版与个人版的额度口径不同，走各自独立的接口：企业版是单周期的
+/// `credit`/`limitNum`，个人版是 package 列表。两条路径最终都归一化成
+/// 同一个 `credit_result` 返回值，调用方无需分支。
 pub async fn get_credit_expiry(account: &Value) -> Value {
-    let account_id = account.get("id").cloned().unwrap_or(Value::Null);
     let now = now_ms();
+    if is_enterprise_account(account) {
+        let result = fetch_enterprise_usage(account).await;
+        if is_success(&result.response) {
+            if let Some(resource) = enterprise_resource_summary(&result.response, now) {
+                return credit_result(account, vec![resource], now);
+            }
+        }
+        // 企业接口不可用时回落到通用路径：企业账号同样可能有个人套餐
+        //（或该账号被误判），让通用三路再试一次比直接报错更有用。
+        // 复用已刷新的账号对象，避免二次刷新覆盖刚落盘的 token。
+        let fallback = result.account.clone();
+        if let Some(resources) = personal_resources(&fallback, now).await {
+            return credit_result(account, resources, now);
+        }
+        return json!({
+            "ok": false,
+            "accountId": account_id_of(account),
+            "accountName": account_display_name(account),
+            "error": response_error(&result.response),
+        });
+    }
+
     let responses = fetch_new_resource_responses(account).await;
     if let Some(resources) = normalized_new_resources(
         &responses.summary,
@@ -773,10 +942,42 @@ pub async fn get_credit_expiry(account: &Value) -> Value {
     }
     json!({
         "ok": false,
-        "accountId": account_id,
+        "accountId": account_id_of(account),
         "accountName": account_display_name(account),
         "error": response_error(&response),
     })
+}
+
+fn account_id_of(account: &Value) -> Value {
+    account.get("id").cloned().unwrap_or(Value::Null)
+}
+
+/// 通用（个人版）资源路径，供企业版分支回落时复用。
+///
+/// 与主路径的差别：主路径在旧接口 401 时还会再刷新一次并重试（保证
+/// 「一次查询最多一次 401 refresh」的既有契约），这里刻意不复用那段 ——
+/// 企业分支前面已经用 `fetch_enterprise_usage` 刷过一次，再刷就是第二次。
+async fn personal_resources(account: &Value, now: i64) -> Option<Vec<Value>> {
+    let responses = fetch_new_resource_responses(account).await;
+    if let Some(resources) = normalized_new_resources(
+        &responses.summary,
+        &responses.paid,
+        &responses.free,
+        now,
+    ) {
+        return Some(resources);
+    }
+    let fallback_account = responses.account;
+    let response = fetch_legacy_user_resource(&fallback_account).await;
+    if is_success(&response) && has_resource_accounts(&response) {
+        return Some(
+            resource_accounts(&response)
+                .into_iter()
+                .map(|resource| resource_summary(resource, now))
+                .collect(),
+        );
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1016,7 +1217,8 @@ mod tests {
             "https://www.codebuddy.cn/billing/meter/get-user-resource-summary"
         );
 
-        let headers = resource_auth_headers(&codebuddy, new_resource_endpoint(&codebuddy));
+        let summary_url = new_resource_url(&codebuddy, RESOURCE_SUMMARY_PATH);
+        let headers = resource_auth_headers(&codebuddy, new_resource_endpoint(&codebuddy), &summary_url);
         assert_eq!(headers.get("X-Client-Platform").map(String::as_str), Some("web"));
         assert_eq!(
             headers.get("Accept").map(String::as_str),
@@ -1041,7 +1243,11 @@ mod tests {
         );
 
         let workbuddy_headers =
-            resource_auth_headers(&workbuddy, new_resource_endpoint(&workbuddy));
+            resource_auth_headers(
+                &workbuddy,
+                new_resource_endpoint(&workbuddy),
+                &new_resource_url(&workbuddy, RESOURCE_SUMMARY_PATH),
+            );
         assert_eq!(
             workbuddy_headers.get("Origin").map(String::as_str),
             Some("https://www.workbuddy.cn")
@@ -1055,7 +1261,11 @@ mod tests {
             Some("www.workbuddy.cn")
         );
 
-        let unknown_headers = resource_auth_headers(&unknown, new_resource_endpoint(&unknown));
+        let unknown_headers = resource_auth_headers(
+            &unknown,
+            new_resource_endpoint(&unknown),
+            &new_resource_url(&unknown, RESOURCE_SUMMARY_PATH),
+        );
         assert_eq!(
             unknown_headers.get("Origin").map(String::as_str),
             Some("https://www.codebuddy.cn")
@@ -1087,7 +1297,7 @@ mod tests {
         // Origin/Referer 跟请求 host：国际版请求不能带 codebuddy.cn 的 Origin。
         let intl_usage_url = official_usage_url(&intl);
         assert_eq!(request_origin(&intl_usage_url), WORKBUDDY_API_ENDPOINT_INTL);
-        let intl_usage_headers = resource_auth_headers(&intl, request_origin(&intl_usage_url));
+        let intl_usage_headers = resource_auth_headers(&intl, request_origin(&intl_usage_url), &intl_usage_url);
         assert_eq!(
             intl_usage_headers.get("Origin").map(String::as_str),
             Some("https://www.workbuddy.ai")
@@ -1099,7 +1309,7 @@ mod tests {
 
         let usage_url = official_usage_url(&codebuddy);
         assert_eq!(request_origin(&usage_url), WORKBUDDY_WEB_ENDPOINT);
-        let usage_headers = resource_auth_headers(&codebuddy, request_origin(&usage_url));
+        let usage_headers = resource_auth_headers(&codebuddy, request_origin(&usage_url), &usage_url);
         assert_eq!(
             usage_headers.get("Origin").map(String::as_str),
             Some("https://www.workbuddy.cn")
@@ -1216,10 +1426,140 @@ mod tests {
         // Origin 必须与目标域名一致，否则同样会被网关拒绝。
         let intl_url = legacy_user_resource_url(&intl);
         assert_eq!(request_origin(&intl_url), WORKBUDDY_API_ENDPOINT_INTL);
-        let intl_headers = resource_auth_headers(&intl, request_origin(&intl_url));
+        let intl_headers = resource_auth_headers(&intl, request_origin(&intl_url), &intl_url);
         assert_eq!(
             intl_headers.get("Origin").map(String::as_str),
             Some("https://www.workbuddy.ai")
+        );
+    }
+
+    #[test]
+    fn detects_enterprise_accounts_from_enterprise_id() {
+        // 两条登录路径都会落 enterpriseId，这是最可信的信号。
+        assert!(is_enterprise_account(
+            &json!({"enterpriseId": "fsxhtx5bn9q8", "access_token": "t"})
+        ));
+        assert!(is_enterprise_account(
+            &json!({"enterprise_id": "fsxhtx5bn9q8", "access_token": "t"})
+        ));
+        // accountType 为 enterprise 时同样判定成立。
+        assert!(is_enterprise_account(
+            &json!({"accountType": "enterprise", "access_token": "t"})
+        ));
+        assert!(is_enterprise_account(
+            &json!({"profile_raw": {"type": "enterprise"}, "access_token": "t"})
+        ));
+
+        // accountType 缺失只是「未采集」，不能反推成个人版 —— 但无任何企业
+        // 信号时必须走通用路径，否则个人账号会去请求企业接口而凭空失败。
+        assert!(!is_enterprise_account(&json!({
+            "accountType": "personal",
+            "access_token": "t"
+        })));
+        assert!(!is_enterprise_account(&json!({"access_token": "t"})));
+
+        // isCurrentOneIdEnterprise 由导出凭证时 setdefault 恒写 false，
+        // 不是上游真实值，绝不能作为判定依据。
+        assert!(!is_enterprise_account(&json!({
+            "isCurrentOneIdEnterprise": false,
+            "access_token": "t"
+        })));
+    }
+
+    #[test]
+    fn normalizes_enterprise_usage_into_unified_resource_shape() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("credit-enterprise-shape");
+        let now = 1_800_000_000_000_i64;
+        let response = json!({
+            "code": 0,
+            "msg": "OK",
+            "requestId": "741dc1ca-e3a3-4129-8150-20dbfcd7c1a3",
+            "data": {
+                "credit": 3983.66,
+                "cycleStartTime": "2026-08-25 00:00:00",
+                "cycleEndTime": "2026-09-25 23:59:59",
+                "limitNum": 8000,
+                "cycleResetTime": "2026-09-26 00:00:00"
+            }
+        });
+        assert!(is_success(&response), "code=0 必须被判定为成功");
+
+        let resource = enterprise_resource_summary(&response, now).expect("应能解析企业版额度");
+        assert_eq!(resource["total"], 8000.0);
+        assert_eq!(resource["remaining"], 3983.66);
+        assert_eq!(resource["used"], 4016.34);
+        assert_eq!(resource["packageName"], "企业版额度");
+        // expireAt 取 cycleEndTime，而非 cycleResetTime（差一天）。
+        assert_eq!(
+            resource["expireAt"],
+            parse_timestamp_ms(Some(&json!("2026-09-25 23:59:59"))).unwrap()
+        );
+
+        // 归一化后必须能直接喂给 credit_result，汇总口径与个人版一致。
+        let result = credit_result(&json!({"id": "a1", "nickname": "企业号"}), vec![resource], now);
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["totalCapacity"], 8000.0);
+        assert_eq!(result["totalRemaining"], 3983.66);
+        assert_eq!(result["resources"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn enterprise_usage_tolerates_string_numbers_and_missing_data() {
+        let now = 1_800_000_000_000_i64;
+        // 上游偶发把数值序列化成字符串。
+        let resource = enterprise_resource_summary(
+            &json!({"code": 0, "data": {"credit": "3983.66", "limitNum": "8000"}}),
+            now,
+        )
+        .expect("字符串数值也应解析");
+        assert_eq!(resource["total"], 8000.0);
+        assert_eq!(resource["remaining"], 3983.66);
+        // 无 cycleEndTime 时不应 panic，且不可标记为即将到期。
+        assert_eq!(resource["expireAt"], Value::Null);
+        assert_eq!(resource["expiringSoon"], false);
+        assert_eq!(resource["expired"], false);
+
+        // data 缺失/非对象时返回 None，交由调用方回落通用路径。
+        assert!(enterprise_resource_summary(&json!({"code": 0}), now).is_none());
+        assert!(enterprise_resource_summary(&json!({"code": 0, "data": null}), now).is_none());
+    }
+
+    #[test]
+    fn routes_enterprise_endpoint_and_referer_together() {
+        let enterprise = json!({
+            "domain": "www.codebuddy.cn",
+            "enterpriseId": "fsxhtx5bn9q8",
+            "access_token": "redacted",
+            "uid": "u1"
+        });
+        assert_eq!(
+            enterprise_user_usage_url(&enterprise),
+            "https://www.codebuddy.cn/billing/meter/get-enterprise-user-usage"
+        );
+        // 企业接口由「用量」页调用：Referer 必须是 /profile/usage。
+        let headers = resource_auth_headers(
+            &enterprise,
+            new_resource_endpoint(&enterprise),
+            &enterprise_user_usage_url(&enterprise),
+        );
+        assert_eq!(
+            headers.get("Referer").map(String::as_str),
+            Some("https://www.codebuddy.cn/profile/usage")
+        );
+        assert_eq!(
+            headers.get("X-Enterprise-Id").map(String::as_str),
+            Some("fsxhtx5bn9q8")
+        );
+        // 其余资源接口仍走套餐页。
+        let summary_url = new_resource_url(&enterprise, RESOURCE_SUMMARY_PATH);
+        let headers = resource_auth_headers(
+            &enterprise,
+            new_resource_endpoint(&enterprise),
+            &summary_url,
+        );
+        assert_eq!(
+            headers.get("Referer").map(String::as_str),
+            Some("https://www.codebuddy.cn/profile/plans-usage")
         );
     }
 }

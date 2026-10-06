@@ -27,6 +27,7 @@ import type {
   AgentRestoreResult,
   GatewayConfig,
   GatewayConfigResult,
+  GatewayLogResult,
   GatewayMode,
   GatewayModeSwitchResult,
   GatewayModelItem,
@@ -1130,6 +1131,16 @@ export function getGatewayStatus(): Promise<GatewayStatus> {
 /** 读取网关配置。 */
 export function getGatewayConfig(): Promise<GatewayConfigResult> {
   return call<GatewayConfigResult>("get_gateway_config");
+}
+
+/** 读取网关日志尾部（移植上游 0.8.9 的查看入口）。 */
+export function readGatewayLog(bytes?: number): Promise<GatewayLogResult> {
+  return call<GatewayLogResult>("read_gateway_log", bytes && bytes > 0 ? { bytes } : undefined);
+}
+
+/** 在文件管理器里选中网关日志文件。 */
+export function revealGatewayLog(): Promise<{ ok: boolean; path?: string; error?: string }> {
+  return call<{ ok: boolean; path?: string; error?: string }>("reveal_gateway_log");
 }
 
 /**

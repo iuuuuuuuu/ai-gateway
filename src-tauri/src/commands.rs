@@ -54,14 +54,10 @@ pub async fn get_status() -> Result<AppStatus, String> {
 
 fn build_app_status() -> AppStatus {
     let auth = auth_file::read_auth_file();
-    let current = auth.as_ref().and_then(|a| {
-        let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        Some(json!({
-            "uid": acct.get("uid"),
-            "nickname": acct.get("nickname"),
-            "email": acct.get("email"),
-        }))
-    });
+    // 当前账号的拼装收敛到 core 的 `account::current_account_view`：
+    // 桌面端 / 独立服务端 / CLI 三处此前各写了一遍同样的 JSON，
+    // 展示字段裸透传（对象 ⇒ 前端白屏）这个缺陷要修三次且必漏一处。
+    let current = account::current_account_view(auth.as_ref());
     AppStatus {
         running: process::is_workbuddy_running(),
         auth_file: auth_file::auth_file_path().to_string_lossy().to_string(),
@@ -803,6 +799,50 @@ pub fn set_launch_at_login_enabled(_app: tauri::AppHandle, enabled: bool) -> Res
 #[tauri::command]
 pub async fn get_gateway_status() -> Result<Value, String> {
     Ok(ai_gateway_core::modules::gateway::gateway_status().await)
+}
+
+/// 读取网关日志尾部（移植上游 0.8.9 的查看入口）。
+///
+/// bytes 省略 = 64 KB：够看最近几百行，又不会把 4 MB 的日志整个塞进前端。
+#[tauri::command]
+pub fn read_gateway_log(bytes: Option<usize>) -> Result<Value, String> {
+    let bytes = bytes.unwrap_or(64 * 1024).clamp(1024, 1024 * 1024);
+    Ok(ai_gateway_core::modules::gateway::read_router_log_tail(bytes))
+}
+
+/// 在文件管理器里选中网关日志（Windows 用 explorer /select）。
+///
+/// ⚠ 不能照抄 `reveal_app_in_finder`：那个只对 macOS 的 `open -R` 有效，
+/// 而本应用的主力平台是 Windows —— `open` 在 Windows 上根本不存在。
+#[tauri::command]
+pub fn reveal_gateway_log() -> Result<Value, String> {
+    let path = ai_gateway_core::modules::gateway::router_log_path();
+    if !path.exists() {
+        return Ok(json!({
+            "ok": false,
+            "error": "日志文件还不存在（网关从未启动过？）",
+            "path": path.to_string_lossy(),
+        }));
+    }
+    #[cfg(target_os = "windows")]
+    // 路径含空格/中文（默认用户名就是中文）⇒ 必须整段作为一个参数传给 explorer。
+    let spawned = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", path.to_string_lossy()))
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let spawned = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let spawned = std::process::Command::new("xdg-open")
+        .arg(path.parent().map(|p| p.to_path_buf()).unwrap_or_default())
+        .spawn();
+    match spawned {
+        Ok(_) => Ok(json!({ "ok": true, "path": path.to_string_lossy() })),
+        Err(e) => Ok(json!({
+            "ok": false,
+            "error": e.to_string(),
+            "path": path.to_string_lossy(),
+        })),
+    }
 }
 
 /// 读取网关配置。

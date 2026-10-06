@@ -114,6 +114,15 @@ pub fn is_silent_startup(args: impl IntoIterator<Item = impl AsRef<str>>) -> boo
 /// 窗口晚 1 秒出现，比出现后卡 1 分钟体验好得多；启动过程本身不受影响
 /// （后台循环、网关自动启动都在 setup 里照常跑，与窗口可见性无关）。
 pub fn setup_startup_visibility<R: Runtime>(app: &AppHandle<R>, silent: bool) {
+    // 启动时**清零**轻量模式（2026-10-06 加固，对齐上游 0.8.13）。
+    //
+    // 上游那条缺陷是「重启后标记残留 ⇒ 白屏」：他们的轻量模式标记会跨进程
+    // 存活。本仓库的 `LIGHTWEIGHT_MODE` 是纯进程内 `AtomicBool`（不落盘），
+    // 结构上不可能残留 —— 但**同一进程内**依然可能：先进入轻量模式、
+    // 再从托盘以外的地方（例如二次启动）走到这里，标记若仍是 true，
+    // `show_main_window` 会立刻又 `exit_lightweight` 一次，窗口闪一下又没。
+    // 显式清零是一行成本，换来「这个入口永远从『正常模式』开始」。
+    LIGHTWEIGHT_MODE.store(false, Ordering::Release);
     STARTUP_SILENT.store(silent, Ordering::Release);
     eprintln!("[tray] 启动可见性 silent={silent} t={}ms", crate::elapsed_ms());
     if silent {
