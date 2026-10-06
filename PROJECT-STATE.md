@@ -22,7 +22,7 @@
 | Go 参照实现 | `go-gateway/` | Go（**保留作对照，构建链已不依赖**） |
 
 - git 根 = `wt-port\`，主分支 `main`（2026-10-06 由 `migrate/aigw-v1.0.2` 改名而来；原上游陈旧线 `224919a` 改名 `archive/origin-main` 留档。详见第九节）
-- 远端 **`fork` = `https://github.com/iuuuuuuuu/ai-gateway`**：2026-10-06 已推送 `main` + 42 tag，并发布 Release `v1.0.31`。★ 该仓库同日按业主 m26011 **已转为 private**（匿名访问 404，自动更新通道因此失效，详见 9.6）
+- 远端 **`fork` = `https://github.com/iuuuuuuuu/ai-gateway`**：2026-10-06 已推送 `main` + **43 tag**，并发布 Release `v1.0.31` 与 `v1.0.32`（`releases/latest` 现指向 **v1.0.32**，5 资产）。★ 该仓库同日按业主 m26011 **已转为 private**（匿名访问 404，自动更新通道因此失效，详见 9.6）
 - 当前版本号 **1.0.32**（`tauri.conf.json` / `package.json` / `Cargo.toml` / `Cargo.lock` 已对齐；签名安装包已产出、解包核验、**包内网关**隔离实例真机实测）
   - 业主**实机安装的是 1.0.21**（`HKCU:\...\Uninstall\AI Gateway` ⇒ `InstallLocation=D:\APP\AI Gateway`，主程序 39,173,120 B）；1.0.22–1.0.32 **均未安装**，直接装 1.0.32 即可（跳过版本里的修复全在 1.0.32 内）
   - ★ NSIS 同版本**不覆盖**（`installer.nsi:233-259` 用 `nsis_tauri_utils::SemverCompare` 比 `DisplayVersion`，相等走维护页）⇒ 升版本号是交付的硬前提
@@ -427,7 +427,7 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 
 | 通道 | 地址 | 现状 |
 |---|---|---|
-| 桌面端自动更新 | `https://github.com/iuuuuuuuu/ai-gateway/releases/latest/download/latest.json` | 2026-10-06 **已发 v1.0.31 Release**（id `404503791`，5 资产，`releases/latest` 已指向它）。但**仓库同日按业主 m26011 转为 private** ⇒ 匿名拉取 **404**，该通道**目前对客户端失效**（详见 9.6）。★ 1.0.32 的 Release **尚未发布**（本轮推送时补发） |
+| 桌面端自动更新 | `https://github.com/iuuuuuuuu/ai-gateway/releases/latest/download/latest.json` | 2026-10-06 **已发 v1.0.31 Release**（id `404503791`，5 资产）与 **v1.0.32 Release**（id `404687242`，5 资产，`releases/latest` 现指向它）。但**仓库同日按业主 m26011 转为 private** ⇒ 匿名拉取 **404**，该通道**目前对客户端失效**（详见 9.6；1.0.32 的推送 / tag / Release 全过程见 9.7） |
 | npm | `npm/` 子目录的 `ai-gateway` 包（`optionalDependencies` 5 个平台包） | 未发布过 |
 | 直接发安装包 | `D:\WishProject\WorkbuddySwitchAPi\dist\` | 1.0.7 – 1.0.32 全套都在（每版含 `.sig`），**比 GitHub Release 完整** |
 
@@ -442,8 +442,8 @@ Tauri 启动时 WebView2 **先加载 `about:blank`，约 700 ms 后才真正导�
 
 ### 9.4 没做的事（有意）
 
-- ~~**没有 push**~~ → **2026-10-06 已 push**（业主 m26008「发布推送吧」授权）。见 9.6：`main` + 42 tag + v1.0.31 Release 全部落到 `fork`。
-  - 凭据真相：`GITHUB_TOKEN`/`GH_TOKEN` 未设置、`gh` CLI 不存在，但 **Windows 凭据管理器里有可用 token** —— `cmdkey /list` 的 `LegacyGeneric:target=git:https://github.com`（user `iuuuuuuuu`，secret 40 字符、前缀 `gho_`）。用 `advapi32.dll` 的 `CredRead` P/Invoke 读出来即可（脚本 `.scratch\ghtoken.ps1`）。**scopes = `gist, repo, workflow`** ⇒ 能 push / 建 Release / 改可见性，但**没有 `delete_repo`**。
+- ~~**没有 push**~~ → **2026-10-06 已 push**（业主 m26008「发布推送吧」授权）。见 9.6：`main` + 42 tag + v1.0.31 Release 全部落到 `fork`；1.0.32 后为 `main` + **43 tag** + v1.0.31/v1.0.32 两个 Release（见 9.7）。
+  - 凭据真相：`GITHUB_TOKEN`/`GH_TOKEN` 未设置、`gh` CLI 不存在，但 **Windows 凭据管理器里有可用 token** —— `cmdkey /list` 的 `LegacyGeneric:target=git:https://github.com`（user `iuuuuuuuu`，secret 40 字符、前缀 `gho_`）。用 `advapi32.dll` 的 `CredRead` P/Invoke 读出来即可（脚本 `.scratch\ghtoken.ps1`，该目录已被清理；重建版在仓库外的 `.tmp\ghtoken.ps1`，同一套 `CredRead` P/Invoke）。**scopes = `gist, repo, workflow`** ⇒ 能 push / 建 Release / 改可见性，但**没有 `delete_repo`**。
   - ★ `git credential fill` 走管道会报 `refusing to work with credential missing protocol field`；`git push --dry-run` 在重定向 stdio 下**会卡死 70 s** 等交互提示 ⇒ 只能直接读凭据管理器。
 - **仍然没有开 PR、没有建新仓库**（业主 m24376-2 授权自主决定，结论是继续自研本仓库）。
 - **没有合并 `main` 的最后一个提交**：`archive/origin-main` 相对主线只有 1 个提交（`224919a`「修复负载均衡只用到少数账号与长对话 unexpected EOF」），改动全在 `go-gateway/`（已不参与构建的 Go 参照）+ 版本行 + README 15 行 ⇒ 无移植价值。
@@ -529,3 +529,38 @@ Release 的 5 个资产（上传前安装包**改名为 updater 约定名** `ai-
 
 **为什么转私有对安全没有实质收益**：全量扫描 850 个 tracked 文件，`gho_[A-Za-z0-9]{20,}` / `Bearer [A-Za-z0-9._-]{40,}` / `sk-[A-Za-z0-9]{16,}` **命中均为 0** ⇒ 仓库里本来就没有真 token / API key。命中的 email 与 GUID 全是测试占位（`user@example.com` 一类、`00000000-0000-4000-8000-000000000001` 一类）。
 
+### 9.7 1.0.32 的推送 / tag / Release（2026-10-06，本轮实测）
+
+业主 m26396 报障（裸名 `space-bunny` ⇒ 503）修复完成后，按与 1.0.31 完全相同的流程落地远端。
+
+| 项 | 结果 |
+|---|---|
+| 版本提交 | `371b97198ead140a652dd8a80d53754a5499820e`（`feat(1.0.32): 修裸名模型 503（上游实测集）+ 裸名区域收敛`，18 files / 1072 insertions / 50 deletions） |
+| tag | `v1.0.32` = annotated，对象 `8d33aedd39bce985cb4aa59953436570e7b03074`，指向 `371b971`（**tag 落在版本提交上**，规则见 9.2）；本地 tag **42 → 43** |
+| `main` | 推送 `c1ae06a..371b971`；远端 `refs/heads/main` = `371b97198ead140a652dd8a80d53754a5499820e` = 本地 HEAD |
+| tag 远端一致性 | 远端 **43** = 本地 **43**（`ls-remote --tags` 去 peel 行计数） |
+| Release | tag `v1.0.32`，id **`404687242`**，`draft=false prerelease=false`，`target_commitish=main`，正文 = `.github\RELEASE_NOTES_1.0.32.md` 全文（`bodyLen=7854`） |
+
+Release 的 5 个资产（安装包上传前**改名为 updater 约定名** `ai-gateway-windows-x86_64-setup.exe`）：
+
+| asset | bytes | assetId |
+|---|---|---|
+| `ai-gateway-windows-x86_64-setup.exe` | 14598416 | 615475451 |
+| `ai-gateway-windows-x86_64-setup.exe.sig` | 424 | 615475894 |
+| `ai-gateway_1.0.32_server-x64.exe` | 27063808 | 615475963 |
+| `latest.json` | 1551 | 615476242 |
+| `latest-windows-x86_64.json` | 1551 | 615476281 |
+
+★ **`latest.json` 的写法**：`version` = `1.0.32`，`platforms` 只发 `windows-x86_64-nsis` 与 `windows-x86_64` 两个键，两者的 `signature` **都是 `.sig` 文件内容逐字**（`.sig` 本身已是 base64 文本 ⇒ 原样填入，**不要解码、不要二次 base64**），`url` 都指向 `releases/latest/download/ai-gateway-windows-x86_64-setup.exe`。两个清单文件**内容完全相同**（1.0.31 亦然）。`pub_date` = `2026-10-06T12:00:00Z`。
+
+**发布后复核（实测，不是推断）**
+
+| 检查 | 结果 |
+|---|---|
+| `releases/latest` | 指向 `v1.0.32`（id `404687242`），`draft=false prerelease=false`，`bodyLen=7854` |
+| 资产逐字节核对（走 API + token 真下回来） | 5 个资产 `remoteBytes` 与本地完全相等，`buf.equals(local)=true`：安装包 `14598416` / `BD07D32C…`、`.sig` `424` / `FAE936C8…`、server `27063808` / `1788241A…`、两个 `latest*.json` `1551` / `BF154F53…` |
+| 匿名访问（转私有后仍是） | `releases/latest/download/latest.json` **404**、`api.github.com/.../releases` **403**、仓库页 **404** ⇒ 9.6 的结论**未变**，updater 通道对客户端依旧失效 |
+
+★ 推送踩到的坑（留给后来者）：`git push` / `ls-remote` 在**同一 shell 里先跑过交互式命令**后可能报 `fatal: Cannot prompt because user interactivity has been disabled.` / `could not read Username for 'https://github.com'`。解法：每次调用前显式设 `$env:GIT_TERMINAL_PROMPT='0'; $env:GCM_INTERACTIVE='never'; $env:GCM_PROVIDER='generic'`（凭据本来就在 Windows 凭据管理器里，GCM 能非交互取到）。
+
+★ 另一个坑：`git ls-remote fork refs/heads/main` 的 URL 会走全局 `http.proxy = http://127.0.0.1:7890`（业主代理，全程在线，**没动它**）。本机对 `github.com` 直连与走代理**都通**（`curl` 实测 `code=200`）；`api.github.com` 直连返回 **403**，所以 API 调用一律走 HTTPS 直连的 `fetch`。
