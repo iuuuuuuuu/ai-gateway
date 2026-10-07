@@ -582,3 +582,38 @@ Release 的 5 个资产（安装包上传前**改名为 updater 约定名** `ai-
 ★ 推送踩到的坑（留给后来者）：`git push` / `ls-remote` 在**同一 shell 里先跑过交互式命令**后可能报 `fatal: Cannot prompt because user interactivity has been disabled.` / `could not read Username for 'https://github.com'`。解法：每次调用前显式设 `$env:GIT_TERMINAL_PROMPT='0'; $env:GCM_INTERACTIVE='never'; $env:GCM_PROVIDER='generic'`（凭据本来就在 Windows 凭据管理器里，GCM 能非交互取到）。
 
 ★ 另一个坑：`git ls-remote fork refs/heads/main` 的 URL 会走全局 `http.proxy = http://127.0.0.1:7890`（业主代理，全程在线，**没动它**）。本机对 `github.com` 直连与走代理**都通**（`curl` 实测 `code=200`）；`api.github.com` 直连返回 **403**，所以 API 调用一律走 HTTPS 直连的 `fetch`。
+
+### 9.8 1.0.33 的推送 / tag / Release（2026-10-07，本轮实测）
+
+业主 m28058 报障（裸名 `space-bunny` ⇒ 400 `model_not_in_upstream`）修复完成后，按与 1.0.32 完全相同的流程落地远端。
+
+| 项 | 结果 |
+|---|---|
+| 版本提交 | `2263b173ada5abe68e1d94511e6a798f7687bdc6`（`feat(1.0.33): 修裸名模型抽到 Trae 账号（兜底清单权威性）+ 启动预热`，18 files / 459 insertions / 26 deletions） |
+| 文档提交 | `868db64f8bca1d396b96a1efde6a6e820aa5a5cf`（`docs(1.0.33): PROJECT-STATE 记录 1.0.33`，1 file / 46 insertions / 28 deletions）—— 与 1.0.32 同规矩：tag 只落**版本提交** |
+| tag | `v1.0.33` = annotated，对象 `19f06b1c9c188fec94a92806b9e10208778b7b42`，指向 `2263b17`；本地 tag **43 → 44** |
+| `main` | 推送 `8624461..868db64`；远端 `refs/heads/main` = `868db64f8bca1d396b96a1efde6a6e820aa5a5cf` = 本地 HEAD |
+| tag 远端一致性 | 远端 `refs/tags/v1.0.33` = `19f06b1c…`，与本地一致（本地 tag 44） |
+| Release | tag `v1.0.33`，id **`405310590`**，`draft=false prerelease=false`，`target_commitish=main`，正文 = `.github\RELEASE_NOTES_1.0.33.md` 全文（`bodyLen=7872`，文件 13,051 B） |
+
+Release 的 5 个资产（安装包上传前**改名为 updater 约定名** `ai-gateway-windows-x86_64-setup.exe`）：
+
+| asset | bytes | assetId |
+|---|---|---|
+| `ai-gateway-windows-x86_64-setup.exe` | 14605514 | 617316496 |
+| `ai-gateway-windows-x86_64-setup.exe.sig` | 424 | 617316567 |
+| `ai-gateway_1.0.33_server-x64.exe` | 27302400 | 617316583 |
+| `latest.json` | 1642 | 617316688 |
+| `latest-windows-x86_64.json` | 1642 | 617316710 |
+
+★ `latest.json` 写法同 9.7（`version=1.0.33`、两个平台键的 `signature` 都是 `.sig` 逐字、`url` 指向 `releases/latest/download/ai-gateway-windows-x86_64-setup.exe`、两份文件内容完全相同）。`pub_date` = `2026-10-07T02:30:00Z`。
+
+**发布后复核（实测，不是推断）**
+
+| 检查 | 结果 |
+|---|---|
+| `releases/latest` | 指向 `v1.0.33`（id `405310590`），`draft=false prerelease=false`，`bodyLen=7872`，5 资产 |
+| 资产逐字节核对（走 API + token 真下回来） | 5 个资产 `buf.equals(local)=true`：安装包 `14605514` / `20746313…`、`.sig` `424` / `B7854BCB…`、server `27302400` / `AC18AD26…`、两个 `latest*.json` `1642` / `549F1B4D…` |
+| 匿名访问（转私有后仍是） | `releases/latest/download/latest.json` **404**、`api.github.com/.../releases` **403**、仓库页 **404** ⇒ 9.6 的结论**未变**，updater 通道对客户端依旧失效 |
+
+★ 本轮新增的坑：`git add -- 'a','b','c'` 在 PowerShell 里**整串被当成一个 pathspec** ⇒ `fatal: pathspec 'a,b,c' did not match any files`，且**一个文件都不会 staged**。正确写法是数组：`$files = @('a','b','c'); git add -- $files`。
