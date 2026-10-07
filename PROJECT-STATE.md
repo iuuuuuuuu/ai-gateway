@@ -642,8 +642,9 @@ Release 的 5 个资产（安装包上传前**改名为 updater 约定名** `ai-
 |---|---|
 | 版本提交 | `cd863ebe661f4c3cb8372e1bf7d552ac5b1398d3`（`feat(1.0.34): 修「对话输出完就中断」（上游已宣告完成时不再误判为截断）`，**20 files / 503 insertions / 69 deletions**）★ 与 1.0.33 不同：本轮的 `PROJECT-STATE.md` 与 `RELEASE_NOTES_1.0.34.md` **一起进版本提交**（1.0.33 时 PROJECT-STATE 是单独的 docs 提交） |
 | tag | `v1.0.34` = annotated，对象 `d555a3dcc12561a3291e2045aed4d9356cf04afa`，指向 `cd863eb`；本地 tag **44 → 45** |
-| `main` | 推送 `b66d5d7..cd863eb`；远端 `refs/heads/main` = `cd863ebe661f4c3cb8372e1bf7d552ac5b1398d3` = 本地 HEAD |
+| `main` | 推送 `b66d5d7..cd863eb`（版本提交）；随后文档提交 `87cf271eb16804134082964abd1c2cfbf9653a4a` 又推了一次 `cd863eb..87cf271`；远端 `refs/heads/main` 现为 **`87cf271`** = 本地 HEAD（`git describe --tags` = `v1.0.34-1-g87cf271`） |
 | tag 远端一致性 | 远端 `refs/tags/v1.0.34` = `d555a3dc…`，与本地一致（本地 tag 45、远端 tag 45） |
+| 文档提交 | `87cf271eb16804134082964abd1c2cfbf9653a4a`（`docs(1.0.34): 补记推送 / tag / Release（发布后复核实测）`，1 file / 35 insertions）—— 与 1.0.32 / 1.0.33 同规矩：**tag 只落版本提交**（`git diff --stat v1.0.34 HEAD` 只有 `PROJECT-STATE.md`） |
 | Release | tag `v1.0.34`，id **`405456103`**，`draft=false prerelease=false`，`target_commitish=main`，正文 = `.github\RELEASE_NOTES_1.0.34.md` 全文（`bodyLen=8327`，文件 13,965 B / 8,327 字符，`body === file` 为 true） |
 
 Release 的 5 个资产（安装包上传前**改名为 updater 约定名** `ai-gateway-windows-x86_64-setup.exe`）：
