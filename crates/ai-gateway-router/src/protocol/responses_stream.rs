@@ -664,13 +664,18 @@ impl ResponsesStreamState {
 
     /// 判定本次流是否应当按**失败**收尾（口径同
     /// [`crate::protocol::anthropic_stream::AnthropicStreamState::failure_message`]）。
-    pub fn failure_message(&self, saw_done: bool, saw_any_frame: bool) -> Option<String> {
+    pub fn failure_message(
+        &self,
+        saw_done: bool,
+        saw_any_frame: bool,
+        saw_finish_reason: bool,
+    ) -> Option<String> {
         // ★ 与 anthropic_stream 同一道文案闸门（Go `responses_stream.go:370`）。
         let gate = crate::clienttext::client_safe_message;
         if let Some(e) = &self.upstream_err {
             return Some(gate(&format!("upstream error: {e}")));
         }
-        if saw_done || !saw_any_frame {
+        if saw_done || !saw_any_frame || saw_finish_reason {
             return None;
         }
         Some(gate("upstream stream ended unexpectedly before [DONE]"))

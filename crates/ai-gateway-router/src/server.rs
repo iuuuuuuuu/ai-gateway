@@ -2663,7 +2663,15 @@ fn anthropic_stream_response(
         //
         // Anthropic 规范里 error 事件本身就是终止事件，发出后不要再补
         // message_delta / message_stop（那会被理解为正常完成）。
-        if let Some(msg) = state.failure_message(frames.saw_done(), frames.saw_any_frame()) {
+        //
+        // ★ 第三个标志（2026-10-07 追加）：上游已宣告过**非空** finish_reason、
+        // 只差终止字节 [DONE] 时按**正常收尾** —— 内容已经完整，再判失败会让
+        // 用户看到「回答写完了却报本轮运行失败」，客户端只能整轮重试。
+        if let Some(msg) = state.failure_message(
+            frames.saw_done(),
+            frames.saw_any_frame(),
+            frames.saw_finish_reason(),
+        ) {
             let _ = state.close_open_blocks(&mut out);
             let _ = out.write(
                 "error",
@@ -2782,7 +2790,15 @@ fn responses_stream_response(
         // Responses 协议里终止事件是 response.failed，**不是** Anthropic 的
         // error 事件；发出后同样不能再补 response.completed（两者自相矛盾，
         // 客户端只认最后一个）。
-        if let Some(msg) = state.failure_message(frames.saw_done(), frames.saw_any_frame()) {
+        //
+        // ★ 第三个标志（2026-10-07 追加）：上游已宣告过**非空** finish_reason、
+        // 只差终止字节 [DONE] 时按**正常收尾** —— 内容已经完整，再判失败会让
+        // 用户看到「回答写完了却报本轮运行失败」，客户端只能整轮重试。
+        if let Some(msg) = state.failure_message(
+            frames.saw_done(),
+            frames.saw_any_frame(),
+            frames.saw_finish_reason(),
+        ) {
             let _ = state.fail(&mut out, &msg);
             yield Ok(out.take());
             guard.release();
@@ -2828,6 +2844,13 @@ fn sse_headers() -> axum::http::response::Builder {
 /// 对着一个残缺的回答发呆 —— 比现在更糟。
 const UPSTREAM_TRUNCATED_MSG: &str =
     "upstream stream ended before a completion event; this turn may be incomplete";
+
+/// 收尾用的纯 `[DONE]` 帧。
+///
+/// 与 [`chat_stream_error_frame`] 的区别：这里**不带** error 帧，用于「上游已经
+/// 宣告过非空 `finish_reason`、内容完整，只是终止字节没到」的情形（见
+/// `chat_stream_response` 的 Err 分支）。
+const TAIL_DONE_FRAME: &str = "data: [DONE]\n\n";
 
 /// 构造一帧终止性的 OpenAI 协议 error 帧（自带 `[DONE]`）。
 ///
@@ -3112,6 +3135,33 @@ fn chat_stream_response(
                     yield Ok::<_, std::io::Error>(text);
                 }
                 Err(e) => {
+                    // ★★ 2026-10-07 追加的例外：上游**已经宣告过非空
+                    // `finish_reason`** 时，本轮内容其实是完整的 —— 少的只是那个
+                    // 终止字节 [DONE]，而上游正是「先给 finish_reason、后写 [DONE]」，
+                    // 两者之间那一瞬恰恰是连接最容易被掐断的位置。
+                    //
+                    // 业主现场（2026-10-07，27 个账号）的断流里就有这一形态：回答
+                    // 已经写完，用户看到「对话输出完就中断」并报「本轮运行失败」，
+                    // 客户端随后整轮重试 —— 重新生成一遍，比丢掉一个终止字节昂贵
+                    // 得多。此时只补一帧纯 [DONE] 正常收尾，不补 error 帧。
+                    //
+                    // 反过来说：真截断（吐了一半、finish_reason 没到）仍然走下面
+                    // 那条 error 帧路径，语义没有被放宽。
+                    if frames.saw_finish_reason() {
+                        eprintln!(
+                            "chat uid={} product={} model={}: 上游已发 finish_reason、\
+                             仅终止字节 [DONE] 未到（读错误：{e}），\
+                             按正常收尾补发 [DONE]（已收 {} 个有效帧 / {} 字节）",
+                            uid,
+                            product_label_for_log(&product),
+                            model,
+                            frames.valid_frames(),
+                            sent_bytes,
+                        );
+                        yield Ok::<_, std::io::Error>(TAIL_DONE_FRAME.to_string());
+                        break;
+                    }
+
                     // 上游读到一半断流。**不能** yield Err：axum 的
                     // `Body::from_stream` 遇到 Err 会直接中止响应体，客户端拿到的
                     // 是一个「没有终止帧的半截 SSE 流」，只能靠自己猜 —— 实测 DSH

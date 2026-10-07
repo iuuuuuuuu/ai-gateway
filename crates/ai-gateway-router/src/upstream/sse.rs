@@ -510,6 +510,25 @@ impl Iterator for SseFrames<'_> {
     }
 }
 
+/// 归一化后的帧文本里是否带**非空** `finish_reason`（`choices[].finish_reason`）。
+///
+/// ★ 必须在 [`normalize_frame`] **之后**判：归一化会给缺键的帧补上
+/// `"finish_reason": null`，所以「键存在」不等于「上游宣告了完成」。
+fn payload_has_finish_reason(text: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    let Some(choices) = v.get("choices").and_then(|c| c.as_array()) else {
+        return false;
+    };
+    choices.iter().any(|c| {
+        c.get("finish_reason")
+            .and_then(|f| f.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    })
+}
+
 /// 逐帧解析**流式**上游 SSE（用于把响应边收边转，而不是先读满内存）。
 ///
 /// 与 [`SseFrames`] 的差别：那个吃 `&str`（适合已读完整的聚合场景），
@@ -530,6 +549,18 @@ pub struct SseFramesIter<S> {
     /// 空闲超时最容易掐断的位置（`usage` 也还没落下来）。所以见过
     /// `finish_reason` 不等于流正常结束。
     saw_done: bool,
+    /// 是否读到过**非空**的 `finish_reason`（上游已宣告本轮答完）。
+    ///
+    /// 与 [`SseFramesIter::saw_done`] 的分工：`[DONE]` 仍是「流正常收尾」的
+    /// 权威标志，但上游是**先**给 `finish_reason`、**后**写 `[DONE]`，两者之间
+    /// 那一瞬恰是连接最容易被掐断的位置（`usage` 也还没落下来）。实测业主现场
+    /// （2026-10-07，27 个账号）的断流里就有「内容已吐完、`finish_reason` 已到，
+    /// 只差 `[DONE]`」这一形态 —— 那时若仍按失败收尾，用户看到的是回答其实已经
+    /// 完整、却被标成「本轮运行失败」。
+    ///
+    /// 因此这个标志只用来**放宽**收尾判定（见 [`SseFramesIter::premature_end`]），
+    /// 不用来宣告成功：真失败（吐了一半就断）时它仍然是 false。
+    saw_finish_reason: bool,
     /// 是否读到过任何一个可解析的 data 帧。
     ///
     /// 用于区分「空流」（上游正常解析后发现没什么可发，客户端得到一个合法的
@@ -547,6 +578,7 @@ impl<S> SseFramesIter<S> {
             valid_frames: 0,
             wrote_error: false,
             saw_done: false,
+            saw_finish_reason: false,
             saw_any_frame: false,
         }
     }
@@ -587,6 +619,11 @@ impl<S> SseFramesIter<S> {
         self.saw_done
     }
 
+    /// 是否读到过非空的 `finish_reason`（上游已宣告本轮答完，但可能还没写 `[DONE]`）。
+    pub fn saw_finish_reason(&self) -> bool {
+        self.saw_finish_reason
+    }
+
     /// 是否读到过任何一个可解析的 data 帧。
     pub fn saw_any_frame(&self) -> bool {
         self.saw_any_frame
@@ -594,7 +631,8 @@ impl<S> SseFramesIter<S> {
 
     /// 判定一次上游流是否应当按**失败**收尾，返回原因（`None` = 可正常收尾）。
     ///
-    /// 三种情形（与 Go 侧 `streamFailureMessage` 同一口径）：
+    /// 四种情形（前三条与 Go 侧 `streamFailureMessage` 同一口径，第四条是本仓
+    /// 2026-10-07 追加的放宽）：
     ///
     /// - 见过 `[DONE]` → 正常收尾
     /// - 没见过 `[DONE]`，且一个 data 帧都没读到（空流）→ 正常收尾
@@ -603,8 +641,13 @@ impl<S> SseFramesIter<S> {
     ///   （IdleTimeout 取消连接、或上游提前关连接的形态；补一个
     ///   `stop_reason=end_turn` 等于告诉客户端「模型答完了」，它会据此推进对话，
     ///   用户只看到回答被从中间截断）
+    /// - 见过**非空** `finish_reason`、只差 `[DONE]` → 正常收尾
+    ///   （见 [`SseFramesIter::saw_finish_reason`]；上游已经宣告本轮答完，内容完整，
+    ///   少的只是那个终止字节。此时仍按失败收尾会让用户看到「回答写完了却报
+    ///   本轮运行失败」，而客户端拿到 error 帧后只能整轮重试 —— 重试会重新生成，
+    ///   比丢掉一个终止字节昂贵得多）
     pub fn premature_end(&self) -> Option<&'static str> {
-        if self.saw_done || !self.saw_any_frame {
+        if self.saw_done || !self.saw_any_frame || self.saw_finish_reason {
             return None;
         }
         Some("upstream stream ended unexpectedly before [DONE]")
@@ -637,6 +680,9 @@ where
                     if valid {
                         self.valid_frames += 1;
                         self.saw_any_frame = true;
+                        if payload_has_finish_reason(&text) {
+                            self.saw_finish_reason = true;
+                        }
                     }
                     return Some(Ok(format!("data: {text}\n\n")));
                 }
@@ -672,6 +718,9 @@ where
                                 if valid {
                                     self.valid_frames += 1;
                                     self.saw_any_frame = true;
+                                    if payload_has_finish_reason(&text) {
+                                        self.saw_finish_reason = true;
+                                    }
                                 }
                                 return Some(Ok(format!("data: {text}\n\n")));
                             }
@@ -1781,6 +1830,92 @@ mod tests {
         assert!(
             !out.contains("error"),
             "迭代器不负责判定失败，补 error 是调用方的事：{out}"
+        );
+    }
+
+    /// ★★ 上游**已经宣告过非空 `finish_reason`**、只差终止字节 `[DONE]`：
+    /// 内容完整，不得再判成提前结束。
+    ///
+    /// 2026-10-07 追加。上游是先给 `finish_reason`、后写 `[DONE]`，两者之间那一瞬
+    /// 恰是连接最容易被掐断的位置（业主现场 27 个账号的断流里就有这一形态）。
+    /// 旧口径下这一形态会被 `premature_end()` 标成失败，调用方随即补一帧 error，
+    /// 用户看到的是「回答明明写完了，却报本轮运行失败」，客户端只能整轮重试。
+    #[tokio::test]
+    async fn finish_reason_without_done_is_not_flagged_as_premature() {
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"}}]}\n",
+            "\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+            "\n",
+        );
+        let mut frames = SseFramesIter::new(probe_response(vec![body.to_string()]).bytes_stream());
+        let mut out = String::new();
+        while let Some(item) = frames.next_frame().await {
+            if let Ok(text) = item {
+                out.push_str(&text);
+            }
+        }
+
+        assert_eq!(frames.valid_frames(), 2, "{out}");
+        assert!(frames.saw_finish_reason(), "必须记下非空 finish_reason：{out}");
+        assert!(!frames.saw_done(), "上游确实没写 [DONE]：{out}");
+        assert!(out.contains("\"finish_reason\":\"stop\""), "{out}");
+        assert!(out.ends_with("data: [DONE]\n\n"), "{out}");
+        assert!(
+            frames.premature_end().is_none(),
+            "内容已完整（finish_reason 已到），不得再判提前结束：{out}"
+        );
+    }
+
+    /// `finish_reason: null` 是归一化补出来的缺省值，**不算**上游宣告完成。
+    ///
+    /// `normalize_frame` 会给每一帧都补上 `finish_reason` 键（缺省为 null），所以
+    /// 判据必须是「非空字符串」，而不是「键存在」——否则任何一帧都会被当成答完。
+    #[tokio::test]
+    async fn null_finish_reason_does_not_count_as_completion() {
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"},\"finish_reason\":null}]}\n",
+            "\n",
+        );
+        let mut frames = SseFramesIter::new(probe_response(vec![body.to_string()]).bytes_stream());
+        let mut out = String::new();
+        while let Some(item) = frames.next_frame().await {
+            if let Ok(text) = item {
+                out.push_str(&text);
+            }
+        }
+
+        assert_eq!(frames.valid_frames(), 1, "{out}");
+        assert!(!frames.saw_finish_reason(), "null 不是宣告完成：{out}");
+        assert!(
+            frames.premature_end().is_some(),
+            "吐过内容却没宣告完成必须仍判提前结束：{out}"
+        );
+    }
+
+    /// EOF 时残留在缓冲里的那一帧同样要参与 `finish_reason` 判定。
+    ///
+    /// 上游最后一段字节常常不带结尾换行（连接就在那里断），那一帧只会在
+    /// 「干净 EOF 冲缓冲」这条分支里被归一化 —— 若只在前一条分支记录，
+    /// 「内容吐完 + 无换行收尾」的形态仍会被误判成截断。
+    #[tokio::test]
+    async fn finish_reason_in_tail_buffer_counts_too() {
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}"
+        );
+        let mut frames = SseFramesIter::new(probe_response(vec![body.to_string()]).bytes_stream());
+        let mut out = String::new();
+        while let Some(item) = frames.next_frame().await {
+            if let Ok(text) = item {
+                out.push_str(&text);
+            }
+        }
+
+        assert_eq!(frames.valid_frames(), 1, "{out}");
+        assert!(frames.saw_finish_reason(), "尾部残留帧也要判：{out}");
+        assert!(
+            frames.premature_end().is_none(),
+            "内容已完整（finish_reason 已到），不得再判提前结束：{out}"
         );
     }
 }

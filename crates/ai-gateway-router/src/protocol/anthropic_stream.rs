@@ -390,15 +390,23 @@ impl AnthropicStreamState {
 
     /// 判定本次流是否应当按**失败**收尾，返回原因（`None` = 可正常收尾）。
     ///
-    /// `saw_done` / `saw_any_frame` 由调用方从帧迭代器取（见
+    /// 三个标志都由调用方从帧迭代器取（见
     /// [`crate::upstream::sse::SseFramesIter::premature_end`]）。
     ///
-    /// 判定顺序（与 Go 侧 `streamFailureMessage` 同一口径）：
+    /// 判定顺序（前四条与 Go 侧 `streamFailureMessage` 同一口径，第五条是本仓
+    /// 2026-10-07 追加的放宽）：
     /// 1. 上游显式发过终止性 error 帧 → 失败（根因优先）
     /// 2. 见过 `[DONE]` → 正常收尾
     /// 3. 没见过 `[DONE]` 且一个 data 帧都没读到（空流）→ 正常收尾
     /// 4. 没见过 `[DONE]` 但已吐过内容 → 失败
-    pub fn failure_message(&self, saw_done: bool, saw_any_frame: bool) -> Option<String> {
+    /// 5. 没见过 `[DONE]`，但上游已宣告过**非空** `finish_reason` → 正常收尾
+    ///    （内容完整，少的只是终止字节；见 `SseFramesIter::saw_finish_reason`）
+    pub fn failure_message(
+        &self,
+        saw_done: bool,
+        saw_any_frame: bool,
+        saw_finish_reason: bool,
+    ) -> Option<String> {
         // ★ 过文案闸门：这里的内容来自上游原文，一个裸「403」就会让 DSH 把
         // 「上游拒绝了这个账号」读成「API 密钥无效」（Go `responses_stream.go:370`
         // 是同一个闸门）。`failure_message` 是流式路径唯一的对外文案出口。
@@ -406,7 +414,7 @@ impl AnthropicStreamState {
         if let Some(e) = &self.upstream_err {
             return Some(gate(&format!("upstream error: {e}")));
         }
-        if saw_done || !saw_any_frame {
+        if saw_done || !saw_any_frame || saw_finish_reason {
             return None;
         }
         Some(gate("upstream stream ended unexpectedly before [DONE]"))
@@ -796,7 +804,7 @@ mod tests {
         .unwrap();
 
         let msg = st
-            .failure_message(true, true)
+            .failure_message(true, true, false)
             .expect("error 帧必须判为失败");
         assert!(msg.contains("channel not approved"), "{msg}");
     }
@@ -808,34 +816,49 @@ mod tests {
         let mut st = AnthropicStreamState::new("m");
         st.consume(&mut out, &chunk(json!({"error":{"msg":"boom"}})))
             .unwrap();
-        assert!(st.failure_message(true, true).is_some(), "error 应优先");
+        assert!(st.failure_message(true, true, false).is_some(), "error 应优先");
     }
 
     /// 见过 [DONE] 且无 error 帧 → 正常收尾。
     #[test]
     fn done_means_normal_end() {
         let st = AnthropicStreamState::new("m");
-        assert!(st.failure_message(true, true).is_none());
+        assert!(st.failure_message(true, true, false).is_none());
     }
 
     /// 空流（一个 data 帧都没读到）→ 正常收尾（合法空回合，无损）。
     #[test]
     fn empty_stream_is_not_a_failure() {
         let st = AnthropicStreamState::new("m");
-        assert!(st.failure_message(false, false).is_none());
+        assert!(st.failure_message(false, false, false).is_none());
     }
 
-    /// 吐过内容却没见过 [DONE] 就断了（空闲超时 / 上游提前关连接）→ 失败。
-    ///
-    /// 不能拿 finish_reason 当收尾标志：上游是先给 finish_reason 再写 [DONE]，
-    /// 而那一瞬正是空闲超时最容易掐断的位置。
+    /// 吐过内容、也没见过 finish_reason、更没见过 [DONE] 就断了
+    /// （空闲超时 / 上游提前关连接）→ 失败。
     #[test]
     fn truncated_stream_without_done_is_a_failure() {
         let st = AnthropicStreamState::new("m");
         let msg = st
-            .failure_message(false, true)
+            .failure_message(false, true, false)
             .expect("吐了内容却没 [DONE] 必须判为失败");
         assert!(msg.contains("before [DONE]"), "{msg}");
+    }
+
+    /// 上游已宣告过非空 `finish_reason`，只是终止字节 `[DONE]` 没到 → 正常收尾。
+    ///
+    /// 2026-10-07 追加：上游是**先**给 finish_reason、**后**写 [DONE]，两者之间
+    /// 那一瞬恰是连接最容易被掐断的位置。此时内容已经完整，仍判失败会让用户看到
+    /// 「回答写完了却报本轮运行失败」，客户端只能整轮重试（重新生成，昂贵得多）。
+    #[test]
+    fn finish_reason_without_done_is_not_a_failure() {
+        let st = AnthropicStreamState::new("m");
+        assert!(st.failure_message(false, true, true).is_none());
+        // 但上游显式报错仍优先（根因优先，不看 finish_reason）。
+        let mut st2 = AnthropicStreamState::new("m");
+        let mut out = SseOut::new();
+        st2.consume(&mut out, &chunk(json!({"error":{"msg":"boom"}})))
+            .unwrap();
+        assert!(st2.failure_message(false, true, true).is_some());
     }
 
     /// error 帧文案抽取兼容多种形态。
