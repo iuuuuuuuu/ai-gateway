@@ -633,3 +633,38 @@ Release 的 5 个资产（安装包上传前**改名为 updater 约定名** `ai-
 | 匿名访问（转私有后仍是） | `releases/latest/download/latest.json` **404**、`api.github.com/.../releases` **403**、仓库页 **404** ⇒ 9.6 的结论**未变**，updater 通道对客户端依旧失效 |
 
 ★ 本轮新增的坑：`git add -- 'a','b','c'` 在 PowerShell 里**整串被当成一个 pathspec** ⇒ `fatal: pathspec 'a,b,c' did not match any files`，且**一个文件都不会 staged**。正确写法是数组：`$files = @('a','b','c'); git add -- $files`。
+
+### 9.9 1.0.34 的推送 / tag / Release（2026-10-07，本轮实测）
+
+业主 m29254 报障（「对话过程中对话会输出完就中断」）修复完成后，按与 1.0.32 / 1.0.33 完全相同的流程落地远端。
+
+| 项 | 结果 |
+|---|---|
+| 版本提交 | `cd863ebe661f4c3cb8372e1bf7d552ac5b1398d3`（`feat(1.0.34): 修「对话输出完就中断」（上游已宣告完成时不再误判为截断）`，**20 files / 503 insertions / 69 deletions**）★ 与 1.0.33 不同：本轮的 `PROJECT-STATE.md` 与 `RELEASE_NOTES_1.0.34.md` **一起进版本提交**（1.0.33 时 PROJECT-STATE 是单独的 docs 提交） |
+| tag | `v1.0.34` = annotated，对象 `d555a3dcc12561a3291e2045aed4d9356cf04afa`，指向 `cd863eb`；本地 tag **44 → 45** |
+| `main` | 推送 `b66d5d7..cd863eb`；远端 `refs/heads/main` = `cd863ebe661f4c3cb8372e1bf7d552ac5b1398d3` = 本地 HEAD |
+| tag 远端一致性 | 远端 `refs/tags/v1.0.34` = `d555a3dc…`，与本地一致（本地 tag 45、远端 tag 45） |
+| Release | tag `v1.0.34`，id **`405456103`**，`draft=false prerelease=false`，`target_commitish=main`，正文 = `.github\RELEASE_NOTES_1.0.34.md` 全文（`bodyLen=8327`，文件 13,965 B / 8,327 字符，`body === file` 为 true） |
+
+Release 的 5 个资产（安装包上传前**改名为 updater 约定名** `ai-gateway-windows-x86_64-setup.exe`）：
+
+| asset | bytes | assetId |
+|---|---|---|
+| `ai-gateway-windows-x86_64-setup.exe` | 14626546 | 617830983 |
+| `ai-gateway-windows-x86_64-setup.exe.sig` | 424 | 617831091 |
+| `ai-gateway_1.0.34_server-x64.exe` | 27160576 | 617831129 |
+| `latest.json` | 1726 | 617831352 |
+| `latest-windows-x86_64.json` | 1726 | 617831389 |
+
+★ `latest.json` 写法同 9.7 / 9.8（`version=1.0.34`、两个平台键的 `signature` 都是 `.sig` 逐字、`url` 指向 `releases/latest/download/ai-gateway-windows-x86_64-setup.exe`、两份文件内容完全相同）。`pub_date` = `2026-10-07T14:40:00Z`。上传源目录 `\.scratch\rel34\upload\`（安装包 / `.sig` / server 从 `dist\` 改名复制，`buf.equals` 逐字节相同）。
+
+**发布后复核（实测，不是推断）**
+
+| 检查 | 结果 |
+|---|---|
+| `releases/latest` | 指向 `v1.0.34`（id `405456103`），`draft=false prerelease=false`，`bodyLen=8327`，5 资产 |
+| 资产逐字节核对（走 API + token 真下回来） | 5 个资产 `buf.equals(local)=true`：安装包 `14626546` / `6B87A399…`、`.sig` `424` / `66A7A984…`、server `27160576` / `70E72BD0…`、两个 `latest*.json` `1726` / `4E2210E4353BDE4F…` |
+| 匿名访问（转私有后仍是） | `releases/latest/download/latest.json` **404**、`api.github.com/.../releases` **403** ⇒ 9.6 的结论**未变**，updater 通道对客户端依旧失效 |
+
+★ 凭据流程与 9.8 相同：`\.tmp\ghtoken.ps1`（CredRead P/Invoke，脚本本身不含字面 token）⇒ 写 `\.tmp\ghtoken.txt`（40 B `gho_`）⇒ 用完**立即删除**（`ghtoken.txt` 已删，`ghtoken.ps1` 保留复用）。推送前的 `GIT_TERMINAL_PROMPT=0` / `GCM_INTERACTIVE=never` / `GCM_PROVIDER=generic` 三件套同样必要。
+★ 本轮 `git add` 沿用 9.8 的数组写法（`$files = @(...); git add -- $files`），20 个路径一次 staged，无 pathspec 报错。
