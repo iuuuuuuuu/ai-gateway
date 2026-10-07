@@ -592,7 +592,7 @@ Release 的 5 个资产（安装包上传前**改名为 updater 约定名** `ai-
 | 版本提交 | `2263b173ada5abe68e1d94511e6a798f7687bdc6`（`feat(1.0.33): 修裸名模型抽到 Trae 账号（兜底清单权威性）+ 启动预热`，18 files / 459 insertions / 26 deletions） |
 | 文档提交 | `868db64f8bca1d396b96a1efde6a6e820aa5a5cf`（`docs(1.0.33): PROJECT-STATE 记录 1.0.33`，1 file / 46 insertions / 28 deletions）—— 与 1.0.32 同规矩：tag 只落**版本提交** |
 | tag | `v1.0.33` = annotated，对象 `19f06b1c9c188fec94a92806b9e10208778b7b42`，指向 `2263b17`；本地 tag **43 → 44** |
-| `main` | 推送 `8624461..868db64`；远端 `refs/heads/main` = `868db64f8bca1d396b96a1efde6a6e820aa5a5cf` = 本地 HEAD |
+| `main` | 推送 `8624461..868db64`（发布时）⇒ 随后又推 `868db64..2048591`（本节的文档提交）；远端 `refs/heads/main` 现为 `2048591e97b07bdcd16f169065e0c99c2445ffb5` = 本地 HEAD |
 | tag 远端一致性 | 远端 `refs/tags/v1.0.33` = `19f06b1c…`，与本地一致（本地 tag 44） |
 | Release | tag `v1.0.33`，id **`405310590`**，`draft=false prerelease=false`，`target_commitish=main`，正文 = `.github\RELEASE_NOTES_1.0.33.md` 全文（`bodyLen=7872`，文件 13,051 B） |
 
