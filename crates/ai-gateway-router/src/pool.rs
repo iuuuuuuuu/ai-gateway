@@ -843,6 +843,33 @@ pub struct Pool {
     product_model_set: HashMap<String, HashSet<String>>,
     /// 网关自己补的兜底清单（只影响「不排除」）。
     product_model_fallback_set: HashMap<String, HashSet<String>>,
+    /// 「兜底清单**权威**的产品集合」（产品名，小写）。
+    ///
+    /// # 为什么必须区分「猜测」与「权威」（2026-10-07 所有者现场）
+    ///
+    /// 兜底清单有两种来源，可信度天差地别：
+    ///
+    /// - WorkBuddy 那份是 `static_workbuddy_model_ids`，2026-09-18 的人工快照 ——
+    ///   上游新上模型它就落空，只能算**猜测**；
+    /// - Trae 那份是 `products::trae::dispatch::static_trae_model_ids`，派生自
+    ///   客户端别名表（文档原话：它是**唯一**的模型名真相）—— 对「上游能不能解析
+    ///   这个名字」而言是**权威**的。
+    ///
+    /// 未区分之前，两种「未命中」被一视同仁地降级到 `guess_excluded`（最后一档
+    /// 才放开）。于是业主现场：`space-bunny` 既不在 WorkBuddy 兜底清单、也不在
+    /// Trae 兜底清单 ⇒ 27 个 WorkBuddy 账号与 **1 个 Trae 账号**一起进最后一档
+    /// ⇒ 按权重抽签 ⇒ 约 3% 的概率抽到 Trae ⇒ 上游回 4001 ⇒ 业主看到的
+    /// `400 model_not_in_upstream`「两条产品线的 function 池（chat_v3 /
+    /// solo_work_lite）都拒绝了 space-bunny」。
+    ///
+    /// 标记为权威的产品，其兜底清单未命中即「**确定**没有该模型」
+    ///（见 [`Pool::product_definitely_lacks_model`]）⇒ 该产品的账号进 `scoped`
+    /// （硬排除），不再与「只是没听说过」的账号平等抽签。
+    ///
+    /// ⚠ 只标记**兜底清单即全量真相**的产品。WorkBuddy 绝不能进这个集合 ——
+    /// 那会把它打回 2026-10-06 的 503（`space-bunny` 这类新模型在任何路径上
+    /// 都选不出号）。
+    product_fallback_authoritative: HashSet<String>,
     /// 「产品 → 上游**实测**存在的模型集合」（运行期从真值刷新，见
     /// `[Pool::observe_product_models`]）。
     ///
@@ -958,6 +985,7 @@ impl Pool {
             cost_weight: 0.3,
             product_model_set: HashMap::new(),
             product_model_fallback_set: HashMap::new(),
+            product_fallback_authoritative: HashSet::new(),
             product_model_observed_set: HashMap::new(),
             product_truth_regions: HashMap::new(),
             product_model_regions: HashMap::new(),
@@ -1086,6 +1114,33 @@ impl Pool {
     /// - `set_product_models_fallback` 网关兜底（猜测）→ **只**参与「不排除」
     pub fn set_product_models_fallback(&mut self, by_product: &HashMap<String, Vec<String>>) {
         self.product_model_fallback_set = normalize_product_models(by_product);
+    }
+
+    /// 标记哪些产品的兜底清单是**权威**的（未命中即「确定没有」，见字段文档）。
+    ///
+    /// 调用点：`bin/gateway.rs` 只把 `trae` 放进来。**绝不要**把 `workbuddy`
+    /// 也放进来 —— 它的静态表是快照，当权威会退回 2026-10-06 的 503。
+    ///
+    /// 传空切片等于「谁都不权威」（回到 2026-10-06 的行为）。
+    pub fn set_product_fallback_authoritative(&mut self, products: &[String]) {
+        self.product_fallback_authoritative = products
+            .iter()
+            .map(|p| p.trim().to_ascii_lowercase())
+            .filter(|p| !p.is_empty())
+            .collect();
+    }
+
+    /// 该产品的兜底清单是否是**权威**的（且确实存在）。
+    fn fallback_authoritative(&self, product: &str) -> bool {
+        if !self.product_fallback_authoritative.contains(product) {
+            return false;
+        }
+        // 权威但**空**的兜底清单等于「网关没有更多信息」，不能当「已知没有」
+        //（与 [`Pool::product_may_serve`] 里 `fb` 的非空判据保持一致）。
+        self.product_model_fallback_set
+            .get(product)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
     }
 
     /// 用上游**实测**的模型清单刷新某产品的「观测集」（只增不减）。
@@ -1223,6 +1278,19 @@ impl Pool {
     ///
     /// 旧代码把两者一视同仁地扔进 `scoped`，于是第 2 种会**灭绝**整个产品
     /// —— 27 个账号全被排除，报 503「所有账号不可用」。
+    ///
+    /// # 第 3 种成因（2026-10-07 新增）：兜底清单**权威**且未命中
+    ///
+    /// `product_may_serve` 的 `false` 还有第三种成因：网关自己补的兜底清单
+    /// **未命中**。它是不是「确定」，取决于这份清单够不够格当真相 ——
+    /// 见 [`Pool::product_fallback_authoritative`]：
+    ///
+    /// - Trae 的清单派生自客户端别名表，对「上游能不能解析这个名字」是权威的
+    ///   ⇒ 未命中 = 确定没有；
+    /// - WorkBuddy 的静态表是 2026-09-18 快照 ⇒ 未命中只是猜测，**不**算确定。
+    ///
+    /// ⚠ 实测观测集（`product_model_observed_set`）永远**不**算否定：它可能只
+    /// 覆盖了一个区域，拿它当否定会误杀另一个区域独有的模型。
     pub fn product_definitely_lacks_model(&self, product: &str, model: &str) -> bool {
         if model.is_empty() || !self.multi_product_on {
             return false;
@@ -1230,10 +1298,11 @@ impl Pool {
         if self.product_may_serve(product, model) {
             return false;
         }
-        // 只有**宿主清单**（可信来源）说「没有」才算确定。实测观测集不算 ——
-        // 它可能只覆盖了一个区域，拿它当否定会误杀另一个区域独有的模型。
+        // ① 宿主清单（最可信来源）说「没有」⇒ 确定。
+        // ② 权威兜底清单未命中 ⇒ 也确定（Trae 事故的硬保护）。
+        // ③ 观测集不算 —— 它可能只覆盖了一个区域。
         let (_, known) = self.product_offers_model(product, model);
-        known
+        known || self.fallback_authoritative(product)
     }
 
     /// 报告三份清单里**有没有任何一份**包含该模型（= 有没有依据说它能服务）。
@@ -2606,6 +2675,19 @@ impl Pool {
                 declared.push(uid);
             } else if self.product_definitely_lacks_model(&product, model) {
                 // 宿主清单**已知**且明确没有 → 确定排除（Trae 事故那一档，必须保留）
+                scoped.push(uid);
+            } else if self.fallback_authoritative(&product) {
+                // ★★ 2026-10-07 业主现场：**权威**兜底清单未命中同样是「确定没有」。
+                //
+                // 与上一支的差别只在**依据来源**：上一支靠宿主下发的清单，这一支
+                // 靠网关自补的权威清单（目前只有 Trae）。两支都进 `scoped`。
+                //
+                // 为什么不能让它落到 `guess_excluded`：那里装的是「我们**没听说过**
+                // 这个模型名」的账号 —— 它们可能真的有（`space-bunny` 之于
+                // WorkBuddy）。Trae 的清单是别名表，`space-bunny` 不可能被上游解析
+                // ⇒ 让它进最后一档抽签，就是拿 27 个可能成功的号去陪 1 个注定
+                // 失败的号（实测抽中率约 3%，表现为业主那条
+                // `400 model_not_in_upstream`）。
                 scoped.push(uid);
             } else if !self.product_may_serve(&product, model) {
                 // ★ 仅「静态兜底清单未命中」→ **只降级，不灭绝**（2026-10-06 修复）
@@ -4920,5 +5002,108 @@ mod tests {
                 .is_some(),
             "区域相符时粘性照常命中"
         );
+    }
+
+    /// ★★★ 2026-10-07 业主现场回归：裸名 `space-bunny` 被抽中 Trae 账号。
+    ///
+    /// 现场：Rust 1.0.32 网关，宿主清单只有 qoder / zcode，workbuddy 与 trae 都靠
+    /// 网关自补的兜底清单。`space-bunny` 两份兜底清单都没有 ⇒ 27 个 WorkBuddy 账号
+    /// 与 1 个 Trae 账号一起进 `guess_excluded`（最后一档）⇒ 抽签抽到 Trae
+    /// ⇒ 上游回 4001 ⇒ 业主看到
+    /// `400 model_not_in_upstream`（「两条产品线的 function 池都拒绝了 space-bunny」）。
+    ///
+    /// 修法：Trae 的兜底清单派生自客户端别名表（上游 config_name 解析的唯一真相）
+    /// ⇒ 标记**权威** ⇒ 未命中即「确定没有」⇒ 进 `scoped`（硬排除）。
+    /// WorkBuddy **不**标记 ⇒ 它的「未命中」仍然只降级（否则退回 2026-10-06 的 503）。
+    #[test]
+    fn authoritative_fallback_keeps_bare_model_off_that_product() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        p.add(mk_product("wb1", "workbuddy"));
+        p.add(mk_product("tr1", "trae"));
+        // 宿主清单：只有 qoder / zcode（业主机器上的真实形状）
+        let mut pm: HashMap<String, Vec<String>> = HashMap::new();
+        pm.insert("qoder".into(), vec!["Qwen3.8-Flash".into()]);
+        pm.insert("zcode".into(), vec!["zcode:glm-5".into()]);
+        p.set_product_models(&pm);
+        // 兜底清单：workbuddy 是快照（不权威）、trae 是别名表（权威）
+        let mut fb: HashMap<String, Vec<String>> = HashMap::new();
+        fb.insert("workbuddy".into(), vec!["deepseek-v4.1-flash".into()]);
+        fb.insert("trae".into(), vec!["glm-5.2".into()]);
+        p.set_product_models_fallback(&fb);
+        p.set_product_fallback_authoritative(&["trae".to_string()]);
+
+        // Trae 未命中 ⇒ **确定**没有 ⇒ 硬排除（不再进最后一档抽签）
+        assert!(
+            p.product_definitely_lacks_model("trae", "space-bunny"),
+            "权威兜底清单未命中 = 确定没有（Trae 保护）"
+        );
+        // Trae 自己有的模型照旧放行，不能因噎废食
+        assert!(!p.product_definitely_lacks_model("trae", "glm-5.2"));
+        // WorkBuddy 是快照 ⇒ 未命中只是猜测 ⇒ **不**算确定（否则退回 503）
+        assert!(
+            !p.product_definitely_lacks_model("workbuddy", "space-bunny"),
+            "非权威兜底清单未命中不得当成「确定没有」"
+        );
+
+        // 裸名抽 200 次，一次都不许落到 Trae 上
+        for _ in 0..200 {
+            let a = p.pick_for_model_any("space-bunny", &[]).unwrap();
+            assert_eq!(
+                a.uid, "wb1",
+                "裸名 space-bunny 只能落到 WorkBuddy（Trae 上游解析不了这个名字）"
+            );
+        }
+    }
+
+    /// 权威兜底清单**空**时不得当权威 —— 与 `product_may_serve` 里 `fb` 的非空
+    /// 判据保持一致：「网关没有更多信息」不能当成「已知没有」。
+    #[test]
+    fn authoritative_fallback_needs_a_non_empty_list() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        p.add(mk_product("tr1", "trae"));
+        p.set_product_fallback_authoritative(&["trae".to_string()]);
+        // 没有任何兜底清单（哪怕标了权威）⇒ 真不知道 ⇒ 不排除
+        assert!(
+            !p.product_definitely_lacks_model("trae", "space-bunny"),
+            "权威但空的兜底清单等于「没有信息」，不得排除账号"
+        );
+        assert!(p.pick_for_model_any("space-bunny", &[]).is_some());
+    }
+
+    /// 粘性路径也要过权威闸：会话此前绑过 Trae 号，再发裸名 `space-bunny` 必须解绑。
+    ///
+    /// 业主日志里 `gpt-6-astra` 与 `space-bunny` **先后落到同一个 Trae 账号**
+    /// （`trae-2593120869167228`），正是这条路径。
+    #[test]
+    fn sticky_pick_rejects_an_account_from_a_product_with_an_authoritative_list() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        p.add(mk_product("wb1", "workbuddy"));
+        p.add(mk_product("tr1", "trae"));
+        let mut fb: HashMap<String, Vec<String>> = HashMap::new();
+        fb.insert("workbuddy".into(), vec!["deepseek-v4.1-flash".into()]);
+        fb.insert("trae".into(), vec!["glm-5.2".into()]);
+        p.set_product_models_fallback(&fb);
+        p.set_product_fallback_authoritative(&["trae".to_string()]);
+
+        assert!(
+            p.pick_by_uid_for_model_product_region("tr1", "space-bunny", Region::Any, "")
+                .is_none(),
+            "绑在 Trae 号上的会话遇到 Trae 解析不了的模型必须解绑重选"
+        );
+        assert!(
+            p.pick_by_uid_for_model_product_region("tr1", "glm-5.2", Region::Any, "")
+                .is_some(),
+            "Trae 真有的模型，粘性照常命中"
+        );
+        // 裸名主路径同样选不到 Trae
+        for _ in 0..100 {
+            let a = p
+                .pick_for_model_product_region("space-bunny", &[], Region::Any, "")
+                .unwrap();
+            assert_eq!(a.uid, "wb1");
+        }
     }
 }

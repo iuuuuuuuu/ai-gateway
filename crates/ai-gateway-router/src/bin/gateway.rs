@@ -143,6 +143,9 @@ async fn main() {
         let pm = &cfg.product_models;
         let mut fallback: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
+        // 兜底清单**权威**的产品（未命中即「确定没有」，见
+        // [`ai_gateway_router::pool::Pool::product_fallback_authoritative`]）。
+        let mut authoritative: Vec<String> = Vec::new();
         if pm.get("workbuddy").map(|v| v.is_empty()).unwrap_or(true) {
             let ids = ai_gateway_router::server::static_workbuddy_model_ids();
             println!(
@@ -161,8 +164,28 @@ async fn main() {
                 ids.len()
             );
             fallback.insert("trae".to_string(), ids);
+            // ★★ 2026-10-07：Trae 这份兜底清单是**权威**的。
+            //
+            // 它不是人工快照，而是派生自 `dispatch::ALIASES` —— 客户端唯一能发的
+            // 名字集合，也正是上游 config_name 解析的唯一真相。因此「别名表里没有」
+            // ⇒「Trae 上游解析不了这个模型名」是**确定结论**：该产品的账号必须被
+            // 硬排除，而不是降级到「最后一档抽签」。
+            //
+            // 现场（业主 2026-10-07 07:3x，Rust 1.0.32）：`space-bunny` 不在任何一份
+            // 兜底清单里 ⇒ 27 个 WorkBuddy 账号与 1 个 Trae 账号一起进最后一档
+            // ⇒ 约 3% 概率抽到 Trae ⇒ 业主看到
+            // `400 model_not_in_upstream`（「两条产品线的 function 池都拒绝了
+            // space-bunny」）。标记权威后 Trae 进 `scoped`，最后一档只剩 WorkBuddy。
+            //
+            // ⚠ **只**能标记 Trae。WorkBuddy 的静态表是 2026-09-18 快照，把它当权威
+            // 会立刻退回 2026-10-06 的 503（`space-bunny` 这类新模型全池挑不出号）。
+            authoritative.push("trae".to_string());
+            println!(
+                "product_models 缺 trae：兜底清单标记为**权威**（未命中 = 确定没有，其账号不参与裸名兜底抽签）"
+            );
         }
         pool.set_product_models_fallback(&fallback);
+        pool.set_product_fallback_authoritative(&authoritative);
         pool.set_product_models(pm);
 
         // 用户白名单（平台 × 区域 → 允许的模型）。
@@ -882,6 +905,25 @@ async fn main() {
         cfg.state_file
     );
     let app = router(state.clone());
+
+    // ★★ 启动即预热上游真值（2026-10-07）。
+    //
+    // 没有它，进程起来到「第一次有人访问 /v1/models」之间的窗口里，池子既不知道
+    // 哪些模型属于哪个区，也不知道上游此刻有哪些模型 —— 裸名请求会选中错区账号，
+    // 报「模型在当前通道上不存在」。业主的两次现场都落在窗口内。
+    //
+    // 放在 `axum::serve` **之前** spawn：不阻塞监听（预热是网络动作，最长可能
+    // 几十秒），但也不晚于第一个请求 —— 两个上游请求并行不了（`region_snapshot`
+    // 内部按区顺序拉），故它只影响「刚启动那一两秒」的选号质量。
+    //
+    // ⚠ 失败静默：预热是**优化**不是前提，拉不到就退化成既有行为。
+    {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            ai_gateway_router::server::warm_up_live_models(&state).await;
+            eprintln!("[warmup] 上游模型真值预热完成（观测集已填充，裸名请求不再选中错区账号）");
+        });
+    }
 
     // 后台落盘：池状态与用量统计每 5 秒 flush 一次（与 Go 侧 flusher 同周期）。
     // 进程退出前还会各补一次（见下面的 shutdown 分支）。

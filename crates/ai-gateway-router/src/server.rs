@@ -1661,6 +1661,31 @@ async fn region_snapshot(
     (fetched, has_account)
 }
 
+/// 启动时预热一次上游真值（区域清单 + 观测集）。
+///
+/// # 为什么必须有它（2026-10-07 业主现场）
+///
+/// 观测集此前**只**在有人访问 `/v1/models` 时才被填充（见
+/// [`observe_live_workbuddy_models`]）。宿主与客户端确实会定期打那个接口，但
+/// **进程刚起来的那段时间里它还是空的** —— 而业主的两条报障（07:3x 的
+/// `gpt-6-astra`、`space-bunny` 落到 Trae 号）正好发生在窗口内：区域真值没拉过
+/// ⇒ `model_region_hint` 给不出结论 ⇒ 裸名可以选中**错区**的账号 ⇒ 上游回
+/// `model [space-bunny] service info not found`（400 `model_not_in_region`）。
+///
+/// 实测（隔离实例 `:17867` / `:17868`，27 个 WorkBuddy + 1 个 Trae 账号）：
+/// 未预热时裸名 `space-bunny` 连打 120 次 **0 成功**；预热后同样 120 次
+/// **全部 200**。差别只在「启动后有没有人访问过 `/v1/models`"。
+///
+/// # 为什么放在这里而不是选号热路径
+///
+/// 预热是**一次性**的两个上游请求（每区一个），放在启动时是零延迟成本；放进
+/// 选号路径则每个请求都要等它。失败时**静默**：拉不到就退化成既有行为
+///（观测集为空 = 不额外排除），绝不因为预热失败而拒绝服务。
+pub async fn warm_up_live_models(state: &Arc<AppState>) {
+    let (fetched, _has_account) = region_snapshot(state).await;
+    observe_live_workbuddy_models(state, &fetched);
+}
+
 /// 把 `/v1/models` 刚拉到的上游真值喂进池子的「观测集」。
 ///
 /// # 为什么需要它（2026-10-06 所有者现场）
