@@ -117,7 +117,7 @@ pub fn anthropic_to_chat(raw: &[u8]) -> Result<(Vec<u8>, String), String> {
     // assistant.tool_calls 与 role:tool 对不上，上游命中直接 400 code=11148。
     let fixed = rectify_chat_tool_sequence(&mut messages);
     if fixed > 0 {
-        eprintln!("rectify /v1/messages tool sequence: fixed={fixed}");
+        crate::logline!("rectify /v1/messages tool sequence: fixed={fixed}");
     }
 
     let target_model = resolve_claude_model(&req.model);

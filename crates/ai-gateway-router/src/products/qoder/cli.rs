@@ -479,7 +479,7 @@ async fn run_import_client(args: &[String]) -> i32 {
         match client_import::find_client_app_dir() {
             Some(found) => dir = found,
             None => {
-                eprintln!(
+                crate::logline!(
                     "找不到 Qoder 客户端的登录数据。请先在 Qoder 客户端里登录一次\
                      （会自动探测 %APPDATA%\\com.qodercn.app.stable 等目录）。"
                 );
@@ -501,11 +501,11 @@ async fn run_import_client(args: &[String]) -> i32 {
     {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
-            eprintln!("读取 Qoder 客户端凭证失败: {e}");
+            crate::logline!("读取 Qoder 客户端凭证失败: {e}");
             return 1;
         }
         Err(e) => {
-            eprintln!("读取 Qoder 客户端凭证失败: 后台解密任务异常结束（{e}）");
+            crate::logline!("读取 Qoder 客户端凭证失败: 后台解密任务异常结束（{e}）");
             return 1;
         }
     };
@@ -533,7 +533,7 @@ async fn run_import_client(args: &[String]) -> i32 {
         ..Default::default()
     };
     if c.uid.is_empty() {
-        eprintln!("客户端凭证里没有 user.id，无法确定账号标识");
+        crate::logline!("客户端凭证里没有 user.id，无法确定账号标识");
         return 1;
     }
     if c.machine_id.is_empty() {
@@ -544,12 +544,12 @@ async fn run_import_client(args: &[String]) -> i32 {
 
     // ⚠ 0700 在 Windows 上是空操作（与 Go `os.MkdirAll(dir, 0o700)` 同）。
     if let Err(e) = std::fs::create_dir_all(&auth_dir) {
-        eprintln!("创建凭证目录失败: {e}");
+        crate::logline!("创建凭证目录失败: {e}");
         return 1;
     }
     c.file_path = login::join_path(&auth_dir, &format!("qoder-{}.json", login::sanitize_uid(&c.uid)));
     if let Err(e) = c.save_atomic() {
-        eprintln!("保存凭证失败: {e}");
+        crate::logline!("保存凭证失败: {e}");
         return 1;
     }
 
@@ -588,13 +588,13 @@ async fn run_url(args: &[String]) -> i32 {
     let s = match login::login_start(r) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{e}");
+            crate::logline!("{e}");
             return 1;
         }
     };
     let auth_dir = fs.get("auth-dir");
     if let Err(e) = login::save_session(&auth_dir, &s) {
-        eprintln!("保存登录会话失败: {e}");
+        crate::logline!("保存登录会话失败: {e}");
         return 1;
     }
 
@@ -630,7 +630,7 @@ async fn run_poll(args: &[String]) -> i32 {
     let s = match login::load_session(&auth_dir, &session_id) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{e}");
+            crate::logline!("{e}");
             return 1;
         }
     };
@@ -670,7 +670,7 @@ async fn run_poll(args: &[String]) -> i32 {
         // 其它错误：授权已被上游拒绝（如用户点了取消），清掉会话
         Err(e) => {
             let _ = std::fs::remove_file(login::session_file(&auth_dir, &session_id));
-            eprintln!("{e}");
+            crate::logline!("{e}");
             1
         }
     }

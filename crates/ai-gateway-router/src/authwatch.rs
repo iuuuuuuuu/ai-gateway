@@ -98,7 +98,7 @@ pub fn start_auth_dir_watch(
     interval: Duration,
 ) -> AuthDirWatch {
     if dir.is_empty() {
-        eprintln!("[watch] auths 目录未配置，跳过热加载监听");
+        crate::logline!("[watch] auths 目录未配置，跳过热加载监听");
         return AuthDirWatch::inert();
     }
     let interval = if interval.is_zero() {
@@ -107,10 +107,10 @@ pub fn start_auth_dir_watch(
         interval
     };
     let Some(base) = dir_fingerprint(dir) else {
-        eprintln!("[watch] auths 目录 {dir} 不可读，跳过热加载监听（加账号后需手动重启）");
+        crate::logline!("[watch] auths 目录 {dir} 不可读，跳过热加载监听（加账号后需手动重启）");
         return AuthDirWatch::inert();
     };
-    eprintln!(
+    crate::logline!(
         "[watch] auths 目录监听已启用（每 {interval:?} 检查一次，新增账号自动加载，无需重启）"
     );
 
@@ -153,13 +153,13 @@ fn reload_auth_dir(pool: &Arc<Mutex<Pool>>, dir: &str) {
     //     照单全收的话，一次目录瞬时不可读就会被当成「凭证全被删了」，整个账号池
     //     被清空 —— 与 Go 的意图正好相反。
     if !Path::new(dir).is_dir() {
-        eprintln!("WARN: [watch] {dir} 不是目录或不可读，本轮跳过（保持现有池状态）");
+        crate::logline!("WARN: [watch] {dir} 不是目录或不可读，本轮跳过（保持现有池状态）");
         return;
     }
     let auths = match auth::load_dir(dir) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("WARN: [watch] 重新加载 {dir} 失败: {e}（保持现有池状态）");
+            crate::logline!("WARN: [watch] 重新加载 {dir} 失败: {e}（保持现有池状态）");
             return;
         }
     };
@@ -175,12 +175,12 @@ fn reload_auth_dir(pool: &Arc<Mutex<Pool>>, dir: &str) {
     };
 
     if after != before {
-        eprintln!(
+        crate::logline!(
             "[watch] auths 目录变化：账号数 {before} → {after}（已热加载，无需重启；当前可选 {available}）"
         );
     } else {
         // 数量没变但内容变了（凭证刷新 / 文件改名）也要落一条，便于对账。
-        eprintln!("[watch] auths 目录变化：账号数保持 {before}（已热加载凭证更新；当前可选 {available}）");
+        crate::logline!("[watch] auths 目录变化：账号数保持 {before}（已热加载凭证更新；当前可选 {available}）");
     }
 }
 

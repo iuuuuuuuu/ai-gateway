@@ -135,7 +135,7 @@ pub fn load_credentials(dir: &str) -> (Vec<Auth>, Vec<String>) {
             // 只有**变化**才写盘：`LoadFile` 在每个请求路径上都会被调用，
             // 无条件写会让一次对话产生一次磁盘写入（Go 的注释专门警告过）。
             if let Err(e) = cr.save_atomic() {
-                eprintln!(
+                crate::logline!(
                     "Qoder 账号 {} 保存机器指纹失败（该账号本次仍可用，下次启动会重试）：{e}",
                     mask_uid(&cr.uid)
                 );

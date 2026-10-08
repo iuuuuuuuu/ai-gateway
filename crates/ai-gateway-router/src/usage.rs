@@ -531,7 +531,7 @@ impl Stats {
         self.dirty.store(false, Ordering::Relaxed);
 
         let Ok(raw) = serde_json::to_string_pretty(&state) else {
-            eprintln!("usage: 序列化失败");
+            crate::logline!("usage: 序列化失败");
             self.dirty.store(true, Ordering::Relaxed);
             return;
         };
@@ -541,12 +541,12 @@ impl Stats {
         // 原子写：先写 tmp 再 rename，避免进程中断留下半截文件。
         let tmp = format!("{}.tmp", self.path);
         if let Err(e) = std::fs::write(&tmp, raw) {
-            eprintln!("usage: 落盘失败: {e}");
+            crate::logline!("usage: 落盘失败: {e}");
             self.dirty.store(true, Ordering::Relaxed);
             return;
         }
         if let Err(e) = std::fs::rename(&tmp, &self.path) {
-            eprintln!("usage: 落盘失败: {e}");
+            crate::logline!("usage: 落盘失败: {e}");
             let _ = std::fs::remove_file(&tmp);
             self.dirty.store(true, Ordering::Relaxed);
         }
@@ -635,11 +635,11 @@ fn load(path: &str) -> Inner {
         return Inner::default();
     };
     let Ok(fs) = serde_json::from_str::<FileState>(&raw) else {
-        eprintln!("usage: 解析 {path} 失败，忽略");
+        crate::logline!("usage: 解析 {path} 失败，忽略");
         return Inner::default();
     };
     if fs.version > 1 {
-        eprintln!("usage: {path} 版本 {} 高于当前支持，忽略", fs.version);
+        crate::logline!("usage: {path} 版本 {} 高于当前支持，忽略", fs.version);
         return Inner::default();
     }
     let mut inner = Inner {

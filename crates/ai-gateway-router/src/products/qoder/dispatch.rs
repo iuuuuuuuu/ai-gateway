@@ -98,7 +98,7 @@ impl Dispatch {
         let (model_key, models, ok) = self.resolve_model_key(&mut cr, &client_model).await;
         if !ok {
             // ★ 在**发请求之前**拒绝，绝不降级为原样透传。
-            eprintln!(
+            crate::logline!(
                 "qoder dispatch uid={} region={}: 上游没有模型 {:?}（清单 {} 个），已拒绝（不发请求）",
                 a.uid,
                 cr.region.label(),
@@ -117,7 +117,7 @@ impl Dispatch {
         //   整个请求失败（Go 同款口径）。真正失效时下一步的上游调用会给出错误。
         if token::needs_refresh(&cr, token::REFRESH_SKEW) && !cr.drt.is_empty() {
             if let Err(e) = token::refresh_token(&mut cr, self.client.rpc()).await {
-                eprintln!("qoder dispatch uid={}: 刷新令牌失败，沿用现有令牌: {e}", a.uid);
+                crate::logline!("qoder dispatch uid={}: 刷新令牌失败，沿用现有令牌: {e}", a.uid);
             }
         }
 
@@ -192,7 +192,7 @@ impl Dispatch {
                 models
             }
             Err(e) => {
-                eprintln!(
+                crate::logline!(
                     "qoder dispatch uid={}: 拉取模型清单失败（本次不校验模型名，原样透传）: {e}",
                     cr.uid
                 );

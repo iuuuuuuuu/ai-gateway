@@ -43,7 +43,7 @@ async fn main() {
         pool.add(a);
     }
     if n == 0 {
-        eprintln!("warning: 未从 {auth_dir} 加载到任何凭证");
+        ai_gateway_router::logline!("warning: 未从 {auth_dir} 加载到任何凭证");
     }
     println!(
         "state restored={loaded_state} (state_file={})",
@@ -67,7 +67,7 @@ async fn main() {
     }) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("构造上游客户端失败: {e}");
+            ai_gateway_router::logline!("构造上游客户端失败: {e}");
             std::process::exit(1);
         }
     };

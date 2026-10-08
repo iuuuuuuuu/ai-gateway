@@ -452,7 +452,7 @@ impl Runner {
         if cur.needs_accept() {
             match self.accept_tasks(a, &[code.to_string()]).await {
                 Err(e) => {
-                    eprintln!(
+                    crate::logline!(
                         "growtask: accept {code} uid={}: {e}（继续走行为链路）",
                         uid8(&a.uid)
                     );
@@ -655,7 +655,7 @@ impl Runner {
         match self.up.list_growth_tasks(a).await {
             Ok(tasks) => index_tasks(tasks).remove(code),
             Err(e) => {
-                eprintln!("growtask: refetch {code} uid={}: {e}", uid8(&a.uid));
+                crate::logline!("growtask: refetch {code} uid={}: {e}", uid8(&a.uid));
                 None
             }
         }
@@ -752,7 +752,7 @@ impl Runner {
         let detail = format!(
             "执行 {done} 项（跳过 {skipped}、失败 {failed}），领奖 {claimed} 项 +{credit} 积分 +{energy} 能量"
         );
-        eprintln!("growtask: uid={} {detail}", uid8(&a.uid));
+        crate::logline!("growtask: uid={} {detail}", uid8(&a.uid));
         // 一轮什么都没做（全部跳过）不值得写记录：那是「无变化」，天天写只会刷屏。
         if done == 0 && failed == 0 {
             return;

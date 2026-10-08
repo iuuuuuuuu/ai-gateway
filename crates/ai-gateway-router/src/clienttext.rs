@@ -113,7 +113,7 @@ pub fn client_safe_message(msg: &str) -> String {
         // 与 Go 一样在此处报警：出现裸 401/403 说明**某处文案自己带上了状态码**，
         // 应当去修那个产出点，而不是长期依赖这道闸门兜着。
         // （Go 侧是 `log.Printf`，本 crate 既有代码统一用 `eprintln!`。）
-        eprintln!(
+        crate::logline!(
             "clienttext: 文案里出现裸 401/403，已就地改写为 4xx（请修正该文案的产出点）：{msg:?}"
         );
     }

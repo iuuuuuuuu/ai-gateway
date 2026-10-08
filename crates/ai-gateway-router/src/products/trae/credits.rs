@@ -438,7 +438,7 @@ pub(crate) async fn refresh_credits_once(
             })
             .collect(),
         Err(e) => {
-            eprintln!("Trae 积分刷新：账号池锁中毒，本轮跳过（{e}）");
+            crate::logline!("Trae 积分刷新：账号池锁中毒，本轮跳过（{e}）");
             return (0, 0);
         }
     };
@@ -466,7 +466,7 @@ pub(crate) async fn refresh_credits_once(
         processed += 1;
 
         let Some(cr) = dispatch::cred_of(&a) else {
-            println!(
+            crate::logline!(
                 "trae-credits {}: 凭证不可用于查询（缺 token 或文件读不出），已跳过",
                 mask_uid(&uid)
             );
@@ -475,7 +475,7 @@ pub(crate) async fn refresh_credits_once(
 
         // ★ 端点 CN 专属（真机 providerCode === CN 才发）：国际版直接跳过，不发请求。
         if cr.realm != Realm::Cn {
-            println!(
+            crate::logline!(
                 "trae-credits {}: 国际版（sg）没有这个端点（真机 CN 专属），已跳过",
                 mask_uid(&uid)
             );
@@ -485,7 +485,7 @@ pub(crate) async fn refresh_credits_once(
         let sample = match fetch(cr).await {
             Ok(v) => v,
             Err(e) => {
-                println!("trae-credits {}: {e}", mask_uid(&uid));
+                crate::logline!("trae-credits {}: {e}", mask_uid(&uid));
                 continue;
             }
         };
@@ -505,7 +505,7 @@ pub(crate) async fn refresh_credits_once(
             None => None,
         };
         let Some(value) = value else {
-            println!(
+            crate::logline!(
                 "trae-credits {}: {why}且无到期日，本轮无可写字段（跳过）",
                 mask_uid(&uid)
             );
@@ -517,14 +517,14 @@ pub(crate) async fn refresh_credits_once(
                 p.set_credits_and_expiry(&uid, value, expire);
                 updated += 1;
                 if sample.credits.is_none() {
-                    println!(
+                    crate::logline!(
                         "trae-credits {}: {why}（已用 {}）—— 跳过 credits 写入，仅更新到期日",
                         mask_uid(&uid),
                         sample.used
                     );
                 }
             }
-            Err(e) => eprintln!(
+            Err(e) => crate::logline!(
                 "Trae 积分刷新：账号池锁中毒，{} 本轮跳过（{e}）",
                 mask_uid(&uid)
             ),
@@ -579,7 +579,7 @@ pub(crate) fn new_credits_refresh_runner_with(
         Box::pin(async move {
             let (processed, updated) = refresh_credits_once(&pool, &fetch, &cancel).await;
             if processed > 0 {
-                println!("Trae 积分刷新：处理 {processed} 个账号，{updated} 个有更新");
+                crate::logline!("Trae 积分刷新：处理 {processed} 个账号，{updated} 个有更新");
             }
         }) as Pin<Box<dyn Future<Output = ()> + Send>>
     }))

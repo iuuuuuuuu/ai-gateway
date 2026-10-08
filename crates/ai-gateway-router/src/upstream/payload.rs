@@ -75,7 +75,7 @@ pub fn prepare_body_for_region(
     if let Some(Value::Array(msgs)) = obj.get_mut("messages") {
         let fixed = crate::protocol::rectify::rectify_chat_tool_sequence(msgs);
         if fixed > 0 {
-            eprintln!("rectify chat tool sequence: fixed={fixed}");
+            crate::logline!("rectify chat tool sequence: fixed={fixed}");
         }
     }
 

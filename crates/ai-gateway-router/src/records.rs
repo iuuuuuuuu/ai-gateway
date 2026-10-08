@@ -232,7 +232,7 @@ impl Recorder {
 
         let (mut all, ok) = self.load();
         if !ok {
-            eprintln!("records: {} 不可解析，按空记录集继续写入", self.path);
+            crate::logline!("records: {} 不可解析，按空记录集继续写入", self.path);
         }
         if daily && already_today(&all, &rec) {
             return;
@@ -240,7 +240,7 @@ impl Recorder {
         all.push(marshal_record(&rec));
         let kept = normalize(all, rec.ts, self.retention_days);
         if let Err(e) = atomic_write(&self.path, &must_json_array(&kept)) {
-            eprintln!("records: 写入 {} 失败: {e}", self.path);
+            crate::logline!("records: 写入 {} 失败: {e}", self.path);
         }
     }
 

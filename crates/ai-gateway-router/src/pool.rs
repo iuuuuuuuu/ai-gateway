@@ -2438,6 +2438,26 @@ impl Pool {
         (self.entries.len(), healthy, cooling, disabled, in_flight_full)
     }
 
+    /// 当前**在途**（已分配名额、尚未释放）的请求数合计。
+    ///
+    /// # 为什么必须单独暴露（2026-10-08）
+    ///
+    /// 业主排查「对话输出完就中断」时，最需要回答的一个问题是
+    /// **「重启网关的那一刻，有没有正在服务的流」** —— 有在途流就重启，
+    /// 那些流会被拦腰截断（客户端看到的就是「本轮运行失败」）。
+    ///
+    /// 但池子此前只对外暴露 `in_flight_full`（**占满名额的账号数**，
+    /// 见 [`Pool::counts_detailed`]），它是「有几个账号被顶满了」，
+    /// 不是「有几个请求在飞」。用一个恒为 0/1 的计数去判「现在安全吗」，
+    /// 结论必然是错的 —— 静默期的 1 个在途流与 27 个账号全满，
+    /// 在这个字段上可能完全一样。
+    ///
+    /// 故这里给出**请求维度**的合计值：`in_flight == 0` 才是「现在重启不会
+    /// 打断任何流」的硬判据（配合宿主侧的优雅重启，见 `restart_gateway_serialized`）。
+    pub fn in_flight_total(&self) -> usize {
+        self.entries.iter().map(|e| e.in_flight.max(0) as usize).sum()
+    }
+
     /// 当前是否有账号可受理（healthy 且未占满在途）。
     pub fn servable_now(&self) -> bool {
         let now = SystemTime::now();
@@ -3480,7 +3500,7 @@ impl Pool {
         // 与 Go 侧 `log.Printf("pool: fallback_earliest_expiry uid=%s until=%s kind=%s")` 对应。
         {
             let e = &self.entries[idx];
-            eprintln!(
+            crate::logline!(
                 "pool: fallback_earliest_expiry uid={} until={:?} kind={}",
                 e.a.uid,
                 e.expiry(now),

@@ -254,7 +254,7 @@ pub fn start_config_watch(
     let trae_on = !spec.trae_dir.is_empty();
 
     if !watch_cfg && !qoder_on && !zcode_on && !trae_on {
-        eprintln!("[watch] 未启用配置监听（无 -config 路径，且三个产品凭证目录都未配置）");
+        crate::logline!("[watch] 未启用配置监听（无 -config 路径，且三个产品凭证目录都未配置）");
         return ConfigWatch::inert();
     }
 
@@ -271,7 +271,7 @@ pub fn start_config_watch(
     if trae_on {
         parts.push("Trae 凭证".to_string());
     }
-    eprintln!(
+    crate::logline!(
         "[watch] 配置监听已启用（每 {interval:?} 检查一次：{}；模型清单与提示词改动无需重启）",
         parts.join(" / ")
     );
@@ -332,7 +332,7 @@ pub fn start_config_watch(
                                 //
                                 // ★ 刻意**不更新** `last_cfg`：下一轮还会看到同一个指纹，
                                 // 于是自动重试 —— 宿主写完就恢复正常，不需要人工干预。
-                                eprintln!(
+                                crate::logline!(
                                     "[watch] 配置已变化但解析失败（保留当前配置，稍后重试）：{e}"
                                 );
                             }
@@ -364,14 +364,14 @@ pub fn start_config_watch(
                                 dynamic.reload(dc);
                                 last_cfg = stamp;
                                 if n > 0 {
-                                    eprintln!("[watch] 配置热重载：模型清单已更新（{n} 个产品）");
+                                    crate::logline!("[watch] 配置热重载：模型清单已更新（{n} 个产品）");
                                 } else {
-                                    eprintln!("[watch] 配置热重载：模型清单已更新（空）");
+                                    crate::logline!("[watch] 配置热重载：模型清单已更新（空）");
                                 }
                                 // ★ 被关掉的平台**必须**打出来：用户报「没有账号可用」
                                 // 时，这是第一现场 —— 否则得先去翻配置文件才知道。
                                 if off_platforms > 0 {
-                                    eprintln!(
+                                    crate::logline!(
                                         "[watch] 配置热重载：{off_platforms} 个平台已关闭「参加兼容网关路由」（养号任务不受影响）"
                                     );
                                 }
@@ -429,10 +429,10 @@ pub fn start_config_watch(
                     // ★ Trae 的凭证由宿主写入，同样必须报出来 —— 静默跳过会表现为
                     //   「宿主里明明有这个账号，网关却说没有」。
                     for f in &failed {
-                        eprintln!("{label} 凭证解析失败，已跳过：{f}");
+                        crate::logline!("{label} 凭证解析失败，已跳过：{f}");
                     }
                     let n = add_all(&pool, creds);
-                    eprintln!("[watch] {label} 凭证热加载：目录已变化，重新载入 {n} 个账号");
+                    crate::logline!("[watch] {label} 凭证热加载：目录已变化，重新载入 {n} 个账号");
                 }
             }
         })

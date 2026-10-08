@@ -1065,7 +1065,24 @@ export interface GatewayPool {
   healthy?: number;
   cooling?: number;
   disabled?: number;
+  /**
+   * **被顶满名额**的账号数（不是请求数）。
+   *
+   * 判「现在重启会不会打断在途流」**不能用它**：静默期 1 个在途流与
+   * 27 个账号全满，在这个字段上可能完全一样（见 `in_flight`）。
+   */
   in_flight_full?: number;
+  /**
+   * 此刻**在途**（已分配名额、尚未释放）的请求数合计。
+   *
+   * `in_flight === 0` 才是「现在重启不会打断任何流」的硬判据。
+   * 由 1.0.35 起从网关 /status 透出；旧版网关没有这个字段 ⇒ 界面必须按
+   * `undefined` 处理（显示「未知」而不是 0，把"不知道"显示成"安全"会让
+   * 优雅重启在错误的时刻放行）。
+   */
+  in_flight?: number;
+  /** 网关自身版本号（1.0.35 起由 /status 透出；旧版为 undefined）。 */
+  version?: string;
   sticky_sessions?: number;
   redis_mode?: string;
 }

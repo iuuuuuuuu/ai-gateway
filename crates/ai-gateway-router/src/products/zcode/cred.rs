@@ -432,7 +432,7 @@ pub(crate) fn persist_device_mid_once(c: &ZcodeCred) {
     // 写入失败**不影响功能**：内存里的值仍然有效，只是下次启动会重新借用/生成。
     // 故只记日志，不返回错误 —— 让"落盘失败"变成"这个账号查不到额度"是过度反应。
     if let Err(e) = c.save_atomic() {
-        eprintln!("zcode: device_mid 固化失败（本次仍有效，下次会重新借用）: {e}");
+        crate::logline!("zcode: device_mid 固化失败（本次仍有效，下次会重新借用）: {e}");
     }
 }
 

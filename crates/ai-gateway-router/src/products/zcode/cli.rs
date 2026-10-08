@@ -115,13 +115,13 @@ async fn run_start(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => {
             // 业务失败 ⇒ stderr + 1（宿主 `run_login_cmd` 会把 stderr 当错误消息）。
-            eprintln!("{e}");
+            crate::logline!("{e}");
             return 1;
         }
     };
 
     if let Err(e) = login::save_session(&auth_dir, &session) {
-        eprintln!("保存登录会话失败: {e}");
+        crate::logline!("保存登录会话失败: {e}");
         return 1;
     }
 
@@ -182,7 +182,7 @@ async fn run_poll(args: &[String]) -> i32 {
     let session = match login::load_session(&auth_dir, &session_id) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{e}");
+            crate::logline!("{e}");
             return 1;
         }
     };
@@ -200,7 +200,7 @@ async fn run_poll(args: &[String]) -> i32 {
         Err(e) => {
             // 真失败：会话已无推进可能，删掉它再报错。
             login::remove_session(&auth_dir, &session_id);
-            eprintln!("{e}");
+            crate::logline!("{e}");
             return 1;
         }
     };
@@ -209,13 +209,13 @@ async fn run_poll(args: &[String]) -> i32 {
         Ok(c) => c,
         Err(e) => {
             login::remove_session(&auth_dir, &session_id);
-            eprintln!("兑换凭证失败: {e}");
+            crate::logline!("兑换凭证失败: {e}");
             return 1;
         }
     };
 
     if let Err(e) = std::fs::create_dir_all(&auth_dir) {
-        eprintln!("创建凭证目录失败: {e}");
+        crate::logline!("创建凭证目录失败: {e}");
         return 1;
     }
     let mut cred = cred;
@@ -224,7 +224,7 @@ async fn run_poll(args: &[String]) -> i32 {
         .to_string_lossy()
         .to_string();
     if let Err(e) = cred.save_atomic() {
-        eprintln!("保存凭证失败: {e}");
+        crate::logline!("保存凭证失败: {e}");
         return 1;
     }
 
@@ -279,7 +279,7 @@ async fn run_quota(args: &[String]) -> i32 {
     let cred = match load_cred_by_uid(&auth_dir, uid.trim()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{e}");
+            crate::logline!("{e}");
             return 1;
         }
     };
@@ -488,7 +488,7 @@ async fn run_import(args: &[String]) -> i32 {
     let mut cred = match cred::parse_credential(&credential) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{e}");
+            crate::logline!("{e}");
             return 1;
         }
     };
@@ -515,7 +515,7 @@ async fn run_import(args: &[String]) -> i32 {
 
     let auth_dir = fs.get("auth-dir");
     if let Err(e) = std::fs::create_dir_all(&auth_dir) {
-        eprintln!("创建凭证目录失败: {e}");
+        crate::logline!("创建凭证目录失败: {e}");
         return 1;
     }
     cred.file_path = std::path::Path::new(&auth_dir)
@@ -523,7 +523,7 @@ async fn run_import(args: &[String]) -> i32 {
         .to_string_lossy()
         .to_string();
     if let Err(e) = cred.save_atomic() {
-        eprintln!("保存凭证失败: {e}");
+        crate::logline!("保存凭证失败: {e}");
         return 1;
     }
 
@@ -937,7 +937,7 @@ fn load_cred_for_plan(auth_dir: &str, uid: &str) -> Result<Option<ZcodeCred>, i3
     let c = match load_cred_by_uid(auth_dir, uid.trim()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{e}");
+            crate::logline!("{e}");
             return Err(1);
         }
     };
@@ -999,7 +999,7 @@ fn install_captcha_solver(auth_dir: &str) {
     // 3007，而不知道为什么。
     let reason = cs.unavailable_reason();
     if !reason.is_empty() {
-        eprintln!("⚠ ZCode 验证码求解器不可用：{reason}（本次领取会因 3007 失败）");
+        crate::logline!("⚠ ZCode 验证码求解器不可用：{reason}（本次领取会因 3007 失败）");
     }
 }
 

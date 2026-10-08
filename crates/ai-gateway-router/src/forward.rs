@@ -771,7 +771,7 @@ pub async fn forward_chat(
         {
             let breaker = ctx.unusual.for_product(acct.product_of());
             if let Some(wait) = breaker.tripped() {
-                eprintln!(
+                crate::logline!(
                     "chat: {} 3012 熔断中（还需 {:?}），不发请求（本请求已试 {} 个账号）",
                     acct.product_of(),
                     wait,
@@ -840,7 +840,7 @@ pub async fn forward_chat(
                 continue;
             }
             if let Err(e) = acct.save_atomic() {
-                eprintln!("chat refresh uid={}: save auth failed: {e}", acct.uid);
+                crate::logline!("chat refresh uid={}: save auth failed: {e}", acct.uid);
             }
         }
 
@@ -973,7 +973,7 @@ pub async fn forward_chat(
                     let breaker = ctx.unusual.for_product(acct.product_of());
                     breaker.note3012();
                     let wait = breaker.tripped().unwrap_or_default();
-                    eprintln!(
+                    crate::logline!(
                         "chat uid={} product={}: 上游 3012 unusual activity，已熔断至 {:?}\
                          （不再换号重试）",
                         acct.uid,
@@ -1016,7 +1016,7 @@ pub async fn forward_chat(
                 if crate::wafip::is_waf_forbidden(status, &resp_body) {
                     let distinct = ctx.waf_ip.note_waf(&acct.uid);
                     let blocked = ctx.waf_ip.blocked();
-                    eprintln!(
+                    crate::logline!(
                         "chat uid={}: WAF 403（窗口内 {} 个不同账号 403，已判定 IP 被拦={}）",
                         acct.uid, distinct, blocked
                     );
@@ -1058,7 +1058,7 @@ pub async fn forward_chat(
                     // 记一行再重试：上游抖动是**唯一**只能靠日志发现的故障模式，
                     // 不记的话「重试救回来了」与「上游本来就没抖」无法区分，
                     // 抖动恶化到重试也压不住时没有任何先兆。
-                    eprintln!(
+                    crate::logline!(
                         "[forward] upstream rejected, retrying (left={reject_retries_left}): \
                          model={model} uid={} status={status} body={}",
                         acct.uid,
@@ -1161,7 +1161,7 @@ pub async fn forward_chat(
                         // 口径）：空流文案里没有 1113 / 14018 等业务码 ⇒ 落
                         // [`ErrKind::Server`] ⇒ [`pool.note_error`]（喂熔断，指数退避），
                         // 既不会硬冷却也不会把号打死。
-                        eprintln!(
+                        crate::logline!(
                             "chat uid={} product=zcode: {} — 冷却换号（按 503 上游故障分类）",
                             acct.uid, probe_msg
                         );
@@ -1195,7 +1195,7 @@ pub async fn forward_chat(
                     }
 
                     // 其它产品：按上游故障冷却换号（Go `forward.go:934-951`）。
-                    eprintln!(
+                    crate::logline!(
                         "chat uid={} product={}: {} — 冷却换号",
                         acct.uid,
                         acct.product_of(),
@@ -1502,7 +1502,7 @@ fn product_request_side_failure(
         // 「用户写错模型名」在网关日志里会完全不可见 —— 而这是最常见的用户
         // 求助原因。日志里带 uid 与清单条数，便于判断是「清单没刷新」还是
         // 「模型真不存在」。
-        eprintln!(
+        crate::logline!(
             "chat uid={}: 上游 {} 没有模型 {:?}（清单 {} 个），请求侧错误 —— 不轮转、不罚账号",
             acct.uid,
             if mnf.region.is_empty() { "该产品" } else { &mnf.region },
@@ -1514,7 +1514,7 @@ fn product_request_side_failure(
 
     // ② 上游要求人机验证（ZCode 3007）。轮转必定无用（见 `CaptchaRequired` 文档）。
     if e.is_captcha_required() {
-        eprintln!(
+        crate::logline!(
             "chat uid={} product={}: 上游要求人机验证，请求侧错误 —— 不轮转、不罚账号",
             acct.uid,
             acct.product_of()

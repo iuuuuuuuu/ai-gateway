@@ -85,12 +85,99 @@ pub fn chat_headers(a: &Auth) -> HeaderMap {
     h
 }
 
-/// billing 接口请求头。
+/// billing 接口请求头（`billingJSON` 管道专用：签到 / 活跃上报 / 领奖 / 任务）。
+///
+/// ⚠ **不要**往里加 `Origin`/`Referer`/`User-Agent`：
+///   · `tasks.rs` 的成长任务列表要求**不带 UA**（带上会被上游裁到 18 项，实测），
+///   · `desktop.rs` 的活跃上报自带 `BILLING_GO_UA`，
+///   · 它们各自的头族都是与 Go 侧逐字对齐过的，动一个就会静默改变上游看到的口径。
+///
+/// 积分查询（`user_resource_detail`）需要的是另一套头 —— 见 [`resource_headers`]，
+/// 那个接口的 WAF 会拒绝「看起来像裸 API 客户端」的请求（2026-10-08 实测）。
 pub fn billing_headers(a: &Auth) -> HeaderMap {
     let mut h = HeaderMap::new();
     put(&mut h, "Authorization", &format!("Bearer {}", a.access_token));
     h.insert("Accept", HeaderValue::from_static("application/json"));
     h.insert("Content-Type", HeaderValue::from_static("application/json"));
+    if !a.uid.is_empty() {
+        put(&mut h, "X-User-Id", &a.uid);
+    }
+    if !a.enterprise_id.is_empty() {
+        put(&mut h, "X-Enterprise-Id", &a.enterprise_id);
+        put(&mut h, "X-Tenant-Id", &a.enterprise_id);
+    }
+    if !a.domain.is_empty() {
+        put(&mut h, "X-Domain", &a.domain);
+    }
+    h
+}
+
+/// 积分查询（`POST /v2/billing/meter/get-user-resource`）专用请求头。
+///
+/// # ★★ 2026-10-08 修复：国服账号「消耗积分」恒为 0
+///
+/// ## 现场
+///
+/// 业主报障：「workbuddy 国服账号错误的显示积分为 0」。截图里 **15 个国服账号全部 0**、
+/// 12 个国际版账号正常（130 / 100 / 350 …）。
+///
+/// 网关日志给出直接证据 —— **19 个 uid、每个 202 次**同一句：
+///
+/// ```text
+/// credit-refresh <uid>: upstream client (http 403):
+///   {"code":10085,"msg":"请求不合法，如有疑问请联系客服","requestId":"…"}
+/// ```
+///
+/// ## 定因（隔离实测，逐项二分）
+///
+/// 同一个 token、同一个 URL、同一个 body，只换请求头：
+///
+/// | 请求头组合 | 结果 |
+/// | --- | --- |
+/// | 裸 `Authorization`/`Accept`/`Content-Type`/`X-User-Id`/`X-Domain` | **403 code=10085** |
+/// | 上面 + `X-Client-Platform: web` | **200** |
+/// | 上面 + `Referer` | **200** |
+/// | 上面 + `User-Agent` | **200** |
+/// | 上面 + `Origin`（**单独加它无效**） | 403 |
+///
+/// ⇒ 计费后台的 WAF 拒绝「看起来像裸 API 客户端」的请求，只要带上**任意一个**
+/// 浏览器/客户端特征头就放行。**不是 token 过期、不是区域错、不是并发限流**
+///（同一 token 连打 12 次全 200；直连与走 `127.0.0.1:7890` 代理都是 200）。
+///
+/// ## 为什么宿主侧一直是对的，只有网关错
+///
+/// 宿主 `ai-gateway-core/src/modules/credits.rs` 的 `resource_auth_headers` 早就带了
+/// `X-Client-Platform: web` + `Origin` + `Referer`（照 WorkBuddy 用户中心的 Axios
+/// 拦截器写的）。而网关这条后台巡检走的是自己那套头，没带 —— 同一个接口、两套头表，
+/// 于是「界面上点刷新能出数、网关后台巡检恒 403」，界面读的是网关的池快照 ⇒ 显示 0。
+///
+/// ## 为什么单独一个函数，而不是改 `billing_headers`
+///
+/// 后者被 `billingJSON` 管道共用（签到 / 活跃上报 / 领奖 / 任务列表），那几处的头族
+/// 与 Go 侧逐字对齐，其中任务列表**必须不带 UA**（带上会被上游裁到 18 项）。
+/// 往共用头里加 UA/Origin 会静默改掉它们的口径 —— 实测一次性踩红 7 个用例。
+///
+/// ⚠ `Origin`/`Referer` 必须跟随账号区域：国际版请求带 `codebuddy.cn` 的 Origin
+/// 会被按「非本区来源」拒绝（宿主 `request_origin` 的注释记着同一条）。
+pub fn resource_headers(a: &Auth) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    put(&mut h, "Authorization", &format!("Bearer {}", a.access_token));
+    // 与宿主 `resource_auth_headers` 同形（它照用户中心的 Axios 拦截器写的）。
+    h.insert(
+        "Accept",
+        HeaderValue::from_static("application/json, text/plain, */*"),
+    );
+    h.insert("Content-Type", HeaderValue::from_static("application/json"));
+    // 修复点 1：声明「这是 Web 用户中心发来的请求」（WAF 的放行特征之一）。
+    h.insert("X-Client-Platform", HeaderValue::from_static("web"));
+    // 修复点 2/3：Origin/Referer 跟随区域（与 `common` 同一个函数，不另写判断）。
+    let origin = origin_referer_for(a);
+    if let Ok(v) = HeaderValue::from_str(origin) {
+        h.insert("Origin", v.clone());
+        h.insert("Referer", v);
+    }
+    // 修复点 4：与 chat 路径同一个 UA。
+    h.insert("User-Agent", HeaderValue::from_static(CLIENT_UA));
     if !a.uid.is_empty() {
         put(&mut h, "X-User-Id", &a.uid);
     }
@@ -204,5 +291,59 @@ mod tests {
         let h = billing_headers(&cn());
         assert_eq!(h["x-tenant-id"], "e1");
         assert_eq!(h["x-user-id"], "u1");
+    }
+
+    /// ★★ 2026-10-08 回归：积分查询头必须带 WAF 放行特征，否则国服恒 403（code=10085），
+    /// 表现为「国服账号消耗积分恒为 0」。
+    ///
+    /// 三个特征头**任一**即可通过（隔离实测），但这里逐个钉住 —— 少一个就退回 403，
+    /// 而 403 的表现只是「积分显示 0」，不报错、不冷却账号，极易再次漏掉。
+    #[test]
+    fn resource_headers_carry_the_waf_bypass_markers() {
+        let h = resource_headers(&cn());
+        assert_eq!(
+            h["x-client-platform"], "web",
+            "缺 X-Client-Platform 会被 WAF 判 403 code=10085"
+        );
+        assert_eq!(h["user-agent"], CLIENT_UA, "缺 UA 会被 WAF 判 403 code=10085");
+        assert_eq!(
+            h["referer"], ORIGIN_CN,
+            "缺 Referer 会被 WAF 判 403 code=10085"
+        );
+        assert_eq!(h["origin"], ORIGIN_CN);
+        assert_eq!(
+            h["accept"], "application/json, text/plain, */*",
+            "与宿主 resource_auth_headers 同形"
+        );
+    }
+
+    /// 国际版积分查询的 Origin/Referer 必须跟着区域走 —— 带 `codebuddy.cn` 会被按
+    /// 「非本区来源」拒绝（宿主 `request_origin` 记着同一条）。
+    #[test]
+    fn resource_headers_follow_the_account_region() {
+        let h = resource_headers(&intl());
+        assert_eq!(h["origin"], ORIGIN_INTL);
+        assert_eq!(h["referer"], ORIGIN_INTL);
+        assert_eq!(h["x-client-platform"], "web", "特征头与区域无关");
+    }
+
+    /// 反向护栏：`billing_headers` 是**共用**头（签到 / 活跃上报 / 领奖 / 任务列表），
+    /// 其中任务列表**必须不带 UA**（带上会被上游裁到 18 项，实测）。
+    ///
+    /// 2026-10-08 修积分问题时曾把 UA/Origin 加进这里，一次性踩红 7 个用例 ——
+    /// 本测试把「不要往共用头里塞特征头」钉死。
+    #[test]
+    fn billing_headers_stay_free_of_feature_headers() {
+        let h = billing_headers(&cn());
+        assert!(
+            h.get("user-agent").is_none(),
+            "billing_headers 不得带 UA（任务列表口径要求无 UA）"
+        );
+        assert!(h.get("origin").is_none(), "billing_headers 不得带 Origin");
+        assert!(h.get("referer").is_none(), "billing_headers 不得带 Referer");
+        assert!(
+            h.get("x-client-platform").is_none(),
+            "billing_headers 不得带 X-Client-Platform（那是 tasks/desktop 各自的口径）"
+        );
     }
 }

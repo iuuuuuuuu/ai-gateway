@@ -390,16 +390,16 @@ pub fn configure_captcha_from_host() {
         if !dir.is_empty() {
             let reason = solver.unavailable_reason();
             if !reason.is_empty() {
-                eprintln!("⚠ ZCode 验证码求解已启用，但组件不可用：{reason}");
+                crate::logline!("⚠ ZCode 验证码求解已启用，但组件不可用：{reason}");
             } else if solver.external_solve_enabled() {
-                eprintln!("ZCode 验证码求解已启用：外部服务优先（宿主 WebView2）{url}，本地求解作为回退");
+                crate::logline!("ZCode 验证码求解已启用：外部服务优先（宿主 WebView2）{url}，本地求解作为回退");
             } else {
-                eprintln!("ZCode 验证码求解已启用：{dir}");
+                crate::logline!("ZCode 验证码求解已启用：{dir}");
             }
         } else if !url.is_empty() {
-            eprintln!("ZCode 验证码求解已启用：仅外部服务（宿主 WebView2）{url}");
+            crate::logline!("ZCode 验证码求解已启用：仅外部服务（宿主 WebView2）{url}");
         } else {
-            eprintln!(
+            crate::logline!(
                 "⚠ ZCode 验证码求解器未配置（zcode_captcha_dir 为空）：ZCode 对话会因 3007 人机验证而失败；发行包应包含 assets/zcode-captcha"
             );
         }
@@ -491,8 +491,8 @@ impl Client {
         let addr = cfg.proxy.trim();
         if !addr.is_empty() && cfg.proxy_intl {
             match self.set_proxy(addr) {
-                Ok(()) => eprintln!("ZCode 走代理：{addr}"),
-                Err(e) => eprintln!("⚠ ZCode 代理设置失败（将直连）：{e}"),
+                Ok(()) => crate::logline!("ZCode 走代理：{addr}"),
+                Err(e) => crate::logline!("⚠ ZCode 代理设置失败（将直连）：{e}"),
             }
         } else {
             // 与 Go 同款：不满足条件时显式 SetProxy("")（直连），而不是留着环境代理。

@@ -153,7 +153,7 @@ fn build_proxy(cfg: &ClientConfig) -> Option<reqwest::Proxy> {
     match reqwest::Proxy::all(&url) {
         Ok(p) => Some(p.no_proxy(reqwest::NoProxy::from_env())),
         Err(e) => {
-            eprintln!("[upstream] 代理地址无效 {url}: {e}，本次直连");
+            crate::logline!("[upstream] 代理地址无效 {url}: {e}，本次直连");
             None
         }
     }
@@ -339,7 +339,7 @@ impl Client {
             Ok(tok) => Some(tok),
             Err(e) => {
                 // 降级：不发该头。日志保留原因，否则「为什么这次没带」无从查起。
-                eprintln!(
+                crate::logline!(
                     "device_token uid={}: 获取失败（本次不发该头，请求照常）: {e}",
                     a.uid
                 );
@@ -536,7 +536,7 @@ impl Client {
         let req = self
             .http
             .post(&url)
-            .headers(headers::billing_headers(a))
+            .headers(headers::resource_headers(a))
             .json(&body)
             .timeout(self.cfg.timeout);
         let resp = req.send().await.map_err(transport_err)?;

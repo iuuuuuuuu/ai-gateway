@@ -187,8 +187,8 @@ impl FlagSet {
     /// 语法错误时写 stderr 的文案。与 Go `flag` 的 `ContinueOnError` 同型：
     /// 先打错误，再打 usage。
     pub fn fail(&self, err: &str) {
-        eprintln!("{err}");
-        eprintln!("用法: {} [选项]", self.name);
+        crate::logline!("{err}");
+        crate::logline!("用法: {} [选项]", self.name);
     }
 }
 
@@ -207,7 +207,7 @@ fn parse_bool(s: &str) -> Option<bool> {
 pub fn write_json(v: &Value) {
     match serde_json::to_string(v) {
         Ok(s) => println!("{s}"),
-        Err(e) => eprintln!("序列化输出失败: {e}"),
+        Err(e) => crate::logline!("序列化输出失败: {e}"),
     }
 }
 
@@ -243,7 +243,7 @@ pub fn write_business_error_uid(uid: &str, message: &str) -> i32 {
 
 /// 参数错误的统一出口：**只写 stderr、返回 2**。
 pub fn usage_error(err: &str) -> i32 {
-    eprintln!("{err}");
+    crate::logline!("{err}");
     2
 }
 

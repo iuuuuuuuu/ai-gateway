@@ -115,7 +115,7 @@ impl Dispatch {
                 // 而真正原因（翻译失败 / 凭证字段缺失 / 代理地址非法）只存在于这个
                 // err 里。2026-09-21 定位「网关恒 503」时，正是这条日志把
                 // `invalid character 'm'` 暴露出来；没有它只能靠猜。
-                eprintln!(
+                crate::logline!(
                     "zcode dispatch: ChatStream 失败 uid={} provider={}: {}{}",
                     super::mask_uid(&cr.uid),
                     cr.provider.as_str(),
@@ -251,7 +251,7 @@ impl Dispatch {
         let models = match self.client.fetch_models(Some(cr)).await {
             Ok(ms) => ms,
             Err(e) => {
-                eprintln!(
+                crate::logline!(
                     "zcode dispatch provider={}: 拉取模型清单失败（将回退原样模型名）: {e}",
                     cr.provider.as_str()
                 );

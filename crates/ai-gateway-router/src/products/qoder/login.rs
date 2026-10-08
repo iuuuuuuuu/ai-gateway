@@ -640,7 +640,7 @@ pub(crate) fn new_cli_client(auth_dir: &str) -> QoderClient {
         Ok(c) => c,
         Err(e) => {
             // 不静默降级成"直连但用户以为走了代理" —— 明确告诉他这次没用上。
-            eprintln!("代理地址无效，本次登录将直连：{e}");
+            crate::logline!("代理地址无效，本次登录将直连：{e}");
             QoderClient::new()
         }
     }

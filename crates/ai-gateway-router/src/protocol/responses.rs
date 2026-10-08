@@ -115,7 +115,7 @@ pub fn responses_to_chat(raw: &[u8]) -> Result<(Vec<u8>, String), String> {
     // function_call 与 function_call_output 不配对，上游命中 400 code=11148。
     let fixed = rectify_chat_tool_sequence(&mut messages);
     if fixed > 0 {
-        eprintln!("rectify /v1/responses tool sequence: fixed={fixed}");
+        crate::logline!("rectify /v1/responses tool sequence: fixed={fixed}");
     }
 
     let mut out = Map::new();

@@ -472,7 +472,7 @@ impl ClaimScheduler {
             if res.outcome == ClaimTickOutcome::Failed && res.kind == ClaimFailureKind::LoginRequired
             {
                 ctx.lock().stopped = true;
-                eprintln!(
+                crate::logline!(
                     "zcode claim: 凭证失效（login_required），自动领取已停止；\
                      重新登录后重启网关可恢复"
                 );
@@ -672,7 +672,7 @@ async fn tick_account_with(
             if wait > Duration::ZERO {
                 tr.next_in = wait;
                 ctx.record(tr.clone());
-                eprintln!(
+                crate::logline!(
                     "zcode claim: 账号 {} 领取成功 plan={}，下次再探 {} 后",
                     short_uid_log(&cr.uid),
                     target.plan_id,
@@ -682,7 +682,7 @@ async fn tick_account_with(
             }
             tr.next_in = CLAIM_POLL_INTERVAL;
             ctx.record(tr.clone());
-            eprintln!(
+            crate::logline!(
                 "zcode claim: 账号 {} 领取成功 plan={}",
                 short_uid_log(&cr.uid),
                 target.plan_id

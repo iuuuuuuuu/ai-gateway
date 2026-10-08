@@ -84,7 +84,7 @@ fn put(map: &mut HeaderMap, name: &'static str, value: &str) {
     }
     let Ok(v) = HeaderValue::from_str(value) else {
         // 含非 ASCII 或控制字符：宁可少一个头，也不能让整个请求构造失败。
-        eprintln!("⚠ Trae 请求头 {name} 的值非法（含不可编码字符），已跳过");
+        crate::logline!("⚠ Trae 请求头 {name} 的值非法（含不可编码字符），已跳过");
         return;
     };
     map.insert(HeaderName::from_static(name), v);

@@ -77,7 +77,7 @@ async fn main() {
         Some(p) => match Config::load(p) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("加载配置失败 {p}: {e}");
+                ai_gateway_router::logline!("加载配置失败 {p}: {e}");
                 std::process::exit(1);
             }
         },
@@ -86,7 +86,7 @@ async fn main() {
             let mut c = Config::default();
             c.apply_env();
             if let Err(e) = c.normalize() {
-                eprintln!("配置归一化失败: {e}");
+                ai_gateway_router::logline!("配置归一化失败: {e}");
                 std::process::exit(1);
             }
             c
@@ -127,7 +127,7 @@ async fn main() {
         // 空 = 不限制，行为与加该功能之前逐字相同 —— 这是回滚点。
         pool.set_model_platforms(&cfg.model_platforms);
         if !cfg.model_platforms.is_empty() {
-            println!(
+            ai_gateway_router::logline!(
                 "模型平台白名单已启用：{} 个模型被限定平台",
                 cfg.model_platforms.len()
             );
@@ -148,7 +148,7 @@ async fn main() {
         let mut authoritative: Vec<String> = Vec::new();
         if pm.get("workbuddy").map(|v| v.is_empty()).unwrap_or(true) {
             let ids = ai_gateway_router::server::static_workbuddy_model_ids();
-            println!(
+            ai_gateway_router::logline!(
                 "product_models 缺 workbuddy：已补 {} 个模型作为**兜底**（只用于「不排除」，不参与「声明」竞争）",
                 ids.len()
             );
@@ -159,7 +159,7 @@ async fn main() {
         // 兜底清单时 `product_may_serve` 一律放行。2026-10-04 现场实测复现过。
         if pm.get("trae").map(|v| v.is_empty()).unwrap_or(true) {
             let ids = ai_gateway_router::server::static_trae_model_ids();
-            println!(
+            ai_gateway_router::logline!(
                 "product_models 缺 trae：已补 {} 个模型作为**兜底**（只用于「不排除」，不参与「声明」竞争）",
                 ids.len()
             );
@@ -180,7 +180,7 @@ async fn main() {
             // ⚠ **只**能标记 Trae。WorkBuddy 的静态表是 2026-09-18 快照，把它当权威
             // 会立刻退回 2026-10-06 的 503（`space-bunny` 这类新模型全池挑不出号）。
             authoritative.push("trae".to_string());
-            println!(
+            ai_gateway_router::logline!(
                 "product_models 缺 trae：兜底清单标记为**权威**（未命中 = 确定没有，其账号不参与裸名兜底抽签）"
             );
         }
@@ -198,11 +198,11 @@ async fn main() {
             for (plat, by_region) in cfg.platform_models.iter() {
                 for (region, models) in by_region.iter() {
                     let label = if region.is_empty() { "不分区域" } else { region.as_str() };
-                    println!("平台白名单：{plat} / {label} → {} 个模型", models.len());
+                    ai_gateway_router::logline!("平台白名单：{plat} / {label} → {} 个模型", models.len());
                 }
             }
         } else {
-            println!("平台白名单未配置（platform_models 为空）：显式指定平台时不拦模型，行为与引入前一致");
+            ai_gateway_router::logline!("平台白名单未配置（platform_models 为空）：显式指定平台时不拦模型，行为与引入前一致");
         }
 
         // 用户**禁用**清单（平台 × 区域 → 不许跑的模型）。
@@ -223,23 +223,23 @@ async fn main() {
                     for (plat, by_region) in m.iter() {
                         for (region, models) in by_region.iter() {
                             let label = if region.is_empty() { "不分区域" } else { region.as_str() };
-                            println!(
+                            ai_gateway_router::logline!(
                                 "平台禁用清单：{plat} / {label} → {} 个模型（否决项，压过白名单并集）",
                                 models.len()
                             );
                         }
                     }
                 } else {
-                    println!("平台禁用清单未配置（platform_models_disabled 为空）：不否决任何模型");
+                    ai_gateway_router::logline!("平台禁用清单未配置（platform_models_disabled 为空）：不否决任何模型");
                 }
             }
             None => {
                 pool.set_platform_models_disabled(&std::collections::HashMap::new());
-                println!("平台禁用清单未配置（platform_models_disabled 为空）：不否决任何模型");
+                ai_gateway_router::logline!("平台禁用清单未配置（platform_models_disabled 为空）：不否决任何模型");
             }
         }
     } else {
-        println!("多产品路由已关闭（pool.multi_product=false）：只使用 WorkBuddy 账号");
+        ai_gateway_router::logline!("多产品路由已关闭（pool.multi_product=false）：只使用 WorkBuddy 账号");
     }
 
     // 平台总开关：该平台是否**参加兼容网关路由**。
@@ -260,13 +260,13 @@ async fn main() {
             let mut off: Vec<&String> = m.keys().collect();
             off.sort();
             for plat in off {
-                println!(
+                ai_gateway_router::logline!(
                     "平台总开关：{plat} 已关闭「参加兼容网关路由」—— 它的账号不参与选号，养号任务不受影响"
                 );
             }
         }
         None => {
-            println!("平台总开关未配置（platform_enabled 为空）：所有平台都参加兼容网关路由");
+            ai_gateway_router::logline!("平台总开关未配置（platform_enabled 为空）：所有平台都参加兼容网关路由");
         }
     }
 
@@ -278,7 +278,7 @@ async fn main() {
     // 逐字）。名单已在 `cfg.normalize()` 里归一化过 —— 所以这里打印的就是
     // 请求路径上实际比较的那一份，不会出现「日志说放行 a、被拒文案却说 b」。
     if !cfg.pool.allowed_model.is_empty() {
-        println!(
+        ai_gateway_router::logline!(
             "pool: 已限制可使用的模型，只放行 {}（其他模型一律拒绝；改配置后需重启网关）",
             ai_gateway_router::model_allow::allowed_models_text(
                 cfg.pool.allowed_model.as_slice()
@@ -287,7 +287,7 @@ async fn main() {
     } else if cfg.pool.rotation {
         // 轮转但未限制模型：语义不完整（客户端可换模型绕过额度控制），
         // 但这是合法配置，只提示不拦。
-        println!(
+        ai_gateway_router::logline!(
             "pool: 已启用「积分轮转」模式，但未限制模型（pool.allowed_model 为空）—— 建议在界面「放行模型」里选择"
         );
     }
@@ -308,7 +308,7 @@ async fn main() {
     // 下面 `if cfg.multi_product` 块里才发生）。★ 这个顺序不能颠倒。
     pool.sync_to_dir(&accounts);
     if n == 0 {
-        eprintln!("warning: 未从 {} 加载到任何凭证", cfg.auth_dir);
+        ai_gateway_router::logline!("warning: 未从 {} 加载到任何凭证", cfg.auth_dir);
     }
 
     // ---- 产品凭证（Qoder / ZCode）：与 WorkBuddy **分开加载** ----
@@ -342,13 +342,13 @@ async fn main() {
         // 解析失败的文件**必须报出来**：用户会以为「账号导入了但没生效」，
         // 而真正原因是格式不对（Qoder 凭证可能是手写的）。
         for f in &qfailed {
-            eprintln!("Qoder 凭证解析失败，已跳过：{f}");
+            ai_gateway_router::logline!("Qoder 凭证解析失败，已跳过：{f}");
         }
         for a in qcreds {
             pool.add(a);
             qoder_accounts += 1;
         }
-        println!(
+        ai_gateway_router::logline!(
             "多产品路由已开启：Qoder 凭证目录 {}，载入 {} 个账号（解析失败 {} 个）",
             cfg.qoder_auth_dir,
             qoder_accounts,
@@ -367,13 +367,13 @@ async fn main() {
         let (zcreds, zfailed) =
             ai_gateway_router::products::zcode::load_credentials(&cfg.zcode_auth_dir);
         for f in &zfailed {
-            eprintln!("ZCode 凭证解析失败，已跳过：{f}");
+            ai_gateway_router::logline!("ZCode 凭证解析失败，已跳过：{f}");
         }
         for a in zcreds {
             pool.add(a);
             zcode_accounts += 1;
         }
-        println!(
+        ai_gateway_router::logline!(
             "多产品路由已开启：ZCode 凭证目录 {}，载入 {} 个账号（解析失败 {} 个）",
             cfg.zcode_auth_dir,
             zcode_accounts,
@@ -395,13 +395,13 @@ async fn main() {
         let (tcreds, tfailed) =
             ai_gateway_router::products::trae::load_credentials(&cfg.trae_auth_dir);
         for f in &tfailed {
-            eprintln!("Trae 凭证解析失败，已跳过：{f}");
+            ai_gateway_router::logline!("Trae 凭证解析失败，已跳过：{f}");
         }
         for a in tcreds {
             pool.add(a);
             trae_accounts += 1;
         }
-        println!(
+        ai_gateway_router::logline!(
             "多产品路由已开启：Trae 凭证目录 {}，载入 {} 个账号（解析失败 {} 个）",
             cfg.trae_auth_dir,
             trae_accounts,
@@ -481,7 +481,7 @@ async fn main() {
     }) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("构造上游客户端失败: {e}");
+            ai_gateway_router::logline!("构造上游客户端失败: {e}");
             std::process::exit(1);
         }
     };
@@ -531,7 +531,7 @@ async fn main() {
     } else {
         // 用户主动关掉：这条日志要**明确指向配置键**，否则用户看到的是
         // 「加账号没生效」而不知道是自己关的。
-        eprintln!("凭证目录热加载已禁用（pool.watch_auth_dir=false）：新增账号后需手动重启网关");
+        ai_gateway_router::logline!("凭证目录热加载已禁用（pool.watch_auth_dir=false）：新增账号后需手动重启网关");
         authwatch::AuthDirWatch::inert()
     };
 
@@ -624,7 +624,7 @@ async fn main() {
             cfg.record_identities(),
         );
         if rec.enabled() {
-            println!(
+            ai_gateway_router::logline!(
                 "账号记录回写已启用：{}（保留 {} 天）",
                 rec.path(),
                 if cfg.account_records.retention_days > 0 {
@@ -634,7 +634,7 @@ async fn main() {
                 }
             );
         } else {
-            println!("账号记录回写未启用（配置缺少 account_records.file）：任务照跑，但界面不会有记录");
+            ai_gateway_router::logline!("账号记录回写未启用（配置缺少 account_records.file）：任务照跑，但界面不会有记录");
         }
         Arc::new(rec)
     };
@@ -704,14 +704,14 @@ async fn main() {
         }
         // 两条日志逐字对齐 Go（`main.go:577-580`）。
         if zcode_tasks.is_some() {
-            println!(
+            ai_gateway_router::logline!(
                 "ZCode 自动领取：启动即跑，之后每 {} 轮询（失败冷却 {}，开关={}）",
                 ai_gateway_router::products::product_tasks::go_duration_text(CLAIM_POLL_INTERVAL),
                 ai_gateway_router::products::product_tasks::go_duration_text(CLAIM_COOLDOWN),
                 cfg.zcode_claim_active()
             );
         }
-        println!(
+        ai_gateway_router::logline!(
             "Qoder 权益领取：时点 {}（开关={}，超时 {} 补一轮轮询）",
             ai_gateway_router::products::product_tasks::go_int_slice_text(&cfg.qoder_claim_hours),
             qoder_claim_on,
@@ -746,7 +746,7 @@ async fn main() {
     } else {
         // 逐字对齐 Go `main.go:785-787` 的口径：让用户知道 `/usage` 的
         // `billingCycles` 为什么是空的。
-        println!("计费周期刷新未接线（池里没有 Qoder 账号或未启用多产品）：/usage 的 billingCycles 将为空");
+        ai_gateway_router::logline!("计费周期刷新未接线（池里没有 Qoder 账号或未启用多产品）：/usage 的 billingCycles 将为空");
     }
 
     // ★★ 接线：Trae 账号积分采集（POST /trae/api/v2/pay/ide_user_ent_usage）。
@@ -765,7 +765,7 @@ async fn main() {
     ) {
         let interval =
             ai_gateway_router::products::trae::credits::DEFAULT_CREDITS_REFRESH_INTERVAL;
-        println!(
+        ai_gateway_router::logline!(
             "Trae 积分采集已接线：每 {} 分钟一轮，每个 Trae 账号每轮 1 次出站（ent_usage）",
             interval.as_secs() / 60
         );
@@ -782,9 +782,9 @@ async fn main() {
 
     // 签到范围日志（与 Go `main.go:380-395` 同口径）。
     if cfg.checkin_scope_all() {
-        println!("签到与猫猫旅行范围：国服 + 国际版（schedule.checkin_scope=all）");
+        ai_gateway_router::logline!("签到与猫猫旅行范围：国服 + 国际版（schedule.checkin_scope=all）");
     } else {
-        println!("签到与猫猫旅行范围：仅国服（schedule.checkin_scope=cn，国际版账号自动跳过）");
+        ai_gateway_router::logline!("签到与猫猫旅行范围：仅国服（schedule.checkin_scope=cn，国际版账号自动跳过）");
     }
 
     let state = Arc::new(AppState {
@@ -900,7 +900,7 @@ async fn main() {
         growtask: Some(growtask),
     });
 
-    println!(
+    ai_gateway_router::logline!(
         "state restored={loaded_state} (state_file={})",
         cfg.state_file
     );
@@ -921,7 +921,7 @@ async fn main() {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             ai_gateway_router::server::warm_up_live_models(&state).await;
-            eprintln!("[warmup] 上游模型真值预热完成（观测集已填充，裸名请求不再选中错区账号）");
+            ai_gateway_router::logline!("[warmup] 上游模型真值预热完成（观测集已填充，裸名请求不再选中错区账号）");
         });
     }
 
@@ -988,7 +988,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .expect("bind failed");
-    println!("rust gateway listening on http://127.0.0.1:{port} (accounts={n})");
+    ai_gateway_router::logline!("rust gateway listening on http://127.0.0.1:{port} (accounts={n})");
 
     // 优雅退出：收到 Ctrl+C / 终止信号时先落盘再退出。
     //

@@ -9,14 +9,14 @@ use ai_gateway_router::pool::StateFile;
 
 fn main() {
     let Some(path) = std::env::args().nth(1) else {
-        eprintln!("用法: probe_state <state.json 路径>");
+        ai_gateway_router::logline!("用法: probe_state <state.json 路径>");
         std::process::exit(2);
     };
 
     let raw = match std::fs::read(&path) {
         Ok(raw) => raw,
         Err(e) => {
-            eprintln!("读取 {path} 失败: {e}");
+            ai_gateway_router::logline!("读取 {path} 失败: {e}");
             std::process::exit(1);
         }
     };

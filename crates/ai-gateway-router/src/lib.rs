@@ -44,6 +44,7 @@ pub mod config;
 pub mod error;
 pub mod forward;
 pub mod growtask;
+pub mod logging;
 pub mod model_allow;
 pub mod models_cache;
 pub mod pool;

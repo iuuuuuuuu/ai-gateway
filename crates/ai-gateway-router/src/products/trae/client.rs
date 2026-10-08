@@ -277,8 +277,8 @@ impl Client {
         let addr = cfg.proxy.trim();
         if !addr.is_empty() && cfg.proxy_intl {
             match self.set_proxy(addr) {
-                Ok(()) => eprintln!("Trae 走代理：{addr}"),
-                Err(e) => eprintln!("⚠ Trae 代理设置失败（将直连）：{e}"),
+                Ok(()) => crate::logline!("Trae 走代理：{addr}"),
+                Err(e) => crate::logline!("⚠ Trae 代理设置失败（将直连）：{e}"),
             }
         } else {
             let _ = self.set_proxy("");
@@ -1094,7 +1094,7 @@ impl Client {
         // 字节原样拼回流首，forward 的预读因此**立即**命中，一帧都不会丢。
         let head = read_first_group(&mut resp).await;
         if let Some((code, message)) = head.error {
-            eprintln!("⚠ Trae 上游返回业务错误（code {code}）：{message}");
+            crate::logline!("⚠ Trae 上游返回业务错误（code {code}）：{message}");
             if code == 4008 {
                 // 额度耗尽：forward.rs:723-754 转成 402 并停到明天 4 点，不轮转。
                 return Err(GatewayError::QuotaExhausted(translate::error_text(
@@ -1227,9 +1227,9 @@ impl Client {
                 let token = normalize_access_token(&token);
                 if let Err(e) = cred.save_refreshed(&token, refresh.as_deref(), expires_at.unwrap_or(0))
                 {
-                    eprintln!("⚠ Trae 刷新后的凭证落盘失败（继续用新令牌）：{e}");
+                    crate::logline!("⚠ Trae 刷新后的凭证落盘失败（继续用新令牌）：{e}");
                 }
-                eprintln!("Trae 令牌已刷新（uid {}）", super::mask_uid(&cred.uid));
+                crate::logline!("Trae 令牌已刷新（uid {}）", super::mask_uid(&cred.uid));
                 let mut out = cred.clone();
                 out.token = token;
                 if let Some(rt) = refresh {
@@ -1243,9 +1243,9 @@ impl Client {
                 let msg = e.message().to_string();
                 let uid = super::mask_uid(&cred.uid);
                 if e.is_fatal() {
-                    eprintln!("⚠ Trae 账号 {uid} 的令牌刷新被拒：{msg}");
+                    crate::logline!("⚠ Trae 账号 {uid} 的令牌刷新被拒：{msg}");
                 } else {
-                    eprintln!("⚠ Trae 账号 {uid} 的令牌刷新失败（临时）：{msg}");
+                    crate::logline!("⚠ Trae 账号 {uid} 的令牌刷新失败（临时）：{msg}");
                 }
                 Err(GatewayError::Transport(format!("Trae 令牌刷新失败：{msg}")))
             }

@@ -136,7 +136,7 @@ pub(crate) fn new_billing_cycle_refresh_runner_with(
             // 日志逐字对齐 Go（`billing_cycle.go:93-95`）：**仅当处理过账号才打**，
             // 否则每 15 分钟刷一行「处理 0 个」是纯噪声。
             if processed > 0 {
-                println!("计费周期刷新：处理 {processed} 个 Qoder 账号，{updated} 个周期有更新");
+                crate::logline!("计费周期刷新：处理 {processed} 个 Qoder 账号，{updated} 个周期有更新");
             }
         }) as Pin<Box<dyn Future<Output = ()> + Send>>
     }))
@@ -194,7 +194,7 @@ pub(crate) async fn refresh_billing_cycles_once(
             .collect(),
         Err(e) => {
             // 中毒锁：如实报出来，但不让巡检崩掉。
-            eprintln!("计费周期刷新：账号池锁中毒，本轮跳过（{e}）");
+            crate::logline!("计费周期刷新：账号池锁中毒，本轮跳过（{e}）");
             return (0, 0);
         }
     };
@@ -225,7 +225,7 @@ pub(crate) async fn refresh_billing_cycles_once(
         processed += 1;
 
         let Some(cr) = billing_cycle_cred_of(&a) else {
-            println!(
+            crate::logline!(
                 "billing-cycle {}: 凭证不可用于查询（缺 uid），已跳过",
                 mask_uid(&uid)
             );
@@ -236,7 +236,7 @@ pub(crate) async fn refresh_billing_cycles_once(
             Err(e) => {
                 // ② 错误隔离：这一行日志是唯一的痕迹，整轮继续。
                 //    ★ 且**不写**该账号的周期（宁可没数据，也不要假边界）。
-                println!("billing-cycle {}: {e}", mask_uid(&uid));
+                crate::logline!("billing-cycle {}: {e}", mask_uid(&uid));
                 continue;
             }
         };

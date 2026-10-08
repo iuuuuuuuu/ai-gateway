@@ -306,6 +306,18 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         &state.redis_mode
     };
 
+    // ★ 请求维度的在途数（`in_flight_full` 是「被顶满的账号数」，不是请求数）。
+    //
+    // 宿主侧的优雅重启要回答「现在重启会不会打断正在服务的流」，唯一可靠
+    // 的判据就是这个数 == 0（见 `Pool::in_flight_total` 的注释）。
+    let in_flight = {
+        let p = state.pool.lock().unwrap();
+        p.in_flight_total()
+    };
+    // ★ 网关自身版本：排查「端口上跑的是哪一版」时，不必再去猜文件名里的
+    // 指纹（`gateway-4f811f-….exe`），直接读这里即可。
+    let version = env!("CARGO_PKG_VERSION");
+
     json_response(
         StatusCode::OK,
         json!({
@@ -315,6 +327,8 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             "cooling": cooling,
             "disabled": disabled,
             "in_flight_full": inflight_full,
+            "in_flight": in_flight,
+            "version": version,
             "sticky_sessions": state.session.as_ref().map(|s| s.count()).unwrap_or(0),
             "redis_mode": redis_mode,
         }),
@@ -2687,6 +2701,19 @@ fn anthropic_stream_response(
         if state.finish(&mut out).is_ok() && !out.is_empty() {
             yield Ok(out.take());
         }
+        // ★ 流正常走完：留一条「网关把这条流收干净了」的凭据（同
+        // `chat_stream_response` 收尾那行的理由 —— 客户端再报断流时，
+        // 有没有这行就能判定断在网关内还是网关外）。
+        crate::logline!(
+            "messages uid={} product={} model={}: 流结束（已收 {} 个有效帧，\
+             saw_done={}，saw_finish_reason={}）",
+            uid,
+            product_label_for_log(&product),
+            model,
+            frames.valid_frames(),
+            frames.saw_done(),
+            frames.saw_finish_reason(),
+        );
         // 收尾：记用量 + 释放租约（流已结束，二者都不再依赖连接）。
         record_usage(&state_ref, &uid, &model, &product, &region, state.usage());
         guard.release();
@@ -2807,6 +2834,18 @@ fn responses_stream_response(
         if state.finish(&mut out).is_ok() && !out.is_empty() {
             yield Ok(out.take());
         }
+        // ★ 流正常走完：留一条「网关把这条流收干净了」的凭据（同
+        // `chat_stream_response` 收尾那行的理由）。
+        crate::logline!(
+            "responses uid={} product={} model={}: 流结束（已收 {} 个有效帧，\
+             saw_done={}，saw_finish_reason={}）",
+            uid,
+            product_label_for_log(&product),
+            model,
+            frames.valid_frames(),
+            frames.saw_done(),
+            frames.saw_finish_reason(),
+        );
         // 收尾：记用量 + 释放租约。
         record_usage(&state_ref, &uid, &model, &product, &region, state.usage());
         guard.release();
@@ -2968,7 +3007,7 @@ fn note_upstream_stream_error(
     model: &str,
     msg: &str,
 ) {
-    eprintln!(
+    crate::logline!(
         "chat uid={} product={} model={}: 上游在流中下发错误帧：{}（按 503 上游故障分类）",
         uid,
         product_label_for_log(product),
@@ -3115,7 +3154,7 @@ fn chat_stream_response(
                         // 还是客户端自己合成的（DSH 的 ACP 代理会合成**逐字相同**的
                         // 文案，见业主 2026-10-06 的 flash 报障）。
                         // 判据就靠这一行：日志里有它 ⇒ 是网关判定的上游截断。
-                        eprintln!(
+                        crate::logline!(
                             "chat uid={} product={} model={}: 上游未发 [DONE] 就结束，\
                              已向客户端补发 error 帧 code=upstream_stream_truncated\
                              （已收 {} 个有效帧 / {} 字节，saw_done={}）",
@@ -3148,7 +3187,7 @@ fn chat_stream_response(
                     // 反过来说：真截断（吐了一半、finish_reason 没到）仍然走下面
                     // 那条 error 帧路径，语义没有被放宽。
                     if frames.saw_finish_reason() {
-                        eprintln!(
+                        crate::logline!(
                             "chat uid={} product={} model={}: 上游已发 finish_reason、\
                              仅终止字节 [DONE] 未到（读错误：{e}），\
                              按正常收尾补发 [DONE]（已收 {} 个有效帧 / {} 字节）",
@@ -3172,7 +3211,7 @@ fn chat_stream_response(
                     // 客户端按明确的错误码自动换账号重试（实测重试能拿到完整回答）。
                     // 与上面那条分支同理：这是「传输层断流」而不是「上游没写 [DONE]」，
                     // 两者客户端看到的现象一样，但排查方向完全不同，必须分别留痕。
-                    eprintln!(
+                    crate::logline!(
                         "chat uid={} product={} model={}: 上游流读取失败：{e}\
                          （已收 {} 个有效帧 / {} 字节，saw_done={}）",
                         uid,
@@ -3189,6 +3228,24 @@ fn chat_stream_response(
                 }
             }
         }
+        // ★ 流正常走完（含上面各条「补 error 帧 / 补 [DONE]」的收尾分支）。
+        //
+        // 这一行是「**网关侧确实把这条流收干净了**」的凭据：客户端若仍报
+        // 「stream ended before/without …」，而这里没有对应记录，就能立刻判定
+        // 断在网关**之外**（客户端插件、本机代理、或客户端自己取消），
+        // 不必再对着网关源码猜。此前这条流结束时**一行日志都没有**，
+        // 「网关收干净了没有」根本无法回答 —— 只能靠有没有 error 帧反推。
+        crate::logline!(
+            "chat uid={} product={} model={}: 流结束（已收 {} 个有效帧 / {} 字节，\
+             saw_done={}，saw_finish_reason={}）",
+            uid,
+            product_label_for_log(&product),
+            model,
+            frames.valid_frames(),
+            sent_bytes,
+            frames.saw_done(),
+            frames.saw_finish_reason(),
+        );
         record_usage(&state_ref, &uid, &model, &product, &region, last_usage.as_ref());
         guard.release();
     };

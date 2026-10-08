@@ -634,7 +634,7 @@ impl Scheduler {
         F: std::future::Future<Output = ()>,
     {
         if !self.claim_task(name) {
-            eprintln!("{name}: skipped (a manual run is already in progress)");
+            crate::logline!("{name}: skipped (a manual run is already in progress)");
             return;
         }
         let _guard = TaskBusyGuard {
@@ -989,7 +989,7 @@ impl Scheduler {
             let info = match self.cfg.upstream.user_resource_detail(&a).await {
                 Ok(info) => info,
                 Err(e) => {
-                    eprintln!("credit-refresh {}: {e}", st.uid);
+                    crate::logline!("credit-refresh {}: {e}", st.uid);
                     continue;
                 }
             };
@@ -1031,13 +1031,13 @@ impl Scheduler {
                 continue;
             }
             if let Err(e) = self.cfg.upstream.daily_checkin(&a).await {
-                eprintln!("checkin {}: {e}", st.uid);
+                crate::logline!("checkin {}: {e}", st.uid);
                 // 已签到等业务错误也继续走余额查询
             }
             let info = match self.cfg.upstream.user_resource_detail(&a).await {
                 Ok(info) => info,
                 Err(e) => {
-                    eprintln!("user-resource {}: {e}", st.uid);
+                    crate::logline!("user-resource {}: {e}", st.uid);
                     continue;
                 }
             };
@@ -1074,7 +1074,7 @@ impl Scheduler {
             let info = match self.cfg.upstream.user_resource_detail(&a).await {
                 Ok(info) => info,
                 Err(e) => {
-                    eprintln!("credit-refresh {}: {e}", st.uid);
+                    crate::logline!("credit-refresh {}: {e}", st.uid);
                     continue;
                 }
             };
@@ -1118,19 +1118,19 @@ impl Scheduler {
                         None => (false, 0, 0),
                     };
                     if hit {
-                        eprintln!(
+                        crate::logline!(
                             "keepalive {}: session dead x{threshold}, disabled (re-login required)",
                             uid8(&st.uid)
                         );
                     } else {
                         // 未达阈值：保留账号，下轮再判（误判防护）
-                        eprintln!(
+                        crate::logline!(
                             "keepalive {}: session dead {fails}/{threshold} (not disabling yet): {e}",
                             uid8(&st.uid)
                         );
                     }
                 } else {
-                    eprintln!("keepalive {}: {e}", uid8(&st.uid));
+                    crate::logline!("keepalive {}: {e}", uid8(&st.uid));
                 }
                 continue;
             }
@@ -1139,7 +1139,7 @@ impl Scheduler {
                 pool.clear_session_dead(&st.uid);
             }
             if let Err(e) = a.save_atomic() {
-                eprintln!("keepalive {} save: {e}", uid8(&st.uid));
+                crate::logline!("keepalive {} save: {e}", uid8(&st.uid));
             }
         }
     }
@@ -1202,12 +1202,12 @@ impl Scheduler {
                 // ⚠ **不重试**：失败就等明天那个时点。这是与参考实现最重要的差异，
                 //   也是本功能不扩大风控面的关键 —— 重试风暴正是把账号打进风控的
                 //   典型特征（我们在 ZCode 上亲身经历过）。
-                eprintln!("product_tasks: {err}");
+                crate::logline!("product_tasks: {err}");
                 self.rec_task_all_daily("产品日常任务", crate::records::RESULT_FAILED, &err);
             }
             None => {
                 if !detail.is_empty() {
-                    eprintln!("product_tasks: {detail}");
+                    crate::logline!("product_tasks: {detail}");
                 }
                 self.rec_task_all_daily("产品日常任务", crate::records::RESULT_SUCCESS, &detail);
             }
@@ -1401,7 +1401,7 @@ impl Scheduler {
             for i in 1..=count {
                 let rid = format!("{cid}-r{i}");
                 if let Err(e) = self.cfg.upstream.report_chat_activity(&a, &cid, &rid).await {
-                    eprintln!(
+                    crate::logline!(
                         "activity {}: report {i}/{count} failed: {e}",
                         uid8(&a.uid)
                     );
@@ -1424,7 +1424,7 @@ impl Scheduler {
                 );
                 continue;
             }
-            eprintln!("activity {}: reported {ok}/{count} ok", uid8(&a.uid));
+            crate::logline!("activity {}: reported {ok}/{count} ok", uid8(&a.uid));
             // 成功用**非** Daily：确实有新变化，每次都要留痕。
             self.rec_task(
                 &a.uid,
@@ -1451,21 +1451,21 @@ impl Scheduler {
     async fn read_streak_state(&self, a: &Auth) -> (Option<crate::upstream::growth::GrowthStreakState>, bool) {
         match self.cfg.upstream.growth_streak_state(a).await {
             Err(e) => {
-                eprintln!(
+                crate::logline!(
                     "WARN: activity {}: streak check failed (report ok): {e}",
                     uid8(&a.uid)
                 );
                 (None, true)
             }
             Ok(st) if st.days() == 0 => {
-                eprintln!(
+                crate::logline!(
                     "WARN: activity {}: report ok but streak.days=0 (silent drop?)",
                     uid8(&a.uid)
                 );
                 (Some(st), true)
             }
             Ok(st) => {
-                eprintln!("activity {}: streak days={}", uid8(&a.uid), st.days());
+                crate::logline!("activity {}: streak days={}", uid8(&a.uid), st.days());
                 (Some(st), false)
             }
         }
@@ -1484,7 +1484,7 @@ impl Scheduler {
             "当前不在夜猫时段（23:00–08:00 北京时间），上游不计入本次上报";
 
         if !nightowl::within_night_window() {
-            eprintln!("nightowl: skipped (outside 23:00-08:00 CST window)");
+            crate::logline!("nightowl: skipped (outside 23:00-08:00 CST window)");
             // 整轮汇总**不带 accountId**，用户在账号卡片按账号筛选时看不到它，
             // 故手动触发要**再**补一条账号级。
             self.rec_task_all_daily(TASK_NAME_NIGHT_OWL, crate::records::RESULT_INFO, NIGHT_OWL_SKIP_MSG);
@@ -1521,11 +1521,11 @@ impl Scheduler {
                 .report_chat_activity(&a, &cid, &format!("{cid}-r1"))
                 .await
             {
-                eprintln!("nightowl {}: report failed: {e}", uid8(&a.uid));
+                crate::logline!("nightowl {}: report failed: {e}", uid8(&a.uid));
                 self.rec_task_daily(&a.uid, "夜猫子任务", crate::records::RESULT_FAILED, &e.to_string());
                 continue;
             }
-            eprintln!("nightowl {}: black_cat reported ok", uid8(&a.uid));
+            crate::logline!("nightowl {}: black_cat reported ok", uid8(&a.uid));
             self.rec_task(
                 &a.uid,
                 "夜猫子任务",
@@ -1591,7 +1591,7 @@ impl Scheduler {
             let (in_period, tasks) = match self.cfg.upstream.school_tasks(&a).await {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("school {}: fetch tasks failed: {e}", uid8(&a.uid));
+                    crate::logline!("school {}: fetch tasks failed: {e}", uid8(&a.uid));
                     // 失败按天去重：活动任务每天只跑一次，失败留一条即可。
                     self.rec_task_daily(
                         &a.uid,
@@ -1604,7 +1604,7 @@ impl Scheduler {
             };
             any_answered = true;
             if !in_period {
-                eprintln!("school {}: activity not in period, skip", uid8(&a.uid));
+                crate::logline!("school {}: activity not in period, skip", uid8(&a.uid));
                 // ⚠ 只对手动触发补写。自动排程每天跑一次，为「活动不在期」逐账号
                 //    写记录会把记录刷成噪音 —— 原作者那条顾虑**对自动路径成立**。
                 if !manual_uid.is_empty() {
@@ -1621,7 +1621,7 @@ impl Scheduler {
 
             let (claimed, claim_errs) = self.claim_finished_tasks(&a, &tasks).await;
             if claimed > 0 {
-                eprintln!("school {}: claimed {claimed} task(s)", uid8(&a.uid));
+                crate::logline!("school {}: claimed {claimed} task(s)", uid8(&a.uid));
                 // 只在**真的领到奖励**时写成功记录 —— 那才是「有新变化」。
                 self.rec_task(
                     &a.uid,
@@ -1648,7 +1648,7 @@ impl Scheduler {
         // 汇总只在「确实问过上游、且都回答不在期」时写：没问到任何账号就断言活动
         // 下线，会让用户拿着错误结论去排查。
         if any_answered && !any_in_period {
-            eprintln!("school: activity not in period for any account (probably ended)");
+            crate::logline!("school: activity not in period for any account (probably ended)");
             self.rec_task_all_daily(
                 "开学季活动",
                 crate::records::RESULT_INFO,
@@ -1680,13 +1680,13 @@ impl Scheduler {
                 continue;
             }
             if let Err(e) = self.cfg.upstream.school_claim(a, &t.code).await {
-                eprintln!("school {}: claim {} failed: {e}", uid8(&a.uid), t.code);
+                crate::logline!("school {}: claim {} failed: {e}", uid8(&a.uid), t.code);
                 // 带上任务 code：活动有多个任务，不写清楚用户不知道是哪个没领到。
                 errs.push(format!("领取 {} 失败: {e}", t.code));
                 continue;
             }
             n += 1;
-            eprintln!(
+            crate::logline!(
                 "school {}: claim {} ok (+{} credits)",
                 uid8(&a.uid),
                 t.code,
@@ -1739,12 +1739,12 @@ impl Scheduler {
 
             match self.cfg.upstream.claim_trial(&a).await {
                 Err(e) => {
-                    eprintln!("trial {}: {e}", uid8(&a.uid));
+                    crate::logline!("trial {}: {e}", uid8(&a.uid));
                     self.rec_task_daily(&a.uid, "trial 加油包", crate::records::RESULT_FAILED, &e.to_string());
                 }
                 Ok(true) => {
                     newly += 1;
-                    eprintln!("trial {}: claimed new trial pack", uid8(&a.uid));
+                    crate::logline!("trial {}: claimed new trial pack", uid8(&a.uid));
                     self.rec_task(
                         &a.uid,
                         "trial 加油包",
@@ -1765,7 +1765,7 @@ impl Scheduler {
         }
         // 只在有新领取时打汇总，避免每天刷一行「全部已领过」的噪音日志。
         if newly > 0 {
-            eprintln!("trial: claimed {newly} new pack(s), {already} already claimed");
+            crate::logline!("trial: claimed {newly} new pack(s), {already} already claimed");
         }
     }
 
@@ -1807,7 +1807,7 @@ impl Scheduler {
         let buddy = match self.cfg.upstream.buddy_info(a).await {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("travel {}: buddy-info: {e}", a.uid);
+                crate::logline!("travel {}: buddy-info: {e}", a.uid);
                 return;
             }
         };
@@ -1818,7 +1818,7 @@ impl Scheduler {
         let ts = match self.cfg.upstream.travel_status(a).await {
             Ok(ts) => ts,
             Err(e) => {
-                eprintln!("travel {}: status: {e}", a.uid);
+                crate::logline!("travel {}: status: {e}", a.uid);
                 return;
             }
         };
@@ -1826,37 +1826,37 @@ impl Scheduler {
             TRAVEL_STATE_ARRIVED => self.travel_claim(a, &ts).await,
             TRAVEL_STATE_IDLE => self.travel_depart(a, &ts).await,
             TRAVEL_STATE_TRAVELING => {
-                eprintln!("travel {}: skip (traveling record={})", a.uid, ts.record_id)
+                crate::logline!("travel {}: skip (traveling record={})", a.uid, ts.record_id)
             }
-            other => eprintln!("travel {}: skip (unknown state {other:?})", a.uid),
+            other => crate::logline!("travel {}: skip (unknown state {other:?})", a.uid),
         }
     }
 
     /// 空闲且未达当日上限时派出（每日 1 次，自然日 00:00 CST 重置）。
     async fn travel_depart(&self, a: &Auth, ts: &crate::upstream::growth::TravelState) {
         if ts.daily_limit_reached {
-            eprintln!("travel {}: skip (daily limit reached)", a.uid);
+            crate::logline!("travel {}: skip (daily limit reached)", a.uid);
             return;
         }
         if let Err(e) = self.cfg.upstream.travel_depart(a, TRAVEL_LOCATION_ID).await {
-            eprintln!("travel {}: depart: {e}", a.uid);
+            crate::logline!("travel {}: depart: {e}", a.uid);
             return;
         }
-        eprintln!("travel {}: depart ok location={TRAVEL_LOCATION_ID}", a.uid);
+        crate::logline!("travel {}: depart ok location={TRAVEL_LOCATION_ID}", a.uid);
     }
 
     /// 到站领奖（必须带 `record_id`）。
     async fn travel_claim(&self, a: &Auth, ts: &crate::upstream::growth::TravelState) {
         if ts.record_id == 0 {
-            eprintln!("travel {}: claim skipped (arrived but no record_id)", a.uid);
+            crate::logline!("travel {}: claim skipped (arrived but no record_id)", a.uid);
             return;
         }
         match self.cfg.upstream.travel_claim(a, ts.record_id).await {
-            Ok(reward) => eprintln!(
+            Ok(reward) => crate::logline!(
                 "travel {}: claim ok record={} reward={reward}",
                 a.uid, ts.record_id
             ),
-            Err(e) => eprintln!("travel {}: claim record={}: {e}", a.uid, ts.record_id),
+            Err(e) => crate::logline!("travel {}: claim record={}: {e}", a.uid, ts.record_id),
         }
     }
 
@@ -1885,23 +1885,23 @@ impl Scheduler {
             return;
         }
         if let Err(e) = self.cfg.upstream.buddy_agreement(a).await {
-            eprintln!("travel {}: agreement: {e}", uid8(&a.uid));
+            crate::logline!("travel {}: agreement: {e}", uid8(&a.uid));
             return;
         }
         match self.cfg.upstream.buddy_first(a).await {
             Ok(()) => {
                 // 成功即清标记，避免残留影响后续判断。
                 self.clear_adopt_tried(&a.uid);
-                eprintln!("travel {}: adopt ok (+300 credits)", uid8(&a.uid));
+                crate::logline!("travel {}: adopt ok (+300 credits)", uid8(&a.uid));
             }
             Err(e) if crate::upstream::growth::is_buddy_task_incomplete(&e) => {
                 self.mark_adopt_tried(&a.uid);
-                eprintln!(
+                crate::logline!(
                     "travel {}: adopt skipped (conversation threshold not reached, retry tomorrow)",
                     uid8(&a.uid)
                 );
             }
-            Err(e) => eprintln!("travel {}: adopt: {e}", uid8(&a.uid)),
+            Err(e) => crate::logline!("travel {}: adopt: {e}", uid8(&a.uid)),
         }
     }
 
@@ -2063,7 +2063,7 @@ impl Scheduler {
             })
             .collect();
         let detail = format!("开出 {} 个：{}", items.len(), names.join("、"));
-        eprintln!("growth {}: blindbox ok ({} 个)", uid8(&a.uid), items.len());
+        crate::logline!("growth {}: blindbox ok ({} 个)", uid8(&a.uid), items.len());
         self.rec_task(&a.uid, GROWTH_TASK_TITLE, crate::records::RESULT_SUCCESS, &detail);
     }
 
@@ -2080,7 +2080,7 @@ impl Scheduler {
         match self.cfg.upstream.claim_gift(a).await {
             Err(e) => log_growth_err("growth", &a.uid, "claim-gift", &e),
             Ok(credit) if credit > 0 => {
-                eprintln!("growth {}: gift ok (+{credit} credit)", uid8(&a.uid));
+                crate::logline!("growth {}: gift ok (+{credit} credit)", uid8(&a.uid));
                 self.rec_task(
                     &a.uid,
                     GROWTH_TASK_TITLE,
@@ -2093,7 +2093,7 @@ impl Scheduler {
         match self.cfg.upstream.claim_compensation(a).await {
             Err(e) => log_growth_err("growth", &a.uid, "claim-compensation", &e),
             Ok(credit) if credit > 0 => {
-                eprintln!("growth {}: compensation ok (+{credit} credit)", uid8(&a.uid));
+                crate::logline!("growth {}: compensation ok (+{credit} credit)", uid8(&a.uid));
                 self.rec_task(
                     &a.uid,
                     GROWTH_TASK_TITLE,
@@ -2158,7 +2158,7 @@ impl Scheduler {
             log_growth_err("growth", &a.uid, &format!("makeup {yesterday}"), &e);
             return false;
         }
-        eprintln!("growth {}: makeup ok {yesterday} (streak kept)", uid8(&a.uid));
+        crate::logline!("growth {}: makeup ok {yesterday} (streak kept)", uid8(&a.uid));
         self.rec_task(
             &a.uid,
             GROWTH_TASK_TITLE,
@@ -2186,7 +2186,7 @@ impl Scheduler {
         }
         match self.cfg.upstream.growth_redeem(a, &tier, "").await {
             Ok(res) => {
-                eprintln!(
+                crate::logline!(
                     "growth {}: redeem tier={tier} ok (+{} credit, +{} energy, +{} card, +{} chance)",
                     uid8(&a.uid),
                     res.credit_granted,
@@ -2237,7 +2237,7 @@ impl Scheduler {
             // 空 = 每次自动生成新 client_token
             match self.cfg.upstream.growth_lottery_draw(a, "").await {
                 Ok(res) => {
-                    eprintln!(
+                    crate::logline!(
                         "growth {}: lottery prize={} type={} (+{} credit)",
                         uid8(&a.uid),
                         res.prize_name,
@@ -2337,7 +2337,7 @@ fn log_growth_err(prefix: &str, uid: &str, what: &str, err: &GatewayError) {
         // 兜底：调用方本应各自静默，这里防的是将来新增分支时漏判。
         return;
     }
-    eprintln!("WARN: {prefix} {}: {what}: {err}", uid8(uid));
+    crate::logline!("WARN: {prefix} {}: {what}: {err}", uid8(uid));
 }
 
 // ---------------------------------------------------------------------------

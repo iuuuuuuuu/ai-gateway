@@ -123,7 +123,7 @@ impl Dispatch {
         let resolved = resolve_model(&client_model, default_fn);
 
         if let Some(want) = realm_conflict(resolved.config_name.as_deref(), cr.realm) {
-            eprintln!(
+            crate::logline!(
                 "⚠ Trae 模型与账号区域不匹配：model={client_model} 属于 {}，账号 {} 属于 {}；\
                  请求未发出（跨区令牌会撞上游风控）",
                 want.label(),
@@ -139,12 +139,12 @@ impl Dispatch {
             Ok(Value::Object(obj)) => obj,
             Ok(_) => {
                 let msg = "Trae 请求体不是 JSON 对象".to_string();
-                eprintln!("⚠ Trae dispatch: uid={} {msg}", super::mask_uid(&cr.uid));
+                crate::logline!("⚠ Trae dispatch: uid={} {msg}", super::mask_uid(&cr.uid));
                 return Err(GatewayError::Other(msg));
             }
             Err(e) => {
                 let msg = format!("Trae 请求体不是合法 JSON：{e}");
-                eprintln!("⚠ Trae dispatch: uid={} {msg}", super::mask_uid(&cr.uid));
+                crate::logline!("⚠ Trae dispatch: uid={} {msg}", super::mask_uid(&cr.uid));
                 return Err(GatewayError::Other(msg));
             }
         };
@@ -154,7 +154,7 @@ impl Dispatch {
         let body = match assemble(&resolved) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!(
+                crate::logline!(
                     "⚠ Trae dispatch: uid={} 组装上游请求体失败：{e}",
                     super::mask_uid(&cr.uid)
                 );
@@ -173,7 +173,7 @@ impl Dispatch {
         let mut swapped = false;
         if matches!(&call, Err(e) if e.model_not_found().is_some()) {
             if let Some(alt) = other_function(&resolved.function) {
-                eprintln!(
+                crate::logline!(
                     "Trae dispatch: uid={} 上游回 4001/4023（function={}），改发另一条产品线的池 {} 重试一次",
                     super::mask_uid(&cr.uid),
                     resolved.function,
@@ -197,7 +197,7 @@ impl Dispatch {
                     }
                     // 同一份 obj 刚刚组装成功过，这里不该失败；真失败了也不能吞掉
                     // 原始错误，只留一行日志。
-                    Err(e) => eprintln!(
+                    Err(e) => crate::logline!(
                         "⚠ Trae dispatch: uid={} 换池后重组装请求体失败：{e}",
                         super::mask_uid(&cr.uid)
                     ),
@@ -208,7 +208,7 @@ impl Dispatch {
         match call {
             Ok(call) => Ok(call),
             Err(e) => {
-                eprintln!(
+                crate::logline!(
                     "trae dispatch: ChatStream 失败 uid={} realm={} model={} config_name={} function={} -> {e}",
                     super::mask_uid(&cr.uid),
                     cr.realm.as_str(),
