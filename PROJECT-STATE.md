@@ -124,9 +124,29 @@
 | 保活幂等（37s 前刚刷过） | 日志里**一条 keepalive 都没有** |
 | 端口不被补跑阻塞 | `listening` 与「开始补跑」同毫秒 |
 
-**测试基线**：workspace **3070 passed / 0 failed / 7 ignored**（15 suite）。
+**测试基线**：workspace **3075 passed / 0 failed / 7 ignored**（15 suite）。
 
 **未做**：未推送、未打 tag、未建 Release（业主未表态）。
+
+### 9.13 Qoder 积分余额恒为 0（2026-10-09，业主第三报）
+
+**业主原话**：「qoder这个虽然到期时间查不出来,但是积分余额显示错误,这个是可以查出来的」（附账号池截图：两个 Qoder 账号积分余额列显示 0）
+
+**根因**：账号池页「积分余额」列取**网关 `/status` 的 `credits`**，而该字段只有两条写入路径，都对 Qoder 无效 ——
+① `scheduler::refresh_credits_with_gap` 带产品闸门 `a.product_of() != PRODUCT_WORKBUDDY ⇒ continue`；
+② `products/trae/credits.rs` 只认 Trae。⇒ Qoder 的 `credits` 恒为 `Entry::default()` 的 0，
+而界面判据是 `typeof credits === "number"` ⇒ 显示 **0** 而不是「—」。
+
+**定位读数**：宿主 `~/.wb-switch/qoder/accounts.json` 是 1996 / 1700；网关 `/status` 是 0 / 0；
+上游 `/api/v2/quota/usage` 一直能查到 1996 / 1700。业主说的「这个是可以查出来的」准确。
+
+**修法**：新增 `crates/ai-gateway-router/src/products/qoder/credits.rs`（与 `trae/credits.rs` 同形），
+`bin/gateway.rs` 接成**第三条**独立定时循环（每 15 分钟一轮，逐个 Qoder 账号 GET `/api/v2/quota/usage`）。
+三条纪律：① 失败不写池（查不到就跳过，**绝不**写 0）；② 只读不改状态（只写 `credits`，不碰 `until`/`breaker_until`/`disabled`）；
+③ 池里没有 Qoder 账号就不装回调。到期档位仍「未知」是**正确**的：`expiresAt` 是套餐到期不是周期重置，实测两个账号都回 0。
+
+**真机实测**（隔离实例，release 二进制）：一轮后 `/status` 给出 `credits=1996 / 1700`（与上游一致）；
+同时刻业主在跑的 1.0.36 实例给出 `0 / 0`（= 截图上的 0）；两个凭证文件跑完一轮 **mtime 与 SHA256 完全未变**。
 
 ### 9.12 成本调度三条缝的定位与修复（2026-10-08，业主第二报）
 
