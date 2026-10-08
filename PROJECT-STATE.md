@@ -676,3 +676,46 @@ Release 的 5 个资产（安装包上传前**改名为 updater 约定名** `ai-
 
 ★ 凭据流程与 9.8 相同：`\.tmp\ghtoken.ps1`（CredRead P/Invoke，脚本本身不含字面 token）⇒ 写 `\.tmp\ghtoken.txt`（40 B `gho_`）⇒ 用完**立即删除**（`ghtoken.txt` 已删，`ghtoken.ps1` 保留复用）。推送前的 `GIT_TERMINAL_PROMPT=0` / `GCM_INTERACTIVE=never` / `GCM_PROVIDER=generic` 三件套同样必要。
 ★ 本轮 `git add` 沿用 9.8 的数组写法（`$files = @(...); git add -- $files`），20 个路径一次 staged，无 pathspec 报错。
+
+### 9.10 1.0.35 的推送 / tag / Release（2026-10-08，本轮实测）
+
+业主 10-08 两条指令：先自行决定仓库里两个脏文件怎么处理，然后「发布一下 rela 新版本的构建」。本版 = 可观测性补完（㉛）+ 国服积分恒 0 修复（㉜），按与 1.0.32 / 1.0.33 / 1.0.34 完全相同的流程落地远端。
+
+| 项 | 结果 |
+|---|---|
+| 版本提交 | `7170d48bdf2c1dcea3d79571eda0dedcc229bef1`（`feat(1.0.35): 网关日志全量时间戳 + 流收尾凭据 + /status 在途数；修国服账号消耗积分恒为 0`，**52 files / 762 insertions / 248 deletions**，含新增 `.github/RELEASE_NOTES_1.0.35.md` 与 `crates/ai-gateway-router/src/logging.rs`）★ 与 1.0.34 同规矩：PROJECT-STATE.md 与 RELEASE_NOTES 一起进版本提交 |
+| tag | `v1.0.35` = annotated，对象指向 `7170d48`（`git rev-list -n 1 v1.0.35` = HEAD，`git diff --stat v1.0.35 HEAD` 为空 ⇒ **tag 只落版本提交**） |
+| `main` | 推送 `44b5bfb..7170d48`（`git push fork main`）；远端 `refs/heads/main` 现为 `7170d48` = 本地 HEAD |
+| tag 远端一致性 | `git push fork v1.0.35` ⇒ `* [new tag] v1.0.35 -> v1.0.35` |
+| Release | tag `v1.0.35`，id **`406646519`**，`draft=false prerelease=false`，`target_commitish=main`，正文 = `.github\RELEASE_NOTES_1.0.35.md` 全文（`bodyLen=5717`；文件 5,717 字符 / 9,853 B，`body === file` 为 true） |
+
+Release 的 5 个资产（安装包上传前**改名为 updater 约定名** `ai-gateway-windows-x86_64-setup.exe`）：
+
+| asset | bytes | assetId |
+|---|---|---|
+| `ai-gateway-windows-x86_64-setup.exe` | 14673521 | 621334571 |
+| `ai-gateway-windows-x86_64-setup.exe.sig` | 424 | 621335026 |
+| `ai-gateway_1.0.35_server-x64.exe` | 27212800 | 621335602 |
+| `latest.json` | 1954 | 621335872 |
+| `latest-windows-x86_64.json` | 1954 | 621335924 |
+
+★ `latest.json` 写法同 9.7 / 9.8 / 9.9（`version=1.0.35`、两个平台键 `windows-x86_64-nsis` 与 `windows-x86_64` 的 `signature` 都是 `.sig` 逐字、`url` 指向 `releases/latest/download/ai-gateway-windows-x86_64-setup.exe`、两份文件内容完全相同）。`pub_date` = `2026-10-08T09:17:19Z`。上传源目录 `\.scratch\rel35\upload\`（安装包 / `.sig` / server 从 `dist\` 改名复制）。
+
+**发布后复核（实测，不是推断）**
+
+| 检查 | 结果 |
+|---|---|
+| `releases/latest` | 指向 `v1.0.35`（id `406646519`），`draft=false prerelease=false`，5 资产 |
+| 资产逐字节核对（走 API + token 真下回来） | **5/5 `MATCH=True`**：安装包 `14673521` / `F8236A91…`、`.sig` `424` / `47700194…`、server `27212800` / `4F7E7D73…`、两个 `latest*.json` `1954` / `0D594218…` |
+| 匿名访问（转私有后仍是） | `releases/latest/download/latest.json` **404**、`api.github.com/.../releases` **403** ⇒ 9.6 的结论**未变**，updater 通道对客户端依旧失效 |
+| Ed25519 验签（公钥取 `tauri.conf.json plugins.updater.pubkey`） | `FILE SIG VALID = true`、`GLOBAL SIG VALID = true`；keyid `6fa3c36f4be67c7e`（展示形）双方一致 |
+
+★ **验签配方补正（1.0.35 实测发现，之前 9.8 的写法对 FILE SIG 是错的）**：tauri/minisign 的 `Ed`/`ED` 算法标识意味着**预哈希**签名 —— 文件签名必须对 `blake2b-512(file)` 验，直接对原文件验会得到 `false`（本轮先踩到这个 false，再改成预哈希才为 true）。全局签名仍不预哈希，消息 = `sig64 || trusted_comment 正文`（去掉 `"trusted comment: "` 前缀、不加换行）。公钥/签名的二进制布局：`[2 字节算法标识][8 字节 keyid][32 字节公钥 | 64 字节签名]`，keyid 在小端存储（`7e7ce64b6fc3a36f` ↔ 展示形 `6fa3c36f4be67c7e`）。
+
+★ 凭据流程与 9.8 / 9.9 相同：`\.tmp\ghtoken.ps1`（CredRead P/Invoke，脚本本身不含字面 token）⇒ 写 `\.tmp\ghtoken.txt`（40 B `gho_`）⇒ 用完**立即删除**（`ghtoken.txt` 已删，`ghtoken.ps1` 保留复用）。推送前的 `GIT_TERMINAL_PROMPT=0` / `GCM_INTERACTIVE=never` / `GCM_PROVIDER=generic` 三件套同样必要。
+★ 本轮 `git add` 沿用 9.8 的数组写法（`$files = @(...); git add -- $files`），52 个路径一次 staged，无 pathspec 报错。
+★ 本轮的 Windows 侧坑：`Invoke-RestMethod` 建 Release 时 `-Body` 传含中文的 JSON 会因编码丢字符 ⇒ 改为**先把 payload 写成 UTF-8 文件再 `-InFile`**，`bodyLen` 才与文件字符数相等（5,717）。另：node 侧的 `fetch` 在本机直连 api.github.com 会 `TypeError: fetch failed`（无系统代理），GitHub API 一律走 PowerShell。
+
+★ **本版顺带落地的仓库卫生决定（业主授权「你自己拿主意吧」）**：
+- `repo` worktree 的 `Cargo.lock`（`wb-switch-rust` 0.8.1 → 0.8.2 一行，与 `src-tauri/Cargo.toml` 已声明的 0.8.2 对齐）—— 属遗留一致性修正，保留待提交；
+- `repo` worktree 的 `src-tauri/tauri.dev-sandbox.conf.json`（本机 dev 沙箱配置、标题乱码）—— 属机器本地文件，**进 `.gitignore` 而非提交**（`wt-port/.gitignore:91` 已含同名条目）。
