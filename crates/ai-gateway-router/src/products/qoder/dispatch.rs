@@ -218,7 +218,7 @@ impl Dispatch {
 ///
 /// 返回 `None` 表示「Product=qoder 但两个令牌都是空的」：那是凭证加载层的缺陷，
 /// 与其发一次注定失败的请求，不如给出指向明确的错误。
-fn cred_of(a: &Auth) -> Option<QoderCred> {
+pub(crate) fn cred_of(a: &Auth) -> Option<QoderCred> {
     if a.access_token.is_empty() && a.refresh_token.is_empty() {
         return None;
     }

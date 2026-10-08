@@ -785,6 +785,44 @@ async fn main() {
         });
     }
 
+    // ★★ 接线：Qoder 账号积分采集（GET /api/v2/quota/usage，OpenAPI 域、只带 Bearer DT）。
+    //
+    // 为什么是**第三条**独立循环（前两条：scheduler 的 WorkBuddy 积分巡检、Trae 采集）：
+    //
+    // 1. scheduler 那条带产品闸门（`a.product_of() != PRODUCT_WORKBUDDY ⇒ continue`），
+    //    Qoder 账号**必被跳过** ⇒ 池里的 `credits` 从来没被写过 ⇒ 恒为 0；
+    // 2. 而账号池页的「积分余额」列取的正是网关 `/status` 的 `credits`（不是宿主那份
+    //    `~/.wb-switch/qoder/accounts.json`）⇒ 界面显示 0 而不是真实余额；
+    // 3. Qoder 的端点/鉴权（OpenAPI 域、不签名）与 Trae 完全不同，也不能复用
+    //    scheduler 里那个已被 `billing_cycle` 占用的 qoder 单槽回调。
+    //
+    // 业主原话（2026-10-09）：「qoder这个虽然到期时间查不出来,但是积分余额显示错误,
+    // 这个是可以查出来的」。
+    //
+    // ⚠ 池里没有 Qoder 账号时 new_credits_refresh_runner 返回 None ⇒ 回调不装、
+    // task 不启、**一个出站请求都不发**（与 Trae 那处同口径）。
+    if let Some(runner) =
+        ai_gateway_router::products::qoder::credits::new_credits_refresh_runner(
+            Arc::clone(&pool),
+            sched_cancel.clone(),
+        )
+    {
+        let interval =
+            ai_gateway_router::products::qoder::credits::DEFAULT_CREDITS_REFRESH_INTERVAL;
+        ai_gateway_router::logline!(
+            "Qoder 积分采集已接线：每 {} 分钟一轮，每个 Qoder 账号每轮 1 次出站（quota/usage）",
+            interval.as_secs() / 60
+        );
+        let cancel = sched_cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                runner().await;
+                if !cancel.sleep(interval).await {
+                    return;
+                }
+            }
+        });
+    }
     // 签到范围日志（与 Go `main.go:380-395` 同口径）。
     if cfg.checkin_scope_all() {
         ai_gateway_router::logline!("签到与猫猫旅行范围：国服 + 国际版（schedule.checkin_scope=all）");

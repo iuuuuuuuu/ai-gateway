@@ -25,6 +25,7 @@
 pub mod billing_cycle;
 pub mod cli;
 pub mod cred;
+pub mod credits;
 pub mod region;
 
 pub(crate) mod campaign;
