@@ -226,6 +226,18 @@ fn spawn_background_loops(app: tauri::AppHandle) {
     // invalid_grant），**与豆包无关** —— 豆包是「启动客户端再关掉」的
     // 客户端级滑动续期，走 `cli_task` 的 `doubao-keepalive`，由上面的
     // 应用内调度循环负责。两者同名不同物，别把其中一个删掉当成去重。
+    //
+    // ★ 2026-10-08 修「跨天判据」：原来只比 `date_str(None)`（自然日），于是
+    // 「应用 23:50 启动 ⇒ 当天已跑 ⇒ 第二天 00:00 翻页 ⇒ 又跑」这个组合下
+    // 频率是对的；但「应用 21:00 关、次日 23:00 开」会让**这一天一次都不跑**
+    // （23:00 开机的当天算「新的一天」，可它 30s 后就跑了，而前一天的 22:00
+    // 槽位整个错过）—— 保活的目的是「别让 refresh 会话闲置」，它只认
+    // 「距上次成功多久」，不该被自然日边界切断。
+    //
+    // 故改为与网关侧同一口径：**距上次成功刷新 ≥ `keepalive_days` 天（默认 1）**
+    // 就补跑，`0` 表示每次启动都跑（旧行为）。判据读的是账号里的
+    // `refreshedAt`（`refresh_account_token` 成功时写入），所以「刚刷过」不会
+    // 被重复触发。
     tauri::async_runtime::spawn(async move {
         let mut last_keepalive_day = String::new();
         let mut last_rotate_at: i64 = 0;
@@ -244,9 +256,21 @@ fn spawn_background_loops(app: tauri::AppHandle) {
                     let _ = modules::rotate::run_rotate_cycle().await;
                 }
             }
-            let today = modules::checkin::date_str(None);
-            if today != last_keepalive_day {
-                last_keepalive_day = today;
+            // 与网关侧 `scheduler::Config::keepalive_max_age` 同一口径：
+            // 判据是「距上次成功刷新的时长」，不是自然日边界。
+            let kp_days = modules::config::load_checkin_config()
+                .get("keepalive_days")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let due = if kp_days <= 0 {
+                // 0 = 未配置：保持旧语义（每自然日一轮），避免升级后行为突变。
+                let today = modules::checkin::date_str(None);
+                today != last_keepalive_day
+            } else {
+                modules::refresh::keepalive_due(kp_days)
+            };
+            if due {
+                last_keepalive_day = modules::checkin::date_str(None);
                 let _ = modules::refresh::run_keepalive_cycle().await;
             }
             tokio::time::sleep(Duration::from_secs(30)).await;

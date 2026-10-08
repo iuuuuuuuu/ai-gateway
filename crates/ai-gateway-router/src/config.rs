@@ -41,6 +41,14 @@ fn default_true() -> bool {
     true
 }
 
+/// 保活兜底的默认容错间隔（小时）。
+///
+/// 24：与「每日一次」的语义一致 —— 超过一天没成功刷新就补跑。
+/// 配置里写 0 = 关闭兜底（退回「只认整点」的旧行为）。
+fn default_keepalive_max_age_hours() -> i64 {
+    24
+}
+
 /// 默认 Qoder 凭证目录：`~/.wb-switch/qoder/auths`。
 ///
 /// ★ **必须**与宿主 `crates/ai-gateway-core/src/modules/qoder_account.rs::auth_dir()`
@@ -722,6 +730,18 @@ pub struct ScheduleConfig {
     /// token 保活时点（小时），默认 `[22]`。
     #[serde(rename = "keepalive_hours")]
     pub keepalive_hours: Vec<i32>,
+    /// 保活兜底：距上次**成功**刷新超过这么多小时就在启动时补跑一次；0 = 关闭。
+    ///
+    /// # 为什么需要它（2026-10-08）
+    ///
+    /// `keepalive_hours` 只在整点触发，而网关是独立子进程 —— 22:00 那一刻没在跑
+    /// （应用关了 / 刚重启 / 维护窗口），当天的保活就**静默消失**，下次机会 24 小时后。
+    /// 保活要防的正是「服务端清理闲置 refresh 会话」（闲置数天 ⇒ 12153 invalid_grant
+    /// ⇒ 账号被迫重新登录）。有它之后，「今天没在 22:00 跑过」会在下次启动时补上。
+    ///
+    /// 默认 24（宿主 `native_config` 写出；缺键也按 24 处理）。
+    #[serde(rename = "keepalive_max_age_hours", default = "default_keepalive_max_age_hours")]
+    pub keepalive_max_age_hours: i64,
     /// 签到开关，缺省 true。
     #[serde(rename = "checkin_enabled", default = "default_true")]
     pub checkin_enabled: bool,
@@ -789,6 +809,7 @@ impl Default for ScheduleConfig {
         Self {
             checkin_hours: vec![9, 21],
             keepalive_hours: vec![22],
+    keepalive_max_age_hours: default_keepalive_max_age_hours(),
             checkin_enabled: true,
             keepalive_enabled: true,
             checkin_scope: "cn".into(),
@@ -1382,6 +1403,11 @@ impl Config {
         if self.schedule.keepalive_hours.is_empty() {
             self.schedule.keepalive_hours = vec![22];
         }
+        // 保活兜底：负数无意义（会被当成巨大的超期窗口 ⇒ 每次启动全量刷新），
+        // 归一为 0（= 关闭兜底）；上界不设 —— 365 天也是用户的合法选择。
+        if self.schedule.keepalive_max_age_hours < 0 {
+            self.schedule.keepalive_max_age_hours = 0;
+        }
         // 四个养号任务的时点：空数组 = 未配置 → 回落默认（与 Go `scheduler.New`
         // 的兜底逐字一致）。
         //
@@ -1649,6 +1675,8 @@ mod tests {
         assert_eq!(c.cooldown.soft_rate, "60s");
         assert_eq!(c.schedule.checkin_hours, vec![9, 21]);
         assert_eq!(c.schedule.keepalive_hours, vec![22]);
+        // ★ 保活兜底必须有默认值：缺了它，「22:00 网关没在跑」就永远补不回来。
+        assert_eq!(c.schedule.keepalive_max_age_hours, 24);
         assert!(c.schedule.checkin_enabled);
         assert!(c.schedule.keepalive_enabled);
         assert_eq!(c.schedule.checkin_scope, "cn");
@@ -1762,6 +1790,31 @@ mod tests {
         let raw = br#"{"schedule":{"keepalive_hours":[24]}}"#;
         let err = Config::from_json(raw).unwrap_err();
         assert!(err.to_string().contains("keepalive_enabled"));
+    }
+
+    /// ★ 2026-10-08：保活兜底的小时数只做单向归一（负数 → 0 = 关闭）。
+    ///
+    /// # 为什么不能在验证层拒绝负数
+    ///
+    /// `keepalive_max_age_hours` 与 `keepalive_hours` 是两回事：后者是**时点**，
+    /// 越界只能报错（`[24]` 不是小时）；前者是一个**时长**，0 是它的合法取值
+    ///（= 关闭兜底）。负数没有意义，但把它当成「非法」会让整份配置拒绝启动 ——
+    /// 一个畸形的兜底窗口不该让网关起不来。
+    ///
+    /// 而若把负数**原样放过**，`as_secs()` 转换后是一个天文数字，判据会变成
+    /// 「每次启动都对全部账号刷一遍」—— 那是对上游的真实骚扰。故归一到 0。
+    #[test]
+    fn keepalive_max_age_negative_clamps_to_disabled() {
+        let raw = br#"{"schedule":{"keepalive_max_age_hours":-5}}"#;
+        let c = Config::from_json(raw).unwrap();
+        assert_eq!(c.schedule.keepalive_max_age_hours, 0, "负数应归一为 0（关闭兜底）");
+        // 0 本身必须能原样读回（它与「缺键」不同：缺键是 24）。
+        let raw = br#"{"schedule":{"keepalive_max_age_hours":0}}"#;
+        let c = Config::from_json(raw).unwrap();
+        assert_eq!(c.schedule.keepalive_max_age_hours, 0);
+        // 缺键 ⇒ 默认 24（不是 0）—— 否则升级上来的用户永远不补跑。
+        let c = Config::from_json(br#"{"schedule":{}}"#).unwrap();
+        assert_eq!(c.schedule.keepalive_max_age_hours, 24, "缺键必须回落 24，否则兜底形同不存在");
     }
 
     #[test]

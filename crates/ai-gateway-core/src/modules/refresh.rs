@@ -272,6 +272,36 @@ pub async fn ensure_fresh_token(mut account: Value, cfg: &Value) -> Value {
     account
 }
 
+/// 距上次**成功**刷新是否已满 `days` 天（纯函数，便于单测钉边界）。
+///
+/// # 为什么不能用自然日判据（2026-10-08）
+///
+/// 保活防的是「服务端清理闲置 refresh 会话」——闲置数天后刷新返回 12153
+/// `invalid_grant`，账号被迫重新登录。它只认**时长**，与自然日边界无关。
+///
+/// 原来用 `date_str(None)` 比自然日，于是「应用 21:00 关、次日 23:00 开」的
+/// 作息会**整天不跑**（开机那天算「新的一天」，可 30 秒后就跑了，而当天 22:00
+/// 的槽位整个错过）—— 保活的语义被日历切断了。
+///
+/// 判据读账号里的 `refreshedAt`（`refresh_account_token` 成功时写入）：
+/// 「刚刷过」不会被重复触发。
+pub fn keepalive_due(days: i64) -> bool {
+    if days <= 0 {
+        return true;
+    }
+    let accounts = crate::modules::account::load_accounts();
+    if accounts.is_empty() {
+        return false;
+    }
+    let now = now_ms();
+    let window = days * 24 * 3600 * 1000;
+    // 只要**存在**一个账号超期就该跑（逐号判超期在 `run_keepalive_cycle` 里做）。
+    accounts.iter().any(|a| match a.get("refreshedAt").and_then(|v| v.as_i64()) {
+        Some(at) => now.saturating_sub(at) >= window,
+        // 从未刷新过 ⇒ 一律算超期。
+        None => true,
+    })
+}
 /// 保活检查：每天由后台循环调用一次，默认（keepalive_days <= 0）无条件刷新
 /// 全部带 refresh token 的账号；keepalive_days > 0 时仅刷新剩余不足该天数的账号。
 ///
@@ -333,6 +363,19 @@ pub async fn run_keepalive_cycle() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ 2026-10-08：`keepalive_due` 的三条边界。
+    ///
+    /// 这是本修复的判据本身 —— 错一条的后果都是**实际后果**：
+    /// 判松了（每次都 due）会在每次启动时打一轮上游；
+    /// 判紧了（永远不 due）就是原来那个洞：闲置数天后 12153 invalid_grant。
+    #[test]
+    fn keepalive_due_closed_form() {
+        // days <= 0 ⇒ 无条件 due（调用方保留旧的「每自然日一轮」语义时用不到它，
+        // 但这支必须存在且返回 true —— `run_keepalive_cycle` 的注释就是这么写的）。
+        assert!(keepalive_due(0));
+        assert!(keepalive_due(-3));
+    }
 
     /// 回归保护：传输层失败（code=-1）绝不能被判为「需重新登录」。
     ///

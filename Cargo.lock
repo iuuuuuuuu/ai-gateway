@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "ai-gateway"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "ai-gateway-core",
  "bytes",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "ai-gateway-core"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "ai-gateway-router"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "ai-gateway-server"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "ai-gateway-core",
  "axum",
@@ -4137,9 +4137,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "log",
  "once_cell",

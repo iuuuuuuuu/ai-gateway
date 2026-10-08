@@ -659,6 +659,11 @@ async fn main() {
         upstream: client.clone(),
         checkin_hours: cfg.schedule.checkin_hours.clone(),
         keepalive_hours: cfg.schedule.keepalive_hours.clone(),
+        // ★ 2026-10-08：整点槽位管「节奏」，这个管「错过之后的兜底」。
+        // 默认 24 小时；配置 `schedule.keepalive_max_age_hours = 0` 表示关闭兜底。
+        keepalive_max_age: Duration::from_secs(
+            (cfg.schedule.keepalive_max_age_hours.max(0) as u64) * 3600,
+        ),
         activity_hours: cfg.schedule.activity_hours.clone(),
         trial_hours: cfg.schedule.trial_hours.clone(),
         school_hours: cfg.schedule.school_hours.clone(),
@@ -952,6 +957,36 @@ async fn main() {
     // ★ 取消信号与 `ctrl_c` 联动：`Cancel` 是 `watch` 通道（不是 `Notify`），
     // 排程循环的等待能被立刻唤醒，不会让进程退出时卡在一个长达数小时的
     // `sleep` 里 —— 这正是 axum 的 graceful shutdown 等不到 task 结束的场景。
+    // ★★ 保活兜底（2026-10-08）：补跑「距上次成功刷新 ≥ keepalive_max_age」的账号。
+    //
+    // 这一条堵的是「22:00 网关没在跑 ⇒ 当天保活静默消失 ⇒ 闲置数天后 12153
+    // invalid_grant ⇒ 账号被迫重新登录」那个洞。
+    //
+    // ⚠ **必须在后台 spawn，不能 await**：首次升级后所有账号的 `keepalive_at`
+    // 都是 0（旧 state.json 没这个字段）⇒ 27 个账号要逐个刷新 + 每个留 300ms 间隔，
+    // 同步跑会让**端口 30 秒不监听**，宿主那边直接判「网关没起来」。
+    // 补跑本身不需要阻塞任何东西：它只改账号凭证，与监听无关。
+    if cfg.schedule.keepalive_enabled {
+        let scheduler = Arc::clone(&scheduler);
+        let cancel = sched_cancel.clone();
+        tokio::spawn(async move {
+            let n = scheduler.run_keepalive_if_stale().await;
+            if n > 0 {
+                ai_gateway_router::logline!("[keepalive] 启动兜底：补跑 {n} 个超期账号");
+            }
+            // 补跑完不等下一天：每 24 小时复查一次（`run_keepalive_if_stale` 自己
+            // 有「未超期一个请求都不发」的门槛，重复调用是安全的）。
+            loop {
+                if !cancel
+                    .sleep(std::time::Duration::from_secs(24 * 3600))
+                    .await
+                {
+                    return;
+                }
+                scheduler.run_keepalive_if_stale().await;
+            }
+        });
+    }
     {
         let scheduler = Arc::clone(&scheduler);
         let cancel = sched_cancel.clone();

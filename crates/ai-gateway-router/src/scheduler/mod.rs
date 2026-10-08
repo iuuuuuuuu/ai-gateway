@@ -68,6 +68,9 @@ pub const TRIAL_GAP: Duration = Duration::from_millis(400);
 /// 积分巡检账号之间的间隔，避免瞬间并发打满上游。
 pub const CREDIT_REFRESH_GAP: Duration = Duration::from_millis(300);
 
+/// 保活补跑时账号之间的间隔（与 [`CREDIT_REFRESH_GAP`] 同因：摊平突发）。
+pub const KEEPALIVE_GAP: Duration = Duration::from_millis(300);
+
 /// 积分到期巡检的默认周期。
 ///
 /// # 为什么需要独立于签到的高频巡检
@@ -332,7 +335,28 @@ pub struct Config {
     /// 签到时点，默认 `[9, 21]`。
     pub checkin_hours: Vec<i32>,
     /// token 保活时点，默认 `[22]`。
+    ///
+    /// ⚠ 这是**节奏**，不是**保证**：网关是独立子进程，整点那一刻没在跑（应用关了/
+    /// 刚重启过）就不会触发，而下次机会是 24 小时后 —— 见 [`Self::keepalive_max_age`]。
     pub keepalive_hours: Vec<i32>,
+    /// 保活的最大容忍间隔；超过它就在**启动时 / 每轮巡检时**补跑一次。
+    ///
+    /// # 为什么必须有这个兜底（2026-10-08）
+    ///
+    /// 保活要防的是「官方服务端清理闲置 refresh 会话」——闲置数天后刷新返回
+    /// 12153 `invalid_grant`（Session doesn't have required client），账号被迫重新登录
+    ///（见 `refresh.rs` 模块头）。而原来的实现**只认整点**：
+    ///
+    /// ```text
+    /// 22:00 到了 → 网关没在跑 → 当天不保活 → 下次机会 24h 后
+    /// ```
+    ///
+    /// 于是「用户每天 23:00 才开电脑」这类作息会让保活**永远不跑**，直到某天刷新
+    /// 突然 12153。默认 24 小时（`std::time::Duration::ZERO` = 关闭兜底，退回纯整点行为）。
+    ///
+    /// ⚠ 与上面 `keepalive_hours` 是**两个不同的问题**：那个管「正常运行时多久刷一次」，
+    /// 这个管「错过之后多久必须补一次」。两者都不能删。
+    pub keepalive_max_age: std::time::Duration,
     /// 活跃上报时点，默认 `[10]`。
     ///
     /// 签到只恢复余额，**连登天数**要靠对话活跃上报点亮；一条
@@ -392,6 +416,7 @@ impl std::fmt::Debug for Config {
             .field("pool", &self.pool.as_ref().map(|_| "<pool>"))
             .field("checkin_hours", &self.checkin_hours)
             .field("keepalive_hours", &self.keepalive_hours)
+            .field("keepalive_max_age", &self.keepalive_max_age)
             .field("activity_hours", &self.activity_hours)
             .field("trial_hours", &self.trial_hours)
             .field("school_hours", &self.school_hours)
@@ -412,6 +437,7 @@ impl Config {
             upstream,
             checkin_hours: Vec::new(),
             keepalive_hours: Vec::new(),
+            keepalive_max_age: std::time::Duration::ZERO,
             activity_hours: Vec::new(),
             trial_hours: Vec::new(),
             school_hours: Vec::new(),
@@ -820,6 +846,18 @@ impl Scheduler {
         latest
     }
 
+    /// 保活是否已超期（纯函数，便于单测钉住边界）。
+    ///
+    /// - `last == 0` ⇒ 从未成功过 ⇒ 一律算超期（宁可多刷一次，也不要让一个号
+    ///   悄悄闲置到 12153 invalid_grant，那需要人工重新登录）；
+    /// - 否则看 `now - last >= max_secs`；`now < last`（系统时钟回拨）不算超期 ——
+    ///   用 `saturating_sub` 会把它算成 0，若 0 >= max_secs 为假则自然安全。
+    pub fn keepalive_is_stale(last_unix: i64, now_unix: i64, max_secs: i64) -> bool {
+        if last_unix <= 0 {
+            return true;
+        }
+        now_unix.saturating_sub(last_unix) >= max_secs
+    }
     /// 该计划时点是否落在启动补跑窗口内（对应 Go `withinCatchUp`）。
     pub fn within_catch_up(now: DateTime<Local>, scheduled: Option<DateTime<Local>>) -> bool {
         match scheduled {
@@ -1137,11 +1175,106 @@ impl Scheduler {
             // 刷新成功 = 账号确实未死：清零连续 12153 计数（复活路径）。
             if let Some(mut pool) = self.lock_pool() {
                 pool.clear_session_dead(&st.uid);
+                // ★ 2026-10-08：记录「保活成功时刻」并落盘。它是启动兜底判据
+                // （见 `Config::keepalive_max_age`）——不记的话，错过一次整点后
+                // 无法区分「刚刷过」与「已经两天没刷」。
+                pool.set_keepalive_at(&st.uid, chrono::Utc::now().timestamp());
             }
             if let Err(e) = a.save_atomic() {
                 crate::logline!("keepalive {} save: {e}", uid8(&st.uid));
             }
         }
+    }
+
+    /// 保活兜底：距上次**成功**刷新超过 [`Config::keepalive_max_age`] 的账号补跑一次。
+    ///
+    /// # 为什么整点槽位不够（2026-10-08）
+    ///
+    /// [`Self::run_keepalive_now`] 只在配置整点（默认 22:00）触发，而网关是独立子
+    /// 进程：22:00 那一刻没在跑（应用关了 / 刚重启 / 维护窗口），当天的保活就**静默
+    /// 消失**，下次机会是 24 小时后。保活要防的正是这个（闲置 refresh 会话被服务端
+    /// 清理 ⇒ 12153 invalid_grant ⇒ 账号被迫重新登录）。
+    ///
+    /// 故在**启动时**调一次本函数：只对「已超期」的账号补跑，未超期的一个请求都不发。
+    /// `keepalive_max_age == ZERO` ⇒ 关闭兜底，行为与本修复前逐字相同。
+    ///
+    /// 返回本轮补跑的账号数（供启动日志）。
+    pub async fn run_keepalive_if_stale(&self) -> usize {
+        let max_age = self.cfg.keepalive_max_age;
+        if max_age.is_zero() {
+            return 0;
+        }
+        let now = chrono::Utc::now().timestamp();
+        let max_secs = max_age.as_secs() as i64;
+        // 先筛出「确实超期」的 uid：`keepalive_at == 0` 表示从未成功过，
+        // 一律算超期（宁可多刷一次，也不要让一个号悄悄闲置到 12153）。
+        let stale: Vec<String> = match self.lock_pool() {
+            Some(pool) => pool
+                .keepalive_snapshot()
+                .into_iter()
+                .filter(|(_, at)| Self::keepalive_is_stale(*at, now, max_secs))
+                .map(|(uid, _)| uid)
+                .collect(),
+            None => Vec::new(),
+        };
+        if stale.is_empty() {
+            return 0;
+        }
+        crate::logline!(
+            "[keepalive] {} 个账号距上次成功刷新已 ≥{}h（或从未成功），开始补跑",
+            stale.len(),
+            max_secs / 3600
+        );
+        let mut done = 0usize;
+        for uid in stale {
+            let Some(mut a) = self.auth_by_uid(&uid) else {
+                continue;
+            };
+            if a.refresh_token.is_empty() || a.product_of() != PRODUCT_WORKBUDDY {
+                continue;
+            }
+            if let Err(e) = self.cfg.upstream.refresh_token(&mut a).await {
+                if upstream_err_kind(&e) == ErrKind::SessionDead {
+                    // 与 `run_keepalive_now` 同一套「连续计数」语义：
+                    // 一次 12153 不杀号（网络抖动也会触发），达阈值才禁用。
+                    let (hit, fails, threshold) = match self.lock_pool() {
+                        Some(mut pool) => (
+                            pool.note_session_dead(&uid),
+                            pool.session_dead_fails(&uid),
+                            pool.session_dead_threshold(),
+                        ),
+                        None => (false, 0, 0),
+                    };
+                    if hit {
+                        crate::logline!(
+                            "[keepalive] {} session dead x{threshold}, disabled (re-login required)",
+                            uid8(&uid)
+                        );
+                    } else {
+                        crate::logline!(
+                            "[keepalive] {} session dead {fails}/{threshold} (not disabling yet): {e}",
+                            uid8(&uid)
+                        );
+                    }
+                } else {
+                    crate::logline!("[keepalive] {}: {e}", uid8(&uid));
+                }
+                continue;
+            }
+            if let Some(mut pool) = self.lock_pool() {
+                pool.clear_session_dead(&uid);
+                pool.set_keepalive_at(&uid, chrono::Utc::now().timestamp());
+            }
+            if let Err(e) = a.save_atomic() {
+                crate::logline!("[keepalive] {} save: {e}", uid8(&uid));
+            }
+            done += 1;
+            // 账号之间留间隔，与 `refresh_credits_with_gap` 同因：
+            // 一次性打 27 个 refresh 容易被上游按突发流量看待。
+            tokio::time::sleep(KEEPALIVE_GAP).await;
+        }
+        crate::logline!("[keepalive] 补跑完成：{done} 个账号已刷新");
+        done
     }
 
     // ---- 产品日常任务 ----
@@ -3178,5 +3311,27 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), c.cancelled())
             .await
             .expect("查标志与 await 之间的取消不能丢");
+    }
+
+    /// ★ 2026-10-08 回归：保活兜底的超期判据。
+    ///
+    /// 这三条边界正是「整点槽位漏跑」这个洞的判据，错一条就会表现成
+    /// 「账号闲置数天后 12153，需要人工重新登录」。
+    #[test]
+    fn keepalive_staleness_boundaries() {
+        let now = 1_800_000_000i64;
+        let day = 24 * 3600i64;
+        // 从未成功过 ⇒ 一定超期（第一次启动就要刷，不能等第二天 22:00）。
+        assert!(Scheduler::keepalive_is_stale(0, now, day));
+        // 负数（异常数据）同样按「从未成功过」处理。
+        assert!(Scheduler::keepalive_is_stale(-1, now, day));
+        // 恰好 24h ⇒ 超期（边界取「大于等于」：不能因为差 0 秒就再等一天）。
+        assert!(Scheduler::keepalive_is_stale(now - day, now, day));
+        // 23h59m ⇒ 未超期（一个请求都不该发）。
+        assert!(!Scheduler::keepalive_is_stale(now - (day - 60), now, day));
+        // 刚刷过 ⇒ 未超期。
+        assert!(!Scheduler::keepalive_is_stale(now - 60, now, day));
+        // 时钟回拨（last > now）：不得算成超期，否则每次回拨都会触发一轮全量刷新。
+        assert!(!Scheduler::keepalive_is_stale(now + 3600, now, day));
     }
 }

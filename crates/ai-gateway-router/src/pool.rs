@@ -265,6 +265,12 @@ struct Entry {
     /// 「最近到期积分」的到期时刻（Unix 秒）；0 = 未知。
     expire_at: i64,
 
+    /// 最近一次 **token 保活成功** 的时刻（Unix 秒）；0 = 从未成功过。
+    ///
+    /// 持久化到 `state.json`（见 [`StateAccount::keepalive_at`]）；用途是
+    /// 「启动 / 每轮巡检时判距上次成功是否已 ≥24 小时 ⇒ 补跑一次保活」。
+    keepalive_at: i64,
+
     /// 单调序号：打破 `last_used` 的时钟粒度平局。
     ///
     /// 详见模块文档「与 Go 实现的关键差异」；对应 Go 侧 `entry.lastUsedSeq`。
@@ -611,6 +617,22 @@ pub struct StateAccount {
     /// 「最近到期积分」的到期时刻（Unix 秒）；0/缺省 = 未知。
     #[serde(default, skip_serializing_if = "is_zero")]
     pub expire_at: i64,
+    /// 最近一次 **token 保活成功** 的时刻（Unix 秒）；0 = 从未成功过。
+    ///
+    /// # 为什么要持久化它（2026-10-08）
+    ///
+    /// 保活此前**只在配置的整点（默认 22:00）触发**，而网关是个独立子进程：
+    /// 22:00 那一刻它没在跑（用户关了应用、或刚重启过），当天的保活就被**静默跳过**
+    /// —— 下一次机会是 24 小时以后。而保活要防的正是「服务端清理闲置 refresh 会话」
+    /// （闲置数天后刷新返回 12153 invalid_grant，账号被迫重新登录）。
+    ///
+    /// 有了这个时刻，网关启动时就能判「距上次成功刷新是否已 ≥24 小时」：
+    /// 是则补跑一次。整点槽位照旧保留（它管的是「正常运行时的节奏」），
+    /// 这个字段管的是「错过之后的兜底」。
+    ///
+    /// 与 `until` / `last_success` 同款序列化（Go 侧 `state.json` 可读）。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub keepalive_at: i64,
 }
 
 /// 反序列化 Go `time.Time` 的 RFC3339 字符串。
@@ -729,6 +751,7 @@ impl Pool {
                 session_dead_fails: 0,
                 in_flight: 0,
                 expire_at: s.expire_at,
+                keepalive_at: s.keepalive_at,
                 last_used_seq: 0,
                 model_until: std::collections::HashMap::new(),
                 cost_rate: 0.0,
@@ -774,6 +797,7 @@ impl Pool {
                     last_success: e.last_success,
                     last_err: e.last_err,
                     expire_at: e.expire_at,
+                    keepalive_at: e.keepalive_at,
                 },
             );
         }
@@ -1923,6 +1947,7 @@ impl Pool {
             session_dead_fails: 0,
             in_flight: 0,
             expire_at,
+            keepalive_at: 0,
             last_used_seq: 0,
             model_until: std::collections::HashMap::new(),
             cost_rate: 0.0,
@@ -2159,6 +2184,39 @@ impl Pool {
         self.entries[idx].session_dead_fails = 0;
     }
 
+    /// 记录一次 **token 保活成功** 的时刻（Unix 秒），并置 `dirty`。
+    ///
+    /// # 为什么要落盘（2026-10-08）
+    ///
+    /// 保活此前只在配置整点（默认 22:00）触发，而网关是独立子进程：那一刻它没在跑
+    /// （应用关了 / 刚重启过），当天保活就被**静默跳过**，下次机会是 24 小时后。
+    /// 而保活要防的正是「服务端清理闲置 refresh 会话」（闲置数天后 12153 invalid_grant，
+    /// 账号被迫重新登录）。故把这个时刻持久化，启动时据此判「是否已 ≥24 小时」。
+    ///
+    /// ⚠ 置 `dirty`：这是**需要落盘**的状态（与 `clear_session_dead` 相反）。
+    pub fn set_keepalive_at(&mut self, uid: &str, at_unix: i64) {
+        let Some(&idx) = self.by_uid.get(uid) else { return };
+        self.entries[idx].keepalive_at = at_unix;
+        self.dirty = true;
+    }
+
+    /// 该账号最近一次保活成功的时刻（Unix 秒）；0 = 从未成功过。
+    ///
+    /// UID 不在池中返回 0（与 `session_dead_fails` 同口径）。
+    pub fn keepalive_at(&self, uid: &str) -> i64 {
+        match self.by_uid.get(uid) {
+            Some(&idx) => self.entries[idx].keepalive_at,
+            None => 0,
+        }
+    }
+
+    /// 池内所有账号的 `(uid, keepalive_at)` 快照（保活巡检据此判哪些该补跑）。
+    pub fn keepalive_snapshot(&self) -> Vec<(String, i64)> {
+        self.entries
+            .iter()
+            .map(|e| (e.a.uid.clone(), e.keepalive_at))
+            .collect()
+    }
     /// 当前**连续** 12153 计数（供 scheduler 日志与测试断言）。
     ///
     /// UID 不在池中返回 0（与 Go 一致：`byUID` 未命中时返回零值）。

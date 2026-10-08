@@ -1117,6 +1117,85 @@ fn restart_lock() -> &'static tokio::sync::Mutex<()> {
     GATEWAY_RESTART_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// 读网关 `/status` 的 `in_flight`（此刻在途请求数）；取不到返回 `None`。
+///
+/// # 为什么需要它（2026-10-08）
+///
+/// 网关是**子进程**，宿主停它时没有任何「把手」通知它「别再收新请求、把在途的
+/// 做完」——`stop_gateway()` 直接终止进程，正在服务的 SSE 流被拦腰截断。
+/// 客户端看到的就是「回答写到一半断了 / 本轮运行失败」。
+///
+/// 1.0.35 起网关在 `/status` 透出 `in_flight`（请求维度，见 `Pool::in_flight_total`），
+/// 于是「现在停会不会打断人」从**猜**变成了**读数**：0 = 没人被影响。
+///
+/// ⚠ 旧版网关（≤1.0.34）没有这个字段 ⇒ 返回 `None`，调用方必须按「不知道」
+/// 处理，**不能当成 0** —— 把「不知道」当「安全」会让优雅重启在最不该放的
+/// 时刻放行，比不等待更糟。
+async fn gateway_in_flight(port: u16) -> Option<usize> {
+    let cfg = load_gateway_config();
+    let key = cfg.get("api_key").and_then(Value::as_str).unwrap_or("");
+    let url = format!("http://127.0.0.1:{port}/status");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(1500))
+        .build()
+        .ok()?;
+    let mut req = client.get(&url);
+    if !key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    let v = req.send().await.ok()?.json::<Value>().await.ok()?;
+    v.get("in_flight").and_then(Value::as_u64).map(|n| n as usize)
+}
+
+/// 重启前等在途请求归零的最长时间。
+///
+/// 取 30 秒：正常一轮对话的尾部（上游已发 finish_reason、只差收尾帧）在百毫秒级
+/// 结束；30 秒足够覆盖「刚发出、模型还在思考」以外的绝大多数情况。
+/// 超过就照常重启并**留日志** —— 无限等会让「账号变更生效」这类操作彻底卡死，
+/// 那比偶尔打断一条长回答更糟。
+const RESTART_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// 轮询间隔。250ms 是「够快」与「不把 /status 打成压测」的折中。
+const RESTART_DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// 重启前等在途请求排空；返回等待了多少毫秒。
+///
+/// 三条出口都必须留日志（等到了 / 等超时了 / 旧版网关读不到数），否则
+/// 「这次重启为什么慢了几十秒」在事后无从解释。
+async fn drain_before_restart(port: u16) -> u64 {
+    let started = std::time::Instant::now();
+    match gateway_in_flight(port).await {
+        // 旧版网关没有 in_flight：按「不知道」处理，不等待、不假装安全。
+        None => {
+            eprintln!("[gateway] 重启前排空：网关未提供 in_flight（1.0.34 及更早），跳过等待");
+            return 0;
+        }
+        Some(0) => return 0,
+        Some(n) => eprintln!("[gateway] 重启前排空：当前 {n} 个请求在途，等待其结束（最多 30s）"),
+    }
+    loop {
+        if started.elapsed() >= RESTART_DRAIN_TIMEOUT {
+            let last = gateway_in_flight(port).await.unwrap_or(0);
+            eprintln!(
+                "[gateway] 重启前排空超时（{}ms），仍有 {last} 个请求在途，按原逻辑重启",
+                started.elapsed().as_millis()
+            );
+            return started.elapsed().as_millis() as u64;
+        }
+        tokio::time::sleep(RESTART_DRAIN_POLL).await;
+        match gateway_in_flight(port).await {
+            Some(0) => {
+                eprintln!(
+                    "[gateway] 重启前排空完成：在途请求已归零（等待 {}ms）",
+                    started.elapsed().as_millis()
+                );
+                return started.elapsed().as_millis() as u64;
+            }
+            // 读不到数（网关正在退出等）：不再等，交给下面的 stop 收尾。
+            None => return started.elapsed().as_millis() as u64,
+            Some(_) => {}
+        }
+    }
+}
 /// 重启网关：**串行化**的 stop → 等端口释放 → start。
 ///
 /// 三处调用方（Tauri 命令 / WebUI 端点 / 后台自动同步）都必须走这里，
@@ -1126,6 +1205,22 @@ fn restart_lock() -> &'static tokio::sync::Mutex<()> {
 pub async fn restart_gateway_serialized() -> Result<Value, String> {
     // 持有锁覆盖整个 stop→start：期间别的重启请求排队，不会插进中间
     let _guard = restart_lock().lock().await;
+    // ★★ 2026-10-08：先等在途请求归零再停。
+    //
+    // 此前是「立刻 stop」—— 正在服务的 SSE 流被拦腰截断，客户端报
+    // 「回答写到一半断了」。每日维护窗口（本地 00:00:45）那两条 A 族断流就是它。
+    // 排空只对**运行中**的网关有意义；没在跑时读不到 in_flight，直接跳过。
+    if is_running() {
+        let port = port_of(
+            load_gateway_config()
+                .get("listen")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
+        if port > 0 {
+            drain_before_restart(port).await;
+        }
+    }
     stop_gateway();
     // 等旧进程真正释放端口。`stop_gateway` 内部已 wait 过子进程，
     // 但 TerminateJobObject 是**异步**生效的 —— 立刻 start 会撞上
@@ -2655,6 +2750,12 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
         "schedule": {
             "checkin_hours": [9, 21],
             "keepalive_hours": [22],
+            // ★ 保活兜底（2026-10-08）：距上次**成功**刷新超过这么多小时就在启动时补跑。
+            // 只认整点会让「22:00 网关没在跑」变成「当天保活静默消失」，下次机会 24h 后。
+            // 0 = 关闭兜底（退回旧行为）。
+            "keepalive_max_age_hours": cfg.get("keepalive_max_age_hours")
+                .and_then(Value::as_i64)
+                .unwrap_or(24),
             // 缺省 true；false = 关签到（猫猫旅行搭签到便车，因此也随之停摆）
             "checkin_enabled": cfg.get("checkin_enabled").and_then(Value::as_bool).unwrap_or(true),
             // 缺省 true；false = 关 token 保活
@@ -5452,6 +5553,73 @@ mod tests {
     /// 我把它定位成"防新增绕过口"的护栏，而不是竞态本身的验证 ——
     /// 后者靠 `restart_gateway_serialized` 里那把锁的正确使用。
     #[test]
+    /// ★★ 2026-10-08 回归：`restart_gateway_serialized` 必须先**排空在途请求**再停。
+    ///
+    /// # 守的是什么
+    ///
+    /// 网关是独立子进程，`stop_gateway()` 直接终止它 —— 正在服务的 SSE 流被拦腰截断，
+    /// 客户端看到「回答写到一半断了」。每日维护窗口（本地 00:00:45）那两条 A 族断流
+    /// 就是这个形状。修法是停之前先轮询 `/status` 的 `in_flight` 直到归零（或超时）。
+    ///
+    /// # 为什么用「读源码」而不是起真网关
+    ///
+    /// 起真网关的集成测试要绑端口 + 起子进程 + 造一条持续数秒的流，在 `cargo test`
+    /// 里既慢又脆（且 CI 上没有那个端口语义）。而**行为**已由真机实测覆盖
+    /// （`test-bin\inst-1036-drain`：流在飞时 `/status.in_flight=1`，触发重启会等到 0）。
+    /// 这里只钉住「排空这一段不许被删掉/绕过」——它与 `stop_gateway` 的调用顺序
+    /// 是本次修复的全部内容。
+    #[test]
+    fn restart_drains_in_flight_before_stopping() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/modules/gateway.rs");
+        let src = std::fs::read_to_string(path).expect("读不到 gateway.rs");
+        let lines: Vec<&str> = src.lines().collect();
+
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("pub async fn restart_gateway_serialized()"))
+            .expect("找不到 restart_gateway_serialized 定义");
+        // 函数体到下一个顶层 `}`（列 0 的右花括号）。
+        let end = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|i| start + i)
+            .expect("找不到函数结尾");
+        let body = lines[start..=end].join("\n");
+
+        let drain = body.find("drain_before_restart(port)").unwrap_or_else(|| {
+            panic!("restart_gateway_serialized 里没有排空调用 —— 「停之前先等在途归零」\
+                   这条修复被删掉了？\n{body}")
+        });
+        let stop = body.find("stop_gateway();").unwrap_or_else(|| {
+            panic!("restart_gateway_serialized 里没有 stop_gateway —— 函数被改坏了？")
+        });
+        assert!(
+            drain < stop,
+            "排空必须在 stop_gateway **之前**（它是唯一能让流自然结束的机会）：\n{body}"
+        );
+        // 排空必须真的读 /status（而不是一句空等待）。
+        assert!(
+            body.contains("gateway_in_flight") || body.contains("drain_before_restart"),
+            "排空没有读 in_flight，等于空等：\n{body}"
+        );
+    }
+
+    /// ★ 2026-10-08：`drain_before_restart` 必须区分「旧版网关没有 in_flight」。
+    ///
+    /// 把「不知道」当成 0（= 安全）会让优雅重启在最不该放的时刻放行 —— 比不等待更糟。
+    #[test]
+    fn drain_treats_missing_in_flight_as_unknown_not_safe() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/modules/gateway.rs");
+        let src = std::fs::read_to_string(path).expect("读不到 gateway.rs");
+        assert!(
+            src.contains("网关未提供 in_flight"),
+            "缺少「旧版网关没有 in_flight」的日志分支 —— 该分支必须存在且留痕"
+        );
+        assert!(
+            src.contains("Some(0) => return 0,"),
+            "缺少「in_flight == 0 直接返回」的分支"
+        );
+    }
     fn gateway_restart_goes_through_serialized_entry() {
         // ⚠ 运行时读文件而不是 `include_str!`：后者嵌进编译产物、
         // 只靠 mtime 失效，我实测踩过"改完仍是旧的"的假绿。
@@ -6397,6 +6565,9 @@ mod tests {
         // 既有字段不能被这次改动挤掉
         assert_eq!(sched["checkin_hours"], json!([9, 21]), "{text}");
         assert_eq!(sched["keepalive_hours"], json!([22]), "{text}");
+        // ★ 保活兜底必须显式写出：缺键时网关按 24 处理，但「显式」才是契约 ——
+        // 否则将来有人把网关侧默认值改成 0，界面上的设置会**静默失效**。
+        assert_eq!(sched["keepalive_max_age_hours"], json!(24), "{text}");
         assert_eq!(sched["checkin_enabled"], json!(true), "{text}");
         assert_eq!(sched["keepalive_enabled"], json!(true), "{text}");
         assert_eq!(sched["checkin_scope"], json!("cn"), "{text}");
