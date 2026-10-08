@@ -891,7 +891,15 @@ async fn main() {
         },
         // 按区域的模型清单缓存（`/v1/models`、`/v1/models/regions` 的数据源）。
         // 进程级一份，理由见 `AppState::models`。
-        models: Arc::new(ai_gateway_router::models_cache::ModelsCache::new()),
+        // ★ 带持久化：从 `state.json` 同目录的 `models_cache.json` 恢复上次的成功
+        // 清单。倍率（`credit_multiplier`）是**成本调度**的唯一输入，重启后缓存为空
+        // 会让「免费优先」静默失效（见 `models_cache::CACHE_FILE` 的注释）。
+        models: Arc::new(ai_gateway_router::models_cache::ModelsCache::with_persistence(
+            std::path::Path::new(&cfg.state_file)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from(".")),
+        )),
         // ★ 可热更新的配置（模型清单 + 系统提示词）：由上面起的 `_cfg_watch` 在后台
         // 轮询配置文件的指纹，变了就换进这里。池里那份 `Pool::set_product_models`
         // 由监听线程**一并**更新（Go 只换 dynamic 不换池，会让新模型被当成「该产品

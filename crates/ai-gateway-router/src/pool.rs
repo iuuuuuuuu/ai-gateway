@@ -2988,6 +2988,14 @@ impl Pool {
         model: &str,
         region: Region,
     ) -> Option<Auth> {
+        // ★★ 2026-10-08：粘性快路径也必须尊重成本维度。
+        //
+        // 现场：会话一旦绑到计费号，30 分钟 TTL 内所有请求都走它 —— `free_tier`
+        // 在主路径把计费号筛掉了，粘性却把它请了回来（15 个国服号被均匀摊了
+        // 710 条）。返回 `None` 会让调用方解绑并走完整选号，那里成本维度生效。
+        if self.sticky_costs_more_than_a_free_option(uid, model) {
+            return None;
+        }
         let idx = *self.by_uid.get(uid)?;
         let now = SystemTime::now();
         let e = &self.entries[idx];
@@ -3002,6 +3010,52 @@ impl Pool {
         Some(self.entries[idx].a.clone())
     }
 
+    /// 该账号对当前模型是「确定计费」而池里**存在**确定免费的候选吗？
+    ///
+    /// # 为什么需要它（2026-10-08 业主现场）
+    ///
+    /// 现场：12 个国际版号对 `deepseek-v4.1-flash` 是 `x0.00`（免费）、15 个国服号
+    /// 是 `x0.11`（计费）。正常选号路径的 `free_tier` 把国服号筛掉了，**但粘性
+    /// 快路径与兜底都漏了这一步** —— 会话一旦绑到一个计费号，之后 30 分钟 TTL 内
+    /// 全部请求都走它，成本维度形同不存在。
+    ///
+    /// 实测形状：15 个国服号被**均匀摊了 710 条**（45–50 条/号，极均匀 ⇒ 会话
+    /// 各自绑到不同号），每条平均 27 万 input token，而同期国际版 10,844 条。
+    ///
+    /// # 判据为什么是「有免费候选」而不是「本号不是免费」
+    ///
+    /// 只判后者会让**全池都在计费**时永远解绑 —— 那时粘性白丢、每轮重新选号，
+    /// 却挑不出更好的号。与 `free_tier` 的语义保持一致：只有「确实存在更优解」
+    /// 才值得放弃粘性。
+    ///
+    /// # 为什么不看 `tried` / 在途 / 冷却
+    ///
+    /// 那些是**运行态**，粘性本来就是「少一次选号」的优化，判据越复杂越容易
+    /// 与主路径漂移。这里只问「成本维度上有没有更好的选择」—— 解绑后主路径会
+    /// 用完整的 `pick_inner` 重新选，那些条件自然都会被考虑。
+    fn sticky_costs_more_than_a_free_option(&self, uid: &str, model: &str) -> bool {
+        if !self.multi_product_on || self.cost_weight <= 0.0 {
+            return false; // 成本维度未启用 ⇒ 逐字退回旧行为
+        }
+        let Some(&idx) = self.by_uid.get(uid) else {
+            return false;
+        };
+        let e = &self.entries[idx];
+        // 本号未声明倍率 ⇒ 中性，不算「更贵」（与 free_tier 的「未声明不算免费」对称）。
+        if !e.cost_known || e.cost_rate <= 0.0 {
+            return false;
+        }
+        let now = SystemTime::now();
+        // 池里是否存在**确定免费**且此刻可服务的候选（不含本号）。
+        self.entries.iter().any(|o| {
+            o.a.uid != uid
+                && o.cost_known
+                && o.cost_rate <= 0.0
+                && o.healthy(now)
+                && o.model_available(model, now)
+                && !self.in_flight_full(o)
+        })
+    }
     /// 挑号，跳过 `tried` 中的 UID。
     pub fn pick_excluding(&mut self, tried: &[String]) -> Option<Auth> {
         self.pick_inner(tried, "", RegionFilter::Any, "", true)
@@ -3499,6 +3553,32 @@ impl Pool {
     /// 否则兜底会把刚被 6004 拒掉的账号立刻再选一次，既浪费轮换又让用户看到
     /// 重复报错。若排除后无候选则返回 `None`，由调用方报告「全部账号该模型均
     /// 受限」（比继续撞限流更有信息量）。
+    ///
+    /// # ★★ 成本维度：兜底也要「免费优先」（2026-10-08 业主现场）
+    ///
+    /// 现场：12 个国际版号对 `deepseek-v4.1-flash` 是 `x0.00`（免费）、15 个国服号
+    /// 是 `x0.11`（计费）。正常路径的 `free_tier` 把国服号筛掉了（实测 502 次 chat
+    /// 全走国际版），**但兜底漏了这一步** —— 于是国服号被稳定选中：
+    ///
+    /// ```text
+    /// 国际版 12 个号长期占满在途（max_in_flight=3，只有它们会被正常选中）
+    /// ⇒ 兜底里 `in_flight_full` 把它们全跳过
+    /// ⇒ 只剩 15 个永远空闲的国服号
+    /// ⇒ 按到期日最早挑，每次都挑中国服号
+    /// ```
+    ///
+    /// 实测读数：15 个国服号被**均匀摊了 710 条**（47–50 条/号），
+    /// 每条平均 27 万 input token —— 与真实对话同一量级（养号任务走 billing 域，
+    /// 不记 token）。而同期国际版 10,844 条。
+    ///
+    /// 修法：在「挑到期最早」之前先跑一遍 [`Self::free_tier`] —— 与 `pick_best_from`
+    /// （兜底 1）**已经做的事**保持一致。那条兜底有 free_tier，只有本函数漏了，
+    /// 看起来更像当初漏写而不是有意设计。
+    ///
+    /// ⚠ 收窄后若为空则**退回未收窄**：`free_tier` 自己已保证「没有免费候选 ⇒
+    /// 原样返回」，这里的 `is_empty` 只是防御（免费候选可能全被下面的 tried /
+    /// 冷却 / 模型限流条件排掉）。宁可拿一个付费号试一次，也不要返回 None 让
+    /// 调用方报「所有账号不可用」—— 那是把人引向账号池的误导文案。
     fn pick_earliest_expiry(
         &mut self,
         tried: &[String],
@@ -3506,7 +3586,8 @@ impl Pool {
         model: &str,
         product: &str,
     ) -> Option<Auth> {
-        let mut best: Option<usize> = None;
+        // ① 先按「硬性排除」收集候选（与修复前逐条一致）。
+        let mut cands: Vec<usize> = Vec::new();
         for i in 0..self.entries.len() {
             let e = &self.entries[i];
             if tried.iter().any(|t| t == &e.a.uid) {
@@ -3543,7 +3624,23 @@ impl Pool {
             if self.in_flight_full(e) {
                 continue;
             }
-            let Some(exp) = e.expiry(now) else {
+            if e.expiry(now).is_none() {
+                continue; // 无到期信息 ⇒ 不参与「挑最早」
+            }
+            cands.push(i);
+        }
+
+        // ② ★★ 成本维度：有「确定免费」的候选就只用它们（见本函数文档）。
+        //
+        // ⚠ 收窄后为空必须**退回未收窄**，不能直接返回 None —— 免费候选可能
+        // 全被上面的条件排掉了（tried / 冷却 / 模型限流），此时宁可拿一个付费号
+        // 试一次，也不要让调用方报「所有账号不可用」。
+        let (cands, narrowed) = self.free_tier(cands);
+
+        // ③ 在收窄后的候选里挑到期最早的。
+        let mut best: Option<usize> = None;
+        for &i in &cands {
+            let Some(exp) = self.entries[i].expiry(now) else {
                 continue;
             };
             if best.is_none()
@@ -3556,13 +3653,20 @@ impl Pool {
         // 兜底选号必须留痕：这是「本不该被选中」的账号（冷却中 / 被白名单排除），
         // 一旦线上出现「怎么又打到那个号了」，唯一的排查入口就是这行日志。
         // 与 Go 侧 `log.Printf("pool: fallback_earliest_expiry uid=%s until=%s kind=%s")` 对应。
+        //
+        // ★ 2026-10-08 起额外打 `cost=`：兜底「为什么会挑到这个号」曾经无法回答
+        //（业主现场：国服号被稳定选中，而日志里没有任何一行提到成本）。
+        // `free` = 这一轮被免费优先收窄过；`paid` = 候选里没有确定免费的号。
         {
             let e = &self.entries[idx];
+            let cost = if narrowed { "free" } else { "paid" };
             crate::logline!(
-                "pool: fallback_earliest_expiry uid={} until={:?} kind={}",
+                "pool: fallback_earliest_expiry uid={} until={:?} kind={} cost={} rate={}",
                 e.a.uid,
                 e.expiry(now),
-                e.fallback_kind(now)
+                e.fallback_kind(now),
+                cost,
+                if e.cost_known { format!("{}", e.cost_rate) } else { "?".into() }
             );
         }
         self.mark_used(idx);
@@ -4500,6 +4604,207 @@ mod tests {
         assert!(!p.servable_now());
     }
 
+    /// ★★ 2026-10-08 业主现场回归：**兜底选号也必须「免费优先」**。
+    ///
+    /// # 守的是什么
+    ///
+    /// 现场：12 个国际版号对 `deepseek-v4.1-flash` 是 `x0.00`（免费）、15 个国服号
+    /// 是 `x0.11`（计费）。正常路径的 `free_tier` 把国服号筛掉了（实测 502 次 chat
+    /// 全走国际版），**但兜底漏了这一步** ⇒ 国服号被稳定选中：
+    ///
+    /// ```text
+    /// 国际版 12 个号长期占满在途（max_in_flight=3，只有它们会被正常选中）
+    /// ⇒ 兜底里 `in_flight_full` 把它们全跳过
+    /// ⇒ 只剩 15 个永远空闲的国服号 ⇒ 每次都挑中国服号
+    /// ```
+    ///
+    /// 实测读数：15 个国服号被**均匀摊了 710 条**（47–50 条/号），每条平均
+    /// 27 万 input token（与真实对话同量级）。
+    ///
+    /// # 为什么这里用「冷却」构造
+    ///
+    /// 兜底只在**正常候选为空**时触发，而 [`Entry::expiry`] 取的是**冷却截止时刻**
+    ///（`until` / `breaker_until`），所以兜底池里的账号必然是「正在冷却」的。
+    /// 本用例给两个号各加一段冷却，并把**免费号**的冷却结束得更**晚** —— 若兜底
+    /// 不看成本，它必然挑中冷却更早结束的付费号；修好后必须挑中免费号。
+    #[test]
+    fn fallback_earliest_expiry_prefers_free_over_earlier_paid() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        p.add(mk("free1"));
+        p.set_cost_rate_known("free1", 0.0, true);
+        p.add(mk("paid1"));
+        p.set_cost_rate_known("paid1", 0.11, true);
+        // 付费号冷却 60s 后结束；免费号 120s —— 旧实现按「最早结束」必挑付费号。
+        p.cooldown("paid1", CoolKind::Soft, Duration::from_secs(60), "test");
+        p.cooldown("free1", CoolKind::Soft, Duration::from_secs(120), "test");
+
+        let now = SystemTime::now();
+        let a = p
+            .pick_earliest_expiry(&[], now, "deepseek-v4.1-flash", "")
+            .expect("兜底应能选出账号");
+        assert_eq!(
+            a.uid, "free1",
+            "兜底必须免费优先 —— 挑中 paid1 说明它又绕过了成本维度（业主现场回归）"
+        );
+    }
+
+    /// 兜底的「免费优先」不得在**没有免费候选**时改变行为。
+    ///
+    /// 既有契约逐字不变：「两个付费账号之间仍先烧快过期的那个」。
+    /// 这条是上一条的**反向护栏** —— 少了它，一个「永远挑第一个」的实现也能过。
+    #[test]
+    fn fallback_earliest_expiry_keeps_earliest_when_all_paid() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        p.add(mk("paid_late"));
+        p.set_cost_rate_known("paid_late", 0.50, true);
+        p.add(mk("paid_early"));
+        p.set_cost_rate_known("paid_early", 0.11, true);
+        p.cooldown("paid_late", CoolKind::Soft, Duration::from_secs(120), "test");
+        p.cooldown("paid_early", CoolKind::Soft, Duration::from_secs(60), "test");
+
+        let now = SystemTime::now();
+        let a = p
+            .pick_earliest_expiry(&[], now, "deepseek-v4.1-flash", "")
+            .expect("兜底应能选出账号");
+        assert_eq!(
+            a.uid, "paid_early",
+            "全付费时仍必须挑冷却最早结束的（既有契约）"
+        );
+    }
+
+    /// `cost_known = false`（未声明）**不算免费** —— 兜底同样适用。
+    ///
+    /// 否则某个还没查到倍率的平台会抢走全部兜底流量，而那正是倍率表最后补齐的一批。
+    #[test]
+    fn fallback_earliest_expiry_treats_unknown_cost_as_not_free() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        // 未声明倍率、冷却结束更晚 ⇒ 不得被当成免费而优先
+        p.add(mk("unknown_late"));
+        // 明确计费、冷却结束更早 ⇒ 必须挑它
+        p.add(mk("paid_early"));
+        p.set_cost_rate_known("paid_early", 0.11, true);
+        p.cooldown("unknown_late", CoolKind::Soft, Duration::from_secs(120), "test");
+        p.cooldown("paid_early", CoolKind::Soft, Duration::from_secs(60), "test");
+
+        let now = SystemTime::now();
+        let a = p
+            .pick_earliest_expiry(&[], now, "deepseek-v4.1-flash", "")
+            .expect("兜底应能选出账号");
+        assert_eq!(
+            a.uid, "paid_early",
+            "未声明倍率不能被当成免费（那会让它抢走全部兜底流量）"
+        );
+    }
+
+    /// 成本维度**关闭**时（`multi_product_on = false`）兜底逐字退回旧行为。
+    #[test]
+    fn fallback_earliest_expiry_is_inert_when_multi_product_off() {
+        let mut p = Pool::new(String::new());
+        // 刻意不开 multi_product：free_tier 必须完全不介入
+        p.add(mk("free_late"));
+        p.set_cost_rate_known("free_late", 0.0, true);
+        p.add(mk("paid_early"));
+        p.set_cost_rate_known("paid_early", 0.11, true);
+        p.cooldown("free_late", CoolKind::Soft, Duration::from_secs(120), "test");
+        p.cooldown("paid_early", CoolKind::Soft, Duration::from_secs(60), "test");
+
+        let now = SystemTime::now();
+        let a = p
+            .pick_earliest_expiry(&[], now, "deepseek-v4.1-flash", "")
+            .expect("兜底应能选出账号");
+        assert_eq!(a.uid, "paid_early", "成本维度关闭时行为必须逐字不变");
+    }
+    /// ★★ 2026-10-08 业主现场回归：**粘性快路径也必须尊重成本维度**。
+    ///
+    /// # 守的是什么
+    ///
+    /// 现场：15 个国服号（`x0.11`）被**均匀摊了 710 条**对话记录，而 12 个国际版号
+    /// 是 `x0.00`（免费）。成因是会话绑定：`pick_by_uid_for_model_region` 只查
+    /// healthy / in_flight / model_available，**完全不看 cost** ⇒ 一旦绑到计费号，
+    /// 30 分钟 TTL 内所有请求都走它。15 个号被均匀分摊正是「各会话绑到不同号」的形状。
+    ///
+    /// 修法：绑定号是「确定计费」而池里存在「确定免费」的可服务候选时，返回 `None`
+    /// 让调用方解绑、走完整选号（那里 `free_tier` 生效）。
+    #[test]
+    fn sticky_binding_yields_to_a_free_account() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        p.add(mk("paid"));
+        p.set_cost_rate_known("paid", 0.11, true);
+        p.add(mk("free"));
+        p.set_cost_rate_known("free", 0.0, true);
+
+        // 绑到计费号，而池里有免费号 ⇒ 必须拒绝（调用方据此解绑）
+        assert!(
+            p.pick_by_uid_for_model_region("paid", "deepseek-v4.1-flash", Region::Any)
+                .is_none(),
+            "存在免费候选时，粘性不该继续把请求钉在计费号上（业主现场回归）"
+        );
+        // 免费号自身照常可粘（它不「更贵」）
+        assert!(
+            p.pick_by_uid_for_model_region("free", "deepseek-v4.1-flash", Region::Any)
+                .is_some(),
+            "免费号的粘性必须保留"
+        );
+    }
+
+    /// 粘性的成本守卫**不得**在「没有更优解」时解绑。
+    ///
+    /// 反向护栏：少了它，一个「只要绑的是计费号就解绑」的实现也能过 —— 而那会让
+    /// 全池计费时白丢粘性、每轮重新选号。
+    #[test]
+    fn sticky_binding_survives_when_every_account_is_paid() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        p.add(mk("paid_a"));
+        p.set_cost_rate_known("paid_a", 0.11, true);
+        p.add(mk("paid_b"));
+        p.set_cost_rate_known("paid_b", 0.50, true);
+
+        assert!(
+            p.pick_by_uid_for_model_region("paid_a", "deepseek-v4.1-flash", Region::Any)
+                .is_some(),
+            "全池都在计费时不该解绑（否则粘性白丢、每轮重选）"
+        );
+    }
+
+    /// 倍率**未声明**的绑定号不算「更贵」⇒ 粘性保留。
+    ///
+    /// 与 `free_tier` 的「未声明不算免费」对称：未声明是中性，不该触发解绑。
+    #[test]
+    fn sticky_binding_survives_when_cost_is_unknown() {
+        let mut p = Pool::new(String::new());
+        p.set_multi_product(true, 0.3);
+        p.add(mk("unknown")); // 不设 cost ⇒ cost_known=false
+        p.add(mk("free"));
+        p.set_cost_rate_known("free", 0.0, true);
+
+        assert!(
+            p.pick_by_uid_for_model_region("unknown", "deepseek-v4.1-flash", Region::Any)
+                .is_some(),
+            "未声明倍率是中性，不该被当成「更贵」而解绑"
+        );
+    }
+
+    /// 成本维度**关闭**时粘性逐字退回旧行为。
+    #[test]
+    fn sticky_binding_is_inert_when_cost_dimension_is_off() {
+        let mut p = Pool::new(String::new());
+        // 刻意不开 multi_product
+        p.add(mk("paid"));
+        p.set_cost_rate_known("paid", 0.11, true);
+        p.add(mk("free"));
+        p.set_cost_rate_known("free", 0.0, true);
+
+        assert!(
+            p.pick_by_uid_for_model_region("paid", "deepseek-v4.1-flash", Region::Any)
+                .is_some(),
+            "成本维度关闭时粘性行为必须逐字不变"
+        );
+    }
     /// 造一个指定产品的账号（`domain` 保持默认 ⇒ 区域按 CN 算，与产品无关）。
     fn mk_product(uid: &str, product: &str) -> Auth {
         Auth {

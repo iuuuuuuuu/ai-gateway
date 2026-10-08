@@ -594,7 +594,11 @@ pub async fn forward_chat(
                 product,
             );
             if acct.is_none() {
-                // 绑定号已冷却/占满/模型限流/产品不符 → 解绑，落入普通选号。
+                // 绑定号已冷却/占满/模型限流/产品不符/**成本更贵** → 解绑，落入普通选号。
+                //
+                // ★ 成本那一条是 2026-10-08 加的：会话绑到计费号后，30 分钟 TTL 内
+                // 全部请求都走它，`free_tier` 形同不存在（业主现场：15 个国服号被均匀
+                // 摊了 710 条）。解绑后主路径会用完整的 `pick_inner` 重新选。
                 if let Some(s) = ctx.session {
                     s.unbind(sess_key);
                 }

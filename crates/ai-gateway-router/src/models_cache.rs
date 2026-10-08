@@ -150,12 +150,118 @@ pub struct RegionMeta {
 #[derive(Debug, Default)]
 pub struct ModelsCache {
     by_region: std::sync::Mutex<HashMap<Region, RegionModels>>,
+    /// 持久化目录（`None` = 不落盘，单测默认）。
+    dir: Option<std::path::PathBuf>,
 }
+
+/// 落盘形状：区域码 → 模型清单。
+///
+/// 只存 `infos`：退避与失败文案是运行态，跨重启带过去会让「上次启动时上游正好
+/// 挂了」变成「这次启动 5 分钟内不再重试」（见 `load_from_disk` 的注释）。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedCache {
+    regions: HashMap<String, Vec<ModelInfo>>,
+}
+
+/// 磁盘上的缓存文件（与 `state.json` 同目录）。
+///
+/// # 为什么需要持久化（2026-10-08）
+///
+/// 倍率（`credit_multiplier`）是**成本调度**的唯一输入，而它只存在于这个内存缓存里。
+/// 网关重启后缓存为空 ⇒ `inject_cost_rates` 一个倍率都注入不了 ⇒ 全部
+/// `cost_known = false` ⇒ `free_tier` 判定「未声明」不介入 ⇒ **成本优先静默失效**，
+/// 直到有人访问 `/v1/models` 或启动预热拉回清单。
+///
+/// 实测（隔离实例）：两个账号都在冷却时，区域探测拿不到探测账号 ⇒ `/v3/config`
+/// 拉不了 ⇒ 缓存空 ⇒ 兜底日志打出 `rate=?`（未声明）⇒ 免费优先失效。
+/// 而「冷却是暂时的、倍率是静态的」—— 不该因为此刻拿不到清单就丢掉已知倍率。
+///
+/// 故把「成功清单」落盘复用：启动时先读盘，拉取成功后再覆盖。
+/// 文件缺失/损坏一律静默忽略（首次启动属正常情况）。
+const CACHE_FILE: &str = "models_cache.json";
 
 impl ModelsCache {
     /// 空缓存。
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 带持久化的构造：从 `dir/models_cache.json` 恢复上次的成功清单。
+    ///
+    /// 目录由调用方给（生产是 `state.json` 所在目录）：本模块不该知道数据目录的
+    /// 解析规则（那是 `config::store_dir` 的职责），否则两处算法迟早分叉。
+    pub fn with_persistence(dir: std::path::PathBuf) -> Self {
+        let me = Self {
+            by_region: std::sync::Mutex::new(HashMap::new()),
+            dir: Some(dir),
+        };
+        me.load_from_disk();
+        me
+    }
+
+    /// 缓存文件路径（未配置持久化时为 `None`）。
+    fn cache_path(&self) -> Option<std::path::PathBuf> {
+        Some(self.dir.as_ref()?.join(CACHE_FILE))
+    }
+
+    /// 从磁盘恢复。解析失败/文件缺失都静默跳过（首次启动的正常路径）。
+    ///
+    /// ★ 只恢复 `infos`，**不**恢复 `last_err`/`fails`：退避是「这一轮运行」的
+    /// 运行态，跨重启带着它会让「上次启动时上游正好挂了」变成「这次启动 5 分钟内
+    /// 不再重试」—— 而重启恰恰是最该重新试一次的时刻。
+    fn load_from_disk(&self) {
+        let Some(path) = self.cache_path() else { return };
+        let Ok(raw) = std::fs::read(&path) else { return };
+        let Ok(saved) = serde_json::from_slice::<SavedCache>(&raw) else {
+            return;
+        };
+        let mut g = self.lock();
+        for (code, infos) in saved.regions {
+            // `Region::parse` 对未知串回落 `Any`（不是 Option）；`Any` 不是
+            // 合法桶键（缓存只按 CN/Intl 分），跳过即可。
+            let region = Region::parse(&code);
+            if region == Region::Any {
+                continue;
+            }
+            if infos.is_empty() {
+                continue;
+            }
+            // `fetched = None` ⇒ `cached()` 不命中（会重新拉），但 `snapshot()`
+            // 仍能取到倍率 —— 正是我们要的：**不假装清单是新鲜的**，但也不丢倍率。
+            g.insert(
+                region,
+                RegionModels {
+                    infos,
+                    fetched: None,
+                    last_err: None,
+                    last_err_msg: String::new(),
+                    fails: 0,
+                },
+            );
+        }
+    }
+
+    /// 把成功清单落盘（失败静默：缓存是观测数据，写不进去不该影响服务）。
+    fn save_to_disk(&self) {
+        let Some(path) = self.cache_path() else { return };
+        let g = self.lock();
+        let mut regions: HashMap<String, Vec<ModelInfo>> = HashMap::new();
+        for (region, rm) in g.iter() {
+            if !rm.infos.is_empty() {
+                regions.insert(region.as_str().to_string(), rm.infos.clone());
+            }
+        }
+        drop(g);
+        if regions.is_empty() {
+            return;
+        }
+        let Ok(raw) = serde_json::to_vec(&SavedCache { regions }) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = crate::auth::atomic_write(&path, &raw);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Region, RegionModels>> {
@@ -197,6 +303,24 @@ impl ModelsCache {
         now.duration_since(last).unwrap_or_default() < retry_after(rm.fails)
     }
 
+    /// 该区域的**已知真值**（不看 TTL、不看退避），`None` = 从未拿到过。
+    ///
+    /// # 与 [`ModelsCache::cached`] 的区别
+    ///
+    /// `cached()` 问的是「这份清单还新鲜吗」（1h TTL），本函数问的是「我们曾经
+    /// 知道什么」。拉取失败时调用方用它退回旧真值 —— 倍率（`credit_multiplier`）
+    /// 是成本调度的唯一输入，丢掉它会让「免费优先」静默失效；而一份稍旧的倍率
+    /// 远好过没有倍率。
+    ///
+    /// ⚠ 刻意**不**回填 `fetched`：清单仍被当作「需要重拉」，退避一过就会刷新。
+    pub fn stale_truth(&self, region: Region) -> Option<Vec<ModelInfo>> {
+        let g = self.lock();
+        let rm = g.get(&region)?;
+        if rm.infos.is_empty() {
+            return None;
+        }
+        Some(rm.infos.clone())
+    }
     /// 该区域**是否拿到过真值**（对应 Go `capabilityIndex.knownRegion`）。
     ///
     /// ★ 判据是「`infos` 非空」而**不是**「TTL 内」：Go 的 `knownRegion` 由
@@ -223,6 +347,10 @@ impl ModelsCache {
                 fails: 0,
             },
         );
+        drop(g);
+        // ★ 落盘复用：倍率是成本调度的唯一输入，重启后缓存为空会让「免费优先」
+        // 静默失效（见 `CACHE_FILE` 的注释）。失败静默 —— 缓存是观测数据。
+        self.save_to_disk();
     }
 
     /// 记录一次失败（**不动**已有清单，只推进退避）。
@@ -388,14 +516,26 @@ pub async fn fetch_models_for_region(
         return hit;
     }
     if cache.in_backoff(region, now) {
-        return Vec::new();
+        // ★★ 2026-10-08：退避窗口内同样退回**已知真值**。
+        //
+        // 这条分支最容易漏：它比下面的「无账号」「拉取失败」更早返回。实测症状是
+        // 「上游刚挂过一次 ⇒ 退避 5 分钟 ⇒ 这 5 分钟里倍率全空 ⇒ 免费优先失效」。
+        // 倍率是静态事实，不该被「这一轮拉取失败」的退避窗口牵连。
+        return cache.stale_truth(region).unwrap_or_default();
     }
 
     // ③ 没有可用账号：这一支**没有**走下面的 err 分支，若不记，
     //    `/v1/models/regions` 会显示「失败但没原因」，排查时是盲区。
     if probe.is_empty() {
         cache.record_failure(region, NO_ACCOUNT_MESSAGE.to_string(), SystemTime::now());
-        return Vec::new();
+        // ★★ 2026-10-08：退回**已知真值**（哪怕过期、哪怕来自上次运行的落盘缓存）。
+        //
+        // 为什么必须退：探测账号全在冷却时拉不了清单，而清单里的**倍率**是成本
+        // 调度的唯一输入。返回空会让 `inject_cost_rates` 一个都注入不了 ⇒ 全部
+        // `cost_known=false` ⇒ 免费优先静默失效（隔离实例实测：兜底日志打出
+        // `rate=?`）。而「冷却是暂时的、倍率是静态的」—— 不该因为此刻没有可用
+        // 探测账号就丢掉已知倍率。
+        return cache.stale_truth(region).unwrap_or_default();
     }
 
     // ④ 试到第一个成功为止（上限 MAX_PROBE_ACCOUNTS，避免账号很多时打太多上游）。
@@ -436,7 +576,9 @@ pub async fn fetch_models_for_region(
             last_failure = format!("连续试了 {tried} 个账号都不行；最后一个：{last_failure}");
         }
         cache.record_failure(region, last_failure, SystemTime::now());
-        return Vec::new();
+        // ★★ 同上：拉取失败也退回已知真值 —— 倍率比「这次拉没拉到」重要得多。
+        // `last_error` 仍如实记录失败原因（可排查），只是清单不空。
+        return cache.stale_truth(region).unwrap_or_default();
     }
 
     // ⑤ 成功即**清零退避**：下次失败重新从 15 秒开始。
@@ -758,5 +900,142 @@ mod tests {
         assert!(m.fetched.is_none());
         // 记完之后进入退避，下一轮不会立刻再记一次
         assert!(cache.in_backoff(Region::Intl, SystemTime::now()));
+    }
+    // -----------------------------------------------------------------------
+    // 持久化（2026-10-08）
+    // -----------------------------------------------------------------------
+
+    /// 落盘再读回：倍率必须原样保留。
+    ///
+    /// 这是「成本调度在重启后仍然生效」的全部依据 —— 少了它，重启后
+    /// `cost_known` 全是 false，免费优先静默失效。
+    #[test]
+    fn persists_and_restores_region_lists_with_multipliers() {
+        let dir = std::env::temp_dir().join(format!("wbmc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = ModelsCache::with_persistence(dir.clone());
+        let infos = vec![
+            ModelInfo {
+                id: "deepseek-v4.1-flash".into(),
+                credit_multiplier: Some(0.11),
+                ..Default::default()
+            },
+            ModelInfo {
+                id: "hy3".into(),
+                credit_multiplier: Some(0.0),
+                ..Default::default()
+            },
+        ];
+        a.record_success(Region::CN, infos.clone(), SystemTime::now());
+        assert!(dir.join("models_cache.json").exists(), "成功清单必须落盘");
+
+        let b = ModelsCache::with_persistence(dir.clone());
+        let snap = b.snapshot();
+        let got = snap.get(&Region::CN).and_then(|o| o.as_ref()).expect("应恢复国服清单");
+        assert_eq!(got.len(), 2);
+        let flash = got.iter().find(|m| m.id == "deepseek-v4.1-flash").unwrap();
+        assert_eq!(flash.credit_multiplier, Some(0.11), "倍率必须原样恢复");
+        let hy3 = got.iter().find(|m| m.id == "hy3").unwrap();
+        assert_eq!(hy3.credit_multiplier, Some(0.0), "0（免费）与 None（未声明）必须区分开");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 恢复的清单**不该**被当成新鲜缓存（否则 1 小时内不重拉，真值永远停在旧快照）。
+    #[test]
+    fn restored_cache_is_not_treated_as_fresh() {
+        let dir = std::env::temp_dir().join(format!("wbmc-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = ModelsCache::with_persistence(dir.clone());
+        a.record_success(
+            Region::CN,
+            vec![ModelInfo { id: "m".into(), ..Default::default() }],
+            SystemTime::now(),
+        );
+        let b = ModelsCache::with_persistence(dir.clone());
+        let now = SystemTime::now();
+        assert!(
+            b.cached(Region::CN, now).is_none(),
+            "恢复的清单不算「未过期成功清单」—— 否则真值会停在旧快照上 1 小时"
+        );
+        assert!(b.has_truth(Region::CN), "但它仍是「拿到过真值」（倍率可用）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文件缺失/损坏时静默退化成空缓存（首次启动的正常路径）。
+    #[test]
+    fn missing_or_corrupt_file_degrades_silently() {
+        let dir = std::env::temp_dir().join(format!("wbmc-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 目录不存在
+        let a = ModelsCache::with_persistence(dir.join("nope"));
+        assert!(a.snapshot().values().all(|v| v.is_none()));
+        // 文件损坏
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("models_cache.json"), b"{not json").unwrap();
+        let b = ModelsCache::with_persistence(dir.clone());
+        assert!(b.snapshot().values().all(|v| v.is_none()), "损坏文件必须静默忽略");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 未配置目录（`new()`）时行为与本特性引入前逐字相同。
+    #[test]
+    fn no_dir_means_no_persistence() {
+        let c = ModelsCache::new();
+        c.record_success(
+            Region::CN,
+            vec![ModelInfo { id: "m".into(), ..Default::default() }],
+            SystemTime::now(),
+        );
+        // 不 panic、不建文件即通过
+        assert!(c.has_truth(Region::CN));
+    }
+    /// 拉取失败时退回已知真值（倍率不丢）—— 成本调度的关键路径。
+    #[test]
+    fn fetch_failure_falls_back_to_stale_truth() {
+        let dir = std::env::temp_dir().join(format!("wbmc-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 先落一份带倍率的真值
+        let a = ModelsCache::with_persistence(dir.clone());
+        a.record_success(
+            Region::CN,
+            vec![ModelInfo {
+                id: "deepseek-v4.1-flash".into(),
+                credit_multiplier: Some(0.11),
+                ..Default::default()
+            }],
+            SystemTime::now(),
+        );
+        // 模拟重启（新实例从盘恢复），且此刻**没有可用探测账号**
+        let b = ModelsCache::with_persistence(dir.clone());
+        let got = b.stale_truth(Region::CN).expect("应能取到已知真值");
+        assert_eq!(got[0].credit_multiplier, Some(0.11), "倍率必须还在");
+        // 从未拿到过的区域仍返回 None（不编造）
+        assert!(b.stale_truth(Region::Intl).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// 退避窗口内也必须退回已知真值（这是最容易漏的一条分支）。
+    ///
+    /// 现场：上游刚挂过一次 ⇒ 退避 5 分钟 ⇒ 这 5 分钟里清单全空 ⇒ 倍率全丢 ⇒
+    /// 免费优先失效。倍率是静态事实，不该被「这一轮拉取失败」的退避牵连。
+    #[test]
+    fn backoff_window_still_yields_stale_truth() {
+        let now = SystemTime::now();
+        let c = ModelsCache::new();
+        c.record_success(
+            Region::CN,
+            vec![ModelInfo {
+                id: "deepseek-v4.1-flash".into(),
+                credit_multiplier: Some(0.11),
+                ..Default::default()
+            }],
+            now,
+        );
+        // 制造一次失败 ⇒ 进入退避窗口
+        c.record_failure(Region::CN, "boom".into(), now);
+        assert!(c.in_backoff(Region::CN, now), "应处于退避窗口");
+        // 退避窗口内，调用方仍能拿到真值（倍率不丢）
+        let got = c.stale_truth(Region::CN).expect("退避期间必须仍能取到已知真值");
+        assert_eq!(got[0].credit_multiplier, Some(0.11));
     }
 }

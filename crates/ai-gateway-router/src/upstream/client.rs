@@ -786,7 +786,10 @@ pub struct CreditInfo {
 /// ★ 刻意**不**派生 `Eq`：`credit_multiplier: Option<f64>` 里是浮点，
 /// 而 `f64` 没有 `Eq`（只有 `PartialEq`）。去掉 `Eq` 不会损失任何既有能力 ——
 /// 本类型的比较只用于测试与去重，`PartialEq` 已足够。
-#[derive(Debug, Clone, Default, PartialEq)]
+/// ★ 派生 `Serialize`/`Deserialize`（2026-10-08）：区域清单要**落盘复用**，
+/// 否则重启后倍率全丢 ⇒ 成本调度（免费优先）静默失效。见 `models_cache::CACHE_FILE`。
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ModelInfo {
     /// 模型 ID。
     pub id: String,
