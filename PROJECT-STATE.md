@@ -64,6 +64,7 @@
 
 | 版本 | 内容 | 状态 |
 |---|---|---|
+| **1.0.36** | ㉝ **重启前排空在途请求（修「回答写到一半断了」）**：`restart_gateway_serialized()` 此前是「拿锁 → 立刻 `stop_gateway()` → 600ms → start」——**没有任何排空**，正在服务的 SSE 流被拦腰截断。A 族断流（528 条）排查把每日维护窗口（本地 00:00:45）那两条定位到这个形状。修法：停之前先读 `/status.in_flight`（1.0.35 新透出的请求维度在途数），非 0 则每 250ms 轮询、最多等 30s，归零即停；两条**不等待的出口**都留日志 —— ① 旧版网关（≤1.0.34）无 `in_flight` ⇒ 按「不知道」处理、**绝不当成 0**（把不知道显示成安全会让优雅重启在最不该放的时刻放行，比不等待更糟）；② 30s 超时 ⇒ 照常重启并留日志（无限等会让「账号变更生效」这类操作彻底卡死，比偶尔打断一条长回答更糟）。新增 `gateway_in_flight()` / `drain_before_restart()` / `RESTART_DRAIN_TIMEOUT=30s` / `RESTART_DRAIN_POLL=250ms`（`gateway.rs` 重启段）。㉞ **保活兜底（整点漏了就补，不再静默丢一天）**：保活此前只在配置整点（默认 22:00）触发，而网关是独立子进程 —— 那一刻没在跑（应用关了 / 刚重启 / 维护窗口），当天保活**静默消失**，下次机会 24h 后。而保活要防的正是「服务端清理闲置 refresh 会话」（闲置数天 ⇒ 12153 `invalid_grant` ⇒ 账号被迫重新登录）。修法：网关把每次保活**成功**的时刻持久化到 `state.json` 的 `keepalive_at`（新字段，`pool.rs` 的 `StateAccount`/`Entry`/`load_state`/`flush` 四处 + `set_keepalive_at`/`keepalive_at`/`keepalive_snapshot` 三个访问器），启动时按「距上次成功 ≥ `schedule.keepalive_max_age_hours`（默认 24，0 = 关闭兜底）」筛出超期账号补跑（`Scheduler::run_keepalive_if_stale`，纯判据 `Scheduler::keepalive_is_stale` 可单测）；**未超期一个请求都不发**。补跑在**后台 spawn** —— 首次升级后所有账号 `keepalive_at` 都是 0（旧 state.json 没这个字段），27 个账号同步跑会让端口 30s 不监听，而补跑只改账号凭证、与监听无关。宿主侧 WorkBuddy 保活循环同步改口径：原来比自然日（`date_str`），现在按「距上次成功刷新的时长」判（新增 `refresh::keepalive_due(days)`）。㉟ **依赖告警**：`source-map-js` 1.2.1 → 1.2.2（high，补丁 1.2.2）、`rustls` 0.23.43 → 0.23.45（medium，补丁 0.23.45）；`glib` 保持 0.18.5 —— 告警要求 ≥0.20.0，而 `glib` 由 `gtk 0.18.2` ← `tauri 2.11.5`（经 `tray-icon 0.24.2` / `libappindicator 0.9.0`）引入，`cargo update -p glib --precise 0.20.12` 直接报 `glib = ^0.18` 约束冲突；上游 `gtk` 版本线止于 **0.18.x**（crates.io 无 `gtk 0.20`），`tray-icon` 0.24.2→0.26.1 **每版都仍写 `gtk ^0.18`**；且该依赖**只在 Linux 目标**（`cargo tree -i glib --target x86_64-pc-windows-msvc` 报 `nothing to print`），本产品在 Windows 发布 ⇒ 暴露面为零，属上游待办。 | ✅ 单测 router **1692/0/1**（+`keepalive_staleness_boundaries`、+`keepalive_max_age_negative_clamps_to_disabled`、+`keepalive_due_closed_form`）、core **1289/0/4**（+`restart_drains_in_flight_before_stopping` / `drain_treats_missing_in_flight_as_unknown_not_safe`）、workspace **3056/0/7**；★ **真机实测跑的是发行包里的二进制**（`test-bin\inst-1036-final`：隔离 `AI_GATEWAY_HOME` + 单账号凭证副本 + 本地假上游 `:17952` 15×700ms）：`/status.in_flight` 逐秒轮询在流在飞期间恒为 **1**、流结束立刻回 **0**；`POST /api/gateway/restart`（出厂 server）耗时 **3814ms**，其中排空等待 **1832ms**，日志逐字 `[gateway] 重启前排空：当前 1 个请求在途，等待其结束（最多 30s）` / `[gateway] 重启前排空完成：在途请求已归零（等待 1832ms）`；客户端侧 `STREAM_END +10677ms chunks=18 sawDone=true bytes=3035`（**完整 `[DONE]`，未被截断**）。保活：`keepalive_at=0` ⇒ 启动即补跑并写入真实时刻（age=37s）；紧接着重启 ⇒ 日志里**一条 keepalive 都没有**（未超期不发请求）；`listening` 与「开始补跑」同毫秒（端口不被阻塞）。签名端到端验签 **VALID**（`Ed` 公钥 / `ED` 预哈希签名，FILE SIG 过 blake2b-512，GLOBAL SIG 过 `sig64||comment`）；约束④全程成立（业主 `:7864` / `:3080` 未动） |
 | **1.0.35** | ㉛ **可观测性补完（业主 10-08「推送代码吧 / 发布一下 rela 新版本的构建」）**：排查 A 族断流（528 条）时发现**网关日志每一行都没有时间**——宿主把子进程 stdout/stderr 直接重定向进文件（`open_router_log()` + `cmd.stdout(out).stderr(err)`），没经过任何带时间戳的框架，于是与客户端插件日志（`2026-10-08T05:37:42.945Z`）**无法对齐**，只能拿字节数猜。三件事：① 新增 `crates/ai-gateway-router/src/logging.rs`（`stamp()` + `#[macro_export] macro_rules! logline`），**173 处 `eprintln!` 全量**改为 `logline!`，另把 36 处周期性 `println!`（Trae 积分刷新 6、计费周期刷新 3、启动摘要 27）也改到带时间戳的 stderr；② 三个流式入口收尾各加一行 `流结束（已收 N 个有效帧 / M 字节，saw_done=…，saw_finish_reason=…）`（`server.rs` anthropic `:2708` / responses `:2840` / chat `:3239`）—— 此前**流正常结束时一行日志都没有**，「网关有没有把这条流收干净」无法回答；③ `/status` 新增 `in_flight`（请求维度在途数，新 `Pool::in_flight_total()` `pool.rs:2457`）与 `version`（`env!("CARGO_PKG_VERSION")`）。★ **stdout 一个字没动**：`qoder-login`/`zcode-login` 的 JSON 仍只走 stdout（宿主 `serde_json::from_str(stdout.trim())` 直接解析），实测子命令 stdout 恰好一行合法 JSON。㉜ **国服账号「消耗积分」恒为 0**（业主 10-08 第二报：「workbuddy 国服账号错误的显示积分为 0」，截图 15 个国服号整列 0、12 个国际版正常）：网关日志 **19 个 uid × 202 次** `credit-refresh <uid>: upstream client (http 403): {"code":10085,"msg":"请求不合法，如有疑问请联系客服"}`。定因（同 token / 同 URL / 同 body，**只换头**逐项二分）：裸 `Authorization`+`Accept`+`Content-Type`+`X-User-Id`+`X-Domain` ⇒ **403 code=10085**；再加 `X-Client-Platform: web` / `Referer` / `User-Agent` **任一** ⇒ **200**；单独加 `Origin` 无效 ⇒ 计费后台 WAF 拒绝「看起来像裸 API 客户端」的请求。宿主 `ai-gateway-core/src/modules/credits.rs` 的 `resource_auth_headers` 早就带了这三个（照用户中心 Axios 拦截器写的），**网关这条后台巡检没带** ⇒ 界面读网关池快照，故恒显示 0。修法：新增 `headers.rs::resource_headers`（`X-Client-Platform: web` + `Origin`/`Referer` 跟随区域 + 与 chat 同 UA + `Accept: application/json, text/plain, */*`），**只给 `client.rs:539 user_resource_detail` 用**；`billing_headers` 保持原样（它被签到/活跃上报/领奖/**任务列表**共用，其中任务列表**必须不带 UA**——第一版把 UA 加进共用头，一次性踩红 7 个用例）。实测：隔离实例真实计费端点，`credits` 0 ⇒ **7246**、`expire_day` 空 ⇒ **2026-10-23**，日志无 403。 | ✅ 单测 router **1691/0/1**（+3 时间戳单测、+3 计费头护栏单测）、workspace **3051/0/7**；★ 真机隔离实例 `test-bin\inst-1035-obs`（独立数据目录 + 单账号凭证副本 + 本地假上游 `:17912`，端口 `:17911`）：三种上游收尾形态实测（正常 ⇒ `saw_done=true` 不补；只 finish_reason ⇒ 只补 `[DONE]` 不报错；真截断 ⇒ 补 error 帧 + `[DONE]`），响应体逐字节抓取确认 `[DONE]` 恒为 1 个且 error 帧在它**之前**；三协议 200；`/status` 新字段实测（1.0.35 `version=1.0.35 in_flight=0`，业主 `:7864` 的 1.0.34 **无这两个字段**）；子命令契约实测；约束④全程成立（业主 `:7864`/`:3080`/`:7890` 未动） |
 | **1.0.34** | ㉙ **「对话输出完就中断」**（业主 10-07 原话：「对话过程中对话会输出完就中断，这是我为什么回退版本的原因」）：上游收尾顺序 = **先** `finish_reason`、**后** `[DONE]`，两者之间那一瞬最容易被掐断；旧判据 `if saw_done \|\| !saw_any_frame` 只看 `[DONE]` ⇒ **内容已完整却判成本轮失败**（补 error 帧 → 客户端显示「本轮运行失败」）。现场：`gateway.log` **16 条** `上游流读取失败…saw_done=false`（**全为 `www.workbuddy.ai` 国际版号**，已收 29,628–1,992,314 B）+ 插件 **18 次** `upstream stream truncated (openai) — emitting in-band error`；失败率 **16/13,780 ≈ 0.12%**；断流集中在**请求发出后 32 ms – 6 s**、**多会话几十到几百毫秒内齐断** ⇒ 共享通道抖动（与账号/模型无关）。修法：`SseFramesIter` 加 `saw_finish_reason`（`upstream\sse.rs:563` / `:623` / `:650` / `:684` / `:722` + 自由函数 `payload_has_finish_reason`，**必须在 `normalize_frame` 之后判非空字符串**）+ `failure_message` 三参（`anthropic_stream.rs:408`/`:417`、`responses_stream.rs:671`/`:678`）+ `server.rs:2853 const TAIL_DONE_FRAME` + 读错误分支 `:3150-3161` 按正常收尾补 `[DONE]`。★ **不放宽**：首帧之前就断仍 503 + 换账号重试（`forward.rs:1130`/`:1147-1233`）、真截断仍报错。㉚ 回答业主「这几个不是都有接口返回吗？」—— `/v1/models` 是**并集**（185–189 条），国服独有 9 / 国际版独有 16 ⇒ 列表里有 ≠ 抽到的那个号能发。 | ✅ 单测 router **1685/0/1**（+4）、workspace **3045/0/6**（+4）；★ 假上游 5 模式矩阵（`:17903` 出厂 1.0.33 vs `:17904` 出厂 1.0.34）modeA/modeC **1.0.33 补 error 帧 → 1.0.34 无 error 帧**、modeB/D 两边都报错、modeE 两边正常、`doneCount` 恒 1；三协议探针（`/v1/messages` `message_stop`、`/v1/responses` `response.completed`）；真机隔离台 27 号只读副本 **15/15 全 200**；包内 GUI 内嵌 gz blob **逐字节 identical**（`0x17CB042`，解压 13,831,680 B / `9447272A…`）；签名验签 VALID；约束④全程成立（业主 `:7864` / `:3080` / `:7890` 未动） |
 | **1.0.33** | ㉗ **裸名 `space-bunny` ⇒ 400 `model_not_in_upstream`**（业主 10-07 报障截图，错误码本身证明 1.0.32 的选号已修好）：1.0.32 把「静态兜底清单没命中」从「确定没有」降级成「猜测」（`guess_excluded`），使 **27 个 WorkBuddy 号 + 1 个 Trae 号同池抽签** ⇒ ~3% 抽中 Trae（`trae-2593120869167228`，业主 `gateway.log:1080/1082/1083` 逐字对上）⇒ Trae 上游 4001 ⇒ 400。修法：区分「猜测 vs **权威**」—— Trae 兜底清单派生自 `dispatch.rs:275 ALIASES`（58 条，文档称「唯一的模型名真相」）⇒ 对 Trae 是**确定**；新增字段 `product_fallback_authoritative`（`pool.rs:872`）+ setter（`:1125`）+ helper（`:1134`）+ `product_definitely_lacks_model` 末行（`:1305` = `known || fallback_authoritative`）+ `pick_for_model_any` 新支（`:2679`/`:2691` ⇒ `scoped`）+ 注入（`bin\gateway.rs:148/182/188`，**只有 trae**）。㉘ 顺带修 A/B 实测发现的**启动窗口观测集为空** ⇒ 新增 `server.rs:1684 warm_up_live_models` + `bin\gateway.rs:923` 启动预热（失败静默）。 | ✅ 单测 router **1681/0/1**（+3）、workspace **3041/0/6**（+3）；★ **出厂二进制冷启动 120/120**（业主现场形状：27 WB + 1 Trae、qoder/zcode 空）—— 对照 1.0.32 同形状 **0/120**（30× `model_not_in_upstream` + 90× `model_not_in_region`）；探针矩阵 6 用例（sticky / `国服:space-bunny` / 反向 `gpt-6-sol` / `glm-5.3` 全 200，`国际版:space-bunny` 400 预期）；包内 GUI 内嵌 gz blob **逐字节 identical** + 解压哈希 `1BEDC8E6…`；签名验签 VALID；约束④全程成立（业主 `:7864` / `:3080` / `:7890` 未动） |
@@ -80,6 +81,52 @@
 | **1.0.31** | ⑳ **合入上游 6 项可用更新**（`account.rs` 新增 `display_string()` / `current_account_view()` 把 `id/uid/email/nickname/enterpriseName/needsReloginReason/note/domain/phoneNumber/accountType` 一律归一成字符串或 `null`，杜绝上游 JSON 结构体透传 UI 导致 React 崩页；四处状态出口统一；`gateway.rs static_models()` 与网关侧静态表取并集 **30 条** + 两侧快照测试锁死；`rotate.rs` 剩余天数向上取整；`tray.rs` 显式清 `LIGHTWEIGHT_MODE`；`classify.rs` 增补 `4028`）+ ㉑ **截断留痕**（`server.rs` 补 `sent_bytes` 与「上游未发 [DONE]」分支 eprintln，此前该分支**零日志**）+ ㉒ **对齐上游 `1c8bfed` 的网关日志查看入口**（`router_log_path()` / `read_router_log_tail()` / `gateway_status().logFile/.logBytes` / `read_gateway_log` / `reveal_gateway_log`；上游同款命令按行数取，本仓库按字节取）+ ㉓ **非客户端纯部署产物** `dist-single\ai-gateway.exe`（27,274,752 B，纯 CLI 无 GUI） | ✅ 单测 core **1285/0/4**、router **1669/0/1**；假上游 6 模式矩阵 6/6；隔离实例真机端到端 200；交付包解包核验 `FileVersion=1.0.31` + 新符号命中；约束④全程成立（业主 :7864/:57890 未动） |
 | **1.0.30** | ⑲ **业主最后四件事一次修完**：① Trae 网关凭证被清空（`trae_account.rs` 的 `active_uids()` 把 **WorkBuddy 的 uid 勾选名单**当成 Trae 的过滤条件，两套 uid 空间交集恒空 ⇒ `export_accounts_to_dir` 清理循环删光 `trae-*.json`，且切回 balance 不自愈；改恒 `None` 不过滤）+ ② 后台任务完成事件（`lib.rs` 调度循环 `emit("background-task-done")` + 新增 `src/lib/use-background-task-refresh.ts`，Trae/豆包页按前缀监听 `dsh:background-task-done`）+ ③ 后台拉客户端隐藏窗口（`Action::hides_client_window()` 只对 `KeepAlive` 为真 + `CLIENT_HIDE_WINDOW_KEY` 默认 `true` + 设置→后台运行勾选框）+ ④ 顺带修「豆包保活失败仍记账」（`cli_task.rs` 失败改返 `Err`、只在成功时写时间戳、空池短路） | ✅ 真机：包内二进制 reqB **三臂 A/B/C**（修复前记账 / 修复后不记账 / 空池短路）+ reqC **GUI 勾选框↔磁盘往返** + reqD **48/48**（三种断流形态，用包内反解出的网关）+ workspace **3011/0/6** |
 
+### 9.11 1.0.36 的构建与真机实测（2026-10-08，尚未推送）
+
+**版本**：1.0.36（`scripts/bump-version.ps1 1.0.36` 统一 bump，覆盖 `package.json` /
+`src-tauri/tauri.conf.json` / `npm/package.json` / 四个 `Cargo.toml` / `npm/platform/*` /
+`Cargo.lock` 的 4 个 workspace 包）。
+
+**构建**：`scripts/build-signed.ps1 -Bundles nsis`（签名密钥用 `-KeyFile` /
+`-PasswordFile` 显式指向 `keys\ai-gateway-updater.*`；默认路径 `~/.wb-switch/wb-switch-updater.key`
+在本机不存在）。内嵌网关 `crates/ai-gateway-core/embedded/gateway.exe` 与
+`target/release/gateway.exe` **逐字节一致**。
+
+| 产物 | 字节 | SHA256 |
+|---|---|---|
+| `dist\AI Gateway_1.0.36_x64-setup.exe` | 14,736,756 | `24F760F84958C315002B50EF6568F6C2F6C3BC6787709B7DFC8C0A5824DB30F4` |
+| `dist\AI Gateway_1.0.36_x64-setup.exe.sig` | 424 | `36D18C01BE5B286BDB160A118DE0BFCE403786947B9AAF09D26BBBB8F3F0220E` |
+| `dist\ai-gateway_1.0.36_server-x64.exe` | 27,422,208 | `1CD866E2A724749E4589FA8300677D5A7B5DEBC4F5F3D5B5F19B1A8DA1043C2E` |
+| `crates\ai-gateway-core\embedded\gateway.exe` | 13,999,616 | `458163AECF3B317E7AFAE5836CFE90D542B137A9436033D124CE030F432AF75D` |
+
+**签名验签（端到端，不只看 keyid）**：`tauri.conf.json` 的 `plugins.updater.pubkey`
+（base64 解出 `Ed` 前缀 + keyid `6fa3c36f4be67c7e`）与 `.sig`（`ED` 前缀 = **预哈希**）配对；
+用 Node `crypto.verify` 逐条验：
+
+- **FILE SIG**（`sig64`）过 **`blake2b-512(安装包)`** ⇒ **VALID**（这就是 updater 实际校验的那条）；
+- **GLOBAL SIG** 的签名消息 = **`sig64 || trusted_comment正文`**（不含 `trusted comment: ` 前缀、不含换行）
+  ⇒ **VALID**。
+
+⚠ 记下来：上一轮记的「GLOBAL SIG 消息 = `sig64 || trusted_comment`」是对的，但本轮先用
+「`sigline + \n + comment`」试了一轮全 invalid —— **预哈希与全局签名是两套消息**，
+不要用同一个式子套两者。
+
+**真机实测（跑发行包二进制）**：`test-bin\inst-1036-final`，隔离 `AI_GATEWAY_HOME`，
+单账号凭证副本（用后已删），本地假上游 `:17952`（15 帧 × 700ms ≈ 10.5s 慢流）。
+
+| 观察 | 读数 |
+|---|---|
+| `/status.in_flight` 逐秒轮询（流在飞） | 连续 11 次 **1**，流结束那一次 **0** |
+| `POST /api/gateway/restart`（出厂 server） | **3814 ms**（含排空 **1832 ms**） |
+| 排空日志 | `[gateway] 重启前排空：当前 1 个请求在途，等待其结束（最多 30s）` / `[gateway] 重启前排空完成：在途请求已归零（等待 1832ms）` |
+| 客户端侧 | `STREAM_END +10677ms chunks=18 sawDone=true bytes=3035`（完整 `[DONE]`） |
+| 保活补跑（`keepalive_at=0`） | 启动即补跑并写入真实时刻（age=37s） |
+| 保活幂等（37s 前刚刷过） | 日志里**一条 keepalive 都没有** |
+| 端口不被补跑阻塞 | `listening` 与「开始补跑」同毫秒 |
+
+**测试基线**：workspace **3056 passed / 0 failed / 7 ignored**（15 suite）。
+
+**未做**：未推送、未打 tag、未建 Release（业主未表态）。
 ### 交付物
 
 ```
