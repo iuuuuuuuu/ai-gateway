@@ -130,6 +130,54 @@
 `fork`（`iuuuuuuuu/ai-gateway`），并各发一个 Release。**只推 `fork`**；`origin` / `upstream` / `aigw`
 三个 remote 全程未碰（与 9.6 授权一致）。
 
+### 9.19 1.0.38 打包 / tag / Release（2026-10-09，业主「打包,然后发新版本构建」）
+
+| 项 | 结果 |
+|---|---|
+| 版本 bump | `scripts/bump-version.ps1 1.0.38`，14 个文件（含 `Cargo.lock` 4 个 workspace 包 + `package-lock.json`） |
+| 构建 | `build-signed.ps1` **EXIT=0**；`npm` 仍坏 ⇒ 用 `.tmp/shimbin` 垫片（见 9.6） |
+| 提交 | `d5520b2`（release）+ `03f2917`（docs）+ `aa17690`（fix） |
+| CI | `d5520b2` **5/5 全绿**（**先确认绿了再打 tag** —— 1.0.37 的教训） |
+| tag | `v1.0.38` → `d5520b2`；本地 tag 48 → **49** |
+| Release | id **`407832877`**，`draft=false prerelease=false`，body = `RELEASE_NOTES_1.0.38.md` 全文（`bodyLen=3456`） |
+| 资产 | **5 个**（与 1.0.33~1.0.37 惯例一致）：setup + .sig + `ai-gateway_1.0.38_server-x64.exe` + `latest.json` + `latest-windows-x86_64.json` |
+| `releases/latest` | 指向 **v1.0.38** |
+
+**实测（用成品里解出来的内嵌网关，不是 target/release 那份）**：
+
+```text
+从 ai-gateway.exe 解出内嵌网关：offset=25348834  14053888 B
+SHA256 2AD429030AF134937EADDFFD4CD6F0A3B2AE8729D21B9A339A97AB0B26F2C543
+与 crates/ai-gateway-core/embedded/gateway.exe 一致: True
+```
+
+用这同一份跑（独立端口 18047 + 独立数据目录 + 假上游固定回真实 11133）：
+
+| 形状 | status | code |
+|---|---|---|
+| A) 小输入 + `max_tokens=1048576`（业主 VS Code） | 400 | `context_length_exceeded` + 人话文案 |
+| B) 贴上限 + `max_tokens=128000`（DSH） | 400 | `model_param_invalid` + 人话文案 |
+
+前端指纹：`dist/index.html` 引用 `assets/index-CeNZf-SA.js`，exe 内 contains ⇒ True。
+`ai-gateway_1.0.38_server-x64.exe` 也在独立端口起过并 `GET /` 200（488 B 前端）。
+
+**下载件逐字节比对**：5/5 `MATCH=True`。**FILE SIG 有效**（blake2b-512 prehash + Ed25519，
+keyid `7e7ce64b6fc3a36f` 与 `tauri.conf.json` 公钥配对）—— 对**下载回来的**那份也验过。
+
+★ 三个坑（都当场踩到并绕过）：
+
+1. **`npm` 坏了**（nvmd 垫片解析不到）⇒ `build-signed.ps1` 的 `npm run tauri -- build` 直接
+   失败。用 `.tmp/shimbin/npm.cmd` 垫片（把 `run build` 映射到 tsc+vite、`run tauri` 映射到
+   tauri CLI）并把它放进 PATH 才过。
+2. **`tauri-build` 的 `rerun-if-changed` 不含 `../dist`** ⇒ 重建前端不会触发重新内嵌，
+   构建前必须先删 `target/release/ai-gateway.exe`，否则脚本的前端指纹闸会拦下。
+3. **57890 / 57901 都绑不上**（`os error 10013`）—— 它们在 Windows 的 **excluded port
+   range** 里（`netsh int ipv4 show excludedportrange protocol=tcp` 显示 57805~57904 等
+   大段被 Hyper-V/WSL 预留）。独立实例要用 18xxx 这类。
+
+★ 教训：**`.sig` 别用 `Set-Content` 改写**（会多加一个 `\n`，444 → 445 B，逐字节比对就不
+相等了）。tauri 生成的那份直接 `Copy-Item`。
+
 ### 9.18 11133 说人话 + 修掉漏判「小输入 + 极大 max_tokens」（2026-10-09）
 
 业主原话：「把 11133 workbuddy 这个报错更明显，**就说人话**，不要再说拒绝了」。
