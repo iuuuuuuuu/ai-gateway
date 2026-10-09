@@ -1077,12 +1077,20 @@ mod tests {
         }
     }
 
-    /// 构造一个 **CST（+08:00）** 时刻，再换算成 `Local`。
+    /// 构造一个「**CST（+08:00）墙上时间是这组数字**」的时刻，再换算成 `Local`。
     ///
-    /// ★★ 2026-10-09：同 `scheduler/mod.rs` 的同名 helper —— 此前按**运行机**
-    /// 时区解释，而 `growth_yesterday` / `growth_makeup_out_of_month` 一律按 CST
-    /// 判日 ⇒ CI 的 UTC runner 上断言全错（本地是 CST，所以一直没暴露）。
-    fn at(y: i32, m: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
+    /// ★★ 2026-10-09：此前叫 `at` 且用 `Local.with_ymd_and_hms(...)` —— 即按
+    /// **运行机**时区解释这组数字。而本模块的被测函数
+    /// （`growth_yesterday` / `growth_makeup_out_of_month`，都经 `growth_cst`）
+    /// **一律按 CST 判日** ⇒ CI 的 UTC runner 上断言全错
+    ///（本地是 CST，所以这条一直没在开发机上暴露）。
+    ///
+    /// 改成先按 +08:00 构造再换算：得到的是**同一个瞬时**，
+    /// 无论运行机在哪个时区，CST 判定结果都不变。
+    ///
+    /// ⚠ 名字刻意从 `at` 改成 `cst`：本模块里**每个**调用方都是 CST 语义，
+    /// 名字带上口径，避免以后有人当成「本地时刻」误用。
+    fn cst(y: i32, m: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
         use chrono::TimeZone;
         chrono::FixedOffset::east_opt(8 * 3600)
             .expect("+8h")
@@ -1118,20 +1126,20 @@ mod tests {
 
     #[test]
     fn yesterday_is_cst_calendar_day() {
-        assert_eq!(growth_yesterday(at(2026, 9, 20, 23, 30)), "2026-09-19");
-        assert_eq!(growth_yesterday(at(2026, 9, 21, 0, 30)), "2026-09-20");
+        assert_eq!(growth_yesterday(cst(2026, 9, 20, 23, 30)), "2026-09-19");
+        assert_eq!(growth_yesterday(cst(2026, 9, 21, 0, 30)), "2026-09-20");
         // 跨月：9 月 1 日的昨日是 8 月 31 日。
-        assert_eq!(growth_yesterday(at(2026, 9, 1, 9, 0)), "2026-08-31");
+        assert_eq!(growth_yesterday(cst(2026, 9, 1, 9, 0)), "2026-08-31");
         // 跨年。
-        assert_eq!(growth_yesterday(at(2027, 1, 1, 9, 0)), "2026-12-31");
+        assert_eq!(growth_yesterday(cst(2027, 1, 1, 9, 0)), "2026-12-31");
     }
 
     #[test]
     fn makeup_out_of_month_only_on_the_first() {
-        assert!(growth_makeup_out_of_month(at(2026, 9, 1, 0, 5)));
-        assert!(growth_makeup_out_of_month(at(2026, 9, 1, 23, 59)));
-        assert!(!growth_makeup_out_of_month(at(2026, 9, 2, 0, 1)));
-        assert!(!growth_makeup_out_of_month(at(2026, 9, 30, 12, 0)));
+        assert!(growth_makeup_out_of_month(cst(2026, 9, 1, 0, 5)));
+        assert!(growth_makeup_out_of_month(cst(2026, 9, 1, 23, 59)));
+        assert!(!growth_makeup_out_of_month(cst(2026, 9, 2, 0, 1)));
+        assert!(!growth_makeup_out_of_month(cst(2026, 9, 30, 12, 0)));
     }
 
     // ── 业务答复判定 ──

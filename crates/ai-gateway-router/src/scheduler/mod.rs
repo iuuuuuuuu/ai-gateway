@@ -2517,20 +2517,29 @@ mod tests {
 
     // ---- 排程时点 ----
 
-    /// 构造一个 **CST（+08:00）** 时刻，再换算成 `Local`。
+    /// 构造一个 **Local** 时刻（按运行机时区解释）。
     ///
-    /// ★★ 2026-10-09：此前这里是 `Local.with_ymd_and_hms(...)` —— 即按**运行机**
-    /// 的时区解释这组数字。而调用方（`travel_day` / `local_at_hour` / `next_fire`
-    /// 等）**一律按 CST 判日**，于是 CI 的 `ubuntu-22.04`（TZ=UTC）上
-    /// `23:30` 被当成 UTC 23:30 = CST 次日 07:30 ⇒ 断言全错（本地是 CST，
-    /// 所以这条回归一直没在开发机上暴露）。
+    /// ⚠ 本模块里**两种语义并存**，别混用：
+    ///   · `local_at_hour` / `next_fire` / `within_catch_up` / `next_wake` 等按
+    ///     **Local** 取整点 ⇒ 必须用本函数（两侧同为 Local，时区自动抵消）；
+    ///   · `travel_day` 按 **CST** 判日 ⇒ 必须用 [`cst`]。
     ///
-    /// 修法：先按 CST 构造，再 `with_timezone(&Local)` —— 得到的是**同一个瞬时**，
-    /// 无论运行机在哪个时区，被测函数的 CST 判定结果都不变。
-    ///
-    /// ⚠ 不要改成给测试设 `TZ=Asia/Shanghai`：`Local` 在多数平台上只在进程
-    /// 启动时读一次 TZ，测试内改环境变量不可靠（且并行测试会互相干扰）。
+    /// ★★ 2026-10-09：此前本函数同时承担这两种用途，于是把 `travel_day` 的
+    /// 断言绑在了「运行机恰好是 CST」上 —— CI 的 `ubuntu-22.04`（TZ=UTC）上必红。
+    /// 拆成两个 helper 后，两种语义各自与运行机时区无关。
     fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
+        use chrono::TimeZone;
+        Local
+            .with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .single()
+            .expect("valid local time")
+    }
+
+    /// 构造一个「**CST（+08:00）墙上时间是这组数字**」的时刻，再换算成 `Local`。
+    ///
+    /// 得到的是**同一个瞬时**，无论运行机在哪个时区，`travel_day` 的 CST 判定
+    /// 结果都不变 —— 这正是 `travel_day_uses_cst` 要钉的东西。
+    fn cst(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
         use chrono::TimeZone;
         chrono::FixedOffset::east_opt(8 * 3600)
             .expect("+8h")
@@ -3160,10 +3169,10 @@ mod tests {
     #[test]
     fn travel_day_uses_cst() {
         // 2026-09-20 23:30 CST 的 UTC 是 15:30，CST 自然日仍是 09-20
-        let d = travel_day(at(2026, 9, 20, 23, 30));
+        let d = travel_day(cst(2026, 9, 20, 23, 30));
         assert_eq!(d, "2026-09-20");
         // 跨过 CST 午夜后才是次日
-        assert_eq!(travel_day(at(2026, 9, 21, 0, 30)), "2026-09-21");
+        assert_eq!(travel_day(cst(2026, 9, 21, 0, 30)), "2026-09-21");
     }
 
     // ---- 档位挑选 ----

@@ -868,6 +868,17 @@ mod tests {
     #[test]
     fn proxy_config_candidate_order_is_data_dir_then_home_then_env() {
         // 顺序是**契约**：第一个能解析的胜出，故顺序错了就会用错代理。
+        // ★★ 2026-10-09：`proxy_config_candidates` 复刻的是 **Go 的
+        // `filepath.Dir` / `filepath.Join`**，它们按**运行平台**的路径语义工作 ——
+        // 而本测试喂的是 `C:\...` 形态的 Windows 路径。在 Linux 上
+        // `Path::new(r"C:\data\qoder\auths")` 整串只是一个 `Normal` 组件，
+        // `parent()` 给 `""` ⇒ `go_dir` 退回 `"."` ⇒ 候选里根本没有 `data`，
+        // 于是 CI 的 ubuntu 腿必红。
+        //
+        // 被测函数只在 **Windows 客户端**的路径语义下有意义（Qoder 桌面端），
+        // 故门控到 Windows；非 Windows 上另行钉住「同样输入不 panic」这条底线。
+        #[cfg(windows)]
+        {
         let cands = proxy_config_candidates(
             r"C:\data\qoder\auths",
             Some(r"C:\Users\someone"),
@@ -887,5 +898,13 @@ mod tests {
         assert_eq!(only_authdir.len(), 1, "{only_authdir:?}");
         let empty_strings = proxy_config_candidates(r"C:\data\qoder\auths", Some(""), Some("  "));
         assert_eq!(empty_strings.len(), 1, "空白 home/env 不算候选：{empty_strings:?}");
+        }
+        // 非 Windows：路径语义不同，不比对具体串；只钉住不 panic 且候选非空
+        // （`go_dir` 的兜底保证第一项总是存在）。
+        #[cfg(not(windows))]
+        {
+            let c = proxy_config_candidates("/data/qoder/auths", None, None);
+            assert_eq!(c.len(), 1, "即使没有任何 home/env，也必须有一个候选：{c:?}");
+        }
     }
 }

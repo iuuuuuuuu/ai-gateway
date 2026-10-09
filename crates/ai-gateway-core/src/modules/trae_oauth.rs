@@ -2212,11 +2212,26 @@ mod tests {
                 );
             }
         }
-        // 真实客户端 `this.c = Id==="win32" ? "windows" : Id` —— 小写
+        // 真实客户端 `this.c = Id==="win32" ? "windows" : Id` —— 小写。
+        //
+        // ★★ 2026-10-09：`os_info()` 取的是 **`cfg!(windows)`**（本机平台），
+        // 而这条断言无条件钉 `"windows"` ⇒ CI 的 `macos-14` 腿拿到 `"mac"`、
+        // ubuntu 腿拿到 `"linux"`，必红。
+        //
+        // 该函数**不可能**跨平台返回同一个值（它就是本机平台名），所以这里按平台
+        // 分别钉：Windows 上钉「小写 windows」（那才是修过的那个回归 —— 此前发的是
+        // 首字母大写的 `Windows`），其余平台钉它们各自的小写形态。
+        let want_os = if cfg!(windows) {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "mac"
+        } else {
+            "linux"
+        };
         assert_eq!(
-            dev["OSInfo"], "windows",
-            "OSInfo 必须是小写 windows（main.js 的 `Id===\"win32\"?\"windows\":Id`），\
-             我们此前发的是首字母大写的 Windows"
+            dev["OSInfo"], want_os,
+            "OSInfo 必须是小写平台名（main.js 的 `Id===\"win32\"?\"windows\":Id`），\
+             我们此前在 Windows 上发的是首字母大写的 Windows"
         );
     }
 
