@@ -1415,11 +1415,28 @@ mod tests {
     fn ends_at_time_survives_an_absurd_ends_at_instead_of_panicking() {
         // ★ 回归：`SystemTime + Duration` 溢出会 **panic**，而上游若给出荒唐的
         // `ends_at`（畸形响应），调度器会当场崩掉、整轮 tick 被带走。
-        // Go 的 `time.Unix(n, 0)` 不 panic ⇒ 这里必须等价地「当作没有截止时间」。
-        assert!(
-            ends_at_time(&offer("p", "", i64::MAX)).is_none(),
-            "溢出要退化成 None（不 hold），而不是 panic"
-        );
+        // Go 的 `time.Unix(n, 0)` 不 panic ⇒ 这里必须等价地不 panic。
+        //
+        // ★★ 2026-10-09：这条测试此前断言**恒为 `None`**，那只是 **Windows 的
+        // 表示法**的结果 —— Windows 的 `SystemTime` 是 1601 起的 u64 百纳秒，
+        // `i64::MAX` 秒必然溢出 ⇒ `checked_add` 给 `None`；而 Linux 的
+        // `SystemTime` 是 `{i64 秒, i32 纳秒}`，`i64::MAX` 秒**装得下** ⇒
+        // `checked_add` 给 `Some`。于是同一条断言在 CI 的 ubuntu 上必红。
+        //
+        // 真正该钉的不变量是**「不 panic」**（那才是这条回归要防的事），
+        // 加上「无论哪种结果，`set_hold` 都把它截到 24h 上限」——
+        // 后者才是生产路径上真正保护我们的那一步。
+        let absurd = ends_at_time(&offer("p", "", i64::MAX));
+        // 上一步没 panic 就已经是主要结论；下面把两种合法结果都覆盖到。
+        if let Some(at) = absurd {
+            // 平台装得下 ⇒ 给一个极远的时刻；`set_hold` 必须把它截到上限。
+            let s = sched(Fake::new(), None, None);
+            assert_eq!(
+                s.set_hold("u", Some(at)),
+                CLAIM_HOLD_CAP,
+                "荒唐的 ends_at 必须被 24h 上限截断，而不是让 hold 永远不过期"
+            );
+        }
     }
 
     // ── 10. set_hold / check_hold ────────────────────────────────────

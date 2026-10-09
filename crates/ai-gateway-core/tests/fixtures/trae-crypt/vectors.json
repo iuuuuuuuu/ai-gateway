@@ -1,0 +1,382 @@
+{
+  "_generatedBy": "test-bin/verify-trae/gen_vectors.js",
+  "_referenceImplementation": "test-bin/recon/trae-wangqi233/src/trae-decrypt.js",
+  "_referenceLines": {
+    "SALT_A": 12,
+    "SALT_B": 13,
+    "SALT_C": 14,
+    "SALT_D": 15,
+    "xorSalts": 17,
+    "sha512": 25,
+    "detectEncType": 29,
+    "deriveKeyAndIV": 39,
+    "aesCbcDecrypt": 57,
+    "isTcEncrypted": 64,
+    "decryptTcBuffer": 70,
+    "decryptStorageValue": 117,
+    "decryptAuthData": 129,
+    "minCiphertextLenExpr": "HEADER_SIZE + RANDOM_BYTES_LEN + HASH_SIZE + 16 = 6+32+64+16 = 118"
+  },
+  "_nodeVersion": "v26.0.0",
+  "_saltSourceNote": "盐字节由 gen_vectors.js 用正则从参考实现源码 L12-15 程序化读出，未手抄；读出的盐已与参考实现导出的 deriveKeyAndIV 对拍一致。",
+  "_saltSelfCheckAllMatch": true,
+  "_saltSelfCheckCount": 16,
+  "_saltFingerprints": {
+    "SALT_A_sha256": "a11e80f923aebb372ca5d5455239529278afd4990cf4348e6a2c6e2ec8349009",
+    "SALT_B_sha256": "969973bbc3e82d7d5a81205632c6d540009a5142c8ef88bf06f3af6b39d1b46e",
+    "SALT_C_sha256": "9207df805b7784f5f2407525519fe55639a976d7a786fa1e934caee343dc5254",
+    "SALT_D_sha256": "823fa965f1cb5d877743242579686d73d2b24012228aaa170938d2d5d27b1c34",
+    "AES_salt_xorAB_sha256": "ebc17f362f05265d373a3f782230f246b3eb2510a3a12b164fd5b417e7f49741",
+    "AES_PRIVATE_salt_xorCD_sha256": "1cc81612a12f1f64bc96788404526dff008b9949a24240157516830fd3661c8d",
+    "AES_salt_is_xorCD": false
+  },
+  "_containerFormat": "header(6) ‖ randomBytes(32) ‖ AES-128-CBC-PKCS7( sha512(plaintext)(64) ‖ plaintext )",
+  "_expectedRustErrorSemantics": "expectedRustErrorAnyOf 是**允许集合**（Rust 侧实际变体必须落在其中）；expectedRustMechanism 说明该集合为什么是确定的或数据相关的。★ 密钥错误类向量（n1/n2/n3）的 DecryptFailed↔HashMismatch 边界是数据相关的（随机明文末字节碰巧构成合法 PKCS7 的概率 ≈ 0.4%），确定性判据是「必须失败」。",
+  "vectors": [
+    {
+      "id": "p1_ascii_json__AES",
+      "note": "ASCII JSON",
+      "encType": "AES",
+      "plaintext": "{\"token\":\"abc123\",\"exp\":1735689600,\"scope\":\"user\"}",
+      "plaintextUtf8Bytes": 50,
+      "randomBytesHex": "6f7f3104435872419266c70aaaf688898cb671405e3604093e332116d9bd1d86",
+      "keyHex": "42e96cfc63cda8cee5d018e413037513",
+      "ivHex": "bd074b4660730dfc1908a27d761d223c",
+      "containerLen": 166,
+      "cipherB64": "dGMFEAAAb38xBENYckGSZscKqvaIiYy2cUBeNgQJPjMhFtm9HYYqj7vkLEJ2QlenzvMvtPju/tAtrVkALPwm2wBsnyWGfRwIBpn1aHVK6gw3AdMqAj02J72QLyEToYUT98uTobX71k2PqSvn9DdtcbJx+Hiw2zkQWUlY+Ht6YI4cwVnYg5mpFw4c3eXo01NJbmPzIkyLVwEmh23JkMRBNugAPU2XXw==",
+      "jsRoundTrip": true
+    },
+    {
+      "id": "p1_ascii_json__AES_PRIVATE",
+      "note": "ASCII JSON",
+      "encType": "AES_PRIVATE",
+      "plaintext": "{\"token\":\"abc123\",\"exp\":1735689600,\"scope\":\"user\"}",
+      "plaintextUtf8Bytes": 50,
+      "randomBytesHex": "81881115a05cc3c2f3c8c183ad21ebb987e18d912864b65339182b949f94e123",
+      "keyHex": "433b14ec8b8980d0503962c1e13c8d3c",
+      "ivHex": "821620227787fd4985b3c28e2e2c45ff",
+      "containerLen": 166,
+      "cipherB64": "EjkgIAIDgYgRFaBcw8LzyMGDrSHruYfhjZEoZLZTORgrlJ+U4SNFR3UP8MKS6ByRANNIo0k4cSyrBlo9d4SynQhdr9jUzkxYmThEA7eG8tm5ih7+Yb8H6jNNcd2/qEgHp/HV5f5+lNYh++kShUQ8KtNCRDXg4+whnHQ5sm3Mmm1sAwfPOFUflJ+w95leIm5S4ntQ47K6aFKW3og43bCxWX+AkO19xA==",
+      "jsRoundTrip": true
+    },
+    {
+      "id": "p2_chinese__AES",
+      "note": "中文 + 全角标点",
+      "encType": "AES",
+      "plaintext": "{\"msg\":\"你好，世界 —— 中文与标点\",\"用户\":\"测试账号\"}",
+      "plaintextUtf8Bytes": 72,
+      "randomBytesHex": "ecd5f6053bd73288f4ba024717f01d34dacb1d1a3feff757bf2ef667ca191e01",
+      "keyHex": "b40a9bf0d4c644820bbd13d5981abd24",
+      "ivHex": "91eb5e7de49baa2b8943ed96c277f8f5",
+      "containerLen": 182,
+      "cipherB64": "dGMFEAAA7NX2BTvXMoj0ugJHF/AdNNrLHRo/7/dXvy72Z8oZHgG/SqKR/1f8qW3N2LWjWfF2ELIR4z8aGfBfS0wQRcaRCfayhp2thLr/zPYH1enVxHbXu5JP7RrepqsE7Cs87XzRoKyHuNNyzWUy+soUsTS47D1ycln2PMn7bkiCuJzokYylC1u2nJjBkA4aS073ZYMUmsu3bpWsdr30JVHIREmte/YB4VunLmqF+TmRPPka8BM=",
+      "jsRoundTrip": true
+    },
+    {
+      "id": "p2_chinese__AES_PRIVATE",
+      "note": "中文 + 全角标点",
+      "encType": "AES_PRIVATE",
+      "plaintext": "{\"msg\":\"你好，世界 —— 中文与标点\",\"用户\":\"测试账号\"}",
+      "plaintextUtf8Bytes": 72,
+      "randomBytesHex": "8eeccba2b95cd52e05f9f76b456c55b7fd5b3c0f1d42a8c1bd93b12cb7822408",
+      "keyHex": "721e3e8fc77e5654b9f144f3bb5f4801",
+      "ivHex": "abec76d5b335c5958592fb9b328bf72a",
+      "containerLen": 182,
+      "cipherB64": "EjkgIAIDjuzLorlc1S4F+fdrRWxVt/1bPA8dQqjBvZOxLLeCJAiQrVlSoMDPbqqiOffvT9tk7KXlbWORIVXB0o5XsVOh6bHRV4/o807cmtOOpfuN+G5XbFDg6HMua+kh3q3vHoqeVX57rx0/jUPXgYfIDNTVH6WUw/jwf7eZIp1cmfR1kq1uyH0HElSgx1tcCxMgDLh1q11+b+T04rST/cgPEqjXLm6fDoC59aBpd9d+suF8SMI=",
+      "jsRoundTrip": true
+    },
+    {
+      "id": "p3_emoji__AES",
+      "note": "emoji（含 ZWJ 无关的代理对）",
+      "encType": "AES",
+      "plaintext": "{\"note\":\"🎉🚀✨ 完成\",\"flag\":\"🇨🇳\",\"mood\":\"😀\"}",
+      "plaintextUtf8Bytes": 61,
+      "randomBytesHex": "687cc3c46bfdcd705e52a211677073f0f85eca3193ad16542cd51ab1d854a9e6",
+      "keyHex": "8abe149816426ff6345488f8075347dc",
+      "ivHex": "254f18c1dd4125921ded5d4409197d23",
+      "containerLen": 166,
+      "cipherB64": "dGMFEAAAaHzDxGv9zXBeUqIRZ3Bz8PheyjGTrRZULNUasdhUqeYIcNN2rcYfn4BpsNONt0VL9t73go0heDYVL71+hbIH9dDpsFhg6Fl1cEx5b8OVsfVHkHpVs+2pGMAK4oiZ1EqmWnHd67CULBRwnID2nk9iV0vb4OUCyGgKOd5FnXu4YLCWc2JwKihpXk6yOthFlcIfRXNAcHrd7CraeT9n7tw1sQ==",
+      "jsRoundTrip": true
+    },
+    {
+      "id": "p3_emoji__AES_PRIVATE",
+      "note": "emoji（含 ZWJ 无关的代理对）",
+      "encType": "AES_PRIVATE",
+      "plaintext": "{\"note\":\"🎉🚀✨ 完成\",\"flag\":\"🇨🇳\",\"mood\":\"😀\"}",
+      "plaintextUtf8Bytes": 61,
+      "randomBytesHex": "665410e679e5f356e3899b9a4c5cb0838fb56416fb36036ea448ca24fd605068",
+      "keyHex": "c86f32c6321527fe7e0bb0f86fd3eccc",
+      "ivHex": "1e53b1659d43aedebaf0cfc5e9e959f1",
+      "containerLen": 166,
+      "cipherB64": "EjkgIAIDZlQQ5nnl81bjiZuaTFywg4+1ZBb7NgNupEjKJP1gUGiwJMwcIUBtUlNfhDR345Uw2zS6Ow/AS9e0aRxKTKPh9gtBdSEmf6wl9zS4P2phUxlK3EKXPsw6B3mqu31ATDP5gdlOdz/ZGxsuYFyD0fRO6gVwYYLNOIibbMJrlQDfzWZIsyW5tb3mI3peqNeAydK3ULyr+0l32mqVgZ7gSjurYw==",
+      "jsRoundTrip": true
+    },
+    {
+      "id": "p4_long_4000__AES",
+      "note": "4000 字符超长串",
+      "encType": "AES",
+      "plaintext": "abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标",
+      "plaintextUtf8Bytes": 6066,
+      "randomBytesHex": "599f96d7f7a107f42946eb6d8f5ac849fbf1574185fa45d1823d24111750ec08",
+      "keyHex": "12dccf701d74a994a8952da25c83a73e",
+      "ivHex": "d469999eeb83dc25986ce2f3ce552967",
+      "containerLen": 6182,
+      "cipherB64": "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",
+      "jsRoundTrip": true
+    },
+    {
+      "id": "p4_long_4000__AES_PRIVATE",
+      "note": "4000 字符超长串",
+      "encType": "AES_PRIVATE",
+      "plaintext": "abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标点，abcdefghij0123456789 中文内容·标",
+      "plaintextUtf8Bytes": 6066,
+      "randomBytesHex": "c9ceee2802a7bf4456afda370d833573b7cab352fac963fdf23ed092986ee274",
+      "keyHex": "a7090706d962020c13074382beb8a30d",
+      "ivHex": "0f7c3639dafee426cfd900ac8225a5a7",
+      "containerLen": 6182,
+      "cipherB64": "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",
+      "jsRoundTrip": true
+    },
+    {
+      "id": "p5_empty__AES",
+      "note": "★ 空明文（容器长度恰为 118 = MIN_CIPHERTEXT_LEN）",
+      "encType": "AES",
+      "plaintext": "",
+      "plaintextUtf8Bytes": 0,
+      "randomBytesHex": "312d27e12f0d58305428440d100aff41fd43bece28d2e9fecc2b71e402f3da55",
+      "keyHex": "9d13063b7a1b24e203a0d4c2d0b84b66",
+      "ivHex": "97b63842f3351ffe28ef2f3b60f261db",
+      "containerLen": 118,
+      "cipherB64": "dGMFEAAAMS0n4S8NWDBUKEQNEAr/Qf1Dvs4o0un+zCtx5ALz2lX6tZ6b6ONB/NwcC7gK05ZEbyUAtyuJ7vaGg1wB68uSKfPn2BUw/AzDXqRIVRZz1js4MoK+9nr1/hyYZ6iiyQ0YC+tkAazUYc6lUvj/315B8Q==",
+      "jsRoundTrip": true
+    },
+    {
+      "id": "p5_empty__AES_PRIVATE",
+      "note": "★ 空明文（容器长度恰为 118 = MIN_CIPHERTEXT_LEN）",
+      "encType": "AES_PRIVATE",
+      "plaintext": "",
+      "plaintextUtf8Bytes": 0,
+      "randomBytesHex": "a4b7a1dd1c35781784a893d5ddbaed1c6f981958cc9a47896c689a799f4227bd",
+      "keyHex": "54e1482db3ab1da697cd33623a1f3e58",
+      "ivHex": "d016418d8b479b028dad1d9491d702d1",
+      "containerLen": 118,
+      "cipherB64": "EjkgIAIDpLeh3Rw1eBeEqJPV3brtHG+YGVjMmkeJbGiaeZ9CJ73Ey0MjrF4BTLzDGSKcTCrKAq88rVvnQ6Md3u4G4JC8zT15VFMIFwF6fDG29GleJKyvlQVQRlK7GnVlIyjwMb9QEwy+L0fMpZsyTkYl8Dz5Ew==",
+      "jsRoundTrip": true
+    },
+    {
+      "id": "p6_single_byte__AES",
+      "note": "★ 单字节明文（容器长度恰为 118）",
+      "encType": "AES",
+      "plaintext": "x",
+      "plaintextUtf8Bytes": 1,
+      "randomBytesHex": "769092cc29a5118e129d5c4f0813978535b3390b00b4c9ea5496c84cb9c22f0e",
+      "keyHex": "41051d7bf2f7d8a4fe369db07d4fa417",
+      "ivHex": "7b336882aeb7014e19b79d99e01de76d",
+      "containerLen": 118,
+      "cipherB64": "dGMFEAAAdpCSzCmlEY4SnVxPCBOXhTWzOQsAtMnqVJbITLnCLw4hk62jgHuRIig0XTAoRNWJYJvdHxDeU7KAMbClxC0fgg3rPLYfOXAITsgXNhq+zw2NSNN02OAHC3rUAVTfKRCFTNnGSVeIvfC2KQB2vNhAbA==",
+      "jsRoundTrip": true
+    },
+    {
+      "id": "p6_single_byte__AES_PRIVATE",
+      "note": "★ 单字节明文（容器长度恰为 118）",
+      "encType": "AES_PRIVATE",
+      "plaintext": "x",
+      "plaintextUtf8Bytes": 1,
+      "randomBytesHex": "2f7a5241bb9d74dfc07f7e32363533dfe8f537cdb8580b0e88864e6467d2afd0",
+      "keyHex": "ccc0e6a7c0745e5e4bd2f15c82e87b9b",
+      "ivHex": "91e79e15658eb5d6a3839ef1d8037000",
+      "containerLen": 118,
+      "cipherB64": "EjkgIAIDL3pSQbuddN/Af34yNjUz3+j1N824WAsOiIZOZGfSr9Dm9NJNRzg17MihqqKw7QX7+pXYaUlTu5yO1DRmNTk6K4fwkjT+WfXvUviQpLPyTI2iwjy+rkDgghAhONZx71hNL878Lyh/XnmMJEQ1TjoMRQ==",
+      "jsRoundTrip": true
+    },
+    {
+      "id": "p7_braces_only__AES",
+      "note": "仅花括号（明文快路径形态）",
+      "encType": "AES",
+      "plaintext": "{}",
+      "plaintextUtf8Bytes": 2,
+      "randomBytesHex": "0afb6554e7a976304e05712d7479c616c6c00c5e668956ee0e0def0ba8d2533e",
+      "keyHex": "a9c999439ea14045a5eda3affb64b3eb",
+      "ivHex": "0bf6a38d67e57a8d97672a4bb15192fa",
+      "containerLen": 118,
+      "cipherB64": "dGMFEAAACvtlVOepdjBOBXEtdHnGFsbADF5miVbuDg3vC6jSUz4qhIobmGKr7fOx+ob2NFWiBWR76SjuzE3FnphAIiCCx9lqDjScz4HuwPUwvO0+jmH6eiLTK/u2bTJn5KPE2YSgPbAAzgBXxtvTWiykORtCSA==",
+      "jsRoundTrip": true
+    },
+    {
+      "id": "p7_braces_only__AES_PRIVATE",
+      "note": "仅花括号（明文快路径形态）",
+      "encType": "AES_PRIVATE",
+      "plaintext": "{}",
+      "plaintextUtf8Bytes": 2,
+      "randomBytesHex": "cbb8cb47bbcb0f64409ce762c67238b9a3171cbd0dcde0e34d1d804015022670",
+      "keyHex": "4da80b4aa417283ffc50781096b05fd8",
+      "ivHex": "24bfd47c7d4ef42445cda12f59aeddf8",
+      "containerLen": 118,
+      "cipherB64": "EjkgIAIDy7jLR7vLD2RAnOdixnI4uaMXHL0NzeDjTR2AQBUCJnDZkGrxSalsGXHu6HUqZghU1qv0yn2bAAFsrFjOgZ9r/nkLAw3GgN4deYqWTtY82PP/R/MYSyGFjrYOSD+7+TEWzY0u3B1XKAYLTAXolgpRnw==",
+      "jsRoundTrip": true
+    },
+    {
+      "id": "p1_ascii_json__AES__zerorandom",
+      "note": "★ randomBytes 全零的合法容器（密钥派生边界）",
+      "encType": "AES",
+      "plaintext": "{\"token\":\"abc123\",\"exp\":1735689600,\"scope\":\"user\"}",
+      "plaintextUtf8Bytes": 50,
+      "randomBytesHex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "keyHex": "3911a32ca60df4628bfb9569df412b19",
+      "ivHex": "f151b97d9845b6e91c0b6292cc85fd2d",
+      "containerLen": 166,
+      "cipherB64": "dGMFEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABZOpWEw6ziSa1/gm/L+Dmb4WlDzImp5Y+tq5TIblz09w4vr2vC+P1nkRUKbIRPMYUzeIeQboCGb35NUg+Iucy4nlBMNkAUlf/JGOKKP28hZyp2hVQzNBYS3/q1m+2ll2U0pw3efZRSVeMEfTEaxvi38wf5U8HsePsErw5roGY9kw==",
+      "jsRoundTrip": true
+    }
+  ],
+  "negativeVectors": [
+    {
+      "id": "n1_private_header_with_ab_salt",
+      "why": "AES_PRIVATE 头 + 用 SALT_A⊕SALT_B 派生的密钥：若 salt_for 取错盐，这个会被「成功」解开",
+      "containerLen": 166,
+      "cipherB64": "EjkgIAIDr3gIbmoNxCc3J5sb8o40X/BC1T2JZLzHxPi7F+J+aGYNzdfavc+3tRW4tVS67zKZ18FoaEUnc3iMMKV+755Wnw48wuXT6kpcojHLKS1rvVq6xiVN1vKpcUlBbTq4OdBhnGXpcwd7y/DlzcKzDZXrFvKEeGc0fZiYCfbeTJ802TuxQ5nVfLrrR6809fxoCjr5LdNRcVNqGnU9bPLRLdxoEA==",
+      "jsError": "AES-128-CBC decryption failed: error:1C800064:Provider routines::bad decrypt",
+      "jsSucceeded": false,
+      "expectedRustError": "DecryptFailed",
+      "expectedRustErrorAnyOf": [
+        "DecryptFailed",
+        "HashMismatch"
+      ],
+      "expectedRustMechanism": "★ 方向性判据是「必须失败」而非具体变体：取错盐 ⇒ 密钥错 ⇒ 明文随机。实测 Rust 落 DecryptFailed（随机末字节碰巧非法 padding），只有 ~0.4% 概率会走到 sha512 而报 HashMismatch。若 salt_for 真的取错盐，本条会 Ok 而非 Err。"
+    },
+    {
+      "id": "n2_tampered_random_bytes",
+      "why": "改 randomBytes 第 1 字节（密钥/IV 随之改变）",
+      "containerLen": 166,
+      "cipherB64": "dGMFEAAAbn8xBENYckGSZscKqvaIiYy2cUBeNgQJPjMhFtm9HYYqj7vkLEJ2QlenzvMvtPju/tAtrVkALPwm2wBsnyWGfRwIBpn1aHVK6gw3AdMqAj02J72QLyEToYUT98uTobX71k2PqSvn9DdtcbJx+Hiw2zkQWUlY+Ht6YI4cwVnYg5mpFw4c3eXo01NJbmPzIkyLVwEmh23JkMRBNugAPU2XXw==",
+      "jsError": "AES-128-CBC decryption failed: error:1C800064:Provider routines::bad decrypt",
+      "jsSucceeded": false,
+      "expectedRustError": "DecryptFailed",
+      "expectedRustErrorAnyOf": [
+        "DecryptFailed",
+        "HashMismatch"
+      ],
+      "expectedRustMechanism": "同 n1：密钥错 ⇒ 明文随机 ⇒ 先撞 PKCS7 padding 校验。实测 DecryptFailed。"
+    },
+    {
+      "id": "n3_tampered_ciphertext_last_byte",
+      "why": "改密文体最后一个字节（末块）",
+      "containerLen": 166,
+      "cipherB64": "dGMFEAAAb38xBENYckGSZscKqvaIiYy2cUBeNgQJPjMhFtm9HYYqj7vkLEJ2QlenzvMvtPju/tAtrVkALPwm2wBsnyWGfRwIBpn1aHVK6gw3AdMqAj02J72QLyEToYUT98uTobX71k2PqSvn9DdtcbJx+Hiw2zkQWUlY+Ht6YI4cwVnYg5mpFw4c3eXo01NJbmPzIkyLVwEmh23JkMRBNugAPU2XXg==",
+      "jsError": "AES-128-CBC decryption failed: error:1C800064:Provider routines::bad decrypt",
+      "jsSucceeded": false,
+      "expectedRustError": "DecryptFailed",
+      "expectedRustErrorAnyOf": [
+        "DecryptFailed",
+        "HashMismatch"
+      ],
+      "expectedRustMechanism": "末块被改 ⇒ padding 首当其冲。实测 DecryptFailed。"
+    },
+    {
+      "id": "n4_tampered_ciphertext_first_byte",
+      "why": "改密文体第一个字节（首块）",
+      "containerLen": 166,
+      "cipherB64": "dGMFEAAAb38xBENYckGSZscKqvaIiYy2cUBeNgQJPjMhFtm9HYYrj7vkLEJ2QlenzvMvtPju/tAtrVkALPwm2wBsnyWGfRwIBpn1aHVK6gw3AdMqAj02J72QLyEToYUT98uTobX71k2PqSvn9DdtcbJx+Hiw2zkQWUlY+Ht6YI4cwVnYg5mpFw4c3eXo01NJbmPzIkyLVwEmh23JkMRBNugAPU2XXw==",
+      "jsError": "Hash verification failed - data may be corrupted or wrong key",
+      "jsSucceeded": false,
+      "expectedRustError": "DecryptFailed",
+      "expectedRustErrorAnyOf": [
+        "DecryptFailed",
+        "HashMismatch"
+      ],
+      "expectedRustMechanism": "★ 首块被改：CBC 下末块解密结果**不受影响** ⇒ padding 仍然合法 ⇒ 必定走到 sha512 ⇒ 稳定报 HashMismatch。实测 DecryptFailed 则说明 padding 校验位置与预期不同。"
+    },
+    {
+      "id": "n5_padding_zero",
+      "why": "末字节置 0x00（PKCS7 非法 padding 长度）",
+      "containerLen": 166,
+      "cipherB64": "dGMFEAAAb38xBENYckGSZscKqvaIiYy2cUBeNgQJPjMhFtm9HYYqj7vkLEJ2QlenzvMvtPju/tAtrVkALPwm2wBsnyWGfRwIBpn1aHVK6gw3AdMqAj02J72QLyEToYUT98uTobX71k2PqSvn9DdtcbJx+Hiw2zkQWUlY+Ht6YI4cwVnYg5mpFw4c3eXo01NJbmPzIkyLVwEmh23JkMRBNugAPU2XAA==",
+      "jsError": "AES-128-CBC decryption failed: error:1C800064:Provider routines::bad decrypt",
+      "jsSucceeded": false,
+      "expectedRustError": "DecryptFailed",
+      "expectedRustErrorAnyOf": [
+        "DecryptFailed"
+      ],
+      "expectedRustMechanism": "确定性：0x00 恒为非法 padding。"
+    },
+    {
+      "id": "n6_padding_0x11",
+      "why": "末字节置 0x11（17 > 块长 16，非法）",
+      "containerLen": 166,
+      "cipherB64": "dGMFEAAAb38xBENYckGSZscKqvaIiYy2cUBeNgQJPjMhFtm9HYYqj7vkLEJ2QlenzvMvtPju/tAtrVkALPwm2wBsnyWGfRwIBpn1aHVK6gw3AdMqAj02J72QLyEToYUT98uTobX71k2PqSvn9DdtcbJx+Hiw2zkQWUlY+Ht6YI4cwVnYg5mpFw4c3eXo01NJbmPzIkyLVwEmh23JkMRBNugAPU2XEQ==",
+      "jsError": "AES-128-CBC decryption failed: error:1C800064:Provider routines::bad decrypt",
+      "jsSucceeded": false,
+      "expectedRustError": "DecryptFailed",
+      "expectedRustErrorAnyOf": [
+        "DecryptFailed"
+      ],
+      "expectedRustMechanism": "确定性：0x11 恒为非法 padding。"
+    },
+    {
+      "id": "n7_len_117",
+      "why": "截到 117 字节，比 MIN_CIPHERTEXT_LEN 少 1",
+      "containerLen": 117,
+      "cipherB64": "dGMFEAAAb38xBENYckGSZscKqvaIiYy2cUBeNgQJPjMhFtm9HYYqj7vkLEJ2QlenzvMvtPju/tAtrVkALPwm2wBsnyWGfRwIBpn1aHVK6gw3AdMqAj02J72QLyEToYUT98uTobX71k2PqSvn9DdtcbJx+Hiw",
+      "jsError": "Buffer too short: 117",
+      "jsSucceeded": false,
+      "expectedRustError": "TooShort",
+      "expectedRustErrorAnyOf": [
+        "TooShort"
+      ],
+      "expectedRustMechanism": "确定性：长度闸。"
+    },
+    {
+      "id": "n8_len_not_block_aligned",
+      "why": "容器后追加 1 字节 ⇒ 密文体 16k+1",
+      "containerLen": 167,
+      "cipherB64": "dGMFEAAAb38xBENYckGSZscKqvaIiYy2cUBeNgQJPjMhFtm9HYYqj7vkLEJ2QlenzvMvtPju/tAtrVkALPwm2wBsnyWGfRwIBpn1aHVK6gw3AdMqAj02J72QLyEToYUT98uTobX71k2PqSvn9DdtcbJx+Hiw2zkQWUlY+Ht6YI4cwVnYg5mpFw4c3eXo01NJbmPzIkyLVwEmh23JkMRBNugAPU2XX0E=",
+      "jsError": "AES-128-CBC decryption failed: error:1C80006B:Provider routines::wrong final block length",
+      "jsSucceeded": false,
+      "expectedRustError": "NotBlockAligned",
+      "expectedRustErrorAnyOf": [
+        "NotBlockAligned"
+      ],
+      "expectedRustMechanism": "确定性：对齐闸。"
+    },
+    {
+      "id": "n9_unknown_header",
+      "why": "头部首字节改成 0x41",
+      "containerLen": 166,
+      "cipherB64": "QWMFEAAAb38xBENYckGSZscKqvaIiYy2cUBeNgQJPjMhFtm9HYYqj7vkLEJ2QlenzvMvtPju/tAtrVkALPwm2wBsnyWGfRwIBpn1aHVK6gw3AdMqAj02J72QLyEToYUT98uTobX71k2PqSvn9DdtcbJx+Hiw2zkQWUlY+Ht6YI4cwVnYg5mpFw4c3eXo01NJbmPzIkyLVwEmh23JkMRBNugAPU2XXw==",
+      "jsError": "Unknown encryption type. Header: 416305100000",
+      "jsSucceeded": false,
+      "expectedRustError": "UnknownHeader",
+      "expectedRustErrorAnyOf": [
+        "UnknownHeader"
+      ],
+      "expectedRustMechanism": "确定性：6 字节头不匹配任一已知头。"
+    },
+    {
+      "id": "n10_empty",
+      "why": "空 buffer",
+      "containerLen": 0,
+      "cipherB64": "",
+      "jsError": "Buffer too short: 0",
+      "jsSucceeded": false,
+      "expectedRustError": "TooShort",
+      "expectedRustErrorAnyOf": [
+        "TooShort"
+      ],
+      "expectedRustMechanism": "确定性：长度闸。"
+    },
+    {
+      "id": "n12_non_utf8_body",
+      "why": "密文体解出的明文含 0xff 0xfe（非法 UTF-8）；JS 用 toString(\"utf8\") 会产出替换字符，Rust 应报 NotUtf8",
+      "containerLen": 118,
+      "cipherB64": "dGMFEAAA2oZi/R9zsMO/ma1FiTGGTpmaAu/fBOyxbk1lP/tj29iId0Gsqr2QGsRSN3r8GoJ6hwKXVEVP4Q4JvI8pDhwXdINr5QMH3YnRYBReqr1O3cWQlthml7A66TYcXA2NaJW86k6XcaKP0sgNmqhqwWgcQQ==",
+      "jsError": null,
+      "jsSucceeded": true,
+      "jsValueIsReplacementChars": true,
+      "expectedRustError": "NotUtf8",
+      "expectedRustErrorAnyOf": [
+        "NotUtf8"
+      ],
+      "expectedRustMechanism": "确定性：sha512 校验通过（badBody 的摘要就是自己）但 body 含 0xff 0xfe ⇒ String::from_utf8 失败。"
+    }
+  ]
+}

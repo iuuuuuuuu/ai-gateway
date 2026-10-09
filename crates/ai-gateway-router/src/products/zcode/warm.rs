@@ -573,7 +573,13 @@ mod tests {
         // ★ 刻意与参考实现分叉：我们报 zh-CN / Asia/Shanghai（与 billing 头
         // 声明的是同一对），而不是它硬编码的 en-US / America/New_York。
         // 同一个账号出现两个区域对，正是参考实现自己警告过的事。
-        let c = crate::products::zcode::client::Client::new();
+        let mut c = crate::products::zcode::client::Client::new();
+        // ★★ 2026-10-09：`Identity::new()` 从 `LANG` / `TZ` 环境变量推导这对值，
+        // 而 CI 的 `ubuntu-22.04` 上是 `LANG=C.UTF-8` ⇒ `client_language` 变成
+        // `"C"`，这条断言在 Linux 上必红。这里要测的是**我们选了哪一对**
+        // （与参考实现的 en-US/America/New_York 分叉），不是环境探测，故钉死。
+        c.identity.client_language = "zh-CN".into();
+        c.identity.client_timezone = "Asia/Shanghai".into();
         let ev = c.build_activation_event("app_launch", "u", "m");
         assert_eq!(ev.client_language, "zh-CN");
         assert_eq!(ev.client_timezone, "Asia/Shanghai");

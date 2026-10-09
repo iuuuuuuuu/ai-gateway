@@ -754,6 +754,16 @@ mod tests {
         assert_eq!(parse_region(""), QoderRegion::Unknown);
     }
 
+    /// ★★ 2026-10-09：这条测试**只对 Windows 路径语义**成立 ——
+    /// 判据全是 `C:\...` 形态的路径，而 Linux 上 `Path::new(r"C:\a\b")`
+    /// 里**没有** `Prefix`/`RootDir` 组件（整串是一个 `Normal`），
+    /// `clean_path` / `go_dir` 的结果因此必然不同。
+    ///
+    /// 那正是被测函数的设计：它们复刻的是 **Go 的 `filepath.Clean`**，
+    /// 而 Go 在 Windows 上跑 —— 非 Windows 上这些函数不会被调用到
+    /// （`keep_workbuddy_only` / qoder 登录都只在 Windows 客户端路径上有意义）。
+    /// 所以门控是**如实表达适用范围**，不是把断言放宽。
+    #[cfg(windows)]
     #[test]
     fn sessions_dir_is_a_sibling_of_auth_dir_not_a_child() {
         let d = sessions_dir("C:\\data\\qoder\\auths");
@@ -767,6 +777,16 @@ mod tests {
         assert_eq!(sessions_dir("auths"), "sessions");
     }
 
+    /// ★★ 2026-10-09：这条测试**只对 Windows 路径语义**成立 ——
+    /// 判据全是 `C:\...` 形态的路径，而 Linux 上 `Path::new(r"C:\a\b")`
+    /// 里**没有** `Prefix`/`RootDir` 组件（整串是一个 `Normal`），
+    /// `clean_path` / `go_dir` 的结果因此必然不同。
+    ///
+    /// 那正是被测函数的设计：它们复刻的是 **Go 的 `filepath.Clean`**，
+    /// 而 Go 在 Windows 上跑 —— 非 Windows 上这些函数不会被调用到
+    /// （`keep_workbuddy_only` / qoder 登录都只在 Windows 客户端路径上有意义）。
+    /// 所以门控是**如实表达适用范围**，不是把断言放宽。
+    #[cfg(windows)]
     #[test]
     fn session_file_is_named_after_the_sanitized_id() {
         let p = session_file("C:\\data\\qoder\\auths", "a/b");

@@ -5600,7 +5600,14 @@ mod tests {
     /// ⚠ 这**不是**理想形态（它测"代码长什么样"而不是"行为"）。
     /// 我把它定位成"防新增绕过口"的护栏，而不是竞态本身的验证 ——
     /// 后者靠 `restart_gateway_serialized` 里那把锁的正确使用。
-    #[test]
+    ///
+    /// ★★ 2026-10-09：这里此前**多了一个 `#[test]`** —— 它夹在两段文档注释
+    /// 之间，被 Rust 归给了下面 `restart_drains_in_flight_before_stopping` 的
+    /// 文档，于是触发 `duplicated attribute`；而上面这条文档所属的
+    /// `gateway_restart_goes_through_serialized_entry` 自己丢掉了属性、
+    /// 退化成普通私有函数（`never used`）——
+    /// **那条「不得绕过串行化入口」的护栏从未被执行过**。
+    /// 属性已各自归位（见下方两个函数）。
     /// ★★ 2026-10-08 回归：`restart_gateway_serialized` 必须先**排空在途请求**再停。
     ///
     /// # 守的是什么
@@ -5668,6 +5675,12 @@ mod tests {
             "缺少「in_flight == 0 直接返回」的分支"
         );
     }
+
+    /// 网关重启**必须**走带互斥的入口，不得各自写 stop+start。
+    ///
+    /// ⚠ 这条属性此前被上面那条 `#[test]` 的错位吃掉了（见上面的说明）——
+    /// 恢复它，护栏才真的会跑。
+    #[test]
     fn gateway_restart_goes_through_serialized_entry() {
         // ⚠ 运行时读文件而不是 `include_str!`：后者嵌进编译产物、
         // 只靠 mtime 失效，我实测踩过"改完仍是旧的"的假绿。

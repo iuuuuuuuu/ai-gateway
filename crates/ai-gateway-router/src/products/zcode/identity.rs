@@ -724,6 +724,14 @@ mod tests {
         id.app_version = "3.14.0".into();
         id.platform = "windows".into();
         id.arch = "amd64".into();
+        // ★★ 2026-10-09：`Identity::new()` 从**环境变量**推导 `client_language`
+        // （`LANG`）与 `client_timezone`（`TZ`）。CI 的 `ubuntu-22.04` 上是
+        // `LANG=C.UTF-8` ⇒ 归一成 `"C"`，于是下面那两条断言在 Linux 上必红。
+        //
+        // 这里要测的是**头组装**，不是环境探测；把这两个字段钉成确定值，
+        // 环境探测本身另有专门的测试（见 `defaults_to_zh_cn_when_lang_absent`）。
+        id.client_language = "zh-CN".into();
+        id.client_timezone = "Asia/Shanghai".into();
         let h = id.headers();
         assert_eq!(
             h.get("User-Agent").map(String::as_str),

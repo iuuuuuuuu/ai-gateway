@@ -2176,13 +2176,41 @@ mod tests {
         // `iCubeSystemInformationService` —— 空串只在系统信息取不到时才出现。
         // 我们此前把 DeviceModel / DeviceBrand / DeviceCPU 全写死空串，
         // 这里钉住「不能回归成空串」。
+        //
+        // ★★ 2026-10-09：这段断言此前**没有平台门控**，于是 ci.yml 与
+        // release.yml 的 `ubuntu-22.04` 腿**从 1.0.23 起一直是红的**
+        // （`cargo test -p ai-gateway-core` ⇒ `1284 passed; 1 failed`）。
+        //
+        // 根因：三个取值函数都是 `#[cfg(windows)]` 的 —— 非 Windows 上它们
+        // **必然**返回 `String::new()`（那正是 `#[cfg(windows)]` 块后面的兜底）。
+        // 也就是说「空串」在 Linux/macOS 上不是回归，而是**设计如此**：
+        // 那三个平台根本读不到 `HARDWARE\\DESCRIPTION\\System\\BIOS` 注册表。
+        //
+        // 为什么必须按平台分流而不是放宽断言：
+        //  · 放宽（如「允许空」）⇒ Windows 上真正的回归就再也测不出来了，
+        //    而这条测试存在的唯一理由就是防那个回归；
+        //  · 门控 ⇒ Windows 上仍然逐字钉死，非 Windows 上跳过这段（并断言
+        //    它们**确实是**空串 —— 把「兜底真的生效」也钉住）。
+        //
+        // ⚠ 别把整个测试标 `#[cfg(windows)]`：这条测试还钉着 DeviceInfo 的
+        // 字段集、PlatformCode、OSInfo、公钥 PEM 等**跨平台**契约，
+        // 那些在任何平台上都该验。只有下面这三个字段是平台相关的。
         for key in ["DeviceModel", "DeviceBrand", "DeviceCPU"] {
             let v = dev[key].as_str().expect("设备字段必须是字符串");
-            assert!(
-                !v.trim().is_empty(),
-                "{key} 不能是空串（真实客户端上报真实机型/厂商/CPU），实际: {v:?}"
-            );
             assert_eq!(v, v.trim(), "{key} 不能带首尾空格，实际: {v:?}");
+            if cfg!(windows) {
+                assert!(
+                    !v.trim().is_empty(),
+                    "{key} 不能是空串（真实客户端上报真实机型/厂商/CPU），实际: {v:?}"
+                );
+            } else {
+                // 非 Windows：三个函数走 `#[cfg(windows)]` 之后的兜底 ⇒ 必为空。
+                // 断言这一点，等于钉住「兜底路径真的存在且生效」。
+                assert!(
+                    v.is_empty(),
+                    "非 Windows 上 {key} 应走兜底返回空串（读不到 Windows 注册表），实际: {v:?}"
+                );
+            }
         }
         // 真实客户端 `this.c = Id==="win32" ? "windows" : Id` —— 小写
         assert_eq!(

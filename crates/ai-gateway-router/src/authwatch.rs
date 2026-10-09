@@ -380,6 +380,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// ★★ 2026-10-09：这条测试**只对 Windows 路径语义**成立 ——
+    /// 判据全是 `C:\...` 形态的路径，而 Linux 上 `Path::new(r"C:\a\b")`
+    /// 里**没有** `Prefix`/`RootDir` 组件（整串是一个 `Normal`），
+    /// `clean_path` / `go_dir` 的结果因此必然不同。
+    ///
+    /// 那正是被测函数的设计：它们复刻的是 **Go 的 `filepath.Clean`**，
+    /// 而 Go 在 Windows 上跑 —— 非 Windows 上这些函数不会被调用到
+    /// （`keep_workbuddy_only` / qoder 登录都只在 Windows 客户端路径上有意义）。
+    /// 所以门控是**如实表达适用范围**，不是把断言放宽。
+    #[cfg(windows)]
     #[test]
     fn keep_workbuddy_only_protects_other_products_and_foreign_files() {
         let keep = keep_workbuddy_only(r"C:\auths");
@@ -406,6 +416,16 @@ mod tests {
         }));
     }
 
+    /// ★★ 2026-10-09：这条测试**只对 Windows 路径语义**成立 ——
+    /// 判据全是 `C:\...` 形态的路径，而 Linux 上 `Path::new(r"C:\a\b")`
+    /// 里**没有** `Prefix`/`RootDir` 组件（整串是一个 `Normal`），
+    /// `clean_path` / `go_dir` 的结果因此必然不同。
+    ///
+    /// 那正是被测函数的设计：它们复刻的是 **Go 的 `filepath.Clean`**，
+    /// 而 Go 在 Windows 上跑 —— 非 Windows 上这些函数不会被调用到
+    /// （`keep_workbuddy_only` / qoder 登录都只在 Windows 客户端路径上有意义）。
+    /// 所以门控是**如实表达适用范围**，不是把断言放宽。
+    #[cfg(windows)]
     #[test]
     fn clean_path_normalizes_like_go_filepath_clean() {
         assert_eq!(clean_path(""), ".");

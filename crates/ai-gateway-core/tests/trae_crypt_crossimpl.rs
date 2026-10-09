@@ -35,14 +35,32 @@ use base64::Engine as _;
 use serde_json::Value;
 use std::path::PathBuf;
 
+// ---------------------------------------------------------------- 夹具位置
+//
+// ★★ 2026-10-09：这些夹具此前指向 `../../../test-bin/verify-trae/` —— 而
+// `test-bin/` 在 `.gitignore` 里（`/test-bin/`），**从不进仓库**。后果是：
+//
+//   · 开发机上它们一直在（生成器跑过），本文件 9 条测试**全绿**；
+//   · CI 上 checkout 出来根本没有 `test-bin/` ⇒ 7 条测试红（另 2 条不读夹具）；
+//   · 于是 `ci.yml` 的 windows-latest 腿与 `release.yml` 的 preflight 腿
+//     **从 1.0.23 起一直失败**，而发版照样手工进行 ⇒ 没人发现。
+//
+// 修法：把**输入夹具**（由生成器产出、已逐字节核对过不含任何真实账号/凭证）
+// 随源码分发，放在 `tests/fixtures/trae-crypt/`。生成器与参考实现仍在
+// `test-bin/`（它们依赖本机抓包产物，不适合进仓库），
+// 但**测试不再依赖它们**。
+//
+// ⚠ `rust_adversarial_table.json` 是**本测试的输出**（`adversarial_probe_…`
+// 每次跑都重写），不是输入 ⇒ 它继续落在 `test-bin/`（那里被 gitignore，
+// 正合适：不该让测试往仓库里写文件）。
 /// 向量文件（相对 `CARGO_MANIFEST_DIR` = `wt-port/crates/ai-gateway-core`）。
-const VECTORS_REL: &str = "../../../test-bin/verify-trae/vectors.json";
+const VECTORS_REL: &str = "tests/fixtures/trae-crypt/vectors.json";
 /// `storage.json` 夹具（同样由参考实现真调用产出）。
-const FIXTURE_REL: &str = "../../../test-bin/verify-trae/storage_fixture.json";
-/// 对抗探测表落盘位置（属本任务 writeScope）。
+const FIXTURE_REL: &str = "tests/fixtures/trae-crypt/storage_fixture.json";
+/// 对抗探测表落盘位置 —— **输出**，仍留在被 gitignore 的 `test-bin/` 下。
 const TABLE_REL: &str = "../../../test-bin/verify-trae/rust_adversarial_table.json";
 /// base64 入口宽容度对照表（Node 宽松 vs Rust 严格，见第 8 组测试）。
-const BASE64_REL: &str = "../../../test-bin/verify-trae/base64_variants.json";
+const BASE64_REL: &str = "tests/fixtures/trae-crypt/base64_variants.json";
 
 // ---------------------------------------------------------------- helpers
 

@@ -2517,12 +2517,27 @@ mod tests {
 
     // ---- 排程时点 ----
 
+    /// 构造一个 **CST（+08:00）** 时刻，再换算成 `Local`。
+    ///
+    /// ★★ 2026-10-09：此前这里是 `Local.with_ymd_and_hms(...)` —— 即按**运行机**
+    /// 的时区解释这组数字。而调用方（`travel_day` / `local_at_hour` / `next_fire`
+    /// 等）**一律按 CST 判日**，于是 CI 的 `ubuntu-22.04`（TZ=UTC）上
+    /// `23:30` 被当成 UTC 23:30 = CST 次日 07:30 ⇒ 断言全错（本地是 CST，
+    /// 所以这条回归一直没在开发机上暴露）。
+    ///
+    /// 修法：先按 CST 构造，再 `with_timezone(&Local)` —— 得到的是**同一个瞬时**，
+    /// 无论运行机在哪个时区，被测函数的 CST 判定结果都不变。
+    ///
+    /// ⚠ 不要改成给测试设 `TZ=Asia/Shanghai`：`Local` 在多数平台上只在进程
+    /// 启动时读一次 TZ，测试内改环境变量不可靠（且并行测试会互相干扰）。
     fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
         use chrono::TimeZone;
-        Local
+        chrono::FixedOffset::east_opt(8 * 3600)
+            .expect("+8h")
             .with_ymd_and_hms(y, mo, d, h, mi, 0)
             .single()
-            .expect("valid local time")
+            .expect("valid CST time")
+            .with_timezone(&Local)
     }
 
     /// `next_fire` 取「今天或明天里最早的那个时点」。

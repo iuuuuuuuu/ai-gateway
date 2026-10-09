@@ -572,7 +572,14 @@ mod tests {
         // ★ 实测：不带 `?app_version=&platform=` 时上游回 **3001 parameter error**。
         // 这条断言钉住 query 的两个键都在，且 `platform` 是 Node 命名的形态。
         let _g = lock_cache();
-        let (c, seen) = client_against_stub(200, START_PLAN_BODY);
+        let (mut c, seen) = client_against_stub(200, START_PLAN_BODY);
+        // ★★ 2026-10-09：`platform` 由 `std::env::consts::OS` + `ARCH` 推导
+        // （`Identity::new()` 里），CI 的 ubuntu runner 上是 `linux-x64` ——
+        // 而下面钉的是 Node 命名的 `win32-x64`，在 Linux 上必红。
+        // 这条测试要验的是 **query 里带没带 platform**，不是「本机是什么平台」，
+        // 故把平台钉成确定值。
+        c.identity.platform = "windows".into();
+        c.identity.arch = "x64".into();
         let sp = c.fetch_start_plan_preview().await.expect("应能取到");
         assert_eq!(sp.name, "免费 GLM 旗舰模型体验");
 

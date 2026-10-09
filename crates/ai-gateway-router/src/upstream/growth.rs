@@ -1051,7 +1051,7 @@ fn rarity_text(v: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::upstream::classify::UpstreamError;
-    use chrono::TimeZone;
+    // `chrono::TimeZone` 由 `at()` 内部按需 `use`（本模块只有它用到）。
 
     fn upstream_err(status: u16, msg: &str) -> GatewayError {
         GatewayError::UpstreamError(UpstreamError {
@@ -1077,11 +1077,19 @@ mod tests {
         }
     }
 
+    /// 构造一个 **CST（+08:00）** 时刻，再换算成 `Local`。
+    ///
+    /// ★★ 2026-10-09：同 `scheduler/mod.rs` 的同名 helper —— 此前按**运行机**
+    /// 时区解释，而 `growth_yesterday` / `growth_makeup_out_of_month` 一律按 CST
+    /// 判日 ⇒ CI 的 UTC runner 上断言全错（本地是 CST，所以一直没暴露）。
     fn at(y: i32, m: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
-        chrono::Local
+        use chrono::TimeZone;
+        chrono::FixedOffset::east_opt(8 * 3600)
+            .expect("+8h")
             .with_ymd_and_hms(y, m, d, h, mi, 0)
             .single()
-            .expect("本地时刻唯一")
+            .expect("CST 时刻唯一")
+            .with_timezone(&Local)
     }
 
     // ── 热力图判据 ──

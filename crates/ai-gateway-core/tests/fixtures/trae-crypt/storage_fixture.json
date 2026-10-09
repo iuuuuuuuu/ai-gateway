@@ -1,0 +1,271 @@
+{
+  "_generatedBy": "test-bin/verify-trae/gen_storage_fixture.js",
+  "_referenceImplementation": "test-bin/recon/trae-wangqi233/src/trae-decrypt.js",
+  "_referenceCall": "ref.decryptAllEncryptedValues(<fixture-appdata>) 与 ref.decryptAuthData(<fixture-appdata>) —— 真落盘 + 真调用，非内存复述",
+  "_nodeVersion": "v26.0.0",
+  "_fixturePath": "test-bin/verify-trae/fixture-appdata/User/globalStorage/storage.json",
+  "_syntheticOnly": true,
+  "_syntheticIds": {
+    "gtmUid": "1883919207380040",
+    "dcUid": "199439841787403"
+  },
+  "_syntheticGuard": "gen_storage_fixture.js 内置守卫：夹具里出现未声明的 15+ 位数字串即抛错中止（不落盘）",
+  "_jsStorageResults": {
+    "iCubeAuthInfo://icube.cloudide": {
+      "uid": "u-synthetic-1001",
+      "plan": "pro",
+      "exp": 1735689600
+    },
+    "iCubeAuthInfo://usertag": "synthetic-usertag",
+    "nonjson.encrypted": {
+      "_decryptError": "Unexpected token 'o', \"not json at all ~~~\" is not valid JSON"
+    },
+    "corrupt.encrypted": {
+      "_decryptError": "AES-128-CBC decryption failed: error:1C800064:Provider routines::bad decrypt"
+    }
+  },
+  "_jsAuthData": {
+    "uid": "u-synthetic-1001",
+    "plan": "pro",
+    "exp": 1735689600
+  },
+  "_jsAuthError": null,
+  "_jsSingleValue": {
+    "iCubeServerData://icube.cloudide": {
+      "ok": false,
+      "error": "Buffer too short: 9"
+    },
+    "plaintext.quoted": {
+      "ok": false,
+      "error": "Buffer too short: 9"
+    },
+    "iCubeAuthInfo://icube.cloudide": {
+      "ok": true,
+      "value": "{\"uid\":\"u-synthetic-1001\",\"plan\":\"pro\",\"exp\":1735689600}"
+    },
+    "iCubeAuthInfo://icube-dc:199439841787403": {
+      "ok": true,
+      "value": "{\"uid\":\"u-synthetic-2002\",\"plan\":\"solo\"}"
+    },
+    "iCubeAuthInfo://usertag": {
+      "ok": true,
+      "value": "\"synthetic-usertag\""
+    },
+    "nonjson.encrypted": {
+      "ok": true,
+      "value": "not json at all ~~~"
+    },
+    "corrupt.encrypted": {
+      "ok": false,
+      "error": "AES-128-CBC decryption failed: error:1C800064:Provider routines::bad decrypt"
+    },
+    "telemetry.sqmId": {
+      "ok": false,
+      "error": "Buffer too short: 3"
+    },
+    "__import__vscode__extensions": {
+      "ok": false,
+      "error": "Buffer too short: 21"
+    },
+    "telemetry.devDeviceId": {
+      "ok": false,
+      "error": "Buffer too short: 18"
+    }
+  },
+  "_missedByBulkButDecryptable": [
+    "iCubeAuthInfo://icube-dc:199439841787403"
+  ],
+  "_expectStats": {
+    "scanned": 10,
+    "encrypted": 5,
+    "decrypted": 4,
+    "failed": 1
+  },
+  "_perKeyDecision": [
+    {
+      "key": "iCubeServerData://icube.cloudide",
+      "decision": "plaintext_fastpath"
+    },
+    {
+      "key": "plaintext.quoted",
+      "decision": "plaintext_fastpath"
+    },
+    {
+      "key": "iCubeAuthInfo://icube.cloudide",
+      "decision": "decrypted"
+    },
+    {
+      "key": "iCubeAuthInfo://icube-dc:199439841787403",
+      "decision": "decrypted"
+    },
+    {
+      "key": "iCubeAuthInfo://usertag",
+      "decision": "decrypted"
+    },
+    {
+      "key": "nonjson.encrypted",
+      "decision": "decrypted"
+    },
+    {
+      "key": "corrupt.encrypted",
+      "decision": "failed"
+    },
+    {
+      "key": "telemetry.sqmId",
+      "decision": "too_short"
+    },
+    {
+      "key": "__import__vscode__extensions",
+      "decision": "not_encrypted_header"
+    },
+    {
+      "key": "telemetry.devDeviceId",
+      "decision": "not_encrypted_header"
+    },
+    {
+      "key": "icube_gtm",
+      "decision": "non_string"
+    },
+    {
+      "key": "windowControlHeight",
+      "decision": "non_string"
+    },
+    {
+      "key": "windowSplash",
+      "decision": "non_string"
+    }
+  ],
+  "_expect": [
+    {
+      "key": "iCubeServerData://icube.cloudide",
+      "kind": "plaintext_kept",
+      "expectedValue": "{\"tier\":\"pro\",\"seats\":3}",
+      "encType": null,
+      "note": "明文 JSON（以 { 开头）：两侧都不解密，原样保留"
+    },
+    {
+      "key": "plaintext.quoted",
+      "kind": "plaintext_kept",
+      "expectedValue": "\"just-a-string\"",
+      "encType": null,
+      "note": "以双引号开头的明文：两侧都不解密"
+    },
+    {
+      "key": "iCubeAuthInfo://icube.cloudide",
+      "kind": "decrypted_json",
+      "expectedValue": {
+        "uid": "u-synthetic-1001",
+        "plan": "pro",
+        "exp": 1735689600
+      },
+      "encType": "AES",
+      "note": "AES 头 + 合法 JSON 对象：JS results[k]=JSON.parse，Rust 也换成结构化值（用于 decryptAuthData 真调用）"
+    },
+    {
+      "key": "iCubeAuthInfo://icube-dc:199439841787403",
+      "kind": "decrypted_json",
+      "expectedValue": {
+        "uid": "u-synthetic-2002",
+        "plan": "solo"
+      },
+      "encType": "AES_PRIVATE",
+      "note": "★★ AES_PRIVATE 头 + 合法 JSON：Rust 必须解出；参考实现的 decryptAllEncryptedValues 因 isTcEncrypted 只认 tc 头会**静默跳过**它（实测分歧）"
+    },
+    {
+      "key": "iCubeAuthInfo://usertag",
+      "kind": "decrypted_json",
+      "expectedValue": "synthetic-usertag",
+      "encType": "AES",
+      "note": "AES 头 + JSON 字符串标量"
+    },
+    {
+      "key": "nonjson.encrypted",
+      "kind": "rust_keeps_plain_string",
+      "expectedValue": "not json at all ~~~",
+      "encType": "AES",
+      "note": "★ 刻意分歧：JS 塞 {_decryptError} 占位对象，Rust 保留解出的明文串"
+    },
+    {
+      "key": "corrupt.encrypted",
+      "kind": "rust_keeps_original",
+      "expectedValue": "dGMFEAAAwSGf967kuW99TaOwj+HJfN4IITeOoS6weKvw5KP+A7/opnmgK5psoAvEya3AUGwk+fRtjiC24v1miI6sVE3D4IAThdZfPkfmRGSEOWWJGfE+sWUWrDGlTw1iflM/GYPWr8cDzr5+UJh+SL25ZsDHgw==",
+      "encType": "AES",
+      "note": "★ 刻意分歧：合法 tc 头但密文被篡改 ⇒ JS 塞占位对象，Rust 保留原值 + stats.failed++"
+    },
+    {
+      "key": "telemetry.sqmId",
+      "kind": "skipped_kept",
+      "expectedValue": "short",
+      "encType": null,
+      "note": "长度 5 < 10：两侧都跳过"
+    },
+    {
+      "key": "__import__vscode__extensions",
+      "kind": "skipped_kept",
+      "expectedValue": "this-is-not-base64-container",
+      "encType": null,
+      "note": "长度 >= 10 但非 base64 容器：两侧都跳过"
+    },
+    {
+      "key": "telemetry.devDeviceId",
+      "kind": "skipped_kept",
+      "expectedValue": "a1b2c3d4e5f6a7b8c9d0e1f2",
+      "encType": null,
+      "note": "hex 串（24 字符），头两字节不是 tc：两侧都跳过"
+    },
+    {
+      "key": "icube_gtm",
+      "kind": "non_string_kept",
+      "expectedValue": {
+        "users": {
+          "1883919207380040": {
+            "gtm101_idea": {
+              "showCount": 1,
+              "closed": true
+            }
+          }
+        }
+      },
+      "encType": null,
+      "note": "★ 嵌套对象（形态照抄本机真实结构，内层 uid 已换合成值）：两侧都跳过并原样保留"
+    },
+    {
+      "key": "windowControlHeight",
+      "kind": "non_string_kept",
+      "expectedValue": 30,
+      "encType": null,
+      "note": "数字：原样保留"
+    },
+    {
+      "key": "windowSplash",
+      "kind": "non_string_kept",
+      "expectedValue": true,
+      "encType": null,
+      "note": "布尔：原样保留"
+    }
+  ],
+  "fixture": {
+    "iCubeServerData://icube.cloudide": "{\"tier\":\"pro\",\"seats\":3}",
+    "plaintext.quoted": "\"just-a-string\"",
+    "iCubeAuthInfo://icube.cloudide": "dGMFEAAAJaZErXEznA7C8U4eo/S5f3eWpDxI7khcsTI5oEtri6ys1QVpVWXvq1InZXC9hNRQNREGOw1fSPcTeyF5kXoyUquJsxkZF11zfBgwdz7lwJuLkoFd0WfPgLSArpGQ6TS4TgOR3S61LD0Qcq2vwIwdCdo2pNB23Pjf/x9lJ08+LZVFT8g3HOcj/sC/onhhnio+U1eq4BOmLf5eRIUqP/vOsA==",
+    "iCubeAuthInfo://icube-dc:199439841787403": "EjkgIAIDYOxEbRAaekmwyOS8TyXwVl2XkaxmD+sHaQf1tegfM6YhuxVfTdZA92XBSMcwg/iUdM6+8KwmMioEfb7kvpe2BRjvAxdcDgw15g6Q0CPxwcX+nGDMlqEiT9GB0atiEKM+a01IPpbbnBOOwSHM/ew/3teDALPQ4h/mJpyMz12MvnfnVFgRZHfKcKECT5UYj1gK",
+    "iCubeAuthInfo://usertag": "dGMFEAAAPT23IvqbT9yK2XTEXnttpaLHe1LcjP3JUwQMco0CTS5AIoYUy0OQIec78+7ze1/Z58ccH3vvo4+n44WXIhxxt5cvgfBk7MPDfU3fz8iRV4KsvhkopxU+Ewk0XX0kBGioiGdzlnzgCBXZYIIwbIOGDwkoj/Yu7s3rGjUGYhmhgZQ=",
+    "nonjson.encrypted": "dGMFEAAAEXyKlCVRsTw21+1DMJ9rXm0zXmiPmU2OKgfGGD2BbPZDcxaoYO4wKN4A5Zupy/tsHDE+xNnUk045/xes6Xr9t2L4mJTOWwJNjgtPLqFsxEGVR6Jg2bbjU6LQL3h6OX9CqAWXJLkjrUe0ooIENw0jjjhbFoAMqiwB65Q7rgoeqns=",
+    "corrupt.encrypted": "dGMFEAAAwSGf967kuW99TaOwj+HJfN4IITeOoS6weKvw5KP+A7/opnmgK5psoAvEya3AUGwk+fRtjiC24v1miI6sVE3D4IAThdZfPkfmRGSEOWWJGfE+sWUWrDGlTw1iflM/GYPWr8cDzr5+UJh+SL25ZsDHgw==",
+    "telemetry.sqmId": "short",
+    "__import__vscode__extensions": "this-is-not-base64-container",
+    "telemetry.devDeviceId": "a1b2c3d4e5f6a7b8c9d0e1f2",
+    "icube_gtm": {
+      "users": {
+        "1883919207380040": {
+          "gtm101_idea": {
+            "showCount": 1,
+            "closed": true
+          }
+        }
+      }
+    },
+    "windowControlHeight": 30,
+    "windowSplash": true
+  }
+}
