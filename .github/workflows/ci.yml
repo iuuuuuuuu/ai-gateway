@@ -101,6 +101,24 @@ jobs:
       # 旧版这里还带 `cache-dependency-path: go-gateway/go.sum`，那是为了
       # 让 setup-go 的缓存生效（它默认找**仓库根**的 go.sum，而本仓库的
       # go.mod/go.sum 在 go-gateway/ 下）。整条 setup-go 一起去掉。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # ★★ 2026-10-09：`ai-gateway-server` 用 `RustEmbed` 嵌 `../../dist/`，
+      # 而 `dist/` 在 `.gitignore` 里 ⇒ 刚 checkout 出来**根本不存在**，
+      # `#[derive(RustEmbed)]` 会直接报
+      #   「folder '…/../../dist/' does not exist」
+      # 并让 `Assets::get` 一并解析失败（两条 E0599）。
+      #
+      # 下面那条「宿主 WebUI 服务端单测」正需要它 ⇒ 必须先构建前端。
+      # 这与 `release-bin` job 里那两条注释是同一件事，此处此前漏了。
+      - name: 构建前端
+        run: npm run build
+
       - name: 网关单测
         run: cargo test -p ai-gateway-router --lib
 
