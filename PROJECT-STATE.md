@@ -124,9 +124,62 @@
 | 保活幂等（37s 前刚刷过） | 日志里**一条 keepalive 都没有** |
 | 端口不被补跑阻塞 | `listening` 与「开始补跑」同毫秒 |
 
-**测试基线**：workspace **3075 passed / 0 failed / 7 ignored**（15 suite）。
+**测试基线**：workspace **3081 passed / 0 failed / 7 ignored**（15 suite）。
 
 **未做**：未推送、未打 tag、未建 Release（业主未表态）。
+
+### 9.14 上游把「超上下文预算」报成 11133（2026-10-09，业主第四报）
+
+**业主原话**：「你看看为什么cctv_to_client 这个会话 接手上下文,为什么报这个错误无法接着往下对话了,无论怎么搞都是提示这个错误」
+
+**根因**（真上游逐点二分，全部实测）：
+
+```text
+输入 1,042,398 + max_tokens=16      → 200
+输入 1,042,398 + max_tokens=8192    → 400 code=11133
+输入 1,042,398 + max_tokens=128000  → 400 code=11133
+输入   982,318 + max_tokens=128000  → 400 code=11133
+```
+
+同一 6.03 MB 的 body：**CJK 触发、ASCII 不触发** ⇒ 限的是 token 不是字节。
+⇒ 上游预算 = `输入 + max_tokens ≤ 1,048,576`，且**把超限报成 `model_param_invalid`**。
+
+DSH 按「输入 ≤ 1,048,576」估算 ⇒ `1,042,398 + 128,000` 它认为还有余量 ⇒ **不触发压缩**
+⇒ 每轮重发同一个超限请求 ⇒「怎么搞都是这个错」。
+
+会话读数：`session-5b6d3617`（【接手上文·从超大会话…】）压缩后载荷 **7.1 MB**，其中 608 条
+assistant 消息占 6.0 MB；DSH 自报压力 666,696 词元（67%）。同目录 `session-a8854fb7`
+（# Handoff from session…）只有 1.6 MB ⇒ 正常。
+
+**修法**（判据刻意窄）：① `classify.rs` 新增 `is_param_invalid_from_context_overflow`（11133 **且**
+文案点名上下文边界）；② `forward.rs` 新增 `budget_exceeded_guess` / `estimate_tokens` / `max_tokens_of`，
+发请求前判「估算输入 + `max_tokens` > `1<<20`」，命中则把 11133 归 `ContextTooLong`；③ `server.rs` 传
+`overflow_guess`。`estimate_tokens` 按字符类型分档（CJK ≈ 2 字符/token、其它 ≈ 4）且**向上取整**
+（宁可高估：高估只是多压缩一次，低估就是本 bug）。门槛：输入须超上限 **60%** 才参与判定。
+未知模型 / 算不出 ⇒ `None` ⇒ **逐字退回**原来的 11133 行为。
+
+**真机实测**（发行包内嵌网关，真上游）：
+
+```text
+发行包: in~1.040M mt=128000 → 400 code=context_length_exceeded  ← 客户端会压缩
+发行包: in~1.040M mt=16     → 200（对照：不误判）
+日志：[forward] 上游 11133 且预算超限估算为真 ⇒ 归上下文超长（让客户端压缩）
+```
+
+验签链路：新 body 的 `detail = "api_error context_length_exceeded Invalid request parameters…"`，
+DSH 的 `STRUCTURED_CONTEXT_OVERFLOW` 正则**命中** ⇒ 归类 `CONTEXT_WINDOW_EXCEEDED`
+（旧 body 的 `model_param_invalid` 不命中）。
+
+### 9.15 随 App 启动与模型清单刷新（同一轮）
+
+**① 重启电脑后网关没跟随启动**：日志读数 —— 宿主 11:19:55 起、网关 11:19:58 起
+（`maybe_autostart` **成功过**），但用户 11:22 看时已不在，且**没有任何停止日志**。
+自启是 setup 里一次性 spawn ⇒ 任何「起来了又悄悄没了」都静默退化成「没自启」。
+修法：每个出口都打日志 + 启动后调 `ensure_gateway_alive` 再确认（1.5s 后查，不在就补拉）。
+
+**② 点「启动网关」后模型路由清单没更新**：`run()` 只 `refresh()`（网关状态），不重拉模型清单；
+而模型清单只在「挂载 / 信息不完整 / 手点刷新」三条路径加载。修法：操作后
+`Promise.all([refresh(), loadModels(true)])`（`force=true` 因为刚起来的网关可能带上一进程的失败负缓存）。
 
 ### 9.13 Qoder 积分余额恒为 0（2026-10-09，业主第三报）
 

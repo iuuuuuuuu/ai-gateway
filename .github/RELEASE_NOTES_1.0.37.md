@@ -128,7 +128,89 @@ version=1.0.36
 
 ---
 
-## 五、与 1.0.36 的关系
+
+---
+
+## 六、上游把「超上下文预算」报成 11133 —— 归成 `context_length_exceeded`
+
+### 现象
+
+业主现场：`cctv_to_client` 的会话「接手上下文」之后，**无论怎么搞**都报
+
+```text
+400 {"code":"model_param_invalid","message":"上游拒绝本次请求的参数（code=11133）：
+     the request parameters were rejected by the model provider。这不是账号问题，
+     换账号无效；请检查请求参数（如模型名、思考档位、工具定义）后重试。"}
+```
+
+### 根因（真上游逐点二分实测）
+
+```text
+输入 1,042,398 + max_tokens=16      → 200
+输入 1,042,398 + max_tokens=8192    → 400 code=11133
+输入 1,042,398 + max_tokens=128000  → 400 code=11133
+输入   982,318 + max_tokens=128000  → 400 code=11133
+```
+
+同一个 6.03 MB 的 body：**CJK 触发、ASCII 不触发** ⇒ 限的是 token 不是字节。
+
+⇒ 上游预算是 **`输入 + max_tokens ≤ 1,048,576`**，而且**把超限报成 `model_param_invalid`**。
+
+DSH 按「输入 ≤ 1,048,576」估算 ⇒ `1,042,398 + 128,000` 它认为还有余量 ⇒ **不触发压缩**
+⇒ 每轮重发同一个超限请求 ⇒ 「怎么搞都是这个错」。
+
+会话读数：`session-5b6d3617` 压缩后载荷 **7.1 MB**（608 条 assistant 消息占 6.0 MB），
+DSH 自己报的压力是 666,696 词元（67%），而实际请求已经越界。
+
+### 修法（判据刻意窄）
+
+| 改动 | 作用 |
+|---|---|
+| `classify.rs` 新增 `is_param_invalid_from_context_overflow` | 11133 **且**文案点名上下文边界才归 `ContextTooLong` |
+| `forward.rs` 新增 `budget_exceeded_guess` / `estimate_tokens` / `max_tokens_of` | 发请求前判「估算输入 + max_tokens > 1<<20」，命中则把 11133 归 `ContextTooLong` |
+| `server.rs` | 构造 `ForwardCtx` 时算好 `overflow_guess` 传进去 |
+
+`estimate_tokens` 按字符类型分档（CJK ≈ 2 字符/token、其它 ≈ 4），实测校准且**向上取整**
+—— 宁可高估：高估只是多压缩一次，低估就是本 bug。门槛：输入须超过上限的 **60%**
+才参与判定，小请求即使 `max_tokens` 很大也不误判。
+
+未知模型 / 算不出 ⇒ `None` ⇒ **逐字退回**原来的 11133 行为（不猜）。
+
+### 真机实测
+
+```text
+修后：in~1.040M mt=128000 → 400 code=context_length_exceeded  ← 客户端会压缩
+      in~1.040M mt=16     → 200（对照：不该误判）
+```
+
+验签链路：新 body 的 `detail = "api_error context_length_exceeded Invalid request
+parameters…"`，DSH 的 `STRUCTURED_CONTEXT_OVERFLOW` 正则**命中** ⇒ 归类
+`CONTEXT_WINDOW_EXCEEDED`（旧 body 的 `model_param_invalid` 不命中）。
+
+---
+
+## 七、随 App 启动与模型清单刷新（同一轮业主报告）
+
+### ① 重启电脑后网关没跟随启动
+
+日志读数：宿主 `11:19:55` 起、网关 `11:19:58` 起（`maybe_autostart` **成功过**），
+但用户 `11:22` 看时已经不在，且**没有任何停止日志**。
+
+自启是 setup 里**一次性** spawn，任何「起来了又悄悄没了」都会静默退化成「没自启」。
+
+修法：`maybe_autostart` 每个出口都打日志，并在启动后调 `ensure_gateway_alive`
+再确认一次（1.5 秒后查，不在就补拉一次）—— 把静默失败变成日志里有一行。
+
+### ② 点「启动网关」后模型路由清单没更新，切页面才更新
+
+`run()` 此前只 `refresh()`（网关状态），**不重拉模型清单**；而模型清单只在
+「挂载 / 信息不完整 / 手点刷新」三条路径加载 ⇒ 网关刚启动时它必然是空的或旧的。
+
+修法：操作后 `Promise.all([refresh(), loadModels(true)])`。`force=true` 是因为
+刚起来的网关可能带着**上一个进程**留下的按区域失败负缓存，带缓存拉会拿到空清单。
+---
+
+## 八、与 1.0.36 的关系
 
 1.0.36 的内容（成本调度三条缝、排空重启、保活兜底、依赖告警）**全部包含**在本版。
 1.0.37 只加这一件事。
