@@ -126,7 +126,58 @@
 
 **测试基线**：workspace **3081 passed / 0 failed / 7 ignored**（15 suite）。
 
-**未做**：未推送、未打 tag、未建 Release（业主未表态）。
+**已做（2026-10-09 12:05，业主 m11719「推送一下吧」授权）**：`main` + `v1.0.36` + `v1.0.37` 已推
+`fork`（`iuuuuuuuu/ai-gateway`），并各发一个 Release。**只推 `fork`**；`origin` / `upstream` / `aigw`
+三个 remote 全程未碰（与 9.6 授权一致）。
+
+### 9.16 1.0.36 + 1.0.37 的推送 / tag / Release（2026-10-09，本轮实测）
+
+业主指令：「推送一下吧」。本轮把**两个**版本一起落地（1.0.36 此前一直只在本地）。
+
+| 项 | 结果 |
+|---|---|
+| `main` | `git push fork main` ⇒ `8e4f5f1..9981783`；远端 `refs/heads/main` = `9981783537da3a318af40d901895f63554e8eb68` = 本地 HEAD（`rev-list --left-right --count fork/main...HEAD` = `0 0`） |
+| `v1.0.36` | annotated，对象 `20cac1dac763d43c464d2541726f0f28825202d7`（1.0.36 工作线的最后一个提交）；`git push fork v1.0.36` ⇒ `* [new tag]` |
+| `v1.0.37` | annotated，对象 `9981783537da3a318af40d901895f63554e8eb68`（= HEAD，1.0.37 工作线的最后一个提交）；`* [new tag]` |
+| 本地 tag 总数 | **46 → 48** |
+| Release v1.0.36 | id **`407492463`**，`draft=false prerelease=false`，正文 = `.github\RELEASE_NOTES_1.0.36.md` 全文（`bodyLen=4105`） |
+| Release v1.0.37 | id **`407492477`**，`draft=false prerelease=false`，正文 = `.github\RELEASE_NOTES_1.0.37.md` 全文（`bodyLen=5376`） |
+| `releases/latest` | 现指向 **`v1.0.37`**（id `407492477`，5 资产） |
+
+两个 Release 各 5 资产（安装包上传前**改名**为 updater 约定名 `ai-gateway-windows-x86_64-setup.exe`）：
+
+| tag | asset | bytes | assetId |
+|---|---|---|---|
+| v1.0.36 | `ai-gateway-windows-x86_64-setup.exe` | 14750159 | 623836282 |
+| v1.0.36 | `ai-gateway-windows-x86_64-setup.exe.sig` | 424 | 623836361 |
+| v1.0.36 | `ai-gateway_1.0.36_server-x64.exe` | 27438592 | 623835935 |
+| v1.0.36 | `latest.json` / `latest-windows-x86_64.json` | 1716 | 623836391 / 623836424 |
+| v1.0.37 | `ai-gateway-windows-x86_64-setup.exe` | 14768471 | 623837205 |
+| v1.0.37 | `ai-gateway-windows-x86_64-setup.exe.sig` | 444 | 623837329 |
+| v1.0.37 | `ai-gateway_1.0.37_server-x64.exe` | 27480576 | 623836879 |
+| v1.0.37 | `latest.json` / `latest-windows-x86_64.json` | 3087 | 623837357 / 623837392 |
+
+**发布后复核（实测，不是推断）**：
+
+| 检查 | 结果 |
+|---|---|
+| 资产逐字节核对（走 API + token 真下回来） | **4/4 `MATCH=True`**：1.0.36 安装包 `14750159`、1.0.37 安装包 `14768471`、1.0.37 `.sig` `444`、1.0.37 `latest.json` `3087` |
+| Ed25519 验签（**对下载回来的那份**，不是本地那份） | 1.0.36 与 1.0.37 都是 `FILE SIG VALID = true` + `GLOBAL SIG VALID = true`，keyid `6fa3c36f4be67c7e` |
+| `releases/latest` | `v1.0.37`，`draft=false prerelease=false`，5 资产 |
+
+★ **1.0.36 的 `latest.json` 是本轮补造的**：当时只留了安装包/`.sig`/server 三个资产，`latest.json` 没落盘。
+按 9.7 的写法补了一份（`version=1.0.36`、两个平台键的 `signature` 都是那份 `.sig` 逐字、`url` 指向
+`releases/latest/download/ai-gateway-windows-x86_64-setup.exe`）。它**只用于 v1.0.36 那个 Release 的归档**，
+不影响自动更新（`releases/latest` 指向 v1.0.37）。
+
+★ 本轮的 Windows 侧坑（与 9.10 同源）：`npm` 在本 shell 里不可用（`npm.exe` 是 nvmd shim，
+解析不到真实 npm）⇒ `build-signed.ps1` 的 `beforeBuildCommand` 失败。临时做了一个 `npm.cmd` shim
+（`.tmp/shimbin/`，把 `run build` 映射到 tsc+vite、`run tauri` 映射到 tauri CLI），**只在构建时加到 PATH**，
+没有改动仓库任何文件。另：`tauri-build` 的 `rerun-if-changed` 不含 `../dist`，前端重建后**必须**
+删掉 `target/release/ai-gateway.exe` 才会重新嵌入（脚本自己的守卫会拦住，报「内嵌前端不是当次构建的那份」）。
+
+★ 凭据流程与 9.8/9.9/9.10 相同：`.tmp/ghtoken.ps1`（CredRead P/Invoke，脚本本身不含字面 token）⇒
+写 `.tmp/ghtoken.txt`（40 B `gho_`）⇒ 用完**立即删除**。
 
 ### 9.14 上游把「超上下文预算」报成 11133（2026-10-09，业主第四报）
 
