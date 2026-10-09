@@ -2365,6 +2365,13 @@ async fn run_forward(
         route.region = prefer;
     }
 
+    // ★★ 预算超限估算（2026-10-09 业主现场）。
+    //
+    // 上游把「输入 + max_tokens > 1,048,576」报成 `11133 model_param_invalid`，
+    // 而 DSH 按「输入 ≤ 1,048,576」估算 ⇒ 它以为还有余量、**不压缩** ⇒ 永久卡死。
+    // 故这里在**发请求前**算一次，命中时把 11133 归成上下文超长，让客户端去压缩。
+    let overflow_guess = crate::forward::budget_exceeded_guess(body, &resolved.bare, &state.models);
+
     // 池锁只在 forward 内部按操作短暂持有（网络等待期间不持锁），
     // 因此这里不需要先取锁 —— 否则会把整个请求串行化。
     let mut ctx = crate::forward::ForwardCtx {
@@ -2383,6 +2390,7 @@ async fn run_forward(
         // 倍率灌进池子（见 `inject_cost_rates`）。这里传的就是
         // `billing_multiplier_for` 用的同一份缓存，口径完全一致。
         models_cache: Some(&state.models),
+        overflow_guess,
     };
     crate::forward::forward_chat(&mut ctx, body, stream, sess_key, route, &resolved.product).await
 }

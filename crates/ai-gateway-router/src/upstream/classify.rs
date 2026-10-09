@@ -487,8 +487,12 @@ pub fn is_model_not_in_region(body: &str) -> bool {
 /// 或全小写含 `model_param_invalid`。
 ///
 /// ⚠ `param` 字段上游给了**空串**，拿不到具体是哪个参数 —— 故只能如实转达，不猜。
-/// 特别提示：**不要**把它归到上下文超长去，那会让客户端误触发压缩，
-/// 而压缩并不会解决参数问题。
+///
+/// ★★ 但「11133 一律是参数问题」这条**不总成立**（2026-10-09 业主现场）：实测上游
+/// 把**超出上下文预算**也报成 11133 —— 输入 + `max_tokens` 超过 1,048,576 时回
+/// `model_param_invalid`，而 `param` 依旧是空串。那种情况压缩**正是**解药。
+/// 故本函数只回答「是不是 11133 形状」，溢出那一支由调用方先排除
+///（见 [`is_param_invalid_from_context_overflow`] 与 `classify` 的判定顺序）。
 pub fn is_model_param_invalid(body: &str) -> bool {
     if body.contains("11133") {
         return true;
@@ -496,6 +500,43 @@ pub fn is_model_param_invalid(body: &str) -> bool {
     body.to_lowercase().contains("model_param_invalid")
 }
 
+/// 报告 11133 响应体是否**同时**点名了「超出上下文预算」。
+///
+/// # 为什么需要单独一条（2026-10-09 业主现场）
+///
+/// 实测边界（真上游，逐点二分）：
+///
+/// ```text
+/// 输入 1,042,398 + max_tokens=16      → 200
+/// 输入 1,042,398 + max_tokens=8192    → 400 code=11133
+/// 输入 1,042,398 + max_tokens=128000  → 400 code=11133
+/// 输入   982,318 + max_tokens=128000  → 400 code=11133
+/// ```
+///
+/// ⇒ 预算是 **`输入 + max_tokens ≤ 1,048,576`**（`max_tokens` 计入上限）。
+/// DSH 按 `输入 ≤ 1,048,576` 估算，于是 1,042,398 + 128,000 它认为「还有余量」，
+/// **不触发压缩**，每轮都发同一个超限请求 ⇒ 「怎么搞都是这个错」。
+///
+/// 故：11133 **且**文案点名上下文边界时归 [`ErrKind::ContextTooLong`]，
+/// 让客户端认出溢出、去压缩，而不是当成参数错误永久重试。
+///
+/// 判据刻意**窄**（必须同时满足「是 11133」与「点名上下文边界」）：
+/// 只放宽溢出那一支，普通参数错误的出路（改参数）不受影响。
+pub fn is_param_invalid_from_context_overflow(body: &str) -> bool {
+    if !is_model_param_invalid(body) {
+        return false;
+    }
+    let lower = body.to_lowercase();
+    // 实测上游在 11133 里**没给**可读原因（`param` 与 `message` 都是空/通用文案），
+    // 所以这一支只在「上游将来补了原因」时命中 —— 识别职责在调用方的
+    // 「预算超限」估算（见 `forward.rs` 的 `overflow_guess`）。
+    CONTEXT_TOO_LONG_MARKERS
+        .iter()
+        .any(|m| lower.contains(&m.to_lowercase()))
+        || lower.contains("too long")
+        || lower.contains("too large")
+        || lower.contains("context")
+}
 /// 报告 429 响应体是否为「模型级限流」（该账号该模型额度用尽）。
 pub fn is_model_rate_limited(body: &str) -> bool {
     if envelope_code(body) == Some(MODEL_RATE_CODE) {
@@ -560,9 +601,21 @@ pub fn classify(status: u16, body: &str) -> ErrKind {
     if is_model_not_in_region(body) {
         return ErrKind::ModelNotInRegion;
     }
-    // 11133：请求侧错误。必须早于通用 4xx —— 落进去会被当成账号问题逐号轮转，
+    // ★★ 11133：请求侧错误。必须早于通用 4xx —— 落进去会被当成账号问题逐号轮转，
     // 每个账号都被同一个请求体打一遍，最后包装成 503「all accounts unavailable」。
+    //
+    // ★★ 但「11133 一律是参数问题」**不总成立**（2026-10-09 业主现场）：上游把
+    // 「输入 + max_tokens > 1,048,576」也报成 11133。那种情况压缩**正是**解药，
+    // 而 11133 会让客户端认不出溢出 ⇒ 每轮重发同一个超限请求 ⇒ 永久卡死。
+    //
+    // 故这里先看**上游文案**有没有点名上下文边界（[`is_param_invalid_from_context_overflow`]）；
+    // 上游目前不给原因，所以真正兜住的是调用方的预算估算（`forward.rs` 的
+    // `overflow_guess`，见那里的注释）—— 两条判据都不猜：文案没有、估算为 `None` 时
+    // 逐字退回原来的 `ModelParamInvalid`。
     if is_model_param_invalid(body) {
+        if is_param_invalid_from_context_overflow(body) {
+            return ErrKind::ContextTooLong;
+        }
         return ErrKind::ModelParamInvalid;
     }
     if status == 404 {
@@ -1391,5 +1444,27 @@ mod tests {
         assert_eq!(friendly_message(ErrKind::None, 200, ""), "");
         assert!(friendly_message(ErrKind::SoftRate, 429, "").contains("429"));
         assert!(friendly_message(ErrKind::Server, 502, "").contains("502"));
+    }
+    /// ★★ 业主现场回归：11133 里点名上下文边界时归 ContextTooLong。
+    ///
+    /// 守的是「客户端认不出溢出 ⇒ 每轮重发同一个超限请求 ⇒ 永久卡死」。
+    #[test]
+    fn param_invalid_naming_context_overflow_is_recognized() {
+        // 上游**将来**若补了原因（现在 param/message 都是空或通用文案）
+        let naming = r#"{"code":"11133","msg":"context_length_exceeded"}"#;
+        assert!(is_model_param_invalid(naming));
+        assert!(
+            is_param_invalid_from_context_overflow(naming),
+            "点名上下文边界时应归 ContextTooLong"
+        );
+        // 实测真实响应体：**没有**任何上下文线索 ⇒ 不归溢出（逐字退回旧行为）
+        let real = r#"{"code":"model_param_invalid","message":"the request parameters were rejected by the model provider"}"#;
+        assert!(is_model_param_invalid(real));
+        assert!(
+            !is_param_invalid_from_context_overflow(real),
+            "实测响应体里没有上下文线索 —— 这条判据不该凭空命中"
+        );
+        // 非 11133 一律不命中
+        assert!(!is_param_invalid_from_context_overflow("context_length_exceeded"));
     }
 }

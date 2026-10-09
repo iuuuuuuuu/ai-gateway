@@ -4330,11 +4330,59 @@ pub async fn maybe_autostart() -> Option<Value> {
     match start_gateway(&cfg).await {
         Ok(v) => {
             update_runtime_state("started", None);
+            // ★★ 2026-10-09 业主现场：「重启电脑之后，网关没有跟随启动」。
+            //
+            // 现场读数：宿主 11:19:55 起，网关 11:19:58 起（本函数成功过），
+            // 但用户 11:22 看时**已经不在了**，且日志里没有任何停止记录 ——
+            // 即「起来了、又悄悄没了」，而自启只跑一次、不会再看第二眼。
+            //
+            // 自启是**一次性**的（setup 里那个 spawn），所以任何「起来了但没能
+            // 留住」的情况都会静默退化成「开机没自启」。这里补一次**稍后再确认**：
+            // 若子进程已不在，就再拉一次，并把结论写进日志 —— 至少让下一次现场
+            // 有据可查，而不是像这次一样只能从两条 listening 记录反推。
+            let ok = ensure_gateway_alive(&cfg, "自启后确认").await;
+            eprintln!(
+                "[gateway] 随 App 启动：已拉起（配置 auto_start=true，存活确认={ok}）"
+            );
             Some(v)
         }
         Err(e) => {
+            eprintln!("[gateway] 随 App 启动失败: {e}");
             update_runtime_state("failed", Some(e));
             None
+        }
+    }
+}
+
+/// 确认网关还活着；不在就再拉一次。返回「最终确认时它在跑吗」。
+///
+/// # 为什么需要它（2026-10-09 业主现场）
+///
+/// `maybe_autostart` 只在 setup 里跑**一次**。而 `start_gateway` 的成功判据是
+/// 「20 秒内端口探活通过」—— 它**不保证**之后还活着。业主现场正是这样：
+/// 11:19:58 起来了，11:22 用户看时已经没了，中间没有任何停止日志。
+/// 一次性的自启遇上「起来后立刻死」就等于「开机没自启」，且**完全静默**。
+///
+/// 这里做的很有限，刻意不做成常驻守护：只是「等一小会儿再问一句，不在就补一次」。
+/// 真正的存活监督属于宿主的主循环（那是另一件事，见 `spawn_background_loops`）。
+/// 之所以值得加：它把「静默失败」变成「日志里有一行」，并且顺手救回
+/// 「启动瞬间被外部因素打断」这一类偶发。
+async fn ensure_gateway_alive(cfg: &Value, why: &str) -> bool {
+    // 给子进程一点时间把「启动后立刻退出」暴露出来（配置错误、端口竞争等）。
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    if is_running() {
+        return true;
+    }
+    eprintln!("[gateway] {why}：网关已不在运行，正在补拉一次");
+    match start_gateway(cfg).await {
+        Ok(_) => {
+            update_runtime_state("started", None);
+            true
+        }
+        Err(e) => {
+            eprintln!("[gateway] {why}：补拉失败: {e}");
+            update_runtime_state("failed", Some(e));
+            false
         }
     }
 }

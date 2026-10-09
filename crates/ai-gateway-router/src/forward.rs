@@ -339,7 +339,115 @@ pub struct ForwardCtx<'a> {
     /// ★ 只读快照，**绝不**在这里触发网络拉取 —— 本字段在每次 chat 请求的
     /// 关键路径上，见 `inject_cost_rates` 的 doc。
     pub models_cache: Option<&'a crate::models_cache::ModelsCache>,
+    /// ★★ 「这次请求是不是**预算超限**」的估算（2026-10-09 业主现场）。
+    ///
+    /// 上游把「输入 + `max_tokens` > 1,048,576」也报成 `11133 model_param_invalid`，
+    /// 而 DSH 按 `输入 ≤ 1,048,576` 估算 ⇒ 它以为还有余量、**不压缩** ⇒ 永久卡死。
+    /// 由调用方在**发请求前**算好（那里才知道模型真值与账号区域），这里只读。
+    ///
+    /// `None` = 算不出（未启用 / 模型未知）⇒ 逐字退回旧行为（不猜）。
+    pub overflow_guess: Option<bool>,
     pub probe_timeout: Duration,
+}
+
+/// 上游的上下文预算上限（**输入 + `max_tokens`**）。
+///
+/// 实测（2026-10-09，真上游逐点二分）：`1,042,398 + 16 = 1,042,414` 通过；
+/// `1,042,398 + 8,192 = 1,050,590` 被拒（400 code=11133）。⇒ 上限 = `1 << 20`。
+///
+/// ⚠ 与模型声明的 `context_length`（1,000,000）**不是**同一个数：那个是模型窗口，
+/// 这个是网关→上游这条通道的请求预算，后者更宽（多 48,576）。判据用**后者**，
+/// 因为上游按后者卡；用前者会让 1,000,000..1,048,576 这一段被误判成超限。
+pub const UPSTREAM_REQUEST_TOKEN_BUDGET: i64 = 1 << 20;
+
+/// 估算请求体里的 **token 数**（不精确，只用于「是否逼近上限」的二值判断）。
+///
+/// 按字符类型分档，实测校准（真上游 `prompt_tokens` 回读）：
+///
+/// | 内容 | 实测 |
+/// |---|---|
+/// | CJK | **≈ 2 字符 / token** |
+/// | 其它（ASCII 等） | ≈ 3.6 字符 / token |
+///
+/// 为什么取**偏大**的一侧：本估算只用来判断「是不是撞了上限」。高估会在
+/// 真正超限时更早命中（要的就是这个）；代价是极少数**接近**上限但没超的请求
+/// 会被当成溢出 —— 而那种请求本来就该压缩了，压缩一次无害。反向（低估）
+/// 才是致命的：会让客户端继续发超限请求，就是本 bug 本身。
+fn estimate_tokens(bytes: &[u8]) -> i64 {
+    let mut cjk: i64 = 0;
+    let mut other: i64 = 0;
+    let s = String::from_utf8_lossy(bytes);
+    for ch in s.chars() {
+        let c = ch as u32;
+        // CJK 统一表意文字 + 扩展 A + 兼容表意 + 全角标点/假名/谚文。
+        let is_cjk = (0x3040..=0x30FF).contains(&c)      // 假名
+            || (0x3400..=0x4DBF).contains(&c)             // 扩展 A
+            || (0x4E00..=0x9FFF).contains(&c)             // 基本区
+            || (0xF900..=0xFAFF).contains(&c)             // 兼容表意
+            || (0xFF00..=0xFFEF).contains(&c)             // 全角
+            || (0xAC00..=0xD7AF).contains(&c);            // 谚文
+        if is_cjk {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    // 向上取整：宁可高估。
+    (cjk + 1) / 2 + (other + 3) / 4
+}
+
+/// `body` 这次请求**是否会撞上上游的上下文预算**。
+///
+/// 返回 `None` = 算不出（不该据此改判），`Some(true)` = 会撞。
+///
+/// # 判据
+///
+/// `估算输入 + max_tokens > 上限`。
+///
+/// ★ 必须把 `max_tokens` 计入：业主现场正是「输入 1,042,398 已经贴着上限，
+/// 而 DSH 又带 `max_tokens: 128000`」，两者相加 1,170,398 远超 1,048,576 ——
+/// DSH 只按输入估算，于是**以为还有余量、不压缩**，永久卡死。
+///
+/// ★ 只有**输入本身**已经超过上限的 60% 才算 —— 小请求即使 `max_tokens` 很大也
+/// 不该被判成溢出（那些请求从没失败过）。这个门槛把误判面压到「本来就该压缩」
+/// 的区间，同时不影响业主现场（输入 1,042,398 远超 60%）。
+///
+/// `model` 未在清单里 ⇒ `None`（不猜）。
+pub fn budget_exceeded_guess(
+    body: &[u8],
+    model: &str,
+    cache: &crate::models_cache::ModelsCache,
+) -> Option<bool> {
+    // 模型必须在真值清单里 —— 连它多大都不知道就不该下结论。
+    let known = {
+        let snap = cache.snapshot();
+        snap.values().flatten().flatten().any(|mi| {
+            !mi.id.is_empty() && mi.id.trim().eq_ignore_ascii_case(model.trim())
+        })
+    };
+    if !known {
+        return None;
+    }
+    let input = estimate_tokens(body);
+    if input < UPSTREAM_REQUEST_TOKEN_BUDGET * 6 / 10 {
+        // 输入离上限还很远：不可能是预算超限（小请求从未失败过）。
+        return Some(false);
+    }
+    let max_tokens = max_tokens_of(body).unwrap_or(0);
+    Some(input + max_tokens > UPSTREAM_REQUEST_TOKEN_BUDGET)
+}
+
+/// 取请求体里的 `max_tokens` / `maxTokens`（缺失或非数字 ⇒ `None`）。
+///
+/// 缺失按 0 计：那种请求**确实**没有为输出预留预算，不该因为我们不知道就判超限。
+fn max_tokens_of(body: &[u8]) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    for k in ["max_tokens", "maxTokens", "max_completion_tokens"] {
+        if let Some(n) = v.get(k).and_then(|x| x.as_i64()) {
+            return Some(n);
+        }
+    }
+    None
 }
 
 /// 取池锁（中毒时取回内部值：状态是纯内存数据，没有「不一致」风险）。
@@ -1081,7 +1189,7 @@ pub async fn forward_chat(
                 // 落进通用分支就会变成「换个号再试一遍」，把上游的一次性要求
                 // 放大成「账号全部不可用」。
                 if let Some((fk, out_status, message)) =
-                    request_side_failure(kind, status, &resp_body, &model)
+                    request_side_failure(kind, status, &resp_body, &model, ctx.overflow_guess)
                 {
                     let uid = acct.uid.clone();
                     let (product, region) = product_labels(&acct, is_product);
@@ -1558,6 +1666,8 @@ fn request_side_failure(
     status: u16,
     resp_body: &str,
     model: &str,
+    // 「这次请求预算超限」的估算（`None` = 算不出）。见 `ForwardCtx::overflow_guess`。
+    overflow_guess: Option<bool>,
 ) -> Option<(FailureKind, u16, String)> {
     match kind {
         // 上下文超长：必须**保留上游原文** —— 下游客户端（如 DeepSeek Harness）
@@ -1593,13 +1703,34 @@ fn request_side_failure(
             status,
             classify::model_not_in_region_message(model, resp_body),
         )),
-        // 11133：参数被模型提供商拒。保留 `extError.message`，让用户知道是
-        // **参数**被拒而不是账号故障。
-        ErrKind::ModelParamInvalid => Some((
-            FailureKind::ModelParamInvalid,
-            status,
-            classify::model_param_invalid_message(resp_body),
-        )),
+        // ★★ 11133：多数是「参数被模型提供商拒」，但**超出上下文预算**时上游也回它
+        //（2026-10-09 业主现场，见 `is_param_invalid_from_context_overflow` 的实测表）。
+        //
+        // 预算超限时归 `ContextTooLong` —— 客户端据此触发自动压缩，那**正是**解药；
+        // 归 11133 会让它认不出溢出，每轮重发同一个超限请求而永久卡死。
+        //
+        // 判据来自**发请求前**算好的 `ctx.overflow_guess`（`None` = 算不出 ⇒ 不猜，
+        // 逐字退回原来的 11133 行为）。上游文案里若点名了上下文边界也算命中
+        //（`classify` 里已先判过一次；这里再判是因为 `overflow_guess` 只有本层拿得到）。
+        ErrKind::ModelParamInvalid => {
+            if overflow_guess == Some(true)
+                || classify::is_param_invalid_from_context_overflow(resp_body)
+            {
+                crate::logline!(
+                    "[forward] 上游 11133 且预算超限估算为真 ⇒ 归上下文超长（让客户端压缩）"
+                );
+                return Some((
+                    FailureKind::ContextTooLong,
+                    status,
+                    classify::context_too_long_message(resp_body),
+                ));
+            }
+            Some((
+                FailureKind::ModelParamInvalid,
+                status,
+                classify::model_param_invalid_message(resp_body),
+            ))
+        }
         _ => None,
     }
 }
@@ -1996,6 +2127,7 @@ mod tests {
             waf_ip,
             probe_timeout: Duration::from_secs(30),
             models_cache: None,
+        overflow_guess: None,
         }
     }
 
@@ -2757,4 +2889,92 @@ mod tests {
             !p.lock().unwrap().cost_is_free("intl1"),
             "未声明倍率不得被当成免费"
         );
-    }}
+    }
+
+    /// ★★ 业主现场回归：预算是「输入 + max_tokens ≤ 1,048,576」。
+    ///
+    /// 守的是「DSH 只按输入估算 ⇒ 以为还有余量 ⇒ 不压缩 ⇒ 永久卡死」。
+    #[test]
+    fn budget_guess_counts_max_tokens_against_the_input() {
+        // 业主现场的算术：输入贴着上限，max_tokens 又给满。
+        let input = UPSTREAM_REQUEST_TOKEN_BUDGET - 6_000; // 已超 60% 门槛
+        // 造一个能估出 ~input token 的 body：CJK ≈ 2 字符/token
+        let cjk = "测试文本内容".repeat((input as usize) * 2 / 6);
+        let body = serde_json::json!({
+            "model": "deepseek-v4.1-flash",
+            "max_tokens": 16,
+            "messages": [{ "role": "user", "content": cjk }],
+        })
+        .to_string();
+        let cache = crate::models_cache::ModelsCache::new();
+        cache.record_success(
+            crate::auth::Region::Intl,
+            vec![crate::upstream::ModelInfo {
+                id: "deepseek-v4.1-flash".into(),
+                ..Default::default()
+            }],
+            std::time::SystemTime::now(),
+        );
+        let small_mt = budget_exceeded_guess(body.as_bytes(), "deepseek-v4.1-flash", &cache);
+        assert_eq!(small_mt, Some(false), "小 max_tokens 时不该判超限");
+        // 同一输入 + 128000 输出预算 ⇒ 越界（DSH 实际发的是这个）
+        let big = serde_json::json!({
+            "model": "deepseek-v4.1-flash",
+            "max_tokens": 128000,
+            "messages": [{ "role": "user", "content": cjk }],
+        })
+        .to_string();
+        assert_eq!(
+            budget_exceeded_guess(big.as_bytes(), "deepseek-v4.1-flash", &cache),
+            Some(true),
+            "同一输入 + 128000 输出预算就该判超限 —— 这正是业主卡死的那一发"
+        );
+    }
+
+    /// 小请求即使 max_tokens 很大也不判超限（从没失败过的那类）。
+    #[test]
+    fn budget_guess_is_inert_for_small_requests() {
+        let cache = crate::models_cache::ModelsCache::new();
+        cache.record_success(
+            crate::auth::Region::Intl,
+            vec![crate::upstream::ModelInfo {
+                id: "m".into(),
+                ..Default::default()
+            }],
+            std::time::SystemTime::now(),
+        );
+        let body = r#"{"model":"m","max_tokens":128000,"messages":[{"role":"user","content":"hi"}]}"#;
+        assert_eq!(
+            budget_exceeded_guess(body.as_bytes(), "m", &cache),
+            Some(false),
+            "小请求不该被判成溢出"
+        );
+    }
+
+    /// 模型不在真值清单里 ⇒ `None`（不猜）。
+    #[test]
+    fn budget_guess_is_unknown_for_unknown_model() {
+        let cache = crate::models_cache::ModelsCache::new();
+        let body = r#"{"model":"nope","max_tokens":128000,"messages":[]}"#;
+        assert_eq!(budget_exceeded_guess(body.as_bytes(), "nope", &cache), None);
+    }
+
+    /// `max_tokens` 缺失按 0 计（不为「不知道」扣预算）。
+    #[test]
+    fn max_tokens_missing_counts_as_zero() {
+        assert_eq!(max_tokens_of(br#"{"model":"m"}"#), None);
+        assert_eq!(max_tokens_of(br#"{"maxTokens":42}"#), Some(42));
+        assert_eq!(max_tokens_of(b"not json"), None);
+    }
+
+    /// 估算函数：CJK ≈ 2 字符/token，ASCII ≈ 4 字符/token，且**向上取整**。
+    #[test]
+    fn estimate_tokens_matches_measured_ratios() {
+        // 实测：3000 CJK 字符 → 150210-1502... 见 doc 表（≈2 字符/token）
+        assert_eq!(estimate_tokens("测试文本内容".repeat(500).as_bytes()), 1500);
+        // 纯 ASCII：4 字符/token，向上取整
+        assert_eq!(estimate_tokens(b"abcd"), 1);
+        assert_eq!(estimate_tokens(b"abcde"), 2);
+        assert_eq!(estimate_tokens(b""), 0);
+    }
+}
