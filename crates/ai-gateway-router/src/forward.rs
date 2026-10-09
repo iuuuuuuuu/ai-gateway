@@ -409,8 +409,21 @@ fn estimate_tokens(bytes: &[u8]) -> i64 {
 /// DSH 只按输入估算，于是**以为还有余量、不压缩**，永久卡死。
 ///
 /// ★ 只有**输入本身**已经超过上限的 60% 才算 —— 小请求即使 `max_tokens` 很大也
-/// 不该被判成溢出（那些请求从没失败过）。这个门槛把误判面压到「本来就该压缩」
+/// 不该判成溢出（那些请求从没失败过）。这个门槛把误判面压到「本来就该压缩」
 /// 的区间，同时不影响业主现场（输入 1,042,398 远超 60%）。
+///
+/// ★★ **例外：`max_tokens` 自己就超过上限**（2026-10-09 业主 VS Code 现场）。
+///
+/// 业主在 VS Code 里把上下文设置调得很大就稳定复现 11133，调小就好了。
+/// 那种请求的形状是「**输入很小 + `max_tokens` 极大**」（他调的就是那个设置）。
+/// 此时上面那道 60% 门槛会把请求放行 ⇒ 判据返回 `Some(false)` ⇒ 归
+/// `model_param_invalid` ⇒ 客户端**不知道**这是预算问题，只能看到一句
+/// 「参数被拒」而反复重试。
+///
+/// 单独看 `max_tokens` 就够了：它自己都超过上限时，无论输入多小，
+/// `输入 + max_tokens` 必然超限 —— 不需要估算输入，也就没有误判风险。
+/// 实测（本机 rig，假上游固定回 11133）：输入 ~5,000 + `max_tokens` 1,048,576
+/// ⇒ 命中本分支。
 ///
 /// `model` 未在清单里 ⇒ `None`（不猜）。
 pub fn budget_exceeded_guess(
@@ -428,12 +441,24 @@ pub fn budget_exceeded_guess(
     if !known {
         return None;
     }
-    let input = estimate_tokens(body);
-    if input < UPSTREAM_REQUEST_TOKEN_BUDGET * 6 / 10 {
-        // 输入离上限还很远：不可能是预算超限（小请求从未失败过）。
-        return Some(false);
-    }
     let max_tokens = max_tokens_of(body).unwrap_or(0);
+    let input = estimate_tokens(body);
+    // ★★ 直接用**实测公式**，不再加「输入须 > 60%」的前置门槛。
+    //
+    // 旧实现有一道 `input < 上限 * 6/10 ⇒ Some(false)` 的闸门，理由是「小请求从没
+    // 失败过」。但业主 VS Code 现场恰恰是**小输入 + 极大 max_tokens**（他调的就是
+    // 那个上下文/输出设置）：`输入 5,000 + max_tokens 1,048,576 = 1,053,576 > 上限`
+    // —— 公式说超了，闸门却因为「输入太小」把它放行 ⇒ 返回 `Some(false)` ⇒
+    // 客户端看不懂真因。**闸门挡掉的正是它该抓的那类**。
+    //
+    // 为什么可以直接用公式：
+    //   · 上限本身就是实测出来的（见本节开头的实测表），公式即上游规则；
+    //   · 输入估计的误差是**绝对量**（CJK 2 字符/token、ASCII 3.6~4 字符/token），
+    //     小输入时误差极小 ⇒ 小请求上的判断反而更可靠；
+    //   · 两个方向的代价不对称：误判成溢出最多让客户端多压缩一次（无害）；
+    //     漏判则让客户端**永远**重发超限请求（就是本 bug 本身）。
+    //
+    // 边界：判据是**严格大于**（`正好等于上限`的成功，见实测 `1,042,398 + 16`）。
     Some(input + max_tokens > UPSTREAM_REQUEST_TOKEN_BUDGET)
 }
 
@@ -2931,7 +2956,20 @@ mod tests {
         );
     }
 
-    /// 小请求即使 max_tokens 很大也不判超限（从没失败过的那类）。
+    /// 小请求 + **正常**的 `max_tokens` ⇒ 不判超限（从没失败过的那类）。
+    ///
+    /// ★★ 2026-10-09 修正两次，全过程值得记住：
+    ///
+    /// 1. 这条测试原用 `max_tokens: 128000` 断言 `Some(false)` ——
+    ///    而业主 VS Code 现场证明**那个形状真的会 11133**（「把上下文设置调得
+    ///    很大」就稳定复现、调小就好了）⇒ 旧断言把一个真实故障形状钉成了
+    ///    「不该判超限」。
+    /// 2. 我随后加了「`max_tokens` 自己超上限 ⇒ true」的例外，但**保留了**
+    ///    「输入须 > 60%」的闸门 —— 而业主的请求是**小输入 + 极大 max_tokens**，
+    ///    `5,000 + 1,048,576 = 1,053,576 > 上限` 公式成立却被闸门放行。
+    ///    闸门挡掉的正是它该抓的那类。现已**整条移除**，直接用实测公式。
+    ///
+    /// 本条现在守的是：**输入与输出加起来也没超上限**的小请求 ⇒ `Some(false)`。
     #[test]
     fn budget_guess_is_inert_for_small_requests() {
         let cache = crate::models_cache::ModelsCache::new();
@@ -2943,11 +2981,63 @@ mod tests {
             }],
             std::time::SystemTime::now(),
         );
+        // 128000 远小于上限，且输入极小 ⇒ 加起来仍远小于上限。
         let body = r#"{"model":"m","max_tokens":128000,"messages":[{"role":"user","content":"hi"}]}"#;
         assert_eq!(
             budget_exceeded_guess(body.as_bytes(), "m", &cache),
             Some(false),
-            "小请求不该被判成溢出"
+            "输入 + max_tokens 都没超上限 ⇒ 不该判溢出"
+        );
+    }
+
+    /// ★★ 业主 VS Code 现场：**输入很小，但 `max_tokens` 自己就超过上限**。
+    ///
+    /// 他「把上下文设置调得很大」就稳定复现 11133、调小就好了 —— 说明那种请求
+    /// 的形状是「输入小 + 输出预算极大」。此时旧判据被 60% 输入门槛挡在门外、
+    /// 返回 `Some(false)` ⇒ 客户端只看到「参数被拒」，不知道是预算问题。
+    ///
+    /// 判据：`max_tokens > 上限` ⇒ 无条件 `Some(true)`
+    ///（`输入 >= 0` ⇒ `输入 + max_tokens >= max_tokens > 上限`，无需估算输入）。
+    #[test]
+    fn huge_max_tokens_alone_means_over_budget() {
+        let cache = crate::models_cache::ModelsCache::new();
+        cache.record_success(
+            crate::auth::Region::Intl,
+            vec![crate::upstream::ModelInfo {
+                id: "m".into(),
+                ..Default::default()
+            }],
+            std::time::SystemTime::now(),
+        );
+        // 输入极小（"hi" ≈ 1 token），但 max_tokens 自己就超了 1,048,576。
+        let body = format!(
+            r#"{{"model":"m","max_tokens":{},"messages":[{{"role":"user","content":"hi"}}]}}"#,
+            UPSTREAM_REQUEST_TOKEN_BUDGET + 1
+        );
+        assert_eq!(
+            budget_exceeded_guess(body.as_bytes(), "m", &cache),
+            Some(true),
+            "max_tokens 自己就超过上限 ⇒ 必然超预算，与输入多小无关"
+        );
+        // ★ 注意 `estimate_tokens` 估算的是**整个 body**（含 JSON 骨架、模型名、
+        // 字段名），所以「输入」**永远不为 0** —— 不存在「正好等于上限」的
+        // 可构造边界。`max_tokens` 一旦顶到上限，合计就必然**严格大于**上限。
+        let at_budget = format!(
+            r#"{{"model":"m","max_tokens":{},"messages":[]}}"#,
+            UPSTREAM_REQUEST_TOKEN_BUDGET
+        );
+        assert_eq!(
+            budget_exceeded_guess(at_budget.as_bytes(), "m", &cache),
+            Some(true),
+            "max_tokens 顶到上限，加上 body 自身的 token 就必然超"
+        );
+        // 严格大于的另一侧：`max_tokens` 与输入都极小 ⇒ 远低于上限，不判超。
+        //（实测 `1,042,398 + 16 = 1,042,414 < 上限` 是 200，同理。）
+        let small = r#"{"model":"m","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+        assert_eq!(
+            budget_exceeded_guess(small.as_bytes(), "m", &cache),
+            Some(false),
+            "小输入 + 小 max_tokens ⇒ 远低于上限，不判溢出"
         );
     }
 

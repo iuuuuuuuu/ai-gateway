@@ -870,14 +870,39 @@ fn envelope_display_message(body: &str) -> String {
     }
 }
 
-/// 把上下文超长的上游响应体提炼成一条**保留原文**的客户端消息。
+/// 把上下文超长的上游响应体提炼成一条**既保留原文、又能读懂**的客户端消息。
 ///
-/// 为什么必须保留上游原文：下游客户端靠文案模式识别上下文溢出
-///（`prompt is too long` / `context_length_exceeded` / `exceeds the model context limit`），
-/// 据此触发自动压缩并重试。若只回我们自己的措辞，客户端就认不出这是溢出，
-/// 只会把它当成普通失败。
+/// # 保留原文是硬要求
+///
+/// 下游客户端靠文案模式识别上下文溢出（`prompt is too long` /
+/// `context_length_exceeded` / `exceeds the model context limit`），据此触发自动压缩
+/// 并重试。若只回我们自己的措辞，客户端就认不出这是溢出，只会把它当成普通失败。
+///
+/// # 但原文往往读不懂（2026-10-09 业主现场）
+///
+/// 上游对「预算超限」回的是 `{"msg":"Invalid request parameters"}` —— 业主看到
+/// 的就是「Invalid request parameters」这种一句话，既没说「太大」也没说「怎么办」，
+/// 和他自己说的「就说人话」正相反。
+///
+/// 所以**前置**一句中文说明，**再**附上原文：
+///
+/// ```text
+/// 这次请求太大了，超出了这个模型一次能处理的上限。压缩或清空会话后重试。
+/// （上游原话：Invalid request parameters）
+/// ```
+///
+/// ★ 前置**不影响**客户端的模式识别：那个信号在**响应体的 `error.code`**
+///（= `context_length_exceeded`）里，客户端是把 code 与 message 拼起来匹配的
+///（DSH 的 `isContextWindowExceededError(detail)` 收的就是「code/type/message 拼成的
+/// 一个字符串」）。原文与 code 都原样保留，只是多了一句人话。
 pub fn context_too_long_message(body: &str) -> String {
-    envelope_display_message(body)
+    let original = envelope_display_message(body);
+    let head = "这次请求太大了，超出了这个模型一次能处理的上限。\
+                请压缩或清空会话（或调小最大输出）后重试。";
+    if original.trim().is_empty() {
+        return head.to_string();
+    }
+    format!("{head}（上游原话：{original}）")
 }
 
 /// 把「请求被上游拒绝」（11155）的响应体提炼成保留原文的消息。
@@ -935,25 +960,68 @@ pub fn model_not_in_region_message(model: &str, body: &str) -> String {
     b
 }
 
-/// 生成 11133（请求参数被模型提供商拒）的可读文案。
+/// 生成 11133（`model_param_invalid`）的**可读**文案。
 ///
-/// 尽量保留 `extError.message`（如 `the request parameters were rejected by
-/// the model provider`），让用户知道是**参数**被拒而不是账号故障。
+/// # ★★ 2026-10-09 业主原话：「把 11133 workbuddy 这个报错更明显，就说人话，
+/// 不要再说拒绝了」
+///
+/// 旧文案是「上游**拒绝**本次请求的参数（code=11133）…请检查请求参数后重试」，
+/// 问题有三层：
+///
+/// 1. **甩锅给用户**：`拒绝` + 「请检查请求参数」把话说成「你传错了」——
+///    而实测最常撞上它的原因是**上下文/输出预算超了**（见 `forward.rs` 里那张
+///    实测表），根本不是「参数写错」。用户照着文案去查模型名、档位、工具定义，
+///    查不出任何问题，只能反复重试。
+/// 2. **信息量为零**：「参数被拒」没有说清**哪个**参数、**为什么**。
+///    上游的 `extError.param` 实测恒为空串 —— 官方自己也没说。
+/// 3. **真因被埋掉**：真正原因是「这次请求太大了」。上游把它报成 `param_invalid`
+///    是它的口径问题，我们不该**原样转述**那个误导性的口径。
+///
+/// 新文案把话说清楚：**这次请求发不出去，因为太大了**，并给出三条**可操作**的出路
+/// （缩小上下文 / 调小输出上限 / 换上下文更大的模型）。
+///
+/// # ⚠ 为什么仍然保留 `code=11133` 与上游原文
+///
+/// - `code=11133` 是**唯一**能让我们与业主对上话的线索（他看到报错、我看到日志，
+///   靠的就是这个数字）；去掉它，下次排查要重新对一遍。
+/// - 上游原文（`the request parameters were rejected by the model provider`）
+///   **必须保留**：① 它是英文原文，用户拿去搜能对上官方文档；② 有一条现存测试
+///   钉着它不许丢。新文案把它放在「上游原话：」之后，明确标注那是**上游的措辞**，
+///   与我们自己的解释区分开 —— 这样既保留证据，又不让它的误导性口径变成结论。
+///
+/// # 为什么不再说「这不是账号问题，换账号无效」
+///
+/// 那句话是对的、也是有用的（省得用户反复换号），但它被**埋在「参数被拒」之后**，
+/// 而用户看到「检查请求参数」就去查参数了，根本读不到后半句。
+/// 新文案把「不是账号问题」前置，并且**先**说真因、**再**说不是账号问题。
 ///
 /// ★ 上游没给 message 时不能 panic、不能空（Go 测试
 /// `TestModelParamInvalidMessageNoUpstreamText` 用 `{"code":11133}` / `not json` /
 /// `""` 三种输入钉死）。
 pub fn model_param_invalid_message(body: &str) -> String {
-    let mut head = String::from("上游拒绝本次请求的参数（code=11133）");
+    // 第一句就说人话：这是「太大了」，不是「你写错了」，也不是「账号不行」。
+    // ⚠ 刻意不出现「拒绝 / 退回 / 参数错误」这些词 —— 业主点名要去掉的就是它们。
+    let mut head = String::from(
+        "这次请求太大了，超出了这个模型一次能处理的上限（code=11133）。"
+    );
+    head.push_str("上下文或最大输出设置超出上限。");
+    head.push_str("这不是账号问题，换账号无效。");
+    head.push_str(
+        "请任选一种方式重试：① 缩小上下文（压缩或清空会话，少带文件与历史）；\
+         ② 调小最大输出（max_tokens，或客户端的上下文长度设置）；\
+         ③ 换用上下文更大的模型。"
+    );
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         if let Some(ext) = v.get("extError") {
+            // ⚠ 保留上游原文，但**明确标注**那是上游的措辞 —— 它把预算超限说成
+            // 「参数被拒」，正是本节要纠正的那个误导性口径。
             if let Some(msg) = ext
                 .get("message")
                 .and_then(|m| m.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                head.push_str(&format!("：{msg}"));
+                head.push_str(&format!("（上游原话：{msg}）"));
             }
             // `param` 上游给的是**空串**，拿不到具体是哪个参数 —— 有才附上，不猜。
             if let Some(p) = ext
@@ -966,7 +1034,6 @@ pub fn model_param_invalid_message(body: &str) -> String {
             }
         }
     }
-    head.push_str("。这不是账号问题，换账号无效；请检查请求参数（如模型名、思考档位、工具定义）后重试。");
     head
 }
 
@@ -1273,23 +1340,45 @@ mod tests {
         ));
     }
 
-    /// 11133 文案必须保留 `extError.message`，且上游没给 message 时
-    /// 不 panic、不为空。
+    /// 11133 文案必须**说人话**：点明真因（请求太大）、给出出路、且保留
+    /// `code=11133` 与上游原文（见 `model_param_invalid_message` 的文档）。
+    ///
+    /// ★ 2026-10-09 业主原话：「把 11133 workbuddy 这个报错更明显，就说人话，
+    /// 不要再说拒绝了」—— 本条测试把「不再说拒绝」钉死。
     #[test]
-    fn model_param_invalid_message_keeps_upstream_text() {
+    fn model_param_invalid_message_speaks_plainly() {
         let body = r#"{"code":11133,"msg":"Invalid request parameters","extError":{"code":"model_param_invalid","message":"the request parameters were rejected by the model provider"}}"#;
         let msg = model_param_invalid_message(body);
+        // ① 可对上话的线索：错误码必须在。
         assert!(msg.contains("11133"), "{msg}");
+        // ② 真因必须在：是「太大」，不是「你写错了」。
+        assert!(msg.contains("太大"), "文案要点明「请求太大」：{msg}");
         assert!(
-            msg.contains("the request parameters were rejected by the model provider"),
+            msg.contains("上下文") && msg.contains("最大输出"),
+            "文案要点明「上下文 / 最大输出」：{msg}"
+        );
+        // ③ 出路必须在（三条可操作的建议）。
+        assert!(msg.contains("缩小上下文"), "{msg}");
+        assert!(msg.contains("调小最大输出"), "{msg}");
+        assert!(msg.contains("更大的模型"), "{msg}");
+        // ④ ★ 业主点名要改掉的那些说法：一个都不许留。
+        for banned in ["上游拒绝本次请求的参数", "拒绝", "退回", "参数错误"] {
+            assert!(!msg.contains(banned), "不该出现「{banned}」：{msg}");
+        }
+        // ⑤ 上游原文仍要保留（标注为「上游原话」），它是对照官方文档的唯一凭据。
+        assert!(
+            msg.contains("上游原话：the request parameters were rejected by the model provider"),
             "{msg}"
         );
+        // ⑥ 「不是账号问题」仍要说 —— 省得用户反复换号，只是**前置**了。
+        assert!(msg.contains("这不是账号问题"), "{msg}");
 
         // 上游没给 message 时：不能 panic、不能空（Go 测试用这三种输入钉死）
         for input in [r#"{"code":11133}"#, "not json", ""] {
             let got = model_param_invalid_message(input);
             assert!(got.contains("11133"), "输入 {input:?} → {got}");
             assert!(got.contains("这不是账号问题"), "输入 {input:?} → {got}");
+            assert!(got.contains("太大"), "输入 {input:?} → {got}");
         }
     }
 
