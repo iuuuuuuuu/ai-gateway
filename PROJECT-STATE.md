@@ -130,6 +130,51 @@
 `fork`（`iuuuuuuuu/ai-gateway`），并各发一个 Release。**只推 `fork`**；`origin` / `upstream` / `aigw`
 三个 remote 全程未碰（与 9.6 授权一致）。
 
+### 9.17 CI 从 1.0.23 起一直红（2026-10-09，业主追问后查实）
+
+**业主原话**：「你这推送的构建不是都失败了吗?」—— **属实**。
+
+我此前说「本地构建 EXIT=0、产出 bundle + .sig」是**对的**，但我**没查 GitHub Actions**。
+查证：`ci` 与 `release` 两条工作流**从 v1.0.32 起每一次都是红的**（更早可追到 v1.0.9），
+而发版一直手工做 ⇒ 没人发现。`release.yml` 的 preflight 挂在「核心单测」⇒
+四平台 build 与「发布 Release」两步**全被 skip**，等于 tag 打上去什么都不会发生。
+
+三组根因（**都不是本轮改动引入的**，最老的从 1.0.23 就在）：
+
+| # | 根因 | 影响面 |
+|---|---|---|
+| 一 | `trae_crypt_crossimpl.rs` 的夹具指向 `../../../test-bin/verify-trae/`，而 `test-bin/` 在 `.gitignore` 里 ⇒ CI 上根本没这个目录 | windows-latest + preflight，7 条 |
+| 二 | 平台假设：三个设备函数是 `#[cfg(windows)]`（非 Windows 必返空串）；`C:\...` 形态路径在 Linux 上无 `Prefix`/`RootDir` 组件；`i64::MAX` 秒在 Windows 溢出、Linux 装得下 | ubuntu / macos，14 条 |
+| 三 | 环境变量假设：`Identity::new()` 读 `LANG`/`TZ`（CI 上是 `C.UTF-8`）；`platform` 由 `consts::OS` 推导；`at()` helper 按运行机时区解释而被测函数按 CST 判日 | ubuntu / macos |
+
+**四、顺带查出并修掉一处真缺陷**（我 1.0.36 提交时引入）：
+`gateway.rs` 里有一个 `#[test]` 夹在两段文档注释**之间** ⇒ 属性归给了下面那条测试
+（`duplicated attribute`），而上面那条 `gateway_restart_goes_through_serialized_entry`
+自己**丢掉了属性**、退化成普通私有函数（`never used`）—— 即「不得绕过串行化入口」
+那条护栏**从未被执行过**。已归位并做还原验证（把 `drain_before_restart` 挪到
+`stop_gateway()` 之后 ⇒ 测试如实变红）。
+
+**五、`gateway` job 缺「构建前端」**：`ai-gateway-server` 用 `RustEmbed` 嵌 `../../dist/`，
+而 `dist/` 也在 `.gitignore` 里 ⇒ 报「folder does not exist」且**不生成 `Assets::get`**
+（两条 E0599 指向的位置与病因完全不同，极易误读成 rust_embed 坏了）。
+`release-bin` job 本来就有那一步，`gateway` job 漏了。
+
+**修复后 CI 实测**（`34481b8`）：**5/5 全绿** —— `release 二进制编译校验` /
+`check · windows-latest` / `check · macos-14` / `check · ubuntu-22.04` /
+`gateway · Rust 单测与构建`。
+
+本地复现用 `git worktree add --detach` 造了一个**没有 `dist/`、没有 `test-bin/`** 的
+干净 checkout —— 那才是 CI 的真实条件（此前一直在有这些文件的开发机上跑，
+所以永远看不到这些红）。
+
+★ **教训**：`test-bin/`、`dist/` 这类被 gitignore 的目录，会让「本地全绿 / CI 全红」
+长期共存而不自知。凡是被 `.gitignore` 排除、但**测试或构建依赖**的路径，
+都必须先问一句「CI 上它从哪来」。
+
+★ 遗留：`v1.0.37` tag 仍指向 `9981783`（CI 红的那次），其 release run 的 build /
+发布两步是 skipped。**未改 tag**（那会重写已发布的 tag）；Release 是手工建的、
+资产已上传并验签，不受影响。**下次发版前先看 CI 是否绿。**
+
 ### 9.16 1.0.36 + 1.0.37 的推送 / tag / Release（2026-10-09，本轮实测）
 
 业主指令：「推送一下吧」。本轮把**两个**版本一起落地（1.0.36 此前一直只在本地）。
