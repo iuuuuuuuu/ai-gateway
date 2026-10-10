@@ -104,6 +104,8 @@ pub enum Scenario {
     CaptchaChallenge,
     /// SSE 流**中途截断**（`server.py:188-192`）。
     SseTruncate,
+    /// 200 + 完全空的 SSE 流：复现 2026-10-11 国际区整体空流现场。
+    EmptyStream,
     /// 401 + `invalid api key`（凭证无效）。
     AuthInvalid,
     /// 5xx（上游故障）。
@@ -130,6 +132,7 @@ impl Scenario {
             "captcha_3007" => Scenario::Captcha3007,
             "captcha_challenge" => Scenario::CaptchaChallenge,
             "sse_truncate" => Scenario::SseTruncate,
+            "empty_stream" => Scenario::EmptyStream,
             "auth_invalid" => Scenario::AuthInvalid,
             "server_error" => Scenario::ServerError,
             "quota_exhausted" => Scenario::QuotaExhausted,
@@ -215,6 +218,15 @@ impl Scenario {
                 // —— 于是缺省变成 `Some(0)` ⇒ **空流**，"截一半"的语义整个失效
                 //（被 `sse_truncate_scenario_really_truncates` 抓到）。
                 sse_stream(3, truncate_at).into_bytes(),
+                "text/event-stream",
+                vec![],
+            ),
+            Scenario::EmptyStream => (
+                200,
+                // 空流：HTTP 200 + 一帧有效数据都没有 —— 2026-10-11 现场
+                // `deepseek-v4.1-flash-sg` 国际区整体故障的复现形态
+                //（触发网关「上游返回空流（无有效数据帧）」分支）。
+                Vec::new(),
                 "text/event-stream",
                 vec![],
             ),

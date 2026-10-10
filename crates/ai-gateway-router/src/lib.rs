@@ -41,6 +41,7 @@ pub mod cfgwatch;
 pub mod cli;
 pub mod clienttext;
 pub mod config;
+pub mod emptystream;
 pub mod error;
 pub mod forward;
 pub mod growtask;

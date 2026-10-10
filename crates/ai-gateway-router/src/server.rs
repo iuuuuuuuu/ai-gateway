@@ -100,6 +100,12 @@ pub struct AppState {
     /// 同样进程级共享：判据是「**多个不同账号**都 403」，而不同账号出现在
     /// **不同请求**里（一个请求内换号也可能，但只靠单请求会判得太迟）。
     pub waf_ip: crate::wafip::WafIpWindow,
+    /// ★ 上游整体空流的风暴判定窗口（窗口内多个不同账号同通道空流）。
+    ///
+    /// 同 `waf_ip` 进程级共享：2026-10-11 现场 13 个国际区账号被空流轮一遍、
+    /// 全部喂进熔断，最终 5 路并发重试也没能换出一个能用的号。判定成立时
+    /// **中止轮转**而不是继续换号 —— 详见 [`crate::emptystream`]。
+    pub empty_stream: crate::emptystream::EmptyStreamWindow,
     /// 流式首帧预读超时（`upstream.header_timeout_seconds`，未配置回落 30s）。
     pub probe_timeout: std::time::Duration,
     /// ★ 按区域的上游模型清单缓存（`/v1/models`、`/v1/models/regions` 的数据源）。
@@ -2277,6 +2283,14 @@ impl Wire {
             (Wire::Chat, F::EgressIPBlocked) => "egress_ip_blocked",
             (Wire::Messages, F::EgressIPBlocked) => "api_error",
             (Wire::Responses, F::EgressIPBlocked) => "upstream_error",
+            // ★ 上游整体空流（2026-10-11 现场）：多个不同账号同通道空流 ⇒ 换号
+            // 无用、账号是好的。**不能**落 `no_healthy_account`：那个码会诱导
+            // 客户端立即并发重试（现场正是 5 路重试 × 全轮转把 13 个号全拖进
+            // 冷却），而正确出路是「稍等片刻再重试」。真实原因同时写在 message
+            //（`empty_stream_burst_message`）里，见 `crate::emptystream`。
+            (Wire::Chat, F::EmptyStreamBurst) => "upstream_stream_stalled",
+            (Wire::Messages, F::EmptyStreamBurst) => "api_error",
+            (Wire::Responses, F::EmptyStreamBurst) => "upstream_error",
             // ★ 「这条通道没有该账号的资源包」（ZCode 1113）：绝不能落进
             // `no_healthy_account` —— 那个码意味着「账号池暂时不可用，稍后重试」，
             // 而这里的结论是「这个账号在这个模型上永远不行，换号或换模型即可」。
@@ -2430,6 +2444,7 @@ async fn run_forward(
         products: &state.products,
         unusual: &state.unusual,
         waf_ip: &state.waf_ip,
+        empty_stream: &state.empty_stream,
         probe_timeout: state.probe_timeout,
         // ★ 成本调度：让 forward 在选号前按 (账号区域, 模型名) 把上游声明的
         // 倍率灌进池子（见 `inject_cost_rates`）。这里传的就是
@@ -3384,6 +3399,7 @@ mod tests {
             products: crate::products::ProductUpstreams::new(),
             unusual: crate::unusual::UnusualBreakers::new(),
             waf_ip: crate::wafip::WafIpWindow::new(),
+            empty_stream: crate::emptystream::EmptyStreamWindow::new(),
             probe_timeout: std::time::Duration::from_secs(30),
             models: Arc::new(crate::models_cache::ModelsCache::new()),
             dynamic: crate::cfgwatch::DynamicState::new(dc),
@@ -4820,6 +4836,9 @@ mod tests {
             (F::ModelNotAllowed, "model_not_allowed", "handler.go:1304"),
             (F::EffortRejected, "reasoning_effort_rejected", "handler.go:1085"),
             (F::EgressIPBlocked, "egress_ip_blocked", "handler.go:1090"),
+            // 本变体是 Rust 侧新增（Go 侧空流只会按通用上游故障换号，这正是
+            // 2026-10-11 现场的缺陷）⇒ Go 行号栏填本仓库出处。
+            (F::EmptyStreamBurst, "upstream_stream_stalled", "forward.rs:199"),
             (F::ModelNotInRegion, "model_not_in_region", "handler.go:1096"),
             (F::ModelNotInProduct, "model_not_in_product", "handler.go:1101"),
             (F::ModelNotInUpstream, "model_not_in_upstream", "handler.go:1109"),
@@ -4967,6 +4986,7 @@ mod tests {
             F::UnusualActivity,
             F::EgressIPBlocked,
             F::ImageRegionUnavailable,
+            F::EmptyStreamBurst,
             F::NoResourcePack,
         ];
         for kind in chat_only {

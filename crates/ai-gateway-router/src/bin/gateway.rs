@@ -913,6 +913,8 @@ async fn main() {
         unusual: ai_gateway_router::unusual::UnusualBreakers::new(),
         // 出口 IP 被 WAF 拦的判定窗口：同样进程级共享。
         waf_ip: ai_gateway_router::wafip::WafIpWindow::new(),
+        // 上游整体空流的风暴判定窗口：同样进程级共享（2026-10-11 现场新增防线）。
+        empty_stream: ai_gateway_router::emptystream::EmptyStreamWindow::new(),
         // 流式首帧预读超时。
         //
         // ★ 复用 `upstream.header_timeout_seconds`（用户对「等上游开口」的显式表态），

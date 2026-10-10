@@ -100,6 +100,7 @@ async fn main() {
         products: ai_gateway_router::products::ProductUpstreams::new(),
         unusual: ai_gateway_router::unusual::UnusualBreakers::new(),
         waf_ip: ai_gateway_router::wafip::WafIpWindow::new(),
+        empty_stream: ai_gateway_router::emptystream::EmptyStreamWindow::new(),
         probe_timeout: Duration::from_secs(30),
         models: Arc::new(ai_gateway_router::models_cache::ModelsCache::new()),
         // 参考入口不解析配置，故没有产品模型清单、也没有提示词改写：A/B 对照要的是

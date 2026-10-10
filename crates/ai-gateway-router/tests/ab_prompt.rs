@@ -102,6 +102,7 @@ async fn state_with(mode: &str, text: &str) -> (Arc<AppState>, Arc<Mutex<Vec<Vec
         products: ai_gateway_router::products::ProductUpstreams::new(),
         unusual: ai_gateway_router::unusual::UnusualBreakers::new(),
         waf_ip: ai_gateway_router::wafip::WafIpWindow::new(),
+        empty_stream: ai_gateway_router::emptystream::EmptyStreamWindow::new(),
         probe_timeout: std::time::Duration::from_secs(30),
         models: Arc::new(ai_gateway_router::models_cache::ModelsCache::new()),
         // ★ 提示词与模型清单都从 `DynamicState` 读（配置热重载的落点）：这里直接给

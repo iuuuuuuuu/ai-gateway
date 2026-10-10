@@ -185,6 +185,18 @@ pub enum FailureKind {
     /// ★ 判定成立时**不动账号状态**：账号是好的，问题在网络出口。把好账号冷却掉
     /// 只会让用户在「IP 解封之后」发现号也被自己人停了。
     EgressIPBlocked,
+    /// 上游整体空流（窗口内多个**不同**账号在同一（产品, 区域）上 HTTP 200
+    /// 但流里一帧有效数据都没有）。
+    ///
+    /// 判据与 [`FailureKind::UnusualActivity`]（单号 3012）、
+    /// [`FailureKind::EgressIPBlocked`]（多号 403）都不同，不要合并：
+    /// 三者都指向「继续换号无用」，但故障主体依次是 账号自身 / 本机出口 IP /
+    /// 上游服务 —— 结论不同，出路也不同（见 [`crate::emptystream`]）。
+    ///
+    /// ★ 判定成立时**不动账号状态**：账号是好的，是上游通道整体故障。2026-10-11
+    /// 现场的教训：13 个国际区账号被轮一遍、全部喂进熔断，最终把「上游故障」
+    /// 变成「全网关无号可用」。详见 [`crate::emptystream::empty_stream_burst_message`]。
+    EmptyStreamBurst,
 }
 
 /// 一次需要特殊上报的转发失败。
@@ -321,6 +333,8 @@ pub struct ForwardCtx<'a> {
     pub unusual: &'a crate::unusual::UnusualBreakers,
     /// ★ 出口 IP 被 WAF 拦的判定窗口（多个不同账号吃 403）。进程级共享。
     pub waf_ip: &'a crate::wafip::WafIpWindow,
+    /// ★ 上游整体空流的风暴判定窗口（多个不同账号同通道空流）。进程级共享。
+    pub empty_stream: &'a crate::emptystream::EmptyStreamWindow,
     /// 流式请求预读首帧的超时。
     ///
     /// ★ 优先取配置里的 `header_timeout_seconds`（那是用户对「等上游开口」的
@@ -935,6 +949,46 @@ pub async fn forward_chat(
             }
         }
 
+        //
+        // ── 上游整体空流的风暴熔断（2026-10-11 现场：13 个国际区账号被空流轮一遍）──
+        //
+        // 判定与 3012 同款哲学：熔断期就是要一个请求都不发。窗口内同一（产品, 区域）
+        // 已有多个不同账号吃到空流 ⇒ 换号无用（是上游通道整体故障，账号是好的），
+        // 再换号只会把剩下的好账号也拖进冷却。判定按 (产品, 区域) 隔离。
+        {
+            let (burst, distinct) = ctx
+                .empty_stream
+                .blocked(acct.product_of(), acct.region().as_str());
+            if burst {
+                crate::logline!(
+                    "chat: 空流风暴熔断中（最近 {} 秒内 {} 个不同账号空流），不发请求（本请求已试 {} 个账号）",
+                    ctx.empty_stream.window().as_secs(),
+                    distinct,
+                    tried.len()
+                );
+                release(ctx.pool, &mut held_uid);
+                return (
+                    Some(ChatResult::Response {
+                        uid: last_uid.clone(),
+                        model: model.clone(),
+                        // 熔断在**发请求之前**命中 ⇒ 这个账号没被真正使用，
+                        // 报产品有意义（判定按产品+区域隔离），区域留给 WorkBuddy 路径。
+                        product: last_labels.0.clone(),
+                        region: last_labels.1.clone(),
+                        body: serde_json::Map::new(),
+                    }),
+                    503,
+                    Some(ForwardFailure {
+                        kind: FailureKind::EmptyStreamBurst,
+                        status: 503,
+                        message: crate::emptystream::empty_stream_burst_message(
+                            distinct,
+                            ctx.empty_stream.window(),
+                        ),
+                    }),
+                );
+            }
+        }
         // ── 产品派发判定（对应 Go `forward.go:565-572` 的唯一分叉点）──
         //
         // ★★ 这里必须用 `is_product_account`（只看账号的产品标签），**不能**用
@@ -1302,6 +1356,8 @@ pub async fn forward_chat(
                             "chat uid={} product=zcode: {} — 冷却换号（按 503 上游故障分类）",
                             acct.uid, probe_msg
                         );
+                        // 先喂空流风暴窗口（在罚号之前）：多号同通道空流 ⇒ 上游整体故障。
+                        ctx.empty_stream.note(&acct.uid, acct.product_of(), acct.region().as_str());
                         let kind = zcode_gate(&acct, classify::classify(503, &probe_msg), 503, &probe_msg);
                         last_status = 503;
                         last_kind = kind;
@@ -1338,6 +1394,8 @@ pub async fn forward_chat(
                         acct.product_of(),
                         probe_msg
                     );
+                    // 先喂空流风暴窗口（在罚号之前）：多号同通道空流 ⇒ 上游整体故障。
+                    ctx.empty_stream.note(&acct.uid, acct.product_of(), acct.region().as_str());
                     // ★ 用 503 让 `apply_error_policy` 走「服务端/上游故障」分类 ——
                     // 它会据此选择冷却时长与是否停用 —— 而不是「请求侧错误」
                     //（Go `forward.go:936-937` 逐字）。
@@ -1477,6 +1535,14 @@ pub async fn forward_chat(
 
     // 兜底释放：正常情况下各路径已释放，这里是防御性的一步（release 幂等）。
     release(ctx.pool, &mut held_uid);
+
+    // 2026-10-11 现场的教训：走到这里说明轮转整体耗尽，但旧实现**一个字都不记**，
+    // 日志里只有各账号自己的失败行，排障时看不出「这一轮到底试了几个号」。
+    crate::logline!(
+        "chat: 轮转耗尽（本请求已试 {} 个账号，最后状态 {}）",
+        tried.len(),
+        last_status
+    );
 
     let mut msg = "all accounts unavailable (cooling/disabled)".to_string();
     // ★ 单号池（或所有号都撞上同一个 1113）时，这里必须说清「是这条通道没有
@@ -2138,6 +2204,7 @@ mod tests {
         products: &'a crate::products::ProductUpstreams,
         unusual: &'a crate::unusual::UnusualBreakers,
         waf_ip: &'a crate::wafip::WafIpWindow,
+        empty_stream: &'a crate::emptystream::EmptyStreamWindow,
     ) -> ForwardCtx<'a> {
         ForwardCtx {
             pool,
@@ -2150,6 +2217,7 @@ mod tests {
             products,
             unusual,
             waf_ip,
+            empty_stream,
             probe_timeout: Duration::from_secs(30),
             models_cache: None,
         overflow_guess: None,
@@ -2163,13 +2231,18 @@ mod tests {
     /// —— 那里的「同一个出口 IP / 同一个上游风控」是真实共享的状态。
     /// 调用点写法：
     /// ```ignore
-    /// let (unusual, waf_ip) = fresh_breakers();
-    /// let mut c = ctx(&p, &client, &products, &unusual, &waf_ip);
+    /// let (unusual, waf_ip, empty_stream) = fresh_breakers();
+    /// let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
     /// ```
-    fn fresh_breakers() -> (crate::unusual::UnusualBreakers, crate::wafip::WafIpWindow) {
+    fn fresh_breakers() -> (
+        crate::unusual::UnusualBreakers,
+        crate::wafip::WafIpWindow,
+        crate::emptystream::EmptyStreamWindow,
+    ) {
         (
             crate::unusual::UnusualBreakers::new(),
             crate::wafip::WafIpWindow::new(),
+            crate::emptystream::EmptyStreamWindow::new(),
         )
     }
 
@@ -2399,8 +2472,8 @@ mod tests {
         let p = pool_with_products(&[("q1", "qoder")]);
         let client = Client::new(ClientConfig::default()).unwrap();
         let products = crate::products::ProductUpstreams::new();
-        let (unusual, waf_ip) = fresh_breakers();
-        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip);
+        let (unusual, waf_ip, empty_stream) = fresh_breakers();
+        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
         p.lock()
             .unwrap()
             .set_platform_enabled(&std::collections::HashMap::from([(
@@ -2438,8 +2511,8 @@ mod tests {
         let p = pool_with_products(&[("q1", "qoder")]);
         let client = Client::new(ClientConfig::default()).unwrap();
         let products = crate::products::ProductUpstreams::new();
-        let (unusual, waf_ip) = fresh_breakers();
-        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip);
+        let (unusual, waf_ip, empty_stream) = fresh_breakers();
+        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
 
         let (_, status, fail) = forward_chat(
             &mut c,
@@ -2625,8 +2698,8 @@ mod tests {
         let p = pool_with(&["u1"]);
         let client = Client::new(ClientConfig::default()).unwrap();
         let products = crate::products::ProductUpstreams::new();
-        let (unusual, waf_ip) = fresh_breakers();
-        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip);
+        let (unusual, waf_ip, empty_stream) = fresh_breakers();
+        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
         c.allowed_model = vec!["glm-5.3".to_string()];
 
         let (_, status, fail) = forward_chat(
@@ -2663,8 +2736,8 @@ mod tests {
             let p = pool_with(&["u1"]);
             let client = Client::new(ClientConfig::default()).unwrap();
             let products = crate::products::ProductUpstreams::new();
-            let (unusual, waf_ip) = fresh_breakers();
-            let mut c = ctx(&p, &client, &products, &unusual, &waf_ip);
+            let (unusual, waf_ip, empty_stream) = fresh_breakers();
+            let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
             c.allowed_model = vec!["glm-5.3".to_string()];
 
             let (_, status, fail) = forward_chat(
@@ -2690,8 +2763,8 @@ mod tests {
         let p = pool_with(&["u1"]);
         let client = Client::new(ClientConfig::default()).unwrap();
         let products = crate::products::ProductUpstreams::new();
-        let (unusual, waf_ip) = fresh_breakers();
-        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip);
+        let (unusual, waf_ip, empty_stream) = fresh_breakers();
+        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
         assert!(c.allowed_model.is_empty());
 
         let (_, status, fail) = forward_chat(
@@ -2715,8 +2788,8 @@ mod tests {
         let p = Mutex::new(Pool::new(String::new()));
         let client = Client::new(ClientConfig::default()).unwrap();
         let products = crate::products::ProductUpstreams::new();
-        let (unusual, waf_ip) = fresh_breakers();
-        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip);
+        let (unusual, waf_ip, empty_stream) = fresh_breakers();
+        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
         let (_, status, fail) = forward_chat(
             &mut c,
             br#"{"model":"m"}"#,
@@ -2742,8 +2815,8 @@ mod tests {
         let p = pool_with(&["cn1"]);
         let client = Client::new(ClientConfig::default()).unwrap();
         let products = crate::products::ProductUpstreams::new();
-        let (unusual, waf_ip) = fresh_breakers();
-        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip);
+        let (unusual, waf_ip, empty_stream) = fresh_breakers();
+        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
         let route = ImageRoute {
             region: Region::Intl,
             required: true,
@@ -2852,8 +2925,8 @@ mod tests {
         let p = Mutex::new(pool);
         let client = Client::new(ClientConfig::default()).unwrap();
         let products = crate::products::ProductUpstreams::new();
-        let (unusual, waf_ip) = fresh_breakers();
-        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip);
+        let (unusual, waf_ip, empty_stream) = fresh_breakers();
+        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
         c.models_cache = Some(&cache);
 
         inject_cost_rates(&c, "deepseek-v4.1-flash");
@@ -2905,8 +2978,8 @@ mod tests {
         let p = Mutex::new(pool);
         let client = Client::new(ClientConfig::default()).unwrap();
         let products = crate::products::ProductUpstreams::new();
-        let (unusual, waf_ip) = fresh_breakers();
-        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip);
+        let (unusual, waf_ip, empty_stream) = fresh_breakers();
+        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
         c.models_cache = Some(&cache);
 
         inject_cost_rates(&c, "deepseek-v4.1-flash");
