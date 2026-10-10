@@ -1700,6 +1700,51 @@ pub async fn warm_up_live_models(state: &Arc<AppState>) {
     observe_live_workbuddy_models(state, &fetched);
 }
 
+/// 后台**定时刷新**上游真值（区域清单 + 倍率 + 观测集）。
+///
+/// # 为什么必须有它（2026-10-10 业主现场）
+///
+/// 业主原话：「这倍率要定时更新的，我从昨天没关机，但是今天国服的
+/// `deepseek-v4.1-flash` 模型倍率已经是 0.11 了，而这里还用缓存的免费，请修复」。
+///
+/// 此前真值**只有两条更新路径**：启动预热一次、以及每次有人访问 `/v1/models`
+///（还要等 TTL 过期才真发上游请求）。于是「开着机过夜、上游改了倍率」就表现为
+/// 倍率一直停在旧值 —— 而倍率是成本调度（`inject_cost_rates`）的唯一输入。
+///
+/// # 为什么带 TTL 判断而不是无脑拉
+///
+/// 每 15 分钟醒一次，但**只有该区确实过期（或从未成功）才发请求**。
+/// 于是正常情况下每区每小时只多一次出站（与既有 TTL 同频），
+/// 而 TTL 被某个失败的拉取卡住时又不会一直空转打上游。
+///
+/// ★ 退避仍由 `fetch_models_for_region` 内部把关：处于失败退避窗口时它直接
+/// 返回旧真值，**不发请求** —— 所以本循环天然不会绕过退避把上游打爆。
+///
+/// ★ 失败静默：拉不到就退化成既有行为（界面继续显示上一份清单）。
+pub async fn refresh_live_models_loop(state: Arc<AppState>, cancel: crate::scheduler::Cancel) {
+    // 启动时先等一个周期：进程刚起来时 `warm_up_live_models` 已经拉过一次，
+    // 立刻再拉一遍是纯浪费（且会把那一次的退避计数顶上去）。
+    loop {
+        if !cancel.sleep(crate::models_cache::models_refresh_interval()).await {
+            return;
+        }
+        let now = std::time::SystemTime::now();
+        let due = [Region::CN, Region::Intl]
+            .into_iter()
+            .filter(|r| state.models.needs_refresh(*r, now))
+            .collect::<Vec<_>>();
+        if due.is_empty() {
+            continue;
+        }
+        let (fetched, _has_account) = region_snapshot(&state).await;
+        observe_live_workbuddy_models(&state, &fetched);
+        crate::logline!(
+            "[models-refresh] 定时刷新上游真值完成（到期区域 {} 个；倍率已跟进）",
+            due.len()
+        );
+    }
+}
+
 /// 把 `/v1/models` 刚拉到的上游真值喂进池子的「观测集」。
 ///
 /// # 为什么需要它（2026-10-06 所有者现场）

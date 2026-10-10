@@ -976,6 +976,34 @@ async fn main() {
         });
     }
 
+    // ★★ 接线：定时刷新上游真值（区域清单 + **倍率** + 观测集）。
+    //
+    // 业主原话（2026-10-10）：「这倍率要定时更新的，我从昨天没关机，但是今天国服的
+    // `deepseek-v4.1-flash` 模型倍率已经是 0.11 了，而这里还用缓存的免费，请修复」。
+    //
+    // 根因：`DYNAMIC_MODELS_TTL` 只是「多久算过期」，**不是**「多久去刷一次」——
+    // 没有任何后台循环去拉。只有人访问 `/v1/models` 且 TTL 已过才真发上游请求，
+    // 于是没人访问时倍率永远停在启动那一刻（本机实测：缓存文件 mtime 停在
+    // 前一天，倍率仍是旧的）。
+    //
+    // 为什么是独立一条循环：与启动预热是同一件事的两个时机（一次性 vs 周期），
+    // 复用同一条 `region_snapshot` + `observe_live_workbuddy_models` 路径，
+    // 不引入第二套拉取口径。
+    //
+    // ⚠ 循环内部带 TTL 判断：每 15 分钟醒一次，但只有**确实过期**的区域才真发请求。
+    // 退避仍由 `fetch_models_for_region` 把关，故不会绕过退避打上游。
+    {
+        let state = Arc::clone(&state);
+        let cancel = sched_cancel.clone();
+        ai_gateway_router::logline!(
+            "上游模型真值定时刷新已接线：每 {} 分钟检查一次，仅对已过 TTL 的区域发请求",
+            ai_gateway_router::models_cache::models_refresh_interval().as_secs() / 60
+        );
+        tokio::spawn(async move {
+            ai_gateway_router::server::refresh_live_models_loop(state, cancel).await;
+        });
+    }
+
     // 后台落盘：池状态与用量统计每 5 秒 flush 一次（与 Go 侧 flusher 同周期）。
     // 进程退出前还会各补一次（见下面的 shutdown 分支）。
     {

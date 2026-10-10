@@ -57,6 +57,62 @@ use crate::upstream::ModelInfo;
 /// 成功清单的存活时间（Go `dynamicModelsTTL`）。
 pub const DYNAMIC_MODELS_TTL: Duration = Duration::from_secs(3600);
 
+/// 后台**强制**刷新两区模型清单（含倍率）的周期。
+///
+/// # 为什么必须有这条定时刷新（2026-10-10 业主现场）
+///
+/// 业主原话：「这倍率要定时更新的，我从昨天没关机，但是今天国服的
+/// `deepseek-v4.1-flash` 模型倍率已经是 0.11 了，而这里还用缓存的免费，请修复」。
+///
+/// 现场是**两个缺陷叠加**：
+///
+/// 1. 网关侧：`DYNAMIC_MODELS_TTL` 只是「多久算过期」，**不是**「多久去刷一次」。
+///    没有任何后台循环去拉清单 —— 只有人访问 `/v1/models` 时才会（且只在 TTL 过期后
+///    才真的发上游请求）。没人访问 ⇒ 倍率**永远停在启动那一刻**。
+/// 2. 前端侧：模型清单只在挂载时拉一次，之后仅当「有区域没拿到真值」
+///    （`unverified_regions` 非空）才每 30 秒重拉。而**倍率过期不属于「信息不完整」**
+///    —— 清单是全的、只是数字旧了 ⇒ 那条自愈轮询根本不会触发。
+///
+/// 于是「昨天开的机、今天上游调价」就表现为：倍率一直显示昨天的值。
+/// 而倍率是**成本调度**的唯一输入（`inject_cost_rates`），错了会让用户按错的
+/// 数字判断该烧哪个账号的额度 —— 正是本仓库反复强调「绝不编造数字」的那类风险。
+///
+/// # 取值依据
+///
+/// 15 分钟：与 `schedule.credit_refresh_interval` 同档（本仓库既有的巡检节奏）。
+/// `/v3/config` 是**只读探测**（不产生流量、不消耗积分），每区一轮 1 次出站，
+/// 代价可忽略；而倍率是「上游随时可能改」的运营参数，一小时的空窗太长。
+pub const MODELS_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// 生效的成功清单 TTL（默认 [`DYNAMIC_MODELS_TTL`]，可被环境变量压缩）。
+///
+/// # 为什么需要这个开关
+///
+/// 业主硬性规则：**修完必须自己跑实测**，而「倍率会不会自己更新」这件事的
+/// 自然周期是**一小时**（TTL）—— 等不起，也没法在验收里复现「过夜后倍率变了」。
+/// 有了它就能把 TTL 压到秒级，在隔离实例上真实跑通「上游调价 ⇒ 界面/接口跟上」
+/// 这条链路，而不是靠读代码声称它成立。
+///
+/// 非法值（空 / 非数字 / 0）一律回落默认，**不报错**：与 `config::apply_env` 同口径。
+pub fn models_ttl() -> Duration {
+    env_secs("WB2A_MODELS_TTL_SECONDS").unwrap_or(DYNAMIC_MODELS_TTL)
+}
+
+/// 生效的后台刷新周期（默认 [`MODELS_REFRESH_INTERVAL`]，可被环境变量覆盖）。
+pub fn models_refresh_interval() -> Duration {
+    env_secs("WB2A_MODELS_REFRESH_SECONDS").unwrap_or(MODELS_REFRESH_INTERVAL)
+}
+
+/// 读一个「秒数」环境变量；缺失 / 非法 / 非正数 ⇒ `None`（调用方回落默认）。
+fn env_secs(key: &str) -> Option<Duration> {
+    let raw = std::env::var(key).ok()?;
+    let n = raw.trim().parse::<u64>().ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(n))
+}
+
 /// 一个区域最多试几个账号（Go `maxProbeAccounts`）。
 ///
 /// 为什么是 3 而不是 1：单个账号可能因为凭证/权限问题拿到空清单，而**一个坏账号
@@ -281,7 +337,7 @@ impl ModelsCache {
             return None;
         }
         let fetched = rm.fetched?;
-        if now.duration_since(fetched).unwrap_or_default() < DYNAMIC_MODELS_TTL {
+        if now.duration_since(fetched).unwrap_or_default() < models_ttl() {
             return Some(rm.infos.clone());
         }
         None
@@ -332,6 +388,29 @@ impl ModelsCache {
             .get(&region)
             .map(|rm| !rm.infos.is_empty())
             .unwrap_or(false)
+    }
+
+    /// 该区域的清单是否**已经过了 TTL**（该刷新了）。
+    ///
+    /// 与 [`ModelsCache::cached`] 互补：那个回答「能不能直接用」，这个回答
+    /// 「是不是该去拉一份新的了」。后台定时刷新用它判断要不要发上游请求 ——
+    /// 没过 TTL 就什么都不做（零出站），过了才拉。
+    ///
+    /// ★ 从未成功过（`fetched == None`）同样算「该刷」：那种情况下缓存里没有
+    /// 任何倍率，成本调度正在静默失效，越早补上越好。
+    pub fn needs_refresh(&self, region: Region, now: SystemTime) -> bool {
+        let g = self.lock();
+        let Some(rm) = g.get(&region) else {
+            // 该区域连桶都没有（进程刚起来、或从没探测过）⇒ 该刷。
+            return true;
+        };
+        if rm.infos.is_empty() {
+            return true;
+        }
+        match rm.fetched {
+            Some(at) => now.duration_since(at).unwrap_or_default() >= models_ttl(),
+            None => true,
+        }
     }
 
     /// 记录一次成功。★ **整体替换** ⇒ 清零 `fails` 与 `last_err`。
@@ -623,6 +702,82 @@ mod tests {
         assert_eq!(short_uid("123456789"), "12345678");
         // 非 ASCII 不能 panic（按字符截断）
         let _ = short_uid("账号账号账号账号账号账号");
+    }
+
+    /// 业主现场回归（2026-10-10）：倍率必须能**定时**跟进。
+    ///
+    /// 业主原话：「这倍率要定时更新的，我从昨天没关机，但是今天国服的
+    /// deepseek-v4.1-flash 模型倍率已经是 0.11 了，而这里还用缓存的免费」。
+    ///
+    /// 本测试钉住后台循环的判据 `needs_refresh`：
+    ///   · 从未成功过 ⇒ 该刷（缓存里没有倍率，成本调度正在静默失效）
+    ///   · TTL 内      ⇒ 不该刷（零出站，避免每 15 分钟空转打上游）
+    ///   · 刚过 TTL    ⇒ 该刷（这正是「过夜后倍率还是旧的」那个点）
+    ///
+    /// 边界用 >= 而不是 >：TTL **正好**到点就该刷 —— 否则第 3600 秒
+    /// 那一轮会被跳过，实际周期变成两个 interval。
+    #[test]
+    fn needs_refresh_follows_the_ttl_boundary() {
+        let c = ModelsCache::new();
+        let now = SystemTime::now();
+        // ① 从未成功过 ⇒ 该刷
+        assert!(c.needs_refresh(Region::CN, now), "空缓存该刷");
+        assert!(c.needs_refresh(Region::Intl, now), "另一区同样该刷");
+
+        c.record_success(Region::CN, vec![info("a")], now);
+        // ② TTL 内 ⇒ 不该刷（零出站）
+        assert!(!c.needs_refresh(Region::CN, now), "刚成功不该刷");
+        assert!(
+            !c.needs_refresh(Region::CN, now + Duration::from_secs(3599)),
+            "TTL 内不该刷"
+        );
+        // ③ 正好到 TTL ⇒ 该刷（>=）
+        assert!(
+            c.needs_refresh(Region::CN, now + Duration::from_secs(3600)),
+            "正好到 TTL 就该刷"
+        );
+        // ④ 过 TTL ⇒ 该刷 —— 这就是业主过夜后的那一刻
+        assert!(
+            c.needs_refresh(Region::CN, now + Duration::from_secs(3601)),
+            "过 TTL 必须刷，否则倍率永远停在旧值"
+        );
+        // ⑤ 区域独立：国服刷过了不影响国际版
+        assert!(
+            c.needs_refresh(Region::Intl, now + Duration::from_secs(3601)),
+            "两区各自计时"
+        );
+    }
+
+    /// 从磁盘恢复的清单（fetched = None）必须被判定为「该刷」。
+    ///
+    /// 这是业主场景的**真实起点**：进程重启后清单从 models_cache.json 回来，
+    /// 倍率是旧的。若 fetched = None 被判成「不用刷」，那台机器会一直用
+    /// 上一次运行时的倍率 —— 比 TTL 过期更隐蔽（连 TTL 都不参与判断）。
+    #[test]
+    fn restored_cache_still_counts_as_needing_refresh() {
+        let dir = std::env::temp_dir().join(format!("wb2a-mc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        {
+            let a = ModelsCache::with_persistence(dir.clone());
+            a.record_success(
+                Region::CN,
+                vec![ModelInfo {
+                    id: "deepseek-v4.1-flash".into(),
+                    credit_multiplier: Some(0.0),
+                    ..Default::default()
+                }],
+                SystemTime::now(),
+            );
+        }
+        let b = ModelsCache::with_persistence(dir.clone());
+        let now = SystemTime::now();
+        assert!(b.has_truth(Region::CN), "清单应从磁盘恢复");
+        assert!(
+            b.needs_refresh(Region::CN, now),
+            "恢复的清单 fetched=None ⇒ 必须判该刷，否则倍率永远停在上一轮运行"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

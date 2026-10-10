@@ -3062,8 +3062,11 @@ export default function GatewayPage() {
    * 稍后点刷新重试即可确认」的文案承诺了刷新能重新确认，而带缓存的路径
    * 在失败后 5 分钟内连试都不试 ⇒ 点了没变化（2026-09-20 实测缺陷）。
    */
-  const loadModels = useCallback(async (force = false) => {
-    setModelsLoading(true);
+  const loadModels = useCallback(async (force = false, quiet = false) => {
+    // `quiet`：定时轮询用的静默路径。不动 `modelsLoading` —— 那个标志会
+    // 让「刷新」按钮转圈并禁用（`model-routing-list.tsx:461/466`），
+    // 每 15 分钟自己转一次会显得界面在抽风。用户手动点刷新时仍照常转。
+    if (!quiet) setModelsLoading(true);
     try {
       const list = await api.getGatewayModels(force);
       /*
@@ -3111,7 +3114,7 @@ export default function GatewayPage() {
     } catch {
       // 取不到就保留原列表：勾选列表里仍有当前已选值兜底（标「不在当前列表」）
     } finally {
-      setModelsLoading(false);
+      if (!quiet) setModelsLoading(false);
     }
   }, []);
 
@@ -3198,6 +3201,36 @@ export default function GatewayPage() {
       onResume: () => void loadModels(),
     },
   );
+
+  /**
+   * 倍率的**定时**跟进（2026-10-10 业主现场）。
+   *
+   * # 为什么上面那条自愈轮询不够
+   *
+   * 它只在「有区域没拿到真值」（`unverified_regions` 非空）时跑。而业主这次是
+   * **清单是全的、只是数字旧了** —— 上游昨天把国服 `deepseek-v4.1-flash` 的倍率
+   * 从免费调成 `x0.11`，界面还显示「免费」。那种情况 `modelsIncomplete` 恒为
+   * false ⇒ 那条轮询**根本不会触发**。
+   *
+   * 业主原话：「这倍率要定时更新的，我从昨天没关机，但是今天国服的
+   * deepseek-v4.1-flash 模型倍率已经是 0.11 了，而这里还用缓存的免费，请修复」。
+   *
+   * # 为什么是 15 分钟而不是 30 秒
+   *
+   * 倍率是**上游的运营参数**，变化以小时/天为尺度；而这条轮询会穿透到网关、
+   * 由网关决定要不要真发上游请求（网关侧另有 TTL 与退避）。30 秒一轮对这种
+   * 数据是纯浪费，也让「切页即请求」的开销被放大。15 分钟与网关侧那条
+   * `MODELS_REFRESH_INTERVAL` 同档，两处口径一致、便于对照。
+   *
+   * ★ 带 `refresh=0`（默认）：**不**绕网关的 TTL 与退避 —— 那是自愈做成打上游
+   * 的老问题。网关到点自己会去拉，这里只负责把新值取回来。
+   */
+  useVisibilityInterval(() => void loadModels(false, true), 15 * 60_000, {
+    // 挂载那一次已由上面的 effect 做了，这里不 immediate（同上面那条的理由）。
+    immediate: false,
+    // 从托盘/后台回到前台时补一次：倍率可能已经在后台变了，而用户此刻正看着它。
+    onResume: () => void loadModels(false, true),
+  });
 
   // 自动刷新：用量区块需要周期更新（网关在持续接请求），但**不**适合挤进 status 的
   // 5 秒轮询 —— 聚合响应可能较大。这里用独立的 30 秒周期，既能自动跟进，
