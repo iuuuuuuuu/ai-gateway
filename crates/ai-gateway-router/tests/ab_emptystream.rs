@@ -9,8 +9,9 @@
 //!    **中止**（熔断期内一个请求都不发），报 `upstream_stream_stalled`
 //!    （绝不落 `no_healthy_account` —— 那个码会诱导客户端立刻 5 路并发重试，
 //!    正是现场的放大器）；
-//! 2. 孤立的一次空流（单账号）保持旧语义：按 503 上游故障冷却换号，最终仍报
-//!    `no_healthy_account` —— 阈值语义不能误伤单号故障；
+//! 2. 孤立的一次空流（单账号）：不触发风暴、**不罚号**（现场 err_total 涨到 39
+//!    的教训），耗尽时报 `upstream_stream_stalled` 并如实描述单号空流 —— 绝不
+//!    伪装成 `no_healthy_account`；
 //! 3. 健康流零误伤：正常 SSE 照常透传，空流窗口不计数。
 //!
 //! 为什么起真服务：这条链路的问题出在「HTTP 往返 + SSE 首帧探测」本身，
@@ -186,19 +187,38 @@ async fn empty_stream_burst_aborts_rotation_and_names_the_real_cause() {
     assert_eq!(seen.lock().unwrap().len(), 3, "熔断期内一个请求都不发");
 }
 
-/// 【旧语义钉住】孤立单号空流不触发风暴：按 503 上游故障冷却换号，
-/// 无号可换时仍报旧的 `no_healthy_account`。
+/// 【现场回归 2026-10-11】孤立单号空流不触发风暴，但也不再伪装成
+/// `no_healthy_account`（那个码的文案「已切换到其他账号」在耗尽时是假的，
+/// 且会诱导客户端 5 路并发重试）。现在报 `upstream_stream_stalled` +
+/// 如实描述单号空流；且**不罚号**：err_total 不增长、不熔断、不禁用 ——
+/// 现场 err_total 涨到 39 的教训。
 #[tokio::test]
-async fn single_empty_stream_keeps_legacy_no_healthy_account() {
+async fn single_empty_stream_names_cause_and_spares_account() {
     let (state, seen) = state_with(true, 1, 1).await;
 
     let (status, body) = roundtrip(Arc::clone(&state), &chat_body()).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={body}");
-    assert_eq!(body["error"]["code"], "no_healthy_account", "body={body}");
+    assert_eq!(body["error"]["code"], "upstream_stream_stalled", "body={body}");
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("空流"), "message 应点破空流现象: {msg}");
+    assert!(msg.contains("账号本身是好的"), "message 应说明账号无辜: {msg}");
+    assert!(!msg.contains("401") && !msg.contains("403") && !msg.contains("503"), "文案不得含裸状态码: {msg}");
 
     wait_calls(&seen, 1).await;
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert_eq!(seen.lock().unwrap().len(), 1);
+
+    // 账号没有被记错账：err_total 保持 0，无熔断、无禁用、无冷却。
+    let st = state.pool.lock().unwrap().status_by_uid("u0").unwrap();
+    assert_eq!(st.err_total, 0, "空流不得喂 note_error（现场 err_total=39 的教训）");
+    assert!(!st.disabled);
+    assert!(!st.cooling, "空流不得进入任何冷却/熔断");
+    assert_eq!(st.breaker_until, None);
+
+    // 连发第二发：仍能正常选号（不罚 ⇒ 号还健康），依旧失败但不升级。
+    let (status2, body2) = roundtrip(Arc::clone(&state), &chat_body()).await;
+    assert_eq!(status2, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body2["error"]["code"], "upstream_stream_stalled", "body2={body2}");
 }
 
 /// 【零误伤对照】健康 SSE 照常透传；空流窗口不计数、不发难。

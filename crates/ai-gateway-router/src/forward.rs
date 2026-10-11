@@ -1348,15 +1348,19 @@ pub async fn forward_chat(
                         // 而空流的原因很多（上游抖动 / 网关闪断 / 代理超时），与额度
                         // 毫无关系；把「不知道」当成「没额度」是本缺陷的第二条通道。
                         //
-                        // 现在按 `probe_msg` 正常分类（Go `forward.go:936-937` 的
-                        // 口径）：空流文案里没有 1113 / 14018 等业务码 ⇒ 落
-                        // [`ErrKind::Server`] ⇒ [`pool.note_error`]（喂熔断，指数退避），
-                        // 既不会硬冷却也不会把号打死。
+                        // ★★ 也**不**喂 `pool.note_error`（2026-10-11 第二次现场）：
+                        // 空流此前按 503 落 `ErrKind::Server` ⇒ `note_error` 喂熔断，
+                        // 结果 zcode 通道唯一的坏流号在 07:00-09:37 之间被熔断 5 轮
+                        //（err_total 涨到 39），而兜底又反复把它捞出来打 —— 熔断既没
+                        // 挡住请求，还把「上游抖动」记成了账号的错。空流与账号行为
+                        // 无关，任何基于账号的惩罚都罚不到根因；多号同通道空流的
+                        // 保护已由 [`crate::emptystream`] 风暴窗口承担（按 产品+区域
+                        // 中止轮转，不罚任何号），单号空流靠「不罚 + 正常轮转」自愈。
                         crate::logline!(
-                            "chat uid={} product=zcode: {} — 冷却换号（按 503 上游故障分类）",
+                            "chat uid={} product=zcode: {} — 空流不罚号，仅换号（风暴窗口已记）",
                             acct.uid, probe_msg
                         );
-                        // 先喂空流风暴窗口（在罚号之前）：多号同通道空流 ⇒ 上游整体故障。
+                        // 先喂空流风暴窗口：多号同通道空流 ⇒ 上游整体故障 ⇒ 下轮选号中止。
                         ctx.empty_stream.note(&acct.uid, acct.product_of(), acct.region().as_str());
                         let kind = zcode_gate(&acct, classify::classify(503, &probe_msg), 503, &probe_msg);
                         last_status = 503;
@@ -1364,17 +1368,6 @@ pub async fn forward_chat(
                         last_body = probe_msg.clone();
                         last_transport_err = None;
                         last_err = Some(probe_msg.clone());
-                        {
-                            let mut pool = lock_pool(ctx.pool);
-                            apply_error_policy(
-                                &mut pool,
-                                &acct.uid,
-                                &model,
-                                kind,
-                                &probe_msg,
-                                ctx.soft_cooldown,
-                            );
-                        }
                         release(ctx.pool, &mut held_uid);
                         // 对应 Go `fail(uid)` 里的 `Session.Unbind` —— 探测失败说明
                         // 这个账号供不了这一轮，粘性绑定必须解掉。
@@ -1387,35 +1380,21 @@ pub async fn forward_chat(
                         continue;
                     }
 
-                    // 其它产品：按上游故障冷却换号（Go `forward.go:934-951`）。
+                    // 其它产品：换号，但**不罚号**（与上面 zcode 分支同口径）。
                     crate::logline!(
-                        "chat uid={} product={}: {} — 冷却换号",
+                        "chat uid={} product={}: {} — 空流不罚号，仅换号（风暴窗口已记）",
                         acct.uid,
                         acct.product_of(),
                         probe_msg
                     );
-                    // 先喂空流风暴窗口（在罚号之前）：多号同通道空流 ⇒ 上游整体故障。
+                    // 先喂空流风暴窗口：多号同通道空流 ⇒ 上游整体故障 ⇒ 下轮选号中止。
                     ctx.empty_stream.note(&acct.uid, acct.product_of(), acct.region().as_str());
-                    // ★ 用 503 让 `apply_error_policy` 走「服务端/上游故障」分类 ——
-                    // 它会据此选择冷却时长与是否停用 —— 而不是「请求侧错误」
-                    //（Go `forward.go:936-937` 逐字）。
                     let kind = classify::classify(503, &probe_msg);
                     last_status = 503;
                     last_kind = kind;
                     last_body = probe_msg.clone();
                     last_transport_err = None;
                     last_err = Some(probe_msg.clone());
-                    {
-                        let mut pool = lock_pool(ctx.pool);
-                        apply_error_policy(
-                            &mut pool,
-                            &acct.uid,
-                            &model,
-                            kind,
-                            &probe_msg,
-                            ctx.soft_cooldown,
-                        );
-                    }
                     release(ctx.pool, &mut held_uid);
                     // 对应 Go `fail(uid)` 里的 `Session.Unbind` —— 探测失败说明这个
                     // 账号供不了这一轮，粘性绑定必须解掉，否则下次请求还会选它。
@@ -1568,6 +1547,30 @@ pub async fn forward_chat(
                 kind: FailureKind::NoResourcePack,
                 status: last_status,
                 message: msg,
+            }),
+        );
+    }
+    // ★★ 空流耗尽特判（2026-10-11 第二次现场）：最后失败是「上游返回空流」时，
+    // 绝不能报 `no_healthy_account` —— 那个码的 message「已切换到其他账号」与
+    // 「账号池暂时不可用，稍后重试」两个暗示都是错的：耗尽意味着没有号可切，
+    // 而空流账号本身是好的（我们的空流分支已不再罚号）。更重要的是它诱导客户端
+    // 5 路并发重试，把瞬时抖动放大成风暴。这里改用 `EmptyStreamBurst` 的
+    // 客户端契约（Chat `upstream_stream_stalled`，另两个协议 api_error /
+    // upstream_error），message 如实描述单号空流 + 无号可切。
+    if last_kind == ErrKind::Server && last_body.contains("空流") {
+        return (
+            Some(ChatResult::Response {
+                uid: last_uid,
+                model,
+                product: last_labels.0,
+                region: last_labels.1,
+                body: serde_json::Map::new(),
+            }),
+            503,
+            Some(ForwardFailure {
+                kind: FailureKind::EmptyStreamBurst,
+                status: 503,
+                message: crate::emptystream::empty_stream_single_message(),
             }),
         );
     }
