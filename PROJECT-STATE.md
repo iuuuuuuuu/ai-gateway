@@ -26,7 +26,7 @@
 | Go 参照实现 | `go-gateway/` | Go（**保留作对照，构建链已不依赖**） |
 
 - git 根 = `wt-port\`，主分支 `main`（2026-10-06 由 `migrate/aigw-v1.0.2` 改名而来；原上游陈旧线 `224919a` 改名 `archive/origin-main` 留档。详见第九节）
-- 远端 **`fork` = `https://github.com/iuuuuuuuu/ai-gateway`**：`main` 已推送（远端 `fork/main` = `726aafa`；本地另有 **7 个提交未推**：`12c2871` / `cb62b2b` / `641f89c` / `6ade937` / `1c7b7c0` / `e14fea1` / 本次 9.21 的记录提交）；本地 tag 共 **49 个**（最大 `v1.0.38`），已发布的 Release 到 **v1.0.38** 为止（`releases/latest` 与 `dist\latest.json` 现都还指向 **v1.0.38**）—— ★ **1.0.39 ~ 1.0.46 尚未打 tag、尚未发布**（安装包都已产出并落在 `dist\`，只差推 tag + 发 Release）。★ 该仓库 2026-10-06 按业主 m26011 **已转为 private**（匿名访问 404，自动更新通道因此失效，详见 9.6）
+- 远端 **`fork` = `https://github.com/iuuuuuuuu/ai-gateway`**：`main` 已推送（远端 `fork/main` = `726aafa`；本地另有 **8 个提交未推**：`12c2871` / `cb62b2b` / `641f89c` / `6ade937` / `1c7b7c0` / `e14fea1` / `621452e` / 本次 9.22 的记录提交）；本地 tag 共 **49 个**（最大 `v1.0.38`），已发布的 Release 到 **v1.0.38** 为止（`releases/latest` 与 `dist\latest.json` 现都还指向 **v1.0.38**）—— ★ **1.0.39 ~ 1.0.46 尚未打 tag、尚未发布**（安装包都已产出并落在 `dist\`，只差推 tag + 发 Release）。★ 该仓库 2026-10-06 按业主 m26011 **已转为 private**（匿名访问 404，自动更新通道因此失效，详见 9.6）
 - 当前版本号 **1.0.46**（发布提交 `1c7b7c0` 用 `scripts/bump-version.ps1` 把 **14 个文件**（`tauri.conf.json` / `package.json` / `package-lock.json` / `Cargo.toml` / `Cargo.lock` / `npm\package.json` 等）bump 到 1.0.46；签名安装包已产出并复制到 `dist\`，内嵌网关与内嵌前端**双指纹校验 [OK]**，见 9.21）
   - ★ 业主**实机 2026-10-07 07:40 已回退到 1.0.6**（`D:\APP\AI Gateway\ai-gateway.exe` 32,838,656 B / FileVersion 1.0.6 / mtime 2026-09-17 21:01:20；`:7864` 跑的是 Go 网关 `gateway-355c61-29367fd438f80ba2.exe` 8,759,296 B）⇒ 当次 1.0.22–1.0.34 **均未安装**（截至 2026-10-13 业主实机已升到 **1.0.44**；1.0.45 尚未安装），要装就直接装最新版（跳过版本里的修复全在 1.0.34 内；★ **回退到 Go 版会丢掉 1.0.21–1.0.33 的全部修复**，1.0.34 修的「输出完就中断」在 Go 版里**同样存在**——Go 只在「0 有效帧」时补 error 帧、吐过内容却没见 `[DONE]` 时**静默当成功**，与本仓库 1.0.33 及以前的行为不同）
   - ★ NSIS 同版本**不覆盖**（`installer.nsi:233-259` 用 `nsis_tauri_utils::SemverCompare` 比 `DisplayVersion`，相等走维护页）⇒ 升版本号是交付的硬前提
@@ -137,6 +137,41 @@
 `fork`（`iuuuuuuuu/ai-gateway`），并各发一个 Release。**只推 `fork`**；`origin` / `upstream` / `aigw`
 三个 remote 全程未碰（与 9.6 授权一致）。
 
+### 9.22 补验 `credit_floor` 积分闸（2026-10-14 凌晨，同一条业主指令；不改产品代码，只补真机读数）
+
+9.20 / 9.21 都如实记了同一个**没验到的面**：`credit_floor`（保留积分下限）**没有真机读数** —— 真机上游是死的假上游 ⇒ 积分巡检刷不回真值 ⇒ `credits_known` 恒 `false` ⇒ 「未知不拦」的设计让积分闸**在整轮 27 个 PASS 里一次都没被触发过**。这一轮把它补上：**不改任何产品代码**，只加了一套**本机假积分上游**的测试装置。
+
+**为什么必须造假上游**：积分闸只对**上游成功查到过**的余额生效。`scheduler\mod.rs:1027-1033` 的取数是 `Err(e) => { crate::logline!("credit-refresh {}: {e}", st.uid); continue; }` ⇒ **查询失败时旧值原样留着**，一个没人成功问过的数字永远 arming 不了这道闸。所以必须让网关**真的**从某个上游读到一个小余额。
+
+**怎么做到（全程不出本机）**：
+
+| 环节 | 做法 | 依据 |
+|---|---|---|
+| 假上游 | `test-bin\fake-billing.js`（Node，**只监听 `127.0.0.1:57940`**），按真实契约回**双层信封** `{"code":0,"data":{"Response":{"Data":{"Accounts":[{CycleCapacitySize:100,CycleCapacityRemain:5,DeductionEndTime:<now+30d>}]}}}}` | `upstream\client.rs:1265 unwrap_envelope` 返回顶层 `data`，调用方再读 `data.Response.Data.Accounts[]`（`:549-553`）；余额取 `CycleCapacitySize>0` 时的 `CycleCapacityRemain`（`:1002`） |
+| 把网关指过去 | 启动包一层 `.cmd`，只给子进程加 `WB2A_BILLING_BASE_CN=http://127.0.0.1:57940` | 这是代码里自己写明的 A/B 对照钩子（`bin\gateway.rs:469-471`「仅供 A/B 对照测试把网关指向假上游（生产留空走内置常量）」）；宿主 spawn 网关**没有 `env_clear()`**（`gateway.rs:3891-3894`）⇒ 子进程继承环境变量 |
+| 绕开死代理 | 同时设 `NO_PROXY=127.0.0.1,localhost`（含小写别名） | 夹具 native config 顶层写着 `proxy: http://127.0.0.1:57999`（**死端口**，由 `gateway.rs:3201` 从「更新代理」设置写入）；`build_proxy` 只在**有代理时**挂免代理表 `reqwest::NoProxy::from_env()`（`upstream\client.rs:153-154`）⇒ 不设 `NO_PROXY` 的话回环请求会被丢给 57999 |
+| 域判断 | 夹具账号域名 `fake.example.invalid` 不在 `INTL_DOMAINS` 白名单里 ⇒ 属**国服** ⇒ `billing_base()` 才走 CN 覆盖 | `upstream\client.rs:366-377` + `auth.rs:208+` |
+| 开门 | 宿主 `gateway_config.json` 顶层写 `credit_floor=100`（**大于**读到的 5）⇒ `POST /api/gateway/platform-enabled` ⇒ 重生成 native config | 与 9.21 的 P4 同一条**真实热重载**路线，**不重启** |
+
+**真机实测（7 个阶段，`test-bin\guard-credits.log`，56 行，`CREDIT WITNESS RESULT: FAIL=0`，共 27 PASS / 0 FAIL）**：
+
+- **C1/C3 起点为 0**：`guard-prepare.ps1` 会把两个旋钮从**宿主与 native 两份配置里都删掉**（夹具基线），启动后断言 native config 顶层 `credit_floor=0` 且 `daily_token_cap=0` ⇒ 后面的拦截**不可能是额度成因**。
+- **C4 积分是真的从假上游读来的**：两个账号启动后都变成 `credits=5`（**全新池子本来是 0** ⇒ 只可能是巡检写进去的），假上游收到 **2 次** `POST /v2/billing/meter/get-user-resource`，且 `gateway.log` **一条 `credit-refresh` 报错都没有**（两次都解析干净）。同时还断言了**光有余额不会禁用账号**（`disabled=0` / `no_route=0`）。
+- **C5 积分闸真的拦人，且文案不再骗人**：`credit_floor=100` 生效后（pid **不变**，热重载）⇒ 两个账号都 `daily_guard=true` ⇒ chat = **429** `rate_limit_exceeded`，文案含 **余额 / 不会**（不随日期恢复）与 **积分巡撤回充 / 保留积分下限**（两条真实出路），且**不含**只有额度成因才有的 **额度按** ⇒ 两种成因**没有混为一谈**（这正是 9.21 缺陷 1 修的）。同时 `disabled=0`、`no_route=0`、两个账号**仍被 `/status` 列出** ⇒ 它是**选号闸**而不是 kill switch。
+- **C6 调低下限立刻放行**：`credit_floor` 改成 1（低于余额 5）⇒ 闸门在**没有任何新积分取数**的情况下释放，chat 不再 429（回到 503，即夹具死上游的正常失败），pid 仍不变。
+- **C7 清理**：三个测试进程按 **PID + 路径**双条件收掉（`leftovers: gw=0 srv=0 node=0`），57930/57931/57940 全释放，**业主的 :7864 / :3080 全程在听**。
+
+**同一构建下的额度闸复跑**（顺手做的公平性修正）：9.21 那次是「1.0.46 的**网关** + 1.0.44 的**宿主**」。这次把隔离宿主**从 HEAD 重新编译**（`cargo build --release -p ai-gateway-server --target-dir test-bin\build-server`，2m23s，产物 27,090,432 B），二进制里 `1.0.44`/`1.0.45` 字面量 **0 次**、`1.0.46` **2 次** ⇒ 再跑一遍 `guard-live.ps1`：**27 PASS / 0 FAIL**，横幅 `ai-gateway v1.0.46`，P4 拦截文案与 9.21 记录**逐字一致**。现在两条闸的读数都来自**同一个 1.0.46 构建**。
+
+**遗留（仍然没验的）**：`credit_floor` 对 **ZCode** 号恒不生效（ZCode 没有积分查询接口，`products\zcode\` 下没有 `credits.rs`）—— 与 9.20 第 2 条相同，本轮**未变**。
+
+★ 本轮踩到的两个坑（都是**测试装置**的坑，不是产品缺陷）：
+
+1. **PowerShell 的 `if (Fn 'x' -eq 0)` 会静默判假**：整句被解析成**一条命令**（名字 `Fn`、一个位置参数 `'x'`、`-eq`/`-or` 变成**命令参数**），字符串永不等于整数 ⇒ 条件恒为 false 且**解析零报错**。修法：**先把函数调用取到变量再比较**。同样的写法在 `guard-live.ps1` 里也扫过一遍，是干净的。
+2. **`no_route` 是 omitempty**：`server.rs:393-395` 只在为 `true` 时输出该键 ⇒ 健康账号读到的是 `$null` 而不是 `$false`，拿 `-eq $false` 判断会**假红**。改成 `-not $a.no_route`。（`daily_guard` 同款 omitempty；`product`/`region` 相反，是**恒输出**的。）
+
+★ 顺带发现：`test-bin\guard-server.exe` 当时是 **1.0.44 的旧产物**（27,089,920 B），而 harness 只断言网关版本 ⇒ 宿主版本一直是**无声漂移**的。修法是**从 HEAD 重编**并顺手在 PE 里扫版本字面量确认，而不是相信 mtime。
+
 ### 9.21 1.0.46 按第三轮复核修掉护栏的两处真实缺陷（2026-10-14 凌晨，同一条业主指令）
 
 1.0.45 的安装包**已经打出来了**（14,761,478 B，SHA256 `6CC5E9FA…908068`），随后又做了一轮**独立复核**：发现两处**真机可复现的行为错误**，都在护栏内部 —— **两个旋钮都留 `0`（默认）的人完全不受影响**。NSIS 同版本不覆盖，所以必须换号才能把这些修掉，于是 bump 到 **1.0.46**。
@@ -180,7 +215,7 @@
 
 **★ 没验到的面（与 9.20 同源，诚实记账）**：
 
-1. **`credit_floor` 仍然没有真机读数**：真机假上游不可达 ⇒ 积分巡检永远刷不回真值 ⇒ `credits_known` 恒 `false` ⇒ 「未知不拦」的设计让**积分闸在整轮 27 个 PASS 里一次都没被触发过**，它只有单测覆盖（本轮新增的积分成因端到端测试是**进程内**的，不是跨进程真机）。
+1. ~~**`credit_floor` 仍然没有真机读数**~~ ⇒ **已补验，见 9.22**。当时真机假上游不可达 ⇒ 积分巡检刷不回真值 ⇒ `credits_known` 恒 `false` ⇒ 「未知不拦」的设计让积分闸在整轮 27 个 PASS 里一次都没被触发过（只有**进程内**单测）。9.22 用**本机假积分上游**补上了这条跨进程真机读数：**27 PASS / 0 FAIL**。
 2. **ZCode 产品没有积分查询**，所以 `credit_floor` 对 ZCode 号**恒不生效**。
 3. 本轮**只**修了这两个缺陷，**没有**合并任何新功能。
 
@@ -231,7 +266,7 @@
 
 **★ 没验到的面（诚实记账）**：
 
-1. **`credit_floor` 这条闸门没有真机读数**。真机用的是**死的假上游** ⇒ 积分巡检永远刷不回真值 ⇒ `credits_known` 恒为 `false`，按设计「未知就不拦」，所以整轮 27 个 PASS **一次都没有触发过积分闸**，它只有单测覆盖。
+1. ~~**`credit_floor` 这条闸门没有真机读数**~~ ⇒ **已于 9.22 补验**（本机假积分上游 + 跨进程真机实测，27 PASS / 0 FAIL）。当时的原因是死假上游让积分巡检刷不回真值 ⇒ `credits_known` 恒为 `false`，按设计「未知就不拦」。
 2. **ZCode 产品没有积分查询**，所以积分闸对 ZCode 号**恒不生效**（这正是「`credits_known` 不持久化、未知不当 0」的原因：把"查不到"当成 0 会把 ZCode 号全闸掉）。
 3. 本轮**只**合并了这一个功能（cross-repo 调研的其余候选全部未动）。
 
