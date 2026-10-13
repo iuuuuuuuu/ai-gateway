@@ -345,6 +345,20 @@ struct Entry {
     credits_known: bool,
 }
 
+/// 每日护栏**为什么**挡住某个账号（`None` = 没挡住）。
+///
+/// [Entry::daily_guard_blocks] 只是「有没有挡住」的布尔投影；错误文案需要的是
+/// **成因**：两个旋钮的出路并不相同 —— 额度撞顶会随本地零点归零，而保留积分下限
+/// **不随日期恢复**（它只由积分巡检回充刷新）。把两者说成同一句「明天就恢复」，
+/// 会让撞积分闸的用户去等一个永远不会自己到来的零点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardedLine {
+    /// 今日 Token 已达 `daily_token_cap`。**本地零点后自动归零**。
+    DailyTokens,
+    /// 余额已跌破 `credit_floor`（且余额是上游真值）。**不随日期恢复**。
+    Credits,
+}
+
 impl Entry {
     /// 返回「最近到期积分」的到期日（`YYYY-MM-DD`），空串表示未知。
     ///
@@ -417,8 +431,25 @@ impl Entry {
     /// 而「兜底路径漏了同一道判据」正是本项目踩过两次的缺陷类型
     ///（见 [Entry::healthy] 的 `no_route` 文档）。分成两份实现必然会再次分叉。
     fn daily_guard_blocks(&self) -> bool {
-        (self.daily_token_cap > 0 && self.daily_tokens >= self.daily_token_cap)
-            || (self.credit_floor > 0 && self.credits_known && self.credits <= self.credit_floor)
+        self.daily_guard_line().is_some()
+    }
+
+    /// 同一条判据的**成因版**：`None` = 没挡住。
+    ///
+    /// 只此一处写「挡住了」的条件，[Entry::daily_guard_blocks] 与选号文案
+    /// （[Pool::daily_cap_excludes_all] → `forward::daily_guard_message`）都从这里
+    /// 投影 —— 否则会分叉出「布尔版说挡住了、成因版说不出为什么」。
+    ///
+    /// ⚠ 额度优先于积分：两个旋钮同时命中时报「今天用满了」更贴近用户刚做的事，
+    /// 且那条出路代价更小（等到本地零点即可）。交换顺序只会让文案偏保守。
+    fn daily_guard_line(&self) -> Option<GuardedLine> {
+        if self.daily_token_cap > 0 && self.daily_tokens >= self.daily_token_cap {
+            return Some(GuardedLine::DailyTokens);
+        }
+        if self.credit_floor > 0 && self.credits_known && self.credits <= self.credit_floor {
+            return Some(GuardedLine::Credits);
+        }
+        None
     }
 
     /// 报告该账号的**指定模型**当前是否可用。
@@ -1215,10 +1246,19 @@ impl Pool {
     ///
     /// `model` 与 `no_route_excludes_all` 一样当前不参与判定（护栏是**账号级**设置），
     /// 保留参数只为将来不改签名。
-    pub fn daily_cap_excludes_all(&self, product: &str, _model: &str, prefer: Region) -> (usize, usize) {
+    /// 返回值第三项 `credits_blocked` 是**被积分闸挡住**的账号数（`<= blocked`）：
+    /// 额度撞顶会随本地零点归零，积分闸不会，两者的出路不同 ⇒ 文案必须分叉
+    ///（见 [`GuardedLine`]）。判定复用同一条 `daily_guard_line()`，不另写一套。
+    pub fn daily_cap_excludes_all(
+        &self,
+        product: &str,
+        _model: &str,
+        prefer: Region,
+    ) -> (usize, usize, usize) {
         let now = SystemTime::now();
         let mut total = 0usize;
         let mut blocked = 0usize;
+        let mut credits_blocked = 0usize;
         for e in &self.entries {
             if !product.is_empty() && e.a.product_of() != product {
                 continue;
@@ -1236,11 +1276,16 @@ impl Pool {
                 continue;
             }
             total += 1;
-            if e.daily_guard_blocks() {
-                blocked += 1;
+            match e.daily_guard_line() {
+                Some(GuardedLine::DailyTokens) => blocked += 1,
+                Some(GuardedLine::Credits) => {
+                    blocked += 1;
+                    credits_blocked += 1;
+                }
+                None => {}
             }
         }
-        (blocked, total)
+        (blocked, total, credits_blocked)
     }
 
     /// 注入确定性随机源（仅供测试）；传 `None` 恢复真实随机。
@@ -2540,6 +2585,30 @@ impl Pool {
         if soonest_expire_at > 0 {
             e.expire_at = soonest_expire_at;
         }
+        self.dirty = true;
+    }
+
+    /// 只更新「最近到期积分」的到期时刻，**不动** `credits` / `credits_known`。
+    ///
+    /// # 为什么必须单独有一个（2026-10-14）
+    ///
+    /// 上游有时给得出到期日、却给不出额度口径（Trae 无限额包 = `credits_limit` `-1`，
+    /// 或权益包列表里一个正限额包都没有）。这种时候唯一诚实的做法是「只写到期日」：
+    /// 余额保持原样。
+    ///
+    /// ★ 若改走 [`Pool::set_credits_and_expiry`] 去「透传」池里的旧值，
+    /// 那条路径会顺手把 `credits_known` 置 true —— 一个**没人问过**的旧数字就被
+    /// 追认成了上游真值，积分闸（`credit_floor`）会拿它挡住账号，而且**不随日期恢复**：
+    /// 用户表现为「明明无限额，号却一直不被选中」。故这里刻意不碰那两样。
+    ///
+    /// `soonest_expire_at <= 0` 时什么都不做（与 [`Pool::set_credits_and_expiry`]
+    /// 同口径：0 = 「永久/未知」，不覆盖旧值）。
+    pub fn set_expiry_only(&mut self, uid: &str, soonest_expire_at: i64) {
+        if soonest_expire_at <= 0 {
+            return;
+        }
+        let Some(&idx) = self.by_uid.get(uid) else { return };
+        self.entries[idx].expire_at = soonest_expire_at;
         self.dirty = true;
     }
 
@@ -5790,7 +5859,7 @@ mod tests {
         p.set_daily_guard(100, 0);
 
         // 手工注入一个固定时钟，让「今天」可预测（`today_key` 走注入时钟）。
-        let today = 1_792_161_600_000; // 2026-10-14 12:00 +08:00
+        let today = 1_792_161_600_000; // 2026-10-16 22:40:00 +08:00（本机时区）
         s.set_now_for_test(today);
         let day1 = s.today_key();
         s.record_at("u1", "m1", &day1, cnt(500));
@@ -5905,13 +5974,13 @@ mod tests {
         s.record_at("u2", "m1", &s.today_key(), cnt(100));
         feed(&mut p, &s);
 
-        assert_eq!(p.daily_cap_excludes_all("", "m", Region::Any), (2, 2));
+        assert_eq!(p.daily_cap_excludes_all("", "m", Region::Any), (2, 2, 0));
 
         // 把 u2 冷却掉：它不再进分母 ⇒ 变成 1/1（仍然「全部触顶」）。
         p.cooldown("u2", CoolKind::Soft, Duration::from_secs(60), "test");
         assert_eq!(
             p.daily_cap_excludes_all("", "m", Region::Any),
-            (1, 1),
+            (1, 1, 0),
             "冷却中的账号不进分母（判据与 no_route_excludes_all 对齐）"
         );
 
@@ -5919,7 +5988,7 @@ mod tests {
         let mut p2 = Pool::new(String::new());
         p2.add(mk("only"));
         p2.set_daily_guard(100, 0);
-        assert_eq!(p2.daily_cap_excludes_all("", "m", Region::Any), (0, 1));
+        assert_eq!(p2.daily_cap_excludes_all("", "m", Region::Any), (0, 1, 0));
     }
 
     /// #9 护栏**不得**写进 `disabled` / `no_route`，也不得停掉养号路径。

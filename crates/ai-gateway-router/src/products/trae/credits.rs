@@ -428,13 +428,15 @@ pub(crate) async fn refresh_credits_once(
     fetch: &CreditsFetcher,
     cancel: &Cancel,
 ) -> (usize, usize) {
-    let entries: Vec<(String, Option<Auth>, i64)> = match pool.lock() {
+    // ★ 快照**刻意不带** st.credits：池里那个值没人问过上游，本轮任何分支都不该拿它
+    // 往回写（见下方 None 分支的注释）。不带进来 = 从结构上不可能再透传出去。
+    let entries: Vec<(String, Option<Auth>)> = match pool.lock() {
         Ok(p) => p
             .list()
             .into_iter()
             .map(|st| {
                 let a = p.auth_by_uid(&st.uid);
-                (st.uid, a, st.credits)
+                (st.uid, a)
             })
             .collect(),
         Err(e) => {
@@ -446,7 +448,7 @@ pub(crate) async fn refresh_credits_once(
     let mut processed = 0usize;
     let mut updated = 0usize;
 
-    for (uid, auth, current_credits) in entries {
+    for (uid, auth) in entries {
         if cancel.is_cancelled() {
             return (processed, updated);
         }
@@ -496,38 +498,48 @@ pub(crate) async fn refresh_credits_once(
         } else {
             "没有可用的额度口径"
         };
-        // 无限额（或没有额度口径）时 credits 透传**快照里的原值**，只把到期日写进去。
-        // 透传是安全的：同一个 uid 只有本循环会写 credits（scheduler 的产品闸门把
-        // 非 WorkBuddy 全部跳过），且本循环严格串行。
-        let value = match sample.credits {
-            Some(c) => Some(c),
-            None if expire > 0 => Some(current_credits),
-            None => None,
-        };
-        let Some(value) = value else {
-            crate::logline!(
-                "trae-credits {}: {why}且无到期日，本轮无可写字段（跳过）",
-                mask_uid(&uid)
-            );
-            continue;
-        };
-
-        match pool.lock() {
-            Ok(mut p) => {
-                p.set_credits_and_expiry(&uid, value, expire);
-                updated += 1;
-                if sample.credits.is_none() {
+        match sample.credits {
+            // 有额度口径：正常写 credits + 到期日。
+            Some(c) => match pool.lock() {
+                Ok(mut p) => {
+                    p.set_credits_and_expiry(&uid, c, expire);
+                    updated += 1;
+                }
+                Err(e) => crate::logline!(
+                    "Trae 积分刷新：账号池锁中毒，{} 本轮跳过（{e}）",
+                    mask_uid(&uid)
+                ),
+            },
+            // 没有额度口径（无限额 / 权益包里一个正限额都没有）：**只写到期日**。
+            //
+            // ★ 绝不能把池里的旧 credits「透传」回去 —— set_credits_and_expiry 会顺手
+            // 把 credits_known 置 true，一个没人问过的旧数字就被追认成上游真值，积分闸
+            // 会拿它挡住账号，而且**不随日期恢复**（用户看到的症状是「明明无限额，号却
+            // 一直不被选中」）。set_expiry_only 不碰 credits / credits_known，保住了
+            // 「未知」这个三态里的第三态。
+            None if expire > 0 => match pool.lock() {
+                Ok(mut p) => {
+                    p.set_expiry_only(&uid, expire);
+                    updated += 1;
                     crate::logline!(
                         "trae-credits {}: {why}（已用 {}）—— 跳过 credits 写入，仅更新到期日",
                         mask_uid(&uid),
                         sample.used
                     );
                 }
+                Err(e) => crate::logline!(
+                    "Trae 积分刷新：账号池锁中毒，{} 本轮跳过（{e}）",
+                    mask_uid(&uid)
+                ),
+            },
+            // 既没有额度口径、也没有到期日：本轮无可写字段。
+            None => {
+                crate::logline!(
+                    "trae-credits {}: {why}且无到期日，本轮无可写字段（跳过）",
+                    mask_uid(&uid)
+                );
+                continue;
             }
-            Err(e) => crate::logline!(
-                "Trae 积分刷新：账号池锁中毒，{} 本轮跳过（{e}）",
-                mask_uid(&uid)
-            ),
         }
     }
 
@@ -990,7 +1002,73 @@ mod tests {
         assert_eq!(
             pool_pair(&pool, "trae-9"),
             (5000, 1793462399),
-            "无限额：credits 原值透传，只更新到期日"
+            "无限额：池里旧 credits 原样留着，只更新到期日（不是写回、更不是追认）"
+        );
+    }
+
+    /// ★ 回归：池里那个**没人问过**的旧 credits 绝不能因为「本轮没有额度口径」被追认成
+    /// 上游真值。
+    ///
+    /// 旧写法把旧值经 `set_credits_and_expiry` 透传回池，那条路径会顺手把
+    /// `credits_known` 置 true —— 于是积分闸拿一个陈旧的低数字把账号挡住，而且
+    /// **不随日期恢复**（积分闸与每日额度不同，它没有零点归零这一说）。真机上表现为
+    /// 「明明无限额，号却一直不被选中」。这里用「状态文件读回的余额」复现陈旧值：
+    /// `apply_accounts` 刻意写 `credits_known: false`，正是这种「有数字但没人问过」
+    /// 的第三态。
+    #[tokio::test]
+    async fn unlimited_refresh_does_not_promote_stale_credits_to_truth() {
+        let dir = tmp_dir("no-promote");
+        let f1 = write_cred_file(&dir, "trae-9", "cn");
+
+        // 1) 造一个陈旧低余额并落盘（`set_credits` 会置 credits_known，属于已知态——
+        //    这里只是为了把数字写进状态文件）。
+        let state = dir.join("state.json");
+        let state_s = state.to_string_lossy().to_string();
+        {
+            let mut p = Pool::new(state_s.clone());
+            p.add(trae_auth("trae-9", &f1));
+            p.set_credits("trae-9", 5);
+            assert!(p.flush(), "余额已改，必须落盘");
+        }
+
+        // 2) 模拟网关重启：从状态文件读回，credits = 5 但 credits_known 必须是 false。
+        let pool = {
+            let mut p = Pool::new(state_s);
+            p.load_state();
+            p.add(trae_auth("trae-9", &f1));
+            // 一个一定会挡住任何**已知**余额的下限：5 <= 1000。
+            p.set_daily_guard(0, 1000);
+            Arc::new(Mutex::new(p))
+        };
+
+        let (fetch, _seen) = fake_fetcher(vec![Ok(CreditsSample {
+            credits: None,
+            soonest_expire_at: 1793462399,
+            unlimited: true,
+            used: 42,
+            counted_packs: 0,
+        })]);
+
+        let (processed, updated) = refresh_credits_once(&pool, &fetch, &Cancel::new()).await;
+
+        assert_eq!((processed, updated), (1, 1), "本轮确实处理并更新了到期日");
+        assert_eq!(
+            pool.lock()
+                .unwrap()
+                .status_by_uid("trae-9")
+                .unwrap()
+                .soonest_expire_at,
+            1793462399,
+            "到期日必须照写（它与额度大小无关）"
+        );
+        let p = pool.lock().unwrap();
+        assert!(
+            !p.status_by_uid("trae-9").unwrap().daily_guard,
+            "没人问过的旧余额不得被追认成真值 —— 追认了就会凭一个陈旧数字把号锁死"
+        );
+        assert!(
+            p.servable_now(),
+            "无限额账号在积分下限很高时仍必须可选中（余额未知 = 不拦）"
         );
     }
 

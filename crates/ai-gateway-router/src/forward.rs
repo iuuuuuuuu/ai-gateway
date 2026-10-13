@@ -1046,7 +1046,7 @@ pub async fn forward_chat(
             //
             // 反过来则无害：配置都对、只是今天额度用满 ⇒ 落到这里报 429。
             {
-                let (blocked, total) =
+                let (blocked, total, credits_blocked) =
                     lock_pool(ctx.pool).daily_cap_excludes_all(product, &model, route.region);
                 if total > 0 && blocked == total {
                     return (
@@ -1061,7 +1061,7 @@ pub async fn forward_chat(
                         Some(ForwardFailure {
                             kind: FailureKind::DailyGuardExceeded,
                             status: 429,
-                            message: daily_guard_message(total, blocked),
+                            message: daily_guard_message(total, blocked, credits_blocked),
                         }),
                     );
                 }
@@ -2251,30 +2251,55 @@ pub fn all_no_route_message(total: usize) -> String {
     )
 }
 
-/// 生成「今日额度已达上限」的说明（见 [`FailureKind::DailyGuardExceeded`]）。
+/// 生成「账号被本机每日护栏挡住」的说明（见 [`FailureKind::DailyGuardExceeded`]）。
 ///
 /// # 为什么必须把「什么时候恢复」说清楚
 ///
-/// 429 的默认解读是「稍后重试」。而这里拦住请求的是**本机自己设的每日上限**：
-/// 额度在**本地零点**归零，在那之前重试多少次都还是 429。若只回一句「已达上限」，
-/// 用户会一直重试到天亮；说清恢复时刻只需一句话，却是这条文案的全部价值。
+/// 429 的默认解读是「稍后重试」。而这里拦住请求的是**本机自己设的护栏**：
+/// 两个旋钮都有确定的出路（等本地零点 / 等积分回充 / 调旋钮），在那之前
+/// 重试多少次都是 429。若只回一句「已达上限」，用户会一直重试到天亮；
+/// 说清恢复方式只需一句话，却是这条文案的全部价值。
 ///
 /// ⚠ 措辞不能写成「故障」或「账号不可用」：账号是好的，护栏是本机设的，
 /// 用户随时可以调高上限立刻恢复。
-pub fn daily_guard_message(total: usize, capped: usize) -> String {
+///
+/// ⚠⚠ 恢复时刻**必须按成因分叉**（`credits_blocked`）：额度撞顶会在本地零点归零，
+/// 而余额跌破保留积分下限**不随日期恢复** —— 它只等积分巡撤回充。对后者说「过了
+/// 本地零点自动恢复」，用户会等一个永远不会自己到来的零点，并跳过唯一有效的操作。
+pub fn daily_guard_message(total: usize, capped: usize, credits_blocked: usize) -> String {
+    let why = daily_guard_recovery(credits_blocked);
+    // ⚠ 前半句也**不能**写死「用满了每日额度上限」：成因可能是积分闸（余额跌破下限），
+    // 那时用户根本没碰过 Token 上限，写死会把他引到错的旋钮上。
     if capped >= total {
         format!(
-            "该产品下的可用账号（共 {total} 个）今天都已经用满了你设置的每日额度上限，\
-所以本机暂时不给它们接新的对话。这不是故障 —— 额度按**本地日期**统计，\
-过了本地零点自动恢复；也可以调高每日 Token 上限 / 调低保留积分下限后立即恢复。"
+            "该产品下的可用账号（共 {total} 个）今天都被你设置的每日护栏挡住了，\
+所以本机暂时不给它们接新的对话。这不是故障 —— {why}"
         )
     } else {
         // 「有账号可用、却一个都选不出来」是另一类成因（模型/区域/冷却组合），
-        // 不能套用「全池触顶」的措辞 —— 那会把用户引到错误的方向。
+        // 不能套用「全池」的措辞 —— 那会把用户引到错误的方向。
+        format!("今天没有可用的账号：{capped} / {total} 个账号撞到了你设置的每日护栏。{why}")
+    }
+}
+
+/// 按成因给出**出路**（`daily_guard_message` 的后半句）。
+///
+/// ★ 两个旋钮的恢复方式不同，这是这个函数存在的全部理由：
+///
+/// - 额度撞顶：本地零点自动归零，用户**什么都不用做**；
+/// - 余额跌破下限：**不随日期恢复**，只能等积分巡撤回充，或把下限调低。
+///
+/// 混成一句「过了本地零点自动恢复」会让撞积分闸的用户去等一个不会到来的零点。
+pub fn daily_guard_recovery(credits_blocked: usize) -> String {
+    if credits_blocked > 0 {
         format!(
-            "今日额度已达上限：{capped} / {total} 个账号撞到了你设置的每日护栏（每日 Token 上限或保留积分下限）。\
-额度按**本地日期**统计，过了本地零点自动恢复。"
+            "其中 {credits_blocked} 个账号是**余额**跌破了保留积分下限，\
+余额**不会**随日期自动回来 —— 要等积分巡撤回充，或把保留积分下限调低后立即恢复；\
+其余撞到每日 Token 上限的账号过了本地零点自动归零。"
         )
+    } else {
+        "额度按**本地日期**统计，过了本地零点自动恢复；也可以调高每日 Token 上限后立即恢复。"
+            .to_string()
     }
 }
 
@@ -2773,22 +2798,100 @@ mod tests {
     /// 说清恢复时刻只需一句话，却是这条文案的全部价值。
     #[test]
     fn daily_guard_message_states_a_concrete_recovery_time() {
-        let m = daily_guard_message(3, 3);
+        let m = daily_guard_message(3, 3, 0);
         assert!(m.contains("3 个"), "{m}");
         assert!(m.contains("本地零点"), "{m}");
         assert!(m.contains("调高每日 Token 上限"), "{m}");
-        assert!(m.contains("保留积分下限"), "{m}");
         // ★ 必须说清「不是故障」—— 账号是好的，护栏是本机设的。
         assert!(m.contains("不是故障"), "{m}");
+        // ★★ 纯额度成因**不得**把出路说成「等积分回充」—— 那会让人白等一场。
+        assert!(!m.contains("保留积分下限"), "纯额度触顶不该提积分闸: {m}");
+    }
+
+    /// ★★ 撞的是**积分闸**时，出路必须换成「等积分回充 / 调低下限」。
+    ///
+    /// 这是本轮评审抓到的真实缺陷：余额跌破下限**不随日期恢复**，
+    /// 而原文案对两种成因一律说「过了本地零点自动恢复」⇒ 撞积分闸的用户
+    /// 会等一个永远不会自己到来的零点，并跳过唯一有效的操作。
+    #[test]
+    fn daily_guard_message_does_not_promise_a_midnight_reset_for_credits() {
+        let m = daily_guard_message(2, 2, 2);
+        assert!(m.contains("2 个"), "{m}");
+        assert!(m.contains("余额"), "{m}");
+        // ★ 对撞积分闸的号**不得**只说「过了本地零点自动恢复」—— 余额不会自己回来。
+        assert!(m.contains("余额**不会**随日期自动回来"), "{m}");
+        assert!(m.contains("积分巡撤回充"), "{m}");
+        assert!(m.contains("保留积分下限调低"), "{m}");
+        // ★ 只有「余额不会随日期回来」这句还不够 —— 必须同时给出额度那条的出路，
+        //   因为两个旋钮可以同时命中（额度优先报，但另一个号的成因可能不同）。
+        assert!(m.contains("本地零点"), "两个旋钮同时命中时必须两条出路都给: {m}");
     }
 
     /// 部分触顶（不可能到出口，但文案函数自身要能表达）不能套用「全池」措辞。
     #[test]
     fn daily_guard_message_distinguishes_partial_from_full() {
-        let m = daily_guard_message(5, 2);
+        let m = daily_guard_message(5, 2, 0);
         assert!(m.contains("2 / 5"), "{m}");
-        assert!(!m.contains("都已经用满"), "部分触顶不得说成「全池」: {m}");
+        assert!(!m.contains("都被你设置的每日护栏挡住"), "部分触顶不得说成「全池」: {m}");
         assert!(m.contains("本地零点"), "{m}");
+    }
+
+    /// ★★ 端到端：**凭据闸单独**把全池挡住时也走 429，且文案报的是积分出路。
+    ///
+    /// 与 `cap_today` 那条（走用量）刻意分开：两者是同一条出口的两个入口，
+    /// 而「余额跌破下限」这条**不随日期恢复** —— 它的文案必须来自凭据闸。
+    #[tokio::test]
+    async fn daily_guard_reports_credits_cause_end_to_end() {
+        let p = pool_with_products(&[("q1", "qoder")]);
+        {
+            let mut g = p.lock().unwrap();
+            // 先给一个**上游真值**（否则 credits_known == false ⇒ 积分闸 fail-open 不生效）。
+            g.set_credits("q1", 50);
+            g.set_daily_guard(0, 100);
+        }
+        let client = Client::new(ClientConfig::default()).unwrap();
+        let products = crate::products::ProductUpstreams::new();
+        let (unusual, waf_ip, empty_stream) = fresh_breakers();
+        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
+
+        let (_, status, fail) = forward_chat(
+            &mut c,
+            br#"{"model":"qoder:glm-5.3"}"#,
+            false,
+            "",
+            ImageRoute::any(),
+            "qoder",
+        )
+        .await;
+        assert_eq!(status, 429, "全池被积分闸挡住同样必须是 429");
+        let f = fail.expect("应返回失败");
+        assert_eq!(f.kind, FailureKind::DailyGuardExceeded);
+        // ★ 核心：不得把出路说成「等本地零点」。
+        assert!(f.message.contains("积分巡撤回充"), "{}", f.message);
+        assert!(f.message.contains("保留积分下限调低"), "{}", f.message);
+        // 账号本身没被弄坏。
+        let list = p.lock().unwrap().list();
+        assert!(list[0].daily_guard);
+        assert!(!list[0].disabled);
+        assert!(!list[0].no_route);
+    }
+
+    /// ★ 反向保证：**额度为 0 且余额未知**时积分闸必须 fail-open（不拦任何请求）。
+    ///
+    /// `credits_known == false` = 「没人问过上游」，不是「余额是 0」。
+    /// 把它当成 0 会让每个刚启动的网关把所有账号拦死 —— 那是比原缺陷更坏的故障。
+    #[tokio::test]
+    async fn daily_guard_stays_open_when_credits_are_unknown() {
+        let p = pool_with_products(&[("q1", "qoder")]);
+        p.lock().unwrap().set_daily_guard(0, 100);
+        let s = crate::usage::Stats::new(String::new());
+        {
+            let mut g = p.lock().unwrap();
+            g.refresh_daily_usage(&s);
+        }
+        let list = p.lock().unwrap().list();
+        assert!(!list[0].daily_guard, "余额未知不得被当成 0 而拦住账号");
+        assert!(p.lock().unwrap().servable_now());
     }
 
     #[tokio::test]
