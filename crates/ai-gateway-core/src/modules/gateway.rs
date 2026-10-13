@@ -7420,6 +7420,45 @@ mod tests {
         FakeGatewayChild(None)
     }
 
+    /// 「专测端口」的基准。
+    ///
+    /// ★★ 2026-10-13 事故：CI 的 `check / macos-14` 腿又红了一次（run 38354006219），
+    /// 挂掉的正是 `kill_rejects_free_port` —— 报「端口 59873 被占用，但无法识别占用
+    /// 进程」，而本机、ubuntu、windows 三条腿都是绿的。
+    ///
+    /// 根因不是守卫写得不严，而是那些端口**本身就在操作系统的临时端口范围内**：
+    /// macOS 49152–65535、Linux 默认 ip_local_port_range 32768–60999、
+    /// Windows 默认动态范围 49152–65535（本机 `netsh int ipv4 show dynamicport tcp`
+    /// 实测 Start 49152 / 16384 个）。于是 runner 上任何一条短命出站连接都能随机占住
+    /// 它：`port_free(port)` 查完到 `kill_port_holder(port)` 用它之间，端口就可能没了。
+    /// 2026-10-09 那次「再采样一次」的补丁治不了这个病，它只能降低概率。
+    ///
+    /// 所以基准取 24_870 —— **低于三个平台的临时端口范围**，且 24xxx 段没有转发/回环
+    /// 之外的常规用途，正常机器上不会有人监听它。
+    const TEST_PORT_BASE: u16 = 24_870;
+
+    /// 取一个「专测端口」（槽位各自独立，见下）。
+    ///
+    /// 为什么每个用例要占**独立**的槽位：端口与「端口上是我们的网关」这份认领状态
+    /// 都是**进程级 static**，而 cargo 默认多线程跑测试、它们又都在同一个测试二进制
+    /// 里 —— 共用端口会让互不相干的用例互相串味，并制造假绿。
+    ///
+    /// 它只负责拼号，**不替调用方判空闲**：各用例原有的 `if !port_free(port) { return }`
+    /// 守卫必须保留（那是各用例自己的前提条件，集中在 helper 里会看不出用例真正依赖什么）。
+    fn test_port(slot: u16) -> u16 {
+        TEST_PORT_BASE + slot
+    }
+
+    // 专测端口必须待在操作系统的临时端口范围**之下**，否则上一条事故会复发。
+    // 三个平台里最小的是 Linux 的 32768，故上界取它。
+    #[test]
+    fn test_ports_stay_below_ephemeral_range() {
+        let highest = test_port(8);
+        assert!(
+            highest < 32_768,
+            "专测端口必须低于临时端口范围（Linux 最小 32768），否则又会随机被占，实际最高: {highest}"
+        );
+    }
     // 空槽位必须报「没在跑」—— 这正是网关被外部杀掉后的状态。
     #[test]
     fn is_running_is_false_without_child() {
@@ -7509,8 +7548,9 @@ mod tests {
     #[test]
     fn kill_rejects_free_port() {
         // 关键安全约束：端口空闲时绝不能去杀任何进程。
-        // 用一个极不可能被占用的高位端口，保证「空闲」前提成立。
-        let port = 59_873u16;
+        // 端口走 `test_port`（低于临时端口范围）—— 原来的 59_873 落在范围**内**，
+        // macOS runner 上会被短命连接随机占住，正是本用例 2026-10-13 红掉的原因。
+        let port = test_port(3);
         if !port_free(port) {
             return; // 环境异常（真被占用），跳过而不是误报
         }
@@ -7523,6 +7563,12 @@ mod tests {
         // 之间的竞态** —— macOS runner（以及任何有短命临时端口的机器）可能在
         // 这两次调用之间把该端口临时占上，于是这里拿到「被占用，但无法识别占用
         // 进程」而误报。实测：macos-14 腿就是这条红。
+        //
+        // ★★ 2026-10-13：上面这段「再采样一次」只是**降概率**，治不了病 —— 病根是
+        // 59_873 落在操作系统的临时端口范围**内**（macOS 49152–65535），macos-14 腿
+        // 于是又红了一次（run 38354006219）。真正的修法见本模块开头 `TEST_PORT_BASE`
+        // 那段：把专测端口搬到范围**之下**。守卫与下面的复核都保留 —— 它们现在只在
+        // 「这台机器上真有人占了 24xxx」时才生效。
         //
         // 修法：先把「真被占用」的情形识别出来并跳过（那属于环境噪声，不是被测
         // 行为），**只在确认端口空闲时**才要求文案是「空闲」。
@@ -7546,7 +7592,7 @@ mod tests {
 
     #[test]
     fn inspect_port_reports_null_holder_when_free() {
-        let port = 59_874u16;
+        let port = test_port(4);
         if !port_free(port) {
             return;
         }
@@ -7643,7 +7689,7 @@ mod tests {
     // 端口空闲时绝不返回 PID —— 后面紧接着就是 taskkill，这里错一次就是误杀。
     #[test]
     fn claimed_gateway_pid_is_none_for_free_port() {
-        let port = 59_876u16;
+        let port = test_port(6);
         if !port_free(port) {
             return; // 环境异常（真被占用），跳过而不是误报
         }
@@ -7762,7 +7808,7 @@ mod tests {
     #[test]
     fn claimed_gateway_recency_follows_ttl() {
         let _serial = sync_state_lock();
-        let port = 59_877u16;
+        let port = test_port(7);
 
         reset_claim_globals();
         assert!(
@@ -7802,7 +7848,7 @@ mod tests {
     #[test]
     fn claimed_gateway_recency_survives_clock_rollback() {
         let _serial = sync_state_lock();
-        let port = 59_878u16;
+        let port = test_port(8);
 
         reset_claim_globals();
         note_claimed_gateway(port);
@@ -8451,10 +8497,12 @@ p42\ncjava\nf9\nn*:8080\n";
         // 用一个必然空闲的端口触发「空闲」分支是另一条测试；这里针对的是
         // 「无法识别」分支的文案本身（它由 port_holder_manual_hint 提供）。
         // 直接调用被 kill_port_holder 复用的那个函数，保证两边不会漂移。
-        let hint = port_holder_manual_hint(59_876);
+        let hint = port_holder_manual_hint(test_port(6));
+        // 断言端口号被**完整**拼进了提示：原来只断言首位数字（"59"），那种断言
+        // 在换端口之后依然会绿，等于没钉住任何东西。
         assert!(
-            hint.contains("59") || hint.contains("59876"),
-            "提示应包含端口信息，实际: {hint}"
+            hint.contains("24876"),
+            "提示应包含端口信息（完整十进制形态），实际: {hint}"
         );
         // 关键：提示不能是空串 —— 空串会让前端弹出一个没有任何信息的错误框
         assert!(!hint.trim().is_empty(), "无法识别时必须给出可操作的提示");
@@ -8743,7 +8791,7 @@ p42\ncjava\nf9\nn*:8080\n";
     /// 复位「认领了端口上的网关」这份跨调用状态。
     ///
     /// 它是**进程级 static**，而 cargo 默认多线程跑测试：不复位就会串味 ——
-    /// 一个测试认领了端口 59_877，另一个测试的 `inspect_port()` 会莫名其妙
+    /// 一个测试认领了端口 24_877，另一个测试的 `inspect_port()` 会莫名其妙
     /// 报「当前网关正在使用」。
     fn reset_claim_globals() {
         CLAIMED_GATEWAY_PORT.store(0, Ordering::SeqCst);
