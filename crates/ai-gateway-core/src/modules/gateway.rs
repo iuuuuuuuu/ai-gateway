@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::modules::account;
@@ -512,7 +512,11 @@ enum SyncAction {
 
 /// 决定自动同步本轮的动作。判定顺序即优先级，不可调换：
 ///   1. 没有待生效的变更 → 空转（绝大多数轮次走这里）
-///   2. 网关没在跑 → 无需重启（下次启动自然读到新凭证）
+///   2. 网关没在跑 → 无需重启（没有进程可重启，凭证也没人读）
+///      ⚠ 「没在跑」不等于「不管了」：把网关重新拉起来是**存活监督**的职责
+///      （`ensure_gateway_running`，`run_auto_sync_loop` 每轮在调用本函数**之前**
+///      先跑它），而且监督拉起来的是**新**进程 —— 它启动时就会扫最新凭证。
+///      所以这里清掉待办标志是对的，前提正是「先补拉、再判动作」这个顺序。
 ///   3. 任务在跑且未达上限 → 推迟（**不重启**，避免切断在途请求）
 ///   4. 其余（含推迟超限）→ 重启
 fn decide_sync_action(
@@ -755,13 +759,35 @@ async fn apply_pending_restart() {
 ///
 /// 由 GUI / server 的启动流程调用，永续运行。
 ///
-/// 重启一律经 `apply_pending_restart`：那里统一处理「任务在跑就先别重启」，
-/// 本函数不再自己调 stop/start（分散写会让忙标志被绕过）。
+/// **重启**一律经 `apply_pending_restart`：那里统一处理「任务在跑就先别重启」，
+/// 本函数不再自己写 stop/start（分散写会让忙标志被绕过）。
+///
+/// 唯一的例外是**存活监督**（`ensure_gateway_running`）：网关「应当活着却不在」
+/// 时它会直接调 `start_gateway`。它不属于「重启」—— 没有进程可停，不会切断在途
+/// 请求，因此也不必让忙标志让路；养号任务在跑时反而更需要网关在线。
 pub async fn run_auto_sync_loop(interval_secs: u64) {
     let interval = std::time::Duration::from_secs(interval_secs.max(5));
+    // ★ 存活监督的播种：配置里勾了「随 App 启动」就意味着「网关应当活着」。
+    //
+    // 这一句同时覆盖两种开机场景：`maybe_autostart` 那次启动**成功**（网关随后被
+    // 外力杀掉）与它**还没跑完**（本函数在它之前就被 spawn 了，见 `lib.rs` 的
+    // `spawn_background_loops`）。不播种的话，开机后第一轮监督会因为「没人表过态」
+    // 而什么都不做 —— 正是本次要修的现场。
+    sample_alive_wanted(&load_gateway_config());
     // 启动先同步一次，保证首屏即是最新
     if sync_if_changed() {
         SYNC_RESTART_PENDING.store(true, Ordering::SeqCst);
+    }
+    // ⚠ 顺序：先补拉、再决定要不要重启。
+    //
+    // 反过来的话，`apply_pending_restart` 会在「网关没在跑」时判 Idle 并把待生效
+    // 标志清掉（它没做错 —— 那一刻确实不该重启），而补拉起来的新进程启动时就
+    // 扫了最新凭证，标志本来也已无意义。先补拉则这一轮就能结束「账号变了但网关
+    // 不在」的状态，用户不必等下一轮。
+    let cfg = load_gateway_config();
+    if ensure_gateway_running(&cfg).await.is_fresh() {
+        SYNC_RESTART_PENDING.store(false, Ordering::SeqCst);
+        SYNC_DEFER_ROUNDS.store(0, Ordering::SeqCst);
     }
     apply_pending_restart().await;
     loop {
@@ -770,6 +796,18 @@ pub async fn run_auto_sync_loop(interval_secs: u64) {
         // 指纹在检测到变化的当轮就被更新了，被推迟的重启需要靠待办标志活到下一轮。
         if sync_if_changed() {
             SYNC_RESTART_PENDING.store(true, Ordering::SeqCst);
+        }
+        // 每轮重采样 `auto_start`：用户在界面上开关「随 App 启动」之后，
+        // 监督意图最迟在下一轮（≤30 秒）跟上，不必重启 App。
+        let cfg = load_gateway_config();
+        sample_alive_wanted(&cfg);
+        // 长期存活监督（本次修复的核心）：网关**应当**在跑却没在跑，就把它拉回来。
+        // 只有「本轮新起了一个进程」才清待生效标志 —— 它启动时读的就是最新凭证；
+        // 「本来就在跑」那一支绝不能清，否则账号变更会被永远压住（那正是
+        // `SYNC_RESTART_PENDING` 的注释反复警告的失效模式）。
+        if ensure_gateway_running(&cfg).await.is_fresh() {
+            SYNC_RESTART_PENDING.store(false, Ordering::SeqCst);
+            SYNC_DEFER_ROUNDS.store(0, Ordering::SeqCst);
         }
         apply_pending_restart().await;
     }
@@ -1421,6 +1459,251 @@ fn attach_child_to_job(child: &Child) {
 /// 现在真值只有一个来源：`proc_slot()` 里那个子进程是否还活着。
 pub fn is_running() -> bool {
     child_alive()
+}
+
+/// 「宿主应当让网关活着」这一意图。
+///
+/// # 为什么必须有它（2026-10-13 业主现场）
+///
+/// 业主原话：「我刚重启之后,虽然软件跟随启动了,但是并没有网关也跟随启动」。
+///
+/// 现场物证：开机后 App 由 `HKCU\...\Run` 拉起，网关 11:02:31.989 打印
+/// `listening`，11:02:33.014 之后再无任何输出，且没有停止日志、没有 panic、
+/// 没有 Application Error、没有 WER —— 子进程是在 ~20 秒的窗口里**被外力抹掉**的。
+/// 而宿主对此完全无感：`maybe_autostart` 只在 setup 里跑一次，
+/// `ensure_gateway_alive` 那句「等 1.5 秒再确认一次」也早就过去了，
+/// 之后**再没有任何人看过它一眼**，直到 5 分钟后用户手动点「启动」才又起来一个。
+///
+/// 所以本次要修的不是「它怎么死的」（那一环至今未归因），而是「死了没人管」。
+///
+/// # 语义
+///
+/// 记的是**意图**，不是**事实**（事实永远是 `is_running()`）：
+///   * 用户点「启动」/「重启」、开机自启成功 ⇒ `WANTED`，此后被外力杀掉就该补拉；
+///   * 用户点「停止」⇒ `STOPPED`，此后**绝不**自动补拉（否则用户永远关不掉它）；
+///   * 还没人表态 ⇒ `UNKNOWN`，配置里 `auto_start` 为真时采样会把它变成 `WANTED`；
+///   * 随 App 退出 ⇒ 由 `RunEvent::Exit` 收尾，这里不动。
+///
+/// 三态常量见下（`ALIVE_UNKNOWN` / `ALIVE_WANTED` / `ALIVE_STOPPED`）。
+
+/// 还没人表态过（宿主刚起来、配置还没采样）。
+const ALIVE_UNKNOWN: u8 = 0;
+/// 应该让网关活着（用户点过启动/重启，或配置里 `auto_start` 为真）。
+const ALIVE_WANTED: u8 = 1;
+/// 用户明确点过「停止」：在用户重新点「启动」之前**绝不**自动补拉。
+const ALIVE_STOPPED: u8 = 2;
+
+/// 「宿主应当让网关活着」这一意图（三态，见 `ALIVE_UNKNOWN`/`ALIVE_WANTED`/`ALIVE_STOPPED`）。
+///
+/// # 为什么是三态而不是 `bool`（2026-10-13 实测现场）
+///
+/// 早先写成 `AtomicBool` + 「`auto_start` 为真就置位、永不清位」，理由是
+/// 「用户点过停止之后配置里 `auto_start` 很可能仍是 true，清位会把停止自己撤销」。
+/// 但那个写法把**两个方向**都做错了：
+///
+///   * 「永不清位」挡不住「重新置位」—— 用户 13:13:32 点了停止，13:13:53 的
+///     那一轮采样又把意图置回 true，网关在 2 秒后被监督拉起来。
+///     用户眼里的现象就是「点了停止，网关过一会儿自己又活了」。
+///   * `bool` 的初值 `false` 与「用户要求停止」在语义上**撞车**：宿主刚起来、
+///     还没采样配置时，`false` 是「还没决定」而不是「用户不要」。
+///
+/// 三态把「还没决定」与「明确不要」分开：采样**只在 `UNKNOWN` 时**生效，
+/// 一旦变成 `STOPPED` 就只有用户重新点「启动」能翻转它。
+static GATEWAY_ALIVE_STATE: AtomicU8 = AtomicU8::new(ALIVE_UNKNOWN);
+
+/// 标记「宿主应当让网关活着」（见 `GATEWAY_ALIVE_STATE`）。
+///
+/// `true` 会**清掉**停止闩锁（用户点了启动/重启，之前那次停止作废）；
+/// `false` 是用户点「停止」，闩死到下一次 `true`。
+pub fn set_gateway_alive_wanted(wanted: bool) {
+    GATEWAY_ALIVE_STATE.store(if wanted { ALIVE_WANTED } else { ALIVE_STOPPED }, Ordering::SeqCst);
+}
+
+/// 当前是否「应当让网关活着」（存活监督的总开关）。
+pub fn gateway_alive_wanted() -> bool {
+    GATEWAY_ALIVE_STATE.load(Ordering::SeqCst) == ALIVE_WANTED
+}
+
+/// 按配置里的 `auto_start`（界面上的「随 App 启动」）采样存活监督意图。
+///
+/// **只在 `UNKNOWN` 时**生效：
+///   * `UNKNOWN` + `auto_start` 为真 ⇒ 置 `WANTED`（开机自启这一路：宿主的
+///     `maybe_autostart` 与后台循环谁先跑到都行）；
+///   * `UNKNOWN` + `auto_start` 为假 ⇒ 保持 `UNKNOWN`（用户还没表态，
+///     下一轮采样仍可把它打开，开关改了就生效）；
+///   * `WANTED` / `STOPPED` ⇒ 什么都不做。`WANTED` 不用重复置位；
+///     `STOPPED` 更是**绝不能**被覆盖 —— 那正是「点了停止又自己活了」。
+fn sample_alive_wanted(cfg: &Value) {
+    if cfg.get("auto_start").and_then(Value::as_bool).unwrap_or(false)
+        && GATEWAY_ALIVE_STATE.load(Ordering::SeqCst) == ALIVE_UNKNOWN
+    {
+        GATEWAY_ALIVE_STATE.store(ALIVE_WANTED, Ordering::SeqCst);
+    }
+}
+
+/// 启动守卫：同一时刻只允许**一次**启动尝试，避免并发 spawn 撞端口。
+///
+/// 现在有两个可能同时想拉起网关的异步路径：后台存活监督（每 30 秒一轮）与
+/// 开机自启。二者都是「先 `is_running()`、再 `start_gateway`」，中间隔着账号导出、
+/// 写原生配置等好几步 `await` —— 两边同时通过检查就会同时 `spawn`，
+/// 后到的那份必然撞上「端口已被占用」。
+///
+/// 用 `compare_exchange` 的 RAII 闸门（与 `switcher::ActionGate` 同一范式）：
+/// **任何**退出路径都会释放，含 `?` 提前返回与 panic。
+static GATEWAY_STARTING: AtomicBool = AtomicBool::new(false);
+
+struct GatewayStartGuard;
+
+impl GatewayStartGuard {
+    fn acquire() -> Option<Self> {
+        GATEWAY_STARTING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| GatewayStartGuard)
+    }
+}
+
+impl Drop for GatewayStartGuard {
+    fn drop(&mut self) {
+        GATEWAY_STARTING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 最近一次「补拉网关」失败的原因，只用于退避判据。
+///
+/// 原因没变就不必每 30 秒重试一次（那会每轮白烧一次账号导出 + 20 秒就绪等待），
+/// 每 `GATEWAY_RETRY_EVERY_ROUNDS` 轮再试；换了个错法就立刻重试。
+static LAST_REVIVE_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// 同一个失败原因下多少轮才重试一次（一轮 = 自动同步循环的间隔，默认 30 秒）。
+///
+/// 10 轮 ≈ 5 分钟：既不让「网络恢复后网关自动回来」等太久，也不让一个必然失败的
+/// 状态（账号库为空、端口被别的程序占着）变成每半分钟一次的噪音。
+const GATEWAY_RETRY_EVERY_ROUNDS: usize = 10;
+
+/// 存活监督的轮询计数（配合 `LAST_REVIVE_ERROR` 做退避）。
+static REVIVE_ROUNDS: AtomicUsize = AtomicUsize::new(0);
+
+/// `start_gateway` 在「拿不到启动闸门」时返回的文案。
+///
+/// 单独提成常量是因为**调用方要认它**：存活监督拿它区分「启动真的失败了」与
+/// 「别人正在启动」—— 后者不是失败，不该计入退避（见 `gateway_start_busy`）。
+const GATEWAY_START_BUSY_MSG: &str = "网关正在启动中，请稍候";
+
+/// `start_gateway` 的这条错误是不是「另一次启动正在进行」而不是「启动失败」。
+///
+/// `start_gateway` 开头有 `is_running()` 与启动闸门两道互斥：撞上任何一道都说明
+/// **别人正在管这件事**（用户点了启动、另一次监督、串行化的重启），本轮什么都不用做。
+/// 若把它当成失败记进 `LAST_REVIVE_ERROR`，退避就会白等 `GATEWAY_RETRY_EVERY_ROUNDS`
+/// 轮（≈5 分钟）才再试一次 —— 而那次启动很可能几秒内就成功了，
+/// 中间这 5 分钟就是用户眼里的「点了启动，网关半天不出来」。
+fn gateway_start_busy(err: &str) -> bool {
+    err == GATEWAY_START_BUSY_MSG || err == "网关已在运行"
+}
+
+/// 存活监督一轮的结果。
+///
+/// 之所以要区分「本来就在跑」与「本轮新拉起来的」，是因为两者的**凭证新鲜度**不同：
+/// 端口上那个进程是拿它**启动时**的凭证在跑的，有待生效的账号变更时仍然需要重启它；
+/// 而本轮新起的进程启动时就扫了最新的 auths/ 目录。混为一谈会让
+/// `SYNC_RESTART_PENDING` 被提前清掉 —— 那就是「账号加了但网关永远不加载」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviveOutcome {
+    /// 网关本来就活着（本进程托管的，或端口上认领到的）：本轮什么都没做。
+    AlreadyRunning,
+    /// 本轮新拉起了一个进程（它启动时读的就是最新凭证）。
+    Started,
+    /// 没动手：用户没要求它活着、别人正在启动、退避中，或补拉失败。
+    Idle,
+}
+
+impl ReviveOutcome {
+    /// 是否是**本轮新起**的进程（凭证必然是最新的）。
+    fn is_fresh(self) -> bool {
+        matches!(self, ReviveOutcome::Started)
+    }
+}
+
+/// 存活监督：网关**应当**在跑却没在跑时，把它拉回来。
+///
+/// 这是「重启电脑后网关没跟随启动」的正解 —— 自启只负责**第一次**，
+/// 之后由本函数在后台循环里长期盯着（`run_auto_sync_loop` 每轮调一次）。
+/// 用户点过「停止」之后状态是 `ALIVE_STOPPED`，这里直接返回：
+/// 监督绝不跟用户作对。
+///
+/// 返回本轮做了什么（见 `ReviveOutcome`）。
+///
+/// # 为什么先认领、再启动
+///
+/// 端口上可能已经有本程序的网关在跑，只是**不是本进程托管**的（上次运行的遗留、
+/// 用户手工启动）。Windows 上父进程无法接管一个既有进程，此时 `start_gateway`
+/// 必然报「端口已被占用」—— 那就是「明明能用却说失败」。所以先按与状态页
+/// **完全一致**的判据（探活 + 身份校验）认领它，认领成功即算在跑。
+///
+/// ⚠ 认领这一支**不**写 `last_status`：端口被占用时 `should_adopt_gateway` 每轮
+/// 都为真，写一次运行态就等于每 30 秒重写一遍 `gateway_config.json`（每次都刷新
+/// mtime），而端口上确实有一个健康的网关在服务 —— 状态页（走 `gateway_status`）
+/// 本来就会显示「运行中」，两边不会分叉。
+async fn ensure_gateway_running(cfg: &Value) -> ReviveOutcome {
+    if GATEWAY_ALIVE_STATE.load(Ordering::SeqCst) != ALIVE_WANTED {
+        return ReviveOutcome::Idle;
+    }
+    if is_running() {
+        return ReviveOutcome::AlreadyRunning;
+    }
+    let port = port_of(cfg.get("listen").and_then(Value::as_str).unwrap_or(""));
+    // 只在「端口上确实有东西」时才值得花那 1.2 秒探活（与 `maybe_autostart` 同判据）。
+    if should_adopt_gateway(port, port_free_fast(port)) && adopt_running_gateway(port).await {
+        return ReviveOutcome::AlreadyRunning;
+    }
+    // 退避：同一个失败原因不必每轮都重试（见 `GATEWAY_RETRY_EVERY_ROUNDS`）。
+    let round = REVIVE_ROUNDS.fetch_add(1, Ordering::SeqCst) + 1;
+    let last = LAST_REVIVE_ERROR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if last.is_some() && round % GATEWAY_RETRY_EVERY_ROUNDS != 0 {
+        return ReviveOutcome::Idle;
+    }
+    // ⚠ 这里**不能**先抢 `GatewayStartGuard` 再调 `start_gateway`：那道闸门是不可
+    // 重入的 `AtomicBool`，而 `start_gateway` 自己进门第一件事就是拿它 —— 监督先
+    // 拿了，它必然拿到 `None`、必然返回「网关正在启动中，请稍候」，于是**永远**
+    // 补拉不起来。2026-10-13 实测现场正是这样：夹具配置里被反复写入
+    // `last_error: 网关正在启动中，请稍候`，而网关一次都没起来过。
+    //
+    // 互斥的唯一持有者是 `start_gateway`（它在 `is_running()` 之后、`resolve_gateway_exe()`
+    // 之前拿闸门），本函数只负责「调用 + 记账」。
+    let err = match start_gateway(cfg).await {
+        Ok(_) => {
+            LAST_REVIVE_ERROR
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            REVIVE_ROUNDS.store(0, Ordering::SeqCst);
+            update_runtime_state("started", None);
+            return ReviveOutcome::Started;
+        }
+        Err(e) => e,
+    };
+    // 撞上互斥（别人正在启动 / 已经在跑）**不是失败**：不记错误、不推进退避。
+    // 记了就会白等 `GATEWAY_RETRY_EVERY_ROUNDS` 轮（≈5 分钟）才再试一次，
+    // 而那次启动很可能几秒内就成了 —— 中间这 5 分钟就是用户眼里的
+    // 「网关点了启动却半天不出来」。下一轮（默认 30 秒后）自然会再来看一眼。
+    if gateway_start_busy(&err) {
+        return ReviveOutcome::Idle;
+    }
+    let first_time = {
+        let mut slot = LAST_REVIVE_ERROR.lock().unwrap_or_else(|e| e.into_inner());
+        let first = slot.as_deref() != Some(err.as_str());
+        *slot = Some(err.clone());
+        first
+    };
+    // 只在**换了个错法**时写运行态：同一个原因反复写，只会每隔几分钟重写一次
+    // gateway_config.json（每次都刷新 mtime），对用户没有任何新信息。
+    if first_time {
+        update_runtime_state("failed", Some(err));
+    }
+    ReviveOutcome::Idle
 }
 
 /// 子进程存活判定，顺带回收已退出的句柄（见 `is_running` 的说明）。
@@ -3487,6 +3770,19 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
     if is_running() {
         return Err("网关已在运行".to_string());
     }
+    // 启动闸门：后台存活监督（`ensure_gateway_running`）与用户点「启动」可能同时
+    // 走到这里 —— 两边都会 spawn 一个子进程并撞上同一个端口（后到的那个报
+    // 「端口已被占用」）。拿不到闸门说明已经有人在启动，按「稍后再看」返回。
+    //
+    // ⚠ 本函数是这道闸门的**唯一持有者**：`ensure_gateway_running` 只调用本函数、
+    // 自己不抢闸门。曾让它先抢再调本函数，结果闸门不可重入 ⇒ 监督每次都被挡回
+    // 「网关正在启动中，请稍候」，网关永远补拉不起来（2026-10-13 实测现场）。
+    // 调用方要认这条文案时用 `GATEWAY_START_BUSY_MSG`，别抄字面量。
+    //
+    // RAII 释放：`?` 提前返回、`return Err(...)`、panic 都会走到 `Drop`。
+    let Some(_start_gate) = GatewayStartGuard::acquire() else {
+        return Err(GATEWAY_START_BUSY_MSG.to_string());
+    };
     let Some(exe) = resolve_gateway_exe() else {
         return Err(format!(
             "未找到网关可执行文件 {}（可用环境变量 AI_GATEWAY_ROUTER_BIN 指定路径）",
@@ -3633,6 +3929,11 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
                 );
             }
             Ok(v) => {
+                // 启动成功 = 「应当让它活着」的意图成立：此后它被外力杀掉就该补拉
+                // （见 `GATEWAY_ALIVE_STATE`）。这里置 `WANTED` 而不是调用
+                // `set_gateway_alive_wanted(true)` 只是为了少一层调用 —— 语义相同：
+                // 用户点过「停止」后**用户自己**再点「启动」走的也是这条路径。
+                GATEWAY_ALIVE_STATE.store(ALIVE_WANTED, Ordering::SeqCst);
                 return Ok(json!({
                     "started": true,
                     "base": format!("http://127.0.0.1:{port}"),
@@ -3647,6 +3948,9 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
     }
 
     stop_gateway();
+    // ⚠ 这里**故意不**撤销「应当让它活着」的意图：这条路径会在超时后回滚
+    //（把刚起来的子进程停掉），而 2026-10-13 现场正是「起来了、又悄悄没了」
+    // —— 若连意图一起撤销，存活监督就再也不会去补拉它，用户的现场会被原样复刻。
     Err(format!("网关启动超时（端口 {port}）：{last_err}"))
 }
 
@@ -4282,6 +4586,10 @@ pub async fn maybe_autostart() -> Option<Value> {
     if !auto {
         return None;
     }
+    // 配置里勾着「随 App 启动」= 「网关应当活着」：把存活监督的意图立起来，
+    // 下面三条早退分支（已在跑 / 认领到 / 刚重启）就都落在这条监督之下。
+    // 用户点「停止」会把它清回去，所以这里跟着开关走是安全的。
+    sample_alive_wanted(&cfg);
     // 已在运行（如上次退出未清理干净）时不重复启动，但仍同步一次运行态。
     if is_running() {
         update_runtime_state("started", None);
@@ -4330,20 +4638,23 @@ pub async fn maybe_autostart() -> Option<Value> {
     match start_gateway(&cfg).await {
         Ok(v) => {
             update_runtime_state("started", None);
-            // ★★ 2026-10-09 业主现场：「重启电脑之后，网关没有跟随启动」。
+            // ★★ 2026-10-09 与 2026-10-13 两次业主现场：「重启电脑之后，网关没有
+            // 跟随启动」。
             //
-            // 现场读数：宿主 11:19:55 起，网关 11:19:58 起（本函数成功过），
-            // 但用户 11:22 看时**已经不在了**，且日志里没有任何停止记录 ——
-            // 即「起来了、又悄悄没了」，而自启只跑一次、不会再看第二眼。
+            // 两次都是同一个形状：本函数**成功过**（网关确实起来了，子进程日志里有
+            // `listening`），但用户再看时它已经不在了，且没有任何停止记录 ——
+            // 即「起来了、又悄悄没了」。
             //
-            // 自启是**一次性**的（setup 里那个 spawn），所以任何「起来了但没能
-            // 留住」的情况都会静默退化成「开机没自启」。这里补一次**稍后再确认**：
-            // 若子进程已不在，就再拉一次，并把结论写进日志 —— 至少让下一次现场
-            // 有据可查，而不是像这次一样只能从两条 listening 记录反推。
-            let ok = ensure_gateway_alive(&cfg, "自启后确认").await;
-            eprintln!(
-                "[gateway] 随 App 启动：已拉起（配置 auto_start=true，存活确认={ok}）"
-            );
+            // 根因不在这一处，而在「自启只跑一次、之后再没人看过它一眼」。这里曾经
+            // 补过一句「等 1.5 秒再确认一次」，但 10-13 那次的子进程是在起来后
+            // **约 20 秒**才被抹掉的（11:02:33 之后再无输出），1.5 秒的确认早已过去
+            // —— 一次性确认再长也盖不住「之后任意时刻」。
+            //
+            // 真正的修法是长期存活监督：`run_auto_sync_loop` 每轮调
+            // `ensure_gateway_running`，网关**应当**在跑却没在跑就补拉，不设时限
+            // （「应当让它活着」的意图由 `start_gateway` 成功时置位，见
+            // `GATEWAY_ALIVE_STATE`）。本函数只负责把网关拉起来，不再自己
+            // 做一次性复查。
             Some(v)
         }
         Err(e) => {
@@ -4354,38 +4665,6 @@ pub async fn maybe_autostart() -> Option<Value> {
     }
 }
 
-/// 确认网关还活着；不在就再拉一次。返回「最终确认时它在跑吗」。
-///
-/// # 为什么需要它（2026-10-09 业主现场）
-///
-/// `maybe_autostart` 只在 setup 里跑**一次**。而 `start_gateway` 的成功判据是
-/// 「20 秒内端口探活通过」—— 它**不保证**之后还活着。业主现场正是这样：
-/// 11:19:58 起来了，11:22 用户看时已经没了，中间没有任何停止日志。
-/// 一次性的自启遇上「起来后立刻死」就等于「开机没自启」，且**完全静默**。
-///
-/// 这里做的很有限，刻意不做成常驻守护：只是「等一小会儿再问一句，不在就补一次」。
-/// 真正的存活监督属于宿主的主循环（那是另一件事，见 `spawn_background_loops`）。
-/// 之所以值得加：它把「静默失败」变成「日志里有一行」，并且顺手救回
-/// 「启动瞬间被外部因素打断」这一类偶发。
-async fn ensure_gateway_alive(cfg: &Value, why: &str) -> bool {
-    // 给子进程一点时间把「启动后立刻退出」暴露出来（配置错误、端口竞争等）。
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-    if is_running() {
-        return true;
-    }
-    eprintln!("[gateway] {why}：网关已不在运行，正在补拉一次");
-    match start_gateway(cfg).await {
-        Ok(_) => {
-            update_runtime_state("started", None);
-            true
-        }
-        Err(e) => {
-            eprintln!("[gateway] {why}：补拉失败: {e}");
-            update_runtime_state("failed", Some(e));
-            false
-        }
-    }
-}
 
 /// 账号库变化后同步到网关，并让运行中的网关热加载。
 ///
@@ -8481,6 +8760,298 @@ p42\ncjava\nf9\nn*:8080\n";
         clear_proc_slot_for_test();
         reset_claim_globals();
         *TASK_RUNTIME.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        reset_revive_globals();
+    }
+
+    /// 复位存活监督相关的全局状态（见 `reset_sync_globals` 的说明）。
+    ///
+    /// `GATEWAY_ALIVE_STATE` / `GATEWAY_STARTING` / `LAST_REVIVE_ERROR` /
+    /// `REVIVE_ROUNDS` 全是进程级 static：不复位就会串味 —— 一个测试把意图置位后，
+    /// 另一个测试的 `ensure_gateway_running` 会突然开始尝试拉网关。
+    ///
+    /// 意图复位到 `ALIVE_UNKNOWN`（不是 `ALIVE_STOPPED`）：这才是宿主刚起来的
+    /// 初始态，且 `STOPPED` 是闩锁，误用它会把后续测试全钉死。
+    fn reset_revive_globals() {
+        GATEWAY_ALIVE_STATE.store(ALIVE_UNKNOWN, Ordering::SeqCst);
+        GATEWAY_STARTING.store(false, Ordering::SeqCst);
+        REVIVE_ROUNDS.store(0, Ordering::SeqCst);
+        *LAST_REVIVE_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// 取出本文件里某个函数的源码正文（从签名那一行到第一个列 0 的 `}`）。
+    ///
+    /// 用于那些**编译期抓不到、只能在源码层面守**的约束 —— 典型是
+    /// 「监督不得自己抢启动闸门」：抢了照样编译通过、单测也照样过（谁都没真起
+    /// 网关），只有真机跑起来才会发现网关永远补拉不起来。
+    ///
+    /// 刻意用 `std::fs::read_to_string` + `env!("CARGO_MANIFEST_DIR")` 而不是
+    /// `include_str!`：后者会把本文件编进产物、改动后必须整包重编。
+    ///
+    /// ⚠ 读进来先归一化 CRLF —— 仓库在 Windows 上检出为 CRLF，不归一化时
+    /// `\n}\n` 找不到函数结尾，测试会以「找不到」失败，看着像代码问题。
+    fn source_body(sig: &str) -> String {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/modules/gateway.rs"
+        ))
+        .expect("读取 gateway.rs")
+        .replace("\r\n", "\n");
+        let start = src
+            .find(sig)
+            .unwrap_or_else(|| panic!("找不到 `{sig}`"));
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").expect("函数体必须有结束花括号");
+        rest[..end].to_string()
+    }
+
+    // 存活监督的总开关：用户没要求它活着时**一步都不能动**。
+    //
+    // 这是「点了停止它又自己回来」的回归钉子 —— 补拉逻辑一旦忽略这个意图，
+    // 用户就再也关不掉网关。
+    #[test]
+    fn revive_does_nothing_when_alive_not_wanted() {
+        let _serial = sync_state_lock();
+        reset_sync_globals();
+        reset_revive_globals();
+        // 换一个没人监听的端口，避免依赖本机 7863/7864 的实际占用情况。
+        let cfg = json!({ "listen": "127.0.0.1:57987", "auto_start": true });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let out = rt.block_on(ensure_gateway_running(&cfg));
+        assert_eq!(out, ReviveOutcome::Idle, "没表态要它活着时不得动手");
+        assert!(!is_running(), "更不得留下任何子进程");
+    }
+
+    // 网关本来就在跑：如实报「已在跑」，且**不得**去启动第二个进程。
+    #[test]
+    fn revive_reports_already_running_without_starting() {
+        let _serial = sync_state_lock();
+        reset_sync_globals();
+        reset_revive_globals();
+        let _fake_gateway = install_fake_gateway();
+        GATEWAY_ALIVE_STATE.store(ALIVE_WANTED, Ordering::SeqCst);
+        let cfg = json!({ "listen": "127.0.0.1:57987", "auto_start": true });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let out = rt.block_on(ensure_gateway_running(&cfg));
+        assert_eq!(out, ReviveOutcome::AlreadyRunning);
+        assert!(
+            !out.is_fresh(),
+            "它不是本轮新起的进程，凭证新鲜度不能按「刚启动」算"
+        );
+    }
+
+    // 同一个失败原因下的退避：不重试，也不留子进程。
+    #[test]
+    fn revive_backs_off_on_unchanged_error() {
+        let _serial = sync_state_lock();
+        reset_sync_globals();
+        reset_revive_globals();
+        GATEWAY_ALIVE_STATE.store(ALIVE_WANTED, Ordering::SeqCst);
+        *LAST_REVIVE_ERROR.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some("账号库为空".to_string());
+        // 第 1 轮不是 `GATEWAY_RETRY_EVERY_ROUNDS` 的整数倍 ⇒ 本轮不重试。
+        let cfg = json!({ "listen": "127.0.0.1:57987", "auto_start": true });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let out = rt.block_on(ensure_gateway_running(&cfg));
+        assert_eq!(out, ReviveOutcome::Idle, "同一原因未到重试轮次时不该重试");
+        assert_eq!(REVIVE_ROUNDS.load(Ordering::SeqCst), 1, "轮次要推进");
+        assert!(!is_running());
+    }
+
+    // 启动闸门：同一时刻只允许一次启动尝试，且**任何**退出路径都会释放。
+    //
+    // 后台存活监督与用户手点「启动」可能同时走到 `start_gateway`，两边都 spawn
+    // 就会撞同一个端口（后到的报「端口已被占用」）。
+    #[test]
+    fn start_guard_is_exclusive_and_released_on_drop() {
+        let _serial = sync_state_lock();
+        reset_revive_globals();
+        let first = GatewayStartGuard::acquire();
+        assert!(first.is_some(), "空闸门必须能拿到");
+        assert!(
+            GatewayStartGuard::acquire().is_none(),
+            "已持有时第二次必须拿不到（否则并发启动照旧）"
+        );
+        drop(first);
+        let again = GatewayStartGuard::acquire();
+        assert!(again.is_some(), "释放之后必须能重新拿到");
+        drop(again);
+        assert!(
+            !GATEWAY_STARTING.load(Ordering::SeqCst),
+            "Drop 之后闸门必须回到空（`start_gateway` 的 `?` 提前返回同样靠它）"
+        );
+    }
+
+    // 播种：只在**没人表态过**（`ALIVE_UNKNOWN`）时按 `auto_start` 立起意图。
+    //
+    // 2026-10-13 实测现场推翻了早先的写法：那时是「`auto_start` 为真就置位、永不清位」，
+    // 结果用户 13:13:32 点了停止、13:13:53 那一轮采样又把意图置回 true，
+    // 网关 2 秒后被监督拉起来 —— 用户眼里的现象是「点了停止它自己又活了」。
+    // 「永不清位」挡不住「重新置位」，所以这里改用三态：`STOPPED` 是闩锁。
+    #[test]
+    fn sample_alive_wanted_only_seeds_from_unknown() {
+        let _serial = sync_state_lock();
+        reset_revive_globals();
+        // 还没表态 + 没勾开关 ⇒ 仍然是「还没决定」，不是「不要」。
+        sample_alive_wanted(&json!({ "auto_start": false }));
+        assert!(
+            !gateway_alive_wanted(),
+            "没勾「随 App 启动」时不该凭空立起意图"
+        );
+        assert_eq!(
+            GATEWAY_ALIVE_STATE.load(Ordering::SeqCst),
+            ALIVE_UNKNOWN,
+            "读到一个 false 不能把它变成「用户要求停止」——那是两回事"
+        );
+        // 还没表态 + 勾了开关 ⇒ 立起意图（开机自启这一路）。
+        sample_alive_wanted(&json!({ "auto_start": true }));
+        assert!(gateway_alive_wanted(), "勾了就必须立起来");
+        // 已经是 `WANTED` 之后关掉开关**不得**清位（清位只由用户点「停止」触发）。
+        sample_alive_wanted(&json!({ "auto_start": false }));
+        assert!(
+            gateway_alive_wanted(),
+            "播种只能置位、不能清位，否则「停止」会被自动撤销"
+        );
+    }
+
+    // ★ 回归钉子（2026-10-13 实测打穿的那条）：用户点过「停止」之后，
+    // 配置里 `auto_start` 仍是 true 也**绝不能**被采样复活。
+    //
+    // 现场时间线：13:13:32.754 `POST /api/gateway/stop` 返回 `{"stopped":true}`，
+    // 13:13:53 那一轮循环采样把意图置回 true，13:13:55 网关又 listening，
+    // 脚本在 +21s 抓到新进程 ⇒ 「用户关不掉网关」。
+    #[test]
+    fn sample_alive_wanted_never_overrides_user_stop() {
+        let _serial = sync_state_lock();
+        reset_revive_globals();
+        // 用户点「停止」。
+        set_gateway_alive_wanted(false);
+        assert_eq!(
+            GATEWAY_ALIVE_STATE.load(Ordering::SeqCst),
+            ALIVE_STOPPED,
+            "停止必须是闩锁状态，而不是「还没决定」"
+        );
+        assert!(!gateway_alive_wanted());
+        // 之后每一轮采样都读到 `auto_start: true`，一次都不许翻转。
+        for _ in 0..3 {
+            sample_alive_wanted(&json!({ "auto_start": true }));
+            assert_eq!(
+                GATEWAY_ALIVE_STATE.load(Ordering::SeqCst),
+                ALIVE_STOPPED,
+                "用户明确停止之后，配置里的 auto_start 不得把它复活"
+            );
+            assert!(!gateway_alive_wanted());
+        }
+        // 监督也一步都不能动（`ensure_gateway_running` 的早退条件）。
+        let cfg = json!({ "listen": "127.0.0.1:57987", "auto_start": true });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        assert_eq!(rt.block_on(ensure_gateway_running(&cfg)), ReviveOutcome::Idle);
+        assert!(!is_running(), "停止之后更不得留下任何子进程");
+        // 用户重新点「启动」⇒ 闩锁解除。
+        set_gateway_alive_wanted(true);
+        assert!(gateway_alive_wanted(), "用户点启动必须能解除停止闩锁");
+    }
+
+    // `is_fresh()` 的语义必须**只有** `Started` 为真。
+    //
+    // 它决定「要不要清掉待生效的账号变更」：认领到的既有进程是拿**旧**凭证在跑的，
+    // 把它当成「刚启动」就等于永久压住账号变更。
+    #[test]
+    fn revive_outcome_fresh_means_just_started() {
+        assert!(ReviveOutcome::Started.is_fresh());
+        assert!(!ReviveOutcome::AlreadyRunning.is_fresh());
+        assert!(!ReviveOutcome::Idle.is_fresh());
+    }
+
+    // 回归：监督**不能**自己抢启动闸门 —— 那是 `start_gateway` 的活。
+    //
+    // 曾经的写法是监督先 `GatewayStartGuard::acquire()` 再调 `start_gateway`，
+    // 而闸门是不可重入的 `AtomicBool`、`start_gateway` 进门也要拿它 ⇒ 监督每次
+    // 都被自己的锁挡回「网关正在启动中，请稍候」，网关**永远**补拉不起来。
+    // 2026-10-13 实测现场的证据：夹具 gateway_config.json 里被反复写入
+    // `last_error: 网关正在启动中，请稍候`，而 gateway.log 从未生成。
+    //
+    // 这条是纯源码约束（一抢就必然自锁），编译期抓不到，只能靠扫源码。
+    #[test]
+    fn revive_never_takes_the_start_gate_itself() {
+        let body = source_body("async fn ensure_gateway_running");
+        // 只看代码行：注释里**必须**能提这件事（那段解释正是给下一个人看的），
+        // 所以不能拿整段正文去找名字。
+        let code = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("GatewayStartGuard"),
+            "存活监督不得自己抢启动闸门：闸门不可重入，而它调用的 `start_gateway`\n\
+             也会抢同一把锁 ⇒ 监督每次都被挡回「网关正在启动中，请稍候」，\n\
+             网关永远补拉不起来（2026-10-13 实测现场）。互斥的唯一持有者是\n\
+             `start_gateway`，监督只负责「调用 + 记账」。"
+        );
+        assert!(
+            body.contains("start_gateway(cfg).await"),
+            "监督必须直接调 `start_gateway`（让后者负责互斥）"
+        );
+        assert!(
+            body.contains("gateway_start_busy(&err)"),
+            "撞上互斥不是失败：必须认 `gateway_start_busy` 并跳过退避记账，\n\
+             否则会白等 `GATEWAY_RETRY_EVERY_ROUNDS` 轮（≈5 分钟）才再试一次。"
+        );
+    }
+
+    // 互斥文案的识别：两条「别人正在管」的错误都要认，其余一律当失败。
+    //
+    // 认错的代价是退避白等 ≈5 分钟（用户眼里「点了启动半天不出来」）；
+    // 不认的代价是每 30 秒对着同一次成功启动重试一遍。两边都要防。
+    #[test]
+    fn gateway_start_busy_only_matches_mutual_exclusion() {
+        assert!(gateway_start_busy("网关正在启动中，请稍候"), "闸门挡住要认");
+        assert!(gateway_start_busy("网关已在运行"), "已经在跑也要认");
+        assert!(!gateway_start_busy("账号库为空"), "真失败不能当互斥");
+        assert!(!gateway_start_busy("网关启动超时（端口 57931）：timeout"), "超时要走退避");
+    }
+
+    // 顺序回归：存活监督必须**在** `apply_pending_restart` **之前**跑。
+    //
+    // 反过来（先判动作再补拉）会走成这样：网关没在跑 ⇒ 判 Idle ⇒ 待生效标志被清
+    // ⇒ 补拉起来的新进程虽然读到了新凭证（无害），但「账号变了」这件事在标志上
+    // 已经无迹可寻；更糟的是若补拉发生在**下一轮**，这一轮就白清了。
+    #[test]
+    fn auto_sync_loop_supervises_before_deciding_restart() {
+        let body = source_body("pub async fn run_auto_sync_loop");
+        let seed = body
+            .find("sample_alive_wanted(&load_gateway_config());")
+            .expect("序章必须按配置播种存活意图（否则开机第一轮监督什么都不做）");
+        let supervise = body
+            .find("ensure_gateway_running(&cfg).await")
+            .expect("循环里必须有存活监督");
+        let decide = body
+            .find("apply_pending_restart().await")
+            .expect("循环里必须有重启判定");
+        assert!(
+            seed < supervise,
+            "必须先播种存活意图、再跑监督"
+        );
+        assert!(
+            supervise < decide,
+            "存活监督必须在重启判定之前：否则待生效标志会被 Idle 分支清掉"
+        );
+        assert!(
+            body.matches("ensure_gateway_running(&cfg).await").count() >= 2,
+            "序章与循环体各要一次（开机与长期运行两个阶段）"
+        );
     }
 
     // 决策表：无条件覆盖三条分支的优先级。

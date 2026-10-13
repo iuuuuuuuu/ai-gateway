@@ -2464,6 +2464,9 @@ async fn api_gateway_start(Json(body): Json<Value>) -> Response {
     match ai_gateway_core::modules::gateway::start_gateway(&cfg).await {
         Ok(v) => {
             ai_gateway_core::modules::gateway::update_runtime_state("started", None);
+            // 用户明确要求它跑起来 ⇒ 立起「应当活着」的意图（见
+            // `GATEWAY_ALIVE_WANTED`）：此后被外力杀掉时后台存活监督会补回来。
+            ai_gateway_core::modules::gateway::set_gateway_alive_wanted(true);
             json_ok(v)
         }
         Err(e) => {
@@ -2475,6 +2478,9 @@ async fn api_gateway_start(Json(body): Json<Value>) -> Response {
 
 /// POST /api/gateway/stop —— 停止网关。
 async fn api_gateway_stop() -> Response {
+    // ⚠ 先撤销「应当活着」的意图，再停（顺序与 Tauri 侧一致）：否则后台存活监督
+    // 可能在两步之间把刚停掉的网关又拉起来。
+    ai_gateway_core::modules::gateway::set_gateway_alive_wanted(false);
     let r = ai_gateway_core::modules::gateway::stop_gateway();
     ai_gateway_core::modules::gateway::update_runtime_state("stopped", None);
     json_ok(r)

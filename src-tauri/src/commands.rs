@@ -1306,6 +1306,9 @@ pub async fn start_gateway(port: Option<u16>) -> Result<Value, String> {
     match ai_gateway_core::modules::gateway::start_gateway(&cfg).await {
         Ok(v) => {
             ai_gateway_core::modules::gateway::update_runtime_state("started", None);
+            // 用户明确要求它跑起来 ⇒ 立起「应当活着」的意图：此后它被外力杀掉
+            // （开机时那类无日志的突然消失），后台存活监督会把它补回来。
+            ai_gateway_core::modules::gateway::set_gateway_alive_wanted(true);
             Ok(v)
         }
         Err(e) => {
@@ -1319,6 +1322,9 @@ pub async fn start_gateway(port: Option<u16>) -> Result<Value, String> {
 /// 停止网关。
 #[tauri::command]
 pub fn stop_gateway() -> Result<Value, String> {
+    // ⚠ 先撤销「应当活着」的意图，再停：顺序反过来的话，后台存活监督可能正好在
+    // 这两步之间跑一轮，把刚停掉的网关又拉起来（用户表现为「点了停止它又自己回来」）。
+    ai_gateway_core::modules::gateway::set_gateway_alive_wanted(false);
     let r = ai_gateway_core::modules::gateway::stop_gateway();
     ai_gateway_core::modules::gateway::update_runtime_state("stopped", None);
     Ok(r)

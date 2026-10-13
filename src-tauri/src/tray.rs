@@ -208,6 +208,11 @@ pub fn on_run_event(event: RunEvent) {
             }
         }
         RunEvent::Exit => {
+            // ⚠ 先撤销「应当活着」的意图再停：后台存活监督（`run_auto_sync_loop`
+            // 每 30 秒一轮）可能在 `stop_gateway()` 之后、本进程真正退出之前又跑
+            // 一轮，把网关重新拉起来 —— 那会留下一个没人管、却占着端口的孤儿进程
+            //（正常情况下由 Job Object 兜底回收，但没必要赌这一步）。
+            gateway::set_gateway_alive_wanted(false);
             let stopped = gateway::stop_gateway();
             if stopped.get("stopped").and_then(Value::as_bool) == Some(true) {
                 gateway::update_runtime_state("stopped", None);
