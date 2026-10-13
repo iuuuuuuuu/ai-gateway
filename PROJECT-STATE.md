@@ -26,8 +26,8 @@
 | Go 参照实现 | `go-gateway/` | Go（**保留作对照，构建链已不依赖**） |
 
 - git 根 = `wt-port\`，主分支 `main`（2026-10-06 由 `migrate/aigw-v1.0.2` 改名而来；原上游陈旧线 `224919a` 改名 `archive/origin-main` 留档。详见第九节）
-- 远端 **`fork` = `https://github.com/iuuuuuuuu/ai-gateway`**：`main` 已推送（远端 `fork/main` = `726aafa`；本地另有 **3 个提交未推**：`12c2871` / `cb62b2b` / `641f89c`）；本地 tag 共 **49 个**（最大 `v1.0.38`），已发布的 Release 到 **v1.0.38** 为止（`releases/latest` 现指向 **v1.0.38**）—— ★ **1.0.39 ~ 1.0.45 尚未打 tag、尚未发布**（安装包都已产出并落在 `dist\`，只差推 tag + 发 Release）。★ 该仓库 2026-10-06 按业主 m26011 **已转为 private**（匿名访问 404，自动更新通道因此失效，详见 9.6）
-- 当前版本号 **1.0.45**（发布提交 `641f89c` 用 `scripts/bump-version.ps1` 把 **14 个文件**（`tauri.conf.json` / `package.json` / `package-lock.json` / `Cargo.toml` / `Cargo.lock` / `npm\package.json` 等）bump 到 1.0.45；签名安装包已产出并复制到 `dist\`，内嵌网关与内嵌前端**双指纹校验 [OK]**，见 9.20）
+- 远端 **`fork` = `https://github.com/iuuuuuuuu/ai-gateway`**：`main` 已推送（远端 `fork/main` = `726aafa`；本地另有 **7 个提交未推**：`12c2871` / `cb62b2b` / `641f89c` / `6ade937` / `1c7b7c0` / `e14fea1` / 本次 9.21 的记录提交）；本地 tag 共 **49 个**（最大 `v1.0.38`），已发布的 Release 到 **v1.0.38** 为止（`releases/latest` 与 `dist\latest.json` 现都还指向 **v1.0.38**）—— ★ **1.0.39 ~ 1.0.46 尚未打 tag、尚未发布**（安装包都已产出并落在 `dist\`，只差推 tag + 发 Release）。★ 该仓库 2026-10-06 按业主 m26011 **已转为 private**（匿名访问 404，自动更新通道因此失效，详见 9.6）
+- 当前版本号 **1.0.46**（发布提交 `1c7b7c0` 用 `scripts/bump-version.ps1` 把 **14 个文件**（`tauri.conf.json` / `package.json` / `package-lock.json` / `Cargo.toml` / `Cargo.lock` / `npm\package.json` 等）bump 到 1.0.46；签名安装包已产出并复制到 `dist\`，内嵌网关与内嵌前端**双指纹校验 [OK]**，见 9.21）
   - ★ 业主**实机 2026-10-07 07:40 已回退到 1.0.6**（`D:\APP\AI Gateway\ai-gateway.exe` 32,838,656 B / FileVersion 1.0.6 / mtime 2026-09-17 21:01:20；`:7864` 跑的是 Go 网关 `gateway-355c61-29367fd438f80ba2.exe` 8,759,296 B）⇒ 当次 1.0.22–1.0.34 **均未安装**（截至 2026-10-13 业主实机已升到 **1.0.44**；1.0.45 尚未安装），要装就直接装最新版（跳过版本里的修复全在 1.0.34 内；★ **回退到 Go 版会丢掉 1.0.21–1.0.33 的全部修复**，1.0.34 修的「输出完就中断」在 Go 版里**同样存在**——Go 只在「0 有效帧」时补 error 帧、吐过内容却没见 `[DONE]` 时**静默当成功**，与本仓库 1.0.33 及以前的行为不同）
   - ★ NSIS 同版本**不覆盖**（`installer.nsi:233-259` 用 `nsis_tauri_utils::SemverCompare` 比 `DisplayVersion`，相等走维护页）⇒ 升版本号是交付的硬前提
 
@@ -137,6 +137,55 @@
 `fork`（`iuuuuuuuu/ai-gateway`），并各发一个 Release。**只推 `fork`**；`origin` / `upstream` / `aigw`
 三个 remote 全程未碰（与 9.6 授权一致）。
 
+### 9.21 1.0.46 按第三轮复核修掉护栏的两处真实缺陷（2026-10-14 凌晨，同一条业主指令）
+
+1.0.45 的安装包**已经打出来了**（14,761,478 B，SHA256 `6CC5E9FA…908068`），随后又做了一轮**独立复核**：发现两处**真机可复现的行为错误**，都在护栏内部 —— **两个旋钮都留 `0`（默认）的人完全不受影响**。NSIS 同版本不覆盖，所以必须换号才能把这些修掉，于是 bump 到 **1.0.46**。
+
+**修的是什么**：
+
+| # | 缺陷 | 症状（真机上看得见） | 修法 |
+|---|---|---|---|
+| 1 | **积分闸的恢复说法是错的** | 429 文案对**所有**成因都写「过了本地零点自动恢复」。可**余额跌破保留积分下限**这一类**不随日期恢复** —— 它只等积分巡撤回充。用户照着文案等一个永远不会到来的零点，同时**跳过唯一有效的两个动作**（等回充 / 调低下限） | 新增两态 `enum GuardedLine { DailyTokens, Credits }`（`pool.rs:355`），`daily_cap_excludes_all` 改为返回三元组 `(blocked, total, credits_blocked)`（`pool.rs:1252`），`forward.rs` 新增 `daily_guard_recovery(credits_blocked)`（`forward.rs:2293`）按成因分叉文案；**额度优先于积分** |
+| 2 | **Trae 无限额会把没问过的旧余额「追认」成真值** | 无限额刷新原本把快照里**早就过期、根本没重新问上游**的 `credits` 透传给 `set_credits_and_expiry`，而那个函数会把 `credits_known` 置成 `true`。一旦旧的假 `credits` 恰好低于 `credit_floor`，账号就会被**一个没人问过的数字**闸住 ⇒ 症状是「**明明写着无限额，号却一直不被选中**」 | 快照元组由 `(uid, auth, credits)` 缩成 `Vec<(String, Option<Auth>)>`（`products\trae\credits.rs:433`）—— 陈旧值**从作用域上消失**，想复现这个 bug 必须先把字段加回来；只更新到期日那条分支改走新增的 `Pool::set_expiry_only()`（`pool.rs:2606`），**不碰** `credits` / `credits_known` |
+
+**回归**（`cargo test --workspace`，末行 `WS3_EXIT=0`，日志 `full-test3.txt` + `build-router3.txt`）：
+
+| 目标 | 结果 |
+|---|---|
+| `cargo test --workspace` → ai-gateway-core | **1301 passed / 0 failed / 4 ignored** |
+| `cargo test --workspace` → ai-gateway-router | **1780 passed / 0 failed / 1 ignored**（1.0.45 为 1776，净增 4 条：积分成因文案 / 积分成因端到端 / 积分未知时不拦 / 无限额不追认旧余额） |
+
+**真机实测（8 个阶段，重跑，日志 `test-bin\guard-live.log`，80 行；`RESULT: FAIL=0`，共 `27 PASS / 0 FAIL`）**：
+用 1.0.46 构建的**网关** + 1.0.44 的宿主跑独立实例（宿主版本号与本轮功能无关），隔离端口 57930 / 57931，假上游不可达。要点：
+
+- **P3 旋钮未开 ⇒ 一个都不拦**（`daily_token_cap` 未设时，已超量的账号照常路由，`daily_guard=false`）⇒ 护栏是 **opt-in**，升级不改行为。
+- **P4 走真实热重载开门（不重启）**：宿主 `gateway_config.json` 顶层加 `daily_token_cap=500` ⇒ 平台开关接口 `POST /api/gateway/platform-enabled` 200 ⇒ 两个账号在约 6 秒内全被闸住，chat = **429** `rate_limit_exceeded`，文案：**「该产品下的可用账号（共 2 个）今天都被你设置的每日护栏挡住了，所以本机暂时不给它们接新的对话。这不是**故障** —— 额度按**本地日期**统计，过了本地零点自动恢复；也可以调高每日 Token 上限后立即恢复。」**（★ 本例是**额度**成因，所以仍然承诺零点 —— 这正是 9.21 修复要的分叉行为）
+- **P5 只影响选号，不是 kill switch**：被闸住时 `healthy=0/2` 而 `cooling=0 disabled=0 no_route=0`；`/healthz` 503；`/tasks/run?task=activity` 仍 **200 `ran=true`**（闸住的号**仍能跑养号任务**）；`/v1/models` 仍 200。
+- **P5b 不逐条写日志**：3 次被拦请求给 `gateway.log` **加了 0 行**。
+- **P6 调高上限 ⇒ 解除**：改成 2000 ⇒ 约 4 秒后不再 429；**网关进程全程没重启**（pid 32256 不变）。
+- **P7 记账语义 / 跨日恢复**：当天种 540 并重启网关（快照从磁盘加载）⇒ 仍 429；把同样的 540 记到**昨天**再重启 ⇒ 约 3 秒内恢复 ⇒ **昨天的用量不算今天的**。
+- **P8 清理**：两个测试进程按 PID + 路径双条件收掉（`leftovers: gw=0 srv=0`），端口全释放，**业主的 :7864 / :3080 全程在听**。
+
+**构建数字（全部取自 `build-1046.txt`，247 行，`BUILD_EXIT=0`）**：
+
+| 项 | 值 |
+|---|---|
+| 内嵌网关 | `embedded/gateway.exe` **13.47 MB**，SHA256（日志前 16 位）`47292B85EACB78F4`；Rust 网关 `Finished release` in 56.37s |
+| 前端入口 | `assets/index-D25RMaj0.js`（1,595.11 kB / gzip 464.98 kB）—— 与 1.0.45 **同值**（本轮没动前端） |
+| Tauri 主程序 | `target\release\ai-gateway.exe`，`Finished release` in 4m 30s |
+| 安装包 | `dist\AI Gateway_1.0.46_x64-setup.exe` = **14,764,440 B**，SHA256 `58A96BC6F91681B2F3FE8554943CC5D1BFD4A06B223A67A06ABC2293437CAC38`（`target\release\bundle\nsis\` 下那份逐字节同值） |
+| 签名 | `.sig` 444 B，内文 `file:AI Gateway_1.0.46_x64-setup.exe` / `version:1.0.46` / timestamp `1791920549`，keyid `7e7ce64b6fc3a36f`（与 `tauri.conf.json` 公钥配对）；`==> 校验产物签名` 逐条列出 1.0.7 → 1.0.46 全部 `[OK]` |
+| 双指纹 | `embedded/gateway.exe 未被改动 [OK]`；`内嵌前端与 dist 一致：assets/index-D25RMaj0.js [OK]` |
+| 复制产物 | 复制到 `dist\` 后 `[OK] SHA256 一致  AI Gateway_1.0.46_x64-setup.exe` |
+
+**★ 没验到的面（与 9.20 同源，诚实记账）**：
+
+1. **`credit_floor` 仍然没有真机读数**：真机假上游不可达 ⇒ 积分巡检永远刷不回真值 ⇒ `credits_known` 恒 `false` ⇒ 「未知不拦」的设计让**积分闸在整轮 27 个 PASS 里一次都没被触发过**，它只有单测覆盖（本轮新增的积分成因端到端测试是**进程内**的，不是跨进程真机）。
+2. **ZCode 产品没有积分查询**，所以 `credit_floor` 对 ZCode 号**恒不生效**。
+3. 本轮**只**修了这两个缺陷，**没有**合并任何新功能。
+
+★ 本轮新增的一个坑：`test-bin\guard-live.ps1` 里**写死的期望版本号**会随 workspace bump 变成假红 —— 已在同一次修掉（改成从 `crates\ai-gateway-router\Cargo.toml` 现读 `^version`，不再手工同步）。**教训：测试里的版本号期望必须现读，不要写死。**
+
 ### 9.20 1.0.45 账号级每日用量护栏（2026-10-14，业主「你再看看 trae workbuddy qoder zcode 相关仓库有什么可以合并进来的功能,然后你自己挑选合并,在进行完整的测试」）
 
 这一轮先跨仓库调研（Trae / WorkBuddy / Qoder / ZCode 四家的相关实现），**最后只合并了一个功能**：**账号级每日用量护栏**——两个旋钮 `daily_token_cap` / `credit_floor`，都写在 native config 的**顶层**，默认 **0 / 0 = 关闭**，升级后行为与 1.0.44 完全一致。它补的是账号退场的第三档：此前只有「上游报错（熔断）」与「人工禁用」两条路，缺「上游没报错、账号也健康，只是今天不想再烧额度」这一档。
@@ -166,7 +215,7 @@
 
 - **P2 身份**：网关只服务这 2 个假账号；`usage.json` 当天已种入 540 token（上限将设 500）。
 - **P3 旋钮未开 ⇒ 不拦**：`daily_token_cap=0` 时，**已经超量**的用量一个都不拦（chat 走正常路由 ⇒ 因假上游不可达回 503 `no_healthy_account`，**不是 429**），每个账号 `daily_guard=false` ⇒ 这证明护栏是 **opt-in**、升级不改现有行为。
-- **P4 走真实热重载路线开门（不重启）**：往宿主 `gateway_config.json` 顶层加 `daily_token_cap=500` ⇒ 平台开关接口 200 ⇒ **两个账号在约 6 秒（6068ms）内全被闸住**；`daily_guard` 标记出现在 native config 的**顶层**、**不在 pool 块里**；网关进程号未变（**同一条活进程，旋钮不需要重启**）。此后 chat = **429** `rate_limit_exceeded`，中文文案要点：**「该产品下的可用账号（共 2 个）今天都已经用满了你设置的每日额度上限…**这不是故障** —— 额度按**本地日期**统计，过了本地零点自动恢复；也可以调高每日 Token 上限 / 调低保留积分下限后立即恢复」**。
+- **P4 走真实热重载路线开门（不重启）**：往宿主 `gateway_config.json` 顶层加 `daily_token_cap=500` ⇒ 平台开关接口 200 ⇒ **两个账号在约 6 秒（6068ms）内全被闸住**；`daily_guard` 标记出现在 native config 的**顶层**、**不在 pool 块里**；网关进程号未变（**同一条活进程，旋钮不需要重启**）。此后 chat = **429** `rate_limit_exceeded`，中文文案要点：**「该产品下的可用账号（共 2 个）今天都已经用满了你设置的每日额度上限…**这不是故障** —— 额度按**本地日期**统计，过了本地零点自动恢复；也可以调高每日 Token 上限 / 调低保留积分下限后立即恢复」**（★ 这是 **1.0.45** 当时的原文；从 **1.0.46** 起同一句话按**成因分叉**，「余额跌破保留积分下限」那一类**不再承诺零点**，见 9.21）。
 - **P5 只影响选号，不是 kill switch**：被闸住时网关 `healthy=0/2` 而 `cooling=0 disabled=0 no_route=0`；`/healthz` 503（宿主把池读成不可用 → 这正是 UI 弹告警的来源）；`/tasks/run?task=activity` 仍 **200 且 `ran=true`**（被闸住的号**仍能跑养号任务**）；`/v1/models` 仍 200。
 - **P5b 不逐条写日志**：3 次被拦请求给 `gateway.log` **加了 0 行**。
 - **P6 调高上限 ⇒ 解除**：同一路线把 `daily_token_cap` 改成 2000 ⇒ 约 **4 秒**后不再 429；账号不再报 `daily_guard`；**网关进程全程没有重启**（pid 不变）。
@@ -178,7 +227,7 @@
 | 目标 | 结果 |
 |---|---|
 | `cargo test --workspace` → ai-gateway-core | **1301 passed / 0 failed / 4 ignored** |
-| `cargo test --workspace` → ai-gateway-router | **1776 passed / 0 failed / 1 ignored** |
+| `cargo test --workspace` → ai-gateway-router | **1776 passed / 0 failed / 1 ignored**（1.0.46 起为 **1780**，见 9.21） |
 
 **★ 没验到的面（诚实记账）**：
 
