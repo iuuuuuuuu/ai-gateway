@@ -105,6 +105,16 @@ pub struct Status {
     /// 两者在界面上若都写成「禁用」，用户就无法判断「这个号还在不在养」——
     /// 而「禁用了但仍在养号」正是本功能的语义。
     pub no_route: bool,
+    /// 该账号今天是否已撞到**本机的每日护栏**（见 [Pool::set_daily_guard]）。
+    ///
+    /// 第三种「不接流量」，必须与前两种分开下发：它不是账号的问题，也不是用户
+    /// 手动关的路由，而是本机自己设的用量闸（每日 Token 上限 / 保留积分）把它
+    /// 挡在选号之外。若在界面上和 `disabled` 混为一谈，用户会去查账号 ——
+    /// 而真正的出路是「等今天过去」或「调高上限」。
+    ///
+    /// ★ 只在护栏**开启且真的命中**时为 true：护栏关闭（默认）时恒 false，
+    /// 老行为逐字不变。
+    pub daily_guard: bool,
     /// 累计成功数。
     pub success_count: i64,
     /// 累计错误数。
@@ -297,6 +307,42 @@ struct Entry {
     cost_rate: f64,
     /// `cost_rate` 是否**已声明**（见上）。
     cost_known: bool,
+
+    /// 该账号**今天**（本地日期）已消耗的 Token 总量（口径 = `usage::Counters::total`）。
+    ///
+    /// # 为什么缓存在条目上
+    ///
+    /// 判据要落在 [Entry::healthy] 里 —— 那是**唯一**覆盖全部选号路径的闸门
+    ///（见该函数的文档）。而 [Entry::healthy] 只拿得到 `&self`，没有池上下文，
+    /// 更拿不到 [crate::usage::Stats]。故由调用方（网关的 5 秒周期任务，
+    /// 复用已有的落盘循环，不新增定时器）把「账号 × 今天」的数字**灌进条目**。
+    ///
+    /// ★ 每个周期都按**当日**重算：跨过本地零点后新日期的累计为 0，
+    /// 于是护栏在零点自动放开，不需要任何显式的「滚日」逻辑。
+    ///
+    /// 与 `cost_rate`/`cost_known` 同属**运行态**：不持久化，重启后由下一次
+    /// 周期刷新填回。
+    daily_tokens: i64,
+    /// 每日 Token 上限（`0` = 关闭）。池级旋钮在 `Pool::daily_token_cap`，
+    /// 这里是从池下发到条目的副本 —— 理由同上：判据必须在 [Entry::healthy] 里自足。
+    daily_token_cap: i64,
+    /// 剩余积分下限（`0` = 关闭）。见 [Pool::set_daily_guard]。
+    credit_floor: i64,
+    /// 该账号的 `credits` 是否为**上游真值**（而非「没人问过」的 0）。
+    ///
+    /// # 为什么必须三态（与 `cost_rate`/`cost_known` 同款）
+    ///
+    /// `credits == 0` 既可能是「真的用光了」，也可能是「从没查过」——
+    /// **ZCode 恰恰从不写 `credits`**（该产品没有积分巡检，额度在它自己的
+    /// `remaining_units` 里）。若把 0 一律当成「余额耗尽」，一开积分闸就会
+    /// 把整个 ZCode 平台排除掉，表现为「什么都没改，ZCode 却全挂了」。
+    ///
+    /// 由三个 credits 写入方置 true（[Pool::set_credits] /
+    /// [Pool::set_credits_and_expiry] / [Pool::reenable_if_credits]）。
+    /// **不持久化**：重启后到该产品第一次巡检之间（WorkBuddy 最长 15 分钟）
+    /// 积分闸是**失效**的 —— 这是刻意的 fail-open：宁可少拦，也不能凭一个
+    /// 陈旧的持久化数字把账号永久锁死。
+    credits_known: bool,
 }
 
 impl Entry {
@@ -335,6 +381,20 @@ impl Entry {
         if self.a.no_route {
             return false;
         }
+        // ★ 本机的每日护栏（见 [Pool::set_daily_guard]）。
+        //
+        // 与上面两条「不接流量」的区别：`disabled` 是账号坏了、`no_route` 是用户
+        // 关掉的路由，而这一条是**本机自己的用量闸**（每日 Token 上限 / 保留积分）。
+        // 三条都必须落在这里 —— 本函数是全部选号路径的唯一闸门。
+        //
+        // ⚠ 养号任务不走本函数（它们枚举 [Pool::probe_uids] / [Pool::all_uids]），
+        // 所以撞了护栏的账号**照常签到 / 上报 / 参加成长任务** —— 那正是要的：
+        // 护栏管的是「今天别再用它接客」，不是「别管它」。
+        //
+        // 护栏关闭（两个旋钮都为 0，默认）时本判据恒 false，行为逐字不变。
+        if self.daily_guard_blocks() {
+            return false;
+        }
         if let Some(u) = self.until {
             if now < u {
                 return false;
@@ -346,6 +406,19 @@ impl Entry {
             }
         }
         true
+    }
+
+    /// 每日护栏是否把该账号挡在**选号**之外（见 [Pool::set_daily_guard]）。
+    ///
+    /// 两个旋钮都是 `0`（默认）时恒 `false` —— 即关闭护栏，行为逐字不变。
+    ///
+    /// ★ 判据**只此一处**，被 [Entry::healthy] 与 [Pool::pick_earliest_expiry]
+    /// 同时调用：后者刻意不调 `healthy()`（它要选「正在冷却」的账号），
+    /// 而「兜底路径漏了同一道判据」正是本项目踩过两次的缺陷类型
+    ///（见 [Entry::healthy] 的 `no_route` 文档）。分成两份实现必然会再次分叉。
+    fn daily_guard_blocks(&self) -> bool {
+        (self.daily_token_cap > 0 && self.daily_tokens >= self.daily_token_cap)
+            || (self.credit_floor > 0 && self.credits_known && self.credits <= self.credit_floor)
     }
 
     /// 报告该账号的**指定模型**当前是否可用。
@@ -756,6 +829,13 @@ impl Pool {
                 model_until: std::collections::HashMap::new(),
                 cost_rate: 0.0,
                 cost_known: false,
+                // 每日护栏：用量与闸值都是运行态，由随后的 `set_daily_guard` +
+                // 周期刷新填；`credits_known = false` ⇒ 从状态文件读来的积分
+                // **不算真值**，积分闸在第一次巡检之前对它是失效的（fail-open）。
+                daily_tokens: 0,
+                daily_token_cap: 0,
+                credit_floor: 0,
+                credits_known: false,
             };
             if let Some(&idx) = self.by_uid.get(&uid) {
                 self.entries[idx] = entry;
@@ -980,6 +1060,23 @@ pub struct Pool {
     ///
     /// **map 里没有该平台 ⇒ 视为开启**：老配置没有这个键，升级后行为必须逐字不变。
     platform_enabled: HashMap<String, bool>,
+
+    /// 每日 Token 上限（**池级旋钮**；`0` = 关闭，默认）。
+    ///
+    /// 语义：某账号**本地当日**的 Token 用量达到此值后，当天不再被选号，
+    /// 本地零点自然放开（用量按日累计，新的一天从 0 开始）。
+    ///
+    /// ★ 只影响**选号**：不写 `Entry.disabled`、不写 `Entry.no_route`、不碰
+    /// `probe_uids` / `all_uids` —— 撞了护栏的账号照常签到 / 上报 / 成长任务
+    /// （与平台总开关同一约束，见 `platform_enabled` 的文档）。
+    daily_token_cap: i64,
+    /// 剩余积分下限（**池级旋钮**；`0` = 关闭，默认）。
+    ///
+    /// 语义：账号剩余积分小于等于此值时不再被选号，给月末的签到 / 成长任务预留额度。
+    ///
+    /// ⚠ 只对**积分已知**的账号生效（见 [Entry::credits_known]）：ZCode 从来不写
+    /// `credits`，把它当 0 会让整个平台被闸掉。
+    credit_floor: i64,
 }
 
 impl Default for Pool {
@@ -1017,6 +1114,10 @@ impl Pool {
             platform_models_disabled: HashMap::new(),
             model_platforms: HashMap::new(),
             platform_enabled: HashMap::new(),
+            // 每日护栏默认**关闭**：老配置没有这两个键时行为必须逐字不变
+            // （与 `platform_enabled` 的「缺键 = 参加」同一个立场：升级不改行为）。
+            daily_token_cap: 0,
+            credit_floor: 0,
         }
     }
 
@@ -1048,6 +1149,98 @@ impl Pool {
         if n >= 0 {
             self.max_in_flight = n;
         }
+    }
+
+    /// 设置**每日护栏**（每日 Token 上限 + 保留积分下限）。
+    ///
+    /// 两个旋钮都是 `0` = 关闭 —— 与 [Pool::set_breaker] 同款约定：非正值不覆盖，
+    /// 故默认值天然是「关」。只改闸值，**不动**条目上已刷新的当日用量
+    /// （`Entry::daily_tokens`）：那个数字由周期任务按日重算，在这里清零会让
+    /// 「刚调高上限」之后的第一个周期误判为「今天没用过」。
+    pub fn set_daily_guard(&mut self, token_cap: i64, credit_floor: i64) {
+        if token_cap >= 0 {
+            self.daily_token_cap = token_cap;
+        }
+        if credit_floor >= 0 {
+            self.credit_floor = credit_floor;
+        }
+        self.push_daily_guard_to_entries();
+    }
+
+    /// 把池级旋钮下发到每个条目（[Entry::healthy] 的判据自足之前提）。
+    fn push_daily_guard_to_entries(&mut self) {
+        let cap = self.daily_token_cap;
+        let floor = self.credit_floor;
+        for e in &mut self.entries {
+            e.daily_token_cap = cap;
+            e.credit_floor = floor;
+        }
+    }
+
+    /// 周期刷新各账号**本地当日**的 Token 用量（护栏的输入）。
+    ///
+    /// 由网关既有的 5 秒落盘循环调用（复用同一 tick，不新增定时器）。
+    ///
+    /// # 为什么每天重算而不是「记录 + 累加」
+    ///
+    /// 用量真值在 [crate::usage::Stats] 里，按「账号 × 本地日期」聚合。这里按
+    /// **当前日期**整份取回即可：跨过本地零点后新日期的累计为 0，护栏自动放开 ——
+    /// 不需要任何显式的滚日逻辑，也不会有「少减一次」这类记账缺陷。
+    ///
+    /// # 护栏关闭时是纯开销吗
+    ///
+    /// 不是白跑：这一轮顺便把闸值下发到条目（`set_daily_guard` 之后新增的账号、
+    /// 以及热重载改配置后的下发都靠它兜住）。未开启护栏时额外开销只有一次池内
+    /// 遍历 —— 与紧随其后的 `flush()` 同级。
+    pub fn refresh_daily_usage(&mut self, usage: &crate::usage::Stats) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let day = usage.today_key();
+        let cap = self.daily_token_cap;
+        let floor = self.credit_floor;
+        for e in &mut self.entries {
+            e.daily_tokens = usage.account_day_tokens(&e.a.uid, &day);
+            e.daily_token_cap = cap;
+            e.credit_floor = floor;
+        }
+    }
+
+    /// 「全池都被每日护栏挡住」判定：返回 `(被护栏挡住的账号数, 本来能用的账号数)`。
+    ///
+    /// 与 [`Pool::no_route_excludes_all`] 逐字同款：两者都用于「一个都没选出来」时
+    /// 给出**准确**的出路文案，故判据必须严格对齐 —— 分母只算「本来能用」的账号
+    /// （他产品 / 他区域 / 已禁用 / 冷却中 / 熔断中都不进分母），否则「全池触顶」
+    /// 会在只开了一个号的情况下也成立。
+    ///
+    /// `model` 与 `no_route_excludes_all` 一样当前不参与判定（护栏是**账号级**设置），
+    /// 保留参数只为将来不改签名。
+    pub fn daily_cap_excludes_all(&self, product: &str, _model: &str, prefer: Region) -> (usize, usize) {
+        let now = SystemTime::now();
+        let mut total = 0usize;
+        let mut blocked = 0usize;
+        for e in &self.entries {
+            if !product.is_empty() && e.a.product_of() != product {
+                continue;
+            }
+            if prefer != Region::Any && e.a.region() != prefer {
+                continue;
+            }
+            if e.disabled {
+                continue;
+            }
+            if e.until.map(|u| now < u).unwrap_or(false) {
+                continue;
+            }
+            if e.breaker_until.map(|b| now < b).unwrap_or(false) {
+                continue;
+            }
+            total += 1;
+            if e.daily_guard_blocks() {
+                blocked += 1;
+            }
+        }
+        (blocked, total)
     }
 
     /// 注入确定性随机源（仅供测试）；传 `None` 恢复真实随机。
@@ -1952,6 +2145,12 @@ impl Pool {
             model_until: std::collections::HashMap::new(),
             cost_rate: 0.0,
             cost_known: false,
+            // ★ 闸值从**池级旋钮**复制：新增账号必须当场就受护栏约束，
+            // 否则「先开护栏、后导入账号」的新号会有一个周期的空窗。
+            daily_tokens: 0,
+            daily_token_cap: self.daily_token_cap,
+            credit_floor: self.credit_floor,
+            credits_known: false,
         });
         self.by_uid.insert(uid, idx);
     }
@@ -2324,8 +2523,10 @@ impl Pool {
 
     /// 更新余额。
     pub fn set_credits(&mut self, uid: &str, credits: i64) {
+        // ★ 到这里就是**上游真值**：置 `credits_known`，积分闸从此对该账号生效。
         let Some(&idx) = self.by_uid.get(uid) else { return };
         self.entries[idx].credits = credits;
+        self.entries[idx].credits_known = true;
         self.dirty = true;
     }
 
@@ -2334,6 +2535,8 @@ impl Pool {
         let Some(&idx) = self.by_uid.get(uid) else { return };
         let e = &mut self.entries[idx];
         e.credits = credits;
+        // ★ 上游真值（见 `Entry::credits_known`）。
+        e.credits_known = true;
         if soonest_expire_at > 0 {
             e.expire_at = soonest_expire_at;
         }
@@ -2346,6 +2549,8 @@ impl Pool {
     pub fn reenable_if_credits(&mut self, uid: &str, remain: i64) {
         let Some(&idx) = self.by_uid.get(uid) else { return };
         let e = &mut self.entries[idx];
+        // ★ 上游真值（见 `Entry::credits_known`）。
+        e.credits_known = true;
         if remain > 0 && !e.disabled {
             e.credits = remain;
             e.until = None;
@@ -2449,6 +2654,8 @@ impl Pool {
             reason: e.reason.clone(),
             disabled: e.disabled,
             no_route: e.a.no_route,
+            // 判据与选号**同源**（`daily_guard_blocks`），不在下发层另写一套。
+            daily_guard: e.daily_guard_blocks(),
             success_count: e.success_count,
             err_total: e.err_total,
             last_success: e.last_success,
@@ -3598,6 +3805,13 @@ impl Pool {
             }
             // ★ 用户手动禁用（不接流量）同样永不参与兜底（见本函数文档）
             if e.a.no_route {
+                continue;
+            }
+            // ★★ 每日护栏也必须在这里**显式再写一遍** —— 与上面 `no_route` 完全同款
+            // 的理由：本函数**不调 `healthy()`**（它要选「正在冷却」的账号），所以
+            // `healthy()` 里那道判据在这里**不会生效**。「主路径加了、兜底漏了」正是
+            // 本项目在 `no_route` 上踩过两次的缺陷类型，故这里不能省。
+            if e.daily_guard_blocks() {
                 continue;
             }
             // ---- 落点 C：平台总开关（全冷却兜底也必须尊重它）----
@@ -5488,5 +5702,308 @@ mod tests {
                 .unwrap();
             assert_eq!(a.uid, "wb1");
         }
+    }
+
+    // ═══ 每日护栏（每日 Token 上限 + 保留积分下限）═══
+
+    /// 建一个**独立** `Stats`（护栏的输入），路径为空 = 不落盘。
+    fn guard_stats() -> crate::usage::Stats {
+        crate::usage::Stats::new(String::new())
+    }
+
+    /// 今日用量灌进池（等价于网关那 5 秒周期任务做的事）。
+    fn feed(p: &mut Pool, s: &crate::usage::Stats) {
+        p.refresh_daily_usage(s);
+    }
+
+    fn cnt(input: i64) -> crate::usage::Counters {
+        crate::usage::Counters {
+            input,
+            ..Default::default()
+        }
+    }
+
+    /// #1 未开启护栏时，一切都是老行为（这是「升级不改行为」的钉子）。
+    #[test]
+    fn daily_guard_is_inert_when_both_knobs_are_zero() {
+        let mut p = Pool::new(String::new());
+        let s = guard_stats();
+        p.add(mk("u1"));
+        // 用量高得离谱，但护栏没开 ⇒ 必须照选。
+        s.record_at("u1", "m1", &s.today_key(), cnt(10_000_000));
+        feed(&mut p, &s);
+
+        assert!(p.servable_now(), "护栏关闭时不得影响选号");
+        assert_eq!(p.available_uids(), vec!["u1".to_string()]);
+        assert!(p.pick().is_some());
+        assert!(!p.status_by_uid("u1").unwrap().daily_guard);
+    }
+
+    /// #2 达到上限 ⇒ 不再选号；同一判据覆盖 available_uids / servable_now。
+    #[test]
+    fn daily_guard_blocks_picking_once_the_cap_is_reached() {
+        let mut p = Pool::new(String::new());
+        let s = guard_stats();
+        p.add(mk("u1"));
+        p.add(mk("u2"));
+        p.set_daily_guard(100, 0);
+
+        s.record_at("u1", "m1", &s.today_key(), cnt(100));
+        feed(&mut p, &s);
+
+        // u1 触顶 ⇒ 只剩 u2。
+        assert_eq!(p.available_uids(), vec!["u2".to_string()]);
+        for _ in 0..20 {
+            assert_eq!(p.pick().map(|a| a.uid), Some("u2".to_string()));
+        }
+        assert!(p.status_by_uid("u1").unwrap().daily_guard, "触顶的账号要如实标记");
+        assert!(!p.status_by_uid("u2").unwrap().daily_guard);
+    }
+
+    /// #3 恰好在阈值**之下**必须仍然可用（边界不许提前一格）。
+    ///
+    /// 判据是 `>=` 上限；写成 `>` 会让「刚好用满」的账号继续跑一整个请求。
+    #[test]
+    fn daily_guard_uses_greater_or_equal_not_greater() {
+        let mut p = Pool::new(String::new());
+        let s = guard_stats();
+        p.add(mk("u1"));
+        p.set_daily_guard(100, 0);
+
+        s.record_at("u1", "m1", &s.today_key(), cnt(99));
+        feed(&mut p, &s);
+        assert!(p.servable_now(), "99 < 100 时必须仍然可选");
+
+        s.record_at("u1", "m1", &s.today_key(), cnt(1));
+        feed(&mut p, &s);
+        assert!(!p.servable_now(), "100 >= 100 时必须被挡住");
+    }
+
+    /// #4 跨过本地零点后自动放开 —— 且**不需要**任何显式的「滚日」调用。
+    ///
+    /// 这就是「按当日重算」而不是「累加计数」的全部理由：新日期的累计天然是 0。
+    #[test]
+    fn daily_guard_reopens_on_the_next_local_day() {
+        let mut p = Pool::new(String::new());
+        let s = guard_stats();
+        p.add(mk("u1"));
+        p.set_daily_guard(100, 0);
+
+        // 手工注入一个固定时钟，让「今天」可预测（`today_key` 走注入时钟）。
+        let today = 1_792_161_600_000; // 2026-10-14 12:00 +08:00
+        s.set_now_for_test(today);
+        let day1 = s.today_key();
+        s.record_at("u1", "m1", &day1, cnt(500));
+        feed(&mut p, &s);
+        assert!(!p.servable_now(), "当天已超上限");
+
+        // 时钟推进到**次日**：同一个账号、同一份 usage，护栏必须自己放开。
+        s.set_now_for_test(today + 24 * 3600 * 1000);
+        feed(&mut p, &s);
+        assert!(
+            p.servable_now(),
+            "跨过本地零点必须自动恢复 —— 恢复不了就是「用一次锁一天」"
+        );
+    }
+
+    /// #5 积分闸：只在**积分已知**时生效（ZCode 从不写 credits）。
+    ///
+    /// 若把 `credits == 0` 一律当「余额耗尽」，一开积分闸就会把整个 ZCode 平台
+    /// 排除掉 —— 表现为「什么都没改，ZCode 却全挂了」。
+    #[test]
+    fn credit_floor_only_applies_to_accounts_with_known_credits() {
+        let mut p = Pool::new(String::new());
+        let s = guard_stats();
+        p.add(mk("zcode_like")); // 从不写 credits 的账号
+        p.add(mk("wb1"));
+        p.set_daily_guard(0, 50);
+        feed(&mut p, &s);
+
+        // 两者 credits 都是 0，但都**未知** ⇒ 积分闸必须完全不介入。
+        assert!(p.servable_now(), "credits 未知的账号不得被积分闸排除");
+        assert_eq!(p.available_uids().len(), 2, "ZCode 类账号必须照常可用");
+
+        // 上游给出真值：wb1 只剩 50（<= 下限）⇒ 只挡它，不挡另一个。
+        p.set_credits("wb1", 50);
+        feed(&mut p, &s);
+        assert_eq!(
+            p.available_uids(),
+            vec!["zcode_like".to_string()],
+            "积分已知且触底的账号被挡，未知的照旧"
+        );
+    }
+
+    /// #6 积分**刚好等于**下限时挡，等于下限 +1 时放 —— 与 Token 闸同一约定（`<=`）。
+    #[test]
+    fn credit_floor_boundary_is_inclusive() {
+        let mut p = Pool::new(String::new());
+        p.add(mk("u1"));
+        p.set_daily_guard(0, 50);
+        p.set_credits("u1", 51);
+        assert!(p.servable_now(), "51 > 50 必须可选");
+        p.set_credits("u1", 50);
+        assert!(!p.servable_now(), "50 <= 50 必须被挡住");
+    }
+
+    /// #7 ★★ 全冷却兜底路径**也**必须尊重护栏。
+    ///
+    /// # 守的是什么
+    ///
+    /// [`Pool::pick_earliest_expiry`] 刻意不调 `healthy()`（它要选「正在冷却」的
+    /// 账号），所以 `healthy()` 里那道判据在兜底路径上**不会生效**。本项目在
+    /// `no_route` 上正是因为这个原因漏过一次：主路径加了、兜底漏了。
+    ///
+    /// 这条测试若变红，症状是「一个已经用满今日额度的账号，在全池冷却时被兜底
+    /// 捞出来接客」—— 护栏形同虚设。
+    #[test]
+    fn daily_guard_is_respected_by_the_all_cooling_fallback() {
+        let mut p = Pool::new(String::new());
+        let s = guard_stats();
+        p.add(mk("capped"));
+        p.add(mk("free"));
+        p.set_daily_guard(100, 0);
+        s.record_at("capped", "m1", &s.today_key(), cnt(100));
+        feed(&mut p, &s);
+
+        // ★ 让「已触顶」的那个号**冷却结束得更早**：全冷却兜底的既有契约是
+        // 「挑最早结束的」，所以若护栏没进兜底路径，它必然挑中 `capped`。
+        // 两个号冷却时长相同的话挑中谁都不说明问题 —— 那样这条测试会假绿。
+        p.cooldown("capped", CoolKind::Soft, Duration::from_secs(60), "test");
+        p.cooldown("free", CoolKind::Soft, Duration::from_secs(120), "test");
+
+        let now = SystemTime::now();
+        let a = p
+            .pick_earliest_expiry(&[], now, "deepseek-v4.1-flash", "")
+            .expect("兜底应能选出未触顶的账号");
+        assert_eq!(
+            a.uid, "free",
+            "兜底必须跳过已用满今日额度的账号 —— 挑中 capped 说明护栏没进兜底路径"
+        );
+
+        // 端到端那一层同样要挡住：`pick()` 在全冷却时会落到同一个兜底。
+        for _ in 0..10 {
+            assert_ne!(
+                p.pick().map(|a| a.uid),
+                Some("capped".to_string()),
+                "连冷却兜底都不得把用满额度的账号捞出来接客"
+            );
+        }
+    }
+
+    /// #8 全池触顶时 `daily_cap_excludes_all` 报「全部」，且**分母只算本来能用的号**。
+    ///
+    /// 冷却中的账号不进分母：否则「只开了一个号、它在冷却」也会被判成「全池触顶」，
+    /// 把一个临时冷却说成「今天没额度了」。
+    #[test]
+    fn daily_cap_excludes_all_counts_only_otherwise_usable_accounts() {
+        let mut p = Pool::new(String::new());
+        let s = guard_stats();
+        p.add(mk("u1"));
+        p.add(mk("u2"));
+        p.set_daily_guard(100, 0);
+        s.record_at("u1", "m1", &s.today_key(), cnt(100));
+        s.record_at("u2", "m1", &s.today_key(), cnt(100));
+        feed(&mut p, &s);
+
+        assert_eq!(p.daily_cap_excludes_all("", "m", Region::Any), (2, 2));
+
+        // 把 u2 冷却掉：它不再进分母 ⇒ 变成 1/1（仍然「全部触顶」）。
+        p.cooldown("u2", CoolKind::Soft, Duration::from_secs(60), "test");
+        assert_eq!(
+            p.daily_cap_excludes_all("", "m", Region::Any),
+            (1, 1),
+            "冷却中的账号不进分母（判据与 no_route_excludes_all 对齐）"
+        );
+
+        // 只开一个号且未触顶 ⇒ 分母 1、挡住 0（不得报「全池触顶」）。
+        let mut p2 = Pool::new(String::new());
+        p2.add(mk("only"));
+        p2.set_daily_guard(100, 0);
+        assert_eq!(p2.daily_cap_excludes_all("", "m", Region::Any), (0, 1));
+    }
+
+    /// #9 护栏**不得**写进 `disabled` / `no_route`，也不得停掉养号路径。
+    ///
+    /// 与 `platform_switch_never_touches_task_or_probe_paths` 同源的硬约束：
+    /// `probe_uids` / `all_uids` 是养号任务（签到 / 上报 / 成长）的枚举入口，
+    /// 一旦被护栏影响，撞了额度的账号就不再被养 —— 而它恰恰是最需要续额度的那个。
+    ///
+    /// `available_uids`（会话粘性回调）**会**受护栏影响：那是选号路径的一部分。
+    #[test]
+    fn daily_guard_never_touches_task_or_probe_paths() {
+        let mut p = Pool::new(String::new());
+        let s = guard_stats();
+        p.add(mk("u1"));
+        p.set_daily_guard(100, 0);
+        s.record_at("u1", "m1", &s.today_key(), cnt(100));
+        feed(&mut p, &s);
+
+        assert_eq!(p.probe_uids(), vec!["u1".to_string()], "探测必须照旧（养号任务靠它枚举）");
+        assert_eq!(p.all_uids(), vec!["u1".to_string()], "运维观测必须照旧");
+        assert_eq!(p.available_uids(), Vec::<String>::new(), "选号列表要被护栏挡住");
+
+        let st = p.status_by_uid("u1").unwrap();
+        assert!(!st.disabled, "护栏不是「账号已死」—— 账号列表里不能显示成禁用");
+        assert!(!st.no_route, "护栏不是用户关的路由开关");
+        assert!(st.daily_guard, "必须用独立的标志如实下发");
+    }
+
+    /// #10 通过热重载改闸值：`set_daily_guard` 后**立刻**生效，不必等下一个周期。
+    ///
+    /// 因为闸值是 `set_daily_guard` 当场下发到条目的；用量才是周期刷新。
+    #[test]
+    fn raising_the_cap_takes_effect_immediately() {
+        let mut p = Pool::new(String::new());
+        let s = guard_stats();
+        p.add(mk("u1"));
+        p.set_daily_guard(100, 0);
+        s.record_at("u1", "m1", &s.today_key(), cnt(150));
+        feed(&mut p, &s);
+        assert!(!p.servable_now());
+
+        // 用户把上限调高到 200 ⇒ 不需要新的周期，当场就恢复。
+        p.set_daily_guard(200, 0);
+        assert!(p.servable_now(), "调高上限后必须立刻恢复（否则用户会以为没生效）");
+    }
+
+    /// #11 新增账号必须**当场**就受护栏约束（闸值随 `upsert` 复制进条目）。
+    #[test]
+    fn newly_added_account_inherits_the_guard_knobs() {
+        let mut p = Pool::new(String::new());
+        p.set_daily_guard(100, 50);
+        p.add(mk("later"));
+        let st = p.status_by_uid("later").unwrap();
+        assert!(!st.daily_guard, "新号今天还没用量，不该被挡住");
+
+        // 但它**受**约束：给一点用量就挡住。
+        let s = guard_stats();
+        s.record_at("later", "m1", &s.today_key(), cnt(100));
+        p.refresh_daily_usage(&s);
+        assert!(!p.servable_now(), "新号也必须受同一份护栏约束");
+    }
+
+    /// #12 `credits_known` 不得持久化（重启后靠下一次巡检刷回）。
+    ///
+    /// 刻意 fail-open：宁可少拦一个周期，也不能凭一个陈旧数字把账号永久锁死。
+    #[test]
+    fn credits_known_is_not_persisted() {
+        let dir = std::env::temp_dir().join(format!("wbswg-guard-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let path_s = path.to_string_lossy().to_string();
+
+        let mut p = Pool::new(path_s.clone());
+        p.add(mk("u1"));
+        p.set_credits("u1", 7);
+        assert!(p.flush(), "状态已改，必须落盘");
+
+        let mut p2 = Pool::new(path_s);
+        p2.load_state();
+        p2.set_daily_guard(0, 1000); // 一个一定会挡住任何已知余额的下限
+        assert!(
+            p2.servable_now(),
+            "从状态文件读回的 credits 不得被当成真值 —— 否则重启后会凭旧数字把号锁死"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

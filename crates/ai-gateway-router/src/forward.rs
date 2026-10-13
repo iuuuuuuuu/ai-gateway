@@ -197,6 +197,22 @@ pub enum FailureKind {
     /// 现场的教训：13 个国际区账号被轮一遍、全部喂进熔断，最终把「上游故障」
     /// 变成「全网关无号可用」。详见 [`crate::emptystream::empty_stream_burst_message`]。
     EmptyStreamBurst,
+    /// **本机的每日护栏**把该产品/区域下的账号全部挡住了（每日 Token 上限 /
+    /// 保留积分下限，见 [`crate::pool::Pool::set_daily_guard`]）。
+    ///
+    /// # 为什么必须与 [`FailureKind::AllNoRoute`] 分开
+    ///
+    /// 两者都是「一个号都选不出来」，但**出路相反**：`AllNoRoute` 的出路是
+    /// 「去账号列表重新打开路由开关」（用户自己关的，随时可开）；这一条的出路是
+    /// 「等今天过去 / 调高上限」—— 开关本来就是开的，用户去点它只会更困惑。
+    /// 文案与错误码都必须能区分这两者。
+    ///
+    /// # 为什么是 429 而不是 503
+    ///
+    /// 503 的含义是「服务暂时不可用」⇒ 客户端会把它当成故障去重试/告警；
+    /// 而这里的语义是**限流**：请求本身没错，是本机设的额度用完了，恢复时刻
+    /// 明确（下一个本地零点）⇒ 429 才是正确的语义。
+    DailyGuardExceeded,
 }
 
 /// 一次需要特殊上报的转发失败。
@@ -1006,6 +1022,46 @@ pub async fn forward_chat(
                     );
                 }
             }
+            // ── 本机的每日护栏把该产品/区域下的账号全挡住了 ──
+            //
+            // 与上面 AllNoRoute 的**唯一区别是出路**：那里是用户自己关的开关
+            // （点一下就好），这里是本机设的额度（等本地零点 / 调高上限）。
+            // 故必须是另一条分支、另一个错误码与另一份文案。
+            //
+            // ★ 判据同样是 `blocked == total && total > 0`（与 no_route 对齐）：
+            // 只看 `blocked > 0` 会误判 —— 一个号撞护栏、另一个号因冷却而选不出来，
+            // 真实成因是冷却，报「额度上限」会把用户引到错误的方向。
+            //
+            // ⚠ 位置：必须排在「平台总开关 / 模型白名单」那道 400 **之后**。
+            //
+            // 那两条是**无条件**的配置闸：平台被关掉（或模型不在白名单里）时，
+            // 请求换到哪个号、等到哪一天都不可能成功。若先报「今天没额度」，
+            // 用户会把两条真正的病因都漏掉 —— 既不会去打开平台开关，
+            // 也不会去加白名单，只会等到明天再撞同一次墙。
+            //
+            // 反过来则无害：配置都对、只是今天额度用满 ⇒ 落到这里报 429。
+            {
+                let (blocked, total) =
+                    lock_pool(ctx.pool).daily_cap_excludes_all(product, &model, route.region);
+                if total > 0 && blocked == total {
+                    return (
+                        Some(ChatResult::Response {
+                            uid: String::new(),
+                            model: model.clone(),
+                            product: String::new(),
+                            region: String::new(),
+                            body: serde_json::Map::new(),
+                        }),
+                        429,
+                        Some(ForwardFailure {
+                            kind: FailureKind::DailyGuardExceeded,
+                            status: 429,
+                            message: daily_guard_message(total, blocked),
+                        }),
+                    );
+                }
+            }
+
             break;
         };
 
@@ -2190,6 +2246,33 @@ pub fn all_no_route_message(total: usize) -> String {
     )
 }
 
+/// 生成「今日额度已达上限」的说明（见 [`FailureKind::DailyGuardExceeded`]）。
+///
+/// # 为什么必须把「什么时候恢复」说清楚
+///
+/// 429 的默认解读是「稍后重试」。而这里拦住请求的是**本机自己设的每日上限**：
+/// 额度在**本地零点**归零，在那之前重试多少次都还是 429。若只回一句「已达上限」，
+/// 用户会一直重试到天亮；说清恢复时刻只需一句话，却是这条文案的全部价值。
+///
+/// ⚠ 措辞不能写成「故障」或「账号不可用」：账号是好的，护栏是本机设的，
+/// 用户随时可以调高上限立刻恢复。
+pub fn daily_guard_message(total: usize, capped: usize) -> String {
+    if capped >= total {
+        format!(
+            "该产品下的可用账号（共 {total} 个）今天都已经用满了你设置的每日额度上限，\
+所以本机暂时不给它们接新的对话。这不是故障 —— 额度按**本地日期**统计，\
+过了本地零点自动恢复；也可以调高每日 Token 上限 / 调低保留积分下限后立即恢复。"
+        )
+    } else {
+        // 「有账号可用、却一个都选不出来」是另一类成因（模型/区域/冷却组合），
+        // 不能套用「全池触顶」的措辞 —— 那会把用户引到错误的方向。
+        format!(
+            "今日额度已达上限：{capped} / {total} 个账号撞到了你设置的每日护栏（每日 Token 上限或保留积分下限）。\
+额度按**本地日期**统计，过了本地零点自动恢复。"
+        )
+    }
+}
+
 /// 把请求体里的 `model` 字段改写为**剥掉前缀后的裸名**。
 ///
 /// # 为什么必须改写
@@ -2654,6 +2737,186 @@ mod tests {
         }
     }
 
+    // ---------- ★ ⑫ 本机每日护栏（429）的端到端出口 ----------
+
+    /// 给池灌一份「今天已经把额度用满」的用量。
+    ///
+    /// 走的是**生产同一条路**：`Stats` 聚合 → `Pool::refresh_daily_usage`。
+    fn cap_today(pool: &Mutex<Pool>, uids: &[&str], cap: i64) {
+        let s = crate::usage::Stats::new(String::new());
+        let day = s.today_key();
+        for uid in uids {
+            s.record_at(
+                uid,
+                "glm-5.3",
+                &day,
+                crate::usage::Counters { input: cap, ..Default::default() },
+            );
+        }
+        let mut p = pool.lock().unwrap();
+        p.set_daily_guard(cap, 0);
+        p.refresh_daily_usage(&s);
+    }
+
+    /// ★ 全池撞上本机每日护栏 ⇒ **429**，且文案指明出路是「等本地零点 / 调高上限」。
+    ///
+    /// 为什么必须是 429 而不是 503：503 的语义是「上游/账号有问题，稍后重试」，
+    /// 用户会去查账号；而这里的恢复时刻是**确定的**（本地零点）。
+    /// ★ 全池触顶的文案必须给出**确定的**恢复时刻与两条出路。
+    ///
+    /// 429 的默认解读是「稍后重试」；而额度在本地零点归零，重试到天亮也没用。
+    /// 说清恢复时刻只需一句话，却是这条文案的全部价值。
+    #[test]
+    fn daily_guard_message_states_a_concrete_recovery_time() {
+        let m = daily_guard_message(3, 3);
+        assert!(m.contains("3 个"), "{m}");
+        assert!(m.contains("本地零点"), "{m}");
+        assert!(m.contains("调高每日 Token 上限"), "{m}");
+        assert!(m.contains("保留积分下限"), "{m}");
+        // ★ 必须说清「不是故障」—— 账号是好的，护栏是本机设的。
+        assert!(m.contains("不是故障"), "{m}");
+    }
+
+    /// 部分触顶（不可能到出口，但文案函数自身要能表达）不能套用「全池」措辞。
+    #[test]
+    fn daily_guard_message_distinguishes_partial_from_full() {
+        let m = daily_guard_message(5, 2);
+        assert!(m.contains("2 / 5"), "{m}");
+        assert!(!m.contains("都已经用满"), "部分触顶不得说成「全池」: {m}");
+        assert!(m.contains("本地零点"), "{m}");
+    }
+
+    #[tokio::test]
+    async fn daily_guard_returns_429_when_every_account_is_capped() {
+        let p = pool_with_products(&[("q1", "qoder")]);
+        cap_today(&p, &["q1"], 100);
+        let client = Client::new(ClientConfig::default()).unwrap();
+        let products = crate::products::ProductUpstreams::new();
+        let (unusual, waf_ip, empty_stream) = fresh_breakers();
+        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
+
+        let (_, status, fail) = forward_chat(
+            &mut c,
+            br#"{"model":"qoder:glm-5.3"}"#,
+            false,
+            "",
+            ImageRoute::any(),
+            "qoder",
+        )
+        .await;
+        assert_eq!(status, 429, "全池触顶必须是 429（不是 503「稍后重试」）");
+        let f = fail.expect("应返回失败");
+        assert_eq!(f.kind, FailureKind::DailyGuardExceeded);
+        // 文案必须给出**确定的**恢复时刻与两条出路，否则用户只能反复重试。
+        assert!(f.message.contains("本地零点"), "{}", f.message);
+        assert!(f.message.contains("上限"), "{}", f.message);
+
+        // ★ 护栏只是「今天别用它」，**不是**把账号弄坏：两个权威标记都不能被写。
+        let list = p.lock().unwrap().list();
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].disabled, "护栏不得写进账号 disabled（那会让养号任务也跳过）");
+        assert!(!list[0].no_route, "护栏不得写进账号 no_route（那是用户的开关）");
+        // 但必须如实下发「被护栏挡住」这一状态，界面才能解释「为什么没流量」。
+        assert!(list[0].daily_guard, "必须用独立标志如实下发");
+    }
+
+    /// ★★ 位置回归：**平台被关掉**是配置错（400），必须**压过**每日护栏的 429。
+    ///
+    /// 两者同时成立时先报 429 会把用户引向完全错误的操作 —— 他会等到明天，
+    /// 而明天照样是 400。这条测试钉住「无条件的配置闸优先于有恢复时刻的限流」。
+    #[tokio::test]
+    async fn daily_guard_never_masks_a_config_gate() {
+        let p = pool_with_products(&[("q1", "qoder")]);
+        cap_today(&p, &["q1"], 100);
+        p.lock()
+            .unwrap()
+            .set_platform_enabled(&std::collections::HashMap::from([(
+                "qoder".to_string(),
+                false,
+            )]));
+        let client = Client::new(ClientConfig::default()).unwrap();
+        let products = crate::products::ProductUpstreams::new();
+        let (unusual, waf_ip, empty_stream) = fresh_breakers();
+        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
+
+        let (_, status, fail) = forward_chat(
+            &mut c,
+            br#"{"model":"qoder:glm-5.3"}"#,
+            false,
+            "",
+            ImageRoute::any(),
+            "qoder",
+        )
+        .await;
+        assert_eq!(status, 400, "配置错必须优先于「今天没额度」");
+        assert_eq!(
+            fail.expect("应返回失败").kind,
+            FailureKind::PlatformNotInRouting
+            );
+    }
+
+    /// 反向保证：**只有部分**账号触顶时不得报 429 —— 还有号能用。
+    ///
+    /// 判据是 `blocked == total`，写成 `blocked > 0` 会让「一个号用满」
+    /// 被说成「整个产品今天没额度了」。
+    #[tokio::test]
+    async fn daily_guard_does_not_fire_when_some_accounts_are_still_free() {
+        let p = pool_with_products(&[("q1", "qoder"), ("q2", "qoder")]);
+        cap_today(&p, &["q1"], 100);
+        let client = Client::new(ClientConfig::default()).unwrap();
+        let products = crate::products::ProductUpstreams::new();
+        let (unusual, waf_ip, empty_stream) = fresh_breakers();
+        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
+
+        let (_, status, fail) = forward_chat(
+            &mut c,
+            br#"{"model":"qoder:glm-5.3"}"#,
+            false,
+            "",
+            ImageRoute::any(),
+            "qoder",
+        )
+        .await;
+        // 没有真实上游 ⇒ 最终会以 503 落定，但**绝不能**是护栏的 429。
+        assert_ne!(status, 429, "还有可用账号时不得报「今日额度已达上限」");
+        if let Some(f) = fail {
+            assert_ne!(f.kind, FailureKind::DailyGuardExceeded);
+        }
+    }
+
+    /// 护栏关闭（默认）时，用量再高也不得影响任何选号结果。
+    #[tokio::test]
+    async fn daily_guard_is_off_by_default() {
+        let p = pool_with_products(&[("q1", "qoder")]);
+        // 灌用量但**不**设闸值（等价于用户没开这个功能）。
+        let s = crate::usage::Stats::new(String::new());
+        let day = s.today_key();
+        s.record_at(
+            "q1",
+            "glm-5.3",
+            &day,
+            crate::usage::Counters { input: 99_999_999, ..Default::default() },
+        );
+        p.lock().unwrap().refresh_daily_usage(&s);
+
+        let client = Client::new(ClientConfig::default()).unwrap();
+        let products = crate::products::ProductUpstreams::new();
+        let (unusual, waf_ip, empty_stream) = fresh_breakers();
+        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
+        let (_, status, fail) = forward_chat(
+            &mut c,
+            br#"{"model":"qoder:glm-5.3"}"#,
+            false,
+            "",
+            ImageRoute::any(),
+            "qoder",
+        )
+        .await;
+        assert_ne!(status, 429, "功能关闭时不得改变任何行为");
+        if let Some(f) = fail {
+            assert_ne!(f.kind, FailureKind::DailyGuardExceeded);
+        }
+    }
     /// 产品前缀请求**不得**跨平台兜底：池里只有 workbuddy 账号时，
     /// `qoder:xxx` 必须选不出号（否则用户会看到「我指定了 qoder，却报 ZCode 的错」）。
     #[test]

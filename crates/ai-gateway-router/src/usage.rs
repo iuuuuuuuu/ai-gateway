@@ -71,10 +71,22 @@ impl Counters {
             && self.records == 0
     }
 
-    /// 导出成与宿主 Token 统计页一致的字段口径。
+    /// 本次累计的 **Token 总量**。
     ///
     /// `total = input + output + cache_write`（**不含** `cache_read`，
     /// 避免与 `input` 重复计数 —— `input` 已经含了它）。
+    ///
+    /// ★ 这是**唯一**的总量口径：Token 统计页（[Counters::value]）与网关的
+    /// 每日护栏（[`crate::pool::Pool::daily_capped`]）都走这一个函数。
+    /// 若两处各算一套，用户会看到「界面没到上限」而网关已经 429 —— 那是
+    /// 最难排查的一类不一致。
+    pub fn total(&self) -> i64 {
+        self.input + self.output + self.cache_write
+    }
+
+    /// 导出成与宿主 Token 统计页一致的字段口径。
+    ///
+    /// `total` 见 [Counters::total]（**不含** `cache_read`）。
     fn value(&self) -> serde_json::Value {
         let uncached = (self.input - self.cache_read).max(0);
         let hit_rate = if self.input > 0 {
@@ -83,7 +95,7 @@ impl Counters {
             serde_json::Value::Null
         };
         serde_json::json!({
-            "total": self.input + self.output + self.cache_write,
+            "total": self.total(),
             "input": self.input,
             "output": self.output,
             "cacheRead": self.cache_read,
@@ -1470,6 +1482,43 @@ impl Stats {
         chrono::Local::now().timestamp_millis()
     }
 
+    /// 当前**本地日期键**（`YYYY-MM-DD`）；测试注入的时钟优先。
+    ///
+    /// ⚠ 与同文件底部的 `local_day_now()` 区别：那个直接读 `chrono::Local::now()`，
+    /// **绕过注入时钟**，只适合「无测试驱动」的落盘路径。凡是要被测试断言的
+    /// 日期（每日护栏就是），一律走本函数。
+    pub fn today_key(&self) -> String {
+        day_of_ms(self.clock_ms())
+    }
+
+    /// 某账号在**某个本地日期**上的累计 Token（口径 = [Counters::total]）。
+    ///
+    /// # 为什么要它
+    ///
+    /// 每日护栏需要「账号 × 今天」的用量，而 `Inner` 是私有的，
+    /// `Inner::accounts[uid][day]` 没有对外读取器。
+    ///
+    /// 日期键由调用方给（见 [Stats::today_key]）：让「今天」在**一次判定内**
+    /// 只算一次，避免跨零点瞬间同一个循环里前后取到两个不同的日期。
+    ///
+    /// 未记录的账号/日期返回 `0`（= 今天没有用量），与「数据源没接上」等价 ——
+    /// 两者对护栏的后果相同（都不该拦），故不区分。
+    pub fn account_day_tokens(&self, uid: &str, day: &str) -> i64 {
+        if uid.is_empty() || day.is_empty() {
+            return 0;
+        }
+        let Ok(inner) = self.inner.lock() else {
+            return 0;
+        };
+        let Some(days) = inner.accounts.get(uid) else {
+            return 0;
+        };
+        let Some(c) = days.get(day) else {
+            return 0;
+        };
+        c.total()
+    }
+
     /// 注入一个固定时钟（测试用）。对应 Go 直接赋值 `s.now = func() ...`。
     #[cfg(test)]
     pub(crate) fn set_now_for_test(&self, ms: i64) {
@@ -1869,7 +1918,7 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 /// 毫秒时刻 → 本地日期键（`%Y-%m-%d`）。
 ///
 /// 越界到无法表示的毫秒（`i64` 极端值）返回空串，调用方据此退化成「不设边界」。
-fn day_of_ms(ms: i64) -> String {
+pub fn day_of_ms(ms: i64) -> String {
     match chrono::Local.timestamp_millis_opt(ms).single() {
         Some(dt) => dt.format(DAY_LAYOUT).to_string(),
         None => String::new(),
@@ -3623,5 +3672,134 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ────────────── 每日护栏的输入面（账号 × 本地当日 Token）──────────────
+
+    /// [Counters::total] 必须与导出口径**逐字一致**。
+    ///
+    /// 护栏用 `total()` 判上限，而界面显示的是 `value()["total"]`。两处若分叉，
+    /// 用户会看到「界面还没到上限」而网关已经 429 —— 最难排查的一类不一致。
+    #[test]
+    fn counters_total_matches_exported_total() {
+        let c = Counters {
+            input: 100,
+            output: 20,
+            cache_read: 70,
+            cache_write: 5,
+            records: 2,
+        };
+        assert_eq!(c.total(), 125, "total = input + output + cache_write（不含 cache_read）");
+        assert_eq!(c.value()["total"], json!(125));
+    }
+
+    /// 账号 × 日期维度必须能被护栏按 uid + 当天读出来。
+    #[test]
+    fn account_day_tokens_reads_the_account_day_dimension() {
+        let s = Stats::new("");
+        s.record_at(
+            "u1",
+            "m1",
+            "2026-10-14",
+            Counters { input: 30, output: 10, cache_read: 99, cache_write: 5, records: 1 },
+        );
+        s.record_at(
+            "u1",
+            "m2",
+            "2026-10-14",
+            Counters { input: 4, output: 1, ..Default::default() },
+        );
+        s.record_at(
+            "u1",
+            "m1",
+            "2026-10-13",
+            Counters { input: 999, ..Default::default() },
+        );
+        s.record_at("u2", "m1", "2026-10-14", Counters { input: 7, ..Default::default() });
+
+        // 50 = (30+10+5) + (4+1+0)：两次记录的 input+output+cache_write 之和；
+        // `cache_read = 99` **不进总量**（它已经含在 input 里，重复计会让护栏提前触发）。
+        assert_eq!(s.account_day_tokens("u1", "2026-10-14"), 50);
+        // 隔壁那一天不能串进来 —— 串了护栏就永远不放开。
+        assert_eq!(s.account_day_tokens("u1", "2026-10-13"), 999);
+        // 别的账号不能算在一起。
+        assert_eq!(s.account_day_tokens("u2", "2026-10-14"), 7);
+    }
+
+    /// 未知的账号 / 日期 / 空键都返回 0，且不得 panic。
+    ///
+    /// 「没有记录」与「今天没用过」对护栏的后果相同（都不该拦），故不区分。
+    #[test]
+    fn account_day_tokens_is_zero_for_unknown_keys() {
+        let s = Stats::new("");
+        s.record_at("u1", "m1", "2026-10-14", Counters { input: 5, ..Default::default() });
+        assert_eq!(s.account_day_tokens("nobody", "2026-10-14"), 0);
+        assert_eq!(s.account_day_tokens("u1", "1999-01-01"), 0);
+        assert_eq!(s.account_day_tokens("", "2026-10-14"), 0);
+        assert_eq!(s.account_day_tokens("u1", ""), 0);
+    }
+
+    /// `today_key()` 必须走**可注入的**时钟 —— 否则护栏的跨零点行为无法测试。
+    #[test]
+    fn today_key_honours_the_injected_clock() {
+        let s = Stats::new("");
+        // 2026-10-14 12:00:00 +08:00
+        let noon = 1_792_161_600_000;
+        s.set_now_for_test(noon);
+        let got = s.today_key();
+        assert_eq!(got, day_of_ms(noon), "必须与 clock_ms 同源");
+        assert!(!got.is_empty(), "注入合法时刻后不得退化成空串（空串会让护栏静默失效）");
+        assert_eq!(got.len(), 10, "日期键固定宽度，便于直接比较");
+    }
+
+    /// 落盘再读回后，护栏的输入必须**逐字不变**。
+    ///
+    /// 护栏的判据来自 `Inner::accounts`，而 `FileState` 是显式逐字段构造的 ——
+    /// 将来若有人给 `Inner` 加了字段却漏了 `flush`，这条会立刻变红。
+    #[test]
+    fn daily_usage_survives_flush_and_reload() {
+        let dir = std::env::temp_dir().join(format!("wbswg-daily-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("usage.json");
+        let path_s = path.to_string_lossy().to_string();
+
+        let s = Stats::new(&path_s);
+        s.record_at(
+            "u1",
+            "m1",
+            "2026-10-14",
+            Counters { input: 100, output: 50, cache_read: 0, cache_write: 3, records: 1 },
+        );
+        assert_eq!(s.account_day_tokens("u1", "2026-10-14"), 153);
+        s.flush();
+
+        let s2 = Stats::new(&path_s);
+        assert_eq!(
+            s2.account_day_tokens("u1", "2026-10-14"),
+            153,
+            "重启后护栏的输入必须还在 —— 否则重启会静默放开当日额度"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Counters::value()` 的字段集合不得因新增 `total()` 而改变。
+    #[test]
+    fn counters_value_keeps_its_key_set() {
+        let c = Counters { input: 1, ..Default::default() };
+        let v = c.value();
+        let obj = v.as_object().unwrap();
+        for k in [
+            "total",
+            "input",
+            "output",
+            "cacheRead",
+            "cacheWrite",
+            "uncachedInput",
+            "records",
+            "cacheHitRate",
+        ] {
+            assert!(obj.contains_key(k), "导出字段 `{k}` 必须保留（宿主统计页依赖它）");
+        }
+        assert_eq!(obj.len(), 8, "不得悄悄增删字段");
     }
 }

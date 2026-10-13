@@ -104,6 +104,9 @@ async fn main() {
     let mut pool = Pool::new(cfg.state_file.clone());
     pool.load_state();
     let loaded_state = pool.loaded_from_state();
+    // ★ 每日护栏：与 `set_breaker` 同处（池刚建好、账号还没进来之前）。
+    // 缺省 0 = 关闭，故这一步在老配置下是 no-op。
+    pool.set_daily_guard(cfg.daily_token_cap, cfg.credit_floor);
     pool.set_breaker(
         cfg.pool.breaker_threshold,
         cfg.parsed.breaker_cooldown,
@@ -559,6 +562,9 @@ async fn main() {
         // ★ 平台总开关也进热更新面：它在账号页是**随手点**的，走
         // 「写配置 → 重启网关」那条路会让每次点击都掐断正在跑的请求。
         platform_enabled: cfg.platform_enabled.clone().unwrap_or_default(),
+        // ★ 每日护栏的初值 = 启动配置（与上面同一条约定：初值与启动配置一致）。
+        daily_token_cap: cfg.daily_token_cap,
+        credit_floor: cfg.credit_floor,
         prompt_mode: cfg.parsed.prompt_mode.clone(),
         prompt_text: cfg.parsed.prompt_text.clone(),
     });
@@ -1016,6 +1022,14 @@ async fn main() {
                 tick.tick().await;
                 state.usage.flush();
                 if let Ok(mut pool) = state.pool.lock() {
+                    // ★ 每日护栏的输入刷新：把「账号 × 今天」的用量灌进池里。
+                    //
+                    // 复用这同一条 tick —— 护栏需要的是「秒级新鲜度」，
+                    // 而这里本来就是每 5 秒一次的落盘循环，不新增定时器。
+                    //
+                    // ⚠ 顺序：必须在 `flush()` **之前**，让本轮判定用的是刚
+                    // 取到的用量；反过来会晚一个周期（5 秒，可接受但没必要）。
+                    pool.refresh_daily_usage(&state.usage);
                     pool.flush();
                 }
             }

@@ -296,6 +296,24 @@ pub struct Config {
     /// `true` 与「键不存在」同义，写进配置文件只会让「全量还是增量」难以分辨。
     #[serde(rename = "platform_enabled", default)]
     pub platform_enabled: Option<HashMap<String, bool>>,
+    /// 每日 Token 上限（每账号，单位 token；`0` / 缺省 = **关闭**）。
+    ///
+    /// 见 [`crate::pool::Pool::set_daily_guard`]：某账号本地当日的 Token 用量达到
+    /// 此值后当天不再被选号，本地零点自动放开。
+    ///
+    /// ★ 与 `platform_enabled` 同属**热更新面**（`cfgwatch` 每 5 秒比对文件指纹），
+    /// 因为它在账号页可能被随手改 —— 走「写配置 → 重启网关」会让每次调整都掐断
+    /// 正在跑的请求。
+    ///
+    /// ★ 缺省 `0` = 关闭：老配置没有这个键时行为逐字不变。
+    #[serde(rename = "daily_token_cap", default)]
+    pub daily_token_cap: i64,
+    /// 保留积分下限（每账号；`<=` 此值时不再选号；`0` / 缺省 = **关闭**）。
+    ///
+    /// ⚠ 只对**积分已知**的账号生效：ZCode 从不写 `credits`，把它当 0 会让整个
+    /// 平台被误闸（见 `pool::Entry::credits_known`）。
+    #[serde(rename = "credit_floor", default)]
+    pub credit_floor: i64,
     /// Qoder / ZCode 日常任务**自动执行**总闸，缺省 **true**。
     ///
     /// ★ 已于 2026-09-22 拆分为 `qoder_claim_enabled` / `zcode_claim_enabled`
@@ -676,6 +694,10 @@ impl Default for Config {
             platform_models_disabled: None,
             // ★ 同上：`None` = 用户没关任何平台，行为与引入该键前逐字一致。
             platform_enabled: None,
+            // ★ 每日护栏缺省**关闭**：与 `platform_enabled` 同一个立场 ——
+            // 升级不改行为。改这两个值的唯一途径是显式写进网关配置文件。
+            daily_token_cap: 0,
+            credit_floor: 0,
             product_tasks_enabled: true,
             qoder_claim_enabled: None,
             zcode_claim_enabled: None,

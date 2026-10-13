@@ -393,6 +393,16 @@ fn status_to_json(s: &crate::pool::Status) -> Value {
     if s.no_route {
         m.insert("no_route".into(), true.into());
     }
+    // `daily_guard` 是**第三种**「不接流量」：既不是账号坏了（`disabled`），
+    // 也不是用户手动关了路由（`no_route`），而是**本机自己设的每日用量闸**
+    // 把它挡在选号之外。同样必须单独下发 —— 否则用户会去查账号，而真正的
+    // 出路是「等今天过去」或「调高上限」。
+    //
+    // 与 `no_route` 同款：只在为 true 时输出（护栏关闭时这个键根本不出现，
+    // 老前端与老配置行为逐字不变）。
+    if s.daily_guard {
+        m.insert("daily_guard".into(), true.into());
+    }
     // 「按到期档位现在轮不到它」：不是故障，只表示排队。
     //
     // ⚠ 必须由后端下发：前端既拿不到 healthy / 模型冷却 / 在途 这三套判定，
@@ -2309,6 +2319,15 @@ impl Wire {
             (Wire::Chat, F::AllNoRoute) => "no_healthy_account",
             (Wire::Messages, F::AllNoRoute) => "api_error",
             (Wire::Responses, F::AllNoRoute) => "upstream_error",
+            // ★ 本机每日护栏（429）：**请求侧**错误，不是上游故障。
+            //
+            // 与 AllNoRoute 的取舍正好相反：那一条说的是「你自己关了开关」⇒ 归到
+            // 上游/服务侧的形状（客户端重试无意义）；这一条说的是「你今天没额度了」
+            // ⇒ 归到 invalid_request_error，让客户端把它当成**可解释的拒绝**而不是
+            // 「网关坏了」。429 状态码由 `ForwardFailure::status` 带出，与本表无关。
+            (Wire::Chat, F::DailyGuardExceeded) => "rate_limit_exceeded",
+            (Wire::Messages, F::DailyGuardExceeded) => "invalid_request_error",
+            (Wire::Responses, F::DailyGuardExceeded) => "invalid_request_error",
         }
     }
 }
@@ -4938,6 +4957,9 @@ mod tests {
             (F::NoResourcePack, "no_resource_pack", "forward.rs:921"),
             (F::Upstream, "no_healthy_account", "handler.go:1366"),
             (F::AllNoRoute, "no_healthy_account", "handler.go:1366"),
+            // Rust 侧新增（Go 侧没有对应实现）⇒ 出处填**本仓库**行号，
+            // 不编造 `handler.go` 的行号（见本测试的说明）。
+            (F::DailyGuardExceeded, "rate_limit_exceeded", "forward.rs:969"),
         ];
         for (kind, want, go) in cases {
             assert_eq!(

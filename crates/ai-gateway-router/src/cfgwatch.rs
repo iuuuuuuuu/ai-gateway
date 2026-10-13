@@ -80,6 +80,15 @@ pub struct DynamicConfig {
     /// `set_platform_models` 那条「写配置 → 重启网关」的路会让每次点击都掐断
     /// 正在跑的请求。而池读的就是这份 map，热加载即可生效。
     pub platform_enabled: HashMap<String, bool>,
+    /// 每日 Token 上限（每账号；`0` = 关闭）—— [crate::pool::Pool::set_daily_guard] 的第一个旋钮。
+    ///
+    /// 为什么进热更新面：与 `platform_enabled` 同款理由 —— 它是用户在账号页
+    /// **随手改**的旋钮，走「写配置 → 重启网关」会让每次调整都掐断正在跑的请求。
+    ///
+    /// ★ 用 `i64` 而不是 `f64`：本结构体派生了 `Eq`，浮点进不来。
+    pub daily_token_cap: i64,
+    /// 保留积分下限（每账号；`0` = 关闭）—— 第二个旋钮。
+    pub credit_floor: i64,
     /// 系统提示词模式（已归一化：`passthrough` / `custom` / `append`）。
     pub prompt_mode: String,
     /// 系统提示词文本（`passthrough` 下恒空）。
@@ -92,6 +101,9 @@ impl Default for DynamicConfig {
             product_models: HashMap::new(),
             // ★ 缺省空 map = 所有平台都参加路由（与老配置行为逐字一致）。
             platform_enabled: HashMap::new(),
+            // ★ 缺省 0 = 每日护栏关闭（同款立场：升级不改行为）。
+            daily_token_cap: 0,
+            credit_floor: 0,
             // ★ 缺省 passthrough：与 `[crate::config::PromptConfig::default]` 同口径。
             prompt_mode: crate::prompt::MODE_PASSTHROUGH.to_string(),
             prompt_text: String::new(),
@@ -340,6 +352,10 @@ pub fn start_config_watch(
                                 let dc = DynamicConfig {
                                     product_models: next.product_models.clone(),
                                     platform_enabled: next.platform_enabled.clone().unwrap_or_default(),
+                                    // ★ 每日护栏的两个旋钮也进热更新面（缺省 0 = 关闭，
+                                    // 老配置行为逐字不变）。
+                                    daily_token_cap: next.daily_token_cap,
+                                    credit_floor: next.credit_floor,
                                     prompt_mode: next.parsed.prompt_mode.clone(),
                                     prompt_text: next.parsed.prompt_text.clone(),
                                 };
@@ -360,6 +376,9 @@ pub fn start_config_watch(
                                     // ★ 平台总开关同样要落进池里 —— 池读的就是这份，
                                     // 只更新 `dynamic` 不改池等于开关毫无效果。
                                     p.set_platform_enabled(&dc.platform_enabled);
+                                    // ★ 每日护栏：与平台开关同款，只更新 `dynamic` 不改池
+                                    // 等于旋钮毫无效果（池的判据读的是自己那份）。
+                                    p.set_daily_guard(dc.daily_token_cap, dc.credit_floor);
                                 }
                                 dynamic.reload(dc);
                                 last_cfg = stamp;
@@ -584,6 +603,9 @@ mod tests {
             // 平台开关也要显式给一份：它是「整份替换」语义最容易漏掉的字段 ——
             // 漏了会表现为「关掉平台后，随便改点别的配置，平台又自己开了」。
             platform_enabled: HashMap::from([("qoder".to_string(), false)]),
+            // 每日护栏同理：不显式给就会被「整份替换」清零（表现为「调好的上限自己没了」）。
+            daily_token_cap: 4242,
+            credit_floor: 7,
             prompt_mode: crate::prompt::MODE_CUSTOM.to_string(),
             prompt_text: "旧".to_string(),
         });
@@ -601,6 +623,11 @@ mod tests {
             snap.platform_enabled.is_empty(),
             "整份替换：旧的平台开关不能残留（否则关掉的平台会自己开回来）"
         );
+        // ★ 每日护栏是**同一类**风险：`reload` 是整份替换，若热重载路径漏了这两个字段，
+        // 症状是「调好的上限在改点别的配置之后自己归零」—— 与平台开关那条一模一样，
+        // 但更难发现（护栏归零是**放开**流量，不是报错）。
+        assert_eq!(snap.daily_token_cap, 0, "整份替换：旧上限不能残留");
+        assert_eq!(snap.credit_floor, 0, "整份替换：旧积分下限不能残留");
     }
 
     #[test]

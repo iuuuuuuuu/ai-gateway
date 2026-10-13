@@ -171,6 +171,19 @@ pub fn default_gateway_config() -> Value {
         //
         // 空对象 = 所有平台都参加（老配置缺这个键，升级后行为逐字不变）。
         "platform_enabled": {},
+        // ---- 账号级每日用量护栏（2026-10-14 新增）----
+        //
+        // 语义 = 账号级的「今天先别用它了」：某账号**当日 Token 用量**达到
+        // `daily_token_cap`，或**剩余积分**低于 `credit_floor` 时，该账号今天
+        // 不再参与选号；签到 / 上报 / 成长任务**照常运行**（与 `platform_enabled`
+        // 同款边界：只影响路由，不停养号）。
+        //
+        // 0 = 关闭。两个键都缺省 0 ⇒ 老配置升级后行为逐字不变。
+        //
+        // ⚠ 这两个键**必须下发到网关 native config 的顶层**（与 `listen` 同级），
+        // 不是 `pool` 块 —— 理由见 write_native_config 里的说明。
+        "daily_token_cap": 0,
+        "credit_floor": 0,
         "last_status": null,
         "last_error": null,
         // ---- 4 个自动养号任务的排程（写进网关的 schedule 块，见 write_native_config）----
@@ -3030,6 +3043,20 @@ fn write_native_config(cfg: &Value) -> Result<PathBuf, String> {
         "auth_dir": auth_dir.to_string_lossy(),
         "state_file": state_file.to_string_lossy(),
         "cooldown": { "soft_rate": "60s" },
+        // ---- 账号级每日用量护栏 ----
+        //
+        // ⚠ 写在**顶层**（与 `listen` 同级），不是 `pool` 块里：网关侧的 `Config`
+        // 把这两个字段声明在顶层。放 `pool` 下会被 `serde` **静默忽略** ——
+        // 不认识的嵌套键不报错、字段拿默认值、日志一个字都没有，表现为
+        // 「配置改了、网关毫无反应」。真要放 `pool` 下，必须同步加进
+        // `ai-gateway-router/src/config.rs` 的 `HOISTED_POOL_KEYS`，那是给
+        // 历史形状兜底的名单，不是给新键用的。
+        //
+        // 0 = 关闭；缺省 0 ⇒ 老配置升级后行为逐字不变。
+        //
+        // 生效方式：`cfgwatch` 每 5 秒重读本文件 ⇒ 改这里**不需要重启网关**。
+        "daily_token_cap": cfg.get("daily_token_cap").and_then(Value::as_i64).unwrap_or(0),
+        "credit_floor": cfg.get("credit_floor").and_then(Value::as_i64).unwrap_or(0),
         "schedule": {
             "checkin_hours": [9, 21],
             "keepalive_hours": [22],
@@ -7242,6 +7269,11 @@ mod tests {
             assert_eq!(cfg[key], json!(true), "{key} 缺省应为 true");
         }
         assert_eq!(cfg["activity_report_count"], json!(3));
+        // 账号级每日护栏的两个旋钮也必须有初值（同源理由：它是合并磁盘配置的 base）。
+        // 缺字段时 `write_native_config` 走 `unwrap_or(0)` 也能活，但**界面上是空白**，
+        // 用户随手一保存就把别人设过的上限清零。显式 0 = 「从没设过」的唯一表示。
+        assert_eq!(cfg["daily_token_cap"], json!(0), "缺省必须是 0（关闭），不能是 null");
+        assert_eq!(cfg["credit_floor"], json!(0), "缺省必须是 0（关闭），不能是 null");
     }
 
     // 凭证导出必须原样带着 credit 块：它是网关「按积分到期分层选号」的依据。
@@ -10069,6 +10101,88 @@ p42\ncjava\nf9\nn*:8080\n";
             "只留显式 false；true / 非布尔 / 空平台名都要丢掉\
              （true 写进去只会让「全量还是增量」难以分辨）"
         );
+    }
+
+    /// `daily_token_cap` / `credit_floor` 必须出现在 `write_native_config` 的输出里
+    /// —— 这是「下发到网关」的全部依据。
+    ///
+    /// 缺陷背景与 allowed_model / prompt / proxy_scope / platform_* 那几个块同源：
+    /// `write_native_config` 每次启动网关都**全量重写** native config。漏写这两个键 ⇒
+    /// 网关侧读到默认值 0 = 护栏关闭 ⇒ 用户设的上限在**下一次重启网关后**静默消失，
+    /// 而配置文件与界面上都还写着那个数。
+    ///
+    /// ⚠ 还要钉住**落点**：这两个键属于网关 `Config` 的**顶层**（与 `listen` 同级）。
+    /// 写进 `pool` 块下会被 serde **静默忽略** —— 不报错、字段拿默认值、日志一个字都没有，
+    /// 表现与"漏写"一模一样却更难查。
+    #[test]
+    fn native_config_carries_daily_guard_knobs() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-daily-guard-native");
+
+        let path = super::write_native_config(&json!({
+            "mode": "balance",
+            "daily_token_cap": 5_000_000i64,
+            "credit_floor": 20,
+        }))
+        .expect("write native");
+        let native: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+
+        assert_eq!(
+            native.get("daily_token_cap"),
+            Some(&json!(5_000_000i64)),
+            "每日 Token 上限必须写在 native config 的**顶层**下发给网关"
+        );
+        assert_eq!(
+            native.get("credit_floor"),
+            Some(&json!(20)),
+            "保留积分下限必须写在 native config 的**顶层**下发给网关"
+        );
+        assert!(
+            native.pointer("/pool/daily_token_cap").is_none(),
+            "⚠ 不得落在 pool 块下：网关侧读的是顶层，放 pool 里会被 serde 静默忽略（拿默认值、无日志）"
+        );
+        assert!(
+            native.pointer("/pool/credit_floor").is_none(),
+            "⚠ 同上：credit_floor 也必须在顶层"
+        );
+        // 邻居照旧（确认新增没有把 schedule 挤掉）
+        assert!(
+            native.pointer("/schedule").is_some(),
+            "schedule 块必须与新增的键并存"
+        );
+        // 缺键 ⇒ 0（护栏关闭）。老配置升级后必须逐字不变。
+        let path2 = super::write_native_config(&json!({ "mode": "balance" })).expect("write");
+        let native2: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path2).expect("read")).expect("json");
+        assert_eq!(native2.get("daily_token_cap"), Some(&json!(0)), "缺键必须写 0");
+        assert_eq!(native2.get("credit_floor"), Some(&json!(0)), "缺键必须写 0");
+    }
+
+    /// 两个护栏键要能原样过一遍「保存 → 重新加载」，缺键时回落 0。
+    ///
+    /// 为什么单独钉一遍：`load_gateway_config` 走的是
+    /// `overlay(default_gateway_config(), existing)` 的**浅合并**。老配置文件里没有
+    /// 这两个键时值必须来自默认那份；用户改过之后磁盘那份必须盖住默认值
+    /// —— 否则「改了不生效」。两条都错才叫缺陷，所以两条都要有断言。
+    #[test]
+    fn daily_guard_knobs_survive_a_config_roundtrip() {
+        let _iso = crate::modules::config::test_isolation::Isolated::new("gw-daily-guard-cfg");
+
+        // ① 老配置（完全没有这两个键）⇒ 回落 0
+        super::save_gateway_config(&json!({ "api_key": "sk-old" })).expect("save");
+        let loaded = super::load_gateway_config();
+        assert_eq!(loaded["daily_token_cap"], json!(0), "老配置缺键必须回落 0");
+        assert_eq!(loaded["credit_floor"], json!(0), "老配置缺键必须回落 0");
+
+        // ② 用户写过之后 ⇒ 磁盘值盖住默认值
+        super::save_gateway_config(&json!({
+            "daily_token_cap": 1_234_567i64,
+            "credit_floor": 8,
+        }))
+        .expect("save");
+        let loaded = super::load_gateway_config();
+        assert_eq!(loaded["daily_token_cap"], json!(1_234_567i64), "磁盘值必须盖住默认值");
+        assert_eq!(loaded["credit_floor"], json!(8), "磁盘值必须盖住默认值");
     }
 
     /// 畸形输入一律退化成「所有平台都参加」，绝不 panic、绝不放行成"全关"。
