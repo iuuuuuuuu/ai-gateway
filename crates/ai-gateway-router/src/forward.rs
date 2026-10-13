@@ -391,7 +391,12 @@ fn estimate_tokens(bytes: &[u8]) -> i64 {
     let mut cjk: i64 = 0;
     let mut other: i64 = 0;
     let s = String::from_utf8_lossy(bytes);
-    for ch in s.chars() {
+    // ★ 内联图片（`data:image/…;base64,…`）的 base64 段**不能**按字符数计。
+    // 1 MB 的 base64 ≈ 26 万「字符 token」，一张截图就能把估算值撑到预算的
+    // 四分之一，几张图直接把正常请求判成上下文超限 ⇒ 客户端反复无谓压缩。
+    // 这里把 base64 段摘出来，按图片**真实 token 量**（宽高决定）另计。
+    let (text, image_tokens) = strip_inline_image_payloads(&s);
+    for ch in text.chars() {
         let c = ch as u32;
         // CJK 统一表意文字 + 扩展 A + 兼容表意 + 全角标点/假名/谚文。
         let is_cjk = (0x3040..=0x30FF).contains(&c)      // 假名
@@ -407,7 +412,123 @@ fn estimate_tokens(bytes: &[u8]) -> i64 {
         }
     }
     // 向上取整：宁可高估。
-    (cjk + 1) / 2 + (other + 3) / 4
+    (cjk + 1) / 2 + (other + 3) / 4 + image_tokens
+}
+
+/// 内联图片的识别标记：`data:image/png;base64,` 里的那一段。
+const INLINE_IMAGE_MARKER: &str = ";base64,";
+
+/// 认不出宽高时按多少 token 计（≈ 1.2 MP 截图的实测值，宁高勿低）。
+const INLINE_IMAGE_FALLBACK_TOKENS: i64 = 1600;
+
+/// 把内联图片的 base64 段摘掉，返回 `(剩余文本, 图片 token 合计)`。
+///
+/// 判据用 `;base64,` 这个标记：base64 字母表里没有 `;` 和 `,`，因此标记
+/// **不可能**出现在一段 base64 内部，不会误切；普通文本里出现该字面量的概率
+/// 也可忽略。
+fn strip_inline_image_payloads(s: &str) -> (String, i64) {
+    let mut out = String::with_capacity(s.len());
+    let mut image_tokens: i64 = 0;
+    let mut rest = s;
+    while let Some(at) = rest.find(INLINE_IMAGE_MARKER) {
+        let head_end = at + INLINE_IMAGE_MARKER.len();
+        out.push_str(&rest[..head_end]);
+        let after = &rest[head_end..];
+        // 载荷 = 其后连续的 base64 字符。
+        let end = after
+            .find(|c: char| !is_base64_char(c))
+            .unwrap_or(after.len());
+        image_tokens += inline_image_tokens(&after[..end]);
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    (out, image_tokens)
+}
+
+fn is_base64_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='
+}
+
+/// 一张内联图片按多少 token 计。
+///
+/// 只解码**前 512 字节**（够读出所有主流格式的头部），按宽高套上游口径估算：
+/// 长边先缩到 1568 以内、面积再缩到 1.15 M 像素以内，然后 `宽×高 / 750`。
+/// 认不出格式时退回 [`INLINE_IMAGE_FALLBACK_TOKENS`]（宁可高估）。
+fn inline_image_tokens(payload: &str) -> i64 {
+    // `decode` 是 `base64::Engine` 的 trait 方法，必须显式引入。
+    use base64::Engine as _;
+    // 载荷只含 base64 字符（ASCII），按字节切片安全。
+    let cut = payload.len().min(512);
+    let cut = cut - (cut % 4); // 对齐 4 字节，避免解码器因截断报错
+    if let Ok(head) = base64::engine::general_purpose::STANDARD.decode(&payload[..cut]) {
+        if let Some((w, h)) = image_dimensions(&head) {
+            return image_tokens_for(w, h);
+        }
+    }
+    INLINE_IMAGE_FALLBACK_TOKENS
+}
+
+/// 上游的图片计费口径（长边 ≤ 1568、面积 ≤ 1.15 M 像素，`宽×高/750`）。
+fn image_tokens_for(w: u32, h: u32) -> i64 {
+    let (mut w, mut h) = (f64::from(w), f64::from(h));
+    let long_side = w.max(h);
+    if long_side > 1568.0 {
+        let k = 1568.0 / long_side;
+        w *= k;
+        h *= k;
+    }
+    let area = w * h;
+    if area > 1_150_000.0 {
+        let k = (1_150_000.0 / area).sqrt();
+        w *= k;
+        h *= k;
+    }
+    ((w * h) / 750.0).ceil() as i64
+}
+
+/// 从文件头读出宽高（PNG / JPEG / GIF / WebP-VP8X）。
+fn image_dimensions(b: &[u8]) -> Option<(u32, u32)> {
+    // PNG：\x89PNG\r\n\x1a\n，IHDR 的宽高是偏移 16..24 的大端 u32。
+    if b.len() >= 24 && b.starts_with(&[0x89, b'P', b'N', b'G']) {
+        let w = u32::from_be_bytes([b[16], b[17], b[18], b[19]]);
+        let h = u32::from_be_bytes([b[20], b[21], b[22], b[23]]);
+        return (w > 0 && h > 0).then_some((w, h));
+    }
+    // GIF：偏移 6..10 的小端 u16 宽、高。
+    if b.len() >= 10 && b.starts_with(b"GIF8") {
+        let w = u32::from(u16::from_le_bytes([b[6], b[7]]));
+        let h = u32::from(u16::from_le_bytes([b[8], b[9]]));
+        return (w > 0 && h > 0).then_some((w, h));
+    }
+    // WebP：RIFF….WEBP，VP8X 的宽高是偏移 24..30 的 24 位小端（存的是减一）。
+    if b.len() >= 30 && b.starts_with(b"RIFF") && &b[8..12] == b"WEBP" && &b[12..16] == b"VP8X" {
+        let w = u32::from_le_bytes([b[24], b[25], b[26], 0]) + 1;
+        let h = u32::from_le_bytes([b[27], b[28], b[29], 0]) + 1;
+        return (w > 0 && h > 0).then_some((w, h));
+    }
+    // JPEG：扫段找 SOFn，高在偏移 +5、宽在 +7（大端 u16）。
+    if b.len() >= 4 && b.starts_with(&[0xFF, 0xD8]) {
+        let mut i = 2usize;
+        while i + 9 <= b.len() {
+            if b[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = b[i + 1];
+            // SOF0/1/2/3、5/6/7、9/10/11、13/14/15 都带宽高（不含 0xC4/0xC8/0xCC）。
+            if matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
+                let h = u32::from(u16::from_be_bytes([b[i + 5], b[i + 6]]));
+                let w = u32::from(u16::from_be_bytes([b[i + 7], b[i + 8]]));
+                return (w > 0 && h > 0).then_some((w, h));
+            }
+            let len = usize::from(u16::from_be_bytes([b[i + 2], b[i + 3]]));
+            if len < 2 {
+                return None;
+            }
+            i += 2 + len;
+        }
+    }
+    None
 }
 
 /// `body` 这次请求**是否会撞上上游的上下文预算**。
@@ -3142,5 +3263,71 @@ mod tests {
         assert_eq!(estimate_tokens(b"abcd"), 1);
         assert_eq!(estimate_tokens(b"abcde"), 2);
         assert_eq!(estimate_tokens(b""), 0);
+    }
+
+    /// ★ 内联图片的 base64 段**不能**按字符数计。
+    ///
+    /// 1 MB 的 base64 ≈ 26 万「字符 token」：一张截图就能把估算值顶到预算的
+    /// 四分之一，几张图直接把正常请求判成上下文超限 ⇒ 客户端反复无谓压缩。
+    #[test]
+    fn estimate_tokens_does_not_count_image_base64() {
+        // 前缀 `data:image/png;base64,` 共 21 个 ASCII 字符 ⇒ (21+3)/4 = 6 token。
+        let body = format!("data:image/png;base64,{}", "A".repeat(1_000_000));
+        let est = estimate_tokens(body.as_bytes());
+        assert!(
+            est < 5_000,
+            "1MB base64 不该按字符计（会算成 25 万 token），实际 {est}"
+        );
+        // 载荷全是 `A`、解不出图片头 ⇒ 走兜底值，且整段只算**一次**。
+        assert_eq!(est, INLINE_IMAGE_FALLBACK_TOKENS + 6);
+    }
+
+    /// 能认出格式时按宽高计（上游口径：长边 ≤1568、面积 ≤1.15M、宽×高/750）。
+    #[test]
+    fn estimate_tokens_counts_image_by_dimensions() {
+        let png = png_header(1376, 554);
+        let body = format!("data:image/png;base64,{}", encode_b64(&png));
+        // 1376×554 = 762,304 px ⇒ ceil(762304/750) = 1017 token；
+        // 再加前缀 21 个 ASCII 字符的 6 token。
+        assert_eq!(estimate_tokens(body.as_bytes()), 1017 + 6);
+    }
+
+    /// PNG / JPEG 的文件头宽高解析。
+    #[test]
+    fn image_dimensions_reads_png_and_jpeg_headers() {
+        assert_eq!(image_dimensions(&png_header(800, 600)), Some((800, 600)));
+        assert_eq!(image_dimensions(b"not an image"), None);
+        // JPEG：FFD8 + SOF0 段（长度 17、精度 8、高 600、宽 800）
+        let mut jpeg = vec![0xFFu8, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08];
+        jpeg.extend_from_slice(&600u16.to_be_bytes());
+        jpeg.extend_from_slice(&800u16.to_be_bytes());
+        jpeg.extend_from_slice(&[0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01]);
+        assert_eq!(image_dimensions(&jpeg), Some((800, 600)));
+    }
+
+    /// 长边超 1568 / 面积超 1.15M 时按上游口径缩后再计。
+    #[test]
+    fn image_tokens_shrink_like_upstream() {
+        // 4000×3000 = 12 M px ⇒ 先缩长边到 1568（1200×1568 面积仍超），
+        // 再缩面积到 1.15 M ⇒ ≈ 1150000/750 = 1534。
+        let t = image_tokens_for(4000, 3000);
+        assert!((1530..=1540).contains(&t), "实际 {t}");
+        // 小图不缩：100×100 ⇒ ceil(10000/750) = 14
+        assert_eq!(image_tokens_for(100, 100), 14);
+    }
+
+    fn png_header(w: u32, h: u32) -> Vec<u8> {
+        let mut b = vec![0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        b.extend_from_slice(&13u32.to_be_bytes());
+        b.extend_from_slice(b"IHDR");
+        b.extend_from_slice(&w.to_be_bytes());
+        b.extend_from_slice(&h.to_be_bytes());
+        b.extend_from_slice(&[8, 6, 0, 0, 0]);
+        b
+    }
+
+    fn encode_b64(b: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(b)
     }
 }

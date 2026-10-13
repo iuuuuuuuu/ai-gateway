@@ -233,6 +233,7 @@ pub fn anthropic_message_to_chat(raw: &Value) -> Result<(Vec<Value>, String), St
 
     let mut out: Vec<Value> = Vec::with_capacity(blocks.len());
     let mut text = String::new();
+    let mut images: Vec<Value> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
 
     for b in blocks {
@@ -240,8 +241,17 @@ pub fn anthropic_message_to_chat(raw: &Value) -> Result<(Vec<Value>, String), St
         match str_field(block, "type").as_str() {
             "text" | "" => text.push_str(&str_field(block, "text")),
             "image" => {
-                // 图片块：上游支持有限，转换为 image_url 分片与文本共存。
-                // 这里保守处理，保持文本路径不受影响。
+                // 图片块 → Chat 的 `image_url` 分片，与 Responses 入口
+                //（`input_image`）归一后的形状一致：下游 `forward::request_has_image`
+                // 靠它识别「本请求带图」（决定区域路由），出站 zcode 再把它翻回
+                // Anthropic 的 `image` 块。
+                //
+                // ★ 旧实现这里是**空分支**（注释写「上游支持有限」）：Claude Code
+                // 贴的截图被静默丢弃，模型只收到「你能看到图片吗」这句话，
+                // 于是回「看不到 / 内容是空的」。
+                if let Some(part) = anthropic_image_to_chat(block) {
+                    images.push(part);
+                }
             }
             "tool_use" => {
                 let input = block.get("input").cloned().unwrap_or(Value::Null);
@@ -257,10 +267,15 @@ pub fn anthropic_message_to_chat(raw: &Value) -> Result<(Vec<Value>, String), St
             "tool_result" => {
                 // tool_result 必须单独成一条 role:tool 消息，且要排在 assistant 的
                 // tool_calls 之后。
+                //
+                // 工具结果里同样可能带图（Claude Code 的 Read 读图片文件就是这种
+                // 形状）：文本照旧拍平，图片分片一并透传。
+                let (result_text, result_images) =
+                    anthropic_tool_result_parts(block.get("content"));
                 out.push(json!({
                     "role": "tool",
                     "tool_call_id": str_field(block, "tool_use_id"),
-                    "content": anthropic_tool_result_text(block.get("content")),
+                    "content": content_with_images(&result_text, &result_images),
                 }));
             }
             // 推理块不回传上游：上游不接受该形状。
@@ -271,10 +286,10 @@ pub fn anthropic_message_to_chat(raw: &Value) -> Result<(Vec<Value>, String), St
 
     // assistant 消息若带 tool_use，必须携带 tool_calls 字段。
     if !tool_calls.is_empty() {
-        let content = if text.is_empty() {
+        let content = if text.is_empty() && images.is_empty() {
             Value::Null
         } else {
-            Value::String(text.clone())
+            content_with_images(&text, &images)
         };
         let assistant = json!({
             "role": "assistant",
@@ -287,13 +302,112 @@ pub fn anthropic_message_to_chat(raw: &Value) -> Result<(Vec<Value>, String), St
         return Ok((merged, text));
     }
 
-    if !text.is_empty() {
+    if !text.is_empty() || !images.is_empty() {
         // tool_result 必须紧跟 assistant 的 tool_calls，因此正文追加在
         // tool 消息之后。若把正文插到最前，会形成 assistant → user → tool
         // 的断裂序列，上游按 tool_call_sequence_broken 拒绝。
-        out.push(json!({"role": role, "content": text}));
+        //
+        // 无图 ⇒ content 仍是**纯字符串**（历史行为逐字不变）；有图 ⇒ 分片数组。
+        let content = content_with_images(&text, &images);
+        out.push(json!({"role": role, "content": content}));
     }
     Ok((out, text))
+}
+
+/// 组装 Chat 消息的 `content`：**无图 ⇒ 纯字符串**（历史形状逐字不变），
+/// **有图 ⇒ 分片数组** `[{type:"text"},{type:"image_url"}]`。
+///
+/// 无图时保持字符串是刻意的：上游与 [`super::rectify::rectify_chat_tool_sequence`]
+/// 都按老形状走，不必为一个新能力改动所有既有请求的字节。
+fn content_with_images(text: &str, images: &[Value]) -> Value {
+    if images.is_empty() {
+        return Value::String(text.to_string());
+    }
+    let mut parts: Vec<Value> = Vec::with_capacity(images.len() + 1);
+    if !text.is_empty() {
+        parts.push(json!({"type": "text", "text": text}));
+    }
+    parts.extend(images.iter().cloned());
+    Value::Array(parts)
+}
+
+/// 把 Anthropic 的 `image` 块翻成 Chat 的 `image_url` 分片。
+///
+/// Anthropic 的两种 source 与 OpenAI 的两种 url 严格互逆（出站方向见
+/// `products/zcode/translate.rs` 的 `openai_image_to_anthropic`）：
+///
+/// | Anthropic 形态 | Chat 形态 |
+/// |---|---|
+/// | `source:{type:"base64",media_type:"image/png",data:…}` | `image_url:{url:"data:image/png;base64,…"}` |
+/// | `source:{type:"url",url:"https://…"}` | `image_url:{url:"https://…"}` |
+///
+/// 认不出的形状返回 `None`：宁可不发图，也不发一个上游必然 400 的坏分片
+///（坏分片会让**整个请求**失败，比缺图严重得多）。
+fn anthropic_image_to_chat(block: &Map<String, Value>) -> Option<Value> {
+    if let Some(src) = block.get("source").and_then(|v| v.as_object()) {
+        match src.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "base64" => {
+                let data = src.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                if data.is_empty() {
+                    return None;
+                }
+                let media = non_empty(src.get("media_type")).unwrap_or("image/png");
+                return Some(image_url_part(&format!("data:{media};base64,{data}")));
+            }
+            "url" => {
+                let url = src.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                if url.is_empty() {
+                    return None;
+                }
+                return Some(image_url_part(url));
+            }
+            _ => {}
+        }
+    }
+    // 非标准形状：字段直接挂在块上（少数客户端 / 中间层这么发）。
+    if let Some(b64) = non_empty(block.get("data")) {
+        let media = non_empty(block.get("media_type")).unwrap_or("image/png");
+        return Some(image_url_part(&format!("data:{media};base64,{b64}")));
+    }
+    let url = non_empty(block.get("url"))
+        .or_else(|| non_empty(block.get("image_url").and_then(|v| v.get("url"))))
+        .unwrap_or("");
+    if url.is_empty() {
+        return None;
+    }
+    Some(image_url_part(url))
+}
+
+/// `{"type":"image_url","image_url":{"url":…}}` —— 全仓库统一的图片分片形状。
+fn image_url_part(url: &str) -> Value {
+    json!({"type": "image_url", "image_url": {"url": url}})
+}
+
+/// 取一个非空字符串字段（空串 / 非字符串 ⇒ `None`）。
+fn non_empty(v: Option<&Value>) -> Option<&str> {
+    v.and_then(Value::as_str).filter(|s| !s.is_empty())
+}
+
+/// 拍平 `tool_result` 的 content，并**保留**其中的图片分片。
+///
+/// 返回 `(文本, 图片分片)`：文本部分与 [`anthropic_tool_result_text`] 逐字一致
+///（旧行为不变），图片部分是新增能力 —— Claude Code 的 Read 工具读图片文件时，
+/// 结果就是这个形状。
+fn anthropic_tool_result_parts(v: Option<&Value>) -> (String, Vec<Value>) {
+    let Some(Value::Array(pieces)) = v else {
+        return (anthropic_tool_result_text(v), Vec::new());
+    };
+    let mut text = String::new();
+    let mut images: Vec<Value> = Vec::new();
+    for p in pieces.iter().filter_map(|p| p.as_object()) {
+        // 只对明确的图片块尝试转换，避免把带 url 字段的文本块误当图片。
+        let is_image = matches!(str_field(p, "type").as_str(), "image" | "input_image");
+        match (is_image, anthropic_image_to_chat(p)) {
+            (true, Some(img)) => images.push(img),
+            _ => text.push_str(&str_field(p, "text")),
+        }
+    }
+    (text, images)
 }
 
 /// 拍平 `tool_result` 的 content（字符串或 block 数组）。
@@ -560,6 +674,115 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["content"], json!("answer"));
         assert_eq!(text, "answer");
+    }
+
+    /// ★ 业主报的那个 bug：Claude Code 贴的截图必须活到上游。
+    ///
+    /// 旧实现里 `"image"` 是个空分支，图被**静默丢弃** —— 模型只收到「你能看到
+    /// 图片吗」这句话，于是回「看不到 / 内容为空」。
+    #[test]
+    fn image_blocks_become_image_url_parts() {
+        let (out, _text) = anthropic_message_to_chat(&json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "你能看到图片吗"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        let parts = out[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], json!({"type": "text", "text": "你能看到图片吗"}));
+        assert_eq!(parts[1]["type"], json!("image_url"));
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            json!("data:image/png;base64,AAAA")
+        );
+    }
+
+    /// 只有图、没有文字时也不能把整条消息丢掉（旧实现的收尾条件是 `!text.is_empty()`）。
+    #[test]
+    fn image_only_message_survives() {
+        let (out, text) = anthropic_message_to_chat(&json!({
+            "role": "user",
+            "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "BBBB"}}]
+        }))
+        .unwrap();
+        assert_eq!(text, "");
+        assert_eq!(out.len(), 1);
+        let parts = out[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["image_url"]["url"], json!("data:image/jpeg;base64,BBBB"));
+    }
+
+    /// 远程 URL 形状的图（`source.type = "url"`，Anthropic 也允许）。
+    #[test]
+    fn image_url_source_becomes_image_url_part() {
+        let (out, _) = anthropic_message_to_chat(&json!({
+            "role": "user",
+            "content": [{"type": "image", "source": {"type": "url", "url": "https://x/y.png"}}]
+        }))
+        .unwrap();
+        assert_eq!(out[0]["content"][0]["image_url"]["url"], json!("https://x/y.png"));
+    }
+
+    /// 回归：**没有图**时 content 必须仍是纯字符串 —— 既有请求的字节逐字不变。
+    #[test]
+    fn text_only_message_keeps_plain_string_content() {
+        let (out, _) = anthropic_message_to_chat(&json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "hi"}]
+        }))
+        .unwrap();
+        assert_eq!(out[0]["content"], json!("hi"));
+    }
+
+    /// tool_result 里的图（Claude Code 的 Read 读图片文件就是这个形状）也要透传。
+    #[test]
+    fn tool_result_images_survive() {
+        let (out, _) = anthropic_message_to_chat(&json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "t1",
+                "content": [
+                    {"type": "text", "text": "读到了"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "CCCC"}}
+                ]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], json!("tool"));
+        let parts = out[0]["content"].as_array().unwrap();
+        assert_eq!(parts[0], json!({"type": "text", "text": "读到了"}));
+        assert_eq!(parts[1]["image_url"]["url"], json!("data:image/png;base64,CCCC"));
+    }
+
+    /// 回归：tool_result 只有文字时仍是纯字符串（老形状）。
+    #[test]
+    fn tool_result_text_only_stays_string() {
+        let (out, _) = anthropic_message_to_chat(&json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]
+        }))
+        .unwrap();
+        assert_eq!(out[0]["content"], json!("ok"));
+    }
+
+    /// 认不出的图片块（既无 data 也无 url）宁可丢，也不要发坏分片给上游。
+    #[test]
+    fn unrecognized_image_block_is_dropped() {
+        let (out, _) = anthropic_message_to_chat(&json!({
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64"}},
+                {"type": "text", "text": "t"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(out[0]["content"], json!("t"));
     }
 
     #[test]

@@ -184,12 +184,17 @@ pub fn build_anthropic_body_with_meta(
                 //
                 // ⚠ Anthropic **没有** `tool` 角色：工具结果要作为 **user**
                 // 消息里的 `tool_result` 块回传。
+                //
+                // 结果里带图时（Claude Code 的 Read 读图片文件就是这个形状）
+                // 走块数组：Anthropic 的 `tool_result.content` 允许是 block 数组，
+                // 把图压成文本会让模型只看到「读到了一个文件」而看不到内容。
+                // 无图时仍是纯文本 —— 历史形状逐字不变。
                 msgs.push(json!({
                     "role": "user",
                     "content": [{
                         "type": "tool_result",
                         "tool_use_id": str_or(m.get("tool_call_id"), ""),
-                        "content": content_to_text(m.get("content")),
+                        "content": tool_result_content(m.get("content")),
                     }],
                 }));
             }
@@ -595,6 +600,27 @@ fn openai_image_to_anthropic(pm: &Map<String, Value>) -> Option<Value> {
         "type": "image",
         "source": { "type": "url", "url": url },
     }))
+}
+
+/// 工具结果的内容：**无图 ⇒ 纯文本**（历史形状逐字不变），**有图 ⇒ 块数组**。
+///
+/// 判据是「数组里存在图片分片」——只有那种情况才需要换成 Anthropic 的块数组
+/// 形状（`[{type:"text"},{type:"image",source:…}]`），其余一律走原来的拍平路径，
+/// 避免为一个新能力改动所有既有请求的字节。
+fn tool_result_content(content: Option<&Value>) -> Value {
+    if let Some(items) = content.and_then(|v| v.as_array()) {
+        let has_image = items.iter().any(|p| {
+            let Some(pm) = p.as_object() else { return false };
+            matches!(
+                pm.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+                "image_url" | "input_image" | "image"
+            )
+        });
+        if has_image {
+            return Value::Array(openai_content_to_anthropic(content));
+        }
+    }
+    Value::String(content_to_text(content))
 }
 
 /// 把任意 content 压成纯文本（用于 system / tool 结果）。
