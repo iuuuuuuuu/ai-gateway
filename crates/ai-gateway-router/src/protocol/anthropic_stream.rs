@@ -152,6 +152,22 @@ impl AnthropicStreamState {
                 self.upstream_err = Some(error_frame_text(e));
             }
         }
+        // ★★ 失败语义的 `finish_reason`（上游用**正常帧的形状**宣告本轮失败：
+        // HTTP 200 + `choices[0].finish_reason:"error"`，帧里**没有** `error` 字段
+        // —— 见 `crate::upstream::sse::is_failure_finish_reason`）必须走同一个出口。
+        //
+        // 为什么复用 `upstream_err` 而不新增字段：`failure_message` 里
+        // `upstream_err` 的分支**优先于** `saw_done` 那道 gate，而真实上游在这类
+        // 截断之后**会**补 `[DONE]` ⇒ 只走 gate 就必然判成「正常答完」。复用这
+        // 一个字段即可让「带 [DONE]」与「不带 [DONE]」两种形态得到同一个结果
+        // （后者本来就已经按失败收尾）—— `[DONE]` 只是终止字节，不该改变语义。
+        //
+        // 2026-10-12 业主现场（「为什么这个模型在对话过程中一直在中断」）：
+        // workbuddy 后端单轮有约 900s 硬上限，超时后就是这么收尾的；此处漏判时
+        // Claude Code 会把截断的回答当成一次成功回合，用户看到的是「一直在中断」。
+        if let Some(fr) = crate::upstream::sse::failure_finish_reason_in(chunk) {
+            self.upstream_err = Some(format!("上游以 finish_reason={fr} 结束本轮（未给出回答）"));
+        }
         if let Some(m) = chunk.get("model").and_then(|v| v.as_str()) {
             if self.model.is_empty() {
                 self.model = m.to_string();
@@ -885,5 +901,63 @@ mod tests {
         assert_eq!(error_frame_text(&json!("raw")), "raw");
         // 都取不到时保证失败可见
         assert_eq!(error_frame_text(&json!({})), "unknown upstream error");
+    }
+
+    /// ★★ 2026-10-12 业主现场（「为什么这个模型在对话过程中一直在中断」）：
+    /// 上游用**正常帧的形状**宣告本轮失败 —— HTTP 200 +
+    /// `choices[0].finish_reason:"error"`，帧里**没有** `error` 字段 ——
+    /// 而且这类截断之后**会**补 `[DONE]`。
+    ///
+    /// 过去只认 `error` 字段 ⇒ `upstream_err` 永远是 `None` ⇒ `saw_done=true`
+    /// 让 `failure_message` 直接返回 `None` ⇒ 网关补出 `message_stop`，等于向
+    /// Claude Code 宣告「模型正常答完了」，截断的回答被当成一次成功回合收下。
+    #[test]
+    fn failure_finish_reason_is_a_failure_even_with_done() {
+        let mut out = SseOut::new();
+        let mut st = AnthropicStreamState::new("m");
+        st.consume(
+            &mut out,
+            &chunk(json!({"choices":[{"index":0,"delta":{"content":"写了一半"}}]})),
+        )
+        .unwrap();
+        st.consume(
+            &mut out,
+            &chunk(json!({"choices":[{"index":0,"delta":{},"finish_reason":"error"}]})),
+        )
+        .unwrap();
+        assert!(st.upstream_err.is_some(), "必须记下失败原因");
+
+        // 真实上游在这之后补 [DONE] ⇒ saw_done=true、saw_finish_reason=true。
+        let msg = st
+            .failure_message(true, true, true)
+            .expect("失败语义的 finish_reason 必须判为失败（带 [DONE] 也算）");
+        assert!(msg.contains("finish_reason=error"), "{msg}");
+    }
+
+    /// 正常收尾的取值**不能**被判成失败 —— 否则每一次正常回答都会被补一帧 error
+    ///（`error_field_with_real_content_is_not_an_error_frame` 钉的是同一件事）。
+    #[test]
+    fn normal_finish_reason_stays_a_normal_end() {
+        for fr in ["stop", "length", "tool_calls", "content_filter"] {
+            let mut out = SseOut::new();
+            let mut st = AnthropicStreamState::new("m");
+            st.consume(
+                &mut out,
+                &chunk(json!({"choices":[{"index":0,"delta":{"content":"hi"}}]})),
+            )
+            .unwrap();
+            st.consume(
+                &mut out,
+                &chunk(
+                    json!({"choices":[{"index":0,"delta":{},"finish_reason":fr}]}),
+                ),
+            )
+            .unwrap();
+            assert!(st.upstream_err.is_none(), "finish_reason={fr} 是正常收尾");
+            assert!(
+                st.failure_message(true, true, true).is_none(),
+                "finish_reason={fr} 不得被判为失败"
+            );
+        }
     }
 }

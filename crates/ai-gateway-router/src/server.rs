@@ -2749,11 +2749,30 @@ fn anthropic_stream_response(
         // ★ 第三个标志（2026-10-07 追加）：上游已宣告过**非空** finish_reason、
         // 只差终止字节 [DONE] 时按**正常收尾** —— 内容已经完整，再判失败会让
         // 用户看到「回答写完了却报本轮运行失败」，客户端只能整轮重试。
+        //
+        // ★★ 2026-10-12：`finish_reason:"error"`（失败语义）**不在此列** ——
+        // 它由 `AnthropicStreamState::consume` 记进 `upstream_err`，于是走的是上面
+        // 第 1 条分支（根因优先），与「带 [DONE]」「不带 [DONE]」无关。
         if let Some(msg) = state.failure_message(
             frames.saw_done(),
             frames.saw_any_frame(),
             frames.saw_finish_reason(),
         ) {
+            // ★★ 2026-10-12：这条分支过去**没有任何日志**。业主现场查「对话为什么
+            // 一直中断」时，网关侧既没有失败收尾的记录、也没有失败原因的记录，
+            // 只剩客户端那句 `Provider finish_reason: error`。补一行（同
+            // `chat_stream_response` 里 `note_upstream_stream_error` 的作用）。
+            crate::logline!(
+                "messages uid={} product={} model={}: 流以失败收尾，已向客户端发 error 事件\
+                 （已收 {} 个有效帧，saw_done={}，saw_finish_reason={}）：{}",
+                uid,
+                product_label_for_log(&product),
+                model,
+                frames.valid_frames(),
+                frames.saw_done(),
+                frames.saw_finish_reason(),
+                msg,
+            );
             let _ = state.close_open_blocks(&mut out);
             let _ = out.write(
                 "error",
@@ -2889,11 +2908,28 @@ fn responses_stream_response(
         // ★ 第三个标志（2026-10-07 追加）：上游已宣告过**非空** finish_reason、
         // 只差终止字节 [DONE] 时按**正常收尾** —— 内容已经完整，再判失败会让
         // 用户看到「回答写完了却报本轮运行失败」，客户端只能整轮重试。
+        //
+        // ★★ 2026-10-12：`finish_reason:"error"`（失败语义）**不在此列** ——
+        // 它由 `ResponsesStreamState::consume` 记进 `upstream_err`，于是走的是上面
+        // 第 1 条分支（根因优先），与「带 [DONE]」「不带 [DONE]」无关。
         if let Some(msg) = state.failure_message(
             frames.saw_done(),
             frames.saw_any_frame(),
             frames.saw_finish_reason(),
         ) {
+            // ★★ 2026-10-12：同 `anthropic_stream_response` —— 这条分支过去没有任何
+            // 日志，业主现场因此查不到「截断被宣告成正常完成」这件事。
+            crate::logline!(
+                "responses uid={} product={} model={}: 流以失败收尾，已向客户端发 response.failed\
+                 （已收 {} 个有效帧，saw_done={}，saw_finish_reason={}）：{}",
+                uid,
+                product_label_for_log(&product),
+                model,
+                frames.valid_frames(),
+                frames.saw_done(),
+                frames.saw_finish_reason(),
+                msg,
+            );
             let _ = state.fail(&mut out, &msg);
             yield Ok(out.take());
             guard.release();
@@ -3179,6 +3215,53 @@ fn chat_stream_response(
                                 }
                             }
                         }
+                    }
+                    // ★★ 上游用**正常帧的形状**宣告本轮失败（2026-10-12 业主现场：
+                    // 「为什么这个模型在对话过程中一直在中断」）：
+                    // HTTP 200 + `{"choices":[{"index":0,"delta":{},"finish_reason":"error"}]}`，
+                    // 帧里**没有** `error` 字段，形状完全合法。
+                    //
+                    // 现场实测：workbuddy 后端对单轮生成有约 **900s** 的硬上限
+                    //（900.572s / 900.701s / 892.7s 三次取样），到点就写这么一帧收尾。
+                    // 旧口径下它的去向：
+                    //   ① 网关侧：`is_upstream_error_frame` 把「非空 finish_reason」
+                    //      当成「有实际产出 ⇒ 不是错误」⇒ 连一条日志都没有、账号也没
+                    //      喂熔断，收尾日志还写着 `saw_finish_reason=true`（看起来一切正常）；
+                    //   ② 客户端：pi-ai 的 `mapStopReason` 默认分支把它翻成
+                    //      `Provider finish_reason: error`，DSH 的 `classifyPiAiError`
+                    //      兜底成 `PI_AI_ERROR` —— 而它**不在** `DEFAULT_RETRYABLE_CODES`，
+                    //      于是不重试、直接「本轮运行失败」，会话就断在半路。
+                    //
+                    // 这里做三件事：① 记一条能直接读出真凶的日志；② 按「上游故障」
+                    // 给该账号喂一次熔断（与下面的流中 error 帧同一口径）；
+                    // ③ **不透传原文**，改发一帧可读、**可重试**的 error。
+                    // 措辞沿用 `UPSTREAM_TRUNCATED_MSG`（含 `stream ended before`）：
+                    // 客户端据此归 `TRANSPORT`（在白名单里）⇒ 自动换账号重试，
+                    // 而网关无法预知「重试会不会成功」，写死「不可重试」等于剥夺恢复机会。
+                    //
+                    // ★ 必须 `break` 而不是 `continue`：error 帧**自带** `[DONE]`，
+                    //   而这一帧不是 `[DONE]` 尾块 —— `continue` 会把后面的帧继续透传。
+                    // ★ 这条分支放在下面那段通用 error 帧处理**之前**：它 break 掉之后
+                    //   通用段不会再看到这一帧，因此 `note_upstream_stream_error` 只喂一次。
+                    if let Some(fr) = crate::upstream::sse::failure_finish_reason(&text) {
+                        let msg = format!("上游以 finish_reason={fr} 结束本轮（未给出回答）");
+                        note_upstream_stream_error(&state_ref, &uid, &product, &model, &msg);
+                        crate::logline!(
+                            "chat uid={} product={} model={}: 上游以失败语义 finish_reason={} \
+                             收尾（HTTP 200、帧里无 error 字段），已向客户端补发可重试 error 帧 \
+                             code=upstream_stream_truncated（已收 {} 个有效帧 / {} 字节，saw_done={}）",
+                            uid,
+                            product_label_for_log(&product),
+                            model,
+                            fr,
+                            frames.valid_frames(),
+                            sent_bytes,
+                            frames.saw_done(),
+                        );
+                        yield Ok::<_, std::io::Error>(chat_stream_error_frame(
+                            UPSTREAM_TRUNCATED_MSG,
+                        ));
+                        break;
                     }
                     // ★★ 上游在流中间下发 error 帧（HTTP 仍是 200，只是帧里带 error）：
                     // 这是**唯一**能看见「上游自己报错」的地方 —— forward 侧的首帧探测
@@ -5213,6 +5296,44 @@ mod chat_stream_error_tests {
         assert_eq!(product_label_for_log(crate::auth::PRODUCT_ZCODE), "zcode");
         assert_eq!(product_label_for_log(crate::auth::PRODUCT_QODER), "qoder");
         assert_eq!(product_label_for_log(crate::auth::PRODUCT_TRAE), "trae");
+    }
+    /// ★★ 2026-10-12 业主现场（「为什么这个模型在对话过程中一直在中断」）：
+    /// 上游用**正常帧的形状**宣告本轮失败，网关必须把客户端可见的字节换掉。
+    ///
+    /// 这一组钉住「换掉之后客户端拿到什么」——真实的端到端断言在
+    /// `tests/ab_finish_error.rs`（真起 HTTP 服务 + 假上游）。
+    ///
+    /// 为什么必须换掉原文：客户端 pi-ai 的 `mapStopReason` 没有 `error` 分支，
+    /// 落到 default 得到 `Provider finish_reason: error` ⇒ DSH 的
+    /// `classifyPiAiError` 兜底成 `PI_AI_ERROR` ⇒ **不在** `DEFAULT_RETRYABLE_CODES`
+    /// ⇒ 不重试、直接「本轮运行失败」。换成的措辞含 `stream ended before`
+    /// ⇒ 归 `TRANSPORT` ⇒ 自动换账号重试。
+    #[test]
+    fn failure_finish_reason_is_replaced_by_a_retryable_error_frame() {
+        use crate::upstream::classify::ErrKind;
+
+        // ① 上游那一帧本身被认出来，且原因里点名 finish_reason（日志可读性）。
+        let line = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}]}\n\n";
+        let msg = upstream_error_frame_message(line).expect("必须认出来");
+        assert!(msg.contains("finish_reason=error"), "{msg}");
+        assert_eq!(
+            upstream_stream_error_kind(crate::auth::PRODUCT_WORKBUDDY, &msg),
+            ErrKind::Server,
+            "必须按上游故障喂熔断，绝不能落成额度/冷却类"
+        );
+
+        // ② 发给客户端的字节：可重试措辞 + 恰好一个 [DONE]，且**不含**上游原文。
+        let out = chat_stream_error_frame(UPSTREAM_TRUNCATED_MSG);
+        assert!(
+            out.to_lowercase().contains("stream ended before"),
+            "措辞必须能被客户端归成 TRANSPORT（可重试）：{out}"
+        );
+        assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+        assert!(
+            !out.contains("\"finish_reason\":\"error\""),
+            "上游原文绝不能透传（它会让客户端拿到不可重试的 PI_AI_ERROR）：{out}"
+        );
+        assert!(out.contains("upstream_stream_truncated"), "{out}");
     }
 }
 

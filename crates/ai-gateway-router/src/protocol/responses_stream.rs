@@ -229,6 +229,17 @@ impl ResponsesStreamState {
                 self.upstream_err = Some(super::anthropic_stream::error_frame_text(e));
             }
         }
+        // ★★ 同 `anthropic_stream::consume` 那一处：上游用**正常帧的形状**宣告本轮
+        // 失败（HTTP 200 + `choices[0].finish_reason:"error"`，帧里没有 `error`
+        // 字段），而真实上游在这类截断之后**会**补 `[DONE]`。本文件此前**连
+        // `finish_reason` 都不读**，于是这种截断被当成正常完成，客户端收到
+        // `response.completed` —— 截断的回答被宣告成答完了。
+        //
+        // 复用 `upstream_err`（而不是新增字段）的理由同 anthropic_stream：
+        // `failure_message` 里它的分支优先于 `saw_done` 那道 gate。
+        if let Some(fr) = crate::upstream::sse::failure_finish_reason_in(chunk) {
+            self.upstream_err = Some(format!("上游以 finish_reason={fr} 结束本轮（未给出回答）"));
+        }
         if let Some(id) = chunk.get("id").and_then(|v| v.as_str()) {
             if !id.is_empty() && self.response_id == "resp_wb2api" {
                 self.response_id = id.to_string();
@@ -1160,5 +1171,45 @@ mod tests {
         assert_eq!(ps[0]["type"], json!("response.in_progress"));
         // Codex 侧按 kind 分支，必须能被正常解析（非注释帧）。
         assert!(ps[0]["sequence_number"].is_i64());
+    }
+
+    /// ★★ 2026-10-12：与 `anthropic_stream` 同一处缺口 —— 本状态机此前
+    /// **连 `finish_reason` 都不读**，于是「HTTP 200 + `finish_reason:"error"`
+    /// + `[DONE]`」这种截断被当成正常完成，客户端收到 `response.completed`。
+    #[test]
+    fn failure_finish_reason_fails_even_with_done() {
+        let mut out = SseOut::new();
+        let mut st = ResponsesStreamState::new("m");
+        st.consume(
+            &mut out,
+            &chunk(json!({"choices":[{"index":0,"delta":{"content":"写了一半"}}]})),
+        )
+        .unwrap();
+        st.consume(
+            &mut out,
+            &chunk(json!({"choices":[{"index":0,"delta":{},"finish_reason":"error"}]})),
+        )
+        .unwrap();
+        assert!(st.upstream_err.is_some(), "必须记下失败原因");
+        let msg = st
+            .failure_message(true, true, true)
+            .expect("失败语义的 finish_reason 必须判为失败（带 [DONE] 也算）");
+        assert!(msg.contains("finish_reason=error"), "{msg}");
+    }
+
+    /// 正常取值不得被判成失败。
+    #[test]
+    fn normal_finish_reason_stays_a_normal_end() {
+        let mut out = SseOut::new();
+        let mut st = ResponsesStreamState::new("m");
+        st.consume(
+            &mut out,
+            &chunk(
+                json!({"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}),
+            ),
+        )
+        .unwrap();
+        assert!(st.upstream_err.is_none(), "stop 不是失败");
+        assert!(st.failure_message(true, true, true).is_none());
     }
 }

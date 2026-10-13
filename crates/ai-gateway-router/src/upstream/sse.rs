@@ -239,6 +239,17 @@ pub fn aggregate(sse: &str) -> Result<ChatCompletion, String> {
     if valid_events == 0 {
         return Err(EMPTY_STREAM_ERR.to_string());
     }
+    // ★★ 2026-10-12 现场：上游用**正常帧的形状**宣告本轮失败（900s 硬上限，见
+    // [`is_failure_finish_reason`]）。聚合器若照旧把它拼成一个 `finish_reason:
+    // "error"` 的 `chat.completion` 返回，客户端拿到的就是一句不可重试的
+    // `Provider finish_reason: error` —— 与流式那条缺陷同一个根因。
+    // 这里按失败返回：`forward.rs` 会把它翻成 502「上游故障」⇒ 换账号重试，
+    // 与流式路径的可重试语义保持一致（两端口径分叉比没有修复更糟）。
+    if is_failure_finish_reason(&finish_reason) {
+        return Err(format!(
+            "上游以 finish_reason={finish_reason} 结束本轮（未给出回答）"
+        ));
+    }
     if id.is_empty() {
         id = format!("chatcmpl-{}", now_nanos());
     }
@@ -510,10 +521,62 @@ impl Iterator for SseFrames<'_> {
     }
 }
 
+/// 失败语义的 `finish_reason` 取值：上游用**正常帧的形状**宣告本轮失败
+/// （HTTP 200 + `choices[0].finish_reason:"error"`，帧里**没有** `error` 字段）。
+///
+/// ★★ 2026-10-12 业主现场（「为什么这个模型在对话过程中一直在中断」）：
+/// workbuddy 后端对单轮生成有约 **900s** 的硬上限，超时后不回 HTTP 错误，而是在
+/// 流尾写一帧 `{"choices":[{"index":0,"delta":{},"finish_reason":"error"}]}` 就收尾。
+/// 实测跨度 900.572s / 900.701s / 892.7s。
+///
+/// ★ 只认**实测过**的取值：`stop`/`length`/`tool_calls` 都是正常收尾，把它们
+/// 算成失败会让每一次正常回答都被补一帧 error
+/// （`error_field_with_real_content_is_not_an_error_frame` 钉的就是这个）。
+fn is_failure_finish_reason(fr: &str) -> bool {
+    matches!(fr.trim(), "error")
+}
+
+/// 从一个**已解析**的帧对象里取失败语义的 `finish_reason`（取不到回 `None`）。
+///
+/// ★ `pub(crate)`：两个姊妹端点的状态机（`protocol::anthropic_stream::consume`、
+/// `protocol::responses_stream::consume`）拿到的正是**已解析的帧对象**，
+/// 要在这里判一次才能补上「带 [DONE] 的失败收尾」那个缺口。
+pub(crate) fn failure_finish_reason_in(obj: &Map<String, Value>) -> Option<String> {
+    let choices = obj.get("choices")?.as_array()?;
+    for c in choices {
+        let Some(fr) = c.get("finish_reason").and_then(|f| f.as_str()) else {
+            continue;
+        };
+        if is_failure_finish_reason(fr) {
+            return Some(fr.to_string());
+        }
+    }
+    None
+}
+
+/// 归一化后的帧文本是否以**失败语义**的 `finish_reason` 收尾；返回该取值。
+///
+/// 供 `server.rs` 决定「不透传这一帧、改发一帧可读可重试的 error」——
+/// 见 `chat_stream_response` 里那条分支。
+/// ★ 两种形态都要认：迭代器内部拿到的是**裸 JSON 载荷**，而 `server.rs` 拿到的是
+/// 带 `data: ` 前缀、带结尾空行的**整帧文本**（`format!("data: {text}\n\n")`）。
+/// 只认一种会让判定在真实链路上永远返回 `None` —— 这正是本函数第一版踩的坑。
+pub fn failure_finish_reason(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let payload = trimmed.strip_prefix("data:").map(str::trim).unwrap_or(trimmed);
+    let v: Value = serde_json::from_str(payload).ok()?;
+    failure_finish_reason_in(v.as_object()?)
+}
+
 /// 归一化后的帧文本里是否带**非空** `finish_reason`（`choices[].finish_reason`）。
 ///
 /// ★ 必须在 [`normalize_frame`] **之后**判：归一化会给缺键的帧补上
 /// `"finish_reason": null`，所以「键存在」不等于「上游宣告了完成」。
+///
+/// ★★ 失败语义的取值（`"error"`，见 [`is_failure_finish_reason`]）**不算**完成：
+/// 它恰恰是「这一轮没答出来」。若把它算成完成，`premature_end()` 就永远不会
+/// 报截断，`server.rs` 也就不会补那帧可重试的 error —— 用户看到的就是
+/// 「对话一直在中断」却查不到原因（2026-10-12 现场）。
 fn payload_has_finish_reason(text: &str) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
         return false;
@@ -524,7 +587,7 @@ fn payload_has_finish_reason(text: &str) -> bool {
     choices.iter().any(|c| {
         c.get("finish_reason")
             .and_then(|f| f.as_str())
-            .map(|s| !s.is_empty())
+            .map(|s| !s.is_empty() && !is_failure_finish_reason(s))
             .unwrap_or(false)
     })
 }
@@ -566,6 +629,17 @@ pub struct SseFramesIter<S> {
     /// 用于区分「空流」（上游正常解析后发现没什么可发，客户端得到一个合法的
     /// 空回合，无损）与「吐了一半就断」（必须按失败收尾）。
     saw_any_frame: bool,
+    /// 是否读到过**失败语义**的 `finish_reason`（上游用正常帧的形状宣告本轮失败）。
+    ///
+    /// ★★ 2026-10-12 现场（「对话一直在中断」）：这类帧**必须**与「正常收尾」区分开。
+    /// 它不带 `error` 字段、形状完全合法，旧口径下网关侧连一条日志都没有；
+    /// 而客户端 pi-ai 会把它翻成不可重试的 `Provider finish_reason: error`。
+    ///
+    /// 它与 [`SseFramesIter::saw_finish_reason`] **互斥**：失败语义取值不计入后者
+    /// （见 [`payload_has_finish_reason`]）。这个标志只用来堵住「上游已宣告收尾 ⇒
+    /// 按正常收尾补 `[DONE]`」那条放宽分支（`server.rs` 的读错误分支）——
+    /// 否则一次失败会被补成一次成功。
+    saw_failure_finish_reason: bool,
 }
 
 impl<S> SseFramesIter<S> {
@@ -580,6 +654,7 @@ impl<S> SseFramesIter<S> {
             saw_done: false,
             saw_finish_reason: false,
             saw_any_frame: false,
+            saw_failure_finish_reason: false,
         }
     }
 
@@ -629,6 +704,11 @@ impl<S> SseFramesIter<S> {
         self.saw_any_frame
     }
 
+    /// 是否读到过**失败语义**的 `finish_reason`（见结构体字段说明）。
+    pub fn saw_failure_finish_reason(&self) -> bool {
+        self.saw_failure_finish_reason
+    }
+
     /// 判定一次上游流是否应当按**失败**收尾，返回原因（`None` = 可正常收尾）。
     ///
     /// 四种情形（前三条与 Go 侧 `streamFailureMessage` 同一口径，第四条是本仓
@@ -646,6 +726,11 @@ impl<S> SseFramesIter<S> {
     ///   少的只是那个终止字节。此时仍按失败收尾会让用户看到「回答写完了却报
     ///   本轮运行失败」，而客户端拿到 error 帧后只能整轮重试 —— 重试会重新生成，
     ///   比丢掉一个终止字节昂贵得多）
+    /// - 见过**失败语义**的 `finish_reason`（`"error"`）→ **失败**
+    ///   （它被 [`payload_has_finish_reason`] 排除，因此不会点亮
+    ///   `saw_finish_reason`；上游 900s 上限就长这样，见
+    ///   [`is_failure_finish_reason`]。此时必须按失败收尾，否则客户端拿到的是
+    ///   一句不可重试的 `Provider finish_reason: error`）
     pub fn premature_end(&self) -> Option<&'static str> {
         if self.saw_done || !self.saw_any_frame || self.saw_finish_reason {
             return None;
@@ -682,6 +767,9 @@ where
                         self.saw_any_frame = true;
                         if payload_has_finish_reason(&text) {
                             self.saw_finish_reason = true;
+                        }
+                        if failure_finish_reason(&text).is_some() {
+                            self.saw_failure_finish_reason = true;
                         }
                     }
                     return Some(Ok(format!("data: {text}\n\n")));
@@ -720,6 +808,9 @@ where
                                     self.saw_any_frame = true;
                                     if payload_has_finish_reason(&text) {
                                         self.saw_finish_reason = true;
+                                    }
+                                    if failure_finish_reason(&text).is_some() {
+                                        self.saw_failure_finish_reason = true;
                                     }
                                 }
                                 return Some(Ok(format!("data: {text}\n\n")));
@@ -798,6 +889,19 @@ pub fn is_upstream_error_frame(line: &str) -> (bool, String) {
     let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(d) else {
         return (false, String::new());
     };
+
+    // ★★ 失败语义的 `finish_reason`（2026-10-12 现场）：必须在下面那条
+    // `obj.get("error")` **之前**判 —— 这类帧**没有** `error` 字段，走到 `else`
+    // 分支只会落到 `top_level_error_frame`，而它因为「有 choices」直接返回 false。
+    // 旧口径（缺陷）：下面「有实际产出就不算失败」那段把**任何**非空 finish_reason
+    // 都当成产出，于是整轮失败在网关侧连一条日志都没有、账号也没喂熔断，
+    // 客户端只看到 `Provider finish_reason: error`。
+    if let Some(fr) = failure_finish_reason_in(&obj) {
+        return (
+            true,
+            format!("上游以 finish_reason={fr} 结束本轮（未给出回答）"),
+        );
+    }
 
     let Some(e) = obj.get("error").filter(|v| !v.is_null()) else {
         // 形状②：错误在顶层，没有 error 包装。
@@ -1186,6 +1290,31 @@ mod tests {
         );
         let out = aggregate(sse).unwrap();
         assert_eq!(out["choices"][0]["message"]["content"], json!("x"));
+    }
+
+    /// ★★ 2026-10-12 现场：**非流式**聚合路径同样不能把失败语义当成正常收尾。
+    ///
+    /// 旧口径会把上游那帧 `finish_reason:"error"` 拼进 `chat.completion` 原样返回，
+    /// 客户端 pi-ai 的 `mapStopReason` 没有 `error` 分支 ⇒ 不可重试的
+    /// `Provider finish_reason: error`（与流式路径同一个根因）。
+    /// 这里按失败返回，由 `forward.rs` 翻成 502 上游故障 ⇒ 换账号重试。
+    #[test]
+    fn aggregate_rejects_failure_finish_reason() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"写了一半\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let err = aggregate(sse).expect_err("失败语义不得聚合成正常响应");
+        assert!(err.contains("finish_reason=error"), "{err}");
+        // 正常收尾取值一律照旧（防误伤）。
+        for fr in ["stop", "length", "tool_calls"] {
+            let ok = format!(
+                "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"hi\"}},\"finish_reason\":\"{fr}\"}}]}}\n\ndata: [DONE]\n\n"
+            );
+            let out = aggregate(&ok).expect("正常收尾必须照常聚合");
+            assert_eq!(out["choices"][0]["finish_reason"], json!(fr));
+        }
     }
 
     #[test]
@@ -1917,5 +2046,119 @@ mod tests {
             frames.premature_end().is_none(),
             "内容已完整（finish_reason 已到），不得再判提前结束：{out}"
         );
+    }
+    /// ★★ 2026-10-12 业主现场（「为什么这个模型在对话过程中一直在中断」）：
+    /// 上游用**正常帧的形状**宣告本轮失败 —— HTTP 200 +
+    /// `{"choices":[{"index":0,"delta":{},"finish_reason":"error"}]}`，帧里**没有** `error` 字段。
+    ///
+    /// 实测：workbuddy 后端对单轮生成有约 900s 硬上限（900.572s / 900.701s / 892.7s），
+    /// 到点就写这么一帧收尾。旧口径下它被当成「有实际产出 ⇒ 不是错误」⇒ 网关侧
+    /// 连一条日志都没有，客户端只看到不可重试的 `Provider finish_reason: error`。
+    ///
+    /// 这条把三件事一起钉死：① 识别成上游错误；② **不算**宣告完成（否则
+    /// `premature_end()` 永远不报截断，调用方就不会补那帧可重试的 error）；
+    /// ③ 标志位 `saw_failure_finish_reason` 置起（调用方用它堵住「按正常收尾补
+    /// `[DONE]`」那条放宽分支）。
+    #[tokio::test]
+    async fn failure_finish_reason_is_an_upstream_error_not_a_completion() {
+        let frame = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}]}\n\n";
+
+        // ① 识别：形状与 `finish_reason:"stop"` 一模一样，只有取值不同。
+        assert_eq!(
+            is_upstream_error_frame(frame),
+            (true, "上游以 finish_reason=error 结束本轮（未给出回答）".to_string()),
+            "失败语义的 finish_reason 必须被认出来"
+        );
+        // 与正常收尾对照：同样的形状、`stop` ⇒ 不是错误（这条是防回归的锚）。
+        let ok = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        assert_eq!(is_upstream_error_frame(ok), (false, String::new()));
+
+        // ② 迭代器口径：这一帧**不是**完成宣告。
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"写了一半\"}}]}\n",
+            "\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}]}\n",
+            "\n",
+        );
+        let mut frames = SseFramesIter::new(probe_response(vec![body.to_string()]).bytes_stream());
+        let mut out = String::new();
+        while let Some(item) = frames.next_frame().await {
+            if let Ok(text) = item {
+                out.push_str(&text);
+            }
+        }
+
+        assert_eq!(frames.valid_frames(), 2, "{out}");
+        assert!(
+            !frames.saw_finish_reason(),
+            "失败语义不是「宣告答完」——若算完成，截断就永远判不出来：{out}"
+        );
+        assert!(frames.saw_failure_finish_reason(), "{out}");
+        assert!(
+            frames.premature_end().is_some(),
+            "上游以 finish_reason=error 收尾必须按失败收尾：{out}"
+        );
+        // 原文照旧透传给调用方 —— 判不判失败由 `server.rs` 决定，
+        // 迭代器自己**不**注入 error 帧（见 `iterator_never_*` 那几条）。
+        assert!(out.contains("\"finish_reason\":\"error\""), "{out}");
+    }
+
+    /// 失败语义的判定只认**实测过**的取值：正常收尾取值一个都不能被误伤。
+    ///
+    /// 误伤的后果是「每一次正常回答都被补一帧 error」（客户端把它翻成
+    /// 「本轮运行失败」），比原缺陷更糟。
+    /// 形态回归：裸载荷与整帧文本（带 `data: ` 前缀 + 结尾空行）都必须认出。
+    ///
+    /// 只认裸载荷时，`server.rs` 传进来的整帧文本会解析失败 ⇒ 判定恒为 `None`
+    /// ⇒ 失败帧被照旧透传 ⇒ 客户端拿到不可重试的 `PI_AI_ERROR`（端到端对照
+    /// `tests/ab_finish_error.rs` 抓到的就是这个）。
+    #[test]
+    fn failure_finish_reason_accepts_both_payload_and_frame_text() {
+        let payload = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"error"}]}"#;
+        assert_eq!(failure_finish_reason(payload).as_deref(), Some("error"));
+        let frame = format!("data: {payload}\n\n");
+        assert_eq!(failure_finish_reason(&frame).as_deref(), Some("error"));
+        // 正常收尾两种形态都不得误报。
+        let ok = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+        assert_eq!(failure_finish_reason(ok), None);
+        assert_eq!(failure_finish_reason(&format!("data: {ok}\n\n")), None);
+        // 非 JSON 一律 `None`（不得 panic、不得误判）。
+        assert_eq!(failure_finish_reason("data: [DONE]\n\n"), None);
+        assert_eq!(failure_finish_reason(""), None);
+    }
+
+    #[test]
+    fn only_error_is_a_failure_finish_reason() {
+        for fr in ["stop", "length", "tool_calls", "content_filter", ""] {
+            let line = format!(
+                "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{fr}\"}}]}}\n\n"
+            );
+            assert_eq!(
+                is_upstream_error_frame(&line),
+                (false, String::new()),
+                "finish_reason={fr} 不是失败语义，不得误伤"
+            );
+        }
+        // 尾随空格 / 大小写：上游写 `"error "` 也要认出来（trim 后比对）。
+        let line = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error \"}]}\n\n";
+        assert!(is_upstream_error_frame(line).0);
+    }
+
+    /// 失败语义出现在**尾部残留帧**（无结尾换行的 EOF）时同样要认出来。
+    ///
+    /// 上游常在写完最后一帧就断连，那一帧只会在「干净 EOF 冲缓冲」分支里被
+    /// 归一化 —— 只在前一条分支记录会漏掉这个形态。
+    #[tokio::test]
+    async fn failure_finish_reason_in_tail_buffer_counts_too() {
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}]}"
+        );
+        let mut frames = SseFramesIter::new(probe_response(vec![body.to_string()]).bytes_stream());
+        while frames.next_frame().await.is_some() {}
+
+        assert!(frames.saw_failure_finish_reason(), "尾部残留帧也要判");
+        assert!(!frames.saw_finish_reason());
+        assert!(frames.premature_end().is_some());
     }
 }
