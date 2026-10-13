@@ -130,10 +130,24 @@ cargo test -p ai-gateway-router --lib    1776 passed / 0 failed / 1 ignored
 
 两个键默认都是 `0`（关闭），所以**升级不改任何现有行为**。要开：
 
-1. 在宿主配置（`gateway_config.json`）顶层加 `"daily_token_cap": 5000000`（数值按你的量级填）；
-2. 让它下发到网关的 native config —— 走一次会 `resync_native_config` 的动作（例如界面上切一次平台开关），
-   或直接重启网关；
-3. 5 秒内生效，不需要重启。
+1. 在宿主配置的**顶层**加一个键（数值按你的量级填）：
+
+   ```json
+   { "daily_token_cap": 5000000, "credit_floor": 0 }
+   ```
+
+   ★ **改哪个文件很重要**：
+
+   | 文件 | 改了有用吗 |
+   |---|---|
+   | `gateway_config.json`（宿主配置，宿主读写的那份） | ✅ **就改这个** —— 它会被合并保留，每次 resync/重启都会重新写进 native config |
+   | `gateway_native_config.json`（宿主每次启动时生成的那份） | ❌ **改了也会被覆盖掉** —— 它是从宿主配置里抽出来的副本 |
+
+   不要把它放进 native config 的 `pool` 块 里：路由器的 `Config` 把它们声明在**顶层**，
+   放错层会被 serde **静默忽略**（不报错，也不生效）。
+2. 让它下发到网关 —— 走一次会 `resync_native_config` 的动作（例如界面上切一次平台开关），或直接重启网关；
+3. 网关**每 5 秒**重读一次配置，所以第 2 步之后不需要再重启就会生效。
+4. 目前**没有界面**：跟 `breaker_threshold` / `max_in_flight` 这一类一样，只能改配置。
 
 改回 `0` 就是彻底关闭。
 

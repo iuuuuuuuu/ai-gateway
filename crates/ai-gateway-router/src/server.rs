@@ -4959,7 +4959,7 @@ mod tests {
             (F::AllNoRoute, "no_healthy_account", "handler.go:1366"),
             // Rust 侧新增（Go 侧没有对应实现）⇒ 出处填**本仓库**行号，
             // 不编造 `handler.go` 的行号（见本测试的说明）。
-            (F::DailyGuardExceeded, "rate_limit_exceeded", "forward.rs:969"),
+            (F::DailyGuardExceeded, "rate_limit_exceeded", "forward.rs:1043"),
         ];
         for (kind, want, go) in cases {
             assert_eq!(

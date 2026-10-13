@@ -77,7 +77,8 @@ impl Counters {
     /// 避免与 `input` 重复计数 —— `input` 已经含了它）。
     ///
     /// ★ 这是**唯一**的总量口径：Token 统计页（[Counters::value]）与网关的
-    /// 每日护栏（[`crate::pool::Pool::daily_capped`]）都走这一个函数。
+    /// 每日护栏（[`crate::pool::Pool::daily_cap_excludes_all`]，计数前由
+    /// [`crate::pool::Pool::refresh_daily_usage`] 灌入）都走这一个函数。
     /// 若两处各算一套，用户会看到「界面没到上限」而网关已经 429 —— 那是
     /// 最难排查的一类不一致。
     pub fn total(&self) -> i64 {
@@ -3743,11 +3744,15 @@ mod tests {
     #[test]
     fn today_key_honours_the_injected_clock() {
         let s = Stats::new("");
-        // 2026-10-14 12:00:00 +08:00
-        let noon = 1_792_161_600_000;
+        // 2019-07-15 12:00:00 +08:00 —— 刻意取一个**与今天无关**的过去时刻。
+        let noon = 1_563_163_200_000;
         s.set_now_for_test(noon);
         let got = s.today_key();
         assert_eq!(got, day_of_ms(noon), "必须与 clock_ms 同源");
+        // ★ 写死期望值：只说「同源」是同语反复 —— 退化成
+        // `chrono::Local::now()` 也能通过（`day_of_ms` 就是它调的那个）。
+        // 日期取自过去，今天不可能是这一天，所以这条真能抓住「注入时钟没生效」。
+        assert_eq!(got, "2019-07-15", "注入的时刻对应的就是这一天");
         assert!(!got.is_empty(), "注入合法时刻后不得退化成空串（空串会让护栏静默失效）");
         assert_eq!(got.len(), 10, "日期键固定宽度，便于直接比较");
     }
