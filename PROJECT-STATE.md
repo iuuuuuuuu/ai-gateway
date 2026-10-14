@@ -26,7 +26,9 @@
 | Go 参照实现 | `go-gateway/` | Go（**保留作对照，构建链已不依赖**） |
 
 - git 根 = `wt-port\`，主分支 `main`（2026-10-06 由 `migrate/aigw-v1.0.2` 改名而来；原上游陈旧线 `224919a` 改名 `archive/origin-main` 留档。详见第九节）
-- 远端 **`fork` = `https://github.com/iuuuuuuuu/ai-gateway`**：`main` 已推送（远端 `fork/main` = `726aafa`；本地另有 **8 个提交未推**：`12c2871` / `cb62b2b` / `641f89c` / `6ade937` / `1c7b7c0` / `e14fea1` / `621452e` / 本次 9.22 的记录提交）；本地 tag 共 **49 个**（最大 `v1.0.38`），已发布的 Release 到 **v1.0.38** 为止（`releases/latest` 与 `dist\latest.json` 现都还指向 **v1.0.38**）—— ★ **1.0.39 ~ 1.0.46 尚未打 tag、尚未发布**（安装包都已产出并落在 `dist\`，只差推 tag + 发 Release）。★ 该仓库 2026-10-06 按业主 m26011 **已转为 private**（匿名访问 404，自动更新通道因此失效，详见 9.6）
+- 远端 **`fork` = `https://github.com/iuuuuuuuu/ai-gateway`**：`main` 已推送（远端 `fork/main` = `726aafa`；本地另有 **9 个提交未推**：`12c2871` / `cb62b2b` / `641f89c` / `6ade937` / `1c7b7c0` / `e14fea1` / `621452e` / `5f44519` / `0bcea00`（HEAD）
+  - ★ `dist\ai-gateway_1.0.46_server-x64.exe`（纯部署服务端，27,090,432 B）已于 2026-10-14 打包并端到端实测通过（见「交付物」节）；
+    该产物**不随 Release 发布**（`release.yml` 无服务端单文件构建步骤，历来手工产出），故**不需要**为它单独打 tag —— 与 1.0.39~1.0.46 的 tag 缺口相互独立）；本地 tag 共 **49 个**（最大 `v1.0.38`），已发布的 Release 到 **v1.0.38** 为止（`releases/latest` 与 `dist\latest.json` 现都还指向 **v1.0.38**）—— ★ **1.0.39 ~ 1.0.46 尚未打 tag、尚未发布**（安装包都已产出并落在 `dist\`，只差推 tag + 发 Release）。★ 该仓库 2026-10-06 按业主 m26011 **已转为 private**（匿名访问 404，自动更新通道因此失效，详见 9.6）
 - 当前版本号 **1.0.46**（发布提交 `1c7b7c0` 用 `scripts/bump-version.ps1` 把 **14 个文件**（`tauri.conf.json` / `package.json` / `package-lock.json` / `Cargo.toml` / `Cargo.lock` / `npm\package.json` 等）bump 到 1.0.46；签名安装包已产出并复制到 `dist\`，内嵌网关与内嵌前端**双指纹校验 [OK]**，见 9.21）
   - ★ 业主**实机 2026-10-07 07:40 已回退到 1.0.6**（`D:\APP\AI Gateway\ai-gateway.exe` 32,838,656 B / FileVersion 1.0.6 / mtime 2026-09-17 21:01:20；`:7864` 跑的是 Go 网关 `gateway-355c61-29367fd438f80ba2.exe` 8,759,296 B）⇒ 当次 1.0.22–1.0.34 **均未安装**（截至 2026-10-13 业主实机已升到 **1.0.44**；1.0.45 尚未安装），要装就直接装最新版（跳过版本里的修复全在 1.0.34 内；★ **回退到 Go 版会丢掉 1.0.21–1.0.33 的全部修复**，1.0.34 修的「输出完就中断」在 Go 版里**同样存在**——Go 只在「0 有效帧」时补 error 帧、吐过内容却没见 `[DONE]` 时**静默当成功**，与本仓库 1.0.33 及以前的行为不同）
   - ★ NSIS 同版本**不覆盖**（`installer.nsi:233-259` 用 `nsis_tauri_utils::SemverCompare` 比 `DisplayVersion`，相等走维护页）⇒ 升版本号是交付的硬前提
@@ -600,7 +602,34 @@ DSH 的 `STRUCTURED_CONTEXT_OVERFLOW` 正则**命中** ⇒ 归类 `CONTEXT_WINDO
 ### 交付物
 
 ```
-当前交付版（1.0.35）：
+当前交付版（1.0.46）：
+
+dist\AI Gateway_1.0.46_x64-setup.exe   14,764,440 B   （含 GUI 客户端）
+SHA256 58A96BC6F91681B2F3FE8554943CC5D1BFD4A06B223A67A06ABC2293437CAC38
+  .sig  444 B  SHA256 0EE425E5B1B4588B2789DA1E86900E167206B4533461E578A2248CBDE5E72780  keyid 7e7ce64b6fc3a36f
+  （`target\release\bundle\nsis\` 下那份 setup 与 .sig 均与 dist 逐字节同值）
+  ★ 两件都是 **NotSigned**（无 Authenticode）；`.sig` 是更新器签名（tauri secret key），与 Authenticode 无关
+内嵌网关 14,127,104 B  SHA256 47292B85EACB78F4644E11DC7E6A64F065AFC9C828F33C66900C1C5B2935507F
+  （= crates\ai-gateway-core\embedded\gateway.exe = target\release\gateway.exe，三者逐字节相同）
+
+★ 非客户端纯部署（仅网关/服务端，无 GUI/WebView/安装器）：
+
+dist\ai-gateway_1.0.46_server-x64.exe   27,090,432 B
+SHA256 5DA963036E78B20B610489DEB887E909C2682313715689D62F7AD9FD2E0E70F9
+  （构建产物在 wt-port\dist-single\ai-gateway.exe，逐字节一致；已拷到 dist\ 与安装包并列交付）
+  ★ 与 1.0.38 对照 -311,296 B；★ 该文件是**宿主 GUI 单文件形态**，与 `crates\ai-gateway-server\Cargo.toml:7-9`
+    的 `[[bin]] name = "ai-gateway"` 同名同源 ⇒ 命名沿用「server-x64」
+  ★ **PE 版本资源全空**（FileVersion / ProductVersion / CompanyName / FileDescription 皆空）+ 无 Authenticode
+    ⇒ 属性页看不到版本、Windows 弹「未知发布者」；唯一可信版本来源是 `ai-gateway.exe version` → `ai-gateway 1.0.46`
+  ★ 依赖动态 MSVC CRT + UCRT（导入表含 `VCRUNTIME140.dll` / `api-ms-win-crt-runtime-l1-1-0.dll`；不含 `MSVCP140.dll`）
+    ⇒ 部署前置条件 = VC++ 运行库（Win10+ 通常自带 UCRT）
+  ★ 交付文档：`..\部署文档-1.0.46-server.md`（463 行；CLI 契约 / 数据目录 / 配置表 / 运维 / 自检清单 / 故障排查 / 从源码构建）
+  ★ 端到端实测（**真实运行**，非单测）：`test-bin\deploy-verify.ps1` 9 阶段 **58 PASS / 0 FAIL**
+    （交付物哈希 → 假上游 → 启动 → 内嵌网关释放并比对哈希 → 管理端/网关接口 → 真实对话 → 两个守栏杆位真跑到 429
+     → 数据落盘 → 清理），记录 `test-bin\deploy-verify.log`
+  ★ 自启形态实测：账号库 2 个账号 + `auto_start=true` ⇒ 服务启动约 **7 秒**后网关**自行起来**并监听；
+    杀掉服务进程后网关**随之退出、无孤儿**（Job Object KILL_ON_JOB_CLOSE），记录 `test-bin\autostart2.log`
+历史（1.0.35）：
 
 dist\AI Gateway_1.0.35_x64-setup.exe   14,673,521 B   （含 GUI 客户端）
 SHA256 F8236A91CA9502537894E7BBCCF44D30F4CF91E730238581523375E36269F3B6
