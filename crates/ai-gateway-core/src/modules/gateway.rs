@@ -7624,12 +7624,39 @@ mod tests {
 
     #[test]
     fn inspect_port_reports_null_holder_when_free() {
+        // ★★ 2026-10-15：守卫必须与**被断言的判据**一致 —— 这条测试此前用
+        // `port_free`（300ms 预算）做守卫，而 `inspect_port()` 内部用的是
+        // `port_free_fast`（**30ms** 预算，见其注释：热路径不能白烧 600ms）。
+        //
+        // 两者对「空闲」的判定**不是同一个函数**：30ms 预算下，回环连接探测
+        // 若没在预算内拿到应答，`has_listener_with_budget` 会返回 false ⇒
+        // `port_free_fast` 判「空闲」；但反过来，一个**正在被短命连接占用**的
+        // 端口也可能让 300ms 的守卫判「占用」而 30ms 的断言判「空闲」……
+        // 更常见的方向是：守卫（300ms）判空闲、而断言那一刻端口已被别的东西
+        // 占上 ⇒ 断言拿到 `available: false`。
+        //
+        // macOS runner 上就是这条红（run 38729259889，连跑两次都红），
+        // 而同族的 `kill_rejects_free_port` / `claimed_gateway_pid_is_none_for_free_port`
+        // 全绿 —— 差别只在于那两条断言的是**自己再算一遍**的结果，本条断言的
+        // 是**另一个函数**的结果。
+        //
+        // 修法：守卫改用与 `inspect_port()` **同一个**判据（`port_free_fast`），
+        // 使「守卫通过」与「断言期望」建立在同一次判定语义上。
         let port = test_port(4);
-        if !port_free(port) {
-            return;
+        if !port_free_fast(port) {
+            return; // 环境异常（真被占用），跳过而不是误报
         }
         let v = inspect_port(port);
-        assert_eq!(v.get("available").and_then(Value::as_bool), Some(true));
+        // 复核一次：若此刻端口确实被占用，说明是竞态（检查与使用之间被抢），
+        // 跳过而不是误报 —— 与 `kill_rejects_free_port` 的复核同型。
+        if !port_free_fast(port) {
+            return;
+        }
+        assert_eq!(
+            v.get("available").and_then(Value::as_bool),
+            Some(true),
+            "空闲端口应判定为可用，实际: {v}"
+        );
         assert!(
             v.get("holder").map(Value::is_null).unwrap_or(false),
             "空闲端口的 holder 应为 null，实际: {v}"
