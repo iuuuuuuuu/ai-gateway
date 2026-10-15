@@ -58,7 +58,7 @@ ai-gateway        (momo0410)      网关页面、账号同步、单文件内嵌�
 最后一条是**有意的行为分歧**，也是本仓库单独存在的主要理由之一：
 
 > 整合版对不被支持的思考档位做静默降级（改写为最接近的支持档，只在日志留一行）。
-> 本仓库改为**直接拒绝**并回以 `400 unsupported_reasoning_effort`，同时列出该模型
+> 本仓库改为**直接拒绝**并回以 `400 reasoning_effort_rejected`，同时列出该模型
 > 支持哪些档。
 >
 > 理由是：档位是客户端**显式**指定的。悄悄改写会让用户看到「我明明调了 max，
@@ -110,7 +110,7 @@ ai-gateway        (momo0410)      网关页面、账号同步、单文件内嵌�
 
 > 关于**思考档位**这一行：原仓库对不被支持的档位做**静默降级**（改写为最接近的
 > 支持档，只在日志留一行），本仓库改为**直接拒绝**并回以
-> `400 unsupported_reasoning_effort`，同时列出该模型支持哪些档。
+> `400 reasoning_effort_rejected`，同时列出该模型支持哪些档。
 > 两种做法各有取舍：静默降级对「客户端从别处抄来一个档位名」更宽容，
 > 直接拒绝则让「调了 max 却没生效」这类问题立刻可见。**这是有意的行为分歧。**
 
@@ -148,6 +148,23 @@ ai-gateway        (momo0410)      网关页面、账号同步、单文件内嵌�
 > 把 workbuddy-switch 与 workbuddy2api 整合为单一桌面应用的工作由
 > [momo0410](https://github.com/momo0410) 完成。本仓库在该整合版之上继续开发，
 > 详见 [本仓库的由来](#本仓库的由来) 与 [上游来源与许可证](#上游来源与许可证)。
+
+---
+
+## 文档索引
+
+> 想**改代码**，先看 [docs/AGENTS.md](docs/AGENTS.md)；本节面向所有人，说明「哪份文档回答什么问题」。
+
+| 我想…… | 翻这份 |
+|---|---|
+| **开始动手改代码** | [docs/AGENTS.md](docs/AGENTS.md) —— 开发入口（环境与命令、硬约束、工作流、验证纪律） |
+| 知道「为什么当初这么选」/ 想推翻旧结论 | [docs/DECISIONS.md](docs/DECISIONS.md) |
+| 发版、签名、本机运行、按现象排障、回滚 | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| 写测试 / 跑验收 / 怀疑门禁是不是假的 | [docs/TESTING.md](docs/TESTING.md) |
+| 改用户能看见的行为之前对齐语义 | [docs/FEATURES.md](docs/FEATURES.md) |
+| 查当前进展、测试基线、历史交付证据 | [PROJECT-STATE.md](PROJECT-STATE.md) |
+| 查编码契约（Shell / 组件 / 构建签名 / 验证纪律） | [AGENTS.md](AGENTS.md) —— 仓库根，与 docs/AGENTS.md 并存 |
+| 看 `docs/` 全部文档的定位与更新触发 | [docs/README.md](docs/README.md) —— 文档地图 |
 
 ---
 
@@ -913,7 +930,7 @@ IfSilent kill_${UniqueID} 0        ; 静默模式下不询问，直接杀
 
 ##### ⚠ 验证要用独立实例：独立名 + 独立端口 + 独立数据目录
 
-不要拿正在运行的实例做测试。约定：避开 `7864`（网关）与 `43120`（DSH），
+不要拿正在运行的实例做测试。约定：避开 `7864`（网关）与 `3080`（DSH），
 用 `5789x` / `5799x` 段，配独立 `auth_dir` / `state_file`。
 
 清理只允许 **PID + 路径双条件**，禁止按进程名批量结束：
@@ -1313,7 +1330,9 @@ cargo test --workspace          # 核心逻辑 + 桌面端单元测试
 npm run build                   # 前端类型检查与构建
 ```
 
-> Windows x64 上实测 `cargo test --workspace` 全部通过（666 个用例，0 失败）。
+> Windows x64 上实测 `cargo test --workspace` 全部通过（**3045 passed / 0 failed / 6 ignored**，
+> 15 个 test 块累加，1.0.34 口径，证据 `uitest\ws-test-1034.log`）。改动后**不得低于基线**，
+> 完整门禁清单与数字来源见 [docs/TESTING.md](docs/TESTING.md)。
 > 构建需要 **MSVC 工具链**（`stable-x86_64-pc-windows-msvc`，Tauri 依赖它链接
 > WebView2）；若需安装，可用
 > `winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`。
@@ -1336,7 +1355,10 @@ cd path/to/workbuddy2api && go test ./...
 
 > 与整合版的差异：**思考档位的处理策略不同**。整合版对不被支持的档位做**静默降级**
 > （改写为最接近的支持档，只在日志留一行）；本仓库改为**直接拒绝**并回以
-> `400 unsupported_reasoning_effort`，同时列出该模型支持哪些档。
+> `400 reasoning_effort_rejected`，同时列出该模型支持哪些档。
+> （⚠ 2026-10-15 更正：此前三处均误写为 `unsupported_reasoning_effort`，那是 Go 版
+> 已删除的历史分支；Rust 侧实测为 `reasoning_effort_rejected`。三协议取值不同：
+> Chat 用专属码，`/v1/messages` 与 `/v1/responses` 统一 `invalid_request_error`。）
 > 理由：档位是客户端显式指定的，悄悄改写会让用户看到「调了 max 却答得很短」，
 > 既不知道发生了什么，也不知道该改成哪个档。两种策略各有取舍 ——
 > 静默降级对「客户端从别处抄来一个档位名」更宽容，直接拒绝则让问题立刻可见。

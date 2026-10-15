@@ -3,9 +3,17 @@
 
 These instructions are for AI assistants working in this project.
 
-本仓库曾由 Trellis 工具初始化。Trellis 的工作流骨架（`workflow.md`、`workspace/`、
-`spec/cli/`、`.agents/skills/`、`.codex/agents/`）与 spec 目录均未随仓库分发，
-相关引用已于 2026-09-12 清理。
+本仓库曾由 Trellis 工具初始化。
+
+> ⚠ **2026-10-15 更正（此段此前与仓库现状矛盾）**：原文称 Trellis 的 `workflow.md`、
+> `workspace/`、`spec/` 与 `.agents/skills/`、`.codex/agents/`「均未随仓库分发」——
+> 实测**不成立**：`.trellis/` 有 **75 个文件在版本控制内**（含 `.trellis/workflow.md`、
+> `.trellis/spec/**` 27 个、`.trellis/tasks/**` 10 个、`.trellis/agents/**` 2 个、
+> `.trellis/scripts/**` 28 个），最后提交 `401ab97`（2026-09-18）。
+> 确实不存在的是 `.trellis/spec/cli/`、`.codex/`、`.grok/`（后两者在 `.gitignore` 中）；
+> `.agents/` 目录存在但被 `.gitignore:48` 排除、**不在版本控制内**。
+>
+> 复核命令（可自行复现）：`git ls-files .trellis | wc -l`、`git ls-files .trellis/spec | wc -l`。
 
 当前生效的编码约定见下方各节（UI Component Policy、Git Commit Language）。
 
@@ -135,8 +143,14 @@ $want = (Get-Content crates\ai-gateway-core\embedded\gateway.exe.sha256 -Raw).Tr
 
 ## 验证与测试（强制，血泪教训）
 
-所有者本机**正在运行这套软件**：`:7864` 是他的网关，`:43120` 是他运行 AI 对话的
+所有者本机**正在运行这套软件**：`:7864` 是他的网关，`:3080` 是他运行 AI 对话的
 DSH Desktop。**任何验证都不得影响这两个进程。**
+
+> ⚠ **2026-10-15 更正**：本段此前写 DSH 在 `:43120`。实测（可复现）：
+> `netstat -ano | findstr :7864` → PID 13884 = `gateway-509bdb-*.exe`；
+> `:3080` → PID 38744 = `node.exe`（DSH GUI，即本机 `http://127.0.0.1:3080`）；
+> `:43120` → **0 条连接，未监听**。⇒ 拿 `43120` 当判据会**误报「业主服务掉了」**。
+> `PROJECT-STATE.md` §六 写的也是 `:3080`。**端口会变，判据是现场实测，不是文档里的数字。**
 
 ### 绝对禁止：运行安装包 / 卸载器
 
@@ -233,7 +247,7 @@ cargo build --release -p ai-gateway-server --target-dir $tdir
 # 2) 改名，确保与所有者的进程都不同名
 Copy-Item "$tdir\release\ai-gateway.exe" "D:\WishProject\WorkbuddySwitchAPi\test-bin\wb2api-server.exe"
 
-# 3) 独立数据目录 + 独立端口（避开 7864 / 43120 / 57890，用 5789x）
+# 3) 独立数据目录 + 独立端口（避开 7864 / 3080 / 57890，用 5789x）
 $home1 = "D:\WishProject\WorkbuddySwitchAPi\test-bin\inst-xxx"
 New-Item -ItemType Directory -Force -Path $home1 | Out-Null
 $env:AI_GATEWAY_HOME = $home1
@@ -249,16 +263,24 @@ Go 侧的 `gateway.exe` 不存在上述覆盖问题，可直接构建到临时�
 用 `uitest/page-harness.cjs` + `uitest/mock-host-api.cjs`
 （静态服务 + mock 宿主 API + CDP 驱动真实 Chrome）。
 
+> ⚠ **2026-10-15 更正：上面两个文件当前不存在。**
+> 实测（可复现）：`git ls-files uitest` → **0 个文件**；`git log --all --diff-filter=A -- uitest/page-harness.cjs`
+> → **无任何历史提交**；全仓库 `find` 这两个文件名 → **无匹配**。
+> 即它们**从未入库**（`uitest/` 是未跟踪的本地目录，现只有 22 个 `.log` 证据日志）。
+> `crates/ai-gateway-server/src/api.rs` 的注释同样引用了 `uitest/mock-host-api.cjs`，亦为悬空。
+> ⇒ 想按这条路做前端验证，需**先重建**这两个探针；在它们存在之前，本节的步骤不可执行。
+
 ### 每次验证前后都自检
 
 ```powershell
-foreach ($port in @(43120, 7864)) {
+foreach ($port in @(7864, 3080)) {
     $c = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
     if (-not $c) { Write-Warning "所有者的 :$port 未在运行 —— 立即停止并报告" }
 }
 ```
 
-详见 `uitest/README-验证约定.md`。
+详见 `uitest/README-验证约定.md` —— ⚠ **该文件当前不存在**（`git ls-files uitest` = 0，
+且无任何历史提交记录，见上「前端/UI 验证」节的更正）。
 
 ### ⚠⚠ 自己打的包要自己跑通再交付（2026-09-21 教训）
 
@@ -653,12 +675,29 @@ curl.exe -s -X POST "http://127.0.0.1:$port/v1/chat/completions" `
 - 客户端的重试次数是**并发度**的信号：DSH 是 5，故上限至少该留
   一个数量级的余量
 
-**当前值**：`max_in_flight = 3`（三个产品统一；2026-09-22 从临时的 32 收回来，
-因为真正的解法是下面那条"排队"而不是把上限开大），
-配合 `server.Config.InFlightWait`（默认 **3000ms**）在名额满时排队而非失败。
+**当前值**：`max_in_flight = 3`（三个产品统一；`config.rs` 默认值，有测试钉住）。
 
-⚠ **本节曾写 `32` / `1500ms`，与实际代码不符**（代码是 3 / 3000ms）。
-改魔数时务必同步本节 —— 文档与代码分叉比没有文档更糟。
+> ⚠ **2026-10-15 更正：本段此前称「配合 `server.Config.InFlightWait`（默认 3000ms）
+> 在名额满时排队而非失败」—— 这在当前 Rust 实现里不成立。**
+> 逐条核实（可复现）：
+> - `crates/ai-gateway-router/src/pool.rs:2263` `in_flight_full()`；`acquire()` 满额
+>   **直接返回 `false`**（`pool.rs:4588` 的测试断言原文就是「超过上限应拒绝」）。
+> - `crates/ai-gateway-router/src/forward.rs:1077` 是唯一调用点：`if !acquire(...)` 时
+>   **换号重试**；`forward.rs:326` 的注释写明「`Pool::acquire`（原子占名额）兜住 ——
+>   它返回 false 时**换号重试即可**」。
+> - 全仓库 `grep -rn 'InFlightWait|in_flight_wait' crates/ src-tauri/ --include=*.rs`
+>   → 仅 2 处命中，**都在 `gateway.rs` 的注释里**，**没有任何实现**。
+> - `server.Config.InFlightWait` / `pool.AcquireWait` 是 **Go 版**（`go-gateway/`，
+>   已不参与构建）的标识符。`gateway.rs:3210` 那段「为什么现在敢用 3」的说明是
+>   **Go 时代遗留**，与 Rust 现状不符。
+> ⇒ 现行语义：**每账号最多 3 个在途；满额时该账号被跳过、请求换号重试**，
+> 不存在等待/排队。
+>
+> **待办（未决，需 Owner 定夺）**：Go 版靠排队让「客户端 5 次并发重试」不再成片 503；
+> Rust 版改成了换号 —— 对**单账号产品**（qoder / zcode）而言换号无处可换，
+> 这正是「并发重试成片 503」的成因形状。**保留换号还是补回排队，是需要重新评估的决策。**
+>
+> 改魔数时务必同步本节 —— 文档与代码分叉比没有文档更糟。
 
 ## Git Commit Language
 
