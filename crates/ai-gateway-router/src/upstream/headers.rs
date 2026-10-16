@@ -14,12 +14,43 @@ use reqwest::RequestBuilder;
 
 use crate::auth::Auth;
 
-/// 客户端 UA。所有请求共用（模型配置接口另有专用 UA）。
-const CLIENT_UA: &str = "CLI/2.63.2 CodeBuddy/2.63.2";
+/// 国服客户端 UA。
+const CLIENT_UA_CN: &str = "CLI/2.63.2 CodeBuddy/2.63.2";
+/// 国际版客户端 UA（官方 WorkBuddyAI.exe 5.6.2 抓包）。
+const CLIENT_UA_INTL: &str = "WorkBuddy/5.6.2 WorkBuddy/5.6.2 CLI/2.147.0";
 /// 国服 Origin/Referer。
 const ORIGIN_CN: &str = "https://www.codebuddy.cn";
 /// 国际版 Origin/Referer。
 const ORIGIN_INTL: &str = "https://www.workbuddy.ai";
+
+/// 该账号所属区域对应的客户端 UA。
+///
+/// # 为什么必须按区域分流（★ 2026-10-16 补回：Rust 重写时丢失）
+///
+/// 国际版上游**按 UA 判定来源客户端**。只发国服 CLI 的 UA 时，实测
+/// （同一账号、同一模型、同一端点 `POST /v2/chat/completions`）：
+///
+/// ```text
+/// 官方国际版客户端（WorkBuddyAI.exe 5.6.2） → HTTP 200，正常流式
+/// 网关（国服 UA）                          → HTTP 403 code=11140 request illegal
+/// ```
+///
+/// 即**账号与内容都没问题，是请求身份不被国际版接受**。更麻烦的是这个 403
+/// 在客户端界面上还会被渲染成「API 密钥无效」，排查方向会被彻底带偏 ——
+/// **UA 错了不报错，只会 403**。
+///
+/// ⚠ **国服不得跟着改**：国服实测正常，动它的请求身份没有收益，只会引入
+/// 一类新的不确定性（Go 侧 `TestCNDoesNotUseWorkBuddyUA` 专门防这个「修过头」）。
+///
+/// 与 Go `clientUAFor`（`go-gateway/internal/upstream/headers.go`）同口径，
+/// 回归证据见 `go-gateway/internal/upstream/intl_headers_test.go`。
+pub fn client_ua_for(a: &Auth) -> &'static str {
+    if a.is_intl() {
+        CLIENT_UA_INTL
+    } else {
+        CLIENT_UA_CN
+    }
+}
 
 /// 该账号所属区域对应的 Origin/Referer。
 pub fn origin_referer_for(a: &Auth) -> &'static str {
@@ -28,6 +59,39 @@ pub fn origin_referer_for(a: &Auth) -> &'static str {
     } else {
         ORIGIN_CN
     }
+}
+
+/// 由会话键**确定性**派生会话 id（`X-Conversation-ID`）。
+///
+/// # 为什么要稳定派生，而不是每次新造一个
+///
+/// 官方客户端**整段会话复用同一个** `X-Conversation-ID`。若我们每次请求都新造
+/// 一个随机 UUID，那在多轮对话里就是「每轮换一个会话」—— 上游看到的是一串
+/// 互不相干的单轮请求，与官方客户端的行为不一致。
+///
+/// # 为什么必须有它（★ 2026-10-16 补回：Rust 重写时丢失）
+///
+/// 上游的**渠道校验**会看会话头族。请求里完全没有会话 id 时，它回：
+///
+/// ```text
+/// HTTP 400 {"code":11-128,"msg":"conversation id missing",
+///           "displayTips":"这次调用没通过渠道校验，可能不是官方客户端发出的"}
+/// ```
+///
+/// 官方三套身份里，**VSCode / CLI 一直带**这套头，**只有桌面端一个都没带** ——
+/// 而桌面端正是所有 WorkBuddy 账号默认的那套身份。
+///
+/// 无种子（一次性探针，如专家市场探测）时退回随机 UUID，与 VSCode/CLI 的
+/// 历史行为一致。派生口径与参考实现的 `conversation_uuid` 相同：
+/// `uuid5(NAMESPACE_URL, seed)` 且**大写字面量**。
+pub fn conversation_uuid(seed: &str) -> String {
+    let s = seed.trim();
+    if s.is_empty() {
+        return uuid::Uuid::new_v4().to_string().to_uppercase();
+    }
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, s.as_bytes())
+        .to_string()
+        .to_uppercase()
 }
 
 /// 所有 API 共享的请求头。
@@ -43,7 +107,7 @@ fn common(headers: &mut HeaderMap, a: &Auth) {
         headers.insert("Origin", v.clone());
         headers.insert("Referer", v);
     }
-    headers.insert("User-Agent", HeaderValue::from_static(CLIENT_UA));
+    headers.insert("User-Agent", HeaderValue::from_static(client_ua_for(a)));
 }
 
 /// 插入 header，忽略非法值（凭证里的 uid 等理论上可能含非 ASCII）。
@@ -57,7 +121,7 @@ fn put(headers: &mut HeaderMap, key: &'static str, value: &str) {
 ///
 /// 缺省字段用 `X-No-*` 约定（与 CodeBuddy 官方 CLI 一致）—— 上游据此区分
 /// 「字段缺失」与「字段为空」，直接省略会被判成协议错误。
-pub fn chat_headers(a: &Auth) -> HeaderMap {
+pub fn chat_headers(a: &Auth, conversation_seed: &str) -> HeaderMap {
     let mut h = HeaderMap::new();
     common(&mut h, a);
     if a.access_token.is_empty() {
@@ -82,6 +146,38 @@ pub fn chat_headers(a: &Auth) -> HeaderMap {
         put(&mut h, "X-Domain", &a.domain);
     }
     h.insert("X-Product", HeaderValue::from_static("SaaS"));
+    // 国际版额外声明**客户端身份**（对照官方 WorkBuddyAI.exe 5.6.2 抓包）。
+    //
+    // ★ 2026-10-16 补回：Rust 重写时这七个头整体丢失，国际版又回到
+    //「请求不像官方客户端」的状态。缺了它们，上游仍可能把请求判成非官方
+    // 客户端（渠道校验 400/11-128、风控 3012 都指向同一类判定）。
+    //
+    // ⚠ **只在国际版路径上发**：国服上游不认它们，多发等于改变国服的请求
+    // 画像，而国服是主力通道、当前实测良好。Go 侧 `TestCNHasNoIntlOnlyHeaders`
+    // 专门钉住这条 —— 「不知道国服要不要」时**不要**顺手也发一份。
+    if a.is_intl() {
+        put(&mut h, "X-IDE-Type", "WorkBuddy");
+        put(&mut h, "X-IDE-Name", "WorkBuddy");
+        put(&mut h, "X-IDE-Version", "5.6.2");
+        put(&mut h, "X-Agent-Intent", "craft");
+        put(&mut h, "X-Agent-Purpose", "conversation");
+        put(&mut h, "X-Agent-Type", "main");
+        put(&mut h, "x-codebuddy-request", "1");
+    }
+    // 会话头族：**三套身份都要带**（官方 VSCode/CLI 一直带，桌面端原先一个都没有）。
+    //
+    // ★ 2026-10-16 补回：Rust 重写时整体丢失 ⇒ 上游渠道校验回
+    //   400 / code 11-128 `conversation id missing`。见 conversation_uuid 的说明。
+    //
+    // ⚠ 与「国际版专属身份头」不同，这一族**不按区域分流**：参考实现里三套
+    //   身份、两个区域都发（差异只在桌面端的 UA/版本号），故这里也不分。
+    let conv = conversation_uuid(conversation_seed);
+    // Message-ID 与 Request-ID **同值**：参考实现里两者就是同一个 msg_id。
+    let msg_id = uuid::Uuid::new_v4().simple().to_string();
+    put(&mut h, "X-Conversation-ID", &conv);
+    put(&mut h, "X-Conversation-Request-ID", &msg_id);
+    put(&mut h, "X-Conversation-Message-ID", &msg_id);
+    put(&mut h, "X-Request-ID", &msg_id);
     h
 }
 
@@ -176,8 +272,9 @@ pub fn resource_headers(a: &Auth) -> HeaderMap {
         h.insert("Origin", v.clone());
         h.insert("Referer", v);
     }
-    // 修复点 4：与 chat 路径同一个 UA。
-    h.insert("User-Agent", HeaderValue::from_static(CLIENT_UA));
+    // 修复点 4：与 chat 路径同一个 UA —— 故同样按区域分流（不是恒为国服 UA）：
+    // 国际版账号打的是 workbuddy.ai，发国服 CLI 的 UA 会被它判成非官方客户端。
+    h.insert("User-Agent", HeaderValue::from_static(client_ua_for(a)));
     if !a.uid.is_empty() {
         put(&mut h, "X-User-Id", &a.uid);
     }
@@ -241,20 +338,171 @@ mod tests {
 
     #[test]
     fn chat_headers_include_account_fields() {
-        let h = chat_headers(&cn());
+        let h = chat_headers(&cn(), "sess-1");
         assert_eq!(h["authorization"], "Bearer at");
         assert_eq!(h["x-user-id"], "u1");
         assert_eq!(h["x-enterprise-id"], "e1");
         assert_eq!(h["x-domain"], "https://copilot.tencent.com");
         assert_eq!(h["x-product"], "SaaS");
         assert_eq!(h["origin"], ORIGIN_CN);
-        assert_eq!(h["user-agent"], CLIENT_UA);
+        assert_eq!(h["user-agent"], CLIENT_UA_CN);
+    }
+
+    // ---------------------------------------------------------------------
+    // 国际版请求身份（★ 2026-10-16 补回 Rust 重写时丢失的一整块）
+    //
+    // 守的是所有者 2026-09-27 报的真实现场：「国际版不能使用」。
+    // 逐条对应 Go 侧 `intl_headers_test.go` 的断言 —— 那边有、这边没有，
+    // 正是这些头在重写时丢失却无人发现的原因。
+    // ---------------------------------------------------------------------
+
+    /// 国际版必须发 WorkBuddy 客户端 UA，而不是国服 CLI 的。
+    ///
+    /// 这是本次修复的**核心断言**：用国服 UA 打国际版会 403 11140，
+    /// 而那个 403 在客户端界面上会被显示成「API 密钥无效」，把排查方向带偏。
+    #[test]
+    fn intl_uses_workbuddy_client_ua() {
+        let h = chat_headers(&intl(), "sess-1");
+        let ua = h["user-agent"].to_str().unwrap();
+        assert!(
+            ua.starts_with("WorkBuddy/"),
+            "国际版 UA 必须以 WorkBuddy/ 开头（否则上游回 403 11140），实际 {ua:?}"
+        );
+        assert_ne!(ua, CLIENT_UA_CN, "国际版不得复用国服 CLI 的 UA——那正是本次缺陷");
+    }
+
+    /// 国服**不得**被改成国际版 UA（防「修过头」）。
+    ///
+    /// 国服当前实测正常，动它的请求身份没有收益，只会引入新的不确定性。
+    #[test]
+    fn cn_does_not_use_workbuddy_ua() {
+        let h = chat_headers(&cn(), "sess-1");
+        let ua = h["user-agent"].to_str().unwrap();
+        assert_eq!(ua, CLIENT_UA_CN, "国服 UA 应保持不变");
+        assert!(!ua.starts_with("WorkBuddy/"), "国服不得发 WorkBuddy 客户端 UA");
+    }
+
+    /// 国际版必须声明客户端身份头（抓包对照出来的差异项）。
+    #[test]
+    fn intl_sends_ide_and_agent_headers() {
+        let h = chat_headers(&intl(), "sess-1");
+        for (k, v) in [
+            ("x-ide-type", "WorkBuddy"),
+            ("x-ide-name", "WorkBuddy"),
+            ("x-ide-version", "5.6.2"),
+            ("x-agent-intent", "craft"),
+            ("x-agent-purpose", "conversation"),
+            ("x-agent-type", "main"),
+            ("x-codebuddy-request", "1"),
+        ] {
+            assert_eq!(h[k], v, "国际版应发 {k}={v}");
+        }
+    }
+
+    /// 国服路径**不该**带这些国际版专属头。
+    ///
+    /// 理由同 `cn_does_not_use_workbuddy_ua`：国服没要求它们，多发等于改变
+    /// 国服的请求画像，而国服是主力通道。**不许**因为「顺手」也发一份。
+    #[test]
+    fn cn_has_no_intl_only_headers() {
+        let h = chat_headers(&cn(), "sess-1");
+        for k in [
+            "x-ide-type",
+            "x-ide-name",
+            "x-ide-version",
+            "x-agent-intent",
+            "x-agent-purpose",
+            "x-agent-type",
+            "x-codebuddy-request",
+        ] {
+            assert!(h.get(k).is_none(), "国服不该发国际版专属头 {k}");
+        }
+    }
+
+    /// 积分查询路径的 UA 也必须跟随区域（它与 chat 共用同一个分流函数）。
+    #[test]
+    fn resource_headers_ua_follows_region() {
+        assert_eq!(resource_headers(&cn())["user-agent"], CLIENT_UA_CN);
+        assert_eq!(resource_headers(&intl())["user-agent"], CLIENT_UA_INTL);
+    }
+
+    // ---------------------------------------------------------------------
+    // 会话头族（★ 2026-10-16 补回：Rust 重写时整体丢失）
+    //
+    // 缺了它，上游渠道校验回 400 / code 11-128 `conversation id missing`，
+    // 报文是「这次调用没通过渠道校验，可能不是官方客户端发出的」。
+    // ---------------------------------------------------------------------
+
+    /// 三套身份、两个区域**都必须**带全套会话头。
+    ///
+    /// 这是本组的主断言：官方 VSCode / CLI 一直带，桌面端原先一个都没有。
+    #[test]
+    fn conversation_headers_are_always_present() {
+        for (name, h) in [("cn", chat_headers(&cn(), "sess-1")), ("intl", chat_headers(&intl(), "sess-1"))] {
+            for k in [
+                "x-conversation-id",
+                "x-conversation-request-id",
+                "x-conversation-message-id",
+                "x-request-id",
+            ] {
+                assert!(
+                    h.get(k).is_some_and(|v| !v.is_empty()),
+                    "{name} 会话头族缺 {k} —— 上游会回 400/11-128 conversation id missing"
+                );
+            }
+        }
+    }
+
+    /// 会话 id 必须由种子**确定性派生**：同一会话 → 同一个 id。
+    ///
+    /// 若每次新造随机 UUID，多轮对话在上游看来就是「每轮都是新会话」，
+    /// 与官方客户端（整段会话复用同一个 X-Conversation-ID）的行为不一致。
+    #[test]
+    fn conversation_id_is_stable_for_one_session() {
+        let a = chat_headers(&cn(), "sess-1")["x-conversation-id"].clone();
+        let b = chat_headers(&cn(), "sess-1")["x-conversation-id"].clone();
+        assert_eq!(a, b, "同一会话种子必须派生出同一个会话 id");
+
+        let other = chat_headers(&cn(), "sess-2")["x-conversation-id"].clone();
+        assert_ne!(a, other, "不同会话必须得到不同 id");
+    }
+
+    /// Message-ID 与 Request-ID 是**同一个值**（参考实现里就是同一个 msg_id）。
+    #[test]
+    fn message_id_equals_request_id() {
+        let h = chat_headers(&cn(), "sess-1");
+        assert_eq!(h["x-conversation-message-id"], h["x-request-id"]);
+    }
+
+    /// 无种子（一次性探针）退回随机 UUID —— 与官方 VSCode/CLI 的历史行为一致。
+    #[test]
+    fn empty_seed_falls_back_to_random_uuid() {
+        let a = chat_headers(&cn(), "")["x-conversation-id"].clone();
+        let b = chat_headers(&cn(), "")["x-conversation-id"].clone();
+        assert_ne!(a, b, "无种子时每次应不同（随机 UUID）");
+        assert_eq!(a.to_str().unwrap().len(), 36, "应为 UUID 字面量形态");
+        assert_eq!(
+            a.to_str().unwrap(),
+            a.to_str().unwrap().to_uppercase(),
+            "会话 id 应为大写字面量（与参考实现一致）"
+        );
+    }
+
+    /// 派生结果就是 `uuid5(NAMESPACE_URL, seed)` —— 钉住算法，防止被换成别的哈希。
+    #[test]
+    fn conversation_uuid_matches_uuid5_namespace_url() {
+        let want = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, b"seed-abc")
+            .to_string()
+            .to_uppercase();
+        assert_eq!(conversation_uuid("seed-abc"), want);
+        // 两侧空白应被忽略（会话键可能带空格）。
+        assert_eq!(conversation_uuid("  seed-abc  "), want);
     }
 
     /// 安全红线：chat 请求绝不能带 X-Refresh-Token。
     #[test]
     fn chat_headers_never_carry_refresh_token() {
-        let h = chat_headers(&cn());
+        let h = chat_headers(&cn(), "sess-1");
         assert!(
             h.get("x-refresh-token").is_none(),
             "chat 请求不得携带 refresh token"
@@ -271,7 +519,7 @@ mod tests {
             domain: String::new(),
             ..Default::default()
         };
-        let h = chat_headers(&a);
+        let h = chat_headers(&a, "sess-1");
         assert_eq!(h["x-no-authorization"], "1");
         assert_eq!(h["x-no-user-id"], "1");
         assert_eq!(h["x-no-enterprise-id"], "1");
@@ -305,7 +553,7 @@ mod tests {
             h["x-client-platform"], "web",
             "缺 X-Client-Platform 会被 WAF 判 403 code=10085"
         );
-        assert_eq!(h["user-agent"], CLIENT_UA, "缺 UA 会被 WAF 判 403 code=10085");
+        assert_eq!(h["user-agent"], CLIENT_UA_CN, "缺 UA 会被 WAF 判 403 code=10085");
         assert_eq!(
             h["referer"], ORIGIN_CN,
             "缺 Referer 会被 WAF 判 403 code=10085"

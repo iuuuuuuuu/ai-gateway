@@ -99,7 +99,7 @@ async fn device_token_attached_for_intl() {
     .unwrap();
 
     let out = client
-        .chat_stream(&intl_account(), br#"{"model":"m"}"#)
+        .chat_stream(&intl_account(), br#"{"model":"m"}"#, "sess-1")
         .await
         .unwrap();
     assert!(matches!(out, ChatOutcome::Stream(_)), "应为 2xx 流");
@@ -130,7 +130,7 @@ async fn device_token_not_attached_for_cn() {
     .unwrap();
 
     let out = client
-        .chat_stream(&cn_account(), br#"{"model":"m"}"#)
+        .chat_stream(&cn_account(), br#"{"model":"m"}"#, "sess-1")
         .await
         .unwrap();
     assert!(matches!(out, ChatOutcome::Stream(_)));
@@ -162,7 +162,7 @@ async fn device_token_degrades_when_service_fails() {
     .unwrap();
 
     let out = client
-        .chat_stream(&intl_account(), br#"{"model":"m"}"#)
+        .chat_stream(&intl_account(), br#"{"model":"m"}"#, "sess-1")
         .await
         .unwrap();
     assert!(
@@ -189,7 +189,7 @@ async fn device_token_degrades_when_service_unreachable() {
     .unwrap();
 
     let out = client
-        .chat_stream(&intl_account(), br#"{"model":"m"}"#)
+        .chat_stream(&intl_account(), br#"{"model":"m"}"#, "sess-1")
         .await
         .unwrap();
     assert!(matches!(out, ChatOutcome::Stream(_)));
@@ -210,7 +210,7 @@ async fn device_token_rejects_malformed_shape() {
     .unwrap();
 
     let _ = client
-        .chat_stream(&intl_account(), br#"{"model":"m"}"#)
+        .chat_stream(&intl_account(), br#"{"model":"m"}"#, "sess-1")
         .await
         .unwrap();
     assert_eq!(
@@ -233,7 +233,7 @@ async fn device_token_not_configured_is_noop() {
     .unwrap();
 
     let _ = client
-        .chat_stream(&intl_account(), br#"{"model":"m"}"#)
+        .chat_stream(&intl_account(), br#"{"model":"m"}"#, "sess-1")
         .await
         .unwrap();
     assert_eq!(chat_seen.lock().unwrap()[0], None);
@@ -285,7 +285,7 @@ async fn device_token_fetch_is_serialized() {
     for _ in 0..4 {
         let c = client.clone();
         tasks.push(tokio::spawn(async move {
-            let _ = c.chat_stream(&intl_account(), br#"{"model":"m"}"#).await;
+            let _ = c.chat_stream(&intl_account(), br#"{"model":"m"}"#, "sess-1").await;
         }));
     }
     for t in tasks {

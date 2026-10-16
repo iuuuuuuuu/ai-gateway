@@ -607,6 +607,312 @@ cargo update -p glib --precise 0.20.12
 **⚠ 维护纪律**：这条**故意保持 open**。它**不是**回归、**不是**待办、**不是**假绿门禁 ——
 看到它时**先读本条**，不要重复排查一遍依赖链（本次已把每一环查死）。
 另外两条同批告警**已经修好**（`source-map-js` → 1.2.2、`rustls` → 0.23.45），不在本条范围内。
+## D18 · 3012 熔断按 **(产品, 区域)** 隔离；官方身份头与会话头族补回（2026-10-16 · 未发版，随下次构建生效）
+
+**业主现场**（原话）：
+
+> 「使用 deepseek-v4.1-flash 模型，**国际服路由到然后直接报错，不轮换国内账号，直接死掉**」
+> 「我发现**国服也会出现这个情况**」
+
+报错原文是**我们自己**的措辞（出自 `unusual.rs` 的 `unusual_activity_message`），
+即「网关主动拒发 + 熔断倒计时」，**不是上游直接拒绝**。
+
+**核实出的两个独立缺陷**（业主拍板「两条都修」）：
+
+### 缺陷 ①：熔断粒度错了 ⇒ 国际版抖动停掉国服主力通道
+
+`forward.rs` 的 3012 熔断原先按**产品**做键：`ctx.unusual.for_product(acct.product_of())`。
+而**国服账号与国际版账号同属 `workbuddy` 产品**（`auth.rs` 的 `product_of` 空串归一到
+`PRODUCT_WORKBUDDY`）⇒
+
+```text
+国际版账号吃到 3012  ⇒ 整个 workbuddy 熔断 90 秒
+                    ⇒ 国服账号也被挡住，一个请求都不发
+```
+
+**这就是「不轮换国内账号，直接死掉」的精确成因。**
+
+**修法**：键改为 `(产品, 区域)`（新增 `UnusualBreakers::for_scope`，`for_product` 保留为
+便捷入口、区域传空）。
+
+**为什么区域这一维是必须的**：国服与国际版打的是**两个完全不同的上游**
+（`codebuddy.cn` vs `workbuddy.ai`）—— 一侧风控**推不出**另一侧也在风控。
+把两者绑在一个熔断器上，等于用一次国际版抖动去停掉主力国服通道。
+
+**为什么产品这一维必须保留**：`zcode` 的风控不得阻断 `qoder`/`workbuddy`
+（既有回归 `unusual_activity_isolated_by_product`，是另一条现场）。
+
+**与空流熔断的一致性**：本文件的**空流风暴熔断**一直就是按 `(产品, 区域)` 做键的
+（`forward.rs` 的 `empty_stream.blocked`）—— 3012 这条只是**没跟上**，本次对齐。
+即这是**消除一处内部不一致**，不是发明新口径。
+
+### 缺陷 ②：官方身份头 + 会话头族在 Rust 重写时**整体丢失**
+
+对照 Go 参照实现 `go-gateway/internal/upstream/headers.go`，国际版路径**本该发**：
+
+| 头 | 值 |
+|---|---|
+| `User-Agent` | `WorkBuddy/5.6.2 WorkBuddy/5.6.2 CLI/2.147.0`（国服仍是 `CLI/2.63.2 CodeBuddy/2.63.2`） |
+| `X-IDE-Type` / `X-IDE-Name` / `X-IDE-Version` | `WorkBuddy` / `WorkBuddy` / `5.6.2` |
+| `X-Agent-Intent` / `X-Agent-Purpose` / `X-Agent-Type` | `craft` / `conversation` / `main` |
+| `x-codebuddy-request` | `1` |
+
+而 Rust 的 `chat_headers`（主对话链路，`client.rs` 的 `chat_stream` 调用）：
+**这套头一个都没发，UA 还恒为国服**。
+
+**一手证据不是推断**：Go 侧有**专门的测试文件** `intl_headers_test.go` 逐字钉住这些值，
+文件头记录着业主 2026-09-27 的现场「**国际版不能使用**」与实测对照：
+
+```text
+官方国际版客户端（WorkBuddyAI.exe 5.6.2） → HTTP 200，正常流式
+网关（国服 UA）                          → HTTP 403 code=11140 request illegal
+```
+
+★ **这套头与它的测试一起在重写时丢失，所以没人发现** —— 文件头自己写着这条教训：
+「**UA 错了不会报错，只会 403**，而 403 在客户端界面上还会被渲染成『API 密钥无效』，
+排查方向会被彻底带偏」。
+
+**缺会话头族的后果**（对应业主给的参考方案
+[workbuddy2api-hub#381](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/381)）：
+上游**渠道校验**回 `400 / code 11-128` `conversation id missing`，
+报文是「这次调用没通过渠道校验，可能不是官方客户端发出的」。
+官方三套身份里 **VSCode / CLI 一直带**，**只有桌面端一个都没带** —— 而那正是
+WorkBuddy 账号默认的身份。
+
+**修法**：补 `X-Conversation-ID` / `X-Conversation-Request-ID` /
+`X-Conversation-Message-ID` / `X-Request-ID`（后两者**同值**，与参考实现一致）。
+`X-Conversation-ID` 由会话键**确定性派生**（`uuid5(NAMESPACE_URL, seed)`，大写字面量）——
+官方客户端**整段会话复用同一个** id；每次新造会让上游看成「一串互不相干的单轮请求」。
+派生种子取 `sess_key`（`session::extract_key`），它在**整轮换号重试里保持不变**，
+正是会话头族要的语义。
+
+**⚠ 会话头族与身份头分流的区别**：前者**不分区域**（参考实现里三套身份、两个区域都发），
+后者**只在国际版发**。国服多发国际版专属头会改变它的请求画像，而国服是主力通道 ——
+有测试 `cn_has_no_intl_only_headers` 专门防「修过头」（Go 侧同款测试防的也是这个）。
+
+### 验证（三次故障注入，每次都必须变红）
+
+| 注入 | 应红的门禁 |
+|---|---|
+| UA 退回恒为国服 | `intl_uses_workbuddy_client_ua`、`resource_headers_ua_follows_region` |
+| 国际版身份头不发 | `intl_sends_ide_and_agent_headers` |
+| 熔断键退回只按产品 | `unusual_activity_isolated_by_region_within_a_product` |
+| 会话头族不发 | `conversation_headers_are_always_present` 等 4 条 |
+| 会话 id 丢掉确定性 | `conversation_uuid_matches_uuid5_namespace_url` 等 2 条 |
+| 线级：`chat_stream` 不传种子 | `conversation_id_is_stable_across_requests_on_the_wire` |
+
+★ **最后一层是「线级」测试**（`tests/ab_conversation_headers.rs`）：起**真** axum 服务、
+发**真**请求、读它**实际收到**的头。单测只看 `HeaderMap`，证明不了「HTTP 往返之后
+上游确实收到了」—— 本仓库对此有明确约定（见 `ab_devicetoken.rs` 文件头）。
+
+**翻案条件**：若实测发现国服其实**也**需要那套国际版身份头（即「不发就不行」），
+则本条的「只在国际版发」应被推翻 —— 但必须**有实测数据**，不能凭「国际版有、国服大概也要」外推。
+
+## D19 · 设备 token 的 SDK 目录发现：扫全部客户端 + 自带垫片（2026-10-16）
+
+**业主现场**（第二轮，装上 D18 的包之后依旧）：
+
+> 「我装了最新版还是这样子，还是你自己跑全流程吧」
+> 附 503 `unusual_activity`，倒计时 86 秒。
+
+**先确认修复真的生效了**（判据是当日构建指纹，不是"我打包了"）：
+
+```text
+:7864 PID=4772  C:\Users\<u>\.wb-switch\gateway\bin\gateway-50b509-852a8d19734f9765.exe
+  SHA256 = 1268ADE9371C0C0B6573FA68A162DE7BD52BD22645C098CC18845F85349007F9
+自建 embedded/gateway.exe SHA256 = 同一个值        启动 08:06:00
+```
+
+⇒ **D18 的修复确已上线，但它不是本次 3012 的根因。** 先前的诊断不完整。
+
+### 真根因：国际版账号的 `X-Device-Token` **永远拿不到**
+
+网关日志给出 **1:1 对应**（四次 3012 **全部**紧跟同一账号的取 token 失败）：
+
+```text
+08:06:15.784  device_token uid=<uuid>: 获取失败: 缺少组件: native/turing-sdk
+08:06:17.963  chat uid=<uuid>: 上游 3012 unusual activity     ← 2.2 秒后
+```
+
+且 `attach_device_token` **只对国际版发**（`client.rs` 的 `if !a.is_intl()`）——
+即吃 3012 的那个账号就是国际版账号，与业主原话「国际服路由到然后直接报错」吻合。
+
+而 `device_token_server.rs` 的文件头自己写着这条代价：
+
+> ✅ 让网关请求与官方客户端**同形态** —— **长期缺设备凭证会被风控逐步标记**。
+
+### 两层根因（都实测确认）
+
+**① 只认一个客户端目录。** `resolve_sdk_dir()` 原实现只找
+`%LOCALAPPDATA%\Programs\WorkBuddyAI\...\native\turing-sdk`，而业主机器上
+真正可用的是 **`WorkBuddyAIGloable`**（国际版）。客户端目录名与账号区域
+**并非一一对应**，机器上可能装任意一个或两个都装。
+
+**② 判据多要一个 `index.cjs`。** 实测两个目录的真实构成：
+
+| 目录 | `index.cjs` | `build/Release/turing_sdk.node` | `TuringShieldSDK.dll` |
+|---|---|---|---|
+| `WorkBuddyAI`（国服） | ❌ **没有** | ✅ 158 KB | ✅ 1.44 MB |
+| `WorkBuddyAIGloable`（国际版） | ✅ 1.2 KB | ✅ 158 KB | ✅ 1.44 MB |
+
+读 `index.cjs` 全文：**它只是 1.2 KB 的 require 垫片，不含任何 SDK 逻辑**：
+
+```js
+binding = require(path.join(__dirname, 'build', 'Release', 'turing_sdk.node'));
+```
+
+⇒ 国服目录**原生文件齐全且可用**，仅因缺那个垫片就被判「缺少组件」。
+
+### 修法（业主选「两条都改」）
+
+1. **扫全部已知客户端**（`CLIENT_DIR_NAMES`：WorkBuddyAI / WorkBuddyAIGloable /
+   CodeBuddy CN / CodeBuddy / WorkBuddy），任一个可用即采用；
+2. **判据放宽为「原生模块存在即可」**（`sdk_dir_is_usable` 只看
+   `build/Release/turing_sdk.node`）；
+3. **自带垫片** `assets/wb-device-token/turing-sdk-shim.cjs`，worker
+   **优先**用它、客户端 `index.cjs` 只作后备。
+
+★ 垫片**不实现任何协议逻辑**，只把官方原生模块 require 出来原样转发；
+参数仍逐字用官方 `cli/product.json` 的值。它不改变「原生文件仍须来自已安装
+的客户端」这个事实 —— `turing_sdk.node` / `TuringShieldSDK.dll` 是
+**腾讯的闭源二进制**，我们无法自行生成。
+
+### ⚠ 第一版垫片写错了，是实测抓出来的
+
+垫片住在**我们自己的** `assets/` 里，而原生文件在客户端目录 ⇒
+第一版写 `path.join(__dirname, ...)` **必然找不到原生模块**：
+
+```text
+{"ok":false,"error":"turing-sdk 不可用: Cannot find module ...\assets\wb-device-token\build\Release\turing_sdk.node"}
+```
+
+改为由 worker 在 require 之前设置 `WB_TURING_NATIVE_DIR`、垫片据此解析。
+**有门禁钉住这个顺序**（`worker_sets_native_dir_before_requiring_shim`）——
+顺序写反会静默退化成「找不到原生模块」。
+
+### 验证（真跑 worker，四个场景 + 两次故障注入）
+
+| 场景 | 结果 |
+|---|---|
+| 国服目录 + 自带垫片（**修复目标**） | ✅ `{"ok":true,"tokens":["v3:..."]}` |
+| 国际版目录 + 自带垫片 | ✅ 成功 |
+| 国际版目录 + 客户端 `index.cjs`（回归） | ✅ 成功（老路径未破坏） |
+| 国服目录 + 无垫片（= 修复前） | ❌ 失败 —— **即修复前业主的处境** |
+
+故障注入：判据退回「必须有 index.cjs」⇒ 2 条门禁变红 ✅；
+目录清单退回「只认国服」⇒ `client_dir_names_cover_cn_and_intl` 变红 ✅。
+
+### ⚠ 仍然没解决的部分（如实记录）
+
+**已被上游标记的账号，补上 device token 也救不回来。** `device_token_server.rs`
+文件头写明（2026-09-28 实测，9 个国际版账号三组对照）：
+
+> ❌ **不能**救活已被上游标记失效的账号：那是服务端的 (设备,账号) 绑定状态。
+> 403 11140 的账号带上任何 device token 仍然 403；只有重新登录才能恢复。
+
+本次修复的作用是**阻止新的标记产生**。若业主当前账号已被标记，
+需要**重新登录**该账号才能恢复 —— 这一条必须写明，不能让业主以为装上就好。
+
+**翻案条件**：若实测发现补上 token 后**仍然**持续 3012，则说明标记已存在
+（走上一条），或 turing-sdk 参数（channelId / productName / productVersion）
+需要跟随客户端版本更新 —— 届时以抓包对照为准，**不要凭推断改参数**。
+
+## D20 · 被封账号的 11140 被误判成 3012，熔断整个区域（2026-10-16 修复）
+
+**业主现场**（第三轮，装上 D18/D19 的包之后）：
+
+> 「要的，不然我现在发送就直接死了」「这个错误 导致我现在根本用不了」
+> 附 503 `unusual_activity`，倒计时 66 秒。
+
+**先确认 D19 已上线**：宿主 `D:\APP\AI Gateway\ai-gateway.exe` 时间 08:35、
+`_up_/assets/wb-device-token/turing-sdk-shim.cjs` 已就位；网关侧「设备 token 获取失败」
+日志**降为 0 条**（修复前每次请求都失败），且国际版账号 `c5cb5f78` 在 08:54 流式成功。
+⇒ 设备 token 修复**已生效**。
+
+### 真根因：**一个被封账号把整个国际版区域熔断了 90 秒**
+
+逐账号直连上游实测（12 个国际版账号，带真实 device token）：
+
+| 状态 | 数量 | 账号 |
+|---|---|---|
+| ✅ 成功（HTTP 200，流式） | **4** | 4 个国际版账号（占位名 `acct-1`…`acct-4`） |
+| ⏳ 频率限制 6004（正常，非封禁） | 7 | 其余 |
+| ❌ **403 / 11140** | **1** | **`<uuid-A>`** |
+
+即 **11 个好号 + 1 个坏号**。而那一个坏号让**整个 (workbuddy, intl) 被熔断**。
+
+### 缺陷链条（每一环都有实测证据）
+
+上游对**被限制的账号**回的 403 body **逐字**是：
+
+```json
+{"code":11140,"msg":"request illegal",
+ "displayMsg":{"en":"Your account has been restricted due to unusual activity",
+              "zh":"账号存在异常行为，已被限制使用"},
+ "displayTips":{"en":"We detected unusual activity on this account. ..."},
+ "actions":["EDIT_INPUT","SUBMIT_FEEDBACK"]}
+```
+
+⚠ 注意 `displayMsg.en` 里含 **`unusual activity`** —— 而 `unusual.rs` 的
+`is_unusual_activity()` 判据之一是**全文小写子串**匹配该短语：
+
+```text
+上游 403/11140（账号被封，文案含 unusual activity）
+  ⇒ is_unusual_activity() 命中 ⇒ 走 3012 分支
+  ⇒ 3012 分支**刻意不罚账号** ⇒ 坏号永不冷却 ⇒ 每轮换号重新选中
+  ⇒ 且**熔断整个 (产品, 区域)** 90 秒 ⇒ 同区 11 个好号一起被挡
+```
+
+**两者的处置完全相反**：
+
+| | 11140 账号被封 | 3012 请求级风控 |
+|---|---|---|
+| 归属 | **账号侧**（`classify.rs` 第 12 条） | 请求 / 出口侧 |
+| 处置 | 软冷却该号 + 换号 | 熔断区域 + 不罚账号 |
+| 换号有用吗 | **有用**（换号即好） | 无用（换号加重风控） |
+
+### 修法
+
+把判定抽成纯函数 `forward.rs::should_trip_unusual_breaker(kind, status, body)`：
+**`ErrKind::AccountUnusable` 直接返回 false**，其余照旧交给 `is_unusual_activity`。
+命中 11140 的响应于是不再走 3012 分支，而是落到通用 `apply_error_policy`
+→ 账号级**软冷却** → `continue` 换号（该路径已存在，见 `forward.rs` 的
+`ErrKind::AccountUnusable` 臂）。
+
+### ⚠ 第一版修复是**假绿门禁**，已纠正（本轮教训）
+
+第一版把条件内联在轮转循环里（`if !is_account_unusable && is_unusual_activity(...)`），
+并配了 3 条测试。**但故障注入显示：把条件改回缺陷版本，全量单测仍然全绿** ——
+因为那 3 条测的是 `classify` 与 `unusual` 两个**判据各自**的行为，
+**没有任何一条钉住 `forward.rs` 里的那个组合条件**。测试够不着被改的代码。
+
+纠正方式：把判定**抽成纯函数**，由 `unusual_breaker_excludes_banned_account`
+直接钉住。**再次注入确认变红**（panicked，文案即现场描述），撤销后复绿。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| 被封账号 11140 ⇒ 不熔断 | ✅ `unusual_breaker_excludes_banned_account` |
+| 真 3012 ⇒ 仍熔断（防修过头） | ✅ `unusual_breaker_still_trips_for_real_3012` |
+| 封禁文案确实会被 3012 判据命中 | ✅ `banned_account_body_does_match_the_3012_markers` |
+| 故障注入（删掉账号侧排除） | ✅ 门禁**变红**，撤销后复绿 |
+| `cargo test -p ai-gateway-router --lib` | **1798 passed / 0 failed / 1 ignored** |
+
+### ⚠ 仍然没解决的部分
+
+**`<uuid-A>` 这个账号本身是被上游封禁的**（`displayMsg`：「账号存在异常行为，
+已被限制使用」，`actions` 里给了 `SUBMIT_FEEDBACK` 申诉入口）。本次修复让它
+**不再拖累其它 11 个账号**，但它自己仍然不可用 —— 只能去官方客户端提交反馈 / 申诉。
+**已封禁的账号补 device token 也救不回来**（见 D19）。
+
+**翻案条件**：若上游将来把 `unusual activity` 从 11140 的文案里去掉，
+则 `banned_account_body_does_match_the_3012_markers` 会失败 —— 那说明误判不再可能，
+届时可简化 `should_trip_unusual_breaker` 的判断，但**不要**直接删掉那组测试。
+
+**观察判据**：修复后网关日志里该账号的归因会从「3012 unusual activity」
+变成「11140（账号被限制）」—— 这条差异可直接用来确认修复生效。
+
 ## 附：怎么用这份文档
 
 ### 什么时候该翻案

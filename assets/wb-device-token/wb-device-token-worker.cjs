@@ -39,6 +39,8 @@ const path = require('node:path');
 const readline = require('node:readline');
 
 const sdkDir = process.argv[2];
+// argv[3] = 我们**自带**的垫片（可选）。见下方「为什么要自带垫片」。
+const shimPath = process.argv[3] || '';
 
 function fail(msg) {
   process.stdout.write(JSON.stringify({ ok: false, error: String(msg) }) + '\n');
@@ -49,11 +51,36 @@ if (!sdkDir) {
   process.exit(1);
 }
 
+// 加载顺序：**自带垫片优先**，客户端自带的 index.cjs 作后备。
+//
+// # 为什么要自带垫片（★ 2026-10-16 现场）
+//
+// 官方目录里的 `index.cjs` 只是 1.2 KB 的 require 垫片，**不含任何 SDK 逻辑**。
+// 实测（所有者本机）：**国服客户端 WorkBuddyAI 的 turing-sdk 目录里根本没有
+// 它**，而原生文件（turing_sdk.node + TuringShieldSDK.dll）齐全且可用 ——
+// 于是「必须有 index.cjs」这个判据把完全可用的目录判成了「缺少组件」，
+// 国际版账号因此长期拿不到 X-Device-Token，被上游风控逐步标记。
+//
+// 我们自带的垫片内容与之等价（都是一行 require 原生模块），但**归我们所有**：
+// 官方哪天改名 / 挪位置都不会再让这条链路静默失效。
+// 自带垫片按**该变量**解析原生模块（它自己住在我们的 assets 目录，
+// 不能相对 __dirname 找客户端目录下的原生文件）。必须在 require 之前设置。
+process.env.WB_TURING_NATIVE_DIR = sdkDir;
+
 let sdk;
-try {
-  sdk = require(path.join(sdkDir, 'index.cjs'));
-} catch (e) {
-  fail(`加载 turing-sdk 失败: ${e.message || e}`);
+let loadErr = null;
+for (const cand of [shimPath, path.join(sdkDir, 'index.cjs')].filter(Boolean)) {
+  try {
+    sdk = require(cand);
+    loadErr = null;
+    break;
+  } catch (e) {
+    loadErr = e;
+    sdk = null;
+  }
+}
+if (!sdk) {
+  fail(`加载 turing-sdk 失败: ${loadErr && loadErr.message ? loadErr.message : loadErr}`);
   process.exit(1);
 }
 if (!sdk.isSupported || !sdk.isSupported()) {

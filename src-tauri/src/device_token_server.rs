@@ -87,10 +87,19 @@ struct NodeWorker {
 
 impl NodeWorker {
     /// 启动工作进程。Windows 上加 `CREATE_NO_WINDOW`（否则弹黑窗）。
-    fn spawn(node: &PathBuf, script: &PathBuf, sdk_dir: &PathBuf) -> Result<Self, String> {
+    /// `shim`：我们**自带**的垫片路径（可选）。worker 会**优先**用它加载原生
+    /// 模块，客户端目录里的 `index.cjs` 只作后备 —— 见 worker 文件头。
+    fn spawn(
+        node: &PathBuf,
+        script: &PathBuf,
+        sdk_dir: &PathBuf,
+        shim: Option<&PathBuf>,
+    ) -> Result<Self, String> {
         let mut cmd = tokio::process::Command::new(node);
+        // 空串 = 没有自带垫片，worker 会退回客户端目录里的 index.cjs。
         cmd.arg(script)
             .arg(sdk_dir)
+            .arg(shim.map(|p| p.as_os_str()).unwrap_or_default())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // stderr 丢弃：worker 只在致命错误时写 stderr 并退出，
@@ -178,6 +187,9 @@ pub struct DeviceTokenState {
     script: Option<PathBuf>,
     /// TuringShield SDK 目录（`native/turing-sdk`）。
     sdk_dir: Option<PathBuf>,
+    /// 我们**自带**的垫片（`turing-sdk-shim.cjs`）；缺失不致命 —— 会退回
+    /// 客户端目录里的 `index.cjs`（见 worker 加载顺序）。
+    shim: Option<PathBuf>,
     /// 常驻工作进程（懒启动；退出后下次请求自动重启）。
     worker: Mutex<Option<NodeWorker>>,
 }
@@ -187,12 +199,14 @@ impl DeviceTokenState {
         let node = resolve_node();
         let script = resolve_script();
         let sdk_dir = resolve_sdk_dir();
+        let shim = resolve_shim();
         Self {
             token,
             port: Arc::new(Mutex::new(0)),
             node,
             script,
             sdk_dir,
+            shim,
             worker: Mutex::new(None),
         }
     }
@@ -237,13 +251,13 @@ impl DeviceTokenState {
 
         // 首次：懒启动
         if guard.is_none() {
-            *guard = Some(NodeWorker::spawn(node, script, sdk)?);
+            *guard = Some(NodeWorker::spawn(node, script, sdk, self.shim.as_ref())?);
         }
 
         // 已退出（崩溃/被杀）→ 重启一次
         if let Some(w) = guard.as_mut() {
             if !w.alive() {
-                *guard = Some(NodeWorker::spawn(node, script, sdk)?);
+                *guard = Some(NodeWorker::spawn(node, script, sdk, self.shim.as_ref())?);
             }
         }
 
@@ -253,7 +267,7 @@ impl DeviceTokenState {
             Err(e) => {
                 // 失败可能是"进程刚死"，重启后重试一次 ——
                 // 但只重试一次，避免在真正坏掉时无限循环。
-                *guard = Some(NodeWorker::spawn(node, script, sdk)?);
+                *guard = Some(NodeWorker::spawn(node, script, sdk, self.shim.as_ref())?);
                 let worker = guard.as_mut().ok_or("worker 重启后不可用")?;
                 worker.request(count).await.map_err(|e2| {
                     format!("{e}；重启 worker 后仍失败: {e2}")
@@ -427,25 +441,106 @@ fn resolve_script() -> Option<PathBuf> {
     cands.into_iter().find(|p| p.is_file())
 }
 
-/// 解析 TuringShield SDK 目录（从官方客户端安装位置找）。
-fn resolve_sdk_dir() -> Option<PathBuf> {
+/// 官方客户端安装目录名（按**可发现性**列举，不是「只认一个」）。
+///
+/// # ★ 2026-10-16 现场：只认一个目录 ⇒ 国际版账号持续 3012
+///
+/// 所有者报「国际服路由到然后直接报错，不轮换国内账号，直接死掉」。
+/// 网关日志给出 1:1 对应（四次 3012 **全部**紧跟同一账号的取 token 失败）：
+///
+/// ```text
+/// 08:06:15.784  device_token uid=<uuid>: 获取失败: 缺少组件: native/turing-sdk
+/// 08:06:17.963  chat uid=<uuid>: 上游 3012 unusual activity   ← 2.2 秒后
+/// ```
+///
+/// 根因是**两层**，缺一不可：
+///
+/// 1. 原实现只找 `WorkBuddyAI` 一个目录 —— 而所有者的**国际版**账号用的是
+///    `WorkBuddyAIGloable`（客户端目录名与账号区域并非一一对应，机器上可能
+///    装任意一个，也可能两个都装）；
+/// 2. 判据还**多要求一个 `index.cjs`** —— 那是 1.2 KB 的 JS 垫片（内容只有
+///    一行 `require` 原生模块），**国服客户端目录里没有**。实测该目录下原生
+///    文件（`turing_sdk.node` 158 KB + `TuringShieldSDK.dll` 1.44 MB）
+///    **齐全且可用**。
+///
+/// ⇒ 现在扫描**所有已知客户端**，且判据放宽为「**原生模块存在即可**」
+/// （垫片我们自带，见 [`resolve_shim`]）。「装了两个客户端」不再有歧义：
+/// 任何一个可用就够。
+const CLIENT_DIR_NAMES: &[&str] = &[
+    "WorkBuddyAI",        // 国服（WorkBuddy.exe 的安装目录名）
+    "WorkBuddyAIGloable", // 国际版（官方拼写如此，不是 Global）
+    "CodeBuddy CN",
+    "CodeBuddy",
+    "WorkBuddy",
+];
+
+/// 判定一个目录是否是**可用**的 turing-sdk：原生模块在即可。
+///
+/// ⚠ **刻意不再要求 `index.cjs`** —— 理由见 [`CLIENT_DIR_NAMES`] 第 2 条。
+/// 只需 `build/Release/turing_sdk.node`；同目录的 `TuringShieldSDK.dll`
+/// 由原生模块在运行期按相对路径自行加载，无需我们指定。
+fn sdk_dir_is_usable(dir: &std::path::Path) -> bool {
+    dir.join("build")
+        .join("Release")
+        .join("turing_sdk.node")
+        .is_file()
+}
+
+/// 我们**自带**的垫片（优先于客户端目录里的同名文件）。
+///
+/// 布局与 [`resolve_script`] 同一套 —— Tauri 释放布局踩过坑，不另写一套。
+fn resolve_shim() -> Option<PathBuf> {
+    const NAME: &str = "turing-sdk-shim.cjs";
     let mut cands = Vec::new();
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        cands.push(
-            PathBuf::from(&local)
-                .join("Programs")
-                .join("WorkBuddyAI")
-                .join("resources")
-                .join("app.asar.unpacked")
-                .join("native")
-                .join("turing-sdk"),
-        );
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for base in [
+                dir.to_path_buf(),
+                dir.join("resources"),
+                dir.join("_up_"),
+            ] {
+                cands.push(base.join("assets").join("wb-device-token").join(NAME));
+                cands.push(base.join("wb-device-token").join(NAME));
+            }
+        }
     }
-    // 允许显式覆盖（便于测试/非常规安装位置）
+    // 开发期：仓库 assets/
+    cands.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../assets/wb-device-token")
+            .join(NAME),
+    );
+    cands.into_iter().find(|p| p.is_file())
+}
+
+/// 解析 TuringShield SDK 目录（从**任意**官方客户端安装位置找）。
+///
+/// 显式覆盖 `WB_TURING_SDK_DIR` 优先级最高（便于测试 / 非常规安装位置）；
+/// 覆盖值**必须**通过 [`sdk_dir_is_usable`] 校验，否则会退回自动扫描 ——
+/// 否则一个错的覆盖值会静默顶掉本来能用的客户端目录。
+fn resolve_sdk_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("WB_TURING_SDK_DIR") {
-        cands.insert(0, PathBuf::from(p));
+        let p = PathBuf::from(p);
+        if sdk_dir_is_usable(&p) {
+            return Some(p);
+        }
     }
-    cands.into_iter().find(|p| p.join("index.cjs").is_file())
+    let Ok(local) = std::env::var("LOCALAPPDATA") else {
+        return None;
+    };
+    let programs = PathBuf::from(&local).join("Programs");
+    for name in CLIENT_DIR_NAMES {
+        let dir = programs
+            .join(name)
+            .join("resources")
+            .join("app.asar.unpacked")
+            .join("native")
+            .join("turing-sdk");
+        if sdk_dir_is_usable(&dir) {
+            return Some(dir);
+        }
+    }
+    None
 }
 
 /// 启动设备 token 服务（后台任务）。
@@ -564,4 +659,184 @@ fn json_resp(
         .header("Content-Type", "application/json")
         .body(http_body_util::Full::new(bytes::Bytes::from(body)))
         .unwrap_or_else(|_| hyper::Response::new(http_body_util::Full::new(bytes::Bytes::new())))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一个**只有原生文件、没有 index.cjs** 的目录 —— 正是所有者机器上
+    /// 国服客户端 (WorkBuddyAI) 的真实形状。
+    fn mk_sdk_dir(root: &std::path::Path) -> PathBuf {
+        let dir = root.join("turing-sdk");
+        std::fs::create_dir_all(dir.join("build").join("Release")).unwrap();
+        std::fs::write(dir.join("build").join("Release").join("turing_sdk.node"), b"x").unwrap();
+        std::fs::write(dir.join("build").join("Release").join("TuringShieldSDK.dll"), b"x").unwrap();
+        dir
+    }
+
+    /// ★ 核心回归：**没有 index.cjs 但原生模块齐全**的目录必须判为可用。
+    ///
+    /// 守的是所有者 2026-10-16 的现场：原判据要求 index.cjs 存在，而国服客户端
+    /// 目录里没有那个 1.2 KB 垫片 ⇒ 整条链路被判「缺组件」⇒ 国际版账号
+    /// 长期拿不到 X-Device-Token ⇒ 被上游风控逐步标记 ⇒ 3012。
+    #[test]
+    fn sdk_dir_without_index_cjs_is_usable() {
+        let tmp = std::env::temp_dir().join("wb-dt-test-noindex");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dir = mk_sdk_dir(&tmp);
+        assert!(
+            !dir.join("index.cjs").exists(),
+            "夹具前提：本目录刻意不带 index.cjs"
+        );
+        assert!(
+            sdk_dir_is_usable(&dir),
+            "有原生模块就该判可用——再造出「必须有 index.cjs」这个缺陷时会变红"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 只有 index.cjs、没有原生模块 ⇒ 不可用（垫片本身不含 SDK 逻辑）。
+    #[test]
+    fn sdk_dir_with_only_index_cjs_is_not_usable() {
+        let tmp = std::env::temp_dir().join("wb-dt-test-onlyindex");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("index.cjs"), b"module.exports={}").unwrap();
+        assert!(
+            !sdk_dir_is_usable(&tmp),
+            "光有垫片没有原生模块，仍应判不可用"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 空目录不可用。
+    #[test]
+    fn missing_sdk_dir_is_not_usable() {
+        let tmp = std::env::temp_dir().join("wb-dt-test-missing-never-exists");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(!sdk_dir_is_usable(&tmp));
+    }
+
+    /// 客户端目录名清单必须覆盖国服与国际版 —— 少一个就会静默丢掉一类机器。
+    #[test]
+    fn client_dir_names_cover_cn_and_intl() {
+        for want in ["WorkBuddyAI", "WorkBuddyAIGloable"] {
+            assert!(
+                CLIENT_DIR_NAMES.contains(&want),
+                "客户端目录清单必须含 {want}（否则装了它的机器会被静默跳过）"
+            );
+        }
+    }
+
+    /// 自带垫片必须存在于仓库/发行包资源里 —— 缺失时「自带垫片优先」会静默失效，
+    /// 退化成「必须有客户端 index.cjs」（即本次要修的缺陷）。
+    #[test]
+    fn bundled_shim_exists_in_assets() {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../assets/wb-device-token")
+            .join("turing-sdk-shim.cjs");
+        assert!(p.is_file(), "自带垫片必须存在: {}", p.display());
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            body.contains("turing_sdk.node"),
+            "垫片必须加载原生模块 turing_sdk.node"
+        );
+        assert!(
+            body.contains("WB_TURING_NATIVE_DIR"),
+            "垫片必须按 WB_TURING_NATIVE_DIR 解析原生模块 —— 它自己在 assets/ 下，\
+             相对 __dirname 会找不到客户端的原生文件（第一版就是这么错的）"
+        );
+    }
+
+    /// worker 必须在 require 垫片**之前**设置 WB_TURING_NATIVE_DIR。
+    ///
+    /// 顺序错了会退化成「找不到原生模块」—— 实测抓到过这个错误。
+    #[test]
+    fn worker_sets_native_dir_before_requiring_shim() {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../assets/wb-device-token")
+            .join("wb-device-token-worker.cjs");
+        let body = std::fs::read_to_string(&p).unwrap();
+        let set_at = body
+            .find("WB_TURING_NATIVE_DIR")
+            .expect("worker 必须设置 WB_TURING_NATIVE_DIR");
+        let loop_at = body
+            .find("for (const cand of [shimPath")
+            .expect("worker 必须有垫片加载循环");
+        assert!(
+            set_at < loop_at,
+            "WB_TURING_NATIVE_DIR 必须在 require 垫片之前设置（否则原生模块找不到）"
+        );
+    }
+
+    /// worker 必须**优先**用自带垫片，客户端 index.cjs 只能作后备。
+    #[test]
+    fn worker_prefers_bundled_shim() {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../assets/wb-device-token")
+            .join("wb-device-token-worker.cjs");
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            body.contains("[shimPath, path.join(sdkDir, 'index.cjs')]"),
+            "加载顺序必须是「自带垫片优先，客户端 index.cjs 后备」"
+        );
+    }
+
+    /// ★ 真机集成：设备 token 必须真的**跑通到拿到 `v3:` token**。
+    ///
+    /// # 为什么需要它（不是重复上面的单测）
+    ///
+    /// 上面的单测只证明「**目录判定**逻辑对」。而所有者的缺陷在**整条链路**：
+    /// 发现目录 → 起 node → 加载垫片 → 起 SDK → 取 token → 回传。
+    /// 单测证明不了后四步 —— 第一版垫片就是**在链路里**才暴露写错的
+    /// （相对 `__dirname` 找不到原生模块，而单测全绿）。
+    ///
+    /// 本测试用宿主服务**同一个** `DeviceTokenState`，走完整路径。
+    ///
+    /// # 为什么用环境变量显式开启
+    ///
+    /// 它依赖：① 本机装有 WorkBuddy 客户端；② 网络可达腾讯 SDK。
+    /// 两者在 CI 上都不成立 ⇒ 若无条件跑，CI 会红；若「失败就跳过」，
+    /// 那又变成**假绿门禁**（本仓库的强硬红线）。
+    /// 故：**显式开启才跑；一旦跑起来就必须成功**。
+    ///
+    /// ```text
+    /// WB_TURING_LIVE_TEST=1 cargo test -p ai-gateway --lib live_device_token
+    /// ```
+    #[tokio::test]
+    async fn live_device_token_generation_works() {
+        if std::env::var("WB_TURING_LIVE_TEST").is_err() {
+            eprintln!("跳过：未设 WB_TURING_LIVE_TEST=1（见本测试文档注释）");
+            return;
+        }
+        // ⚠ **不是跳过，是失败** —— 这是本门禁的关键。
+        //
+        // 开启本测试的机器上**必然**装了客户端（它就是这么被开启的），
+        // 此时「找不到 SDK 目录」= 发现逻辑又坏了 = **正是要抓的缺陷**。
+        // 若这里写成「找不到就跳过」，则发现逻辑一坏测试就静默变绿 ——
+        // 那是**假绿门禁**（本仓库的强硬红线）。
+        //
+        // 排查时实测：把发现逻辑改成必然找不到，本测试**必须**变红。
+        if let Some(dir) = resolve_sdk_dir() {
+            println!("发现 SDK 目录: {}", dir.display());
+        } else {
+            panic!(
+                "本机未发现任何可用的 turing-sdk 目录 —— 但 WB_TURING_LIVE_TEST=1 的                 机器上必然装了客户端。发现逻辑又坏了（这正是所有者报的缺陷）。                 已扫描: {:?}",
+                CLIENT_DIR_NAMES
+            );
+        }
+        let st = DeviceTokenState::new("test-service-token".into());
+        match st.fetch(1).await {
+            Ok(tokens) => {
+                assert!(!tokens.is_empty(), "应至少返回 1 个 token");
+                assert!(
+                    tokens[0].starts_with("v3:"),
+                    "token 形态应为 v3:，实得 {:?}",
+                    &tokens[0][..tokens[0].len().min(24)]
+                );
+            }
+            // ★ 失败必须**红**，不许静默跳过 —— 那正是所有者报的缺陷本身。
+            Err(e) => panic!("设备 token 生成失败（正是所有者报的缺陷）：{e}"),
+        }
+    }
 }

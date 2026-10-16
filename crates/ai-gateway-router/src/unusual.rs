@@ -1,6 +1,15 @@
-//! unusual.rs 上游 3012「unusual activity」的**产品级熔断**：识别出来就别再换号了。
+//! unusual.rs 上游 3012「unusual activity」的 **(产品, 区域) 级熔断**：识别出来就别再换号了。
 //!
-//! 不同产品的熔断状态严格隔离：ZCode 的 3012 不得阻断 Qoder/WorkBuddy。
+//! # 隔离维度是两层，缺一不可
+//!
+//! * **产品** —— ZCode 的 3012 不得阻断 Qoder/WorkBuddy；
+//! * **区域** —— 国服与国际版打的是**两个完全不同的上游**（`codebuddy.cn` vs
+//!   `workbuddy.ai`），一侧风控推不出另一侧也在风控。
+//!
+//! ★ **2026-10-16 补上区域这一层**：此前只按产品做键，而国服账号与国际版账号
+//! **同属 `workbuddy` 产品** ⇒ 一个国际版账号吃到 3012 就把国服账号一起熔断
+//! 90 秒、一个请求都不发。所有者现场描述为「**国际服路由到然后直接报错，
+//! 不轮换国内账号，直接死掉**」。见 `UnusualBreakers::for_scope` 与 D18。
 //!
 //! 逐字移植 Go 侧 `internal/server/unusual.go`（339 行），常量、判据、状态机
 //! 与文案一字不改。
@@ -244,17 +253,49 @@ impl UnusualBreakers {
         }
     }
 
-    /// 取某产品的熔断器（不存在则创建）。`product` 为空时归一成 `"workbuddy"`。
-    pub fn for_product(&self, product: &str) -> UnusualBreaker {
+    /// 取某产品**某区域**的熔断器（不存在则创建）。`product` 为空时归一成 `"workbuddy"`。
+    ///
+    /// # ★ 2026-10-16：为什么键里必须带区域
+    ///
+    /// 原先只按 **产品** 做键，而**国服账号与国际版账号同属** `workbuddy` 产品。
+    /// 后果是所有者现场报的那个形状：
+    ///
+    /// ```text
+    /// 国际版账号吃到 3012  ⇒ 整个 workbuddy 熔断 90 秒
+    ///                      ⇒ 国服账号也一起被挡，一个请求都不发
+    /// ```
+    ///
+    /// 用所有者原话就是「**不轮换国内账号，直接死掉**」。
+    ///
+    /// 而国服与国际版打的是**两个完全不同的上游**（`codebuddy.cn` vs
+    /// `workbuddy.ai`）：一侧的风控根本推不出另一侧也在风控。把两者绑在一个
+    /// 熔断器上，等于用一次国际版抖动去停掉主力国服通道。
+    ///
+    /// 本文件的**空流风暴熔断**（`forward.rs` 里 `empty_stream.blocked`）
+    /// 一直就是按 `(产品, 区域)` 做键的 —— 这条 3012 只是没跟上，现在对齐。
+    ///
+    /// ⚠ 产品维度**必须保留**：`zcode` 的风控不得阻断 `qoder`/`workbuddy`
+    /// （见 `unusual_activity_isolated_by_product`，那是另一条现场回归）。
+    pub fn for_scope(&self, product: &str, region: &str) -> UnusualBreaker {
         let product = if product.is_empty() {
             DEFAULT_PRODUCT
         } else {
             product
         };
+        // 区域为空（非 WorkBuddy 产品）也要键进同一个确定串，不能退化成「只按产品」，
+        // 否则 qoder/zcode 这类无区域账号会与 workbuddy 的空区域互相串味。
+        let key = format!("{product}\u{1}{region}");
         let mut map = lock_or_recover(&self.by_product);
-        map.entry(product.to_string())
-            .or_insert_with(UnusualBreaker::new)
-            .clone()
+        map.entry(key).or_insert_with(UnusualBreaker::new).clone()
+    }
+    ///
+    /// 取某产品的熔断器，**区域不限**。
+    ///
+    /// ⚠ 生产路径（`forward.rs` 的 chat 轮转）**不要**用这个 —— 它会把国服与
+    /// 国际版重新绑到同一个熔断器上（见 [`Self::for_scope`] 的说明）。
+    /// 保留它是为了便捷方法与既有单测的语义不变。
+    pub fn for_product(&self, product: &str) -> UnusualBreaker {
+        self.for_scope(product, "")
     }
 
     /// 默认委托 [`Self::for_product`]`("workbuddy")`，与 Go 的便捷方法同义。
@@ -576,6 +617,115 @@ mod tests {
             w.tripped().is_none(),
             "WorkBuddy 不应被 Qoder 的 3012 熔断影响"
         );
+    }
+
+    /// ★ 2026-10-16 所有者现场回归：**同一产品的不同区域必须互不熔断**。
+    ///
+    /// 缺陷形状（原话「国际服路由到然后直接报错，**不轮换国内账号**，直接死掉」）：
+    /// 9012 熔断原先只按产品做键，而国服与国际版账号**同属 `workbuddy`**
+    /// ⇒ 一个国际版账号吃到 3012，国服账号也被一起挡住 90 秒、一个请求都不发。
+    ///
+    /// 而两侧打的是**两个完全不同的上游**（`codebuddy.cn` vs `workbuddy.ai`），
+    /// 一侧风控推不出另一侧也在风控。
+    #[test]
+    fn unusual_activity_isolated_by_region_within_a_product() {
+        let b = UnusualBreakers::new();
+        let cn = b.for_scope("workbuddy", "cn");
+        let intl = b.for_scope("workbuddy", "intl");
+
+        intl.note3012();
+        assert!(intl.tripped().is_some(), "国际版命中后自身应熔断");
+        assert!(
+            cn.tripped().is_none(),
+            "国际版风控**不得**把国服账号一起挡住——那正是「不轮换国内账号」这个现场"
+        );
+
+        cn.note3012();
+        assert!(cn.tripped().is_some(), "国服自身命中后也该熔断");
+        // 反向：国服也不影响国际版（不能只修一个方向）。
+        b.reset();
+        b.for_scope("workbuddy", "cn").note3012();
+        assert!(
+            b.for_scope("workbuddy", "intl").tripped().is_none(),
+            "国服风控不得反向影响国际版"
+        );
+    }
+
+    /// 同产品**同区域**内仍必须共享 —— 否则换号就能绕过熔断，本模块直接失效。
+    #[test]
+    fn for_scope_shares_state_within_one_region() {
+        let b = UnusualBreakers::new();
+        b.for_scope("workbuddy", "intl").note3012();
+        assert!(
+            b.for_scope("workbuddy", "intl").tripped().is_some(),
+            "同一(产品,区域)必须拿到同一个熔断器"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 2026-10-16 现场缺陷：被封账号的 11140 文案含 unusual activity
+    //
+    // 上游对**被限制的账号**回 403 code=11140，其 displayMsg.en 是
+    // "Your account has been restricted due to unusual activity"。
+    //
+    // 本模块判据做全文子串匹配 "unusual activity" => 命中 => 被当成 3012。
+    // 而两者处置完全相反（3012 不罚账号且熔断区域；11140 要冷却该号）。
+    //
+    // 修复：forward.rs 用 !is_account_unusable（分类结果）把 11140 挡在
+    // 3012 分支之外。本组测试钉死三条，缺一修复就会静默失效。
+    // ---------------------------------------------------------------------
+
+    /// 上游对**被封账号**回的 11140 原文（2026-10-16 实测，逐字）。
+    const BANNED_11140_BODY: &str = "{\"code\":11140,\"msg\":\"request illegal\",\"requestId\":\"x\",\"displayMsg\":{\"en\":\"Your account has been restricted due to unusual activity\",\"zh\":\"账号存在异常行为，已被限制使用\"},\"displayTips\":{\"en\":\"We detected unusual activity on this account. Submit feedback to appeal this restriction\"}}";
+
+    /// 真实的 3012 原文（405 载体），用于对照。
+    const REAL_3012_BODY: &str = "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\"}";
+
+    /// (1) 封禁文案**确实**会被本模块的 3012 判据命中（这是缺陷的前提）。
+    ///
+    /// 若哪天上游改了文案、这条开始失败 —— 那是好消息（误判不再可能），
+    /// 届时可简化 forward.rs 那个条件，但不要直接删掉这条测试。
+    #[test]
+    fn banned_account_body_does_match_the_3012_markers() {
+        assert!(
+            is_unusual_activity(403, BANNED_11140_BODY),
+            "封禁文案含 unusual activity，本判据必然命中——故调用侧必须先用 is_account_unusable 挡住它"
+        );
+    }
+
+    /// (2) 它同时被分类器归为 AccountUnusable（账号侧），而不是 Client。
+    #[test]
+    fn banned_account_body_classifies_as_account_unusable() {
+        let k = crate::upstream::classify::classify(403, BANNED_11140_BODY);
+        assert_eq!(
+            k,
+            crate::upstream::classify::ErrKind::AccountUnusable,
+            "11140 必须归为账号侧（否则 apply_error_policy 只换号不罚、坏号永不冷却）"
+        );
+    }
+
+    /// (3) 真实 3012 归为 Client（不是 AccountUnusable）—— 两条路径必须分得开。
+    ///
+    /// 若这条失败，说明区分失效：真 3012 会被错误地「冷却单个账号 + 换号」，
+    /// 那正是要避免的风控放大。
+    #[test]
+    fn real_3012_is_not_account_unusable() {
+        let k = crate::upstream::classify::classify(405, REAL_3012_BODY);
+        assert_ne!(
+            k,
+            crate::upstream::classify::ErrKind::AccountUnusable,
+            "真 3012 不得被当成账号侧错误"
+        );
+        assert!(is_unusual_activity(405, REAL_3012_BODY), "真 3012 必须被风控判据命中");
+    }
+
+    /// 产品维度不能因为加了区域而丢：zcode 仍不得影响 workbuddy。
+    #[test]
+    fn for_scope_keeps_product_isolation() {
+        let b = UnusualBreakers::new();
+        b.for_scope("zcode", "cn").note3012();
+        assert!(b.for_scope("workbuddy", "cn").tripped().is_none());
+        assert!(b.for_scope("qoder", "cn").tripped().is_none());
     }
 
     /// 同一产品必须拿到**同一个**熔断器（产品内跨账号共享）。

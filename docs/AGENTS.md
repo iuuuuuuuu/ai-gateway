@@ -327,8 +327,9 @@ if ($err.Count) { $err | Select-Object -First 3 | ForEach-Object { "行 $($_.Ext
 | 目标 | 最新已知 | 口径来源 |
 |---|---|---|
 | `cargo test --workspace` | **3081 passed / 0 failed / 7 ignored**（15 suite） | 1.0.36（2026-10-08/09，`PROJECT-STATE.md` **§9.11**「1.0.36 的构建与真机实测」的「测试基线」行，:136） |
-| `cargo test --workspace` → router | **1780 passed / 0 failed / 1 ignored** | 1.0.46（2026-10-14，§9.21；1.0.45 为 1776，净增 4） |
+| `cargo test --workspace` → router | **1798 passed / 0 failed / 1 ignored** | 2026-10-16 本轮（版本仍 1.0.46，未 bump；1.0.46 为 1780，净增 18 = 会话头族 5 + 国际版身份头 4 + 熔断区域隔离 3 + 会话头族解析 1 + **11140 误判回归 5**（见 D20）；另新增线级套件 `tests/ab_conversation_headers.rs` 3 条，**不在 lib 计数内**） |
 | `cargo test --workspace` → core | **1301 passed / 0 failed / 4 ignored** | 1.0.46（2026-10-14，§9.21） |
+| `cargo test --workspace` → src-tauri | **28 passed / 0 failed / 0 ignored** | 2026-10-16 本轮（1.0.46 基线为 17；新增 7 条设备 token 发现门禁 + 4 条既有） |
 | `cargo test -p ai-gateway-router` | 1685 / 0 / 1 | **1.0.34 旧口径**，已被 1780 取代 |
 | `cargo check -p ai-gateway-router --lib` / `--bin gateway` | EXIT 0，**0 warnings** | 1.0.34 |
 | `cargo check --workspace --all-targets --profile test` | EXIT 0 | 与 CI 同款 |

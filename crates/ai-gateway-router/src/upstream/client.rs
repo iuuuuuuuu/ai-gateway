@@ -448,13 +448,22 @@ impl Client {
     ///
     /// 非 2xx 时**不返回错误**：调用方需要 `classify(status, body)` 来判定
     /// 冷却策略，因此状态与响应体都要交出去。只有传输层失败才是 `Err`。
-    pub async fn chat_stream(&self, a: &Auth, body: &[u8]) -> Result<ChatOutcome> {
+    /// - `conversation_seed`：会话粘性键，用来**确定性派生** `X-Conversation-ID`。
+    ///   空串 = 无会话（一次性探针），此时退回随机 UUID。
+    ///   ⚠ 重试换号时必须传**同一个** seed —— 上游要求一次会话全程同一个会话 id，
+    ///   每轮新造会让它看成「一串互不相干的单轮请求」（见 `headers::conversation_uuid`）。
+    pub async fn chat_stream(
+        &self,
+        a: &Auth,
+        body: &[u8],
+        conversation_seed: &str,
+    ) -> Result<ChatOutcome> {
         let url = format!("{}/v2/chat/completions", self.chat_base(a));
         let prepared = self.prepare_body(body, a);
         let mut req = self
             .chat
             .post(&url)
-            .headers(headers::chat_headers(a))
+            .headers(headers::chat_headers(a, conversation_seed))
             .body(prepared);
         // 设备 token：只对**国际版**发（对应 Go `c.attachDeviceToken(req, a)`）。
         // 拿不到就静默跳过，请求照常发出 —— 见本函数上方那段说明。

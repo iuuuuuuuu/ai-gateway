@@ -1099,10 +1099,22 @@ pub async fn forward_chat(
         // 熔断期就是要**一个请求都不发**；用户看到的是一条说清原因（与账号无关、
         // 多久恢复）的错误，而不是一次注定失败的尝试。
         //
-        // 按**选中账号所属产品**隔离：ZCode 的风控不能阻断 Qoder/WorkBuddy；
-        // 同产品内仍共享，避免换号继续放大同一上游风控。
+        // 按 **(产品, 区域)** 隔离，两层都必要：
+        //
+        //   1. **产品** —— ZCode 的风控不能阻断 Qoder/WorkBuddy；
+        //   2. **区域** —— 国服与国际版打的是两个完全不同的上游
+        //      （`codebuddy.cn` vs `workbuddy.ai`），一侧风控推不出另一侧也在风控。
+        //
+        // ★ 2026-10-16 补上第 2 层：此前只按产品做键，而国服账号与国际版账号
+        // **同属 `workbuddy` 产品** ⇒ 一个国际版账号吃到 3012 就把国服账号
+        // 一起熔断 90 秒，一个请求都不发。所有者现场描述为
+        // 「**国际服路由到然后直接报错，不轮换国内账号，直接死掉**」。
+        //
+        // 商品内**同区域**仍共享：避免换号继续放大同一上游风控（这条不能丢）。
         {
-            let breaker = ctx.unusual.for_product(acct.product_of());
+            let breaker = ctx
+                .unusual
+                .for_scope(acct.product_of(), acct.region().as_str());
             if let Some(wait) = breaker.tripped() {
                 crate::logline!(
                     "chat: {} 3012 熔断中（还需 {:?}），不发请求（本请求已试 {} 个账号）",
@@ -1226,7 +1238,9 @@ pub async fn forward_chat(
         let outcome = {
             let r = match product_up {
                 Some(up) => up.chat_stream(&acct, body).await,
-                None => ctx.client.chat_stream(&acct, body).await,
+                // `sess_key` 在整轮「换号重试」里**保持不变**，正是会话头族要的语义
+                //（同一会话、可换账号，但会话 id 不换）。
+                None => ctx.client.chat_stream(&acct, body, sess_key).await,
             };
             match r {
                 Ok(o) => o,
@@ -1329,6 +1343,53 @@ pub async fn forward_chat(
                     .to_string(),
                 );
 
+                // ── ★★ 账号被上游限制（403 code=11140）必须排在 3012 判定之前 ──
+                //
+                // # 为什么必须排在 3012 前面（2026-10-16 现场缺陷）
+                //
+                // 上游对**被限制的账号**回的 11140 里带 `displayMsg`，其英文原文恰恰
+                // 含 "unusual activity"：
+                //
+                // ```text
+                // HTTP 403 {"code":11140,"msg":"request illegal",
+                //   "displayMsg":{"en":"Your account has been restricted due to unusual activity",
+                //                "zh":"账号存在异常行为，已被限制使用"},
+                //   "actions":["EDIT_INPUT","SUBMIT_FEEDBACK"]}
+                // ```
+                //
+                // 而 [`crate::unusual::is_unusual_activity`] 的判据之一是**全文子串**匹配
+                // `"unusual activity"` ⇒ 它**先命中**，把「账号被封」误判成「请求级瞬时
+                // 风控」，于是两件本来相反的事被走了同一条路：
+                //
+                //   1. 3012 分支**刻意不罚账号**（见下方注释）⇒ 坏号永不冷却 ⇒
+                //      每轮换号都被重新选中；
+                //   2. 且它**熔断整个 (产品, 区域)** 90 秒 ⇒ 同区好号被一起挡在门外。
+                //
+                // 现场形状：12 个国际版账号里 11 个正常（直连实测：4 成功 + 7 限流），
+                // **只有 1 个被封**，却让整个国际版「发送就直接死」。
+                //
+                // 两者的正确处置**完全相反**：
+                //
+                // | | 11140 账号被封 | 3012 请求级风控 |
+                // |---|---|---|
+                // | 归属 | **账号侧** | 请求 / 出口侧 |
+                // | 处置 | 软冷却该号 + 换号 | 熔断区域 + 不罚账号 |
+                // | 换号有用吗 | **有用**（换号即好） | 无用（换号加重风控） |
+                //
+                // ⇒ 先判 `ErrKind::AccountUnusable`（分类器已把 11140 归到这里，见
+                // `classify.rs` 第 12 条），命中就**不**走 3012 分支，落到下面的通用
+                // `apply_error_policy` 做账号级软冷却、再统一 `continue` 换号。
+                //
+                // ⚠ 不重新解析报文：用分类结果判定，避免与 `classify` 出现第二套口径。
+                let is_account_unusable = kind == classify::ErrKind::AccountUnusable;
+                if is_account_unusable {
+                    crate::logline!(
+                        "chat uid={} product={}: 上游 11140（账号被限制），软冷却该号后换下一个",
+                        acct.uid,
+                        acct.product_of()
+                    );
+                }
+                let hit_unusual = should_trip_unusual_breaker(kind, status, &resp_body);
                 // ── 3012「unusual activity」：请求级瞬时风控，按产品熔断 ──
                 //
                 // ★★ 必须早于下面的通用 `apply_error_policy`（Go `forward.go:689-716`）。
@@ -1342,8 +1403,15 @@ pub async fn forward_chat(
                 //
                 // ★ 刻意**不罚账号**：3012 与账号无关（已在官方客户端复现）。罚号会让
                 // 好账号被冷却，用户解封后还会发现号被自己人停了。
-                if crate::unusual::is_unusual_activity(status, &resp_body) {
-                    let breaker = ctx.unusual.for_product(acct.product_of());
+                //
+                // ⚠ `!is_account_unusable` 是关键：账号被封的 11140 文案里也含
+                // "unusual activity"，不加这个条件就会把它误判成 3012（见上方长注释）。
+                if hit_unusual {
+                    // 键必须与上面 `tripped` 处**逐字一致**（产品+区域），否则
+                    // 记的与查的不是同一个熔断器 —— 熔断会永远不生效。
+                    let breaker = ctx
+                        .unusual
+                        .for_scope(acct.product_of(), acct.region().as_str());
                     breaker.note3012();
                     let wait = breaker.tripped().unwrap_or_default();
                     crate::logline!(
@@ -1596,7 +1664,9 @@ pub async fn forward_chat(
                 // 为什么成功要清（逐字）：它证明上游此刻不再风控。继续熔断会让用户
                 // 在一次短暂抖动之后仍然被**我们自己的网关**挡在门外 —— 那是我们
                 // 制造的故障，而 3012 本身是上游临时的、会自己过期的限制。
-                ctx.unusual.for_product(acct.product_of()).note_success();
+                ctx.unusual
+                    .for_scope(acct.product_of(), acct.region().as_str())
+                    .note_success();
                 // 粘性跟随最终成功号。
                 if !sess_key.is_empty() {
                     if let Some(s) = ctx.session {
@@ -2021,6 +2091,48 @@ fn request_side_failure(
 /// - `SessionDead` → 永久禁用（需人工重登）
 /// - `Server` → 喂熔断计数（指数退避）
 /// - 其余（`Client` / `None`）→ 只换号不罚（防雪崩），不喂熔断
+/// 判定这次上游响应是否应当触发 3012 熔断。
+///
+/// # ★★ 为什么必须把「账号被封」排除在外（2026-10-16 现场缺陷）
+///
+/// 上游对**被限制的账号**回的 403 code=11140 里带 `displayMsg`，英文原文恰好含
+/// `unusual activity`：
+///
+/// ```text
+/// HTTP 403 {"code":11140,"msg":"request illegal",
+///   "displayMsg":{"en":"Your account has been restricted due to unusual activity",
+///                "zh":"账号存在异常行为，已被限制使用"},
+///   "actions":["EDIT_INPUT","SUBMIT_FEEDBACK"]}
+/// ```
+///
+/// 而 [`crate::unusual::is_unusual_activity`] 的判据之一是**全文子串**匹配
+/// `unusual activity` ⇒ 会把「账号被封」误判成「请求级瞬时风控」。
+///
+/// 两者的正确处置**完全相反**：
+///
+/// | | 11140 账号被封 | 3012 请求级风控 |
+/// |---|---|---|
+/// | 归属 | **账号侧** | 请求 / 出口侧 |
+/// | 处置 | 软冷却该号 + 换号 | 熔断区域 + 不罚账号 |
+/// | 换号有用吗 | **有用**（换号即好） | 无用（换号加重风控） |
+///
+/// 误判的后果（实测现场）：一个被封账号让**整个 (产品, 区域) 被熔断 90 秒**，
+/// 而同区 11 个好号一起被挡在门外 —— 用户「发送就直接死」。
+///
+/// # 为什么单独抽成函数
+///
+/// 原先是内联在轮转循环里的一个 `if`，**测试够不着**：把条件改回
+/// `is_unusual_activity(...)`（即缺陷版本）时全量单测仍然全绿 —— 那是**假绿门禁**。
+/// 抽出来之后由 `unusual_breaker_excludes_banned_account` 直接钉住，
+/// 改回缺陷版本会立刻变红。
+pub fn should_trip_unusual_breaker(kind: classify::ErrKind, status: u16, body: &str) -> bool {
+    // 账号侧错误（11140 被封 / 12153 等）优先：它不是请求级风控。
+    if kind == classify::ErrKind::AccountUnusable {
+        return false;
+    }
+    crate::unusual::is_unusual_activity(status, body)
+}
+
 pub fn apply_error_policy(
     pool: &mut Pool,
     uid: &str,
@@ -3105,6 +3217,46 @@ mod tests {
         assert!(
             p.lock().unwrap().pick_for_model("glm-4", &[]).is_some(),
             "模型冷却不应触发账号熔断"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // ★★ 2026-10-16 现场缺陷：被封账号的 11140 被误判成 3012
+    // ---------------------------------------------------------------------
+
+    /// 上游对**被封账号**回的 11140 原文（2026-10-16 实测，逐字）。
+    const BANNED_11140: &str = "{\"code\":11140,\"msg\":\"request illegal\",\"displayMsg\":{\"en\":\"Your account has been restricted due to unusual activity\",\"zh\":\"账号存在异常行为，已被限制使用\"},\"actions\":[\"EDIT_INPUT\",\"SUBMIT_FEEDBACK\"]}";
+
+    /// 真实 3012 原文（405 载体）。
+    const REAL_3012: &str =
+        "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\"}";
+
+    /// ★ 核心回归：**账号被封（11140）绝不能触发 3012 熔断**。
+    ///
+    /// 这是所有者现场「发送就直接死」的直接成因：一个被封账号把整个
+    /// (产品, 区域) 熔断 90 秒，同区好号一起被挡。
+    ///
+    /// ⚠ 把本函数里的 `kind == AccountUnusable` 判断删掉，这条必须变红 ——
+    /// 那是本门禁存在的唯一理由。
+    #[test]
+    fn unusual_breaker_excludes_banned_account() {
+        let kind = classify::classify(403, BANNED_11140);
+        assert_eq!(kind, classify::ErrKind::AccountUnusable, "前置：11140 归账号侧");
+        assert!(
+            !should_trip_unusual_breaker(kind, 403, BANNED_11140),
+            "账号被封的 11140 文案里含 unusual activity，但**绝不能**触发 3012 熔断\
+             ——否则一个坏号会熔断整个区域，同区好号全被挡（所有者现场）"
+        );
+    }
+
+    /// 反向保证：**真实 3012 必须照旧触发熔断**（别把修复做成「谁都不熔断」）。
+    #[test]
+    fn unusual_breaker_still_trips_for_real_3012() {
+        let kind = classify::classify(405, REAL_3012);
+        assert_ne!(kind, classify::ErrKind::AccountUnusable, "前置：真 3012 不是账号侧");
+        assert!(
+            should_trip_unusual_breaker(kind, 405, REAL_3012),
+            "真 3012 必须照旧熔断（这条防「修过头」把风控保护一起关掉）"
         );
     }
 
