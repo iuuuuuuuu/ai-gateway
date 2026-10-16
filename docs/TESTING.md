@@ -4,7 +4,6 @@
 > 最后核对：2026-10-15 ｜ 分支 `main` ｜ 版本 **1.0.46** ｜ 核对时 HEAD `dc729e9`
 >
 > **什么时候翻它**：跑门禁、判断「这个绿是不是真的」、写新测试/新探针、怀疑基线数字过时。
-> **什么时候别翻它**：想查「现在到哪了 / 有哪些未验证面」→ [../PROJECT-STATE.md](../PROJECT-STATE.md)；
 > 想知道「当初为什么这么选」→ [DECISIONS.md](DECISIONS.md)；发版与打包步骤 → [RUNBOOK.md](RUNBOOK.md)。
 
 ---
@@ -36,13 +35,13 @@ cargo check --workspace --all-targets --profile test    # 编译门禁（与 CI 
 
 | 命令 | 最新已知 | 口径来源 |
 |---|---|---|
-| `cargo test --workspace`（15 个 test 块累加） | **3081 passed / 0 failed / 7 ignored** | 1.0.36（`PROJECT-STATE.md` §9.11「1.0.36 的构建与真机实测」里的「测试基线」，2026-10-08/10-09） |
-| `cargo test --workspace` → `ai-gateway-router` 分项 | **1780 passed / 0 failed / 1 ignored** | 1.0.46（2026-10-14，`PROJECT-STATE.md` §9.21；1.0.45 为 1776，净增 4） |
-| `cargo test --workspace` → `ai-gateway-core` 分项 | **1301 passed / 0 failed / 4 ignored** | 1.0.46（2026-10-14，`PROJECT-STATE.md` §9.21） |
+| `cargo test --workspace`（15 个 test 块累加） | **3081 passed / 0 failed / 7 ignored** | 1.0.36（2026-10-08/10-09） |
+| `cargo test --workspace` → `ai-gateway-router` 分项 | **1780 passed / 0 failed / 1 ignored** | 1.0.46（2026-10-14；1.0.45 为 1776，净增 4） |
+| `cargo test --workspace` → `ai-gateway-core` 分项 | **1301 passed / 0 failed / 4 ignored** | 1.0.46（2026-10-14） |
 | `cargo test -p ai-gateway-router --lib` | **1685 passed / 0 failed / 1 ignored** | **1.0.34 旧口径，已被 1780 取代**；证据 `uitest\ut-1034-sse.log` |
 | `cargo test -p ai-gateway-core --lib` | **1285 passed / 0 failed / 4 ignored** | **1.0.34 旧口径**（与 1.0.31/1.0.32/1.0.33 同值），已被 1301 取代 |
-| `cargo test -p ai-gateway-server` | **28 passed / 0 failed** | **1.0.20 口径**（`PROJECT-STATE.md` §三；最初记录见 `.github/RELEASE_NOTES_1.0.16.md`） |
-| `cargo check -p ai-gateway-router --lib` / `--bin gateway` | EXIT 0，**0 warnings** | 1.0.34（`PROJECT-STATE.md` §三） |
+| `cargo test -p ai-gateway-server` | **28 passed / 0 failed** | **1.0.20 口径**（最初记录见 1.0.16 的发布说明） |
+| `cargo check -p ai-gateway-router --lib` / `--bin gateway` | EXIT 0，**0 warnings** | 1.0.34 |
 | `cargo check --workspace --all-targets --profile test` | EXIT 0 | 与 CI 同款（`.github/workflows/ci.yml`） |
 
 ★ **1.0.46 的 `cargo test --workspace` 总计数没有单独记录**（§9.21 只记了 core / router 两个分项）
@@ -64,7 +63,7 @@ ai-gateway-server(ai-gateway, main) / Doc-tests ×3
 
 ★ **`-p ai-gateway-router` 与 `-p ai-gateway-router --lib` 不相等**：裸 `-p` 会额外带上
 `src/bin/{gateway,probe_state,wb2g-ref}.rs` 三个 bin 目标与 doc-tests。
-`1685` 这个数是 **`--lib`** 口径（`.github/RELEASE_NOTES_1.0.34.md` §4.1 与 `ci.yml` 都写 `--lib`）。
+`1685` 这个数是 **`--lib`** 口径（`ci.yml` 写的就是 `--lib`）。
 **报数时把完整命令行一起写下来**，否则下一个人复现不出同一个数。
 
 ### 0.3 基线数字的交叉核对（2026-10-15，我逐个解析了日志）
@@ -82,8 +81,7 @@ ai-gateway-server(ai-gateway, main) / Doc-tests ×3
 | `ut-1031-core-final.log` | 1285 / 0 / 4（core） | 1.0.31 |
 | `ut-1031-router-final.log` | 1669 / 0 / 1（router） | 1.0.31 |
 
-这套读数与 `PROJECT-STATE.md` §三 的版本序列（1.0.31 → 1.0.34 的 3029/3038/3041/3045）
-**逐条吻合** ⇒ §三 表里的 1.0.34 口径可信。**但它已经过期**（仓库在 1.0.46），见 §0.2。
+这套读数与 §0.2 表里的 1.0.34 口径**逐条吻合**。**但它已经过期**（仓库在 1.0.46），见 §0.2。
 
 ⚠ **这些日志是 UTF-16LE**（PowerShell `*>` 重定向的默认结果）。
 用 `Get-Content` 读会正常，用 Node `readFileSync(p,'utf8')` 读**全是 NUL 夹杂** —— 解析前先判 BOM。
@@ -111,7 +109,7 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 > 详见 [AGENTS.md](AGENTS.md) §2.3。
 ⚠ **2026-10-15 复测：缓存现在不是空的**（`%USERPROFILE%\.cargo\registry\cache\` 下两个 source 目录
 各有内容，`aes-0.8.4.crate` 也在）。**但规矩保留** —— 本仓库的权威口径（根 `AGENTS.md`、
-`docs/AGENTS.md` §2.3、`PROJECT-STATE.md` §三）都仍写着禁令，且 CI 与别人的机器上没有这份缓存。
+`docs/AGENTS.md` §2.3）都仍写着禁令，且 CI 与别人的机器上没有这份缓存。
 镜像走 `wt-port\.cargo\config.toml` 的 `sparse+https://rsproxy.cn/index/`；
 ⚠ **该文件被 `.gitignore` 排除、不入库** ⇒ 新 clone 的机器拿不到镜像，会遇到
 `SSL connect error (schannel: failed to receive handshake)`。
@@ -268,7 +266,7 @@ $want = (Get-Content crates\ai-gateway-core\embedded\gateway.exe.sha256 -Raw).Tr
 
 ### 3.2 ★★ 「单线程会死锁」这条要求的真实来源
 
-`PROJECT-STATE.md` §四·6 写的是：**假上游用 `ThreadingHTTPServer` + `daemon_threads`；单线程会让网关死锁**
+既有结论：**假上游用 `ThreadingHTTPServer` + `daemon_threads`；单线程会让网关死锁**
 —— 那是**外部假上游进程（形态 B）**的约定。
 
 形态 A 的 mock **故意是单线程的**（`MockUpstream::start()` 里一个 `std::thread::spawn` +
@@ -288,7 +286,7 @@ loop { let Some(req) = read_request(&mut s) else { break }; … }
 （该文件就是这么写的），或者给 mock 加 per-connection 线程。**
 
 > 这是一个**「测试装置自身伪装成产品缺陷」**的典型形状。同型问题还有两处，见
-> `PROJECT-STATE.md` §四·8（CDP 注入落进 `about:blank` 上下文；期望值写死成日历常量）。
+> （CDP 注入落进 `about:blank` 上下文；期望值写死成日历常量）。
 
 ### 3.3 控制协议与观测协议（形态 A）
 
@@ -365,7 +363,7 @@ socket 硬断 / 流中发错误帧 / 静默挂住 / 空流 —— 6/6 按设计�
 > ⚠ **2026-10-15 更正**：本节此前照抄根 `AGENTS.md` 写 `:43120`。实测（可复现）：
 > `:7864` → PID 13884 = `gateway-509bdb-*.exe`；`:3080` → PID 38744 = `node.exe`（DSH GUI）；
 > `:43120` → **0 条连接，未监听**。⇒ 拿 `43120` 当判据会**误报「业主服务掉了」**，
-> 进而触发「立即停止并报告」的假警报。根 `AGENTS.md` 与 `PROJECT-STATE.md` §六 已同步为 `:3080`。
+> 进而触发「立即停止并报告」的假警报。根 `AGENTS.md` 已同步为 `:3080`。
 > **端口会变，判据是现场实测。**
 
 ```powershell
@@ -577,7 +575,7 @@ if ($code -ne 0) { throw "cargo check 失败 EXIT=$code，见 $log" }
 | `uitest\` | 实测证据日志（当前 22 个 `.log`，UTF-16LE） | 未跟踪；`.gitignore` 的 `*.log` 覆盖 |
 | `test-bin\` | 隔离实例、`DELIVERY-*.md` 交付说明、侦察报告、探针脚本 | `.gitignore:109 /test-bin/` |
 | `dist-single\` / `dist-bin\` | 单文件产物 | `.gitignore` |
-| `.github\RELEASE_NOTES_*.md` | 1.0.0 → 1.0.46 的发版说明 | **入库**（与 `test-bin\DELIVERY-*.md` 分工不同） |
+
 
 **不回库的理由**：① 体积（每个隔离实例都有一份 12MB 量级的网关副本）；
 ② **泄漏面**（侦察报告与探针脚本可能夹带真实账号标识）。

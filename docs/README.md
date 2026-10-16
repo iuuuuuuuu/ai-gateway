@@ -13,7 +13,6 @@
 | 写测试 / 跑验收 / 怀疑门禁是不是假的 | [TESTING.md](TESTING.md) |
 | 改用户能看见的行为之前对齐语义 | [FEATURES.md](FEATURES.md) |
 | 看用户视角的功能导览与安装说明 | [../README.md](../README.md) |
-| 查当前进展、测试基线、历史交付证据 | [../PROJECT-STATE.md](../PROJECT-STATE.md) |
 | 查硬约束（Shell / 组件 / 构建签名 / 验证纪律） | [../AGENTS.md](../AGENTS.md) —— 仓库根，与 [AGENTS.md](AGENTS.md) 并存 |
 | 纯部署版（server 单文件）怎么发 | [SERVER-DEPLOY-1.0.46.md](SERVER-DEPLOY-1.0.46.md) |
 | 查「实现搬过来了、接线丢了」这类 P0 | [GO-STARTUP-WIRING-AUDIT.md](GO-STARTUP-WIRING-AUDIT.md) |
@@ -30,10 +29,8 @@
 | [SERVER-DEPLOY-1.0.46.md](SERVER-DEPLOY-1.0.46.md) | 1.0.46 纯部署服务端的交付物、校验与部署步骤 | 该产物重新打包时 |
 | [GO-STARTUP-WIRING-AUDIT.md](GO-STARTUP-WIRING-AUDIT.md) | Go→Rust 迁移期的启动接线穷尽对照（**历史审计，只读**） | 不再更新；结论过时在 DECISIONS.md 翻案 |
 
-> 仓库根另有三份**长期存在**的文档，不属于 `docs/` 但同样重要：
-> `README.md`（用户视角导览）、`AGENTS.md`（编码契约硬约束）、
-> `PROJECT-STATE.md`（接手用持久状态：当前进展 / 测试基线 / 陷阱 / 未验证面）。
-> 本目录的文档与它们**分工**：本目录写「怎么干活」，`PROJECT-STATE.md` 写「现在到哪了」。
+> 仓库根另有两份**长期存在**的文档，不属于 `docs/` 但同样重要：
+> `README.md`（用户视角导览）、`AGENTS.md`（编码契约硬约束）。
 
 ## 写文档的约定
 

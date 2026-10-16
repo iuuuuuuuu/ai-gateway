@@ -52,13 +52,13 @@ Token 统计与网关的接口契约可直接查阅实现本身：
 
 - 一条命令（**必须显式带上 cargo 的 PATH，见下**）：
   ```powershell
-  $env:Path = "C:\Users\iuuuuuuuu\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin;$env:Path"
-  & ".\scripts\build-signed.ps1" -KeyFile "D:\WishProject\WorkbuddySwitchAPi\keys\ai-gateway-updater.key" `
-                                -PasswordFile "D:\WishProject\WorkbuddySwitchAPi\keys\ai-gateway-updater.password"
+  $env:Path = "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin;$env:Path"
+  & ".\scripts\build-signed.ps1" -KeyFile "<keys 目录>\ai-gateway-updater.key" `
+                                -PasswordFile "<keys 目录>\ai-gateway-updater.password"
   ```
   仅校验密钥不构建：加 `-CheckOnly`
-- 签名私钥：`D:\WishProject\WorkbuddySwitchAPi\keys\ai-gateway-updater.key`（minisign 私钥）
-- 私钥口令：`D:\WishProject\WorkbuddySwitchAPi\keys\ai-gateway-updater.password`
+- 签名私钥：`ai-gateway-updater.key`（minisign 私钥，位于仓库根**同级**的 `keys\` 目录）
+- 私钥口令：`ai-gateway-updater.password`（同目录）
 - 两者在 **`wt-port` 之外、`WorkbuddySwitchAPi` 之内**，`.gitignore` 已排除 `*.key`；
   **本仓库是公开仓库，严禁把口令写入任何被 git 跟踪的文件。**
   （脚本默认找 `%USERPROFILE%\.wb-switch\` 与 `%USERPROFILE%\.ai-gateway\`，
@@ -77,7 +77,7 @@ Token 统计与网关的接口契约可直接查阅实现本身：
    而那个报错**完全不提 PATH**，很容易被误判成"Rust 环境坏了"。
 
    实测（2026-09-21）：`cargo`/`rustc` 实际在
-   `C:\Users\iuuuuuuuu\.cargo\bin\`（rustup 1.98.1 装的 stable-msvc），
+   `%USERPROFILE%\.cargo\bin\`（rustup 装的 stable-msvc），
    把这个目录加进 PATH 即可。**注意**：受限沙箱下 `Test-Path` 对这个目录
    会返回 `False`（访问被拒），据此会误判成"工具链不存在" ——
    用 `cmd /c dir` 或直接执行 `cargo --version` 来确认。
@@ -150,7 +150,7 @@ DSH Desktop。**任何验证都不得影响这两个进程。**
 > `netstat -ano | findstr :7864` → PID 13884 = `gateway-509bdb-*.exe`；
 > `:3080` → PID 38744 = `node.exe`（DSH GUI，即本机 `http://127.0.0.1:3080`）；
 > `:43120` → **0 条连接，未监听**。⇒ 拿 `43120` 当判据会**误报「业主服务掉了」**。
-> `PROJECT-STATE.md` §六 写的也是 `:3080`。**端口会变，判据是现场实测，不是文档里的数字。**
+> **端口会变，判据是现场实测，不是文档里的数字。**
 
 ### 绝对禁止：运行安装包 / 卸载器
 

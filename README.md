@@ -162,7 +162,6 @@ ai-gateway        (momo0410)      网关页面、账号同步、单文件内嵌�
 | 发版、签名、本机运行、按现象排障、回滚 | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
 | 写测试 / 跑验收 / 怀疑门禁是不是假的 | [docs/TESTING.md](docs/TESTING.md) |
 | 改用户能看见的行为之前对齐语义 | [docs/FEATURES.md](docs/FEATURES.md) |
-| 查当前进展、测试基线、历史交付证据 | [PROJECT-STATE.md](PROJECT-STATE.md) |
 | 查编码契约（Shell / 组件 / 构建签名 / 验证纪律） | [AGENTS.md](AGENTS.md) —— 仓库根，与 docs/AGENTS.md 并存 |
 | 看 `docs/` 全部文档的定位与更新触发 | [docs/README.md](docs/README.md) —— 文档地图 |
 

@@ -1144,8 +1144,7 @@ WorkBuddy / WorkBuddy AI（国际版）/ CodeBuddy CLI / CodeBuddy CN IDE
    构建与签名流程 —— 这些属于其它文档的范围。
 6. **版本与提交范围**：本页所有"适用版本"以
    `crates/ai-gateway-router/Cargo.toml` 的 `version` 为准（当前 `1.0.46`）。
-   文档提到的历史版本号（1.0.34–1.0.46）取自 PROJECT-STATE 的逐版本叙述，
-   与 Cargo 版本号一致。
+   文档提到的历史版本号（1.0.34–1.0.46）与 Cargo 版本号一致。
 
 ---
 

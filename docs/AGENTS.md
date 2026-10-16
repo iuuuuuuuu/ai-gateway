@@ -27,7 +27,6 @@ WorkBuddy（CodeBuddy）多账号切换工具 + 本地 AI 网关：桌面 GUI �
 | `go-gateway/` | **Go 参照实现，已不参与构建**（仅作对照；`build-gateway.{sh,ps1}` 不再调 `go build`，CI 里的 `actions/setup-go` 已删除） | 改协议细节前仍值得读它的 `CAPTURED-SPEC.md`（见 §4.1） |
 | `docs/` | 本目录：**怎么干活** | 见 [README.md](README.md) 文档地图 |
 | `.github/workflows/` | `ci.yml`（push/PR 编译门禁）/ `build.yml` / `release.yml`（`v*` tag） | 见 §5.5 |
-| `PROJECT-STATE.md` | 接手用持久状态：当前进展 / 测试基线 / 陷阱 / 未验证面 | **很大（150KB+），用 grep 取段，别整份读** |
 | `uitest/` `test-bin/` | 本机实测证据与隔离实例 | ⚠ **都不入库**（`.gitignore`），见 §5.6 |
 
 Cargo workspace 成员：`crates/ai-gateway-core`、`crates/ai-gateway-router`、`crates/ai-gateway-server`、`src-tauri`。
@@ -178,7 +177,7 @@ IfSilent kill_${UniqueID} 0        ; 静默模式下不询问，直接杀
 ```
 
 `src-tauri/installer.nsi` 实测（2026-10-15）在两处调用：**:651** 与 **:788** `!insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"`。
-（`PROJECT-STATE.md` 记的行号 `:641` / `:768` 是**旧快照，已漂移** —— 按行号找会找不到。）
+（别按行号找 —— 它会随模板版本漂移，按宏名 `CheckIfAppIsRunning` 搜。）
 
 主程序名 `ai-gateway.exe` 与业主正在运行的实例**同名** ⇒「装一次 / 卸一次」就会杀掉他的实例；而它是 Job Object（`KILL_ON_JOB_CLOSE`）的父进程，父进程一死，网关被系统连带回收 —— **一次误操作打掉两个服务**。
 
@@ -303,7 +302,7 @@ if ($err.Count) { $err | Select-Object -First 3 | ForEach-Object { "行 $($_.Ext
 ## 4. 工作流
 
 1. **先读文档**：本页 → [README.md](README.md) 文档地图 → 与改动相关的主题文档。
-   查「现在到哪了 / 测试基线 / 未验证面」翻 [../PROJECT-STATE.md](../PROJECT-STATE.md)；查「为什么当初这么选」翻 [DECISIONS.md](DECISIONS.md)。
+   查「为什么当初这么选」翻 [DECISIONS.md](DECISIONS.md)。
 2. **改代码**：改动范围只落在被指派的部分；连带影响可自主修掉，**不相关的别碰**。
 3. **跑门禁**：`npm run build` + `cargo test --workspace`，**不低于 §5.1 的基线**。
 4. **同步文档**：行为变化 → [FEATURES.md](FEATURES.md)；决策变化 → [DECISIONS.md](DECISIONS.md)；流程变化 → [RUNBOOK.md](RUNBOOK.md)；测试体系变化 → [TESTING.md](TESTING.md)。文档与代码**同一次提交**更新。
@@ -322,11 +321,11 @@ if ($err.Count) { $err | Select-Object -First 3 | ForEach-Object { "行 $($_.Ext
 
 ### 5.1 测试基线（改动后不得低于）
 
-⚠ **`PROJECT-STATE.md` §三 的表是 1.0.34 口径，已过期**（表头写「1.0.34」，而仓库已在 1.0.46）。**以版本更晚的记录为准**：
+⚠ 本表以**版本更晚的记录为准**；任何与现读 `cargo test` 输出不一致的数字，以现读为准：
 
 | 目标 | 最新已知 | 口径来源 |
 |---|---|---|
-| `cargo test --workspace` | **3081 passed / 0 failed / 7 ignored**（15 suite） | 1.0.36（2026-10-08/09，`PROJECT-STATE.md` **§9.11**「1.0.36 的构建与真机实测」的「测试基线」行，:136） |
+| `cargo test --workspace` | **3081 passed / 0 failed / 7 ignored**（15 suite） | 1.0.36（2026-10-08/09） |
 | `cargo test --workspace` → router | **1798 passed / 0 failed / 1 ignored** | 2026-10-16 本轮（版本仍 1.0.46，未 bump；1.0.46 为 1780，净增 18 = 会话头族 5 + 国际版身份头 4 + 熔断区域隔离 3 + 会话头族解析 1 + **11140 误判回归 5**（见 D20）；另新增线级套件 `tests/ab_conversation_headers.rs` 3 条，**不在 lib 计数内**） |
 | `cargo test --workspace` → core | **1301 passed / 0 failed / 4 ignored** | 1.0.46（2026-10-14，§9.21） |
 | `cargo test --workspace` → src-tauri | **28 passed / 0 failed / 0 ignored** | 2026-10-16 本轮（1.0.46 基线为 17；新增 7 条设备 token 发现门禁 + 4 条既有） |
@@ -411,7 +410,7 @@ $got -contains $want    # True = 内嵌的是当前前端
 - ⚠ **`uitest/` 当前只有 22 个 `.log` 证据日志**（2026-10-15 实测）。
   **根 `AGENTS.md` 引用的 `uitest/page-harness.cjs` / `uitest/mock-host-api.cjs` / `uitest/README-验证约定.md` 在磁盘上均不存在**（全仓库查找无匹配；根 `AGENTS.md` 的 2026-10-15 更正另记载它们**从未入库**，且 `uitest/` 是未跟踪目录）。
   ⇒ 想按「前端/UI 验证不需要起后端」那条路走，**需先重建这些探针**；在它们存在之前，那些步骤**不可执行**。
-- `.github/RELEASE_NOTES_*.md` **是入库的**（1.0.0 → 1.0.46 共 40 份），与 `test-bin/` 里的 `DELIVERY-*.md` 分工不同。
+
 
 ---
 
@@ -514,5 +513,4 @@ $got -contains $want    # True = 内嵌的是当前前端
 | 纯部署版（server 单文件）怎么发 | [SERVER-DEPLOY-1.0.46.md](SERVER-DEPLOY-1.0.46.md) |
 | 查「实现搬过来了、接线丢了」这类 P0 | [GO-STARTUP-WIRING-AUDIT.md](GO-STARTUP-WIRING-AUDIT.md)（**历史审计，只读**） |
 | 查硬约束（Shell / 组件 / 构建签名 / 验证纪律） | [../AGENTS.md](../AGENTS.md) —— 仓库根，与本页**并存** |
-| 查当前进展、测试基线、历史交付证据 | [../PROJECT-STATE.md](../PROJECT-STATE.md) |
 | 看用户视角的功能导览与安装说明 | [../README.md](../README.md) |

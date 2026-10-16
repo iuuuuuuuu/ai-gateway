@@ -167,11 +167,11 @@ git push <remote> v1.0.47
 1. **预发布版本（tag 名含连字符，如 `v1.0.47-beta.1`）会自动去掉 msi**。原因：MSI 的 `ProductVersion` 只接受 `major.minor.build` 三段**数字**，`beta` 这类字母标识**是 MSI 格式自身的限制，改 Tauri 配置绕不过去**。NSIS 用字符串版本号，没这个约束。
 2. **预发布必须被标成 prerelease**（workflow 按「版本号里有没有连字符」自动判定）。判据在源码注释里写得很清楚：客户端的 updater 端点是 `releases/latest/download/latest.json`，而 GitHub 的 `releases/latest` **会跳过 prerelease** ⇒ 标对了，正式版用户不会被推到 beta；标错了，**所有正式版用户下次启动就会被更新到 beta**。
 
-**重跑同一个 tag 时必须先删掉已有的 Release**：`softprops/action-gh-release@v2` 对**已存在**的 Release **不覆盖正文**（官方文档原文：「When the release info keys are not explicitly set and there is already an existing release, the release will retain its original info.」）⇒ 「改 RELEASE_NOTES → 重打 tag → 修复说明」这条自救路径会**静默失效**：workflow 全绿、日志无异常，而页面上挂的还是上一次的正文。workflow 里已加了「先 `gh release delete --cleanup-tag=false`」这一步来兜住。
+**重跑同一个 tag 时必须先删掉已有的 Release**：`softprops/action-gh-release@v2` 对**已存在**的 Release **不覆盖正文**（官方文档原文：「When the release info keys are not explicitly set and there is already an existing release, the release will retain its original info.」）⇒ 「改发布说明 → 重打 tag → 修复说明」这条自救路径会**静默失效**：workflow 全绿、日志无异常，而页面上挂的还是上一次的正文。workflow 里已加了「先 `gh release delete --cleanup-tag=false`」这一步来兜住。
 
-**发布说明**：优先用仓库里手写的 `.github\RELEASE_NOTES_<版本>.md`；没有才回退到 GitHub 自动生成的提交列表。有手写说明时**不会**再 prepend 自动摘要（避免正文顶部堆一段重复的 "What's Changed"）。
+**发布说明**：由 GitHub 按提交列表自动生成。
 
-**发布前必做**：`gh run list` 看一眼 **CI 是不是绿的**。历史上 `ci` 与 `release` 两条工作流**从 1.0.23 起每一次都是红的**（最老的根因可追到 1.0.9），而发版一直手工做 ⇒ 长期没人发现（详见 [../PROJECT-STATE.md](../PROJECT-STATE.md) §9.17）。
+**发布前必做**：`gh run list` 看一眼 **CI 是不是绿的**。历史上 `ci` 与 `release` 两条工作流**从 1.0.23 起每一次都是红的**（最老的根因可追到 1.0.9），而发版一直手工做 ⇒ 长期没人发现。
 
 ### 1.5 版本号 ↔ 安装包覆盖：NSIS 同版本**不覆盖**
 
@@ -193,7 +193,7 @@ git push <remote> v1.0.47
 >
 > ⚠ 这条与 `scripts/publish-release.sh` **文件头注释**里的说法（"必须对重命名后的文件重新签名，否则客户端校验失败"）**相矛盾**。以 workflow 的实测结论为准，`publish-release.sh` 的注释是**旧口径**。
 
-**生成清单的脚本是 POSIX 的**：`scripts/gen-update-json.sh`（bash）、`scripts/publish-release.sh`（bash + `python3` + `gh`）、`scripts/merge-update-manifests.py`（Python 3）。它们**在 CI 的 ubuntu runner 上跑**；本机是 Windows + 仓库 Shell Policy 强制 PowerShell ⇒ **不要在本机照抄这几个命令**。本机手工发版请用 PowerShell 直接写 JSON（历史做法见 [../PROJECT-STATE.md](../PROJECT-STATE.md) §9.7–§9.10 的"上传源目录"一节）。
+**生成清单的脚本是 POSIX 的**：`scripts/gen-update-json.sh`（bash）、`scripts/publish-release.sh`（bash + `python3` + `gh`）、`scripts/merge-update-manifests.py`（Python 3）。它们**在 CI 的 ubuntu runner 上跑**；本机是 Windows + 仓库 Shell Policy 强制 PowerShell ⇒ **不要在本机照抄这几个命令**。本机手工发版请用 PowerShell 直接写 JSON。
 
 ---
 
@@ -917,7 +917,7 @@ Get-ChildItem "<仓库同级>\dist\" | Select-Object Name, Length, LastWriteTime
 |---|---|
 | 密钥的**具体绝对路径** | 有意不写。它只对本机成立（判据：别人 clone 到是否成立），且属于凭据位置。文档只写"在 `wt-port` 之外、`WorkbuddySwitchAPi` 之内"与脚本的默认探测规则 |
 | 所有者服务端口的**权威清单** | 未写成固定清单。2026-10-15 实测 `:7864`（网关）与 `:3080`（DSH GUI）在听，而 `:43120` **不在听**（`../AGENTS.md` 里写的是 `:43120`）。端口会变，**判据是现场 `Get-NetTCPConnection`**，不是文档里的数字 |
-| 本地手工发 Release 的**完整可照抄命令** | 未给。`publish-release.sh` / `gen-update-json.sh` 是 bash + `python3`，与本仓库 Shell Policy 冲突；本机 `python3` 是 WindowsApps 的**占位程序**（直接跑返回 9009），`gh` 的 token 也已失效（`gh auth status` 报 `The token ... is invalid`）。历史做法散在 `../PROJECT-STATE.md` §9.7–§9.10，未固化成脚本 |
+| 本地手工发 Release 的**完整可照抄命令** | 未给。`publish-release.sh` / `gen-update-json.sh` 是 bash + `python3`，与本仓库 Shell Policy 冲突；且依赖 `gh` 的登录态，未登录时不可用 |
 | 网关"起来后又悄悄没了"的**根因** | 未写成结论。1.0.44 修的是"死了没人管"，**"它怎么死的"至今未归因**（现场无停机日志、无 panic、无 Application Error、无 WER） |
 | `max_in_flight` 该"换号"还是"排队" | **未决**。见 §4.3 的更正框 —— 这是需要 Owner 定夺的决策，文档只陈述现状与影响，不给结论 |
 | 前端/UI 验证路径 | **当前不可执行**。`uitest/page-harness.cjs` + `uitest/mock-host-api.cjs`（以及 `uitest/README-验证约定.md`）从未入库，需先重建（§3.6） |
