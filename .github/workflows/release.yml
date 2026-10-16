@@ -732,6 +732,49 @@ jobs:
           echo "updater 清单已生成："
           cat "$MANIFEST"
 
+      # ★ 纯部署版（server 单文件）—— 只在 Windows 腿顺手构建。
+      #
+      # 为什么挂在这里而不是独立 job：它与桌面版共用同一份前置产物
+      # （embedded/gateway.exe + dist/ 前端），独立 job 要把这两步重跑一遍。
+      #
+      # 为什么只有 Windows：npm 分发的 ai-gateway 命令目前只发布
+      # Windows 构建（docs/SERVER-DEPLOY-*.md 记录的口径）。
+      - name: 构建纯部署版（server 单文件）
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # build-single.ps1 内部依次：构建内嵌网关 -> 构建前端 -> cargo build
+          # -p ai-gateway-server --release -> 拷贝到 dist-single/ai-gateway.exe。
+          # 前面的 step 已做过网关与前端，故传两个跳过开关。
+          powershell -NoProfile -File scripts/build-single.ps1 \\
+            -SkipGateway -SkipFrontend -OutputDir dist-single
+
+          EXE="dist-single/ai-gateway.exe"
+          test -f "$DEXE" || { echo "错误：未生成 $DEXE" >&2; exit 1; }
+          SIZE=$D(wc -c < "$DEXE" | tr -d ' ')
+          if [ "$DSIZE" -lt 10485760 ]; then
+            echo "错误：$DEXE 体积异常（$DSIZE 字节）" >&2
+            exit 1
+          fi
+          echo "server 单文件: $DEXE"
+
+          # 版本自证：该 exe 的 PE 版本资源为空，唯一可信来源是 version 子命令
+          # （docs/SERVER-DEPLOY-*.md 1.2 节记录的判据）。
+          VER=$D(./"$DEXE" version 2>&1 | head -1 || true)
+          echo "version 输出: $DVER"
+          case "$DVER" in
+            *"$DD{APP_VERSION}"*) echo "版本匹配" ;;
+            *) echo "错误：版本不匹配（期望 $DD{APP_VERSION}，实际 $DVER）" >&2; exit 1 ;;
+          esac
+
+          # 交付名带平台与版本，与桌面版风格一致。
+          OUT="dist-bin/ai-gateway_$DD{APP_VERSION}_server-x64.exe"
+          mkdir -p dist-bin
+          cp "$DEXE" "$DOUT"
+          sha256sum "$DOUT" > "$DOUT.sha256"
+          echo "已生成: $DOUT"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}

@@ -1,8 +1,8 @@
 # ai-gateway 1.0.46 纯部署版（server）部署文档
 
-> 适用产物：`dist\ai-gateway_1.0.46_server-x64.exe`
+> 适用产物：`ai-gateway_<版本>_server-x64.exe`（Release 资产，CI 自动构建并上传）
 > 形态：**单文件、无 GUI 窗口、无 WebView、无安装器**，前台跑一个本地 HTTP 服务
-> 编写时间：2026-10-14 ｜ 对应提交：`wt-port` HEAD `0bcea00` ｜ 版本号：1.0.46
+> 编写时间：2026-10-16 │ 版本号：以 `package.json` / `src-tauri/tauri.conf.json` 为准
 
 ---
 
@@ -32,6 +32,42 @@ D:\APP\ai-gateway-server\ai-gateway.exe serve --port 57890
 ```
 
 ---
+
+---
+
+## 0.5 从公开 Release 获取产物（推荐路径）
+
+本节假设你没有本机构建产物。**server 单文件由 CI 自动构建并上传到 GitHub Release**，
+无需本机构建；下载后按下面三道校验确认完整性。
+
+**1） 下载**（本仓库 Release 页，不是上游）
+
+```powershell
+$ver = "1.0.46"                       # 换成你要的版本
+$base = "https://github.com/iuuuuuuuu/ai-gateway/releases/download/v$ver"
+Invoke-WebRequest "$base/ai-gateway_${ver}_server-x64.exe" -OutFile "ai-gateway-server.exe"
+Invoke-WebRequest "$base/ai-gateway_${ver}_server-x64.exe.sha256" -OutFile "ai-gateway-server.exe.sha256"
+```
+
+其它平台资产（Windows 安装包 / 便携版、macOS dmg、Linux deb / AppImage）同理，
+完整清单见 [仓库 README 的下载表](../README.md#安装方式一安装包推荐)。
+
+**2） 校验**（两道都做，分工不同）
+
+```powershell
+# 字节级：防限速 / 截断导致的下载不完整
+(Get-Item .\ai-gateway-server.exe).Length
+# 内容级：与 .sha256 逐字对比（大小写不敏感）
+(Get-FileHash .\ai-gateway-server.exe -Algorithm SHA256).Hash
+Get-Content .\ai-gateway-server.exe.sha256
+# 版本自证：唯一可信来源（见 1.2 节）
+.\ai-gateway-server.exe version
+```
+
+**3） 启动**：接下来直接看第 3 节，选一种部署形态。
+
+> ⚠ 本产品**无数字签名**，首次运行会触发 SmartScreen 「未知发布者」提示。
+> 确认下载渠道与哈希无误后，用「更多信息 → 仍要运行」继续。
 
 ## 1. 交付物与校验
 

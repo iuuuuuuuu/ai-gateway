@@ -164,6 +164,7 @@ ai-gateway        (momo0410)      网关页面、账号同步、单文件内嵌�
 | 改用户能看见的行为之前对齐语义 | [docs/FEATURES.md](docs/FEATURES.md) |
 | 查编码契约（Shell / 组件 / 构建签名 / 验证纪律） | [AGENTS.md](AGENTS.md) —— 仓库根，与 docs/AGENTS.md 并存 |
 | 看 `docs/` 全部文档的定位与更新触发 | [docs/README.md](docs/README.md) —— 文档地图 |
+ | **把网关部署到服务器（无 GUI）** | [docs/SERVER-DEPLOY-1.0.46.md](docs/SERVER-DEPLOY-1.0.46.md) —— 纯部署版下载、三道校验、启动形态、自启 |
 
 ---
 
@@ -775,17 +776,20 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 
 ### 安装方式一：安装包（推荐）
 
-从 [Releases](https://github.com/momo0410/ai-gateway/releases/latest) 下载：
+从 [Releases](https://github.com/iuuuuuuuu/ai-gateway/releases/latest) 下载（本仓库自己的 Release 页）：
 
-| 文件 | 说明 |
-|---|---|
-| `ai-gateway_<版本>_aarch64.dmg` | macOS（Apple Silicon）磁盘映像，拖入「应用程序」即安装 |
-| `ai-gateway_<版本>_x64.dmg` | macOS（Intel）磁盘映像，同上 |
-| `AI.Gateway_<版本>_x64-setup.exe` | Windows 安装向导，自动创建开始菜单与卸载项 |
-| `AI.Gateway_<版本>_x64_en-US.msi` | Windows MSI 包，适合批量部署 |
-| `AI_Gateway_<版本>_portable.zip` | Windows 便携版，解压即用，不写入注册表 |
-| `AI.Gateway_<版本>_amd64.deb` | Linux（Debian/Ubuntu）安装包 |
-| `AI.Gateway_<版本>_amd64.AppImage` | Linux 免安装可执行文件 |
+| 文件 | 平台 | 说明 |
+|---|---|---|
+| `AI.Gateway_<版本>_x64-setup.exe` | Windows | 安装向导，自动创建开始菜单与卸载项；**应用内更新走的就是它** |
+| `AI.Gateway_<版本>_x64_en-US.msi` | Windows | MSI 包，适合批量部署 |
+| `AI_Gateway_<版本>_portable.zip` | Windows | 便携版，解压即用，不写入注册表 |
+| `ai-gateway_<版本>_aarch64.dmg` | macOS | Apple Silicon（M1/M2/M3）磁盘映像，拖入「应用程序」即安装 |
+| `ai-gateway_<版本>_x64.dmg` | macOS | Intel Mac 磁盘映像，同上 |
+| `AI.Gateway_<版本>_amd64.deb` | Linux | Debian/Ubuntu 安装包 |
+| `AI.Gateway_<版本>_amd64.AppImage` | Linux | 免安装可执行文件 |
+| `ai-gateway_<版本>_server-x64.exe` | Windows | **纯部署版**（单文件、无 GUI），配同 `.sha256` 校验；见[纯部署版部署](#安装方式四纯部署版服务器无-gui) |
+
+> 三个平台（Windows / macOS / Linux）的安装包由 CI 自动构建，发布时一并上传。
 
 ### 安装方式二：便携版（Windows，免安装）
 
@@ -806,17 +810,66 @@ refresh token 被服务端明确拒绝（如 `12153 Offline user session not fou
 > 0.6.1 起安装器支持覆盖更新（自定义 NSIS 模板，见 `src-tauri/installer.nsi`）；
 > 从更早版本升级到 0.6.1 时同样无需手动卸载。
 
+### 安装方式四：纯部署版（服务器，无 GUI）
+
+不想装桌面应用？下载 `ai-gateway_<版本>_server-x64.exe` —— **单文件、无安装向导、无 WebView。内嵌了完整网关，拖到服务器上就能跑。
+
+**校验下载（必做）**
+
+```powershell
+Get-FileHash .\ai-gateway_<版本>_server-x64.exe -Algorithm SHA256
+# 与 Release 页的 .sha256 文件逐字对比（大小写不敏感）
+.\ai-gateway_<版本>_server-x64.exe version
+# 期望输出：ai-gateway <版本>
+```
+
+> ⚠ **别用文件属性里的「版本」判断本文件版本** —— 该 exe 的 PE 版本资源是空的，属性页什么都看不到；也没有数字签名，Windows 会显示「未知发布者」。
+> **唯一可信的版本来源是 `version` 子命令**。
+
+**启动**
+
+```bat
+:: 默认端口：管理界面 57890，兼容网关 7863
+ai-gateway.exe serve --port 57890
+```
+
+启动后用浏览器打开 `http://127.0.0.1:57890/` （从另一台机器访问的话，把地址换成服务器 IP，并在「设置」里开启外网访问 + 设置 `api_key`）。
+
+**首次配置（顺序不能倒）**
+
+1. 「账号管理」页导入或添加账号 —— **网关需要账号库非空才能启动**，否则报“无可用账号”
+2. 「兼容网关」页打开 `auto_start`，或点「启动网关」
+3. 客户端把 base_url 指向 `http://<服务器IP>:7863`，API Key 用第 2 步里那个
+
+**数据目录**
+
+| 平台 | 默认位置 | 改法 |
+|---|---|---|
+| Windows | `%USERPROFILE%\.wb-switch\` | 设置环境变量 `AI_GATEWAY_HOME` |
+| Linux / macOS | `~/.wb-switch/` | 同上 |
+
+**常见问题**
+
+| 现象 | 原因与办法 |
+|---|---|
+| 管理界面能开但网关报无账号 | 账号库为空，先去导入账号 |
+| 别的机器访问不了 | 默认只监听 127.0.0.1；要对外开放必须同时设置 `api_key`，否则等于把账号额度送人 |
+| 想后台长驻 | 用 `nssm` / `systemd` / Docker 托管，命令就是上面那来 |
+
+更多细节（依赖、VC++ 运行库、目录说明、升级）见
+[`docs/SERVER-DEPLOY-1.0.46.md`](docs/SERVER-DEPLOY-1.0.46.md)。
+
 ### 安装方式三：从源码构建
 
-需要 Go ≥ 1.22、Node.js ≥ 20、Rust 工具链（Windows 需 MSVC 工具链以链接 WebView2）。
+需要 Node.js ≥ 20、Rust 工具链（Windows 需 MSVC 工具链以链接 WebView2）。
 
-> 网关源码随仓库分发在 `go-gateway/`，无需另行 clone 上游、也不需要打补丁。
+> 网关源码在 `crates/ai-gateway-router/`（Rust，2026-10 从 Go 全量重写）。
+> `go-gateway/` 仍在仓库里，但已不参与构建，只作对照参考。
 
 ```bash
-# 1) 构建网关（Go）—— 产物落到 crates/ai-gateway-core/embedded/，
+# 1) 构建网关（Rust）—— 产物落到 crates/ai-gateway-core/embedded/，
 #    cargo build 时由 build.rs 压缩内嵌进主程序
-sh scripts/build-gateway.sh                              # 当前平台
-GOOS=windows GOARCH=amd64 sh scripts/build-gateway.sh    # 交叉编译到指定平台
+sh scripts/build-gateway.sh                              # 当前平台（按构建主机出产物）
 GOOS=darwin  GOARCH=arm64 sh scripts/build-gateway.sh
 
 # 2) 前端 + 桌面应用
@@ -881,7 +934,7 @@ pwsh scripts/build-gateway.ps1 -CheckOnly # 只校验新鲜度
 
 **根因**：`crates/ai-gateway-core/build.rs` 会无条件内嵌
 `crates/ai-gateway-core/embedded/gateway.exe` 里**当时躺着的那一份**，
-而单纯的 `tauri build` **不会构建网关**。于是改了 `go-gateway/` 却没手动重建
+而单纯的 `tauri build` **不会构建网关**。于是改了 `crates/ai-gateway-router/` 却没手动重建
 embedded 时，打出来的包内嵌的还是旧网关。这与前端是**同型**缺陷 ——
 `tauri-build` 的 `rerun-if-changed` 不包含 `../dist`，前端重建也不会触发重新嵌入。
 
@@ -967,7 +1020,8 @@ crates/
   ai-gateway-server/  # HTTP server + CLI：axum API + rust-embed 前端
   ai-gateway-router/ # 网关内核（Rust 移植版，chat_completions 仍为占位）
 src/                 # 前端：components/pages/lib（api.ts 双通道：Tauri invoke / HTTP fetch）
-go-gateway/          # Go 版网关源码（当前实际构建依赖，编译后内嵌）
+crates/ai-gateway-router/  # 网关内核（Rust，构建后内嵌）
+go-gateway/                # Go 版参照实现，已不参与构建
 npm/                 # npm 包：package.json + bin + scripts/install.js
 scripts/             # 构建与发布脚本
 ```
