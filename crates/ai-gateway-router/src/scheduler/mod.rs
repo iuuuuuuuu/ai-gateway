@@ -136,6 +136,32 @@ pub const TASK_NAMES: [&str; 6] = [
     TASK_NAME_PRODUCT_TASKS,
 ];
 
+/// `run_growth_map` 对单个账号的路由结论。
+///
+/// 抽成纯函数的理由：该判断在 `run_growth_map` 的账号循环里**内联**时无法
+/// 单测（要 mock 整个 upstream），而它是 2026-10-16 修的真实缺陷的判据核心
+/// —— 内联写法一旦被回退，测试根本测不到。纯函数 + 常规断言即可钉住。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrowthMapRoute {
+    /// 非本产品（qoder / zcode）⇒ 完全跳过，绝不能带错凭证打 workbuddy。
+    Skip,
+    /// 国际版 workbuddy ⇒ **只**跑 billing 侧礼包/补偿（成长中心闭环无接口）。
+    BenefitsOnly,
+    /// 国服 workbuddy ⇒ 完整闭环（礼包/补偿 + 补签 + 兑换 + 抽奖）。
+    Full,
+}
+
+/// `run_growth_map` 的账号路由判据（单一真相来源，见 `GrowthMapRoute`）。
+pub(crate) fn growth_map_route(a: &Auth) -> GrowthMapRoute {
+    if a.product_of() != PRODUCT_WORKBUDDY {
+        return GrowthMapRoute::Skip;
+    }
+    if a.is_intl() {
+        return GrowthMapRoute::BenefitsOnly;
+    }
+    GrowthMapRoute::Full
+}
+
 // ---------------------------------------------------------------------------
 // 取消信号
 // ---------------------------------------------------------------------------
@@ -308,6 +334,9 @@ pub type ProductTasksRunner =
 /// 计费周期刷新执行体。
 pub type BillingCycleRunner = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
+/// 成长任务中心执行体签名：对账号池做一次全量「扫描待办 → 执行 → 领取」。
+pub type GrowthTaskRunner = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+
 // ---------------------------------------------------------------------------
 // 配置
 // ---------------------------------------------------------------------------
@@ -476,6 +505,14 @@ pub struct Scheduler {
     /// ⚠ 必须在 [`Scheduler::run`] **之前**调用：排程循环启动时读一次该字段来算
     /// 唤醒时点；之后注入不会让本轮的唤醒计划生效（要等下一个整点重算）。
     product_tasks_runner: RwLock<Option<ProductTasksRunner>>,
+    /// 成长任务中心（`growtask::Runner`）执行体；未接线 ⇒ 排程与手动路径都 no-op。
+    ///
+    /// 2026-10-16 修复：`/tasks/growth` 的 run-all 此前**只有 HTTP 入口**，
+    /// 没有任何排程触发点 —— 任务中心的待办（如 `Sequential_Tasks_2/3`）只能
+    /// 靠用户在界面点「跨账号任务队列」才会跑，不点就永远挂着（所有者现场：
+    /// 「我要不是手动扫描了,我都不知道这个」）。接线后随 `growthmap` 同一时点
+    /// 自动全量扫描；手动触发 `/tasks/run?task=growthmap` 同样覆盖。
+    growth_task_runner: RwLock<Option<GrowthTaskRunner>>,
     /// 计费周期刷新执行体（`None` = 未接线，直接跳过不报错）。
     ///
     /// 与积分巡检**语义不同**，混在一起会互相污染：积分巡检（WorkBuddy）有出站
@@ -552,6 +589,7 @@ impl Scheduler {
         Self {
             cfg,
             product_tasks_runner: RwLock::new(None),
+            growth_task_runner: RwLock::new(None),
             billing_cycle_runner: RwLock::new(None),
             daily: Mutex::new(DailyMarks::default()),
             task_busy: Mutex::new(HashSet::new()),
@@ -572,6 +610,22 @@ impl Scheduler {
     /// 注入计费周期刷新的执行体（对应 Go `SetBillingCycleRefreshRunner`）。
     pub fn set_billing_cycle_refresh_runner(&self, runner: BillingCycleRunner) {
         *self.billing_cycle_runner.write().unwrap_or_else(|e| e.into_inner()) = Some(runner);
+    }
+
+    /// 注入成长任务中心的执行体（`growtask::Runner` 的全量扫描）。
+    ///
+    /// 与 `set_product_tasks_runner` 同因用 setter：`Runner` 在 `bin/gateway.rs`
+    /// 里的构造位置晚于调度器。未接线 ⇒ 排程与手动路径都静默 no-op（不报错），
+    /// 单纯不想要任务中心的部署不受影响。
+    pub fn set_growth_task_runner(&self, runner: GrowthTaskRunner) {
+        *self.growth_task_runner.write().unwrap_or_else(|e| e.into_inner()) = Some(runner);
+    }
+
+    fn growth_task_runner(&self) -> Option<GrowthTaskRunner> {
+        self.growth_task_runner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn product_tasks_runner(&self) -> Option<ProductTasksRunner> {
@@ -2087,6 +2141,27 @@ impl Scheduler {
             if a.access_token.is_empty() {
                 continue;
             }
+            // 路由判据见 [`growth_map_route`]：
+            //
+            // - 国际版：成长中心闭环（连登 / 补签 / 兑换 / 抽奖）在国际版**没有**
+            //   对应接口，但 **billing 侧的礼包与活动补偿是同一对端点**
+            //   （`/billing/meter/claim-gift`、`/billing/meter/claim-compensation`），
+            //   在国际版域名下同样存在（实测 `www.workbuddy.ai` 返回 200，活动未开启
+            //   时 `active:false`）。故国际版**只跑这一项**。
+            // - qoder / zcode：绝不能带错凭证打 workbuddy 端点（401 + 写脏记录，
+            //   与 `account_scope_skip` 文档里 2026-09-22 的真实缺陷同型）。
+            match growth_map_route(&a) {
+                GrowthMapRoute::Skip => continue,
+                GrowthMapRoute::BenefitsOnly => {
+                    if !first && !cancel.sleep(GROWTH_ACCOUNT_DELAY).await {
+                        return;
+                    }
+                    first = false;
+                    self.claim_growth_benefits(&a).await;
+                    continue;
+                }
+                GrowthMapRoute::Full => {}
+            }
             // 本闭环的地基是 growth 连登，只有被点亮过连登的账号才有兑换/补签可言。
             if self.account_scope_skip(TASK_NAME_GROWTH_MAP, &a).is_err() {
                 continue;
@@ -2100,6 +2175,24 @@ impl Scheduler {
             first = false;
             self.growth_map_round(&a, None, true).await;
         }
+        // 任务中心（跨账号队列）搭同一时点的便车：growthmap 是「每日一轮」的
+        // 账号级任务，任务中心同样是「扫一遍全池的待办」，排程语义一致；
+        // 且它内部自带账号级互斥与并发上限，不会与上面的循环互相踩。
+        self.run_growth_task_center().await;
+    }
+
+    /// 成长任务中心全量扫描（`/tasks/growth` run-all 的排程等价物）。
+    ///
+    /// 未接线（`set_growth_task_runner` 未调用）时静默 no-op —— 与
+    /// `product_tasks_runner` / `billing_cycle_runner` 的缺失语义一致。
+    async fn run_growth_task_center(&self) {
+        let Some(runner) = self.growth_task_runner() else {
+            return;
+        };
+        // 未接线时静默返回（上面）；接线后至少留一条启动痕迹，否则「本轮跑没跑」
+        // 只能靠猜 —— 实测路径（2026-10-16）就是靠这行日志核验的。
+        crate::logline!("成长任务中心：排程触发，开始全量扫描");
+        (runner)().await;
     }
 
     /// 单账号一轮闭环（对应 Go `growthMapRound`）。
@@ -2782,6 +2875,42 @@ mod tests {
             let err = s.account_scope_skip(name, &zcode).unwrap_err();
             assert_eq!(err, "该任务是 WorkBuddy 专属：其它产品有自己的任务体系");
         }
+    }
+
+    /// ★★ `run_growth_map` 的账号路由：国际版 workbuddy 只跑 billing 领取。
+    ///
+    /// 2026-10-16 修的真实缺陷。所有者现场要求把 codebuddy 的「活动补偿」
+    /// 领取写到国际服账号的领取任务里。排查发现 `claim_compensation` /
+    /// `claim_gift` 早已实现且 `billing_base()` 对国际版解析正确
+    /// （`www.workbuddy.ai` 实测 200），唯一障碍是 `run_growth_map` 走
+    /// `account_scope_skip(TASK_NAME_GROWTH_MAP)` ⇒ `checkin_scope_allows`
+    /// ⇒ `!a.is_intl()`，国际版账号**整号被跳过** ⇒ 领取永远不跑。
+    ///
+    /// 判据抽成 [`growth_map_route`] 后三条结论都可断言：
+    /// - 国际版 ⇒ `BenefitsOnly`（本次修复点：修复前这里是「跳过」）；
+    /// - 国服 ⇒ `Full`（原有行为不变）；
+    /// - qoder / zcode ⇒ `Skip`（产品闸门对两种区域都成立，修复中**特意保留**）。
+    #[test]
+    fn growth_map_routes_intl_to_benefits_only() {
+        let wb_cn = auth_with("u1", "workbuddy", "www.workbuddy.cn");
+        let wb_intl = auth_with("u4", "workbuddy", "www.workbuddy.ai");
+        let legacy = auth_with("u5", "", "www.workbuddy.ai");
+        let qoder = auth_with("u2", "qoder", "qoder.sh");
+        let zcode = auth_with("u3", "zcode", "z.ai");
+
+        assert_eq!(growth_map_route(&wb_cn), GrowthMapRoute::Full);
+        assert_eq!(
+            growth_map_route(&wb_intl),
+            GrowthMapRoute::BenefitsOnly,
+            "国际版 workbuddy 应只跑 billing 领取（2026-10-16 修复点）"
+        );
+        assert_eq!(
+            growth_map_route(&legacy),
+            GrowthMapRoute::BenefitsOnly,
+            "空产品串归一成 workbuddy 后与国际版同判"
+        );
+        assert_eq!(growth_map_route(&qoder), GrowthMapRoute::Skip);
+        assert_eq!(growth_map_route(&zcode), GrowthMapRoute::Skip);
     }
 
     /// 空产品串归一成 workbuddy —— 判据用 `product_of()` 而不是 `product == ""`。

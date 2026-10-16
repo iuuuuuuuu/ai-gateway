@@ -760,6 +760,62 @@ async fn main() {
         ai_gateway_router::logline!("计费周期刷新未接线（池里没有 Qoder 账号或未启用多产品）：/usage 的 billingCycles 将为空");
     }
 
+    // ★★ 接线：成长任务中心（`/tasks/growth` run-all 的排程等价物）。
+    //
+    // # 为什么必须接
+    //
+    // 此前它**只有 HTTP 入口**（宿主「跨账号任务队列」按钮），排程器没有任何
+    // 触发点 ⇒ 任务中心的待办（`Sequential_Tasks_2/3` 等）不点按钮就永远挂着，
+    // 所有者只能靠手动「扫描待办」才发现（2026-10-16 现场反馈）。接线后随
+    // `growthmap` 时点（activity_hours 同槽）每日自动全量扫描。
+    //
+    // # 闭包里拿什么
+    //
+    // `FleetOptions` 在回调内构造：账号池是 `Arc<Mutex<Pool>>`，回调执行时
+    // 才读快照，账号增减、重新登录都能被下一轮看到（不快照进闭包）。并发沿用
+    // `growth_run_all` 的 2（刻意低于 MAX_FLEET_CONCURRENCY=3，见该处注释）；
+    // `include_intl` 维持 false —— 国际版没有任务中心接口（upstream/tasks.rs
+    // 实测为静态目录），国际版的 billing 领取由 `run_growth_map` 的
+    // `BenefitsOnly` 路径负责，两处职责不重叠。
+    {
+        let pool = Arc::clone(&pool);
+        let growtask = Arc::clone(&growtask);
+        scheduler.set_growth_task_runner(Arc::new(move || {
+            let pool = Arc::clone(&pool);
+            let growtask = Arc::clone(&growtask);
+            Box::pin(async move {
+                // 与 server.rs `growth_pool_auths` 同一口径：按产品过滤而
+                // 不是区域（Qoder 的 qoder.sh 会被误判成国际版），禁用号剔除；
+                // 区域过滤保留在 growtask 内部作第二道闸。
+                let accounts = {
+                    let p = pool.lock().unwrap_or_else(|e| e.into_inner());
+                    p.list()
+                        .into_iter()
+                        .filter(|st| !st.disabled)
+                        .filter_map(|st| p.auth_by_uid(&st.uid))
+                        .filter(|a| a.product_of() == ai_gateway_router::auth::PRODUCT_WORKBUDDY)
+                        .collect::<Vec<_>>()
+                };
+                if accounts.is_empty() {
+                    return;
+                }
+                let opts = ai_gateway_router::growtask::FleetOptions {
+                    accounts,
+                    concurrency: 2,
+                    include_intl: false,
+                };
+                let results = growtask.run_all_accounts(&ai_gateway_router::scheduler::Cancel::new(), &opts).await;
+                let s = ai_gateway_router::growtask::summarize(&results);
+                if s.claimed > 0 {
+                    ai_gateway_router::logline!(
+                        "成长任务中心：本轮领取 {} 项（积分 +{}，能量 +{}）",
+                        s.claimed, s.credit, s.energy
+                    );
+                }
+            })
+        }));
+    }
+
     // ★★ 接线：Trae 账号积分采集（POST /trae/api/v2/pay/ide_user_ent_usage）。
     //
     // 为什么是**独立**一条 tokio::spawn 定时循环，而不是搭上面那条积分巡检的便车：
