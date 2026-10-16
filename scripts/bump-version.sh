@@ -41,4 +41,4 @@ const j = JSON.parse(fs.readFileSync(p));
 for (const k of Object.keys(j.optionalDependencies || {})) j.optionalDependencies[k] = '$V';
 fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
 "
-echo "所有版本已同步为 $V（含平台包、Cargo.lock 与 optionalDependencies）"
+echo "所有版本已同步为 ${V}（含平台包、Cargo.lock 与 optionalDependencies）"

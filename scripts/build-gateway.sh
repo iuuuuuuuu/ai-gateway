@@ -62,7 +62,7 @@ case "$PROFILE" in
   release) PROFILE_FLAG="--release" ;;
   debug)   PROFILE_FLAG="" ;;
   *)
-    echo "build-gateway: CARGO_PROFILE 只支持 release / debug（收到 $PROFILE）" >&2
+    echo "build-gateway: CARGO_PROFILE 只支持 release / debug（收到 ${PROFILE}）" >&2
     exit 1
     ;;
 esac
@@ -88,7 +88,7 @@ else
 fi
 OUT="$ROOT/crates/ai-gateway-core/embedded/$BIN_NAME"
 
-echo "==> 构建 Rust 网关（$PROFILE，$(uname -s)/$(uname -m)）"
+echo "==> 构建 Rust 网关（${PROFILE}，$(uname -s)/$(uname -m)）"
 mkdir -p "$(dirname "$OUT")"
 
 # shellcheck disable=SC2086  # CARGO_ARGS 有意按空格切分

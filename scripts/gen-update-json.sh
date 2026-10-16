@@ -22,7 +22,7 @@ UPDATE_ARCHIVE_NAME="${UPDATE_ARCHIVE_NAME:-}"
 case "$UPDATE_ARCH" in
   aarch64|x86_64) ;;
   *)
-    echo "gen-update-json: 不支持的架构：$UPDATE_ARCH（只支持 aarch64 或 x86_64）" >&2
+    echo "gen-update-json: 不支持的架构：${UPDATE_ARCH}（只支持 aarch64 或 x86_64）" >&2
     exit 1
     ;;
 esac
@@ -73,7 +73,7 @@ case "$UPDATE_OS" in
     PLATFORM_KEYS="linux-$UPDATE_ARCH-appimage linux-$UPDATE_ARCH"
     ;;
   *)
-    echo "gen-update-json: 不支持的系统：$UPDATE_OS（支持 windows / darwin / linux）" >&2
+    echo "gen-update-json: 不支持的系统：${UPDATE_OS}（支持 windows / darwin / linux）" >&2
     exit 1
     ;;
 esac
@@ -86,7 +86,7 @@ fi
 SIG_MATCHES=$(find "$BUNDLE_DIR" -maxdepth 2 -type f -name "$SIG_GLOB" | sort)
 SIG_COUNT=$(printf '%s\n' "$SIG_MATCHES" | sed '/^$/d' | wc -l | tr -d ' ')
 if [ "$SIG_COUNT" != 1 ]; then
-  echo "gen-update-json: 期望恰好 1 个签名包（$SIG_GLOB），实际 $SIG_COUNT" >&2
+  echo "gen-update-json: 期望恰好 1 个签名包（${SIG_GLOB}），实际 $SIG_COUNT" >&2
   printf '%s\n' "$SIG_MATCHES" >&2
   ls -la "$BUNDLE_DIR" >&2 || true
   exit 1
@@ -96,7 +96,7 @@ ARCHIVE_FILE="${SIG_FILE%.sig}"
 JSON_FILE="$BUNDLE_DIR/latest-$UPDATE_OS-$UPDATE_ARCH.json"
 
 if [ ! -f "$SIG_FILE" ] || [ ! -f "$ARCHIVE_FILE" ]; then
-  echo "gen-update-json: 未找到签名更新包（$SIG_GLOB in $BUNDLE_DIR）" >&2
+  echo "gen-update-json: 未找到签名更新包（$SIG_GLOB in ${BUNDLE_DIR}）" >&2
   ls -la "$BUNDLE_DIR" >&2 || true
   exit 1
 fi

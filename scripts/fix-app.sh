@@ -23,7 +23,7 @@ for profile in debug release; do
     if codesign --force --deep --sign "$SIGN_IDENTITY" "$APP" 2>/dev/null; then
       echo "fix-app: 已用证书签名 $APP"
     elif codesign --force --deep --sign - "$APP" 2>/dev/null; then
-      echo "fix-app: 已 adhoc 签名 $APP（证书不可用）"
+      echo "fix-app: 已 adhoc 签名 ${APP}（证书不可用）"
     else
       echo "fix-app: 签名失败（跳过，不影响运行）"
     fi

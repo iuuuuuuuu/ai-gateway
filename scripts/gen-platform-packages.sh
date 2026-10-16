@@ -31,4 +31,4 @@ gen win32-x64 win32 x64 ai-gateway-win32-x64.exe
 gen linux-x64 linux x64 ai-gateway-linux-x64
 gen linux-arm64 linux arm64 ai-gateway-linux-arm64
 
-echo "平台包生成完成（版本 $V），把对应二进制复制到各包 bin/ 后 npm publish。"
+echo "平台包生成完成（版本 ${V}），把对应二进制复制到各包 bin/ 后 npm publish。"

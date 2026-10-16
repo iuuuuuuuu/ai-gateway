@@ -39,7 +39,7 @@ if [ "$VER" != "$CARGO_VER" ]; then
   echo "错误：tag 版本 $VER 与 src-tauri/Cargo.toml 的 $CARGO_VER 不一致" >&2
   exit 1
 fi
-echo "发布目标：$TAG（版本 $VER）"
+echo "发布目标：${TAG}（版本 ${VER}）"
 
 # ── 2. 定位签名私钥 ──────────────────────────────────────────────
 KEY_FILE="${HOME}/.ai-gateway/ai-gateway-updater.key"
@@ -48,7 +48,7 @@ if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ] && [ -f "$KEY_FILE" ]; then
   export TAURI_SIGNING_PRIVATE_KEY
 fi
 if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
-  echo "错误：未找到签名私钥（设置 TAURI_SIGNING_PRIVATE_KEY 或放置于 $KEY_FILE）" >&2
+  echo "错误：未找到签名私钥（设置 TAURI_SIGNING_PRIVATE_KEY 或放置于 ${KEY_FILE}）" >&2
   exit 1
 fi
 if [ -z "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]; then
