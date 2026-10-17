@@ -807,6 +807,43 @@ pub fn friendly_message(kind: ErrKind, status: u16, body: &str) -> String {
                 server_status_label(status)
             )
         }
+        // ★★ `Client` 是 `classify()` 的**兜底分类**：任何「4xx 但不是已知业务码」
+        // 的上游错误都归它（`classify(400, "")` 的测试就断言这一点）。它此前落进
+        // 下面的 `_ => String::new()`，于是 message 退回调用方的通用兜底
+        // `"all accounts unavailable (cooling/disabled)"` —— **前半句把原因说反了**：
+        // 真实原因是「上游拒绝了这次请求本身」，而用户读到的却是「所有账号都挂了」。
+        // 于是他重启网关、重登账号、换密钥，全都无效；而正解（改请求 / 换模型）
+        // 一个字都没提到。这与本仓 `clienttext.rs` 记载的那类伤害同型，只是换了个入口。
+        //
+        // 文案纪律（与 `friendly_message` 其余分支一致）：
+        // ① **可操作**——说清「该改请求，不是等账号恢复」；
+        // ② **不透出裸 401/403**（DSH 用 `/\b(?:401|403)\b/` 判 AUTH，见下方
+        //    `server_status_label` 的注释）；这里连状态码都不写，因为 `Client`
+        //    涵盖 400/422 等多种形态，写死一个数会与真实响应不符；
+        // ③ 附上上游原文（经 `envelope_display_message` 提炼）——排查时需要它，
+        //    但排在可操作的中文之后。
+        ErrKind::Client => {
+            let head = "上游拒绝了这次请求本身（不是账号故障）：\
+                        请检查请求参数、消息内容与模型是否匹配；\
+                        换账号或等待都不会改变结果";
+            // ★ 原文必须**先过 `client_safe_message` 闸门**再拼进文案。
+            //
+            // 这一条是被测试逼出来的，不是预防性写法：上游的 4xx 响应体里常常
+            // 直接带 `"code":"403"` / `"code":401`，把它原样拼进来，用户看到的
+            // 就是一段含裸 403 的文字 ⇒ DSH 的 `classifyPiAiError`
+            // （`/\b(?:401|403)\b/`）判成 AUTH ⇒ 提示「API 密钥无效」⇒ 他去反复
+            // 改密钥，而密钥完全正确。**加这段可读文案反而制造了原本没有的伤害。**
+            //
+            // 调用方（`openai_error` / `Wire::error`）本来也会过这道闸门，但
+            // ① 那是**下游**的保证，本函数是导出的纯函数，别处直接调它就漏了；
+            // ② 在这里过一遍是幂等的，多过一次不改变结果。
+            let original = crate::clienttext::client_safe_message(&envelope_display_message(body));
+            if original.trim().is_empty() {
+                head.to_string()
+            } else {
+                format!("{head}（上游原话：{original}）")
+            }
+        }
         _ => String::new(),
     }
 }
@@ -1533,6 +1570,66 @@ mod tests {
         assert_eq!(friendly_message(ErrKind::None, 200, ""), "");
         assert!(friendly_message(ErrKind::SoftRate, 429, "").contains("429"));
         assert!(friendly_message(ErrKind::Server, 502, "").contains("502"));
+    }
+
+    /// ★★ `Client` 兜底分类的文案不能是「账号全挂了」。
+    ///
+    /// 守的是一个**方向性错误**：`Client` 是「上游拒绝了这次请求本身」，
+    /// 换账号/等待都不会改变结果。此前它落进 `_ => String::new()`，
+    /// 调用方退回 `"all accounts unavailable (cooling/disabled)"`，
+    /// 用户被引向排查账号池 —— 而账号一个都没问题。
+    #[test]
+    fn client_kind_says_request_side_not_account_side() {
+        let msg = friendly_message(ErrKind::Client, 400, "");
+        assert!(!msg.is_empty(), "Client 不得再落进空串兜底");
+        // 必须点明「是请求的问题、不是账号的问题」
+        assert!(
+            msg.contains("请求"),
+            "必须指向请求侧，实际：{msg}"
+        );
+        assert!(
+            !msg.contains("all accounts unavailable"),
+            "不得复用账号池不可用的措辞，实际：{msg}"
+        );
+        // 必须明确否掉两条无效出路（否则用户会去做无用功）
+        assert!(
+            msg.contains("换账号") && msg.contains("等待"),
+            "必须说清换账号/等待都没用，实际：{msg}"
+        );
+    }
+
+    /// `Client` 的文案必须**不透出裸 401/403**。
+    ///
+    /// DSH 的 `classifyPiAiError` 用 `/\b(?:401|403)\b/` 判 AUTH，
+    /// 一旦文案里出现这两个数字，用户会被告知「API 密钥无效」——
+    /// 而密钥是对的，那会把他引向一个**不可能修好的方向**。
+    #[test]
+    fn client_kind_never_leaks_bare_auth_codes() {
+        // 各种可能夹带上游原文的形态
+        for body in [
+            r#"{"error":{"code":"403","message":"forbidden"}}"#,
+            r#"{"code":401,"msg":"unauthorized"}"#,
+            r#"{"msg":"upstream 403 rejected"}"#,
+            "403 forbidden",
+        ] {
+            let msg = friendly_message(ErrKind::Client, 403, body);
+            let leaked = crate::clienttext::client_safe_message(&msg) != msg;
+            assert!(
+                !leaked,
+                "文案里含裸 401/403（过 client_safe_message 会变），body={body} 实际：{msg}"
+            );
+        }
+    }
+
+    /// `Client` 必须保留上游原文 —— 排查时它是唯一可归因的线索。
+    #[test]
+    fn client_kind_keeps_upstream_original() {
+        let body = r#"{"code":"invalid_param","msg":"temperature must be <= 2"}"#;
+        let msg = friendly_message(ErrKind::Client, 400, body);
+        assert!(
+            msg.contains("temperature must be <= 2"),
+            "上游原文必须保留，实际：{msg}"
+        );
     }
     /// ★★ 业主现场回归：11133 里点名上下文边界时归 ContextTooLong。
     ///
