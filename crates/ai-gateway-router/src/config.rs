@@ -28,6 +28,61 @@ use crate::error::{GatewayError, Result};
 fn default_listen() -> String {
     "127.0.0.1:7863".into()
 }
+
+/// 把 `listen` 归一成**必定带 host** 的 `host:port`。
+///
+/// 需要归一的三种输入：
+/// - 裸端口 `"7863"`（无冒号）
+/// - 空 host `":7863"`（有冒号、host 为空）★ 这是宿主实际写进来的形态
+/// - 空白串 `""`（回落默认端口）
+///
+/// ★★ 为什么必须有这个函数（2026-10-17 现场回归）：`crates/ai-gateway-core` 的
+/// `normalize_listen()` 恒返回 `format!(":{port}")`。空 host 交给
+/// `TcpListener::bind` 后走 `getaddrinfo`，**各平台结果不同**：
+///   - Linux/macOS → 只回环，探测 `127.0.0.1` 能通（所以 CI 全绿）
+///   - Windows     → 枚举**全部网卡**，IPv6 link-local 排第一
+///                   （实测 `[fe80::…%6]:7863`）⇒ **不监听** `127.0.0.1`
+/// 而宿主的探活打的是 `http://127.0.0.1:{port}/healthz` ⇒ 20 秒后报
+/// 「网关启动超时（端口 7863）：error sending request for url …」。
+///
+/// 归一成回环而不是 `0.0.0.0` 是**刻意的安全默认**：`api_key` 默认为空
+/// （= 不鉴权），监听全网卡等于把本机账号额度暴露给整个局域网。
+/// 需要对外暴露时应显式写 `0.0.0.0:{port}`（那时会触发非回环告警）。
+pub fn ensure_listen_host(listen: &str) -> String {
+    const DEFAULT_PORT: &str = "7863";
+    let s = listen.trim();
+    // IPv6 字面量形如 `[::1]:7863` —— 冒号在方括号里，不能用 split_once 判空。
+    if s.starts_with('[') {
+        if let Some(rest) = s.strip_prefix('[') {
+            if let Some((host, tail)) = rest.split_once("]:") {
+                if host.trim().is_empty() {
+                    return format!("127.0.0.1:{}", tail.trim());
+                }
+                return s.to_string();
+            }
+        }
+        // 括号不配对 ⇒ 当坏输入处理，回落默认端口。
+        return format!("127.0.0.1:{DEFAULT_PORT}");
+    }
+    match s.split_once(':') {
+        // 有 host 有端口：原样保留（`0.0.0.0:7863` 等部署形态必须生效）。
+        Some((host, port)) if !host.trim().is_empty() && !port.trim().is_empty() => s.to_string(),
+        // 空 host `:7863`，或 `host:` 只有冒号没端口 ⇒ 补回环。
+        Some((_, port)) => {
+            let p = port.trim();
+            format!("127.0.0.1:{}", if p.is_empty() { DEFAULT_PORT } else { p })
+        }
+        // 裸端口 `7863`；空串则回落默认端口。
+        None => {
+            if s.is_empty() {
+                format!("127.0.0.1:{DEFAULT_PORT}")
+            } else {
+                format!("127.0.0.1:{s}")
+            }
+        }
+    }
+}
+
 /// 默认凭证目录。
 fn default_auth_dir() -> String {
     "./auths".into()
@@ -1410,13 +1465,21 @@ impl Config {
             self.upstream.idle_timeout_seconds = 300;
         }
 
-        // 裸端口（无冒号）补成回环地址 —— 不能补成 `:{port}`（全网卡）。
+        // 裸端口补成回环地址 —— 不能留成 `:{port}`（空 host）。
         //
-        // `:{port}` 会监听所有网卡，而 `api_key` 默认为空（= 不鉴权），
-        // 两者叠加等于把本机账号额度暴露给整个局域网。
-        if !self.listen.contains(':') {
-            self.listen = format!("127.0.0.1:{}", self.listen);
-        }
+        // ★★ 2026-10-17 修正：原判据是 `if !self.listen.contains(':')`，
+        // 只处理**无冒号**的裸端口 "7863"，把 `:7863`（**有冒号、但 host 为空**）
+        // 原样放行。这条判据漏掉了宿主实际写进来的形态 ——
+        // `crates/ai-gateway-core/src/modules/gateway.rs::normalize_listen()`
+        // 恒返回 `format!(":{port}")`，于是每台机器上的 `listen` 都是 `:7863`。
+        //
+        // 空 host 交给 `TcpListener::bind` 后走 `getaddrinfo`，**各平台结果不同**：
+        //   - Linux/macOS → 只回环，探测 127.0.0.1 能通（故 CI 全绿）
+        //   - Windows     → 枚举全部网卡，IPv6 link-local 排第一
+        //                   （实测 `[fe80::…%6]:7863`）⇒ 不监听 127.0.0.1
+        // 宿主探活打的是 `http://127.0.0.1:{port}/healthz` ⇒ 必然超时 20 秒后
+        // 报「网关启动超时（端口 7863）：error sending request for url …」。
+        self.listen = ensure_listen_host(&self.listen);
 
         // 空数组 = 未配置 → 回落默认。
         if self.schedule.checkin_hours.is_empty() {
@@ -1770,6 +1833,55 @@ mod tests {
         assert_eq!(c.parsed.session_ttl, Duration::from_secs(1800));
         assert_eq!(c.parsed.session_gc_interval, Duration::from_secs(300));
         assert_eq!(c.parsed.credit_refresh_interval, Duration::from_secs(900));
+    }
+
+    // ★★ 2026-10-17 回归：宿主写的 `listen` 恒为 `:7863`（空 host）。
+    // 它含冒号，故旧判据 `if !self.listen.contains(':')` 放行；
+    // 空 host 在 Windows 上 bind 到 IPv6 link-local ⇒ 宿主探活 127.0.0.1 超时。
+    // 这组测试钉住「空 host 必须被补成回环」。
+    #[test]
+    fn listen_with_empty_host_becomes_loopback() {
+        // 宿主 normalize_listen() 的实际输出形态
+        assert_eq!(ensure_listen_host(":7863"), "127.0.0.1:7863");
+        // 裸端口（旧判据覆盖的那条，不许回退）
+        assert_eq!(ensure_listen_host("7863"), "127.0.0.1:7863");
+        // 空白串回落默认端口
+        assert_eq!(ensure_listen_host(""), "127.0.0.1:7863");
+        assert_eq!(ensure_listen_host("   "), "127.0.0.1:7863");
+        // 只有冒号没端口
+        assert_eq!(ensure_listen_host("127.0.0.1:"), "127.0.0.1:7863");
+    }
+
+    #[test]
+    fn listen_with_explicit_host_is_preserved() {
+        // 部署形态必须原样生效 —— 这正是 2026-10-17 那次「host 部分必须生效」
+        // 改动的目的，不能被本次修复顺手改回回环。
+        assert_eq!(ensure_listen_host("0.0.0.0:7863"), "0.0.0.0:7863");
+        assert_eq!(ensure_listen_host("127.0.0.1:7863"), "127.0.0.1:7863");
+        assert_eq!(ensure_listen_host("192.168.1.10:8080"), "192.168.1.10:8080");
+        assert_eq!(ensure_listen_host("localhost:7863"), "localhost:7863");
+        // IPv6 字面量：方括号里的冒号不能被当成 host 分隔符
+        assert_eq!(ensure_listen_host("[::1]:7863"), "[::1]:7863");
+        assert_eq!(ensure_listen_host("[::]:7863"), "[::]:7863");
+        // IPv6 空 host 也要补回环
+        assert_eq!(ensure_listen_host("[]:7863"), "127.0.0.1:7863");
+    }
+
+    /// 走完整的 `Config::from_json` 路径 —— 光测 `ensure_listen_host` 证明不了
+    /// `normalize()` 真的调到了它（这正是 D20 那条「测试够不着被改的代码」的教训）。
+    #[test]
+    fn config_from_json_normalizes_empty_host_listen() {
+        let raw = br#"{"listen":":7863"}"#;
+        let c = Config::from_json(raw).unwrap();
+        assert_eq!(
+            c.listen, "127.0.0.1:7863",
+            "宿主写入的空 host 必须在 normalize 阶段补成回环"
+        );
+
+        // 显式 host 不许被改写
+        let raw = br#"{"listen":"0.0.0.0:7863"}"#;
+        let c = Config::from_json(raw).unwrap();
+        assert_eq!(c.listen, "0.0.0.0:7863");
     }
 
     #[test]

@@ -604,13 +604,19 @@ async fn main() {
     // `("127.0.0.1", port)` —— 于是配置写 "0.0.0.0:7863" 也仍然只听回环，
     // 部署到服务器后外部永远访问不到，而日志还打印
     // "listening on http://127.0.0.1:..."，看不出任何异常。
+    //
+    // ★★ 2026-10-17 修正：不能假定「配置已在 normalize 阶段补成 host:port」。
+    // `Config::normalize()` 确实会把空 host 补成回环，但这里仍**再兜一次**，
+    // 理由有二：
+    //   1. `cfg.listen` 也可由 `WB2A_LISTEN` 环境变量注入（config.rs 的
+    //      `apply_env`），路径不止一条；
+    //   2. 万一将来 normalize 的判据被改窄，这里静默 bind 到空 host 的后果是
+    //      **Windows 上枚举全部网卡、IPv6 link-local 优先** ⇒ 宿主探活
+    //      `127.0.0.1:{port}/healthz` 必然超时，且日志会打印一个看起来
+    //      「正常」的地址。宁可多一次防御，也不要让这类失败再静默复现。
     let bind_addr = port_override
         .map(|p| format!("127.0.0.1:{p}"))
-        .unwrap_or_else(|| {
-            // 配置已在 normalize 阶段把裸端口补成回环前缀，
-            // 故这里拿到的必定是 "host:port" 形式。
-            cfg.listen.clone()
-        });
+        .unwrap_or_else(|| ai_gateway_router::config::ensure_listen_host(&cfg.listen));
 
     // 非回环监听时必须提醒：网关的 `api_key` 默认为空（= 不鉴权），
     // 两者叠加等于把账号额度对整个网络开放。不阻断启动（部署场景确实需要），
