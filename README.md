@@ -158,7 +158,7 @@ ai-gateway        (momo0410)      网关页面、账号同步、单文件内嵌�
 | 我想…… | 翻这份 |
 |---|---|
 | **开始动手改代码** | [docs/AGENTS.md](docs/AGENTS.md) —— 开发入口（环境与命令、硬约束、工作流、验证纪律） |
-| 知道「为什么当初这么选」/ 想推翻旧结论 | [docs/DECISIONS.md](docs/DECISIONS.md) |
+| 知道「为什么当初这么选」/ 想推翻旧结论 | **`.agents/notes/`** —— 决策笔记（唯一规则；原 docs/DECISIONS.md 的 D01–D20 已全部迁入该树） |
 | 发版、签名、本机运行、按现象排障、回滚 | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
 | 写测试 / 跑验收 / 怀疑门禁是不是假的 | [docs/TESTING.md](docs/TESTING.md) |
 | 改用户能看见的行为之前对齐语义 | [docs/FEATURES.md](docs/FEATURES.md) |

@@ -8,7 +8,7 @@
 | 我想…… | 翻这份 |
 |---|---|
 | **开始动手改代码** | [AGENTS.md](AGENTS.md) —— 开发入口，开工第一件事 |
-| 知道「为什么当初这么选」/ 想推翻旧结论 | [DECISIONS.md](DECISIONS.md) |
+| 知道「为什么当初这么选」/ 想推翻旧结论 | **`.agents/notes/`** —— 决策笔记，唯一规则（`{lifecycle}/{class}/yyyy-mm-dd-topic.md`） |
 | 发版、在本机跑起来、按现象排障、回滚 | [RUNBOOK.md](RUNBOOK.md) |
 | 写测试 / 跑验收 / 怀疑门禁是不是假的 | [TESTING.md](TESTING.md) |
 | 改用户能看见的行为之前对齐语义 | [FEATURES.md](FEATURES.md) |
@@ -22,12 +22,11 @@
 | 文档 | 定位 | 更新触发 |
 |---|---|---|
 | [AGENTS.md](AGENTS.md) | 开发入口：环境与命令、硬约束、工作流、验证纪律 | 命令/约束/流程变化时 |
-| [DECISIONS.md](DECISIONS.md) | 决策记录：为何选它、排除了什么、何时该翻案 | 做出或推翻一项决策时 |
 | [RUNBOOK.md](RUNBOOK.md) | 发版、签名、本机运行、按现象排障、回滚 | 发布流程或排障手法变化时 |
 | [TESTING.md](TESTING.md) | 门禁与基线、四层测试、真机验收约定、禁止假绿门禁 | 测试体系或基线变化时 |
 | [FEATURES.md](FEATURES.md) | 用户可见行为规格（路由、报错文案、流式收尾、用量护栏） | 行为变化时 |
 | [SERVER-DEPLOY-1.0.46.md](SERVER-DEPLOY-1.0.46.md) | 1.0.46 纯部署服务端的交付物、校验与部署步骤 | 该产物重新打包时 |
-| [GO-STARTUP-WIRING-AUDIT.md](GO-STARTUP-WIRING-AUDIT.md) | Go→Rust 迁移期的启动接线穷尽对照（**历史审计，只读**） | 不再更新；结论过时在 DECISIONS.md 翻案 |
+| [GO-STARTUP-WIRING-AUDIT.md](GO-STARTUP-WIRING-AUDIT.md) | Go→Rust 迁移期的启动接线穷尽对照（**历史审计，只读**） | 不再更新；结论过时在新笔记里翻案 |
 
 > 仓库根另有两份**长期存在**的文档，不属于 `docs/` 但同样重要：
 > `README.md`（用户视角导览）、`AGENTS.md`（编码契约硬约束）。

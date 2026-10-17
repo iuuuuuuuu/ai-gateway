@@ -4,7 +4,8 @@
 > 最后核对：2026-10-15 ｜ 分支 `main` ｜ 版本 **1.0.46** ｜ 核对时 HEAD `dc729e9`
 >
 > **什么时候翻它**：跑门禁、判断「这个绿是不是真的」、写新测试/新探针、怀疑基线数字过时。
-> 想知道「当初为什么这么选」→ [DECISIONS.md](DECISIONS.md)；发版与打包步骤 → [RUNBOOK.md](RUNBOOK.md)。
+> 想知道「当初为什么这么选」→ **`.agents/notes/`**（决策笔记，唯一规则；
+> 原 `docs/DECISIONS.md` 已全部迁入该树）；发版与打包步骤 → [RUNBOOK.md](RUNBOOK.md)。
 
 ---
 

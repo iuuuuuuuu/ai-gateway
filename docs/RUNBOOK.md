@@ -538,7 +538,7 @@ npx tauri build --no-bundle --config "<路径>\override.json"
 
 > ⚠ **2026-10-15 更正**：本节此前（以及若干注释里）称"名额满时**排队**而非失败（`server.Config.InFlightWait` 默认 3000 ms）"—— **在当前 Rust 实现里不成立**。逐条核实：`Pool::acquire` 满额时**直接返回 `false`**；`forward.rs` 是唯一调用点，返回 false 时**换号重试**；全仓库 `InFlightWait` / `in_flight_wait` 只命中 2 处、**都在注释里、没有实现**。`server.Config.InFlightWait` / `pool.AcquireWait` 是 **Go 版**（`go-gateway/`，已不参与构建）的标识符。
 >
-> ⇒ 现行语义：**每账号最多 3 个在途；满额时该账号被跳过、请求换号重试**，不存在等待/排队。对**单账号产品**而言换号无处可换 —— 这正是"并发重试成片 503"的成因形状。**保留换号还是补回排队，是需要重新评估的决策**（见 [DECISIONS.md](DECISIONS.md)）。
+> ⇒ 现行语义：**每账号最多 3 个在途；满额时该账号被跳过、请求换号重试**，不存在等待/排队。对**单账号产品**而言换号无处可换 —— 这正是"并发重试成片 503"的成因形状。**保留换号还是补回排队，是需要重新评估的决策**（见 `.agents/notes/implemented/architecture/2026-09-22-max-in-flight-and-account-switch-retry.md`）。
 
 **排查这类问题的方法**（值得记住）：
 

@@ -703,10 +703,12 @@ curl.exe -s -X POST "http://127.0.0.1:$port/v1/chat/completions" `
 >
 > 改魔数时务必同步本节 —— 文档与代码分叉比没有文档更糟。
 
-## 决策笔记（`.agents/notes/`，非平凡改动必带）
+## 决策笔记（`.agents/notes/`，唯一的决策记录规则）
 
-系统级的「为什么长这样」写在 `docs/DECISIONS.md`；**单次改动的边界与否决理由**
-写在 `.agents/notes/{lifecycle}/{class}/yyyy-mm-dd-topic.md`。两者分工不重叠。
+**决策一律写在 `.agents/notes/{lifecycle}/{class}/yyyy-mm-dd-topic.md`，这是唯一的
+决策记录规则。** 原先那份 `docs/DECISIONS.md`（D01–D20）已**全部迁移**进笔记树并删除；
+查某条历史决策去 `.agents/notes/implemented/` 下按分类翻（architecture / bug-fix /
+process）。新决策**不许**另起文档，一律进笔记。
 
 - 命中任一即**非平凡**、必须留笔记：改了行为、架构、跨文件契约、流程与工具链、
   测试策略、落盘/网络/配置格式，或其他维护者日后可能重访的决定。判不准时从严。

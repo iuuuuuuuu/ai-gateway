@@ -302,10 +302,11 @@ if ($err.Count) { $err | Select-Object -First 3 | ForEach-Object { "行 $($_.Ext
 ## 4. 工作流
 
 1. **先读文档**：本页 → [README.md](README.md) 文档地图 → 与改动相关的主题文档。
-   查「为什么当初这么选」翻 [DECISIONS.md](DECISIONS.md)。
+   查「为什么当初这么选」翻 **`.agents/notes/`**（决策笔记，按 `{lifecycle}/{class}`
+   分目录；原 `docs/DECISIONS.md` 的 D01–D20 已全部迁入该树，原文件已删除）。
 2. **改代码**：改动范围只落在被指派的部分；连带影响可自主修掉，**不相关的别碰**。
 3. **跑门禁**：`npm run build` + `cargo test --workspace`，**不低于 §5.1 的基线**。
-4. **同步文档**：行为变化 → [FEATURES.md](FEATURES.md)；决策变化 → [DECISIONS.md](DECISIONS.md)；流程变化 → [RUNBOOK.md](RUNBOOK.md)；测试体系变化 → [TESTING.md](TESTING.md)。文档与代码**同一次提交**更新。
+4. **同步文档**：行为变化 → [FEATURES.md](FEATURES.md)；**决策变化 → `.agents/notes/`**；流程变化 → [RUNBOOK.md](RUNBOOK.md)；测试体系变化 → [TESTING.md](TESTING.md)。文档与代码**同一次提交**更新。
 5. **交付前必须自己跑实测**（§5.2）—— 这是硬要求，不是建议。
 6. **提交 / 推送**：本地 commit 允许且鼓励；**push 必须等业主显式授权**。
 
@@ -326,7 +327,7 @@ if ($err.Count) { $err | Select-Object -First 3 | ForEach-Object { "行 $($_.Ext
 | 目标 | 最新已知 | 口径来源 |
 |---|---|---|
 | `cargo test --workspace` | **3081 passed / 0 failed / 7 ignored**（15 suite） | 1.0.36（2026-10-08/09） |
-| `cargo test --workspace` → router | **1798 passed / 0 failed / 1 ignored** | 2026-10-16 本轮（版本仍 1.0.46，未 bump；1.0.46 为 1780，净增 18 = 会话头族 5 + 国际版身份头 4 + 熔断区域隔离 3 + 会话头族解析 1 + **11140 误判回归 5**（见 D20）；另新增线级套件 `tests/ab_conversation_headers.rs` 3 条，**不在 lib 计数内**） |
+| `cargo test --workspace` → router | **1798 passed / 0 failed / 1 ignored** | 2026-10-16 本轮（版本仍 1.0.46，未 bump；1.0.46 为 1780，净增 18 = 会话头族 5 + 国际版身份头 4 + 熔断区域隔离 3 + 会话头族解析 1 + **11140 误判回归 5**（见 `.agents/notes/implemented/bug-fix/2026-10-16-banned-11140-not-3012.md`）；另新增线级套件 `tests/ab_conversation_headers.rs` 3 条，**不在 lib 计数内**） |
 | `cargo test --workspace` → core | **1301 passed / 0 failed / 4 ignored** | 1.0.46（2026-10-14，§9.21） |
 | `cargo test --workspace` → src-tauri | **28 passed / 0 failed / 0 ignored** | 2026-10-16 本轮（1.0.46 基线为 17；新增 7 条设备 token 发现门禁 + 4 条既有） |
 | `cargo test -p ai-gateway-router` | 1685 / 0 / 1 | **1.0.34 旧口径**，已被 1780 取代 |
@@ -506,7 +507,7 @@ $got -contains $want    # True = 内嵌的是当前前端
 | 我想…… | 翻这份 |
 |---|---|
 | 看 `docs/` 全部文档与分工 | [README.md](README.md) |
-| 知道「为什么当初这么选」/ 想推翻旧结论 | [DECISIONS.md](DECISIONS.md) |
+| 知道「为什么当初这么选」/ 想推翻旧结论 | **`.agents/notes/`**（决策笔记，唯一规则；原 DECISIONS.md 的 D01–D20 已全部迁入该树） |
 | 发版、本机跑起来、按现象排障、回滚 | [RUNBOOK.md](RUNBOOK.md) |
 | 写测试 / 跑验收 / 怀疑门禁是假的 | [TESTING.md](TESTING.md) |
 | 改用户能看见的行为之前对齐语义 | [FEATURES.md](FEATURES.md) |
