@@ -45,7 +45,13 @@ npm/platform/*/bin/
 # AI 工具本地配置
 .codebuddy/
 .cursor/
-.agents/
+.agents/*
+# 例外：决策笔记树与它的校验脚本必须入库 —— 否则 CI 的 verify-notes 无从运行，
+# 笔记也会只留在某台机器上。除此之外 .agents/ 仍是本机私货（trellis-* 等）。
+!.agents/notes/
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/agent-notes/
 .codex/
 .grok/
 /.workbuddy/

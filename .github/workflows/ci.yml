@@ -177,3 +177,40 @@ jobs:
 
       - name: release 二进制编译
         run: cargo build -p ai-gateway-server --release
+
+  # 决策笔记门禁（.agents/notes/）。
+  #
+  # 三条校验：目录/分类/文件名与笔记间链接、头块与必备小节、归档封印。
+  # 详见 .agents/notes/implemented/process/2026-10-17-agent-notes-tree-and-ci-gate.md。
+  #
+  # 为什么不并进 check 矩阵：笔记校验与平台无关，三平台各跑一遍纯烧时间。
+  # 为什么不单开一个 workflow 文件：那样会得到第二个 concurrency 组，
+  # 同一分支连续 push 时两条流水线各自取消，笔记门禁与编译门禁的结论会来自
+  # 不同 commit。放在这里共享 ci-${{ github.ref }}。
+  #
+  # fetch-depth: 0 是必须的 —— verify-archived 要用 `git show <base>:manifest.json`
+  # 取变更前的封印表做只增比对，浅克隆里那个 commit 对象不存在，
+  # 脚本会静默降级成「只比哈希」，等于少查一半。
+  notes:
+    name: notes / 决策笔记门禁
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # 基线必须是**变更前**的 commit：PR 用 base.sha，push 用 event.before。
+      # 用默认的 HEAD 等于拿当前树跟自己比，永远一致 —— 那是假绿。
+      # 新分支 push 时 before 是全零，git show 失败后脚本跳过只增比对，
+      # 但「封印哈希 vs 磁盘」仍然照跑。
+      - name: 决策笔记校验（tree / format / archive seals）
+        env:
+          AGENT_NOTE_ARCHIVE_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: npm run verify-notes

@@ -10,10 +10,14 @@ These instructions are for AI assistants working in this project.
 > 实测**不成立**：`.trellis/` 有 **75 个文件在版本控制内**（含 `.trellis/workflow.md`、
 > `.trellis/spec/**` 27 个、`.trellis/tasks/**` 10 个、`.trellis/agents/**` 2 个、
 > `.trellis/scripts/**` 28 个），最后提交 `401ab97`（2026-09-18）。
-> 确实不存在的是 `.trellis/spec/cli/`、`.codex/`、`.grok/`（后两者在 `.gitignore` 中）；
-> `.agents/` 目录存在但被 `.gitignore:48` 排除、**不在版本控制内**。
+> 确实不存在的是 `.trellis/spec/cli/`、`.codex/`、`.grok/`（后两者在 `.gitignore` 中）。
 >
-> 复核命令（可自行复现）：`git ls-files .trellis | wc -l`、`git ls-files .trellis/spec | wc -l`。
+> **2026-10-17 更新**：`.agents/` 不再整体排除 —— `.agents/notes/`（决策笔记树）与
+> `.agents/skills/agent-notes/`（它的校验脚本）**已入库**，其余 `.agents/*`（含
+> `trellis-*` 技能）仍是本机私货。判据见 `.gitignore` 里的三条 `!` 例外。
+>
+> 复核命令（可自行复现）：`git ls-files .trellis | wc -l`、`git ls-files .trellis/spec | wc -l`、
+> `git ls-files .agents | wc -l`。
 
 当前生效的编码约定见下方各节（UI Component Policy、Git Commit Language）。
 
@@ -698,6 +702,34 @@ curl.exe -s -X POST "http://127.0.0.1:$port/v1/chat/completions" `
 > 这正是「并发重试成片 503」的成因形状。**保留换号还是补回排队，是需要重新评估的决策。**
 >
 > 改魔数时务必同步本节 —— 文档与代码分叉比没有文档更糟。
+
+## 决策笔记（`.agents/notes/`，非平凡改动必带）
+
+系统级的「为什么长这样」写在 `docs/DECISIONS.md`；**单次改动的边界与否决理由**
+写在 `.agents/notes/{lifecycle}/{class}/yyyy-mm-dd-topic.md`。两者分工不重叠。
+
+- 命中任一即**非平凡**、必须留笔记：改了行为、架构、跨文件契约、流程与工具链、
+  测试策略、落盘/网络/配置格式，或其他维护者日后可能重访的决定。判不准时从严。
+- **纯机械改动禁止立笔记**：格式化、错别字、无歧义重命名、不改行为的样式调整与
+  依赖补丁、版本打标、单模块内看 diff 即懂的修复。
+- `lifecycle` 封闭集：`proposed` / `implemented` / `rejected` / `archived`；
+  `class` 封闭集：`feature` / `bug-fix` / `simplification` / `architecture` /
+  `process` / `testing`。**不建 `INDEX.md`**。
+- `implemented` 的 `## Decision` 用现在时；`## Alternatives considered` 必填，
+  且只写**真的权衡过**的方案（先写它的最强理由再否定）。
+- 笔记与代码**同一次改动**落盘（同一 commit）。
+- 改动已有归属的事实时**就地更新**那篇，不要另起新篇；理由翻转则新开一篇并互链，
+  禁止把 `## Decision` 改写成反面。
+
+门禁（CI 的 `notes` job 跑同一条）：
+
+```powershell
+npm run verify-notes      # tree + format + archive seals，失败即红
+npm run archive-agent-note -- <path> [--superseded-by <新笔记>]
+```
+
+完整方法与模板见 `.agents/skills/agent-notes/SKILL.md`；本仓库的接入决定见
+`.agents/notes/implemented/process/2026-10-17-agent-notes-tree-and-ci-gate.md`。
 
 ## Git Commit Language
 

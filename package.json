@@ -11,7 +11,13 @@
     "build": "tsc && vite build",
     "build:demo": "tsc && VITE_DEMO_MODE=1 VITE_PAGES_DEMO=1 vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "verify-agent-note-tree": "tsx .agents/skills/agent-notes/scripts/verify-agent-note-tree.ts",
+    "verify-agent-note-format": "tsx .agents/skills/agent-notes/scripts/verify-agent-note-format.ts",
+    "verify-archived": "tsx .agents/skills/agent-notes/scripts/verify-archived-agent-notes.ts",
+    "verify-notes": "npm run verify-agent-note-tree && npm run verify-agent-note-format && npm run verify-archived",
+    "archive-agent-note": "tsx .agents/skills/agent-notes/scripts/archive-agent-note.ts",
+    "check-anchors": "tsx .agents/skills/agent-notes/scripts/check-note-anchors.ts"
   },
   "dependencies": {
     "@fontsource-variable/bricolage-grotesque": "^5.3.0",
@@ -51,6 +57,7 @@
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
     "tailwindcss": "^4.3.3",
+    "tsx": "^4.23.15",
     "typescript": "~5.8.3",
     "vite": "^7.0.4"
   }
