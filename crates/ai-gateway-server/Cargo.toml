@@ -1,6 +1,6 @@
 [package]
 name = "ai-gateway-server"
-version = "1.0.46"
+version = "1.0.47"
 edition = "2021"
 description = "ai-gateway HTTP server + CLI（npm 安装形态：ai-gateway 命令启动本地 webui）"
 
@@ -14,3 +14,8 @@ axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 serde_json = "1"
 rust-embed = "8"
+
+[dev-dependencies]
+# 鉴权中间件测试要发**真请求**过路由（不是直接调中间件函数）。
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

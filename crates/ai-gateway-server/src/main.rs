@@ -124,12 +124,51 @@ async fn serve(args: &[String]) {
         }
     }
 
-    let app = api::router();
-    let addr = format!("127.0.0.1:{port}");
+    // ★ 监听地址可配（2026-10-17）。默认仍为回环 127.0.0.1，保持旧行为不变；
+    // 部署到服务器时用 --host 0.0.0.0 才对外开放。
+    let mut host = String::from("127.0.0.1");
+    if let Some(i) = args.iter().position(|a| a == "--host") {
+        if let Some(h) = args.get(i + 1).filter(|h| !h.starts_with('-')) {
+            host = h.clone();
+        }
+    }
+
+    // ★ 可选访问令牌。不设时不鉴权（与历史行为一致），
+    // 但若同时监听非回环地址，启动时会强提醒。
+    let mut access_token = String::new();
+    if let Some(i) = args.iter().position(|a| a == "--access-token") {
+        if let Some(tk) = args.get(i + 1).filter(|s| !s.starts_with('-')) {
+            access_token = tk.clone();
+        }
+    }
+    // 也支持环境变量（systemd / Docker 不把令牌写进命令行，避免被 ps 看到）。
+    if access_token.is_empty() {
+        if let Ok(v) = std::env::var("AI_GATEWAY_ACCESS_TOKEN") {
+            if !v.trim().is_empty() {
+                access_token = v.trim().to_string();
+            }
+        }
+    }
+
+    let is_loopback = host == "127.0.0.1"
+        || host == "localhost"
+        || host == "::1"
+        || host.starts_with("127.");
+    if !is_loopback && access_token.is_empty() {
+        eprintln!("⚠⚠ 安全提醒：正在监听 {host}:{port}（非回环），但未设置访问令牌。");
+        eprintln!("   任何能访问该端口的人都可以读取你的全部账号凭证、修改网关配置。");
+        eprintln!("   建议加 --access-token <令牌> 或设环境变量 AI_GATEWAY_ACCESS_TOKEN。");
+        eprintln!("   若确实只在受信任内网（VPN / 安全组）中使用，可忽略本提醒。");
+    } else if !is_loopback {
+        println!("已启用访问令牌鉴权（非回环监听 {host}:{port}）。");
+    }
+
+    let app = api::router(access_token.clone());
+    let addr = format!("{host}:{port}");
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("启动失败: 端口 {port} 被占用或不可用（{e}）。可用 --port 指定其他端口。");
+            eprintln!("启动失败: 无法监听 {addr}（{e}）。可用 --port / --host 指定其他地址。");
             std::process::exit(1);
         }
     };
@@ -138,7 +177,8 @@ async fn serve(args: &[String]) {
     println!("webui: http://{addr}");
     println!("按 Ctrl+C 停止服务。");
 
-    let no_open = args.iter().any(|a| a == "--no-open");
+    // 绑定非回环时不自动开浏览器：本机打开 0.0.0.0 这个地址是访问不到的。
+    let no_open = args.iter().any(|a| a == "--no-open") || !is_loopback;
     if !no_open {
         open_browser(&addr);
     }

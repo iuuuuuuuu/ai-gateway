@@ -117,7 +117,12 @@ pub fn warm_caches() {
     });
 }
 
-pub fn router() -> Router {
+/// 构建路由。
+///
+/// access_token 非空时挂上鉴权中间件：除静态资源（webui 页面本身）外，
+/// 所有 /api/* 请求必须带 Authorization: Bearer <token> 或 ?token=<token>。
+/// 空字符串 = 不鉴权（与历史行为一致；默认只监听回环时安全）。
+pub fn router(access_token: String) -> Router {
     Router::new()
         .route("/api/status", get(api_status))
         .route("/api/accounts", get(api_accounts))
@@ -557,6 +562,62 @@ pub fn router() -> Router {
         .route("/api/tasks/run", post(proxy_api::api_task_run_now))
 
         .fallback(static_handler)
+        // 鉴权层：layer 作用于已有全部路由（含 fallback）。
+        // 中间件内部只拦 /api/：静态资源不鉴权，否则浏览器直接打开页面时
+        // 连 HTML/JS 都拿不到，页面白屏。
+        .layer(axum::middleware::from_fn(move |req, next| {
+            let token = access_token.clone();
+            async move { require_access_token(token, req, next).await }
+        }))
+}
+
+/// 访问令牌鉴权中间件。
+///
+/// 只拦 /api/ 开头的路径。支持两种传法：
+/// Authorization: Bearer <token>（推荐）与 ?token=<token>（便于浏览器地址栏验证）。
+async fn require_access_token(
+    token: String,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if token.is_empty() {
+        return next.run(req).await;
+    }
+    if !req.uri().path().starts_with("/api/") {
+        return next.run(req).await;
+    }
+    let header_ok = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            let v = v.trim();
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+                .map(|t| t.trim() == token)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let query_ok = req
+        .uri()
+        .query()
+        .map(|q| {
+            q.split('&').any(|kv| {
+                let mut it = kv.splitn(2, '=');
+                let k = it.next().unwrap_or("");
+                let v = it.next().unwrap_or("");
+                k == "token" && v == token
+            })
+        })
+        .unwrap_or(false);
+    if header_ok || query_ok {
+        next.run(req).await
+    } else {
+        json_err(
+            "需要访问令牌：请在请求头带 Authorization: Bearer <token>".to_string(),
+            StatusCode::UNAUTHORIZED,
+        )
+    }
 }
 
 fn json_ok(v: Value) -> Response {
@@ -2023,6 +2084,86 @@ mod tests {
     ///
     /// ⚠ 运行时读文件而非 `include_str!`：后者把内容嵌进编译产物，
     /// 改前端不重编就测不出漂移。
+    /// ★★ 访问令牌鉴权（真请求过路由）。
+    ///
+    /// 为什么发真请求而不是直接调 `require_access_token`：直接调只能验证那个函数
+    /// 本身，验证不了「它有没有真被挂到路由上」—— 而「写了中间件但忘了 .layer(...)」
+    /// 正是本项目反复出现的缺陷形状（见下方 ROUTES 一致性测试的背景）。
+    mod access_token_auth {
+        use super::super::router;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        async fn status_of(token: &str, req: Request<Body>) -> StatusCode {
+            let app = router(token.to_string());
+            app.oneshot(req).await.expect("请求应返回响应").status()
+        }
+
+        fn api_get(path: &str) -> Request<Body> {
+            Request::builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("构造请求失败")
+        }
+
+        /// 设了令牌、但请求不带 ⇒ **必须 401**。这是整个鉴权的底线。
+        #[tokio::test]
+        async fn api_request_without_token_is_rejected() {
+            let code = status_of("s3cret", api_get("/api/status")).await;
+            assert_eq!(code, StatusCode::UNAUTHORIZED, "无令牌必须拒绝");
+        }
+
+        /// 错误令牌 ⇒ **必须 401**（防「非空即放行」的假实现）。
+        #[tokio::test]
+        async fn api_request_with_wrong_token_is_rejected() {
+            let req = Request::builder()
+                .uri("/api/status")
+                .header("authorization", "Bearer wrong")
+                .body(Body::empty())
+                .expect("构造请求失败");
+            let code = status_of("s3cret", req).await;
+            assert_eq!(code, StatusCode::UNAUTHORIZED, "错误令牌必须拒绝");
+        }
+
+        /// 正确令牌（Authorization 头）⇒ **不能是 401**。
+        /// 只断言「不是 401」而不断言 200：该接口会真去读账号目录，
+        /// 内容依赖环境，断言 200 会在干净机器上假红。
+        #[tokio::test]
+        async fn api_request_with_correct_header_token_passes() {
+            let req = Request::builder()
+                .uri("/api/status")
+                .header("authorization", "Bearer s3cret")
+                .body(Body::empty())
+                .expect("构造请求失败");
+            let code = status_of("s3cret", req).await;
+            assert_ne!(code, StatusCode::UNAUTHORIZED, "正确令牌不应被拒");
+        }
+
+        /// 正确令牌（query 参数）⇒ 不能是 401。
+        #[tokio::test]
+        async fn api_request_with_correct_query_token_passes() {
+            let code = status_of("s3cret", api_get("/api/status?token=s3cret")).await;
+            assert_ne!(code, StatusCode::UNAUTHORIZED, "query 令牌不应被拒");
+        }
+
+        /// 空令牌 = 不鉴权（保持旧行为）⇒ 不能是 401。
+        /// 若这条失败，说明「没设令牌也要鉴权」，会把所有旧用户锁在外面。
+        #[tokio::test]
+        async fn empty_token_disables_auth() {
+            let code = status_of("", api_get("/api/status")).await;
+            assert_ne!(code, StatusCode::UNAUTHORIZED, "未设令牌时不应鉴权");
+        }
+
+        /// 静态资源不鉴权 ⇒ 浏览器直接打开页面不会白屏。
+        /// 不断言具体状态码（取决于内嵌资源是否命中），只断言「不是 401」。
+        #[tokio::test]
+        async fn static_asset_is_not_blocked_by_auth() {
+            let code = status_of("s3cret", api_get("/")).await;
+            assert_ne!(code, StatusCode::UNAUTHORIZED, "静态资源不应被鉴权拦截");
+        }
+    }
+
     #[test]
     fn every_frontend_route_path_has_a_server_handler() {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");

@@ -596,14 +596,38 @@ async fn main() {
         Arc::clone(&pool),
     );
 
-    // 监听地址：位置参数优先，其次配置里的 listen（形如 ":7863" 或 "7863"）。
-    let port = port_override.unwrap_or_else(|| {
-        cfg.listen
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(7863)
-    });
+    // 监听地址：位置参数优先，其次配置里的 listen（形如 "0.0.0.0:7863"、
+    // "127.0.0.1:7863" 或裸端口 "7863"）。
+    //
+    // ★ host 部分必须生效（2026-10-17）：此前这里只取端口
+    // （`rsplit(':').next()`），host 被丢弃，且下方 bind 写死了
+    // `("127.0.0.1", port)` —— 于是配置写 "0.0.0.0:7863" 也仍然只听回环，
+    // 部署到服务器后外部永远访问不到，而日志还打印
+    // "listening on http://127.0.0.1:..."，看不出任何异常。
+    let bind_addr = port_override
+        .map(|p| format!("127.0.0.1:{p}"))
+        .unwrap_or_else(|| {
+            // 配置已在 normalize 阶段把裸端口补成回环前缀，
+            // 故这里拿到的必定是 "host:port" 形式。
+            cfg.listen.clone()
+        });
+
+    // 非回环监听时必须提醒：网关的 `api_key` 默认为空（= 不鉴权），
+    // 两者叠加等于把账号额度对整个网络开放。不阻断启动（部署场景确实需要），
+    // 但必须让它在日志里显式可见。
+    let is_loopback = bind_addr.starts_with("127.")
+        || bind_addr.starts_with("localhost")
+        || bind_addr.starts_with("[::1]");
+    if !is_loopback {
+        if cfg.api_key.trim().is_empty() {
+            ai_gateway_router::logline!(
+                "⚠ 网关正在监听 {bind_addr}（非回环）但 api_key 为空：任何能访问该端口的人都能用你的账号额度。"
+            );
+            ai_gateway_router::logline!("⚠ 请在网关配置里设置 api_key，或确认端口未对公网开放。");
+        } else {
+            ai_gateway_router::logline!("网关正在监听 {bind_addr}（非回环，已启用 api_key 鉴权）");
+        }
+    }
 
     // Token 用量统计：与 state.json 同目录的 usage.json
     //（独立文件，避免与池状态互相迁移）。
@@ -1167,10 +1191,10 @@ async fn main() {
         });
     }
 
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
-        .expect("bind failed");
-    ai_gateway_router::logline!("rust gateway listening on http://127.0.0.1:{port} (accounts={n})");
+        .unwrap_or_else(|e| panic!("监听 {bind_addr} 失败：{e}（端口被占用或无权绑定？）"));
+    ai_gateway_router::logline!("rust gateway listening on http://{bind_addr} (accounts={n})");
 
     // 优雅退出：收到 Ctrl+C / 终止信号时先落盘再退出。
     //
