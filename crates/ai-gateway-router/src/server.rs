@@ -485,6 +485,43 @@ fn status_to_json(s: &crate::pool::Status) -> Value {
             );
         }
     }
+    // ── 连败降权（`pool.rs` 的 `consecutive_fails` / `degrade_until`）──────────
+    //
+    // 业主排障时唯一的观测面就是 `/status`：降权若只存在于选号侧，用户只会看到
+    // 「healthy 少了一个、冷却却是 0」，无从知道「这是连续未知失败被摘出去了，
+    // 等 10 分钟或成功一次就回来」。
+    //
+    // ★★ 这两个键**恒输出**（未降权时 `degrade_until` 是显式 `null`、
+    // `consecutive_fails` 是 `0`），与上面 `breaker_until` 的「缺席即无」**不同**。
+    // 理由：宿主需要区分「这个网关版本压根不下发降权信息」与「此刻没有降权」——
+    // 前者该回退到旧展示，后者该显示「运行正常」。若也走 omitempty，两种状态在
+    // JSON 里完全同形，前端只能猜（`breaker_until` 那边就吃过这个亏，
+    // 见 `src/components/pool-status.tsx` 里对 Go 零值时间的处理）。
+    //
+    // ⚠⚠ 这是**对外契约**，改动只许纯增量：既有字段的名字 / 类型 / 语义一个都
+    // 不动。降权生效时 `cooling` 由 `Pool::status_of` 一并置 `true`（它表示的
+    // 就是「此刻不接客」）；`cool_kind` 在没有权威分类的冷却时会多出取值
+    // `"degrade"`，而既有 `soft_rate` / `hard_credit` 的判定逐字不变。
+    // 老宿主不认识这两个键，忽略即可。
+    m.insert("consecutive_fails".into(), s.consecutive_fails.into());
+    // 与 `until` / `breaker_until` **同格式**（RFC3339 字符串，秒精度）——
+    // 前端那两个字段已有解析器（`parseGoTime`），同格式才能复用同一套倒计时。
+    //
+    // 转换失败（`SystemTime` 早于 Unix 纪元，实际不可能）时给 `null` 而不是空串：
+    // 空串会让 `new Date("")` 变成 `Invalid Date`，而 `null` 是「没有截止」的
+    // 明确表达，与「未降权」在语义上正好一致。
+    let degrade_until = s.degrade_until.and_then(|t| {
+        t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| {
+                chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
+                    .map(|dt| dt.to_rfc3339())
+            })
+    });
+    m.insert(
+        "degrade_until".into(),
+        degrade_until.map(Value::from).unwrap_or(Value::Null),
+    );
     if s.soonest_expire_at != 0 {
         m.insert("soonest_expire_at".into(), s.soonest_expire_at.into());
     }
@@ -3701,6 +3738,197 @@ mod tests {
         // 的等价写法即可，但显式断言更直白。
         assert!(cn.as_object().unwrap().contains_key("product"));
         assert!(cn.as_object().unwrap().contains_key("region"));
+    }
+
+    /// 取 `/status` 的 `accounts[]` 里某个 uid 的那一条。
+    ///
+    /// 刻意走**真实路由**（`router(state).oneshot(...)`）而不是直接调
+    /// [`status_to_json`]：本任务改的是**对外 JSON 契约**，而「函数返回值里有这个键」
+    /// 与「HTTP 响应体里有这个键」是两件事 —— 中间隔着 handler 的字段挑选
+    /// （`status()` 里那段 `p.list().iter().map(status_to_json)`）。
+    async fn status_account(state: &Arc<AppState>, uid: &str) -> Value {
+        let app = router(Arc::clone(state));
+        let res = app
+            .oneshot(Request::builder().uri("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        let accounts = v["accounts"].as_array().expect("accounts 必须是数组");
+        accounts
+            .iter()
+            .find(|a| a["uid"] == uid)
+            .unwrap_or_else(|| panic!("accounts 里找不到 {uid}: {v}"))
+            .clone()
+    }
+
+    /// ★ `/status` 必须把**连败降权**透出到 JSON。
+    ///
+    /// # 为什么这三个断言就是全部契约
+    ///
+    /// 宿主（`GatewayPage` / `pool-status.tsx`）唯一能看到的降权信息就来自这里。
+    /// 降权只写在选号侧的话，用户的症状是「`healthy` 少了一个、`cooling` 却是 0」——
+    /// 而 `/status` 里**没有任何字段**能解释那一格去哪了。
+    ///
+    /// 三个状态逐个钉住：
+    ///
+    /// 1. **未降权** → `degrade_until` 是显式 `null`（不是键缺席）、`consecutive_fails` 为 0
+    /// 2. **降权中** → `degrade_until` 是非空 RFC3339、`cooling` 为 `true`、
+    ///    `cool_kind` 为 `"degrade"`、`consecutive_fails` 如实反映本轮连败数
+    /// 3. **恢复后** → 回到第 1 种状态（成功一次即回池，`degrade_until` 必须变回 `null`）
+    ///
+    /// ⚠ 「能解析成时间」比「是字符串」更值得断言：`until` / `breaker_until` 都是
+    /// RFC3339，前端 `parseGoTime` 直接 `new Date(raw)`。若这里给了 Unix 秒
+    /// （`1750000000` 这种），`new Date` 会解析成一个荒谬的时刻而**不报错**，
+    /// 前端只能显示「还剩 2000 年」。故用 `DateTime::parse_from_rfc3339` 硬校验格式。
+    #[tokio::test]
+    async fn status_reports_consecutive_fail_degrade() {
+        let state = test_state("");
+        {
+            let mut p = state.pool.lock().unwrap();
+            let mut a = crate::auth::Auth::default();
+            a.uid = "u-degrade".into();
+            a.access_token = "at".into();
+            p.add(a);
+            // 阈值 5 + 1 小时：既覆盖「未达阈不降权」，也让降权在整个用例里不过期
+            // （否则 10 分钟默认时长在慢机器上仍可能跨过边界，测试会偶发变红）。
+            p.set_degrade(5, std::time::Duration::from_secs(3600));
+        }
+
+        // ── ① 未降权：键必须在，且是显式 null ──
+        let a0 = status_account(&state, "u-degrade").await;
+        assert!(
+            a0.as_object().unwrap().contains_key("degrade_until"),
+            "未降权时 degrade_until 键**必须存在**（值为 null），否则宿主分不清\
+             「这个网关不下发降权」与「此刻没有降权」：{a0}"
+        );
+        assert_eq!(a0["degrade_until"], Value::Null, "未降权必须是 null：{a0}");
+        assert_eq!(a0["consecutive_fails"], json!(0));
+        assert_eq!(a0["cooling"], json!(false), "未降权不该冷却：{a0}");
+
+        // ── ② 未达阈：只累计计数，仍然不降权（单次失败不罚）──
+        state.pool.lock().unwrap().note_failures("u-degrade");
+        let a1 = status_account(&state, "u-degrade").await;
+        assert_eq!(a1["consecutive_fails"], json!(1), "计数必须如实透出：{a1}");
+        assert_eq!(a1["degrade_until"], Value::Null, "未达阈不得降权：{a1}");
+        assert_eq!(a1["cooling"], json!(false), "{a1}");
+
+        // ── ③ 达阈：只剩 4 次，正好触发 ──
+        {
+            let mut p = state.pool.lock().unwrap();
+            for _ in 0..4 {
+                p.note_failures("u-degrade");
+            }
+        }
+        let a2 = status_account(&state, "u-degrade").await;
+        assert_eq!(a2["cooling"], json!(true), "降权必须让 cooling 为 true：{a2}");
+        assert_eq!(
+            a2["cool_kind"], "degrade",
+            "降权态必须有独立的 cool_kind（前端据此显示「连败降权」而不是空白）：{a2}"
+        );
+        let raw = a2["degrade_until"]
+            .as_str()
+            .unwrap_or_else(|| panic!("降权后 degrade_until 必须是非空字符串：{a2}"));
+        let parsed = chrono::DateTime::parse_from_rfc3339(raw)
+            .unwrap_or_else(|e| panic!("degrade_until 必须是 RFC3339（与 until 同格式）：{raw} / {e}"));
+        assert!(
+            parsed.timestamp() > (chrono::Utc::now().timestamp() - 5),
+            "degrade_until 必须是**将来**的时刻，实际 {raw}"
+        );
+        // 达阈时计数已清零（供下一轮重新累计），这是 `note_failures` 的既定语义。
+        assert_eq!(a2["consecutive_fails"], json!(0), "{a2}");
+        // reason 是给人看的排查线索，必须出现（`Pool::note_failures` 写入）。
+        assert!(
+            a2["reason"].as_str().unwrap_or_default().contains("连续"),
+            "reason 必须可读（含「连续」字样）：{a2}"
+        );
+
+        // ── ④ 降权期内再失败：计数照常累计，但截止**不延长**（防重试堆叠）──
+        let before = a2["degrade_until"].clone();
+        state.pool.lock().unwrap().note_failures("u-degrade");
+        let a3 = status_account(&state, "u-degrade").await;
+        assert_eq!(a3["consecutive_fails"], json!(1), "降权期内仍要记账：{a3}");
+        assert_eq!(a3["degrade_until"], before, "降权不得被后续失败延长：{a3}");
+
+        // ── ⑤ 恢复：一次成功即回池，两个字段都回到「未降权」形态 ──
+        state.pool.lock().unwrap().note_success("u-degrade");
+        let a4 = status_account(&state, "u-degrade").await;
+        assert_eq!(
+            a4["degrade_until"],
+            Value::Null,
+            "成功后必须回到显式 null（否则界面会一直显示降权）：{a4}"
+        );
+        assert_eq!(a4["consecutive_fails"], json!(0), "成功必须清零连败计数：{a4}");
+        assert_eq!(a4["cooling"], json!(false), "{a4}");
+        assert!(
+            a4.as_object().unwrap().contains_key("degrade_until"),
+            "恢复后键仍然必须在（值才变 null）：{a4}"
+        );
+    }
+
+    /// ★ 纯增量契约：新增的两个字段**不得**改变既有字段的名字与类型。
+    ///
+    /// # 为什么值得单独立一条
+    ///
+    /// 这是**对外 JSON 契约**，宿主（WebUI / Tauri）按字段名解析。历史上本项目
+    /// 有过「为了加一档状态而顺手改动既有字段含义」的隐患形状 —— 例如把降权写进
+    /// `cool_kind` 并顺手让 `breaker_fails` 也兼记连败数。那种改动在单测里
+    /// 通常是绿的（因为测试跟着一起改），却会让**已发布的老宿主**显示错的东西。
+    ///
+    /// 本用例把一个健康账号的 `/status` 条目整体钉死：
+    ///
+    /// - 降权字段之外，既有键**一个都不少**、类型逐字不变
+    /// - `consecutive_fails` 是**数字**（不是字符串/布尔）—— 前端要做 `> 0` 判断
+    /// - 未降权时 `cool_kind` 仍然**整个不下发**（omitempty 的既有语义不变），
+    ///   而不是被改成空串：老宿主用 `acc.cool_kind === "hard_credit"` 之类判等，
+    ///   突然多出一个空串键不影响，但「语义变成恒存在」会让「未知 kind」与
+    ///   「没冷却」混同 —— 那正是 `pool-status.tsx` 里反复提醒的陷阱。
+    #[tokio::test]
+    async fn status_degrade_fields_are_purely_additive() {
+        let state = test_state("");
+        {
+            let mut p = state.pool.lock().unwrap();
+            let mut a = crate::auth::Auth::default();
+            a.uid = "u-plain".into();
+            a.access_token = "at".into();
+            a.nickname = "普通号".into();
+            p.add(a);
+        }
+
+        let acc = status_account(&state, "u-plain").await;
+        let obj = acc.as_object().expect("每条账号必须是 JSON 对象");
+
+        // 既有字段：名字与类型逐字不变（Go 侧 `Status` tag 同款）。
+        assert_eq!(acc["uid"], "u-plain");
+        assert_eq!(acc["credits"], json!(0));
+        assert_eq!(acc["cooling"], json!(false));
+        assert!(acc["disabled"].is_boolean(), "{acc}");
+        assert!(acc["in_flight"].is_number(), "{acc}");
+        assert!(
+            acc["breaker_fails"].is_number(),
+            "breaker_fails 必须仍是数字（不得被降权计数借用）：{acc}"
+        );
+        assert_eq!(acc["product"], "workbuddy");
+        assert_eq!(acc["region"], "cn");
+
+        // 新增字段：类型明确，且与既有字段**正交**。
+        assert!(
+            acc["consecutive_fails"].is_number(),
+            "consecutive_fails 必须是数字：{acc}"
+        );
+        assert!(obj.contains_key("degrade_until"), "{acc}");
+        assert!(acc["degrade_until"].is_null(), "{acc}");
+
+        // 未降权 ⇒ `cool_kind` 仍然**键缺席**（omitempty 语义不变）。
+        assert!(
+            !obj.contains_key("cool_kind"),
+            "未冷却时 cool_kind 仍须整个不下发（既有语义）：{acc}"
+        );
+
+        // 显式对比：`breaker_fails` 与 `consecutive_fails` 是两条独立曲线，
+        // 未降权时都必须是 0，不能被对方串味。
+        assert_eq!(acc["breaker_fails"], json!(0));
+        assert_eq!(acc["consecutive_fails"], json!(0));
     }
 
     #[tokio::test]

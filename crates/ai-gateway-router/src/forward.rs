@@ -1308,6 +1308,31 @@ pub async fn forward_chat(
                     last_kind = ErrKind::None;
                     last_body.clear();
                     last_transport_err = Some(e.to_string());
+                    // ── 喂入口二：传输层失败（见 `apply_error_policy` 的表格）──
+                    //
+                    // 与 `Client` 并列的两个降权喂入口之一，理由同样是「**不知道
+                    // 原因**」：超时 / 连接被拒 / DNS 失败既没有业务码也没有报文，
+                    // `classify` 根本不适用（故这里 `last_kind = None`）。
+                    //
+                    // ★ 它**不走** `apply_error_policy`：那个函数按 `kind` 分派，
+                    // 而 `None` 在那里刻意不喂（见其注释）—— 因为 `None` 还包含
+                    // 「2xx 但没有可判定业务体」这种**不是失败**的形态。传输层是唯一
+                    // 需要按 `None` 喂的场合，故就地喂，判据写在失败分支自己身上。
+                    //
+                    // ★ 为什么它必须有（2026-09-22 现场的形状）：过去这里只换号、
+                    // 一个字都不记。一把网络打不通的号（代理只对它失效、token 指向
+                    // 的域名解析不了）会在每轮重试里**一直排在候选第一位**，用户看到
+                    // 的是「所有账号都连不上」，而池子里其余号完全正常 —— 因为
+                    // `healthy()` 里没有任何一条判据反映「它刚才连续连不上」。
+                    // 降权补的就是这一条：连败达阈后它离开选号池，
+                    // 让别的号接客；成功一次即回池（`note_success` 内已清零）。
+                    //
+                    // ★ 单次不罚：计数 +1 不产生任何行为（阈值缺省 5），故一次
+                    // 代理抖动不会把好号摘掉。
+                    //
+                    // ⚠ 必须在 `release` **之前**加锁：`release` 自己也要取同一把
+                    // 锁，`std::sync::Mutex` 不可重入 —— 顺序反过来会自锁死。
+                    lock_pool(ctx.pool).note_failures(&acct.uid);
                     release(ctx.pool, &mut held_uid);
                     continue;
                 }
@@ -2090,7 +2115,30 @@ fn request_side_failure(
 /// - `AccountUnusable` → 账号级软冷却（★ 有到期、可自动恢复，**绝不永久禁用**）
 /// - `SessionDead` → 永久禁用（需人工重登）
 /// - `Server` → 喂熔断计数（指数退避）
-/// - 其余（`Client` / `None`）→ 只换号不罚（防雪崩），不喂熔断
+/// - `Client` → 只换号不罚（防雪崩），**但**累计连败降权计数（`note_failures`）
+/// - 其余（`None`）→ 只换号不罚（防雪崩），不喂熔断、不喂降权
+///
+/// # ★★ 连败降权为什么**只**在这两个入口喂
+///
+/// 降权（[`Pool::note_failures`]）吃的是「**不知道原因**的失败」，全仓库只有两个
+/// 真实喂入口，本函数是**其一**（另一个是 `forward_chat` 的传输层失败分支，
+/// 见那里的注释）：
+///
+/// | 失败 | 有没有权威分类 | 处置 |
+/// |---|---|---|
+/// | 429 / 402 / 5xx / 12153 / 11140 / 11102 / WAF 403 | **有** | 各自的冷却 / 禁用 / 熔断 / 区域熔断 |
+/// | `Client`（未知 4xx） | **没有** | 只换号；连败达阈才降权 |
+/// | 传输层（超时 / 连接被拒 / DNS） | **没有** | 只换号；连败达阈才降权 |
+///
+/// **带权威分类的错误一律不喂降权**，理由是**重复计罚**：429 已经在
+/// [`Pool::cooldown`] 里给了软冷却、5xx 已经在 [`Pool::note_error`] 里喂了指数退避
+/// 熔断、11140 已经软冷却、12153 已经禁用 —— 再叠一层降权，等于让同一次失败被罚
+/// 两次，且两次的时长口径不同（熔断指数退避 vs 降权固定 10 分钟），事后无法归因。
+///
+/// 反过来说，这两个入口的失败**没有任何权威处置**：`Client` 落进「只换号不罚」，
+/// 传输层也只是换号 —— 于是一把**持续**失败的号会在「每轮都被选中 → 每轮都失败 →
+/// 每轮换个号再来」的循环里永远不被摘掉（业主现场形状：「同一个号反复失败却一直
+/// 被选中」）。降权补的正是这个空档。
 /// 判定这次上游响应是否应当触发 3012 熔断。
 ///
 /// # ★★ 为什么必须把「账号被封」排除在外（2026-10-16 现场缺陷）
@@ -2223,7 +2271,32 @@ pub fn apply_error_policy(
                 "该模型不在本账号套餐内（1113 无可用资源包）",
             );
         }
-        // 其余（Client / None）：只换号不罚（防雪崩），不喂熔断。
+        // ── 喂入口一：`Client`（这是**两个**降权喂入口之一，见下方长注释）──
+        //
+        // `Client` 仍然是「只换号不罚」：**不冷却、不禁用、不喂熔断**。
+        // 唯一的追加动作是 `note_failures` —— 它只累计**连败计数**，单次失败
+        // 不产生任何行为（阈值见 `pool::DEGRADE_THRESHOLD`，缺省 5）。
+        //
+        // ★ 语义边界（别把两者混为一谈）：
+        // - 「罚」= 冷却 / 禁用 / 熔断 —— 这里**一个都不做**，所以「只换号不罚」
+        //   的既有语义**逐字不变**（下面的 `apply_error_policy_routes_kinds`
+        //   仍然断言 `!cooling && !disabled`）；
+        // - 「降权」= 连续 N 次**同一类未知失败**之后，把这把号临时摘出选号池
+        //   （`Pool::note_failures` → `degrade_until`）。它是**连败兜底**，
+        //   不是单次惩罚：一次 4xx 只会让计数 +1，下次选号照样选它。
+        //
+        // ⚠ 为什么单次不能罚：`Client` 的语义是「上游拒绝了**这次请求本身**」，
+        // 可能是用户发了条非法请求 —— 换号也不会好。一次非法请求就把号摘掉，
+        // 是本项目在 `no_route` / 12153 上踩过两次的同型误判（把一次抖动放大成
+        // 停服）。所以这里必须靠**连续**次数来区分「号真有问题」与「请求有问题」。
+        ErrKind::Client => {
+            pool.note_failures(uid);
+        }
+        // 其余（`None` 等）：只换号不罚（防雪崩），既**不**喂熔断，也**不**喂降权。
+        //
+        // ★ `None` 为什么**不**喂：它的含义是「上游给了 2xx / 或者压根没有可判定的
+        // 业务体」，不是一次「失败信号」—— 拿它当失败累计会让降权阈值被无意义地
+        // 逼近。传输层失败确实也落在 `None`，但那条路径**不走本函数**（见下）。
         _ => {}
     }
 }
@@ -3298,6 +3371,326 @@ mod tests {
         );
         let st = p3.lock().unwrap().list();
         assert!(!st[0].cooling && !st[0].disabled, "Client 不应处罚账号");
+    }
+
+    // ══════════════ 连败降权：**两个喂入口**的接线（本文件的职责边界）══════════════
+    //
+    // 语义分工（别在这里重复测 pool.rs 的内部实现）：
+    //   · pool.rs 负责「计数怎么涨、达阈怎么置 degrade_until、持久化」—— 那边已有
+    //     7 条以上的用例（`degrade_*`）。本文件**不**重复它们。
+    //   · forward.rs 负责**唯一**该问的问题：**这两条真实失败路径到底有没有喂**？
+    //     喂漏了，pool 侧再完整也只是死代码。
+    //
+    // 故下面 4 条用例全部走**生产调用路径**（`apply_error_policy` / `forward_chat`），
+    // 只在**断言**里读池子状态。故障注入的目标也正是这些调用点。
+
+    /// 一个 `expires_at` 远在未来的账号（**跳过 token 刷新**）。
+    ///
+    /// ⚠ 不能直接用 [`pool_with`]：它的账号 `expires_at = 0` ⇒ `needs_refresh`
+    /// 恒真 ⇒ `forward_chat` 会先打**刷新**接口，失败后走
+    /// `classify_refresh_err` → `note_error`（喂熔断）而**根本走不到** chat 的
+    /// 传输层分支。那样测试测的是刷新路径，与降权喂入口无关 —— 而且会「绿」得
+    /// 毫无意义（`note_error` 恰好也让 `servable_now` 变假吗？不会，要 3 次熔断）。
+    fn pool_without_refresh(uids: &[&str]) -> Mutex<Pool> {
+        let p = Mutex::new(Pool::new(String::new()));
+        let future = chrono::Utc::now().timestamp() + 86_400;
+        {
+            let mut pool = p.lock().unwrap();
+            for uid in uids {
+                pool.add(Auth {
+                    uid: (*uid).to_string(),
+                    access_token: "at".into(),
+                    domain: "https://copilot.tencent.com".into(),
+                    expires_at: future,
+                    ..Default::default()
+                });
+            }
+        }
+        p
+    }
+
+    /// 起一个**回正常 OpenAI SSE** 的本机假上游（`127.0.0.1:0`，不触网）。
+    ///
+    /// 只用于「成功路径」那一条用例：需要一次**真的走完** `forward_chat` 的成功
+    /// 分支，才能证明 `note_success`（第 1661 行的唯一调用点）真的被调用到了。
+    /// 手写 HTTP/1.1 而非 axum：本 crate 的 tokio 未开 `net` feature（见
+    /// `testing/mock_upstream.rs` 文件头的说明），且这一层与 `client.rs` 测试里
+    /// 既有的假上游写法保持一致。
+    ///
+    /// SSE 形状必须是 **OpenAI 形态**（`choices[].delta`）：WorkBuddy 走通用聚合器
+    /// `sse::aggregate`，而 `testing::mock_upstream` 的 `Ok` 场景给的是 **Anthropic**
+    /// 形态（给 zcode 用的），拿过来会聚合失败、变成 502。
+    fn spawn_ok_workbuddy_upstream() -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 16 * 1024];
+                // 只读一次就回：本用例的请求体很小，reqwest 会一次性写出
+                // （与 `client.rs::unconfigured_proxy_means_direct_connection...`
+                // 同一写法）。不解析请求体 —— 固定回一份成功流。
+                let _ = s.read(&mut buf);
+                let body = concat!(
+                    "data: {\"id\":\"c1\",\"model\":\"m\",",
+                    "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n",
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+            }
+        });
+        base
+    }
+
+    /// 场景 ①：`Client` 连败达阈后，该账号**不再被选中**。
+    ///
+    /// 走生产入口 [`apply_error_policy`]（`forward_chat` 在 classify 之后正是调它）。
+    #[test]
+    fn client_failures_reach_threshold_and_drop_the_account_from_selection() {
+        let p = pool_with(&["u1"]);
+        let threshold = p.lock().unwrap().degrade_threshold();
+        assert!(threshold > 0, "缺省阈值必须启用本机制");
+
+        for i in 1..=threshold {
+            apply_error_policy(
+                &mut p.lock().unwrap(),
+                "u1",
+                "m",
+                ErrKind::Client,
+                "",
+                Duration::from_secs(60),
+            );
+            // ★ 达阈**之前**每一轮都必须仍然可选 —— 证明这是「连败」而不是「单次罚」。
+            if i < threshold {
+                assert!(
+                    p.lock().unwrap().available_uids().contains(&"u1".to_string()),
+                    "第 {i} 次 Client 失败后账号仍必须可用（阈值 {threshold}，不许提前罚）"
+                );
+            }
+        }
+
+        let mut pool = p.lock().unwrap();
+        assert!(pool.degraded("u1"), "连败 {threshold} 次后必须降权");
+        assert!(
+            !pool.available_uids().contains(&"u1".to_string()),
+            "降权后不得再出现在可选集合里（这一条就是「不再被选中」的判据）"
+        );
+        assert!(!pool.servable_now(), "唯一账号降权 ⇒ 池子整体不可服务");
+        assert!(
+            pool.pick_for_model("m", &[]).is_none(),
+            "★ 真实选号路径必须选不出它（`healthy()` 未接降权时这条会失败）"
+        );
+        // 「只换号不罚」的既有语义必须逐字保留：降权 ≠ 冷却 / 禁用。
+        //
+        // ⚠ 判据**不能**写成 `!st.cooling`：`/status` 的 `cooling` 是**投影**
+        //（「这把号此刻不接客」），pool.rs 刻意把降权也算进去，否则界面会出现
+        // 「0 冷却，但 healthy 少了一个」。它**不是**惩罚本身。
+        // 惩罚本身是三个字段：`until`（冷却截止）/ `breaker_until`（熔断截止）/
+        // `disabled`（禁用）。降权一个都不许写 —— 那样才会「用户打错一个字，
+        // 好号被封 10 分钟 / 被指数退避」。
+        let st = &pool.list()[0];
+        assert!(st.until.is_none(), "降权不得写成冷却截止（那是另一套惩罚）");
+        assert!(
+            st.breaker_until.is_none(),
+            "降权不得喂熔断（Led 分类才喂；未知失败只走降权）"
+        );
+        assert!(!st.disabled, "降权绝不得禁用账号");
+        assert_eq!(
+            st.cool_kind, "degrade",
+            "降权态要能被界面区分出来（否则只看到 cooling=true、不知要等多久）"
+        );
+        assert!(st.degrade_until.is_some(), "/status 要能看到降权截止");
+    }
+
+    /// 场景 ②：**单次** Client 失败不影响账号（「只换号不罚」的既有语义）。
+    ///
+    /// 这条守的是**误伤**：一次 4xx 很可能只是用户发了条非法请求，换号也不会好。
+    /// 若这里变红（阈值被人调成 1 之类），表现是「用户打错一个字，好号被封 10 分钟」。
+    #[test]
+    fn a_single_client_failure_does_not_affect_the_account() {
+        let p = pool_with(&["u1"]);
+        apply_error_policy(
+            &mut p.lock().unwrap(),
+            "u1",
+            "m",
+            ErrKind::Client,
+            "",
+            Duration::from_secs(60),
+        );
+
+        let mut pool = p.lock().unwrap();
+        assert_eq!(pool.consecutive_fails("u1"), 1, "失败必须**被记下来**（喂入口通了）");
+        assert!(!pool.degraded("u1"), "单次失败绝不降权");
+        assert!(pool.available_uids().contains(&"u1".to_string()));
+        assert!(pool.pick_for_model("m", &[]).is_some(), "单次失败后照常可选");
+        let st = &pool.list()[0];
+        assert!(!st.cooling && !st.disabled);
+        assert!(st.degrade_until.is_none());
+    }
+
+    /// 场景 ③：**传输层失败同样计数**（喂入口二，走真实 `forward_chat`）。
+    ///
+    /// 判据用的是「连败到阈后账号从可选集合里消失」，而不是只看计数器 ——
+    /// 只看计数器的话，「计了数但忘了达阈判据」这类半截接线照样会绿。
+    #[tokio::test]
+    async fn transport_failure_feeds_the_same_consecutive_counter() {
+        let p = pool_without_refresh(&["u1"]);
+        let threshold = p.lock().unwrap().degrade_threshold();
+
+        // 传输层必然失败的客户端：基址与显式代理都指向**必然拒绝连接**的 `:1`
+        // （写法与 `client.rs::explicit_proxy_does_not_also_enable_system_proxy` 一致）。
+        // 环回地址在 NO_PROXY 里 ⇒ 直连被拒；没有 NO_PROXY 时 ⇒ 代理被拒。
+        // **两条路都是传输层错误**，故与宿主机的代理设置无关。
+        // 超时压到 1s：阈值是 5 次，缺省 120s 会让本用例白等十几分钟。
+        // `:1` 在环回上通常是**立即被拒**，但这个值同时也是慢机器上的上界。
+        let client = Client::new(ClientConfig {
+            chat_base_cn: "http://127.0.0.1:1".into(),
+            proxy: "http://127.0.0.1:1".into(),
+            timeout: Duration::from_secs(1),
+            ..Default::default()
+        })
+        .unwrap();
+        let products = crate::products::ProductUpstreams::new();
+        let (unusual, waf_ip, empty_stream) = fresh_breakers();
+        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
+
+        for i in 1..=threshold {
+            let (_, status, _) = forward_chat(
+                &mut c,
+                br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                false,
+                "",
+                ImageRoute::any(),
+                "",
+            )
+            .await;
+            assert_eq!(status, 503, "传输层失败的对外状态码不变（既有契约）");
+            if i < threshold {
+                assert!(
+                    !p.lock().unwrap().degraded("u1"),
+                    "第 {i} 次传输层失败后**不得**降权（单次不罚）"
+                );
+            }
+        }
+
+        let pool = p.lock().unwrap();
+        assert!(
+            pool.degraded("u1"),
+            "★ 连续 {threshold} 次传输层失败必须降权 —— 变红说明传输层分支没喂 note_failures"
+        );
+        assert!(!pool.available_uids().contains(&"u1".to_string()));
+        // 同场景 ①：降权不得写进任何**惩罚**字段（`cooling` 是投影，见那里的注释）。
+        let st = &pool.list()[0];
+        assert!(st.until.is_none(), "传输层失败不得写冷却截止");
+        assert!(st.breaker_until.is_none(), "传输层失败不得喂熔断（那是 5xx 的处置）");
+        assert!(!st.disabled, "传输层失败不得禁用账号");
+    }
+
+    /// 场景 ④：**一次成功即清零**，且清掉降权（成功后可回池）。
+    ///
+    /// 分两段，各守一个方向：
+    ///
+    /// 1. **防爬升**（端到端）：`threshold - 1` 次 Client 失败 + 一次**真实成功**
+    ///    的 `forward_chat` ⇒ 计数归零。若不归零，零星失败会在一整天里慢慢累加到
+    ///    阈值，把一个完全正常的号摘掉 —— 那正是「连续」二字要防的。
+    ///    这一段同时钉住 `forward.rs` 成功路径（`note_success` 的唯一调用点）
+    ///    真的被执行到了。
+    /// 2. **回池**（判据同源）：降权后再喂一次成功 ⇒ 立刻回到可选集合，不必等
+    ///    10 分钟冷却走完。这里直接用 `Pool::note_success` —— 它与成功路径上第
+    ///    1661 行调用的是**同一个函数**，而「降权态账号不可能被选中」使得这一段
+    ///    无法用 `forward_chat` 复现（选不到就发不出请求）。
+    #[tokio::test]
+    async fn a_successful_forward_clears_the_counter_and_the_pool_re_enters() {
+        let p = pool_without_refresh(&["u1"]);
+        let threshold = p.lock().unwrap().degrade_threshold();
+        let base = spawn_ok_workbuddy_upstream();
+        let client = Client::new(ClientConfig {
+            chat_base_cn: base,
+            ..Default::default()
+        })
+        .unwrap();
+        let products = crate::products::ProductUpstreams::new();
+        let (unusual, waf_ip, empty_stream) = fresh_breakers();
+        let mut c = ctx(&p, &client, &products, &unusual, &waf_ip, &empty_stream);
+
+        // ── 段 1：灌到「差一次就达阈」，再用一次成功把它全部清零 ──
+        for _ in 1..threshold {
+            apply_error_policy(
+                &mut p.lock().unwrap(),
+                "u1",
+                "m",
+                ErrKind::Client,
+                "",
+                Duration::from_secs(60),
+            );
+        }
+        assert_eq!(
+            p.lock().unwrap().consecutive_fails("u1"),
+            threshold - 1,
+            "前置：已累计到阈值前一步"
+        );
+
+        let (result, status, fail) = forward_chat(
+            &mut c,
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+            false,
+            "",
+            ImageRoute::any(),
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "假上游回 2xx SSE ⇒ 必须成功，实际失败 {fail:?}");
+        assert!(result.is_some(), "成功时必须带回结果");
+        assert_eq!(
+            p.lock().unwrap().consecutive_fails("u1"),
+            0,
+            "★ 一次成功必须清零连败计数（否则零星失败会累积到阈值）"
+        );
+
+        // 再灌同样的次数：若上一段没清零，这里就会达阈（累计 2*(threshold-1) ≥ 阈值）。
+        for _ in 1..threshold {
+            apply_error_policy(
+                &mut p.lock().unwrap(),
+                "u1",
+                "m",
+                ErrKind::Client,
+                "",
+                Duration::from_secs(60),
+            );
+        }
+        assert!(
+            !p.lock().unwrap().degraded("u1"),
+            "★ 成功打断连续性后，同样次数的失败**不得**达阈（成功路径没清降权时这条会红）"
+        );
+
+        // ── 段 2：真的降权之后，一次成功即回池 ──
+        apply_error_policy(
+            &mut p.lock().unwrap(),
+            "u1",
+            "m",
+            ErrKind::Client,
+            "",
+            Duration::from_secs(60),
+        );
+        assert!(p.lock().unwrap().degraded("u1"), "前置：第 {threshold} 次失败达阈");
+
+        // 与成功路径第 1661 行**同一个函数**。
+        p.lock().unwrap().note_success("u1");
+        let mut pool = p.lock().unwrap();
+        assert!(!pool.degraded("u1"), "成功即回池，不必等降权期走完");
+        assert!(pool.available_uids().contains(&"u1".to_string()));
+        assert!(pool.pick_for_model("m", &[]).is_some(), "回池后必须重新可选");
+        assert_eq!(pool.consecutive_fails("u1"), 0);
+        assert!(pool.degrade_until("u1").is_none(), "/status 也必须同步回 null");
     }
 
     /// 模型限流按上游给的重置时间冷却（而不是固定软冷却）。

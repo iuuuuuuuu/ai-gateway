@@ -9,6 +9,9 @@
 //!    与 Go 侧「空数组被 unmarshal 覆盖」一致，回落逻辑放在 [`Config::normalize`]。
 //! 3. **`<=0` 一律视为未设置**：timeouts / breaker threshold 等沿用 Go 侧口径，
 //!    「0」不是「禁用」，而是「走默认」。
+//!    ⚠ **例外**：`pool.degrade_threshold` 的 `0` **就是「关闭」**（连败降权是新增
+//!    能力，必须能被关掉回滚），只有负数才收敛为 0。别把这条与上面混为一谈 ——
+//!    把「用户想关掉」静默变成「按默认开启」是本项目吃过亏的一类失效。
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -700,6 +703,18 @@ pub struct ParsedConfig {
     pub session_gc_interval: Duration,
     /// `pool.credit_refresh_interval` 解析结果。
     pub credit_refresh_interval: Duration,
+    /// `pool.degrade_cooldown_secs` 解析结果（连败降权时长）。
+    ///
+    /// ★ 与上面的 `breaker_cooldown` 一样，这里是**归一化后**的值：配置里写的是
+    /// 整数秒，`Duration` 由 [`Config::normalize`] 一次算出，请求路径上不再换算。
+    pub degrade_cooldown: Duration,
+    /// `pool.degrade_cooldown_max_secs` 解析结果（降权上限）。
+    ///
+    /// ⚠ 当前实现**不读**它：降权「不延长、不翻倍」⇒ 时长恒为
+    /// [`ParsedConfig::degrade_cooldown`]（理由见
+    /// [`PoolConfig::degrade_cooldown_max_secs`] 的文档）。这里照样解析出来，
+    /// 是为了与 `breaker_cooldown_max` 成对、且让将来真要启用上限时**零改格式**。
+    pub degrade_cooldown_max: Duration,
     /// `watch_auth_dir_interval` 解析结果。
     ///
     /// 只在 `watch_auth_dir` 开启时有意义。
@@ -1003,6 +1018,91 @@ pub struct PoolConfig {
     /// 指数退避封顶字符串，默认 `"6h"`。
     #[serde(rename = "breaker_cooldown_max")]
     pub breaker_cooldown_max: String,
+    /// 连败降权阈值：**连续**失败多少次把该号从选号里摘掉，默认 5；`0` = **关闭**该机制。
+    ///
+    /// # 与 `breaker_threshold` 的区别（别混用）
+    ///
+    /// 两者都读「失败」，但**喂入口不同**，因此语义正交、并存而不冲突：
+    ///
+    /// - `breaker_threshold`（默认 3）只由**带权威分类**的失败驱动 —— 429 软限流、
+    ///   WAF、余额耗尽、上游 5xx、业务错误码（12153 / 11140 / 11102 …）。那些失败
+    ///   **知道原因**，各有自己的处理（冷却 / 停用 / 记额度）。
+    /// - 本旋钮只由**不知道为什么失败**的路径驱动：`Client` 类错误与传输层失败
+    ///   （连接被断、TLS/代理故障、读超时）。那些既不该冷却（不知道要等多久），
+    ///   也不该熔断（熔断会指数退避到 6 小时，把一次本机网络抖动放大成停服）。
+    ///
+    /// ⇒ 降权是**兜底**：既不罚单次（`apply_error_policy` 的既有语义是「只换号不罚，
+    /// 防雪崩」），也不与既有惩罚重复计罚。
+    ///
+    /// # 为什么默认 5
+    ///
+    /// 取值依据是客户端的重试形态，不是拍脑袋：DSH 用的 `@earendil-works/pi-ai`
+    /// 默认**重试 5 次**（并发的那 5 个请求本身就是 5 次失败）。阈值必须**大于**
+    /// 「一次坏请求带来的失败数」，否则一次瞬时抖动就能把账号摘掉；取 5 与
+    /// `max_in_flight = 3` 同源 —— 都是拿客户端的重试次数做量级依据
+    ///（见 AGENTS.md「客户端并发重试 vs 单账号产品的并发上限」节）。
+    ///
+    /// ★ `0` = 关闭，与 `daily_token_cap` / `credit_floor` 同口径（那两个的
+    /// 「0 = 关闭」是既定约定），而不是 `breaker_threshold` 那种「`<=0` 走默认」——
+    /// 后者没有「关掉熔断」这个选项，降权是**新增能力**，必须能被关掉回滚。
+    ///
+    /// ⚠⚠ **不要给它加 `#[serde(default)]`（字段级）**。本结构体已有
+    /// `#[serde(default)]`（容器级），缺键时本该取 [`PoolConfig::default`] 的值；
+    /// 但**字段级** `default` 一旦写上，缺键会退成 `i64::default()` = **0**
+    /// （serde 的数字零值，不是 `impl Default` 里的 5）⇒ 老配置缺这个键时降权
+    /// **静默变成关闭**。这与 `breaker_threshold` / `breaker_cooldown` 的写法一致
+    /// （它们也都没有字段级 `default`），由 `degrade_absent_in_host_config_uses_defaults`
+    /// 钉住。本次实现时正是这条把测试打红了一次，别重犯。
+    #[serde(rename = "degrade_threshold")]
+    pub degrade_threshold: i64,
+    /// 连败降权时长（秒），默认 600（10 分钟）；`<=0` 收敛为默认值。
+    ///
+    /// # 为什么是 10 分钟
+    ///
+    /// 它要盖住「一次上游/网络的坏窗口」，又不能长到让一个好号整天闲置：
+    ///
+    /// - 下限由**熔断**给出参照：`breaker_cooldown` 基础值 30 分钟是给「有明确
+    ///   病因」的账号的；降权的病因**未知**，惩罚理应更轻（不知道病因就别罚那么重）。
+    /// - 上限由**本地零点**给出参照：每日护栏是「等几小时」，降权若是同量级，
+    ///   用户会把它当成「号坏了」而不是「刚才那阵网不好」。10 分钟量级与
+    ///   `credit_refresh_interval`（15 分钟）相近，一次巡检周期内自然回池。
+    ///
+    /// ★ 用**整数秒**而不是 `breaker_cooldown` 那种 Go duration 字符串：本旋钮
+    /// 没有历史包袱（不是从 Go 侧搬过来的），整数秒省掉一次字符串解析与一类
+    /// 拼写错误（`"10m"` 打成 `"10"` 在 duration 口径下是**报错**，而用户往往
+    /// 就是想写 10 分钟）。同理见 [`PoolConfig::degrade_cooldown_max_secs`]。
+    #[serde(rename = "degrade_cooldown_secs")]
+    pub degrade_cooldown_secs: i64,
+    /// 降权**上限**（秒），默认 600；`<=0` 收敛为默认值。
+    ///
+    /// # ⚠ 当前设计**不需要**这个上限 —— 保留它而不是删掉，理由如下
+    ///
+    /// 降权与熔断的关键差别是**要不要随重犯加长**：
+    ///
+    /// - 熔断**加长**（`breaker_cooldown` → 每次 ×2 → 封顶 `breaker_cooldown_max`）：
+    ///   因为熔断的语义是「这个号反复坏，越坏罚越久」，所以必须有天花板，
+    ///   否则翻几次就溢出到几年后。
+    /// - 降权**不加长也不翻倍**：降权期内再次达阈**只清零计数、不延长**，时长恒等于
+    ///   `degrade_cooldown_secs`。既然存在一个固定的、永不增长的时长，
+    ///   它的上限就是它自己 —— 数学上 `min(d, max)` 恒等于 `d`，读它没有意义。
+    ///
+    /// 为什么仍然保留（而不是删掉省一个字段）：
+    ///
+    /// 1. **格式兼容**：宿主 `ai-gateway-core` 可以无条件写出这个键；若网关侧没有
+    ///    对应字段，配置里就会躺着一个**静默不生效**的键 —— 本项目已有一次
+    ///    「`pool.multi_product` 读不到 ⇒ 网关恒为 false 且日志无报错」的先例
+    ///    （见 [`hoist_nested_keys`] 的文档），不能凭「现在用不上」再埋一颗同型的雷。
+    /// 2. **它是「不许加长」这件事的显式落点**：将来若有人想改成「重犯加长」，
+    ///    第一个要动的就是这个上限（那时它从「等于时长」变成「真正的天花板」）。
+    ///    删掉它等于把这条设计约束变成口头约定。
+    /// 3. 代价只有一次解析 + 两个整数比较（见 [`Config::normalize`]），启动期一次。
+    ///
+    /// ⇒ 结论：**加字段、不加逻辑** —— 它被解析、被收敛（写进
+    /// [`ParsedConfig::degrade_cooldown_max`]，与 `breaker_cooldown_max` 成对），
+    /// 但**不参与**降权时长的计算：降权时长的唯一来源是
+    /// [`PoolConfig::degrade_cooldown_secs`]。
+    #[serde(rename = "degrade_cooldown_max_secs")]
+    pub degrade_cooldown_max_secs: i64,
     /// 闲置补偿：每小时未用增加的权重，默认 0.5。
     #[serde(rename = "idle_weight_per_hour")]
     pub idle_weight_per_hour: f64,
@@ -1056,6 +1156,16 @@ fn default_max_rotate() -> usize {
     3
 }
 
+/// `pool.degrade_threshold` 缺省值：连败 5 次触发降权。
+///
+/// 取值依据见 [`PoolConfig::degrade_threshold`] 的文档（与客户端 5 次并发重试同源）。
+pub const DEFAULT_DEGRADE_THRESHOLD: i64 = 5;
+
+/// `pool.degrade_cooldown_secs` / `degrade_cooldown_max_secs` 缺省值：600 秒 = 10 分钟。
+///
+/// 取值依据见 [`PoolConfig::degrade_cooldown_secs`] 的文档。
+pub const DEFAULT_DEGRADE_COOLDOWN_SECS: i64 = 600;
+
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
@@ -1063,6 +1173,15 @@ impl Default for PoolConfig {
             breaker_threshold: 3,
             breaker_cooldown: "30m".into(),
             breaker_cooldown_max: "6h".into(),
+            // ★ 降权三个旋钮：三个都非零 ⇒ 默认**开启**。
+            //
+            // 与 `daily_token_cap` / `credit_floor`（缺省 0 = 关闭）的立场不同，
+            // 因为那两个是**新增的额外拦截**（开着就多一层拒绝），缺省必须保守；
+            // 而降权是**兜底改号**：它不增加拒绝面（号被摘掉后请求仍会换到别的号），
+            // 只在「一个号连续失败」时把流量挪开。缺省关掉等于让这个能力默认不存在。
+            degrade_threshold: DEFAULT_DEGRADE_THRESHOLD,
+            degrade_cooldown_secs: DEFAULT_DEGRADE_COOLDOWN_SECS,
+            degrade_cooldown_max_secs: DEFAULT_DEGRADE_COOLDOWN_SECS,
             idle_weight_per_hour: 0.5,
             idle_weight_max: 5.0,
             credit_refresh_interval: "15m".into(),
@@ -1429,6 +1548,38 @@ impl Config {
         if self.pool.breaker_threshold <= 0 {
             self.pool.breaker_threshold = 3;
         }
+
+        // ---- 连败降权（三个旋钮）----
+        //
+        // ★ 口径与上面 `breaker_threshold` **刻意不同**，不是笔误：
+        //
+        // - `degrade_threshold` 的 `0` 是**有语义的**（关闭该机制，见字段文档），
+        //   所以只有**负数**才收敛；把它像 breaker 那样 `<=0 → 默认` 会让
+        //   「用户想关掉降权」变成「静默按 5 开启」，是最糟的一类静默失效。
+        // - 两个时长旋钮没有「关闭」语义（时长为 0 的降权等于没降权，只会让
+        //   阈值触发变成空操作），故 `<=0` 一律回落默认 —— 与 `idle_weight_*` /
+        //   `upstream.*_timeout_seconds` 同款约定。
+        if self.pool.degrade_threshold < 0 {
+            self.pool.degrade_threshold = 0;
+        }
+        if self.pool.degrade_cooldown_secs <= 0 {
+            self.pool.degrade_cooldown_secs = DEFAULT_DEGRADE_COOLDOWN_SECS;
+        }
+        if self.pool.degrade_cooldown_max_secs <= 0 {
+            self.pool.degrade_cooldown_max_secs = DEFAULT_DEGRADE_COOLDOWN_SECS;
+        }
+        // 上限不得小于时长：否则将来若有人把「重犯加长」接上来，`min(d, max)`
+        // 会在第一轮就**缩短**降权，症状是「配了 600 秒，实际 30 秒就回池」。
+        // 抬到等于时长 —— 当前不读上限，这一步仍要做，好让配置自洽
+        // （`/status` 与启动日志看到的值不能自相矛盾）。
+        if self.pool.degrade_cooldown_max_secs < self.pool.degrade_cooldown_secs {
+            self.pool.degrade_cooldown_max_secs = self.pool.degrade_cooldown_secs;
+        }
+        self.parsed.degrade_cooldown =
+            Duration::from_secs(self.pool.degrade_cooldown_secs as u64);
+        self.parsed.degrade_cooldown_max =
+            Duration::from_secs(self.pool.degrade_cooldown_max_secs as u64);
+
         if self.pool.idle_weight_per_hour <= 0.0 {
             self.pool.idle_weight_per_hour = 0.5;
         }
@@ -1771,6 +1922,10 @@ mod tests {
         assert_eq!(c.pool.breaker_threshold, 3);
         assert_eq!(c.pool.breaker_cooldown, "30m");
         assert_eq!(c.pool.breaker_cooldown_max, "6h");
+        // ★ 连败降权（连败兜底改号）：默认开启，取值依据见 `PoolConfig` 的字段文档。
+        assert_eq!(c.pool.degrade_threshold, DEFAULT_DEGRADE_THRESHOLD);
+        assert_eq!(c.pool.degrade_cooldown_secs, DEFAULT_DEGRADE_COOLDOWN_SECS);
+        assert_eq!(c.pool.degrade_cooldown_max_secs, DEFAULT_DEGRADE_COOLDOWN_SECS);
         assert!((c.pool.idle_weight_per_hour - 0.5).abs() < f64::EPSILON);
         assert!((c.pool.idle_weight_max - 5.0).abs() < f64::EPSILON);
         assert!(c.pool.credit_refresh_enabled);
@@ -2324,5 +2479,151 @@ mod tests {
         let c = Config::from_json(br#"{"prompt":{"file":"","mode":"custom"}}"#).unwrap();
         assert_eq!(c.parsed.prompt_mode, crate::prompt::MODE_CUSTOM);
         assert_eq!(c.parsed.prompt_text, crate::prompt::default_prompt());
+    }
+
+    // ═══════════════ 连败降权三个旋钮（2026-10-18）═══════════════
+    //
+    // 语义见 `PoolConfig::degrade_threshold` 的文档。这里钉住四件事：
+    // ① 默认值（含「默认是开还是关」这个决策）② JSON 解析
+    // ③ `0` = 关闭（**不能**被 normalize 顶回默认）
+    // ④ 负数收敛 + 两个时长旋钮的边界。
+
+    /// 默认值：三者齐全且默认**开启**（threshold ≠ 0）。
+    ///
+    /// ★ 反面断言（`assert_ne!(…, 0)`）是本用例的重点：只断言「等于 5」无法区分
+    /// 「默认开启」与「默认关闭」这两种设计，而那正是本旋钮最容易被误改的地方。
+    #[test]
+    fn degrade_defaults_are_on_and_match_documented_values() {
+        let c = Config::default();
+        assert_eq!(c.pool.degrade_threshold, 5, "默认阈值应为 5（客户端重试 5 次同源）");
+        assert_eq!(c.pool.degrade_cooldown_secs, 600, "默认降权时长应为 600 秒");
+        assert_eq!(c.pool.degrade_cooldown_max_secs, 600, "默认上限应为 600 秒");
+        // ★ 默认必须是「开启」：0 = 关闭，若有人把默认改成 0，降权能力就默认不存在了。
+        assert_ne!(
+            c.pool.degrade_threshold, 0,
+            "降权默认必须开启（0 表示关闭，改成 0 等于让这个能力默认不存在）"
+        );
+        // 与既有 breaker 默认值不冲突：两者并存，且阈值可以不同（3 vs 5）。
+        assert_eq!(c.pool.breaker_threshold, 3, "既有熔断阈值不得被本次改动带偏");
+        // `Config::default()` 尚未 normalize，故 parsed 侧仍是零值 —— 这不是缺陷，
+        // 而是 `default()` 与 `normalize()` 的分工（解析结果只在 normalize 之后有意义）。
+        assert_eq!(c.parsed.degrade_cooldown, Duration::ZERO);
+    }
+
+    /// `normalize` 之后 `parsed` 侧拿到的是同一份秒数的 `Duration`。
+    #[test]
+    fn degrade_normalize_fills_parsed_durations() {
+        let c = Config::from_json(br#"{}"#).unwrap();
+        assert_eq!(c.parsed.degrade_cooldown, Duration::from_secs(600));
+        assert_eq!(c.parsed.degrade_cooldown_max, Duration::from_secs(600));
+
+        // 自定义值必须原样落到 parsed（不是恒等于默认）。
+        let raw = br#"{"pool":{"degrade_threshold":8,"degrade_cooldown_secs":90,"degrade_cooldown_max_secs":120}}"#;
+        let c = Config::from_json(raw).unwrap();
+        assert_eq!(c.pool.degrade_threshold, 8);
+        assert_eq!(c.parsed.degrade_cooldown, Duration::from_secs(90));
+        assert_eq!(c.parsed.degrade_cooldown_max, Duration::from_secs(120));
+    }
+
+    /// 从 JSON 解析：三个键各自生效，且不互相污染。
+    #[test]
+    fn degrade_fields_parse_from_json() {
+        let raw = br#"{
+            "pool": {
+                "degrade_threshold": 7,
+                "degrade_cooldown_secs": 42,
+                "degrade_cooldown_max_secs": 99,
+                "breaker_threshold": 4
+            }
+        }"#;
+        let c = Config::from_json(raw).unwrap();
+        assert_eq!(c.pool.degrade_threshold, 7);
+        assert_eq!(c.pool.degrade_cooldown_secs, 42);
+        assert_eq!(c.pool.degrade_cooldown_max_secs, 99);
+        // 既有键不受影响（三个新字段是纯增量，不改既有语义）。
+        assert_eq!(c.pool.breaker_threshold, 4);
+
+        // 缺键时逐个回落默认（不是「一个缺失就全用默认」）。
+        let c = Config::from_json(br#"{"pool":{"degrade_threshold":9}}"#).unwrap();
+        assert_eq!(c.pool.degrade_threshold, 9);
+        assert_eq!(c.pool.degrade_cooldown_secs, 600, "缺键应回落默认");
+        assert_eq!(c.pool.degrade_cooldown_max_secs, 600, "缺键应回落默认");
+    }
+
+    /// ★★ `threshold = 0` = **关闭**，且 normalize **不得**把它顶回默认。
+    ///
+    /// 这是本旋钮与 `breaker_threshold` 的**关键语义差异**：后者 `<=0` 走默认
+    ///（没有「关掉熔断」这个选项），前者 `0` 是有意义的配置。若有人照抄 breaker
+    /// 的收敛口径，用户的「关掉降权」会静默变成「按 5 开启」。
+    #[test]
+    fn degrade_threshold_zero_disables_and_is_not_overridden() {
+        let c = Config::from_json(br#"{"pool":{"degrade_threshold":0}}"#).unwrap();
+        assert_eq!(
+            c.pool.degrade_threshold, 0,
+            "0 必须原样保留 = 关闭降权（不得被 normalize 顶回 5）"
+        );
+        // 对照：同一次解析里 breaker 的 0 是「走默认」—— 两套口径并存且都不许串。
+        let c = Config::from_json(br#"{"pool":{"degrade_threshold":0,"breaker_threshold":0}}"#)
+            .unwrap();
+        assert_eq!(c.pool.degrade_threshold, 0, "0 = 关闭");
+        assert_eq!(c.pool.breaker_threshold, 3, "breaker 的 0 走默认（口径不同）");
+    }
+
+    /// 负数一律收敛：threshold → 0（仍 = 关闭），两个时长 → 默认值。
+    #[test]
+    fn degrade_negative_values_are_clamped() {
+        let raw = br#"{
+            "pool": {
+                "degrade_threshold": -1,
+                "degrade_cooldown_secs": -30,
+                "degrade_cooldown_max_secs": -600
+            }
+        }"#;
+        let c = Config::from_json(raw).unwrap();
+        assert_eq!(c.pool.degrade_threshold, 0, "负阈值应收敛为 0（= 关闭），而不是 5");
+        assert_eq!(c.pool.degrade_cooldown_secs, 600, "负时长应回落默认");
+        assert_eq!(c.pool.degrade_cooldown_max_secs, 600, "负上限应回落默认");
+        assert_eq!(c.parsed.degrade_cooldown, Duration::from_secs(600));
+
+        // 显式 0 与负数同归宿（时长没有「关闭」语义）。
+        let c = Config::from_json(
+            br#"{"pool":{"degrade_cooldown_secs":0,"degrade_cooldown_max_secs":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.pool.degrade_cooldown_secs, 600);
+        assert_eq!(c.pool.degrade_cooldown_max_secs, 600);
+    }
+
+    /// 上限不得小于时长：否则将来接上「重犯加长」时 `min(d, max)` 会**缩短**降权。
+    #[test]
+    fn degrade_max_is_raised_to_at_least_cooldown() {
+        let raw = br#"{"pool":{"degrade_cooldown_secs":900,"degrade_cooldown_max_secs":60}}"#;
+        let c = Config::from_json(raw).unwrap();
+        assert_eq!(
+            c.pool.degrade_cooldown_max_secs, 900,
+            "上限小于时长时应抬到等于时长（不能出现「配 900 秒实际 60 秒就回池」）"
+        );
+        assert_eq!(c.parsed.degrade_cooldown, Duration::from_secs(900));
+        assert_eq!(c.parsed.degrade_cooldown_max, Duration::from_secs(900));
+
+        // 上限大于时长时原样保留（不能无脑对齐）。
+        let c =
+            Config::from_json(br#"{"pool":{"degrade_cooldown_secs":60,"degrade_cooldown_max_secs":300}}"#)
+                .unwrap();
+        assert_eq!(c.pool.degrade_cooldown_max_secs, 300);
+        assert_eq!(c.parsed.degrade_cooldown, Duration::from_secs(60));
+    }
+
+    /// 与降权相关的既有约定不许被本次改动带偏：宿主实际写的 `pool` 块仍能解析。
+    ///
+    /// ★ 这条是**向后兼容**的守卫：宿主（`ai-gateway-core`）还没写出这三个新键，
+    /// 老配置里也没有它们。缺键时必须走默认开启 + 默认时长，而不是报错或变 0。
+    #[test]
+    fn degrade_absent_in_host_config_uses_defaults() {
+        let raw = br#"{"pool":{"breaker_threshold":3,"breaker_cooldown":"30m","max_in_flight":3}}"#;
+        let c = Config::from_json(raw).unwrap();
+        assert_eq!(c.pool.degrade_threshold, 5);
+        assert_eq!(c.pool.degrade_cooldown_secs, 600);
+        assert_eq!(c.pool.degrade_cooldown_max_secs, 600);
     }
 }

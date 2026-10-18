@@ -112,6 +112,10 @@ async fn main() {
         cfg.parsed.breaker_cooldown,
         cfg.parsed.breaker_cooldown_max,
     );
+    // ★ 连败降权：紧挨上面的 `set_breaker` —— 同属「池级阈值旋钮」，也同属
+    // 「必须在账号进来之前接好」的那一批（否则先加载的账号会在降权生效前被选走）。
+    // 为什么抽成一个函数、为什么只传两个参数 —— 见 [`apply_degrade_config`]。
+    apply_degrade_config(&mut pool, &cfg);
     pool.set_max_in_flight(cfg.pool.max_in_flight);
     pool.set_weights(cfg.pool.idle_weight_per_hour, cfg.pool.idle_weight_max);
 
@@ -1235,6 +1239,41 @@ async fn main() {
     println!("已落盘，退出");
 }
 
+/// 把**连败降权**的配置接到池子（`main` 里紧挨 `set_breaker` 调它）。
+///
+/// # 为什么抽成一个具名函数
+///
+/// 这段接线是「配置项 → 池子字段」的唯一通路。写成 `main()` 里的一行时，
+/// 它**没有任何可观测的验证手段**：整个 `main` 要起 HTTP 服务、加载凭证目录、
+/// 落盘 state —— 测试没法只跑那一行，于是「接线漏了」只能靠人眼发现，
+/// 而症状是「配了 0 关掉降权，线上照样降权」这种**静默失效**。
+/// 抽出来后 `apply_degrade_config_is_wired_to_pool` 可以直接断言池子的
+/// 生效值等于配置值，故障注入（删掉这次调用）立刻变红。
+///
+/// # 为什么只传两个参数
+///
+/// 池侧签名是 `set_degrade(threshold, cooldown)`，**没有** `cooldown_max`。
+/// 降权按设计「不延长、不翻倍」⇒ 时长恒为 `degrade_cooldown`（见
+/// [`ai_gateway_router::config::PoolConfig::degrade_cooldown_max_secs`] 的文档）。
+/// 配置里的 `cfg.parsed.degrade_cooldown_max` 因而**刻意不往下传**：
+/// 传了也没有任何代码读它，反而会让后人误以为上限真的生效了。
+/// 将来若真要启用上限，先改池侧签名，再来补这一行。
+///
+/// # 为什么不在这里过滤 `threshold = 0`
+///
+/// 阈值 `0` = **关闭**该机制（[`ai_gateway_router::config::Config::normalize`]
+/// 明确保留的语义，只有负数才收敛）。`set_degrade` 对 0 是**接受**的
+/// （与 `set_breaker` 的「非正即不覆盖」不同），所以这里必须原样透传 ——
+/// 任何 `max(1, …)` 之类的「保护」都会把用户的关闭动作变成静默开启。
+fn apply_degrade_config(pool: &mut Pool, cfg: &Config) {
+    pool.set_degrade(cfg.pool.degrade_threshold, cfg.parsed.degrade_cooldown);
+    ai_gateway_router::logline!(
+        "连败降权：阈值 {} 次（0=关闭）/ 降权 {} 秒",
+        cfg.pool.degrade_threshold,
+        cfg.parsed.degrade_cooldown.as_secs()
+    );
+}
+
 /// CLI 子命令派发（Go `cmd/server/main.go:103-122` 的对应物）。
 ///
 /// 返回 `Some(退出码)` 表示**这是一次子命令调用，调用方应立即 `exit`**；
@@ -1273,3 +1312,169 @@ async fn dispatch_subcommand(args: &[String]) -> Option<i32> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ai_gateway_router::auth::Auth;
+    use ai_gateway_router::config::{DEFAULT_DEGRADE_COOLDOWN_SECS, DEFAULT_DEGRADE_THRESHOLD};
+    use ai_gateway_router::pool::DEGRADE_THRESHOLD;
+
+    /// 造一个**非默认**的配置：接线实际读取的两个旋钮都和缺省值不同。
+    ///
+    /// ★ 这是本组用例的**全部要害**：只要有一项恰好等于缺省值，
+    /// 「接线生效」与「接线漏了但缺省值碰巧对」就无法区分，
+    /// 故障注入也就不会变红。故数值刻意选得离缺省很远（2 / 30 秒）。
+    ///
+    /// 只写这两个键：`degrade_cooldown_max_secs` **刻意不写** ——
+    /// 接线不读它（见 [`apply_degrade_config`]），写进夹具会让人误以为它也参与。
+    fn cfg_with(threshold: i64, cooldown_secs: i64) -> Config {
+        let raw = format!(
+            r#"{{"pool":{{"degrade_threshold":{threshold},"degrade_cooldown_secs":{cooldown_secs}}}}}"#
+        );
+        Config::from_json(raw.as_bytes()).expect("测试配置必须能解析")
+    }
+
+    /// 一个最小可用的账号（只需 uid；其余字段与 `pool.rs` 测试里的 `mk` 同款）。
+    fn acct(uid: &str) -> Auth {
+        Auth {
+            uid: uid.to_string(),
+            access_token: format!("at-{uid}"),
+            ..Default::default()
+        }
+    }
+
+    /// **核心断言：接线真的生效** —— 池子的生效阈值等于**配置值**，
+    /// 而非常量缺省值。
+    ///
+    /// 故障注入（已实测）：把 `main` 里的 `apply_degrade_config(...)`
+    /// 或本函数里的 `pool.set_degrade(...)` 删掉，这条立刻变红 ——
+    /// 因为池子会保持 `DEGRADE_THRESHOLD`（5），而这里配的是 2。
+    #[test]
+    fn apply_degrade_config_is_wired_to_pool() {
+        let cfg = cfg_with(2, 30);
+
+        // 先钉住「配置确实读到了非缺省值」，否则下面的断言可能只是因为
+        // 配置本身等于缺省值而假绿。
+        assert_eq!(cfg.pool.degrade_threshold, 2);
+        assert_eq!(cfg.parsed.degrade_cooldown, Duration::from_secs(30));
+        assert_ne!(
+            cfg.pool.degrade_threshold, DEFAULT_DEGRADE_THRESHOLD,
+            "夹具必须偏离缺省值，否则证明不了接线"
+        );
+        assert_ne!(
+            cfg.parsed.degrade_cooldown.as_secs() as i64,
+            DEFAULT_DEGRADE_COOLDOWN_SECS,
+            "夹具必须偏离缺省时长，否则证明不了接线"
+        );
+
+        let mut pool = Pool::new(String::new());
+        // 接线前的缺省值（这也是故障注入后残留的值）。
+        assert_eq!(
+            pool.degrade_threshold(),
+            DEGRADE_THRESHOLD,
+            "新池的缺省阈值应等于常量"
+        );
+
+        apply_degrade_config(&mut pool, &cfg);
+
+        assert_eq!(
+            pool.degrade_threshold(),
+            cfg.pool.degrade_threshold,
+            "池子的生效阈值必须是配置值，而不是常量缺省值"
+        );
+        assert_eq!(
+            pool.degrade_threshold(),
+            2,
+            "阈值必须具体等于配置里写的 2（读的是 cfg.pool.degrade_threshold）"
+        );
+    }
+
+    /// 配置的阈值真的改变**行为**：2 次失败即降权（缺省要 5 次）。
+    ///
+    /// 这条是「数字对上」之外的**行为级**证明：即使有人把阈值传反了
+    /// （比如硬编码 5），上一条会红；而这条证明降权确实按配置的次数触发。
+    #[test]
+    fn configured_threshold_drives_actual_degrade() {
+        let cfg = cfg_with(2, 30);
+        let mut pool = Pool::new(String::new());
+        pool.add(acct("u1"));
+        apply_degrade_config(&mut pool, &cfg);
+
+        assert!(pool.servable_now(), "初始应可选");
+
+        pool.note_failures("u1");
+        assert!(pool.servable_now(), "1 次失败不得降权（阈值是 2）");
+
+        pool.note_failures("u1");
+        assert!(!pool.servable_now(), "第 2 次达阈必须降权（配置值生效）");
+        assert!(pool.degraded("u1"));
+        assert!(pool.pick().is_none(), "降权中的号不得被选中");
+    }
+
+    /// `degrade_threshold = 0` 表示**关闭**，且接线不得把它「保护」成缺省 5。
+    ///
+    /// 这是最容易写错的一项：`set_breaker` 对 `<= 0` 是「保持缺省」，
+    /// 若把同一套约定误套到 `set_degrade`，用户关掉降权后池子会静默变成 5
+    /// （配置界面上明明关着，网关照样降权）。本用例钉住那个例外。
+    #[test]
+    fn zero_threshold_disables_degrade_through_wiring() {
+        let cfg = cfg_with(0, 30);
+        assert_eq!(cfg.pool.degrade_threshold, 0, "0 应原样保留（= 关闭）");
+
+        let mut pool = Pool::new(String::new());
+        pool.add(acct("u1"));
+        apply_degrade_config(&mut pool, &cfg);
+
+        assert_eq!(
+            pool.degrade_threshold(),
+            0,
+            "接线后生效阈值必须是 0（关闭），不能回落成缺省 5"
+        );
+
+        // 行为验证：关掉之后，连败很多次也不得降权。
+        for _ in 0..10 {
+            pool.note_failures("u1");
+        }
+        assert!(
+            pool.servable_now(),
+            "阈值 0 = 关闭：连败 10 次也不得把这把号摘掉"
+        );
+        assert!(!pool.degraded("u1"));
+        assert_eq!(pool.consecutive_fails("u1"), 10, "关闭时仍只记账，不降权");
+    }
+
+    /// 负阈值经 `normalize` 收敛为 0（= 关闭），接线后也是关闭。
+    ///
+    /// 防的是「配了 -1 以为能关、实际按缺省 5 开启」。
+    #[test]
+    fn negative_threshold_normalizes_to_disabled_through_wiring() {
+        let cfg = cfg_with(-1, 30);
+        assert_eq!(
+            cfg.pool.degrade_threshold, 0,
+            "负阈值应被 normalize 收敛为 0（关闭），而不是 5"
+        );
+
+        let mut pool = Pool::new(String::new());
+        pool.add(acct("u1"));
+        apply_degrade_config(&mut pool, &cfg);
+        assert_eq!(pool.degrade_threshold(), 0);
+        assert!(!pool.degraded("u1"));
+    }
+
+    /// 缺省配置接出来仍是 5 / 600 —— 保证「不配就是老行为」。
+    ///
+    /// 与上面几条**互补**：那几条证明「配了会变」，这条证明「不配不变」，
+    /// 也就是这次改动对没写新键的老配置是**零影响**（可回滚点）。
+    #[test]
+    fn default_config_keeps_defaults() {
+        let cfg = Config::default();
+        assert_eq!(cfg.pool.degrade_threshold, DEFAULT_DEGRADE_THRESHOLD);
+
+        let mut pool = Pool::new(String::new());
+        apply_degrade_config(&mut pool, &cfg);
+        assert_eq!(pool.degrade_threshold(), DEFAULT_DEGRADE_THRESHOLD);
+        assert_eq!(pool.degrade_threshold(), DEGRADE_THRESHOLD);
+    }
+}
+

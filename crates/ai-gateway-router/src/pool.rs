@@ -5,9 +5,13 @@
 //! # 状态模型
 //!
 //! 每个账号有三个正交维度：
-//! 1. **健康维度**（唯一权威）：`healthy = !disabled && !until 生效 && !breaker_until 生效`
+//! 1. **健康维度**（唯一权威）：
+//!    `healthy = !disabled && !no_route && !daily_guard && !until 生效 && !breaker_until 生效 && !degrade_until 生效`
 //!    - `until`：按错误类型的即时冷却（软 429 / 硬 余额耗尽）
 //!    - `breaker_until`：连续失败累计触发熔断的指数退避截止
+//!    - `degrade_until`：**连败降权**的截止（[`DEGRADE_THRESHOLD`] 次「不知道原因」
+//!      的失败之后）。与上面两个截止**并列**，不叠加计算 —— 三者同时生效时
+//!      「谁更晚」由或门天然保证（任一未过期即不可选）
 //! 2. **并发维度**：`in_flight`（在途租约，运行态）
 //! 3. **统计维度**：`success_count` / `err_total` / `last_used` / `last_success` / `last_err`
 //!
@@ -73,6 +77,56 @@ pub const SESSION_DEAD_THRESHOLD: i64 = 3;
 /// 与旧文案逐字一致，便于既有运维脚本按 `reason` 匹配。
 /// 对应 Go `internal/pool/pool.go:3152 const sessionDeadReason = "12153 session dead"`。
 pub const SESSION_DEAD_REASON: &str = "12153 session dead";
+
+/// **连败降权**阈值：连续多少次「不知道原因的失败」才把这把号摘出选号池。
+///
+/// # 取值依据：为什么是 5（而不是 1 或 3）
+///
+/// 本机制的喂入口是**没有权威分类**的失败（Client 类 4xx、传输层超时/连接被拒），
+/// 见 `forward::apply_error_policy` 的注释。这类失败的语义是「**不知道**为什么」：
+/// 可能是请求内容本身有问题（换号也没用），也可能是这把号临时不好。单次即罚会把
+/// 「用户发了一条非法请求」误判成「账号坏了」—— 那是本项目在 `no_route` / 12153
+/// 上踩过两次的同一类误判（把一次抖动放大成停服）。
+///
+/// 3 也不够：熔断器的默认阈值正是 3（`Pool::breaker_threshold`），而熔断管的是
+/// 「上游白纸黑字的 5xx」。把降权也定成 3，两条机制的曲线会完全重合，位置一撞就
+/// 分不清「该号是被 5xx 熔断的还是被未知错误降权的」。取 5 与之拉开一档：**分类
+/// 明确**的失败 3 次即熔断，**不知道原因**的失败要 5 次才降权 —— 不确定性越大，
+/// 阈值越保守。
+///
+/// 上界一侧的取舍：客户端（DSH 用的 `pi-ai`）自带 5 次重试，而重试是**并发**的
+/// （见 AGENTS.md「客户端并发重试 vs 单账号产品的并发上限」）。阈值取 5 意味着
+/// 一次「5 连败」的重试风暴**刚好**会在结束时降权 —— 这与业主现场「同一个号反复
+/// 失败却一直被选中」的形状对齐，同时不至于让偶发 2~3 次抖动就把号摘掉。
+///
+/// ★ 不做成配置项：配置旋钮在 `config.rs`（`pool.degrade_threshold`），注入入口是
+/// [`Pool::set_degrade`]。这里是**缺省值**，测试直接钉住它，防止被「顺手调小」。
+pub const DEGRADE_THRESHOLD: i64 = 5;
+
+/// **连败降权**时长：达阈后把这把号摘出选号池多久。
+///
+/// # 取值依据：为什么是 10 分钟（而不是 30 秒或 30 分钟）
+///
+/// - **不能太短**：降权的目的是让「反复未知失败」的号离开选号池一轮，好让同产品的
+///   其他号接客。若只有几十秒，一次并发重试风暴（5 次重试几十毫秒内打完）结束后
+///   它立刻回池，等于什么都没做。
+/// - **不能太长**：与熔断的 30 分钟（`Pool::breaker_cooldown`）拉开一个量级。
+///   降权面对的是**未知**原因，惩罚力度必须**低于**有权威分类的熔断 —— 否则
+///   「不知道错在哪」比「确定上游 5xx」罚得更重，本末倒置。
+/// - 10 分钟恰好覆盖「用户手动重发几次」这个典型人为窗口，又短到一次临时抖动
+///   之后不会让人等太久：真正的恢复判据是**一次成功**（[`Pool::clear_degrade`]），
+///   超时只是「没人再试它」时的兜底放行。
+///
+/// ★ 同样只是缺省值，注入入口是 [`Pool::set_degrade`]（`config.rs` 的
+/// `pool.degrade_cooldown_secs`）。
+pub const DEGRADE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// 连败降权生效时写进 [`Status::reason`] 的前缀。
+///
+/// 只占**降权自己的**文案位：`until` / `breaker_until` 各自有原因文案，三者互不覆盖
+/// 是既有约定（`cooldown` 写 `until` 的、`record_breaker_failure` 不动 `reason`）。
+/// 这里带 `consecutive` 字样，是为了让运维一眼区分「按错误分类冷却」与「未知连败降权」。
+pub const DEGRADE_REASON_PREFIX: &str = "连续未知失败降权";
 
 /// 单账号对外暴露的状态（脱敏），对应 Go 侧 `pool.Status`。
 #[derive(Debug, Clone, Default)]
@@ -193,6 +247,20 @@ pub struct Status {
     pub soonest_expire_at: i64,
     /// 到期日（本地日期 `YYYY-MM-DD`），分层用的档位键。
     pub expire_day: String,
+
+    // ---- 连败降权（见 [`DEGRADE_THRESHOLD`] / [`Pool::note_failures`]）----
+    /// 当前**连续**的「未知原因失败」次数（尚未达阈时的累计值）。
+    ///
+    /// 与 `breaker_fails` 是**两条独立曲线**：那个只吃有权威分类的失败
+    /// （5xx / 429 / 402 …），这个只吃「不知道原因」的失败
+    /// （Client 类 4xx、传输层超时）。达阈时归零（见 [`Pool::note_failures`]），
+    /// 因此这里的数字永远是「这一轮还没还完的账」，不会单调增长。
+    pub consecutive_fails: i64,
+    /// 连败降权的截止时刻；`None` = 未降权（或已到期后被惰性清掉）。
+    ///
+    /// 与 `until` / `breaker_until` **并列**：三者同时生效时「取更长者」由
+    /// 选号侧的或门天然保证，[`Pool::status_of`] 不做叠加计算。
+    pub degrade_until: Option<SystemTime>,
 }
 
 /// 单条「账号 + 模型」冷却的内部记录。
@@ -247,6 +315,41 @@ struct Entry {
     fails: i64,
     /// 已熔断次数（指数退避的指数）。
     retry_count: i64,
+
+    /// **连败降权**计数：连续多少次「不知道原因」的失败。
+    ///
+    /// # 与 `fails`（熔断计数）的分工
+    ///
+    /// `fails` 吃的是**有权威分类**的失败：上游 5xx、429、402、12153、11140 …
+    /// 它们的处置（冷却 / 熔断 / 禁用）都由错误类别直接决定，惩罚曲线是设计好的。
+    ///
+    /// 本字段吃的是**没有分类依据**的失败：Client 类 4xx 与传输层超时 —— 调用方
+    /// 只知道「这一次没成」，不知道是请求内容的问题还是这把号的问题。这类失败的
+    /// 正确处置是**降权（少选它）而不是立刻罚停**：单次即罚会让「用户发了一条
+    /// 非法请求」把好号打成坏的（见 [`DEGRADE_THRESHOLD`] 的取值依据）。
+    ///
+    /// # 为什么达阈后要清零
+    ///
+    /// 与 [`Entry::session_dead_fails`] 同一个理由：「连续」是语义核心。不清零的话，
+    /// 一周里每天偶发一次失败累计到 5 次也会降权，机制退化成「累计 5 次即降权」。
+    /// 清零后每一轮都是**重新观察**，而这一轮的平均间隔由降权时长本身兜着。
+    ///
+    /// ★ **持久化**（与 Go 侧的 `session_dead_fails` 相反）：降权是「跨重启仍然成立
+    /// 的事实」—— 网关重启不代表那把号就好了。见 [`StateAccount::consecutive_fails`]。
+    consecutive_fails: i64,
+
+    /// **连败降权**的截止时刻（`None` = 未降权）。
+    ///
+    /// 与 `until` / `breaker_until` **并列**的第三条「不可选」判据，落在
+    /// [`Entry::healthy`] 的同一个或门里。**刻意不叠加**：三者同时生效时不需要
+    /// 「取更晚的那个」这种计算 —— 或门本身就让「任一未过期 ⇒ 不可选」成立，
+    /// 而只要最晚的那个还没过期，账号就仍然不可选。叠加计算只会引入一条
+    /// 与 `expiry()` 重复的路径，并且迟早与它分叉。
+    ///
+    /// ★ **只落盘未过期的**（惰性过滤，与 [`Entry::breaker_until`] 同口径）：
+    /// 已过期的截止时刻没有信息量，写进 state.json 只会让「重启后为什么它是
+    /// 冷却的」变成一个需要重新验算时间的问题。
+    degrade_until: Option<SystemTime>,
 
     /// **连续** `ErrSessionDead`（12153）计数，达到
     /// [`SESSION_DEAD_THRESHOLD`] 才禁用。
@@ -419,7 +522,35 @@ impl Entry {
                 return false;
             }
         }
+        // ★ 第四条：**连败降权**（见 [`DEGRADE_THRESHOLD`] / [`Pool::note_failures`]）。
+        //
+        // 与上面 `until` / `breaker_until` **并列**，不叠加、不算「取更晚者」：
+        // 或门的语义已经天然覆盖了「三者同时生效」—— 任一未过期即不可选，而三者中
+        // 最晚的那个一旦过期，就意味着另外两个（更早）必然也已过期。
+        //
+        // ⚠ 这条判据必须留在这里（`healthy`），而不是加在某个选号入口上：
+        // 本函数是**全部**选号路径（主路径、全冷却兜底、按 uid 直取、粘性直取、
+        // 探测、健康计数）的唯一闸门。历史上 `no_route` 曾只加在主路径上，
+        // 兜底路径漏了 —— 结果是「被标不接流量的账号在兜底时仍会被选中」
+        // （见本函数上方 `no_route` 的文档）。降权走同一条闸门，才不会重犯。
+        if self.degrade_active(now) {
+            return false;
+        }
         true
+    }
+
+    /// 降权是否**此刻仍生效**（唯一判据）。
+    ///
+    /// 抽成方法而不是在调用处各写 `degrade_until.map(|d| now < d)`，是因为它有三个
+    /// 调用点，而它们必须**永远一致**：
+    ///
+    /// 1. [`Entry::healthy`]（选号闸门）
+    /// 2. [`Pool::flush`]（落盘时惰性过滤 —— 已过期的截止不写盘）
+    /// 3. [`Pool::note_failures`]（「已在降权期内再次达阈」的判定）
+    ///
+    /// 三处分叉的症状极难排查：「`/status` 说它降权、选号却照选它」。
+    fn degrade_active(&self, now: SystemTime) -> bool {
+        self.degrade_until.map(|d| now < d).unwrap_or(false)
     }
 
     /// 每日护栏是否把该账号挡在**选号**之外（见 [Pool::set_daily_guard]）。
@@ -737,6 +868,39 @@ pub struct StateAccount {
     /// 与 `until` / `last_success` 同款序列化（Go 侧 `state.json` 可读）。
     #[serde(default, skip_serializing_if = "is_zero")]
     pub keepalive_at: i64,
+
+    /// **连败降权**计数（见 [`DEGRADE_THRESHOLD`]）：连续多少次「未知原因」的失败。
+    ///
+    /// # 为什么**恒**恢复（与 `session_dead_fails` 相反）
+    ///
+    /// `session_dead_fails` 刻意不持久化，理由是「重启本身就是一次重新观察」。
+    /// 降权不一样：它面对的是**幂等**的失败（同一把号、同一个上游），重启进程不会
+    /// 让上游好起来。若重启即归零，用户只要重启一次网关，「连败 4 次」的观察就白丢，
+    /// `DEGRADE_THRESHOLD` 可以被无限绕过 —— 那样阈值形同虚设。
+    ///
+    /// ★ 恢复时**不做任何裁剪**（哪怕是 999）：计数只是「这一轮还欠几次」，
+    /// 下一次 [`Pool::note_failures`] 就会达阈并归零，不会无限累积。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub consecutive_fails: i64,
+
+    /// **连败降权**的截止时刻；`None` / 缺省 = 未降权。
+    ///
+    /// # 只落盘**未过期**的（惰性过滤）
+    ///
+    /// 与 `breaker_until` 同口径：`breaker_until` 从来就不落盘（它不在这里的字段
+    /// 列表里），因为熔断的**冷却语义由 `until` 承担**。降权没有 `until` 可以借，
+    /// 所以必须自己落盘 —— 但**只落未过期的那些**（见 [`Pool::flush`]）。
+    ///
+    /// 为什么这不算「丢数据」：一个已经过期的截止时刻在语义上等价于 `None`
+    ///（[`Entry::healthy`] 对它恒返回「可选」）。写进文件只会让「重启后它为什么
+    /// 还是冷却的」变成一个需要重新验算时间戳的问题，而答案永远是「因为还没过期」。
+    #[serde(
+        default,
+        deserialize_with = "de_go_time",
+        serialize_with = "ser_go_time",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub degrade_until: Option<SystemTime>,
 }
 
 /// 反序列化 Go `time.Time` 的 RFC3339 字符串。
@@ -851,6 +1015,12 @@ impl Pool {
                 breaker_until: None,
                 fails: 0,
                 retry_count: 0,
+                // ★ 连败降权：**恒恢复**（见 `StateAccount::consecutive_fails`）。
+                consecutive_fails: s.consecutive_fails.max(0),
+                // `degrade_until` 只恢复**未过期**的：已过期的截止在语义上等价于
+                // `None`，把它读进来的唯一效果是让 `/status` 多出一个「已过期但
+                // 非空」的时间戳（前端会把它显示成「还在降权」）。
+                degrade_until: s.degrade_until.filter(|d| *d > SystemTime::now()),
                 // 不持久化（Go 同）：重启即归零，见 `Entry::session_dead_fails`。
                 session_dead_fails: 0,
                 in_flight: 0,
@@ -887,6 +1057,7 @@ impl Pool {
             return false;
         }
         let mut accounts = HashMap::new();
+        let now = SystemTime::now();
         for e in &self.entries {
             // 与 Go 侧 saveLocked 一致：只持久化有意义的维度
             let cool_kind = match e.cool_kind {
@@ -909,6 +1080,14 @@ impl Pool {
                     last_err: e.last_err,
                     expire_at: e.expire_at,
                     keepalive_at: e.keepalive_at,
+                    consecutive_fails: e.consecutive_fails,
+                    // ★ 惰性过滤：只落**未过期**的降权截止（与 `breaker_until`
+                    // 同口径 —— 那个干脆不落盘，因为它的冷却语义由 `until` 承担）。
+                    //
+                    // 判据复用 `degrade_active`，不在这里另写一遍 `now < d`：
+                    // 落盘与选号一旦分叉，就会出现「`/status` 说它降权、选号却
+                    // 照选它」这种自相矛盾的状态。
+                    degrade_until: e.degrade_until.filter(|_| e.degrade_active(now)),
                 },
             );
         }
@@ -952,6 +1131,21 @@ pub struct Pool {
     max_in_flight: i64,
     idle_weight_per_hour: f64,
     idle_weight_max: f64,
+
+    /// **连败降权**阈值（连续多少次「未知原因」的失败 → 降权）。缺省
+    /// [`DEGRADE_THRESHOLD`]，注入入口 [`Pool::set_degrade`]，配置键
+    /// `pool.degrade_threshold`。
+    ///
+    /// `<= 0` 表示**关闭**该机制（配置侧的 `0 = 关闭`，见 `Config::normalize`）。
+    /// 关闭时 [`Pool::note_failures`] 仍然累计计数（这不产生行为），但永不降权 ——
+    /// 于是「关掉它」可以把回滚风险压到最低，而不必回滚代码。
+    degrade_threshold: i64,
+    /// **连败降权**时长（达阈后摘出选号池多久）。缺省 [`DEGRADE_COOLDOWN`]。
+    ///
+    /// ★ 刻意**不做**指数退避：降权面对的是「不知道原因」的失败，惩罚力度必须
+    /// 低于有权威分类的熔断（后者才是 30min 起、指数翻倍、封顶 6h）。理由见
+    /// [`DEGRADE_COOLDOWN`] 与 `Pool::note_failures` 的注释。
+    degrade_cooldown: Duration,
 
     /// 单调序号：每次选号自增，写入 [`Entry::last_used_seq`]。
     pick_seq: i64,
@@ -1130,6 +1324,13 @@ impl Pool {
             max_in_flight: 0,
             idle_weight_per_hour: 0.5,
             idle_weight_max: 5.0,
+            // 连败降权：缺省**开启**（阈值 5 / 时长 10 分钟，见两个常量的取值依据）。
+            //
+            // 与每日护栏（缺省关闭）不同 —— 那个是「本机自己设的闸」，默认不该拦号；
+            // 而降权是**保护**（让反复失败的号离开选号池一轮），默认开启才是它的
+            // 交付状态。配置里写 `pool.degrade_threshold = 0` 即可关闭。
+            degrade_threshold: DEGRADE_THRESHOLD,
+            degrade_cooldown: DEGRADE_COOLDOWN,
             pick_seq: 0,
             rand: None,
             loaded_from_state: false,
@@ -1162,6 +1363,28 @@ impl Pool {
         }
         if cooldown_max > Duration::ZERO {
             self.breaker_cooldown_max = cooldown_max;
+        }
+    }
+
+    /// 注入**连败降权**参数（阈值 / 时长）。
+    ///
+    /// 与 [`Pool::set_breaker`] 同款约定：**非正值不覆盖**，故不传即保持缺省
+    /// （[`DEGRADE_THRESHOLD`] / [`DEGRADE_COOLDOWN`]）。
+    ///
+    /// ★ 但 `threshold = 0` 的语义在这里是**例外**：它表示「关闭该机制」，
+    /// 而 `set_breaker` 的 `<= 0` 是「保持缺省」。为什么允许这一个例外 ——
+    /// 配置侧把 `pool.degrade_threshold = 0` 定义成关闭（见 `Config::normalize`），
+    /// 若这里也拒收 0，那个配置项就成了**空转的旋钮**（用户在界面上关掉，
+    /// 网关照样降权）。故阈值接受 0，只拒负数。
+    ///
+    /// `cooldown <= 0` 仍按「保持缺省」处理：一个零时长的降权等于没降权，
+    /// 而那是「关闭机制」该干的事，不该由一个时长来承担（否则语义重叠成两个开关）。
+    pub fn set_degrade(&mut self, threshold: i64, cooldown: Duration) {
+        if threshold >= 0 {
+            self.degrade_threshold = threshold;
+        }
+        if cooldown > Duration::ZERO {
+            self.degrade_cooldown = cooldown;
         }
     }
 
@@ -1273,6 +1496,12 @@ impl Pool {
                 continue;
             }
             if e.breaker_until.map(|b| now < b).unwrap_or(false) {
+                continue;
+            }
+            // ★ 降权中的号不进分母（与「冷却中的账号不进分母」同一条理由：
+            // 否则「只开了一个号、它正在降权」也会被判成「全池触顶」，
+            // 把一个临时的连败降权说成「今天没额度了」）。
+            if e.degrade_active(now) {
                 continue;
             }
             total += 1;
@@ -2183,6 +2412,9 @@ impl Pool {
             fails: 0,
             retry_count: 0,
             session_dead_fails: 0,
+            // 新建的号没有连败记录，也没有降权。
+            consecutive_fails: 0,
+            degrade_until: None,
             in_flight: 0,
             expire_at,
             keepalive_at: 0,
@@ -2306,7 +2538,141 @@ impl Pool {
         e.retry_count = 0;
         e.breaker_until = None;
         e.session_dead_fails = 0;
+        // ★ 连败降权同样清零：一次成功是最强的「这把号没问题」信号，
+        // 比任何计数器都权威（见 `Pool::clear_degrade`）。
+        e.consecutive_fails = 0;
+        e.degrade_until = None;
         self.dirty = true;
+    }
+
+    /// 记录一次**没有权威分类**的失败（Client 类 4xx / 传输层超时），必要时降权。
+    ///
+    /// # 它与 `note_error` 的分工（**别混用**）
+    ///
+    /// - [`Pool::note_error`]：吃**有分类依据**的失败（上游 5xx），喂的是熔断器
+    ///   （`fails` → `breaker_until`，30 分钟起、指数退避）。
+    /// - 本方法：吃**不知道原因**的失败，喂的是连败降权（`consecutive_fails` →
+    ///   `degrade_until`，固定 10 分钟、**不退避**）。
+    ///
+    /// 为什么不能用同一套：分类明确的失败有确定的处置（该冷却就冷却、该禁用就禁用），
+    /// 而「不知道原因」的失败必须**更保守** —— 它可能是用户自己的请求有问题，
+    /// 换号也不会好。若两种失败喂同一个计数器，一次非法请求就能把熔断推到指数退避，
+    /// 表现为「什么都没干，号突然全被封」。
+    ///
+    /// # 达阈行为
+    ///
+    /// `consecutive_fails++`；达到 [`Pool::degrade_threshold`] 时：
+    ///
+    /// 1. `degrade_until = now + degrade_cooldown`
+    /// 2. **计数清零** —— 供下一轮重新累计（与 [`Entry::session_dead_fails`] 同款）
+    ///
+    /// ★★ **已在降权期内再次达阈：不延长、不翻倍**，只清零计数。
+    ///
+    /// 这是本机制与熔断**最重要的区别**，也是「防用户重试把降权越堆越厚」的关键：
+    /// 客户端（DSH）一次失败会并发重试 5 次，用户手点「重发」还会再来一轮 —— 若每次
+    /// 达阈都往后续 10 分钟，一个坏号会被用户自己的重试**永久**按在降权里（而且
+    /// 是按用户手速叠加的，不可预测）。故这里只**首次**设置截止；已生效期间达阈
+    /// 一律不碰 `degrade_until`。
+    ///
+    /// 代价是「降权期内的失败不再加热惩罚」—— 可以接受：那些失败发生在**至少还有
+    /// 一个健康号之外**的重试上，而真正的出路是「一次成功」（[`Pool::clear_degrade`]）
+    /// 或等到期。
+    ///
+    /// # 关闭机制
+    ///
+    /// 阈值 `<= 0`（配置 `pool.degrade_threshold = 0`）时：仍然累计计数（不产生
+    /// 行为），但**永不降权**。这样「关掉它」是纯粹的配置动作，不必回滚代码。
+    pub fn note_failures(&mut self, uid: &str) {
+        let Some(&idx) = self.by_uid.get(uid) else { return };
+        let now = SystemTime::now();
+        let e = &mut self.entries[idx];
+        e.consecutive_fails += 1;
+        self.dirty = true;
+        if self.degrade_threshold <= 0 {
+            return; // 机制关闭：只记账，不降权
+        }
+        if e.consecutive_fails < self.degrade_threshold {
+            return;
+        }
+        // 达阈：计数清零供下一轮重新累计（无论是否已在降权期内）。
+        e.consecutive_fails = 0;
+        // ★★ 「已在降权期内」⇒ **不延长**（见本方法的文档）。
+        //
+        // 判据复用 `Entry::degrade_active`，不在外面另写 `now < until`：
+        // 与选号/落盘共用同一份判据，才不会出现「选号说还在降权、这里却认为已过期
+        // 于是又续一轮」的漂移。
+        if e.degrade_active(now) {
+            return;
+        }
+        e.degrade_until = Some(now + self.degrade_cooldown);
+        // `reason` 是给人看的排查线索：与 `cooldown` 的 `"429 rate limit"` 同款职责。
+        // ★ 不覆盖**已有**的、来自权威分类的原因（那更具体、更有用）—— 只在为空或
+        // 本就是降权文案时写，避免「上游 5xx 的原因被一条降权文案盖掉」。
+        if e.reason.is_empty() || e.reason.starts_with(DEGRADE_REASON_PREFIX) {
+            e.reason = format!("{}（达阈 {} 次）", DEGRADE_REASON_PREFIX, self.degrade_threshold);
+        }
+    }
+
+    /// 成功时**回池**：清零连败计数并清掉降权截止。
+    ///
+    /// 与 `note_success` 里那两行的关系：那个是「一次 chat 成功」的完整收尾
+    /// （它还清熔断 / session 计数）；本方法是**只**管降权的窄口，供那些
+    /// 「证明这把号可用、但不算一次成功请求」的路径单独调用（例如探测成功）。
+    ///
+    /// # 为什么成功就**立刻**回池（而不是等降权期走完）
+    ///
+    /// 降权的语义是「少选它，直到有反证」—— 一次成功就是最强的反证。若坚持等满
+    /// 10 分钟，用户会在「号明明已经好了」之后仍然拿到 503，且无从得知原因
+    /// （`/status` 里只有一串 `degrade_until`）。
+    ///
+    /// 不置 `dirty` 是**不可以**的：`degrade_until` 是落盘字段（见
+    /// [`StateAccount::degrade_until`]），清了必须让下一次 flush 写出去 ——
+    /// 否则重启后那个已经被证伪的降权会**复活**。
+    pub fn clear_degrade(&mut self, uid: &str) {
+        let Some(&idx) = self.by_uid.get(uid) else { return };
+        let e = &mut self.entries[idx];
+        e.consecutive_fails = 0;
+        e.degrade_until = None;
+        self.dirty = true;
+    }
+
+    /// 当前连败计数（供 `/status` 观测与测试断言；UID 不在池中返回 0）。
+    pub fn consecutive_fails(&self, uid: &str) -> i64 {
+        match self.by_uid.get(uid) {
+            Some(&idx) => self.entries[idx].consecutive_fails,
+            None => 0,
+        }
+    }
+
+    /// 该账号的降权截止时刻；`None` = 未降权（含已到期）。
+    ///
+    /// ★ 与 [`Entry::degrade_active`] 同口径：已过期的截止**这里就返回 `None`**，
+    /// 不把「已过期但非空」的时间戳漏给 `/status` —— 那会让前端把一把可用的号
+    /// 显示成「还在降权」，而唯一能反驳它的地方是选号结果，用户看不见。
+    pub fn degrade_until(&self, uid: &str) -> Option<SystemTime> {
+        let now = SystemTime::now();
+        match self.by_uid.get(uid) {
+            Some(&idx) => {
+                let e = &self.entries[idx];
+                e.degrade_until.filter(|_| e.degrade_active(now))
+            }
+            None => None,
+        }
+    }
+
+    /// 连败降权是否**此刻**把这把号挡在选号之外（含到期判定）。
+    pub fn degraded(&self, uid: &str) -> bool {
+        match self.by_uid.get(uid) {
+            Some(&idx) => self.entries[idx].degrade_active(SystemTime::now()),
+            None => false,
+        }
+    }
+
+    /// 缺省阈值（供 `/status` 与日志引用，避免各处硬编码 [`DEGRADE_THRESHOLD`]）。
+    ///
+    /// ⚠ 返回的是**当前生效**的阈值（可能被 `set_degrade` / 配置改过），不是常量。
+    pub fn degrade_threshold(&self) -> i64 {
+        self.degrade_threshold
     }
 
     /// 记录一次错误：喂入连续失败计数器，达到阈值触发熔断（指数退避）。
@@ -2696,28 +3062,46 @@ impl Pool {
 
     /// 构造单个账号的对外状态。
     fn status_of(&self, e: &Entry, now: SystemTime) -> Status {
+        // 「此刻不可选」的三种来源。与 `Entry::healthy` 的或门**同源**，
+        // 只是这里要的是布尔投影而不是尽早返回 —— 三处（选号 / 计数 / 下发）
+        // 各写一套判据正是本项目反复出现的缺陷类型，故降权也走同一个 `degrade_active`。
+        let degrade_active = e.degrade_active(now);
         let cooling = e
             .until
             .map(|u| now < u)
             .unwrap_or(false)
-            || e.breaker_until.map(|b| now < b).unwrap_or(false);
+            || e.breaker_until.map(|b| now < b).unwrap_or(false)
+            // 降权也是「这把号现在不接客」。不含它会让界面显示「0 冷却，但
+            // healthy 少了一个」，用户只能看到数字对不上。
+            || degrade_active;
         let cool_remaining = e
             .until
             .filter(|u| now < *u)
             .and_then(|u| u.duration_since(now).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        // `cool_kind` 是对外的**冷却类型**枚举式字符串。降权态必须有自己的一档
+        //（`"degrade"`），否则前端只能看到一个空的 cool_kind + cooling=true，
+        // 无从得知「这是连续失败降权，等一会儿就好」。
+        //
+        // ⚠ 纯增量：既有两档（`"soft_rate"` / `"hard_credit"`）的判定**逐字不变**
+        // —— 只在 `cool_kind` 本就为空（即没有权威分类的冷却）时才落到 `"degrade"`。
+        // 理由：`hard_credit` 的出路是「去签到」，与「等一会儿」完全不同，不能让
+        // 降权把它顶掉。
+        let cool_kind = if e.cool_kind.is_some() {
+            e.cool_kind.unwrap().as_str().to_string()
+        } else if degrade_active {
+            "degrade".to_string()
+        } else {
+            String::new()
+        };
 
         Status {
             uid: e.a.uid.clone(),
             nickname: e.a.nickname.clone(),
             credits: e.credits,
             cooling,
-            cool_kind: if e.cool_kind.is_some() {
-                e.cool_kind.unwrap().as_str().to_string()
-            } else {
-                String::new()
-            },
+            cool_kind,
             cool_remaining_sec: cool_remaining,
             until: e.until,
             reason: e.reason.clone(),
@@ -2743,6 +3127,13 @@ impl Pool {
             breaker_until: e.breaker_until,
             soonest_expire_at: e.expire_at,
             expire_day: e.expiry_day_key(),
+            // ★ 连败降权：与选号**同一个判据**（`degrade_active`）。
+            //
+            // `degrade_until` 只下发**仍生效**的：已过期的截止在这里折成 `None`，
+            // 否则前端会把一把可用的号显示成「还在降权」，而唯一能反驳它的地方
+            // 是选号结果 —— 用户看不见。
+            consecutive_fails: e.consecutive_fails,
+            degrade_until: e.degrade_until.filter(|_| e.degrade_active(now)),
         }
     }
 
@@ -2758,7 +3149,11 @@ impl Pool {
                 disabled += 1;
             }
             let is_cooling = e.until.map(|u| now < u).unwrap_or(false)
-                || e.breaker_until.map(|b| now < b).unwrap_or(false);
+                || e.breaker_until.map(|b| now < b).unwrap_or(false)
+                // ★ 连败降权也算「此刻不可选」的一种：`/status` 的 `cooling` 是
+                // 「这把号现在不接客」，而降权正是这个语义。漏了它，界面会显示
+                // 「0 冷却，但 healthy 少了一个」—— 用户只能看到数字对不上。
+                || e.degrade_active(now);
             if is_cooling {
                 cooling += 1;
             }
@@ -2859,6 +3254,16 @@ impl Pool {
     ///
     /// 仍**排除** `disabled`（网关判定 session 死 / 额度冻结）：那种账号连
     /// `/v3/config` 都会失败，拿来探测只会白跑一轮并写进日志噪音。
+    ///
+    /// # 关于降权（**刻意不排除**）
+    ///
+    /// 冷却 / 熔断中的账号被排除，是因为「上游此刻多半还在限流你」，探测只会
+    /// 得到同一个 429。降权不同：它的成因是**未知**错误，而上游的模型清单接口
+    /// 与聊天接口是两条不同的链路 —— 探测**不受**那个未知错误影响。
+    ///
+    /// 反过来，这把号恰恰是最需要被探的：一次探测成功就是「它其实可用」的最强
+    /// 反证（调用方随后走 [`Pool::clear_degrade`] 即可立刻回池），比对着一串
+    /// `degrade_until` 干等 10 分钟有用得多。
     pub fn probe_uids(&self) -> Vec<String> {
         let now = SystemTime::now();
         let mut uids: Vec<String> = self
@@ -3247,6 +3652,12 @@ impl Pool {
                 continue;
             }
             if e.breaker_until.map(|b| now < b).unwrap_or(false) {
+                continue;
+            }
+            // ★ 降权中的号同样「本来就不能用」⇒ 不进分母（与上面两条同款）。
+            // 不进的话，「1 个 no_route + 4 个降权」会被说成「5 个都被设成不接
+            // 流量」—— 用户会去检查一个根本没动过的开关。
+            if e.degrade_active(now) {
                 continue;
             }
             total += 1;
@@ -3881,6 +4292,16 @@ impl Pool {
             // `healthy()` 里那道判据在这里**不会生效**。「主路径加了、兜底漏了」正是
             // 本项目在 `no_route` 上踩过两次的缺陷类型，故这里不能省。
             if e.daily_guard_blocks() {
+                continue;
+            }
+            // ★★ 连败降权也必须在这里**显式再写一遍** —— 与上面 `no_route` /
+            // 每日护栏完全同款的理由：本函数**不调 `healthy()`**（它要选「正在
+            // 冷却」的账号），所以 `healthy()` 里那道判据在这里**不会生效**。
+            //
+            // 「主路径加了、兜底漏了」正是本项目在 `no_route` 上踩过两次的缺陷类型；
+            // 降权若漏在这里，一个连续失败 5 次的号会在全池冷却时被兜底捞出来接客，
+            // 而这恰恰是「用户等了一轮降权、回来发现还是坏号」的形状。
+            if e.degrade_active(now) {
                 continue;
             }
             // ---- 落点 C：平台总开关（全冷却兜底也必须尊重它）----
@@ -6074,5 +6495,419 @@ mod tests {
             "从状态文件读回的 credits 不得被当成真值 —— 否则重启后会凭旧数字把号锁死"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===================================================================
+    // 连败降权（DEGRADE_THRESHOLD / DEGRADE_COOLDOWN / note_failures /
+    // clear_degrade / degrade_until 持久化）
+    //
+    // 这组用例的共同前提：降权只吃「**不知道原因**的失败」（Client 类 4xx /
+    // 传输层超时，由 forward 侧在两个喂入口调用）。分类明确的失败（429 / 402 /
+    // 5xx / 12153 / 11140）**不走这里** —— 它们各有自己的惩罚（见
+    // `forward::apply_error_policy`）。
+    // ===================================================================
+
+    /// 造一个带指定阈值的单账号池。
+    ///
+    /// 多数用例不需要验证「缺省 5」本身（那个由
+    /// [`degrade_threshold_default_is_five`] 单独钉住），用一个**较小的阈值**
+    /// 可以让每个用例的失败次数少一点、读起来更清楚 —— 默认给 3，需要别的值
+    /// 时显式传。
+    fn degrade_pool_with(threshold: i64) -> Pool {
+        let mut p = Pool::new(String::new());
+        p.add(mk("u1"));
+        p.set_degrade(threshold, DEGRADE_COOLDOWN);
+        p
+    }
+
+    /// 缺省值必须与任务约定一致（5 次 / 10 分钟）。
+    ///
+    /// 这条**刻意钉住常量本身**：阈值被「顺手调小」是一次事故级的静默变更 ——
+    /// 调到 1 会让「用户发一条非法请求」立刻把好号摘掉（见 [`DEGRADE_THRESHOLD`]）。
+    #[test]
+    fn degrade_threshold_default_is_five() {
+        assert_eq!(DEGRADE_THRESHOLD, 5, "连败阈值缺省必须是 5（取值依据见常量文档）");
+        assert_eq!(
+            DEGRADE_COOLDOWN,
+            Duration::from_secs(600),
+            "降权时长缺省必须是 10 分钟（取值依据见常量文档）"
+        );
+        let p = Pool::new(String::new());
+        assert_eq!(p.degrade_threshold(), 5, "池的缺省阈值必须与常量一致");
+    }
+
+    /// **场景 1：达阈触发降权** —— 第 N-1 次仍可选，第 N 次被摘出选号池。
+    ///
+    /// 同时钉住「阈值是 `>=` 而不是 `>`」：差一次就永远不降权。
+    #[test]
+    fn reaching_the_threshold_degrades_the_account() {
+        let mut p = degrade_pool_with(3);
+        assert!(p.servable_now());
+
+        p.note_failures("u1");
+        assert!(p.servable_now(), "第 1 次失败不得降权（防单次即罚）");
+        assert_eq!(p.consecutive_fails("u1"), 1);
+
+        p.note_failures("u1");
+        assert!(p.servable_now(), "第 2 次仍不得降权");
+        assert_eq!(p.consecutive_fails("u1"), 2);
+
+        p.note_failures("u1");
+        assert!(!p.servable_now(), "第 3 次达阈必须降权");
+        assert_eq!(
+            p.consecutive_fails("u1"),
+            0,
+            "达阈后计数必须清零（供下一轮重新累计）"
+        );
+        assert!(p.degrade_until("u1").is_some(), "降权截止必须落定");
+        assert!(p.degraded("u1"));
+
+        // 选号的所有入口都必须拒绝它（不是「少选」，是「不选」）。
+        assert!(p.pick().is_none(), "降权中的号不得被主路径选中");
+        assert!(p.pick_by_uid("u1").is_none(), "按 uid 直取同样要过闸门");
+        assert!(
+            p.pick_for_model("m1", &[]).is_none(),
+            "按模型挑号同样要过闸门"
+        );
+        assert_eq!(p.available_uids(), Vec::<String>::new());
+    }
+
+    /// **场景 2：成功清零并回池** —— 达阈后一次成功，立刻恢复可选。
+    ///
+    /// 「立刻」是重点：等下满 10 分钟会让用户在号已经好了之后继续拿到 503。
+    #[test]
+    fn success_clears_degrade_and_returns_to_pool() {
+        let mut p = degrade_pool_with(2);
+        p.note_failures("u1");
+        p.note_failures("u1");
+        assert!(!p.servable_now(), "两次失败应已降权");
+        assert!(p.degraded("u1"));
+
+        // `clear_degrade`（窄口）与 `note_success`（完整收尾）都必须能回池。
+        p.clear_degrade("u1");
+        assert!(p.servable_now(), "clear_degrade 后必须立刻回池");
+        assert_eq!(p.consecutive_fails("u1"), 0);
+        assert!(p.degrade_until("u1").is_none());
+        assert!(!p.degraded("u1"));
+
+        // 再降一次，改用 note_success 回池。
+        p.note_failures("u1");
+        p.note_failures("u1");
+        assert!(!p.servable_now());
+        p.note_success("u1");
+        assert!(p.servable_now(), "note_success 同样必须清降权");
+        assert_eq!(p.consecutive_fails("u1"), 0, "成功也要清零连败计数");
+        assert!(p.degrade_until("u1").is_none());
+    }
+
+    /// **场景 3：健康号的偶发失败不触发** —— 这是本机制存在的全部理由。
+    ///
+    /// 与 session_dead 家族同款：「失败 → 成功 → 失败 → 成功」交替 20 轮，
+    /// 若成功不清零（机制退化成「累计 N 次即降权」），第 5 轮就会红。
+    #[test]
+    fn intermittent_failures_never_accumulate_to_a_degrade() {
+        let mut p = degrade_pool_with(DEGRADE_THRESHOLD);
+        for round in 0..20 {
+            p.note_failures("u1");
+            assert!(
+                p.servable_now(),
+                "第 {round} 轮：单次失败后账号必须仍可选（防单次即罚）"
+            );
+            p.note_success("u1");
+            assert_eq!(p.consecutive_fails("u1"), 0, "成功必须打断连续性");
+        }
+        assert!(p.servable_now());
+        assert!(!p.degraded("u1"));
+    }
+
+    /// **场景 4：降权期内再次达阈不延长、不翻倍**。
+    ///
+    /// # 守的是什么
+    ///
+    /// 客户端（DSH）失败会**并发重试 5 次**，用户手点重发还会再来一轮。若每次
+    /// 达阈都往后续 10 分钟，一个坏号会被用户自己的重试永久按住 —— 而且按住多久
+    /// 取决于他点得多快，不可预测。故「已在降权期内」只清零计数，不碰截止时刻。
+    ///
+    /// 反证方式：再灌 3 轮满阈值，`degrade_until` 必须**一毫秒都没变**。
+    #[test]
+    fn reaching_threshold_while_degraded_does_not_extend() {
+        let mut p = Pool::new(String::new());
+        p.add(mk("u1"));
+        // 时长取长一点，保证整个用例期间不会自然到期（否则「没变」可能是巧合）。
+        p.set_degrade(2, Duration::from_secs(3600));
+
+        p.note_failures("u1");
+        p.note_failures("u1");
+        let first = p.degrade_until("u1").expect("首次达阈必须设置截止");
+        assert!(p.degraded("u1"));
+
+        // 降权期内再达阈 3 轮。
+        for round in 0..3 {
+            std::thread::sleep(Duration::from_millis(5));
+            p.note_failures("u1");
+            p.note_failures("u1");
+            assert_eq!(p.consecutive_fails("u1"), 0, "第 {round} 轮仍须清零计数");
+            assert_eq!(
+                p.degrade_until("u1"),
+                Some(first),
+                "第 {round} 轮：已在降权期内再次达阈**绝不能**延长截止（防重试把降权堆厚）"
+            );
+        }
+        assert!(p.degraded("u1"));
+    }
+
+    /// **场景 5：持久化往返** —— 计数恒恢复、`degrade_until` 只恢复未过期的。
+    #[test]
+    fn degrade_state_survives_a_flush_load_round_trip() {
+        let dir = std::env::temp_dir().join(format!("wbswg-degrade-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let path_s = path.to_string_lossy().to_string();
+
+        let mut p = Pool::new(path_s.clone());
+        p.add(mk("degraded"));
+        p.add(mk("counting"));
+        p.set_degrade(2, Duration::from_secs(3600));
+        // `degraded`：已降权（degrade_until 未过期，必须落盘）。
+        p.note_failures("degraded");
+        p.note_failures("degraded");
+        // `counting`：连败 1 次、尚未达阈（计数必须落盘）。
+        p.note_failures("counting");
+        assert!(p.flush(), "状态已改，必须落盘");
+
+        let mut p2 = Pool::new(path_s.clone());
+        p2.load_state();
+        assert!(p2.degraded("degraded"), "未过期的降权必须跨重启保留");
+        assert!(
+            p2.degrade_until("degraded").is_some(),
+            "截止时刻必须能读回"
+        );
+        assert_eq!(
+            p2.consecutive_fails("counting"),
+            1,
+            "连败计数必须**恒**恢复 —— 否则重启就能无限绕过阈值"
+        );
+        assert!(!p2.degraded("counting"));
+        assert!(
+            p2.pick().is_some(),
+            "未达阈的那个号必须仍可选（不能因为持久化而误伤）"
+        );
+
+        // 已过期的截止**不落盘**：直接把文件里的时间改到过去，读回后必须是未降权。
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("degrade_until"),
+            "未过期的降权截止必须写进 state.json（字段名保持 snake_case）"
+        );
+        let mut sf: StateFile = serde_json::from_str(&raw).unwrap();
+        sf.accounts.get_mut("degraded").unwrap().degrade_until =
+            Some(SystemTime::now() - Duration::from_secs(60));
+        std::fs::write(&path, serde_json::to_string(&sf).unwrap()).unwrap();
+
+        let mut p3 = Pool::new(path_s);
+        p3.load_state();
+        assert!(
+            !p3.degraded("degraded"),
+            "**已过期**的截止不得被恢复 —— 否则重启会让一个早已结束的降权复活"
+        );
+        assert!(
+            p3.degrade_until("degraded").is_none(),
+            "/status 也不得看到过期的时间戳"
+        );
+        assert!(p3.servable_now(), "过期后必须自动回池");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **场景 6：到期回池** —— 降权时长走完即自动恢复，不需要任何显式调用。
+    #[test]
+    fn degrade_expires_and_the_account_returns_by_itself() {
+        let mut p = Pool::new(String::new());
+        p.add(mk("u1"));
+        // 50ms 的降权期：短到不用等，又长到第 1 次断言时必然还没到期。
+        p.set_degrade(2, Duration::from_millis(50));
+        p.note_failures("u1");
+        p.note_failures("u1");
+        assert!(!p.servable_now(), "降权期内必须不可选");
+        assert!(p.degrade_until("u1").is_some());
+
+        std::thread::sleep(Duration::from_millis(90));
+        assert!(p.servable_now(), "降权到期后必须自动回池");
+        assert!(
+            p.degrade_until("u1").is_none(),
+            "到期后不得再把已过期的时间戳下发给 /status"
+        );
+        assert!(!p.degraded("u1"));
+        // 到期**不清**计数之外的任何东西，且可以再被降一次。
+        p.note_failures("u1");
+        p.note_failures("u1");
+        assert!(p.degraded("u1"), "到期后重新连败必须能再次降权");
+    }
+
+    /// **场景 7：与既有 `until` / `breaker_until` 并存时取更长者**。
+    ///
+    /// 「取更长者」**不是**在代码里算出来的 —— 它是或门的天然结果：任一未过期
+    /// 即不可选，所以最晚的那个决定了恢复时刻。本用例把三种组合逐一钉住，
+    /// 防止有人「优化」成叠加/取更早的实现。
+    #[test]
+    fn degrade_composes_with_until_and_breaker_by_or_gate() {
+        // ① 降权比软冷却晚 ⇒ 按降权恢复。
+        let mut p = Pool::new(String::new());
+        p.add(mk("u1"));
+        p.set_degrade(1, Duration::from_millis(120));
+        p.set_breaker(99, Duration::from_secs(3600), Duration::from_secs(3600));
+        p.cooldown("u1", CoolKind::Soft, Duration::from_millis(40), "429");
+        p.note_failures("u1"); // 阈值 1 ⇒ 立刻降权 120ms
+        assert!(!p.servable_now());
+        std::thread::sleep(Duration::from_millis(70));
+        assert!(
+            !p.servable_now(),
+            "软冷却已过期，但降权未过期 ⇒ 仍不可选（或门取更长者）"
+        );
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(p.servable_now(), "两者都过期后才可选");
+
+        // ② 熔断比降权晚 ⇒ 熔断未过期时仍不可选（降权不能「解锁」熔断）。
+        let mut p2 = Pool::new(String::new());
+        p2.add(mk("u1"));
+        p2.set_degrade(1, Duration::from_millis(30));
+        p2.set_breaker(1, Duration::from_secs(3600), Duration::from_secs(3600));
+        p2.note_error("u1"); // 阈值 1 ⇒ 立刻熔断 3600s
+        p2.note_failures("u1"); // 同时降权 30ms
+        assert!(!p2.servable_now());
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            !p2.servable_now(),
+            "降权已过期但熔断仍在 ⇒ 必须仍不可选（或门不得变成「最晚者解锁」）"
+        );
+
+        // ③ 三者同时存在 ⇒ 一个都不消解另一个；到期也是逐个放开。
+        let mut p3 = Pool::new(String::new());
+        p3.add(mk("u1"));
+        p3.set_degrade(1, Duration::from_millis(40));
+        // 熔断 50**毫秒**（不是秒）：本用例只关心「谁更晚」，用毫秒才能在一个
+        // 用例里走完三段到期 —— 写成 50s 会让 200ms 后的断言必然失败。
+        p3.set_breaker(1, Duration::from_millis(50), Duration::from_millis(50));
+        // 顺序：先软冷却（20ms），它同时喂熔断（阈值 1 ⇒ 立刻熔断 50ms）。
+        p3.cooldown("u1", CoolKind::Soft, Duration::from_millis(20), "429");
+        // 再降权（40ms）。
+        p3.note_failures("u1");
+        assert!(!p3.servable_now());
+        assert!(
+            p3.status_by_uid("u1").unwrap().until.is_some(),
+            "软冷却必须仍在（不得被降权覆盖）"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(p3.servable_now(), "三者都过期后必须自动回池");
+    }
+
+    /// 降权中的号**不得**被全冷却兜底捞出来（兜底不经过 `healthy()`）。
+    ///
+    /// # 为什么必须单独钉（本项目踩过两次的缺陷类型）
+    ///
+    /// [`Pool::pick_earliest_expiry`] 刻意不调 `healthy()`（它要选「正在冷却」的
+    /// 账号），所以 `healthy()` 里那道判据在兜底路径上**不会生效**。`no_route`
+    /// 与每日护栏都为此在兜底里各写了一遍排除，降权是第三条。
+    ///
+    /// 反证方式：让「被降权」的那个号冷却结束得**更早** —— 若兜底不看降权，
+    /// 它必然挑中它（兜底契约是「挑最早结束的」）。
+    #[test]
+    fn degraded_account_is_skipped_by_the_all_cooling_fallback() {
+        let mut p = Pool::new(String::new());
+        p.add(mk("degraded"));
+        p.add(mk("fine"));
+        p.set_degrade(2, Duration::from_secs(3600));
+        p.note_failures("degraded");
+        p.note_failures("degraded");
+        assert!(p.degraded("degraded"));
+
+        // 两个号都进冷却（兜底只在「正常候选为空」时触发）；被降权的那个先结束。
+        p.cooldown("degraded", CoolKind::Soft, Duration::from_secs(30), "test");
+        p.cooldown("fine", CoolKind::Soft, Duration::from_secs(60), "test");
+
+        let now = SystemTime::now();
+        let a = p
+            .pick_earliest_expiry(&[], now, "m1", "")
+            .expect("兜底应能选出未降权的账号");
+        assert_eq!(
+            a.uid, "fine",
+            "兜底必须跳过降权中的号 —— 挑中 degraded 说明降权没进兜底路径"
+        );
+
+        // 端到端：`pick()` 在全冷却时会落到同一个兜底。
+        for _ in 0..10 {
+            assert_ne!(
+                p.pick().map(|a| a.uid),
+                Some("degraded".to_string()),
+                "连冷却兜底都不得把降权中的号捞出来接客"
+            );
+        }
+    }
+
+    /// `/status` 必须如实透出降权（`cool_kind = "degrade"` + `degrade_until`）。
+    ///
+    /// 纯增量契约：既有两档（`soft_rate` / `hard_credit`）**一个字段都不变**，
+    /// 只在「没有权威分类的冷却」时才落到 `degrade`。
+    #[test]
+    fn status_reports_degrade_without_changing_existing_kinds() {
+        let mut p = Pool::new(String::new());
+        p.add(mk("u1"));
+        p.set_degrade(1, Duration::from_secs(3600));
+
+        // 未降权：cooling=false、cool_kind 空、degrade_until 为 None。
+        let st = p.status_by_uid("u1").unwrap();
+        assert!(!st.cooling);
+        assert_eq!(st.cool_kind, "");
+        assert!(st.degrade_until.is_none());
+        assert_eq!(st.consecutive_fails, 0);
+
+        p.note_failures("u1");
+        let st = p.status_by_uid("u1").unwrap();
+        assert!(st.cooling, "降权必须让 /status 的 cooling 为 true");
+        assert_eq!(st.cool_kind, "degrade", "降权态必须有独立的 kind 字符串");
+        assert!(st.degrade_until.is_some());
+        assert!(st.reason.starts_with(DEGRADE_REASON_PREFIX), "reason 必须可读");
+
+        // 纯增量：余额耗尽的硬冷却**不得**被降权顶掉它的 kind。
+        p.cooldown("u1", CoolKind::Hard, Duration::from_secs(3600), "余额不足");
+        let st = p.status_by_uid("u1").unwrap();
+        assert_eq!(
+            st.cool_kind, "hard_credit",
+            "既有两档的语义不得被 degrade 改写（纯增量契约）"
+        );
+    }
+
+    /// 阈值 `0` = **关闭机制**：仍然记账，但永不降权（配置侧的回滚点是它）。
+    #[test]
+    fn threshold_zero_disables_the_mechanism() {
+        let mut p = Pool::new(String::new());
+        p.add(mk("u1"));
+        p.set_degrade(0, Duration::from_secs(3600));
+        for _ in 0..100 {
+            p.note_failures("u1");
+        }
+        assert_eq!(
+            p.consecutive_fails("u1"),
+            100,
+            "关闭时仍然记账（计数不再被达阈清零）"
+        );
+        assert!(!p.degraded("u1"), "阈值 0 必须彻底关闭降权");
+        assert!(p.servable_now(), "关闭后账号必须始终可选");
+        assert!(p.degrade_until("u1").is_none());
+    }
+
+    /// 未知 UID 的所有降权操作都安全（不 panic、不误伤他人）。
+    #[test]
+    fn degrade_ops_on_unknown_uid_are_safe() {
+        let mut p = Pool::new(String::new());
+        p.add(mk("u1"));
+        p.set_degrade(1, Duration::from_secs(3600));
+        p.note_failures("nope");
+        p.clear_degrade("nope");
+        assert_eq!(p.consecutive_fails("nope"), 0);
+        assert!(p.degrade_until("nope").is_none());
+        assert!(!p.degraded("nope"));
+        assert!(p.servable_now(), "未知 UID 不得影响池内账号");
+        assert_eq!(p.consecutive_fails("u1"), 0);
     }
 }
