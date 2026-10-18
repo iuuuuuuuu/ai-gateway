@@ -17,7 +17,8 @@
     "verify-archived": "tsx .agents/skills/agent-notes/scripts/verify-archived-agent-notes.ts",
     "verify-notes": "npm run verify-agent-note-tree && npm run verify-agent-note-format && npm run verify-archived",
     "archive-agent-note": "tsx .agents/skills/agent-notes/scripts/archive-agent-note.ts",
-    "check-anchors": "tsx .agents/skills/agent-notes/scripts/check-note-anchors.ts"
+    "check-anchors": "tsx .agents/skills/agent-notes/scripts/check-note-anchors.ts",
+    "notes-board": "tsx .agents/skills/agent-notes/scripts/build-board.ts --init .agents/notes-board.html \"AI Gateway 决策看板\""
   },
   "dependencies": {
     "@fontsource-variable/bricolage-grotesque": "^5.3.0",

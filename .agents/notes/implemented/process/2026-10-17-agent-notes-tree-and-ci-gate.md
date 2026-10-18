@@ -147,11 +147,66 @@ D01–D20 全部**逐条迁移**成 20 篇笔记（`implemented/{architecture,bu
   为历史存档。新增决策不再有两个可能的落点，「该写哪份」不再需要判断。
 - **代价与已知上限**：多一个 `devDependency` 与一条 CI 路径；技能目录（156 KB，
   含 73 KB 的看板 HTML 模板）进了仓库，技能上游更新时需要手工同步 —— 没有
-  自动跟版机制，也没有钉住上游 commit 的说明。**信号**：若 `agent-notes` 上游
-  脚本接口变动导致本仓库的 npm scripts 失效，或有新笔记写进 `docs/DECISIONS.md`
-  （说明规则没被遵守），就重访这个决定。
+  自动跟版机制。**信号**：若 `agent-notes` 上游脚本接口变动导致本仓库的 npm
+  scripts 失效，或有新笔记写进 `docs/DECISIONS.md`（说明规则没被遵守），
+  就重访这个决定。
 - **代价**：门禁只校验**结构**，不校验**内容**。「Decision 用现在时」「备选方案
   是否真的权衡过」仍是散文纪律，脚本管不到 —— 写得敷衍的笔记照样能过 CI。
+
+## 技能版本与同步（2026-10-18）
+
+项目副本（`.agents/skills/agent-notes/`）**曾落后于插件内置版本**，已同步到
+**0.4.1**（内置版 `.synced-version` 的值）。
+
+漂移的具体内容（同步前旧→新）：
+
+| 脚本 | 旧版行为 | 0.4.1 行为 |
+|---|---|---|
+| `verify-agent-note-tree.ts` | 不支持 **CommonMark 尖括号目标**（用 `&lt;` `&gt;` 包住带空格的目标），把尖括号当路径字符 ⇒ **带空格/特殊字符的目标被误判不存在** | 先剥离尖括号再解析 |
+| `verify-agent-note-format.ts` | 不认 `## 后果与边界`、`其他做法` | 两者都算有效别名 |
+| `verify-archived-agent-notes.ts` | `AGENTS.md` / `manifest.json` 也进封印清单 | 两者排除（它们不是笔记） |
+| `build-board.ts` | 节提取用 `(?=\s*$)`，可能提前截断 | `(?![\\s\\S])` |
+
+★ **同步方向是「内置 → 项目」**：内置版由插件维护并会自动更新，项目副本是
+它某一时刻的快照。两者是**两份副本**，项目副本不会被插件自动改（它在 git 跟踪内）。
+逆向「从项目推回内置」没有意义 —— 内置版才是上游。
+
+★ **复核方式**（不依赖印象）：对两份目录做逐文件 `Get-FileHash` 比对，
+排除 `.synced-version`。本项目当前**零差异**：
+
+```powershell
+# 内置目录按你的插件安装位置填；下方是本机实测路径
+$src = "<插件内置 skill 目录>"
+$dst = ".agents/skills/agent-notes"
+Get-ChildItem $src -Recurse -File | Where-Object { $_.Name -ne '.synced-version' } | ForEach-Object {
+  $rel = $_.FullName.Replace("$src\",'')
+  if ((Get-FileHash $_.FullName).Hash -ne (Get-FileHash (Join-Path $dst $rel)).Hash) { "DIFF $rel" }
+}
+```
+
+### 顺带接上的看板命令
+
+同步后补了 `npm run notes-board`（对应技能里 `build-board.ts`，**不进 CI**，
+与 `check-anchors` 同为本地辅助工具）：
+
+- 产出 `.agents/notes-board.html`（约 72 KB 轻量看板），浏览器打开可浏览全部
+  笔记的 Problem / Decision / 备选 / 后果，并支持连接本地目录后热刷新。
+- 产物**不入库**：`.gitignore` 的 `.agents/*` 已覆盖它。它是**生成物**，
+  每次重建字节都会变，入库只会制造无意义 diff —— 与此前「探针产物不进仓库」
+  是同一条纪律。
+
+⚠ **不要用 `Compare-Object (Get-Content a) (Get-Content b)` 判差异** —— 本机
+PowerShell 5.1 对 UTF-8 无 BOM 文件的默认读取会产生**假差异**（同一份内容被
+读成不同行），据此会得出「项目版更新」的**反向结论**。本次排查就因此一度判断
+反了方向，改用 `Get-FileHash` 才对。**字节哈希是唯一可靠判据。**
+
+★ **写笔记时踩到的一件事（门禁在干活）**：本节初稿把「尖括号目标」的**完整字面量**
+写进了正文，`verify-agent-note-tree` 立刻红了 —— `LINK_REGEX` 是纯文本匹配
+方括号紧跟圆括号的形态，**不认反引号与代码块**，因此任何写进正文的链接样例都会被
+当成真链接去解析。修法是把样例包进行内代码并省略可解析的完整形态。
+⇒ 结论：**在笔记里举「链接语法」例子时，不要把可解析的字面量写全**；
+门禁无法区分「这是例子」与「这是真链接」。本节为此返工**两次**（第二次是描述
+正则本身时又写了一个可解析的占位符）。
 
 ## Verification
 
@@ -171,9 +226,27 @@ D01–D20 全部**逐条迁移**成 20 篇笔记（`implemented/{architecture,bu
   最后一条正是 CI 里 `AGENT_NOTE_ARCHIVE_BASE_REF` 存在的理由：同一份改动把基线
   换成 `HEAD` 时，比较的是「磁盘 vs 磁盘」，只会剩下哈希自校验。所以 workflow 里
   必须传 `pull_request.base.sha || github.event.before`，不能省。
+
+**同步到 0.4.1 后的故障注入**（新能力必须各自证明会红/会绿，不是看代码推断）：
+
+| 注入 | 期望 | 实测 |
+|---|---|---|
+| 尖括号目标指向不存在的文件（含空格） | tree 红，且报**剥掉尖括号后**的路径 | exit 1，报 `./不 存在 的目标.md` |
+| 同上但目标**确实存在**（文件名含空格） | tree 绿 | exit 0 —— 旧版在这里**误报** exit 1 |
+| 用 `## 后果与边界` 代替 `## Consequences` | format 绿 | exit 0 |
+| 用 `## 其他做法` 代替 `## Alternatives considered` | format 绿 | exit 0 |
+| **完全没有**备选节 | format 红（证明别名没把门禁放宽成恒过） | exit 1，`missing ## Alternatives considered` |
+
+（表格里刻意不写出完整的链接字面量 —— 门禁会把它们当成真实链接去解析，
+这正是 tree 门禁在干活的表现。）
+
+最后一条是这次特意加的**反向用例**：接受更多别名时最怕顺手把「必写」放宽成
+「可有可无」—— 加别名必须配一条「没有它仍然红」的注入。
 - CI 侧：`notes` job 在 `ci.yml` 中，`npm ci` 保证 `tsx` 存在；该 job 失败会让整条
   ci 流水线红。
-- 结构可复核：`git ls-files .agents | wc -l` 为 21（技能 21 个文件）+ 笔记数；
+- **结构可复核**：`git ls-files .agents/notes | wc -l` 等于笔记数（当前 23 篇：
+  D01–D20 迁移的 20 篇 + 网关启动修复 1 篇 + `Client` 文案修复 1 篇 + 本篇）；
+  `git ls-files .agents/skills/agent-notes | wc -l` 为技能文件数（21 个）；
   `git check-ignore -v .agents/skills/trellis-meta/SKILL.md` 命中
   `.gitignore` 的 `.agents/skills/*`。
 - 本地已跑 `npm ci`（192 packages）+ `npm run verify-notes`（exit 0）+
