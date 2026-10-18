@@ -128,7 +128,18 @@ healthy = !disabled && !no_route && !daily_guard && !until && !breaker_until && 
 |---|---|
 | `cargo test -p ai-gateway-router --lib` | **1830 passed / 0 failed / 1 ignored**（基线 1802，净增 28） |
 | `cargo test -p ai-gateway-router --bin gateway` | **5 passed / 0 failed**（bin 是独立 crate，`--lib` 跑不到它） |
+| `cargo test -p ai-gateway-router --test ab_degrade` | **9 passed / 0 failed**（线级，跨 crate 边界） |
 | `cargo test -p ai-gateway-server` | **34 passed / 0 failed** |
+
+**线级测试 `tests/ab_degrade.rs`** 存在的理由与 `client_error_text.rs` 同源：
+单测在 crate 内跑，即使 API 误标成 `pub(crate)` 也照样过；线级测试能让这类
+可见性错误在编译期就炸出来。它覆盖 9 条：单次不降权、达阈降权且计数清零、
+被排除出可选集合、**降权落进 `servable_now()` 这条选号闸门投影**、成功清零后
+重新计数、降权期内不延长、`threshold=0` 彻底关闭、未知 uid 不 panic、
+配置注入后能读回且**不等于缺省**（否则「接线生效」与「接线漏了」无法区分）。
+
+★ 最后一条的设计要点：断言 `assert_ne!(注入后阈值, DEGRADE_THRESHOLD)`。
+没有它，接线漏了但缺省值恰好等于预期时，测试仍会绿。
 
 故障注入（每一层都做过，全部变红后恢复）：
 
@@ -141,6 +152,16 @@ healthy = !disabled && !no_route && !daily_guard && !until && !breaker_until && 
 | 删掉 `main()` 里的 `apply_degrade_config(...)` | 4 条红（`left: 5` 常量缺省 / `right: 2` 配置值） |
 | 删掉 `/status` 的两个 insert | 2 条红 |
 | 加回字段级 `#[serde(default)]` | 1 条红（`left: 0, right: 5` —— 正是「老配置静默关闭」） |
+| **线级**：`note_failures` 变空操作 | 5 条红（`ab_degrade`） |
+| **线级**：`degraded()` 恒 false | 2 条红 |
+| **线级**：`healthy()` 里的 `degrade_active` 判据失效 | 2 条红，含 `degrade_reaches_the_servable_gate_not_just_a_query` |
+
+★ 最后一条是**补强**的证据：第一次注入「`degraded()` 恒 false」时只有 1 条红，
+暴露出线级测试对「选号闸门真的排除了账号」这一点的覆盖不足 —— 于是补了
+`degrade_reaches_the_servable_gate_not_just_a_query`（用 `servable_now()` 这个
+`healthy()` 的对外投影来钉）。补强后再注入，红的是 2 条。
+**这条记录本身比结果重要**：它说明「写过的测试」不等于「守住了要害」，
+要靠故障注入逐条验证每个断言的独立性。
 
 ### 实机端到端（隔离实例，真实 HTTP）
 
