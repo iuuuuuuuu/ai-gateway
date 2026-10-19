@@ -340,7 +340,11 @@ fn to_sec(ms: i64) -> i64 {
 /// `credit` 参数是上一次导出/网关回写留下的积分到期元数据，原样透传。
 /// 必须保留：它由网关的积分巡检写入，是「按到期紧迫度分层选号」的依据；
 /// 若这里丢掉，每次账号同步都会把依据抹掉一次（表现为分层均衡时灵时不灵）。
-fn build_auth_doc(acc: &Value, credit: Option<Value>) -> Option<(String, String)> {
+///
+/// `force_no_route` 让**本账号不参与选号但照常进池**。用于两类账号：
+/// 用户手动禁用的、以及手动模式下未被勾选的。两者都是「别把流量给它，
+/// 但养号任务要照跑」—— 同一个语义，故走同一条标记，不各写一套。
+fn build_auth_doc(acc: &Value, credit: Option<Value>, force_no_route: bool) -> Option<(String, String)> {
     let uid = account::get_str(acc, "uid")?;
     let access = account::get_str(acc, "access_token")?;
     let refresh = account::get_str(acc, "refresh_token").unwrap_or_default();
@@ -374,7 +378,11 @@ fn build_auth_doc(acc: &Value, credit: Option<Value>) -> Option<(String, String)
     // 由网关在**选号**时排除它。标记名用 `no_route` 而不是 `disabled`，
     // 是为了与网关自己的 disabled（session 死 / 额度冻结，那种跑了也白跑）
     // 区分开 —— 两者语义不同，混用会让「禁用即停养号」这个 bug 复现。
-    if account::account_disabled(acc) {
+    //
+    // ★ `force_no_route` 承载**手动模式下未被勾选**的账号：与禁用同一语义 ——
+    // 不参与选号，但养号任务照跑。两者合并成一条判据，避免出现「禁用走这条路、
+    // 未勾选走另一条路」的分叉（分叉正是本函数历史上反复出问题的形态）。
+    if account::account_disabled(acc) || force_no_route {
         doc["account"]["no_route"] = json!(true);
     }
     if let Some(c) = credit {
@@ -982,10 +990,27 @@ pub fn export_accounts_to_dir(
     // 而池是靠扫描本目录建立的。此前这里把禁用也一并排除，导致被禁用的账号
     // **完全不参与任何养号任务**（实测确认：6 个禁用账号零任务）。
     // 现在改为导出时带上 `no_route` 标记，由网关在选号阶段排除。
-    let should_export = |acc: &Value| -> bool {
-        if needs_relogin(acc) {
-            return false;
-        }
+    //
+    // ★★ 手动模式下**未被勾选**的账号同样照常导出 + 带 `no_route`（2026-10-19）。
+    //
+    // 这与上面「禁用照常导出」是**同一个设计意图**，此前只做了一半：
+    // 手动模式的 `only` 过滤把未勾选账号整份排除出目录 ⇒ 它们不在网关池里 ⇒
+    // 单账号触发养号任务时 `auth_by_uid` 返回 None ⇒ 报
+    // 「该账号不在网关账号池中（可能已禁用、需重新登录或尚未同步）」。
+    // 而账号本身完全正常（能签到、能拉积分），用户看到这句话只会困惑。
+    //
+    // 正确语义与禁用一致：**不参与选号，但养号任务照跑**。
+    // 所以只把「是否导出」与「是否路由」拆成两个判据：
+    //   - 导出：`needs_relogin` 之外一律导出（含未勾选）；
+    //   - 路由：未勾选 / 已禁用 ⇒ 写 `no_route`，网关选号时跳过。
+    //
+    // 清理逻辑仍以「账号库全集」为准（见下方），故切模式不会留残留凭证。
+    let should_export = |acc: &Value| -> bool { !needs_relogin(acc) };
+
+    // 该账号是否需要写 `no_route`（不参与选号）。
+    //
+    // 与 `should_export` 分开是本次修复的核心：**导出 ≠ 路由**。
+    let is_routed = |acc: &Value| -> bool {
         let uid = account::get_str(acc, "uid").unwrap_or_default();
         !select_export_uids(&[uid], &only).is_empty()
     };
@@ -994,11 +1019,12 @@ pub fn export_accounts_to_dir(
         if !should_export(acc) {
             continue;
         }
-        let Some((file, _)) = build_auth_doc(acc, None) else { continue };
+        let routed = is_routed(acc);
+        let Some((file, _)) = build_auth_doc(acc, None, !routed) else { continue };
         let path = dir.join(&file);
         // 保留网关写入的 credit 元数据（积分到期分层选号的依据）。
         let credit = read_credit_block(&path);
-        let Some((_, text)) = build_auth_doc(acc, credit) else { continue };
+        let Some((_, text)) = build_auth_doc(acc, credit, !routed) else { continue };
         // 内容一致则不写盘，避免无意义的文件时间戳变动
         if let Ok(existing) = std::fs::read_to_string(&path) {
             if existing.trim() == text.trim() {
@@ -1013,8 +1039,7 @@ pub fn export_accounts_to_dir(
         written += 1;
     }
 
-    // 清理不再需要的凭证：账号库中已删除的、因模式切换而不再导出的、
-    // 以及已被标记需重新登录的。
+    // 清理不再需要的凭证：账号库中已删除的、以及已被标记需重新登录的。
     //
     // 这里的过滤条件必须与上面 `should_export` **逐条对应** ——
     // 二者一旦分叉就会出现「导出时不写、清理时又保留」的残留凭证，
@@ -1024,13 +1049,16 @@ pub fn export_accounts_to_dir(
     //（见 should_export 的注释：禁用只是不接流量，养号任务仍要跑）。
     // 若这里继续滤掉，就会「刚导出就被删」，禁用账号依然跑不到任务 ——
     // 与导出侧那个 bug 是同一个后果，只是路径不同。
-    let all_uids: Vec<String> = accounts
+    //
+    // ★★ 同样**不能**再按 `only` 过滤（2026-10-19）：手动模式下未勾选的账号
+    // 现在也要导出（带 `no_route`），若清理仍用 `select_export_uids(...only)`，
+    // 它们会在同一个函数里被「刚写就删」—— 正是上面那段注释警告的形态，
+    // 只是这次踩的是 `only` 而不是 `disabled`。
+    // 因此 `live` 与 `should_export` 严格对齐：除需重登外，账号库里有的都留。
+    let live: Vec<String> = accounts
         .iter()
         .filter(|a| !needs_relogin(a))
         .filter_map(|a| account::get_str(a, "uid"))
-        .collect();
-    let live: Vec<String> = select_export_uids(&all_uids, &only)
-        .iter()
         .map(|u| format!("workbuddy-{u}.json"))
         .collect();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -6476,7 +6504,7 @@ mod tests {
             "note": "公司号",
             "expiresAt": 1_793_263_003_967i64,
         });
-        let (_, text) = super::build_auth_doc(&acc, None).expect("doc");
+        let (_, text) = super::build_auth_doc(&acc, None, false).expect("doc");
         assert!(
             !text.contains("公司号") && !text.contains("note"),
             "备注不得写入网关凭证（会被网关重写抹掉）: {text}"
@@ -7309,7 +7337,7 @@ mod tests {
         });
 
         // 无 credit：不出现该键（保持文件精简）。
-        let (file, text) = super::build_auth_doc(&acc, None).expect("doc");
+        let (file, text) = super::build_auth_doc(&acc, None, false).expect("doc");
         assert_eq!(file, "workbuddy-u1.json");
         let doc: Value = serde_json::from_str(&text).unwrap();
         assert!(doc.get("credit").is_none(), "no credit expected: {text}");
@@ -7318,12 +7346,12 @@ mod tests {
 
         // 有 credit：原样透传（网关据此分档）。
         let credit = json!({"soonestExpireAt": 1790639067i64});
-        let (_, text2) = super::build_auth_doc(&acc, Some(credit)).expect("doc");
+        let (_, text2) = super::build_auth_doc(&acc, Some(credit), false).expect("doc");
         let doc2: Value = serde_json::from_str(&text2).unwrap();
         assert_eq!(doc2["credit"]["soonestExpireAt"], 1790639067i64);
 
         // 非对象（脏数据）不应写进凭证。
-        let (_, text3) = super::build_auth_doc(&acc, Some(json!("garbage"))).expect("doc");
+        let (_, text3) = super::build_auth_doc(&acc, Some(json!("garbage")), false).expect("doc");
         let doc3: Value = serde_json::from_str(&text3).unwrap();
         assert!(doc3.get("credit").is_none(), "non-object credit must be ignored");
     }
@@ -8707,11 +8735,23 @@ p42\ncjava\nf9\nn*:8080\n";
     }
 
     // -----------------------------------------------------------------------
-    // 手动模式：勾选列表决定导出集合（需求2）
+    // 手动模式：勾选列表决定**是否路由**，不再决定**是否导出**
     // -----------------------------------------------------------------------
+    //
+    // ★ 2026-10-19 行为变更（业主现场：「养号任务号明明正常却报未在账号池内」）。
+    //
+    // 旧行为：未勾选的账号**整份不导出** ⇒ 不在网关池里 ⇒ 单账号触发养号任务时
+    // `auth_by_uid` 返回 None ⇒ 报「该账号不在网关账号池中」。
+    // 而账号本身完全正常（能签到、能拉积分），用户只会困惑。
+    //
+    // 新行为：未勾选的账号**照常导出，但带 `account.no_route`** ——
+    // 与「用户手动禁用」完全同语义：不参与选号，但养号任务照跑。
+    // 选号隔离由 `no_route` 保证（`Entry::healthy()` 会排除它），
+    // 所以「手动模式只用一个账号」这个能力**没有被削弱**，只是实现手段从
+    // 「不进池」换成了「进池但标记不路由」。
 
     #[test]
-    fn manual_mode_exports_only_selected_accounts() {
+    fn manual_mode_exports_all_but_marks_unselected_as_no_route() {
         let dir = std::env::temp_dir().join(format!("wb-gw-manual-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).expect("temp dir");
 
@@ -8723,20 +8763,83 @@ p42\ncjava\nf9\nn*:8080\n";
         };
         let all = vec![mk("uid-a"), mk("uid-b"), mk("uid-c")];
 
-        // 自动模式（None = 不过滤）：全部导出
+        // 自动模式（None = 不过滤）：全部导出，且都不带 no_route
         export_accounts_to_dir(&dir, &all, None).expect("export all");
         for u in ["uid-a", "uid-b", "uid-c"] {
-            assert!(dir.join(format!("workbuddy-{u}.json")).exists(), "{u} 应在池中");
+            let p = dir.join(format!("workbuddy-{u}.json"));
+            assert!(p.exists(), "{u} 应在池中");
+            let doc: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+            assert!(
+                doc["account"].get("no_route").is_none(),
+                "自动模式下 {u} 不应带 no_route"
+            );
         }
 
-        // 手动模式只勾 a 和 c：b 必须被清理
+        // 手动模式只勾 a 和 c：
+        //   - b **仍然在池里**（养号任务要跑到它）
+        //   - 但 b 必须带 `no_route`（不参与选号）
+        //   - a / c 不带（正常接流量）
         let only = Some(vec!["uid-a".to_string(), "uid-c".to_string()]);
         export_accounts_to_dir(&dir, &all, only).expect("export manual");
-        assert!(dir.join("workbuddy-uid-a.json").exists());
-        assert!(dir.join("workbuddy-uid-c.json").exists());
+
+        for u in ["uid-a", "uid-b", "uid-c"] {
+            assert!(
+                dir.join(format!("workbuddy-{u}.json")).exists(),
+                "{u} 必须仍在池中：养号任务遍历的是这个目录，移出即跑不到"
+            );
+        }
+        let read = |u: &str| -> Value {
+            serde_json::from_str(
+                &std::fs::read_to_string(dir.join(format!("workbuddy-{u}.json"))).unwrap(),
+            )
+            .unwrap()
+        };
         assert!(
-            !dir.join("workbuddy-uid-b.json").exists(),
-            "未勾选的账号必须被移出池，否则手动模式形同虚设"
+            read("uid-b")["account"]["no_route"] == json!(true),
+            "未勾选的 uid-b 必须带 no_route，否则它会照常接流量、手动模式形同虚设"
+        );
+        assert!(
+            read("uid-a")["account"].get("no_route").is_none(),
+            "勾选中的 uid-a 不应带 no_route"
+        );
+        assert!(
+            read("uid-c")["account"].get("no_route").is_none(),
+            "勾选中的 uid-c 不应带 no_route"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 需重登的账号**仍然不导出** —— 与「未勾选」不同。
+    ///
+    /// 这条守着上面那次行为变更的边界：放宽的是「未勾选」，**不是**「凭证已废」。
+    /// 需重登的账号留在池里只会让每次请求白跑一轮。
+    #[test]
+    fn needs_relogin_accounts_are_still_not_exported() {
+        let dir = std::env::temp_dir().join(format!("wb-gw-relogin-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let mk = |uid: &str, relogin: bool| {
+            let mut v = json!({
+                "uid": uid, "access_token": format!("AT-{uid}"),
+                "domain": "copilot.tencent.com", "expiresAt": 1_900_000_000_000i64,
+            });
+            if relogin {
+                v["needs_relogin"] = json!(true);
+                v["needs_relogin_reason"] = json!("refresh failed");
+            }
+            v
+        };
+        let all = vec![mk("ok", false), mk("dead", true)];
+
+        // 即使处于手动模式且两个都被勾选，需重登的那个也不该导出
+        let only = Some(vec!["ok".to_string(), "dead".to_string()]);
+        export_accounts_to_dir(&dir, &all, only).expect("export");
+
+        assert!(dir.join("workbuddy-ok.json").exists());
+        assert!(
+            !dir.join("workbuddy-dead.json").exists(),
+            "需重登的账号不得导出：它留在池里只会让每次请求白跑一轮"
         );
 
         std::fs::remove_dir_all(&dir).ok();
