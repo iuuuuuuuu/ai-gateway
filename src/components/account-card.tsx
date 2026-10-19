@@ -127,6 +127,24 @@ function accountIdentity(account: AccountMeta): string {
  * 值缺失时返回空串，由调用方渲染成「—」，保证行高与字段顺序稳定
  * （不因某个字段缺失而跳行）。
  */
+/**
+ * 该账号在**网关账号池**里的标识 —— 传给网关的一切都用它，不是 `account.id`。
+ *
+ * ★ 2026-10-19 修复的实际缺陷：账号卡片菜单的 7 个入口（活跃上报 / 夜猫子 /
+ * 开学季 / trial / 活跃地图 / 校园日 / 成长任务）此前一律传 `account.id`，
+ * 而网关 `/tasks/run` 的 `accountId` 语义是**上游 UID**（见
+ * `gateway::run_task_for(task, account_uid)` 的参数名与注释）。
+ * 两者是不同主键（本机 27 个账号**无一相同**），于是网关 `auth_by_uid` 查不到，
+ * 每个账号都报「该账号不在网关账号池中（可能已禁用、需重新登录或尚未同步）」——
+ * 而账号完全正常，提示里列的三个原因**一个都不成立**。
+ *
+ * 收敛成函数而不是就地改 7 处：这两个标识长得极像（本机全是 UUID），
+ * 散着写必然再次混用。`uid` 为空时回落 `id` 并禁用入口，见调用处。
+ */
+function gatewayAccountId(account: AccountMeta): string {
+  return (account.uid ?? "").trim() || account.id;
+}
+
 function accountDetailRows(account: AccountMeta): [string, string, string?][] {
   const fmt = (ts: number | null | undefined) =>
     typeof ts === "number" && ts > 0 ? new Date(ts).toLocaleString("zh-CN") : "";
@@ -1140,7 +1158,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   icon: <Zap />,
                   label: "活跃上报",
                   availability: activityAvailability(account),
-                  onSelect: () => onRunTask?.("activity", account.id),
+                  onSelect: () => onRunTask?.("activity", gatewayAccountId(account)),
                   disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
                   busy: taskRunning === "activity",
                 })}
@@ -1148,7 +1166,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   icon: <Moon />,
                   label: "夜猫子任务",
                   availability: nightOwlAvailability(account),
-                  onSelect: () => onRunTask?.("nightowl", account.id),
+                  onSelect: () => onRunTask?.("nightowl", gatewayAccountId(account)),
                   disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
                   busy: taskRunning === "nightowl",
                 })}
@@ -1156,7 +1174,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   icon: <GraduationCap />,
                   label: "开学季活动",
                   availability: schoolAvailability(account),
-                  onSelect: () => onRunTask?.("school", account.id),
+                  onSelect: () => onRunTask?.("school", gatewayAccountId(account)),
                   disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
                   busy: taskRunning === "school",
                 })}
@@ -1164,7 +1182,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   icon: <Gift />,
                   label: "trial 加油包",
                   availability: trialAvailability(account),
-                  onSelect: () => onRunTask?.("trial", account.id),
+                  onSelect: () => onRunTask?.("trial", gatewayAccountId(account)),
                   disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
                   busy: taskRunning === "trial",
                 })}
@@ -1172,7 +1190,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   icon: <MapPin />,
                   label: "活跃地图（补签/兑换/抽奖）",
                   availability: growthMapAvailability(account),
-                  onSelect: () => onRunTask?.("growthmap", account.id),
+                  onSelect: () => onRunTask?.("growthmap", gatewayAccountId(account)),
                   disabled: featuresDisabled || !onRunTask || taskRunning !== undefined,
                   busy: taskRunning === "growthmap",
                 })}
@@ -1183,7 +1201,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   // 校园日是**成长任务**（走 /tasks/growth），不是调度器任务 ——
                   // 它的完成条件是小程序内对话，需要专门的小程序指纹上报。
                   // 这里复用同一个回调，由父级按 code 分流到对应接口。
-                  onSelect: () => onRunGrowthTask?.("school_season", account.id),
+                  onSelect: () => onRunGrowthTask?.("school_season", gatewayAccountId(account)),
                   disabled: featuresDisabled || !onRunGrowthTask || growthTaskRunning !== undefined,
                   busy: growthTaskRunning === "school_season",
                 })}
@@ -1247,7 +1265,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                     直接报「该账号的任务正在执行中」。禁用 + 转圈 +
                     toast 提示三件一起，才能避免用户以为"没反应"而连点。
 
-                    ⚠ 用 `growthAllRunningAccountId === account.id` 判断，
+                    ⚠ 用 `growthAllRunningAccountId === gatewayAccountId(account)` 判断，
                     而不是 `growthTaskRunning === "__all__"`：后者对所有
                     卡片都为真，会让 19 张卡片的按钮一起转圈。 */}
                 <DropdownMenuItem
@@ -1259,10 +1277,10 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                     growthAllRunningAccountId != null
                   }
                   title="依次执行该账号所有可自动完成的成长任务（可能包含真实对话，耗时一到几分钟）"
-                  onSelect={() => onRunAllGrowthTasks?.(account.id)}
+                  onSelect={() => onRunAllGrowthTasks?.(gatewayAccountId(account))}
                 >
                   <span className="mt-0.5 flex shrink-0">
-                    {growthAllRunningAccountId === account.id ? (
+                    {growthAllRunningAccountId === gatewayAccountId(account) ? (
                       <Loader2 className="animate-spin" />
                     ) : (
                       <ListChecks />
@@ -1270,12 +1288,12 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                   </span>
                   <span className="min-w-0 flex-1">
                     <span className="block truncate">
-                      {growthAllRunningAccountId === account.id
+                      {growthAllRunningAccountId === gatewayAccountId(account)
                         ? "正在执行全部任务…"
                         : "一键执行全部任务"}
                     </span>
                     <span className="mt-0.5 block whitespace-normal text-[11px] leading-4 text-muted-foreground">
-                      {growthAllRunningAccountId === account.id
+                      {growthAllRunningAccountId === gatewayAccountId(account)
                         ? "十几项依次执行，请勿重复点击"
                         : "含报名、回读进度与自动领奖；耗时一到几分钟"}
                     </span>
@@ -1310,7 +1328,7 @@ export function AccountCard({ account, onDelete, onNoteSaved, onToggleDisabled, 
                       }
                       title={growthTaskHint(t) ?? undefined}
                       aria-label={`${growthTaskLabel(t)}（${t.status_text}）`}
-                      onSelect={() => onRunGrowthTask?.(t.task_code, account.id)}
+                      onSelect={() => onRunGrowthTask?.(t.task_code, gatewayAccountId(account))}
                     >
                       <span className="mt-0.5 flex shrink-0">
                         {growthTaskRunning === t.task_code ? (
