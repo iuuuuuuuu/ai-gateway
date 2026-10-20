@@ -137,6 +137,23 @@ impl ModelMeta {
 /// `meta` 是**上游 key + 模型清单里的元数据**（不是客户端看到的显示名）。
 /// 只传 key 也能工作（[`ModelMeta::key_only`]），但 `model_config` 会缺字段，
 /// 上游会回落成官方客户端默认身份 —— 见 [`ModelMeta`] 的说明。
+///
+/// # 形状对齐官方客户端（2026-10-20）
+///
+/// 从官方 `qoder-worker-runtime` 的请求体构造函数 `bve` 核对出的差异，
+/// 全部按官方形状补齐（此前只有简单请求能过，DSH Hermes 的复杂请求会被
+/// 上游静默回 `data: [DONE]`）：
+///
+/// - **system 单独放 `system` 字段**（数组），不再混在 `messages` 里；
+/// - 顶层补 `source: 1` / `version: "3"` / `is_retry: false` / `task_id: "common"`；
+/// - `aliyun_user_type` 官方是 **空串**（此前写的 `personal_professional_trial`
+///   是旧参考实现的常量）；
+/// - `chat_context.text` / `originalContent` 官方是**字符串**，不是 `{type,text}`；
+/// - `chat_context.extra.modelConfig` 官方只有 `{key, is_reasoning}`（完整 10 字段
+///   只放在顶层 `model_config`）；
+/// - 消息带 `contents` 块（官方 `uPc` / `gPc` 的输出形状）；
+/// - `parameters.max_tokens` 取客户端传的值（官方取模型的 `max_output_tokens`，
+///   我们拿不到那个字段，就用客户端的，缺省不带）。
 pub(crate) fn build_agent_body(openai_body: &[u8], meta: &ModelMeta) -> Result<Vec<u8>, String> {
     let req: Value =
         serde_json::from_slice(openai_body).map_err(|e| format!("解析 OpenAI 请求体失败: {e}"))?;
@@ -150,28 +167,58 @@ pub(crate) fn build_agent_body(openai_body: &[u8], meta: &ModelMeta) -> Result<V
         return Err("请求里没有 messages".to_string());
     }
 
-    let mut out = agent_body(&messages, meta)?;
+    let tools = req
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    // `max_tokens` / `max_completion_tokens` 都认（后者是新版 OpenAI 字段）。
+    let max_tokens = req
+        .get("max_tokens")
+        .or_else(|| req.get("max_completion_tokens"))
+        .and_then(Value::as_i64)
+        .filter(|n| *n > 0);
 
-    // tools 仅在客户端**显式**传入时注入（模板 tools 会让 prompt_tokens 从 ~60 涨到 ~10K）
-    if let Some(tools) = req.get("tools").and_then(|v| v.as_array()) {
-        if !tools.is_empty() {
-            let mut m: Map<String, Value> = serde_json::from_slice(&out)
-                .map_err(|e| format!("解析 OpenAI 请求体失败: {e}"))?;
-            m.insert("tools".to_string(), Value::Array(tools.clone()));
-            out = serde_json::to_vec(&Value::Object(m))
-                .map_err(|e| format!("序列化 Qoder 请求体失败: {e}"))?;
-        }
-    }
-    Ok(out)
+    agent_body(&messages, meta, &tools, max_tokens)
 }
 
-/// 构造 agent 请求体（不含 tools）。
-fn agent_body(messages: &[Value], meta: &ModelMeta) -> Result<Vec<u8>, String> {
+/// 构造 agent 请求体（形状对齐官方客户端，见 [`build_agent_body`]）。
+fn agent_body(
+    messages: &[Value],
+    meta: &ModelMeta,
+    tools: &[Value],
+    max_tokens: Option<i64>,
+) -> Result<Vec<u8>, String> {
     let prompt = last_user_text(messages);
     let now_ms = now_unix_millis();
     let new_id = new_uuid();
 
     let model_config = meta.to_config();
+
+    // developer 先归一成 system，再按官方形状把 system 拆出来。
+    let normalized = normalize_developer_roles(messages);
+    let (system_texts, conversation) = split_system(&normalized);
+    let system_blocks: Vec<Value> = system_texts
+        .iter()
+        .map(|t| json!({ "text": t }))
+        .collect();
+
+    let sanitized_messages: Vec<Value> = conversation.iter().filter_map(sanitize_message).collect();
+    let sanitized_tools: Vec<Value> = tools.iter().filter_map(sanitize_tool).collect();
+    let dropped_tools = tools.len() - sanitized_tools.len();
+    if dropped_tools > 0 {
+        crate::logline!(
+            "qoder dispatch: 丢弃 {} 个无法转换的工具（function 原样、custom 转 function，其余形状不支持）",
+            dropped_tools
+        );
+    }
+    let image_blocks = count_image_blocks(&sanitized_messages);
+    if image_blocks > 0 {
+        crate::logline!(
+            "qoder dispatch: 消息含 {} 个图片块（保留在 contents，与官方客户端同形）",
+            image_blocks
+        );
+    }
 
     // 键序与 Go 侧源码一致（serde_json 无 preserve_order ⇒ BTreeMap，输出按 key 排序，
     // 与 Go 的 json.Marshal(map) 行为一致）。
@@ -197,32 +244,43 @@ fn agent_body(messages: &[Value], meta: &ModelMeta) -> Result<Vec<u8>, String> {
         json!(derive_session_id(&session_scope, &first_user_text(messages))),
     );
     base.insert("stream".into(), json!(true));
-    base.insert("aliyun_user_type".into(), json!("personal_professional_trial"));
+    // ★ 官方是空串（旧参考实现写 personal_professional_trial，已按官方更正）。
+    base.insert("aliyun_user_type".into(), json!(""));
     base.insert("agent_id".into(), json!("agent_common"));
     base.insert("chat_task".into(), json!("FREE_INPUT"));
     base.insert("is_reply".into(), json!(true));
-    base.insert("image_urls".into(), Value::Null);
+    base.insert("is_retry".into(), json!(false));
+    base.insert("source".into(), json!(1));
+    base.insert("version".into(), json!("3"));
+    base.insert("task_id".into(), json!("common"));
     base.insert("session_type".into(), json!("qodercli"));
     base.insert("model_config".into(), model_config.clone());
-    // `chat_context.text` 是上游协议**必填**项（哪怕 messages 里已有完整历史）
+    base.insert("system".into(), Value::Array(system_blocks));
+    // 官方 `parameters`：max_tokens 来自客户端 / 模型；没有就不带这一项。
+    let mut parameters: Map<String, Value> = Map::new();
+    if let Some(mt) = max_tokens {
+        parameters.insert("max_tokens".into(), json!(mt));
+    }
+    base.insert("parameters".into(), Value::Object(parameters));
+    // `chat_context.text` 是上游协议**必填**项（哪怕 messages 里已有完整历史）。
+    // 官方该字段是**字符串**，extra 里的 modelConfig 只带 key / is_reasoning。
     base.insert(
         "chat_context".into(),
         json!({
             "chatPrompt": "",
-            "text": {"type": "text", "text": prompt},
+            "text": prompt,
             "extra": {
                 "context": [],
-                "modelConfig": model_config,
-                "originalContent": {"type": "text", "text": prompt},
+                "modelConfig": {"key": meta.key, "is_reasoning": meta.is_reasoning},
+                "originalContent": prompt,
             },
             "features": [],
             "imageUrls": Value::Null,
         }),
     );
-    base.insert(
-        "messages".into(),
-        Value::Array(normalize_developer_roles(messages)),
-    );
+    base.insert("messages".into(), Value::Array(sanitized_messages));
+    // 官方恒带 `tools`（没传就是空数组）。
+    base.insert("tools".into(), Value::Array(sanitized_tools));
     base.insert(
         "business".into(),
         json!({
@@ -263,6 +321,264 @@ fn normalize_developer_roles(messages: &[Value]) -> Vec<Value> {
         out.push(msg);
     }
     out
+}
+
+/// 把 system 消息拆出来（官方形状：`system` 是**独立数组**，`messages` 里不带 system）。
+///
+/// 官方 `bve`：`system` = 系统提示块数组，`messages` = 对话消息（system 已被移除）。
+/// 旧实现把 system 留在 `messages` 里 —— 简单请求能过，但复杂请求（工具 + 长
+/// system）会被上游静默回 `[DONE]`。
+fn split_system(messages: &[Value]) -> (Vec<String>, Vec<Value>) {
+    let mut system = Vec::new();
+    let mut conversation = Vec::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+        if role.trim().eq_ignore_ascii_case("system") {
+            let text = content_text_of(msg.get("content").unwrap_or(&Value::Null));
+            if !text.is_empty() {
+                system.push(text);
+            }
+        } else {
+            conversation.push(msg.clone());
+        }
+    }
+    (system, conversation)
+}
+
+/// 把 `content` 归一成块数组（官方 `contents` 的形状）。
+///
+/// 只保留三种块：`text`（含 `input_text`）、`image_url`、`image`；其余丢弃
+/// （上游不认识，带着只会让它静默失败）。
+fn content_parts(content: &Value) -> Vec<Value> {
+    match content {
+        Value::String(s) if !s.is_empty() => vec![json!({ "type": "text", "text": s })],
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                let ty = item.get("type").and_then(Value::as_str).unwrap_or("");
+                match ty {
+                    "text" | "input_text" => {
+                        if let Some(t) = item.get("text").and_then(Value::as_str) {
+                            if !t.is_empty() {
+                                out.push(json!({ "type": "text", "text": t }));
+                            }
+                        }
+                    }
+                    "image_url" | "image" => out.push(item.clone()),
+                    _ => {}
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// 从 `content` 里取纯文本（块数组按换行拼接）。
+fn content_text_of(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(_) => parts_text(&content_parts(content)),
+        _ => String::new(),
+    }
+}
+
+/// 块数组 → 纯文本。
+fn parts_text(parts: &[Value]) -> String {
+    parts
+        .iter()
+        .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|p| p.get("text").and_then(Value::as_str))
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 把一条 OpenAI 消息归一成官方形状（带 `contents` 块；system 已在上游拆走）。
+fn sanitize_message(msg: &Value) -> Option<Value> {
+    let role = msg.get("role").and_then(Value::as_str)?.trim().to_ascii_lowercase();
+    let content = msg.get("content").cloned().unwrap_or(Value::Null);
+    let parts = content_parts(&content);
+    let text = parts_text(&parts);
+    let mut out = Map::new();
+    out.insert("role".into(), json!(role));
+    match role.as_str() {
+        "assistant" => {
+            // 官方 `gPc`：content 是字符串，contents 是块数组，tool_calls 是标准 OpenAI 形状。
+            out.insert("content".into(), json!(text));
+            // 官方保留历史里的 reasoning_content（`gPc` 会写回同名字段）。
+            if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
+                if !rc.is_empty() {
+                    out.insert("reasoning_content".into(), json!(rc));
+                }
+            }
+            let mut contents: Vec<Value> = parts
+                .iter()
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                .cloned()
+                .collect();
+            let mut calls: Vec<Value> = Vec::new();
+            for tc in msg.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
+                let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                let func = tc.get("function");
+                let custom = tc.get("custom");
+                let name = func
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .or_else(|| custom.and_then(|c| c.get("name")).and_then(Value::as_str))
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                // arguments 必须是**字符串**（标准 OpenAI）；custom 的 input 可能是字符串/对象。
+                let arguments = func
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        custom.and_then(|c| c.get("input")).map(|v| match v {
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                    })
+                    .unwrap_or_else(|| "{}".to_string());
+                calls.push(json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }));
+                contents.push(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "arguments": arguments,
+                }));
+            }
+            if !calls.is_empty() {
+                out.insert("tool_calls".into(), Value::Array(calls));
+            }
+            if !contents.is_empty() {
+                out.insert("contents".into(), Value::Array(contents));
+            }
+        }
+        "tool" => {
+            // 官方 `uPc` 的 tool 消息：content 是字符串 + tool_call_id；**带图片时**
+            // content/contents 都是块数组（图片照常转发给视觉上游，不是丢弃）。
+            let has_image = parts
+                .iter()
+                .any(|p| matches!(p.get("type").and_then(Value::as_str), Some("image_url") | Some("image")));
+            if has_image {
+                out.insert("content".into(), Value::Array(parts.clone()));
+                out.insert("contents".into(), Value::Array(parts));
+            } else {
+                out.insert("content".into(), json!(text));
+            }
+            if let Some(id) = msg.get("tool_call_id") {
+                out.insert("tool_call_id".into(), id.clone());
+            }
+            if let Some(name) = msg.get("name") {
+                out.insert("name".into(), name.clone());
+            }
+        }
+        _ => {
+            // user（以及未知角色按 user 处理）：有图片时 content 是块数组，与官方一致。
+            let has_image = parts
+                .iter()
+                .any(|p| matches!(p.get("type").and_then(Value::as_str), Some("image_url") | Some("image")));
+            if has_image {
+                out.insert("content".into(), Value::Array(parts.clone()));
+            } else {
+                out.insert("content".into(), json!(text));
+            }
+            if !parts.is_empty() {
+                out.insert("contents".into(), Value::Array(parts));
+            }
+        }
+    }
+    Some(Value::Object(out))
+}
+
+/// 把工具归一成上游支持的 `type: "function"`。
+///
+/// # 为什么是**转换**而不是丢弃（2026-10-20）
+///
+/// DSH / pi-ai 在开启 grammar 采样时会发 `type: "custom"`（带 `format.grammar`），
+/// 而官方 Qoder 客户端从不发这种形状 —— 上游对它**不报错**，只回 `[DONE]`。
+/// 直接丢掉会让模型彻底看不到这个工具（用户的功能静默消失）；转成 function
+/// 工具后模型仍能调用它，只是失去 grammar 强制约束（调用参数改用字符串输入）。
+fn sanitize_tool(tool: &Value) -> Option<Value> {
+    match tool.get("type").and_then(Value::as_str) {
+        Some("function") => {
+            let name = tool
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(tool.clone())
+        }
+        Some("custom") => {
+            let custom = tool.get("custom")?;
+            let name = custom
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if name.is_empty() {
+                return None;
+            }
+            let description = custom
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            // grammar 约束转成「字符串输入 + 格式说明」：模型仍能按语法产出内容。
+            let hint = custom
+                .pointer("/format/grammar/definition")
+                .and_then(Value::as_str)
+                .or_else(|| custom.pointer("/format/grammar/syntax").and_then(Value::as_str))
+                .unwrap_or("");
+            let mut parameters = json!({
+                "type": "object",
+                "properties": {"input": {"type": "string"}},
+                "required": ["input"],
+            });
+            if !hint.is_empty() {
+                parameters["properties"]["input"]["description"] = json!(format!(
+                    "请输出符合以下语法定义的内容：{hint}"
+                ));
+            }
+            Some(json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                },
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// 统计消息里的图片块数量（只用于日志，不改变内容）。
+fn count_image_blocks(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .filter_map(|m| m.get("contents").and_then(Value::as_array))
+        .flatten()
+        .filter(|p| {
+            matches!(
+                p.get("type").and_then(Value::as_str),
+                Some("image_url") | Some("image")
+            )
+        })
+        .count()
 }
 
 /// 会话 ID：`sha256(会话命名空间 + "\0" + 首条 user 文本)` 取前 16 字节拼 UUID 形态。
@@ -383,13 +699,28 @@ mod tests {
             {"role":"developer","content":"you are helpful"},
             {"role":"user","content":"hi"}]}"#;
         let out = parse(&build_agent_body(body, &ModelMeta::key_only("qmodel_x")).unwrap());
-        assert_eq!(out["messages"][0]["role"], "system");
-        // 其它角色不动
-        assert_eq!(out["messages"][1]["role"], "user");
+        // developer → system，且 system 按官方形状拆到独立的 `system` 字段
+        assert_eq!(out["system"][0]["text"], "you are helpful");
+        assert_eq!(out["messages"][0]["role"], "user", "messages 里不该再有 system");
         // 大小写/空格也要认
         let body2 = br#"{"messages":[{"role":" Developer ","content":"x"},{"role":"user","content":"y"}]}"#;
         let out2 = parse(&build_agent_body(body2, &ModelMeta::key_only("k")).unwrap());
-        assert_eq!(out2["messages"][0]["role"], "system");
+        assert_eq!(out2["system"][0]["text"], "x");
+        assert_eq!(out2["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn system_is_split_out_of_messages_into_its_own_field() {
+        let body = r#"{"messages":[
+            {"role":"system","content":"你是助手"},
+            {"role":"user","content":"hi"},
+            {"role":"system","content":"补充规则"}]}"#;
+        let out = parse(&build_agent_body(body.as_bytes(), &ModelMeta::key_only("k")).unwrap());
+        assert_eq!(out["system"].as_array().unwrap().len(), 2);
+        assert_eq!(out["system"][0]["text"], "你是助手");
+        assert_eq!(out["system"][1]["text"], "补充规则");
+        assert_eq!(out["messages"].as_array().unwrap().len(), 1, "system 不得留在 messages 里");
+        assert_eq!(out["messages"][0]["role"], "user");
     }
 
     #[test]
@@ -423,8 +754,12 @@ mod tests {
             10,
             "model_config 必须发全 10 个字段，实际: {mc}"
         );
-        // chat_context.extra 里的那份必须与顶层**完全一致**
-        assert_eq!(out["chat_context"]["extra"]["modelConfig"], *mc);
+        // chat_context.extra 里按**官方形状**只带 {key, is_reasoning}
+        //（完整 10 字段只放顶层 model_config）。
+        let extra = &out["chat_context"]["extra"]["modelConfig"];
+        assert_eq!(extra["key"], "qmodel_preview");
+        assert_eq!(extra["is_reasoning"], true);
+        assert_eq!(extra.as_object().unwrap().len(), 2, "官方 extra.modelConfig 只有 2 个键");
     }
 
     #[test]
@@ -456,8 +791,9 @@ mod tests {
         assert_eq!(out["model_config"]["key"], "qmodel_preview");
         assert_eq!(out["model_config"]["source"], "system");
         assert_eq!(out["model_config"]["is_reasoning"], false);
-        // chat_context.extra 里的那份也必须一致
-        assert_eq!(out["chat_context"]["extra"]["modelConfig"]["source"], "system");
+        // chat_context.extra 里按官方形状只带 key / is_reasoning
+        assert_eq!(out["chat_context"]["extra"]["modelConfig"]["key"], "qmodel_preview");
+        assert_eq!(out["chat_context"]["extra"]["modelConfig"]["is_reasoning"], false);
     }
 
     #[test]
@@ -471,8 +807,16 @@ mod tests {
         assert_eq!(out["session_type"], "qodercli");
         assert_eq!(out["stream"], true);
         assert_eq!(out["is_reply"], true);
-        assert_eq!(out["aliyun_user_type"], "personal_professional_trial");
-        assert!(out["image_urls"].is_null());
+        // ★ 官方形状（2026-10-20 对齐）：空串 + source/version/is_retry/task_id
+        assert_eq!(out["aliyun_user_type"], "");
+        assert_eq!(out["source"], 1);
+        assert_eq!(out["version"], "3");
+        assert_eq!(out["is_retry"], false);
+        assert_eq!(out["task_id"], "common");
+        assert!(out["system"].as_array().unwrap().is_empty());
+        assert!(out["tools"].as_array().unwrap().is_empty());
+        assert!(out["parameters"].is_object());
+        assert!(out.get("image_urls").is_none(), "官方顶层没有 image_urls");
         assert!(out["chat_context"]["imageUrls"].is_null());
         assert!(out["chat_context"]["features"].as_array().unwrap().is_empty());
         assert!(out["chat_context"]["extra"]["context"].as_array().unwrap().is_empty());
@@ -481,11 +825,14 @@ mod tests {
         // 但 request_set_id / business.id 是各自独立的
         assert_ne!(out["request_id"], out["request_set_id"]);
         assert_ne!(out["request_set_id"], out["business"]["id"]);
-        // chat_context.text 取最后一条 user 文本
-        assert_eq!(out["chat_context"]["text"]["text"], "你好");
-        assert_eq!(out["chat_context"]["text"]["type"], "text");
-        assert_eq!(out["chat_context"]["extra"]["originalContent"]["text"], "你好");
+        // chat_context.text / originalContent 官方是**字符串**（不再是 {type,text}）
+        assert_eq!(out["chat_context"]["text"], "你好");
+        assert_eq!(out["chat_context"]["extra"]["originalContent"], "你好");
         assert_eq!(out["chat_context"]["chatPrompt"], "");
+        // 消息带 contents 块（official 形状）
+        assert_eq!(out["messages"][0]["content"], "你好");
+        assert_eq!(out["messages"][0]["contents"][0]["type"], "text");
+        assert_eq!(out["messages"][0]["contents"][0]["text"], "你好");
     }
 
     #[test]
@@ -502,17 +849,59 @@ mod tests {
     }
 
     #[test]
-    fn tools_injected_only_when_client_sends_them() {
-        // 不带 tools
+    fn tools_are_always_forwarded_in_official_shape() {
+        // 官方恒带 tools（没传就是空数组）
         let out = parse(&build_agent_body(br#"{"messages":[{"role":"user","content":"hi"}]}"#, &ModelMeta::key_only("k")).unwrap());
-        assert!(out.get("tools").is_none(), "客户端没传 tools 就不该注入");
-        // 带 tools
+        assert_eq!(out["tools"].as_array().unwrap().len(), 0, "没传 tools ⇒ 空数组");
+        // 带 tools：function 原样
         let body = br#"{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}"#;
         let out = parse(&build_agent_body(body, &ModelMeta::key_only("k")).unwrap());
         assert_eq!(out["tools"][0]["function"]["name"], "f");
-        // 空数组也不注入
+        // 空数组 ⇒ 空数组
         let out = parse(&build_agent_body(br#"{"messages":[{"role":"user","content":"hi"}],"tools":[]}"#, &ModelMeta::key_only("k")).unwrap());
-        assert!(out.get("tools").is_none());
+        assert_eq!(out["tools"].as_array().unwrap().len(), 0);
+    }
+
+    /// ★★ `type:"custom"`（grammar 工具）必须**转换**成 function，而不是丢弃。
+    ///
+    /// DSH / pi-ai 开启 grammar 采样时会发 custom 工具；官方 Qoder 客户端从不发
+    /// 这种形状 —— 上游对它不报错，只回 `[DONE]`。丢掉会让模型看不到这个工具。
+    #[test]
+    fn custom_tool_is_converted_to_function_not_dropped() {
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],"tools":[
+            {"type":"custom","custom":{"name":"run_grammar","description":"按语法输出",
+             "format":{"type":"grammar","grammar":{"syntax":"regex","definition":"^[0-9]+$"}}}}]}"#;
+        let out = parse(&build_agent_body(body.as_bytes(), &ModelMeta::key_only("k")).unwrap());
+        assert_eq!(out["tools"].as_array().unwrap().len(), 1, "custom 工具必须被保留（转换后）");
+        let f = &out["tools"][0]["function"];
+        assert_eq!(f["name"], "run_grammar");
+        assert_eq!(f["parameters"]["properties"]["input"]["type"], "string");
+        assert!(
+            f["parameters"]["properties"]["input"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("^[0-9]+$"),
+            "语法定义要转成输入说明：{f}"
+        );
+    }
+
+    /// 工具结果里的图片不能被丢弃：按官方形状保留 `content`/`contents` 块。
+    #[test]
+    fn tool_result_image_is_preserved_as_blocks() {
+        let body = r#"{"messages":[{"role":"user","content":"看图"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"shot","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":[{"type":"text","text":"截图如下"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}"#;
+        let out = parse(&build_agent_body(body.as_bytes(), &ModelMeta::key_only("k")).unwrap());
+        let tool_msg = &out["messages"][2];
+        assert_eq!(tool_msg["role"], "tool");
+        assert_eq!(tool_msg["content"][0]["text"], "截图如下", "图片存在时 content 是块数组");
+        assert_eq!(tool_msg["contents"][1]["type"], "image_url");
+    }
+
+    /// assistant 历史里的 `reasoning_content` 按官方形状保留（不丢）。
+    #[test]
+    fn assistant_reasoning_content_is_preserved() {
+        let body = r#"{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok","reasoning_content":"先想一下"}]}"#;
+        let out = parse(&build_agent_body(body.as_bytes(), &ModelMeta::key_only("k")).unwrap());
+        assert_eq!(out["messages"][1]["reasoning_content"], "先想一下");
     }
 
     #[test]
@@ -670,7 +1059,10 @@ mod tests {
             {"role":"tool","content":"t1","tool_call_id":"x"},
             {"role":"user","content":"u2"}]}"#;
         let out = parse(&build_agent_body(body, &ModelMeta::key_only("k")).unwrap());
-        assert_eq!(out["messages"].as_array().unwrap().len(), 5, "消息全量透传");
-        assert_eq!(out["messages"][3]["role"], "tool");
+        // system 拆到 system 字段；其余全量透传（原来 5 条 → 现在 4 条）
+        assert_eq!(out["messages"].as_array().unwrap().len(), 4, "对话消息全量透传");
+        assert_eq!(out["system"][0]["text"], "s");
+        assert_eq!(out["messages"][2]["role"], "tool");
+        assert_eq!(out["messages"][2]["tool_call_id"], "x");
     }
 }
