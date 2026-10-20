@@ -690,16 +690,20 @@ curl.exe -s -X POST "http://127.0.0.1:$port/v1/chat/completions" `
 >   **换号重试**；`forward.rs:326` 的注释写明「`Pool::acquire`（原子占名额）兜住 ——
 >   它返回 false 时**换号重试即可**」。
 > - 全仓库 `grep -rn 'InFlightWait|in_flight_wait' crates/ src-tauri/ --include=*.rs`
->   → 仅 2 处命中，**都在 `gateway.rs` 的注释里**，**没有任何实现**。
+>   → 2026-10-20 起有实现（`config.rs` / `server.rs` / `forward.rs` / `pool.rs`）；
+>   此前仅 2 处注释、没有任何实现。旧结论已失效，保留此条只为说明演进。
 > - `server.Config.InFlightWait` / `pool.AcquireWait` 是 **Go 版**（`go-gateway/`，
 >   已不参与构建）的标识符。`gateway.rs:3210` 那段「为什么现在敢用 3」的说明是
 >   **Go 时代遗留**，与 Rust 现状不符。
-> ⇒ 现行语义：**每账号最多 3 个在途；满额时该账号被跳过、请求换号重试**，
-> 不存在等待/排队。
+> ⇒ 现行语义：**每账号最多 3 个在途**；单账号满额时该账号被跳过、请求换号；
+> 若**所有候选都满**则按 `pool.in_flight_wait_ms` 有界排队（见下条待办）。
 >
-> **待办（未决，需 Owner 定夺）**：Go 版靠排队让「客户端 5 次并发重试」不再成片 503；
-> Rust 版改成了换号 —— 对**单账号产品**（qoder / zcode）而言换号无处可换，
-> 这正是「并发重试成片 503」的成因形状。**保留换号还是补回排队，是需要重新评估的决策。**
+> **待办（已决，2026-10-20）**：Go 版靠排队让「客户端 5 次并发重试」不再成片 503；
+> Rust 版此前改成了换号 —— 对**单账号产品**（qoder / zcode）而言换号无处可换。
+> 现已补回**有界排队**：`pool.in_flight_wait_ms`（缺省 5000ms），选号失败且
+> 「有候选但全部占满在途」时每 50ms 重选，等不到再 503。20 路并发实测从
+> 6 成功/14 × 503 变为 19 成功/1 × 503。详见
+> `.agents/notes/implemented/feature/2026-10-20-in-flight-wait-queue.md`。
 >
 > 改魔数时务必同步本节 —— 文档与代码分叉比没有文档更糟。
 

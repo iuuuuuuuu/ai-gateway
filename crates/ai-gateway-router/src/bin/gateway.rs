@@ -340,6 +340,9 @@ async fn main() {
     let mut qoder_accounts = 0usize;
     let mut zcode_accounts = 0usize;
     let mut trae_accounts = 0usize;
+    // 启动预热模型清单缓存用：倍率来自清单，而清单默认只在首次对话时拉。
+    // 保留全部账号：国际版清单端点可能不可达，要能退到国服账号再试。
+    let mut qoder_warm: Vec<auth::Auth> = Vec::new();
 
     if cfg.multi_product {
         // ---- Qoder ----
@@ -352,6 +355,7 @@ async fn main() {
             ai_gateway_router::logline!("Qoder 凭证解析失败，已跳过：{f}");
         }
         for a in qcreds {
+            qoder_warm.push(a.clone());
             pool.add(a);
             qoder_accounts += 1;
         }
@@ -932,6 +936,8 @@ async fn main() {
         session,
         api_key: cfg.api_key.clone(),
         max_rotate: cfg.pool.max_rotate.max(1),
+        // 上限 30s：再长会先撞客户端自己的超时，等待只会变成「挂住」。
+        in_flight_wait: Duration::from_millis(cfg.pool.in_flight_wait_ms.clamp(0, 30_000) as u64),
         soft_cooldown: cfg.parsed.soft_rate,
         refresh_skew: Duration::from_secs(600),
         redis_mode: "noop".into(),
@@ -1072,6 +1078,20 @@ async fn main() {
             ai_gateway_router::server::warm_up_live_models(&state).await;
             ai_gateway_router::logline!("[warmup] 上游模型真值预热完成（观测集已填充，裸名请求不再选中错区账号）");
         });
+    }
+
+    // ★★ Qoder 倍率预热（2026-10-20）：模型清单缓存默认只在**首次对话**时填充，
+    //    而 `/v1/models` 的倍率列读的就是它 —— 网关刚启动时页面上一片空白，
+    //    用户会以为倍率功能没做。启动后异步拉一次，让首屏就有真实值。
+    //
+    //    失败静默：预热是优化不是前提，拉不到时页面只是暂时没有倍率（与旧行为一致）。
+    if let Some(up) = state.products.qoder.clone() {
+        if !qoder_warm.is_empty() {
+            let accounts = qoder_warm.clone();
+            tokio::spawn(async move {
+                up.warm_model_cache(&accounts).await;
+            });
+        }
     }
 
     // ★★ 接线：定时刷新上游真值（区域清单 + **倍率** + 观测集）。

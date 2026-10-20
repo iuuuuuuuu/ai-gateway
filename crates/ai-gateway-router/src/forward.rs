@@ -333,6 +333,19 @@ pub struct ForwardCtx<'a> {
     pub session: Option<&'a Router>,
     /// 单请求最多换号次数。
     pub max_rotate: usize,
+    /// 在途名额全满时的**排队等待上限**；`Duration::ZERO` = 不等待（立即失败）。
+    ///
+    /// # 为什么需要它（2026-10-20 现场）
+    ///
+    /// 客户端（pi-ai / DSH）的一次失败会触发多路**并发**重试，而每个账号的
+    /// 在途名额只有 `max_in_flight` 个。qoder 只有 2 个账号 ⇒ 整产品最多
+    /// 6 个在途。实测 20 路并发时 14 路直接 503，日志是「轮转耗尽（本请求
+    /// 已试 0 个账号）」—— 上游没坏、账号也没坏，只是**没有空位**。
+    ///
+    /// Go 版曾用 `InFlightWait` 排队；Rust 版改为「换号」，对单账号产品来说
+    /// 等于换无可换。故这里补一个**有界**的等待：每 50ms 重新选号，最多等
+    /// `in_flight_wait`。等不到再按原口径 503。
+    pub in_flight_wait: Duration,
     /// 429 / 404 软冷却时长。
     pub soft_cooldown: Duration,
     /// token 提前刷新窗口。
@@ -653,6 +666,34 @@ impl ImageRoute {
     }
 }
 
+/// 按「产品前缀 / 区域 / 模型」挑下一个账号（主路径与排队等待共用）。
+///
+/// 抽成函数是为了让「排队后重新选号」与「首轮选号」**逐字同一条逻辑** ——
+/// 各写一份必然分叉，而分叉的表现是「排队等到的号其实不符合产品约束」。
+fn pick_next_account(
+    pool: &mut Pool,
+    product: &str,
+    route: ImageRoute,
+    model: &str,
+    tried: &[String],
+) -> Option<Auth> {
+    if product.is_empty() {
+        if route.region == Region::Any {
+            pool.pick_for_model(model, tried)
+        } else {
+            pool.pick_for_model_region(model, tried, route.region, route.required)
+        }
+    } else {
+        pool.pick_for_model_product_region(model, tried, route.region, product)
+    }
+}
+
+/// 在途名额全满时重新选号的间隔。
+///
+/// 50ms 是「够快」与「不空转」的折中：一次对话的耗时在秒级，50ms 的分辨率
+/// 足够；而 5 秒等待期内最多 100 次取锁 —— 每次只是一次线性遍历，代价可忽略。
+const IN_FLIGHT_POLL: Duration = Duration::from_millis(50);
+
 /// 把一个「账号 × 当前模型」的成本率灌进池子（Go `forward.go:1507-1565` 逐字移植）。
 ///
 /// # 为什么需要它（2026-09-23 所有者需求）
@@ -862,7 +903,17 @@ pub async fn forward_chat(
         );
     }
 
-    for _ in 0..(ctx.max_rotate.max(1) + REJECT_RETRY_BUDGET) {
+    // 在途名额全满时，排队等待会**额外消耗循环次数**（每次重选一次）。
+    // 循环上界必须把等待轮数算进去，否则「等到了空位却没机会再选」。
+    let wait_rounds = if ctx.in_flight_wait.is_zero() {
+        0
+    } else {
+        (ctx.in_flight_wait.as_millis() / IN_FLIGHT_POLL.as_millis()).max(1) as usize
+    };
+    let mut in_flight_deadline: Option<tokio::time::Instant> = None;
+    let mut in_flight_wait_logged = false;
+
+    for _ in 0..(ctx.max_rotate.max(1) + REJECT_RETRY_BUDGET + wait_rounds + 1) {
         // ── 选号：优先粘性命中，其次按模型 + 区域挑（短暂持锁）──
         let mut acct: Option<Auth> = None;
         if let Some(uid) = sticky_uid.clone() {
@@ -893,15 +944,7 @@ pub async fn forward_chat(
             let mut pool = lock_pool(ctx.pool);
             // 产品前缀是**强制**约束（不跨平台兜底），区域是软偏好 —— 两者
             // 由 pool 内部两层分别处理，见 `pick_for_model_product_region`。
-            acct = if product.is_empty() {
-                if route.region == Region::Any {
-                    pool.pick_for_model(&model, &tried)
-                } else {
-                    pool.pick_for_model_region(&model, &tried, route.region, route.required)
-                }
-            } else {
-                pool.pick_for_model_product_region(&model, &tried, route.region, product)
-            };
+            acct = pick_next_account(&mut pool, product, route, &model, &tried);
         }
 
         let Some(acct) = acct else {
@@ -1067,6 +1110,49 @@ pub async fn forward_chat(
                 }
             }
 
+            // ── 在途名额全满：**排队等待**，而不是立刻 503（2026-10-20 现场）──
+            //
+            // 20 路并发实测：14 路以「轮转耗尽（本请求已试 0 个账号）」503，
+            // 而上游与账号都正常 —— 只是 2 个 qoder 账号 × 3 个名额 = 6 个槽位
+            // 被占满。客户端每次失败还会再多路重试，立即 503 只会放大风暴。
+            //
+            // 只等「有候选但都忙」：全冷却 / 禁用 / no_route / 模型白名单
+            // 这些情况等多久都不会变，上面的分支已经给出各自的出路。
+            if !ctx.in_flight_wait.is_zero()
+                && lock_pool(ctx.pool).all_candidates_busy(
+                    product,
+                    &model,
+                    route.region,
+                    &tried,
+                )
+            {
+                let now = tokio::time::Instant::now();
+                let deadline =
+                    *in_flight_deadline.get_or_insert_with(|| now + ctx.in_flight_wait);
+                if now < deadline {
+                    if !in_flight_wait_logged {
+                        in_flight_wait_logged = true;
+                        crate::logline!(
+                            "chat: 候选账号在途名额已满（product={} model={} region={}），排队等待空位（上限 {:?}）",
+                            if product.is_empty() { "-" } else { product },
+                            model,
+                            route.region.as_str(),
+                            ctx.in_flight_wait
+                        );
+                    }
+                    let sleep_for =
+                        IN_FLIGHT_POLL.min(deadline.saturating_duration_since(now));
+                    tokio::time::sleep(sleep_for).await;
+                    continue;
+                }
+                crate::logline!(
+                    "chat: 排队 {:?} 仍无空位（product={} model={}），按无可用账号返回 503",
+                    ctx.in_flight_wait,
+                    if product.is_empty() { "-" } else { product },
+                    model
+                );
+            }
+
             break;
         };
 
@@ -1084,6 +1170,25 @@ pub async fn forward_chat(
             continue;
         }
         held_uid = Some(acct.uid.clone());
+
+        // 产品账号判定：下面 3012 / 空流熔断与派发分叉都要用，故提前到此处。
+        //
+        // ★★ 必须用 `is_product_account`（只看账号的产品标签），**不能**用
+        // `products.dispatch(&acct).is_some()`。理由：一个 Qoder 账号即使产品上游
+        // 没配置，也**绝不该**去调 WorkBuddy 的刷新接口 —— 那是别人的端点，调了
+        // 必然失败并把这个好账号冷却掉。对应 Go `isProduct` 变量。
+        let is_product = crate::products::ProductUpstreams::is_product_account(&acct);
+        // 空流风暴的分桶区域：产品前缀请求按**请求区域**（未指定 = any = 整产品）。
+        //
+        // 现场缺陷（2026-10-20 08:36）：qoder 两个账号分属 cn / intl，而
+        // `qoder:模型名` 的轮转跨区域。按账号区域分桶时两个账号各进一个
+        // 「只有 1 个账号」的桶，而判据要求 2 个**不同账号** ⇒ 熔断永远不触发，
+        // 8 次空流全部落空。详见 [`crate::emptystream::channel_region`]。
+        let channel_region = crate::emptystream::channel_region(
+            is_product && !product.is_empty(),
+            route.region.as_str(),
+            acct.region().as_str(),
+        );
 
         // ── 3012 熔断兜底：**发请求之前**先看上游是否正在风控 ──
         //
@@ -1149,15 +1254,29 @@ pub async fn forward_chat(
         // 判定与 3012 同款哲学：熔断期就是要一个请求都不发。窗口内同一（产品, 区域）
         // 已有多个不同账号吃到空流 ⇒ 换号无用（是上游通道整体故障，账号是好的），
         // 再换号只会把剩下的好账号也拖进冷却。判定按 (产品, 区域) 隔离。
+        //
+        // ★★ 阈值必须按**该通道的账号总数**夹小：固定阈值 3 对 qoder（只有 2 个
+        //    账号）永远达不到 ⇒ 熔断**永久失效**。现场（2026-10-20 07:34）表现为
+        //    1 分钟内 23 次「空流 ⇒ 换号 ⇒ 再空流」，每次以「轮转耗尽（已试 2 个
+        //    账号）」收尾。详见 [`crate::emptystream::effective_threshold`]。
         {
-            let (burst, distinct) = ctx
-                .empty_stream
-                .blocked(acct.product_of(), acct.region().as_str());
+            let accounts = {
+                let pool = match ctx.pool.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                pool.channel_account_count(acct.product_of(), channel_region)
+            };
+            let (burst, distinct) =
+                ctx.empty_stream
+                    .blocked(acct.product_of(), channel_region, accounts);
             if burst {
                 crate::logline!(
-                    "chat: 空流风暴熔断中（最近 {} 秒内 {} 个不同账号空流），不发请求（本请求已试 {} 个账号）",
+                    "chat: 空流风暴熔断中（最近 {} 秒内 {} 个不同账号空流，阈值 {}，该通道 {} 个账号），不发请求（本请求已试 {} 个账号）",
                     ctx.empty_stream.window().as_secs(),
                     distinct,
+                    ctx.empty_stream.threshold_for(accounts),
+                    accounts,
                     tried.len()
                 );
                 release(ctx.pool, &mut held_uid);
@@ -1185,11 +1304,7 @@ pub async fn forward_chat(
         }
         // ── 产品派发判定（对应 Go `forward.go:565-572` 的唯一分叉点）──
         //
-        // ★★ 这里必须用 `is_product_account`（只看账号的产品标签），**不能**用
-        // `products.dispatch(&acct).is_some()`。理由：一个 Qoder 账号即使产品上游
-        // 没配置，也**绝不该**去调 WorkBuddy 的刷新接口 —— 那是别人的端点，调了
-        // 必然失败并把这个好账号冷却掉。对应 Go 的 `isProduct` 变量。
-        let is_product = crate::products::ProductUpstreams::is_product_account(&acct);
+        // `is_product` 在上面（3012 / 空流熔断之前）已经算好。
         // 兜底文案路径（循环耗尽）也要能报出「最后试的是哪个产品」。
         last_labels = product_labels(&acct, is_product);
 
@@ -1632,11 +1747,16 @@ pub async fn forward_chat(
                         // 保护已由 [`crate::emptystream`] 风暴窗口承担（按 产品+区域
                         // 中止轮转，不罚任何号），单号空流靠「不罚 + 正常轮转」自愈。
                         crate::logline!(
-                            "chat uid={} product=zcode: {} — 空流不罚号，仅换号（风暴窗口已记）",
-                            acct.uid, probe_msg
+                            "chat uid={} product=zcode model={}: {} — 空流不罚号，仅换号（风暴窗口已记；probe_error={} 已收字节={}）",
+                            acct.uid,
+                            model,
+                            probe_msg,
+                            probe.error.as_deref().unwrap_or("none"),
+                            prefix.len()
                         );
                         // 先喂空流风暴窗口：多号同通道空流 ⇒ 上游整体故障 ⇒ 下轮选号中止。
-                        ctx.empty_stream.note(&acct.uid, acct.product_of(), acct.region().as_str());
+                        ctx.empty_stream
+                            .note(&acct.uid, acct.product_of(), channel_region);
                         let kind = zcode_gate(&acct, classify::classify(503, &probe_msg), 503, &probe_msg);
                         last_status = 503;
                         last_kind = kind;
@@ -1656,14 +1776,22 @@ pub async fn forward_chat(
                     }
 
                     // 其它产品：换号，但**不罚号**（与上面 zcode 分支同口径）。
+                    //
+                    // 日志里带上 model 与 probe_error/已收字节：现场「空流」有三种成因
+                    //（上游超时、上游直接关流、上游发了我们认不出的帧），只看一句
+                    //「空流」无法区分；字节数为 0 且 error 为 closed 才真是空流。
                     crate::logline!(
-                        "chat uid={} product={}: {} — 空流不罚号，仅换号（风暴窗口已记）",
+                        "chat uid={} product={} model={}: {} — 空流不罚号，仅换号（风暴窗口已记；probe_error={} 已收字节={}）",
                         acct.uid,
                         acct.product_of(),
-                        probe_msg
+                        model,
+                        probe_msg,
+                        probe.error.as_deref().unwrap_or("none"),
+                        prefix.len()
                     );
                     // 先喂空流风暴窗口：多号同通道空流 ⇒ 上游整体故障 ⇒ 下轮选号中止。
-                    ctx.empty_stream.note(&acct.uid, acct.product_of(), acct.region().as_str());
+                    ctx.empty_stream
+                        .note(&acct.uid, acct.product_of(), channel_region);
                     let kind = classify::classify(503, &probe_msg);
                     last_status = 503;
                     last_kind = kind;
@@ -2633,6 +2761,9 @@ mod tests {
             client,
             session: None,
             max_rotate: 3,
+            // 单测不引入秒级等待：排队逻辑由 `Pool::all_candidates_busy` 的
+            // 单测覆盖，集成路径用 0 保持既有用例的即时语义。
+            in_flight_wait: Duration::ZERO,
             soft_cooldown: Duration::from_secs(60),
             refresh_skew: Duration::from_secs(600),
             allowed_model: Vec::new(),

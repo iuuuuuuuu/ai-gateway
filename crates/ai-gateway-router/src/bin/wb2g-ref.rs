@@ -88,6 +88,8 @@ async fn main() {
         session: None,
         api_key,
         max_rotate: 3,
+        // 参考入口不排队：保持「立即返回」的对照行为（生产入口才读配置）。
+        in_flight_wait: Duration::ZERO,
         soft_cooldown: Duration::from_secs(60),
         refresh_skew: Duration::from_secs(600),
         redis_mode: "noop".into(),

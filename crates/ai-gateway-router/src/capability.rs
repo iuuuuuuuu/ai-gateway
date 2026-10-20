@@ -1083,14 +1083,32 @@ impl CapabilityIndex {
     ///
     /// ⚠ 只补**该平台确实提供**的组合，不无脑笛卡尔积 —— 否则菜单里会塞满
     /// 用不了的名字，用户选中后得到「模型不存在」，比不显示更糟。
-    pub fn merged_model_list<F>(
+    pub fn merged_model_list<F, M>(
         fetched: &HashMap<Region, Option<Vec<ModelInfo>>>,
         has_account: &HashMap<Region, bool>,
         product_models: &[ProductModel],
         product_regions: F,
+        product_multiplier: M,
     ) -> Vec<Value>
     where
         F: Fn(&str) -> Vec<Region>,
+        // ★ 新增：按 `(产品, 模型名)` 查该产品的计费倍率。
+        //
+        // 返回 `None` = 「不知道」⇒ 渠道**不显示**倍率（`has_multiplier=false`）。
+        // 返回 `Some(x)` = 倍率是 x（`0.0` 表示免费）⇒ 显示 `x`。
+        //
+        // # 为什么必须是回调而不是入参
+        //
+        // 倍率的数据源**在产品内部**：Qoder 的 `price_factor` 只存在于
+        // [`crate::products::qoder::Dispatch`] 的模型清单缓存里。本模块拿到的
+        // `product_models` 只有**模型名**，拿不到倍率 —— 这正是此前把
+        // `credit_multiplier` 写死成 `None` 的原因（注释：「不在本函数的可见
+        // 范围内」）。
+        //
+        // 与既有的 `product_regions` 回调同款形状：**调用方**（`server.rs`）
+        // 手里有 `AppState.products`，由它转给产品查询；本模块保持纯函数、
+        // 不依赖 `AppState`，测试因此可以传 `|_, _| None` 而不必构造整个状态。
+        M: Fn(&str, &str) -> Option<f64>,
     {
         let idx = CapabilityIndex::build(fetched, has_account);
         let cn_infos = dynamic_infos(fetched, Region::CN);
@@ -1318,22 +1336,32 @@ impl CapabilityIndex {
         // 这两个产品**不按区域分**（账号池不分 cn/intl），故 region 留空 ——
         // 一个产品一条渠道。
         //
-        // 倍率：Qoder 有 `price_factor`（账号级、不分区），但那个值来自账号登录时
-        // 的模型清单，**不在本函数的可见范围内**（本函数只拿到模型名清单）。
-        // 故这里 `has_multiplier` 留 `false`，界面不显示倍率列 ——
-        // 宁可不说，也不编一个可能错的数字。ZCode 目前没有倍率数据源，同上。
+        // 倍率：由 `product_multiplier` 回调按「产品 + 模型」查（Qoder 走
+        // `price_factor`）。★ 与 WorkBuddy 的差别只在**取值的时机**：
+        // WorkBuddy 的倍率从能力索引直接读，这里必须问产品 —— 因为
+        // `price_factor` 不在模型名清单里。
+        //
+        // ★★ `has_multiplier` 只在**真拿到值**时置 `true`（2026-10-20 实机现场）：
+        // 此前这里写死 `false`，于是「模型路由清单」里 Qoder 的每一张卡片都
+        // 只显示平台徽标、不显示倍率 —— 而 `/usage` 那条路径（`record_usage`）
+        // 同时又显示着倍率。**同一次改动必须把两条路径都改**，否则用户看到的是
+        // 自相矛盾的界面。
         for pm in product_models {
             let label = channel_label(&pm.product)
                 .map(str::to_string)
                 .unwrap_or_else(|| pm.product.clone());
+            // ★ 用 `pm.id`（上游 key）查，而不是展示名：Qoder 的 `price_factor`
+            //   挂在 key 上（`DeepSeek-Flash` → `dfmodel`），两条路径的匹配口径
+            //   由产品内部统一，`capability` 不该再猜一次。
+            let mult = product_multiplier(&pm.product, &pm.id);
             append_channel(
                 channels.entry(pm.id.clone()).or_default(),
                 ProductChannel {
                     product: pm.product.clone(),
                     label,
                     region: String::new(),
-                    credit_multiplier: None,
-                    has_multiplier: false,
+                    has_multiplier: mult.is_some(),
+                    credit_multiplier: mult,
                 },
             );
         }
@@ -2427,7 +2455,8 @@ mod tests {
         has.insert(Region::CN, true);
         has.insert(Region::Intl, false);
 
-        let list = CapabilityIndex::merged_model_list(&fetched, &has, &[], |_| Vec::new());
+        let list =
+            CapabilityIndex::merged_model_list(&fetched, &has, &[], |_| Vec::new(), |_, _| None);
 
         assert!(has_entry(&list, "glm-5.3"), "真值里的模型必须在");
         assert!(
@@ -2452,6 +2481,7 @@ mod tests {
             &HashMap::new(),
             &[],
             |_| Vec::new(),
+            |_, _| None,
         );
 
         assert_eq!(entry(&list, "auto")["owned_by"], "workbuddy");
@@ -2469,8 +2499,13 @@ mod tests {
         let mut fetched: HashMap<Region, Option<Vec<ModelInfo>>> = HashMap::new();
         fetched.insert(Region::CN, None);
         fetched.insert(Region::Intl, None);
-        let list =
-            CapabilityIndex::merged_model_list(&fetched, &HashMap::new(), &[], |_| Vec::new());
+        let list = CapabilityIndex::merged_model_list(
+            &fetched,
+            &HashMap::new(),
+            &[],
+            |_| Vec::new(),
+            |_, _| None,
+        );
         let e = entry(&list, "glm-5.3");
 
         assert_eq!(
@@ -2489,8 +2524,13 @@ mod tests {
         let mut fetched: HashMap<Region, Option<Vec<ModelInfo>>> = HashMap::new();
         fetched.insert(Region::CN, None);
         fetched.insert(Region::Intl, None);
-        let list =
-            CapabilityIndex::merged_model_list(&fetched, &HashMap::new(), &[], |_| Vec::new());
+        let list = CapabilityIndex::merged_model_list(
+            &fetched,
+            &HashMap::new(),
+            &[],
+            |_| Vec::new(),
+            |_, _| None,
+        );
 
         let ch = channels_of(entry(&list, "glm-5.3"));
         assert_eq!(ch.len(), 2, "两区静态兜底 ⇒ 两条渠道");
@@ -2519,6 +2559,7 @@ mod tests {
             &has_both(),
             &[],
             |_| Vec::new(),
+            |_, _| None,
         );
 
         assert_eq!(
@@ -2547,6 +2588,7 @@ mod tests {
             &has_both(),
             &products,
             |_| Vec::new(),
+            |_, _| None,
         );
 
         assert_eq!(
@@ -2576,6 +2618,7 @@ mod tests {
             &has_both(),
             &products,
             |_| Vec::new(), // zcode 账号覆及的区域为空 ⇒ 只发 `zcode:模型名`
+            |_, _| None,
         );
 
         let bare = entry(&list, "glm-5.3");
@@ -2625,6 +2668,7 @@ mod tests {
             &has_both(),
             &[],
             |_| Vec::new(),
+            |_, _| None,
         );
 
         let cn_alias = channels_of(entry(&list, "国服:glm-5.3"));
@@ -2652,6 +2696,7 @@ mod tests {
             &has_both(),
             &products,
             |_| vec![Region::CN],
+            |_, _| None,
         );
 
         // product_regions 返回国服 ⇒ 该发 `qoder:国服:glm-5.3`。

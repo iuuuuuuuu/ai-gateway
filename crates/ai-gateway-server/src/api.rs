@@ -2326,6 +2326,7 @@ fn normalize_gateway_config_body(body: &Value) -> Value {
         // camelCase 键），用户重启网关后 API Key 归零、客户端全部 401。
         ("apiKey", "api_key"),
         ("autoStart", "auto_start"),
+        ("lanAccess", "lan_access"),
         ("pinnedUid", "pinned_uid"),
         ("manualUids", "manual_uids"),
         ("activityHours", "activity_hours"),

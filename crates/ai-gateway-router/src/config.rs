@@ -36,11 +36,12 @@ fn default_listen() -> String {
 ///
 /// 需要归一的三种输入：
 /// - 裸端口 `"7863"`（无冒号）
-/// - 空 host `":7863"`（有冒号、host 为空）★ 这是宿主实际写进来的形态
+/// - 空 host `":7863"`（有冒号、host 为空）。**旧宿主**写的就是这个形态；
+///   2026-10-20 起新宿主写显式 host（`127.0.0.1` / `0.0.0.0` / 手写 IP），
+///   但空 host 仍可能来自手写配置或老版本，故本函数保留。
 /// - 空白串 `""`（回落默认端口）
 ///
-/// ★★ 为什么必须有这个函数（2026-10-17 现场回归）：`crates/ai-gateway-core` 的
-/// `normalize_listen()` 恒返回 `format!(":{port}")`。空 host 交给
+/// ★★ 为什么必须有这个函数（2026-10-17 现场回归）：空 host 交给
 /// `TcpListener::bind` 后走 `getaddrinfo`，**各平台结果不同**：
 ///   - Linux/macOS → 只回环，探测 `127.0.0.1` 能通（所以 CI 全绿）
 ///   - Windows     → 枚举**全部网卡**，IPv6 link-local 排第一
@@ -1149,6 +1150,25 @@ pub struct PoolConfig {
     /// 本次补上字段并接进 [`crate::forward::ForwardCtx`]。
     #[serde(rename = "max_rotate", default = "default_max_rotate")]
     pub max_rotate: usize,
+    /// 在途名额全满时的排队等待上限（毫秒）；`0` = 关闭（立即 503）。
+    ///
+    /// # 为什么需要它（2026-10-20 现场）
+    ///
+    /// 客户端一次失败会并发重试多路，而 `max_in_flight` 是**每账号**上限。
+    /// qoder 只有 2 个账号 ⇒ 整产品最多 6 个在途；实测 20 路并发时 14 路
+    /// 直接 503（日志「轮转耗尽（本请求已试 0 个账号）」），而上游与账号都
+    /// 正常 —— 只是没空位。Go 版曾有 `InFlightWait` 排队，Rust 版此前缺失。
+    ///
+    /// 缺省 5000ms：一次对话首字节通常在秒级，5 秒足以让并发重试排完一轮；
+    /// 再长会让客户端自己先超时，反而把重试放大成第二波。启动时会被夹到
+    /// `[0, 30000]`（见 `bin/gateway.rs`）——超过 30 秒只会变成「挂住」。
+    #[serde(rename = "in_flight_wait_ms", default = "default_in_flight_wait_ms")]
+    pub in_flight_wait_ms: i64,
+}
+
+/// `pool.in_flight_wait_ms` 缺省值：5000ms。取值依据见字段文档。
+fn default_in_flight_wait_ms() -> i64 {
+    5000
 }
 
 /// `pool.max_rotate` 缺省值。
@@ -1189,6 +1209,7 @@ impl Default for PoolConfig {
             rotation: false,
             allowed_model: AllowedModels::default(),
             max_rotate: default_max_rotate(),
+            in_flight_wait_ms: default_in_flight_wait_ms(),
         }
     }
 }
@@ -1620,9 +1641,9 @@ impl Config {
         //
         // ★★ 2026-10-17 修正：原判据是 `if !self.listen.contains(':')`，
         // 只处理**无冒号**的裸端口 "7863"，把 `:7863`（**有冒号、但 host 为空**）
-        // 原样放行。这条判据漏掉了宿主实际写进来的形态 ——
-        // `crates/ai-gateway-core/src/modules/gateway.rs::normalize_listen()`
-        // 恒返回 `format!(":{port}")`，于是每台机器上的 `listen` 都是 `:7863`。
+        // 原样放行。旧宿主写的正是 `:7863`（`normalize_listen()` 恒返回
+        // `format!(":{port}")`）—— 2026-10-20 起宿主写显式 host，但手写配置
+        // 仍可能是空 host，故这条判据不能回退。
         //
         // 空 host 交给 `TcpListener::bind` 后走 `getaddrinfo`，**各平台结果不同**：
         //   - Linux/macOS → 只回环，探测 127.0.0.1 能通（故 CI 全绿）
@@ -1996,7 +2017,7 @@ mod tests {
     // 这组测试钉住「空 host 必须被补成回环」。
     #[test]
     fn listen_with_empty_host_becomes_loopback() {
-        // 宿主 normalize_listen() 的实际输出形态
+        // 旧宿主写出的空 host 形态（新宿主写显式 host，但手写配置仍可能这样）
         assert_eq!(ensure_listen_host(":7863"), "127.0.0.1:7863");
         // 裸端口（旧判据覆盖的那条，不许回退）
         assert_eq!(ensure_listen_host("7863"), "127.0.0.1:7863");

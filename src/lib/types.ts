@@ -714,6 +714,13 @@ export interface GatewayConfig {
   port: number;
   /** 监听地址，由 port 派生，如 ":7863"。 */
   listen: string;
+  /**
+   * 是否监听局域网（`0.0.0.0`）。默认 `false` = 仅 `127.0.0.1`。
+   *
+   * ★ 缺键时按 `false` 读（老配置没有这个字段，行为逐字不变）。
+   * 开启后局域网设备可访问；若 `api_key` 为空，网关会在日志里告警。
+   */
+  lan_access?: boolean;
   /** OpenAI 兼容接口的鉴权密钥；空 = 不鉴权。 */
   api_key: string;
   /** 随 App 启动而自动拉起。 */

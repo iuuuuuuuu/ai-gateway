@@ -86,9 +86,9 @@ impl DynamicModel {
     /// 该模型的最大上下文（Go `DynamicModel.MaxContextTokens`）。
     ///
     /// 取 `context_config` 里 `token_count` 的最大值；都不大于 0 时回落
-    /// `max_input_tokens`。网关路径不用（Go 侧只有探针命令与 `logincli` 读它），
-    /// 保留以对齐移植面。
-    #[allow(dead_code)]
+    /// `max_input_tokens`。网关路径用它填 `model_config.max_input_tokens`
+    /// （见 [`super::translate::ModelMeta`]）—— 上游据此判断能不能收下这段上下文，
+    /// 缺字段时会回落成官方客户端默认值。
     pub(crate) fn max_context_tokens(&self) -> i64 {
         let mut best = 0i64;
         if let Some(cfg) = &self.context_config {
@@ -187,6 +187,46 @@ impl QoderClient {
     /// 短请求客户端（模型清单、令牌刷新、额度、用户信息）。
     pub(crate) fn rpc(&self) -> &reqwest::Client {
         &self.rpc
+    }
+
+    /// 按宿主配置决定是否走代理（对应 Go `cmd/server/main.go` 的 qoder 接线）。
+    ///
+    /// # 为什么 Qoder 也要走代理
+    ///
+    /// 国际版打的是 `api3.qoder.sh` / `openapi.qoder.sh`（`.sh` 域）——**国际流量**。
+    /// 实测（本仓库 `auth.rs` 的注释）：`openapi.qoder.sh` 直连 **10.3 s**，
+    /// 走代理 **1.2 s**（慢 8.7 倍）。更糟的是直连经常直接超时，表现为
+    /// 「qoder 一会儿能用一会儿不能用」。
+    ///
+    /// # ★★ 这是此前真实存在的缺陷
+    ///
+    /// [`super::mod::QoderUpstream::new`] 用的是 [`Self::new`]（**真直连**），
+    /// 而 [`Self::new_with_proxy`] 只在 `qoder-login` 登录流程里被用到 ⇒
+    /// **网关的对话与模型清单从来没走过代理**。于是 `proxy_scope.intl = true`
+    /// 对 Qoder 完全无效：用户在界面上打开了国际版代理，qoder 通道照样直连。
+    ///
+    /// # 判据为什么只看 `proxy_scope.intl`
+    ///
+    /// 与 ZCode 同款（`zcode.z.ai` 同理）：**产品级**判据，不看单个账号的
+    /// `region`。理由是一个进程只有一对 `reqwest::Client`，而两个区域的账号
+    /// 共用它们 —— 按账号区域切换代理需要每账号一个 client，代价远大于收益。
+    /// 国际版是慢的那一侧，故以它为准。
+    ///
+    /// 设置失败只打日志、不阻断启动（失败后保持直连）—— 与 ZCode 一致。
+    pub(crate) fn apply_host_proxy(&mut self) {
+        let cfg = crate::products::zcode::client::host_config();
+        let addr = cfg.proxy.trim();
+        if !addr.is_empty() && cfg.proxy_intl {
+            match Self::new_with_proxy(Some(addr)) {
+                Ok(c) => {
+                    *self = c;
+                    crate::logline!("Qoder 走代理：{addr}");
+                }
+                Err(e) => crate::logline!("⚠ Qoder 代理设置失败（将直连）：{e}"),
+            }
+        }
+        // 不满足条件时保持 [`Self::new`] 的真直连 —— `base_builder()` 里的
+        // `no_proxy()` 已经清掉了环境代理，故不需要显式 `SetProxy("")`。
     }
 
     /// 拉取模型清单（需 COSY 签名）。

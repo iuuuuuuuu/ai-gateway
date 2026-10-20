@@ -1582,6 +1582,31 @@ impl Pool {
         seen
     }
 
+    /// 该（产品, 区域）通道上**一共**有多少个账号（不论健康与否）。
+    ///
+    /// # 用途：空流风暴阈值必须随池子大小自适应
+    ///
+    /// [`crate::emptystream`] 的判据是「窗口内多少个**不同账号**空流」，
+    /// 阈值取 3。对 WorkBuddy（19+ 个账号）合适，但对 **qoder（2 个账号）
+    /// 永远达不到** —— 上限就是账号数。于是 qoder 通道上的风暴熔断
+    /// **永久失效**：现场表现为 1 分钟内 23 次「上游返回空流 ⇒ 换号 ⇒ 再空流」
+    /// 的死循环，日志末尾每次都是「轮转耗尽（本请求已试 2 个账号）」。
+    ///
+    /// 故调用方要用这个数把阈值夹到「不超过该通道的账号数」，
+    /// 让小池子也能判定上游整体故障。
+    ///
+    /// ⚠ 这里**不过滤健康度**：熔断要回答的是「这个通道还有没有别的号可换」，
+    /// 已冷却的号同样换不到 —— 只数健康号会让阈值随冷却状态漂移，
+    /// 同一故障在不同时刻得出不同结论。
+    pub fn channel_account_count(&self, product: &str, region: &str) -> usize {
+        let want = Region::parse(region);
+        self.entries
+            .iter()
+            .filter(|e| e.a.product_of() == product)
+            .filter(|e| want == Region::Any || e.a.region() == want)
+            .count()
+    }
+
     /// 注入「各产品实际提供哪些模型」（宿主透传）。
     ///
     /// # 为什么需要它
@@ -3193,6 +3218,60 @@ impl Pool {
         self.entries
             .iter()
             .any(|e| e.healthy(now) && !self.in_flight_full(e))
+    }
+
+    /// 该范围内是否**有候选账号、但它们全部被在途名额占满**。
+    ///
+    /// # 为什么需要它（2026-10-20 现场）
+    ///
+    /// 选号失败时，「一个健康的号都没有」与「健康的号都在忙」的**出路完全不同**：
+    /// 前者只能等冷却/查账号，后者值得**排队等几十毫秒到几秒**。qoder 只有
+    /// 2 个账号 × `max_in_flight=3` = 6 个槽位，而客户端一次失败会并发重试多路
+    /// —— 实测 20 路并发时 14 路直接 503，日志是「轮转耗尽（本请求已试 0 个账号）」，
+    /// 上游和账号其实都正常。
+    ///
+    /// 返回 `true` 的条件是「范围内至少有一个可服务的候选，且它们全被占满」。
+    /// 候选为 0（全冷却/禁用/no_route/模型冷却/平台关闭）时返回 `false` ——
+    /// 那些情况等多久都不会变，必须立刻给出各自的出路文案。
+    ///
+    /// # `tried` 必须排除
+    ///
+    /// 已经被本请求试过的账号即使空闲也不会再被选中（轮转的既定语义），
+    /// 把它们算成「有空位」会让调用方误以为无需等待。
+    pub fn all_candidates_busy(
+        &self,
+        product: &str,
+        model: &str,
+        region: Region,
+        tried: &[String],
+    ) -> bool {
+        let now = SystemTime::now();
+        let mut any = false;
+        for e in &self.entries {
+            if !product.is_empty() && e.a.product_of() != product {
+                continue;
+            }
+            if region != Region::Any && e.a.region() != region {
+                continue;
+            }
+            if tried.iter().any(|u| u == &e.a.uid) {
+                continue;
+            }
+            if e.disabled || e.a.no_route {
+                continue;
+            }
+            if !e.healthy(now) || !e.model_available(model, now) {
+                continue;
+            }
+            if !self.platform_enabled(&e.a.product_of()) {
+                continue;
+            }
+            any = true;
+            if !self.in_flight_full(e) {
+                return false;
+            }
+        }
+        any
     }
 
     /// 返回当前 healthy 且未占满在途名额的 UID 列表（按 UID 排序，稳定输出）。
@@ -5010,6 +5089,49 @@ mod tests {
         assert!(!p.servable_now(), "占满后不可受理");
         p.release("u1");
         assert!(p.servable_now());
+    }
+
+    /// ★★ 在途名额全满 ≠ 账号不可用（2026-10-20 现场）。
+    ///
+    /// qoder 2 个账号 × 3 个槽位 = 6，客户端并发重试一多就有请求直接 503。
+    /// 这条钉住「能区分『都在忙』与『没有可用号』」—— 前者值得排队等。
+    #[test]
+    fn all_candidates_busy_distinguishes_busy_from_unavailable() {
+        let mut p = Pool::new(String::new());
+        let mut q1 = mk("q1");
+        q1.product = "qoder".into();
+        q1.domain = "qoder.com.cn".into();
+        let mut q2 = mk("q2");
+        q2.product = "qoder".into();
+        q2.domain = "qoder.sh".into();
+        p.add(q1);
+        p.add(q2);
+        p.set_max_in_flight(1);
+        let none: Vec<String> = Vec::new();
+
+        // 都空闲 ⇒ 不忙
+        assert!(!p.all_candidates_busy("qoder", "DeepSeek-Flash", Region::Any, &none));
+
+        // 只占满一个 ⇒ 仍有一个空位，不忙
+        assert!(p.acquire("q1"));
+        assert!(!p.all_candidates_busy("qoder", "DeepSeek-Flash", Region::Any, &none));
+
+        // 两个都占满 ⇒ 忙（注意两个账号分属 cn / intl，Region::Any 仍算同一范围）
+        assert!(p.acquire("q2"));
+        assert!(p.all_candidates_busy("qoder", "DeepSeek-Flash", Region::Any, &none));
+
+        // 已试过的号即使空闲也不算「有空位」—— 本请求不会再选它
+        p.release("q1");
+        let tried = vec!["q1".to_string()];
+        assert!(
+            p.all_candidates_busy("qoder", "DeepSeek-Flash", Region::Any, &tried),
+            "tried 里的空闲号不能被当成可切换的候选"
+        );
+
+        // 区域不匹配 ⇒ 没有候选，不是「忙」
+        assert!(!p.all_candidates_busy("qoder", "DeepSeek-Flash", Region::CN, &tried));
+        // 产品不匹配同理
+        assert!(!p.all_candidates_busy("workbuddy", "DeepSeek-Flash", Region::Any, &none));
     }
 
     #[test]

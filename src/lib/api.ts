@@ -1223,6 +1223,7 @@ export function smsVerify(
 export function saveGatewayConfig(config: Partial<GatewayConfig>): Promise<{ config: GatewayConfig }> {
   const args: Record<string, unknown> = {};
   if (config.port !== undefined) args.port = config.port;
+  if (config.lan_access !== undefined) args.lanAccess = config.lan_access;
   if (config.api_key !== undefined) args.apiKey = config.api_key;
   if (config.auto_start !== undefined) args.autoStart = config.auto_start;
   if (config.mode !== undefined) args.mode = config.mode;

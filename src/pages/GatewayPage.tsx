@@ -2311,6 +2311,13 @@ export default function GatewayPage() {
   const [error, setError] = useState<string | null>(null);
 
   const [port, setPort] = useState(7863);
+  /**
+   * 是否监听局域网（0.0.0.0）。
+   *
+   * ★ 默认 false = 仅回环：`api_key` 默认为空，监听全网卡等于把账号额度
+   * 暴露给整个局域网。开启后网关日志会打非回环告警。
+   */
+  const [lanAccess, setLanAccess] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [autoStart, setAutoStart] = useState(false);
   /** 网关工作模式：balance 自动 / manual 手动（勾选账号）/ rotation 积分轮转 */
@@ -2704,6 +2711,7 @@ export default function GatewayPage() {
     //（这是原 `dirtyRef` 的职责，语义完全保留）。否则无条件跟随后端 ——
     // 包括保存成功后回读拿到新值的那一次刷新。
     setPort((current) => (pendingRef.current ? current : nextPort));
+    setLanAccess(Boolean(cfg.lan_access));
     setApiKey((current) => (pendingRef.current ? current : nextKey));
     setAutoStart(Boolean(cfg.auto_start));
     setMode(cfg.mode === "manual" ? "manual" : cfg.mode === "rotation" ? "rotation" : "balance");
@@ -3014,6 +3022,29 @@ export default function GatewayPage() {
     try {
       await api.saveGatewayConfig({ auto_start: next });
       await refresh();
+    } catch (e) {
+      toast.error(api.asError(e));
+      await refresh();
+    }
+  }
+
+  /**
+   * 切换「允许局域网访问」。
+   *
+   * 与端口同一类：**重启网关后才生效**（监听 socket 只在进程启动时建立）。
+   * 失败时 `refresh()` 回滚为后端真实值，避免开关显示与实际监听不一致。
+   */
+  async function changeLanAccess(next: boolean) {
+    setLanAccess(next);
+    try {
+      const res = await api.saveGatewayConfig({ lan_access: next });
+      if (res?.config) setLanAccess(Boolean(res.config.lan_access));
+      toast.success(next ? "已开启局域网访问" : "已关闭局域网访问", {
+        id: "gw-lan-save",
+        description: next
+          ? "重启网关后监听 0.0.0.0；若 API Key 为空，局域网内任何人都能调用"
+          : "重启网关后仅监听 127.0.0.1",
+      });
     } catch (e) {
       toast.error(api.asError(e));
       await refresh();
@@ -4924,6 +4955,22 @@ export default function GatewayPage() {
               </Button>
             ) : null}
           </div>
+        </Row>
+        <Row>
+          <div className="min-w-0">
+            <Label htmlFor="gw-lan" className="text-[13px] font-normal">
+              允许局域网访问
+            </Label>
+            <div className="mt-0.5 text-[11px] text-muted-foreground">
+              开启后监听 0.0.0.0，局域网内其它设备可访问；重启网关后生效。请先设置 API Key。
+            </div>
+          </div>
+          <Switch
+            id="gw-lan"
+            checked={lanAccess}
+            onCheckedChange={(v) => void changeLanAccess(v)}
+            aria-label="允许局域网访问"
+          />
         </Row>
         <Row>
           <div className="min-w-0">

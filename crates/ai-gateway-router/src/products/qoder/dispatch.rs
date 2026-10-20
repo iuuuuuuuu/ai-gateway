@@ -43,7 +43,7 @@ use super::region::{region_from_domain, QoderRegion};
 use super::sse::payload_of_line;
 use super::stream::QoderStream;
 use super::token;
-use super::translate::build_agent_body;
+use super::translate::{build_agent_body, ModelMeta};
 
 /// 模型清单缓存时长。
 ///
@@ -78,8 +78,14 @@ pub(crate) struct Dispatch {
 
 impl Dispatch {
     pub(crate) fn new() -> Self {
+        let mut client = QoderClient::new();
+        // ★★ 国际版必须走代理：`api3.qoder.sh` / `openapi.qoder.sh` 直连实测 10.3 s
+        //    （走代理 1.2 s），且经常直接超时。此前这里只用 `QoderClient::new()`
+        //    （真直连），于是 `proxy_scope.intl = true` 对 Qoder **完全无效** ——
+        //    用户在界面上打开了国际版代理，qoder 通道照样直连。
+        client.apply_host_proxy();
         Self {
-            client: QoderClient::new(),
+            client,
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -110,7 +116,11 @@ impl Dispatch {
             )));
         }
 
-        let agent_body = build_agent_body(openai_body, &model_key)
+        // ★ 会话按键号隔离：换号后不能复用上一个账号的 `session_id`，
+        //   否则新账号会继承前一个账号的坏会话（现场表现为两号连续空流）。
+        let mut meta = meta_of(&models, &model_key);
+        meta.session_owner = cr.uid.clone();
+        let agent_body = build_agent_body(openai_body, &meta)
             .map_err(|e| GatewayError::Other(format!("构造 Qoder 请求体失败: {e}")))?;
 
         // ★ 刷新失败**只记日志**，继续用旧令牌：刷新是网络调用，一次抖动不该让
@@ -200,6 +210,77 @@ impl Dispatch {
             }
         }
     }
+
+    /// 从**已缓存的**模型清单里取该模型的 `price_factor`（同步、不发网络请求）。
+    ///
+    /// # 为什么是同步 + 只用缓存
+    ///
+    /// 调用点在计费的**关键路径**上（每个成功响应之后），用户等的是回答而不是
+    /// 我们的账单数字。与 [`crate::server::record_usage`] 对 WorkBuddy 倍率的
+    /// 口径一致：只用缓存里的真值，取不到就返回 `None`（= 未声明），**绝不编造**。
+    ///
+    /// # 缓存未命中时返回 `None` 而不是 0
+    ///
+    /// `price_factor == 0.0` 在上游的语义是**免费**（实测只有 `Qwen3.8-Flash`
+    /// 是 0），而「缓存里没有」是**不知道**。把后者渲染成 0 会让用户以为一个
+    /// 其实在计费的模型不花钱。见 [`crate::usage::Billing`] 的三态语义。
+    ///
+    /// # 区域怎么处理
+    ///
+    /// Qoder 的 `price_factor` **不分区**（同一模型在两个区域同价），而缓存按
+    /// [`QoderRegion`] 分桶。两个区域里任一份清单能查到就用它 —— 与
+    /// [`crate::capability`] 对 Qoder「region 留空、一个产品一条渠道」的
+    /// 口径一致。
+    pub(crate) fn multiplier_of(&self, model: &str) -> Option<f64> {
+        let guard = lock(&self.cache);
+        for c in guard.values() {
+            // 与 `resolve_in_list` 同款匹配：key 或归一化后的展示名都认，
+            // 否则用户写 `DeepSeek_Flash` 时倍率会查不到（而请求本身能成功）。
+            let lower = model.trim().to_lowercase();
+            let norm = normalize_model_name(model);
+            for m in &c.models {
+                let hit = m.key.to_lowercase() == lower
+                    || (!m.display_name.is_empty() && normalize_model_name(&m.display_name) == norm);
+                if hit {
+                    return Some(m.price_factor);
+                }
+            }
+        }
+        None
+    }
+
+    /// 启动预热：缓存过期/为空时拉一次模型清单（只发一次网络请求）。
+    ///
+    /// 返回 `true` = 缓存已可用（本来就新鲜，或本次拉取成功）；
+    /// `false` = 本次没拿到（调用方可以换下一个账号再试）。
+    ///
+    /// **失败只打日志**（由 [`Self::refresh_models`] 负责），不影响启动。
+    pub(crate) async fn warm_models(&self, a: &Auth) -> bool {
+        let Some(mut cr) = cred_of(a) else {
+            return false;
+        };
+        let fresh = {
+            let guard = lock(&self.cache);
+            guard
+                .get(&cr.region)
+                .map(|c| c.fetched.elapsed() < MODEL_CACHE_TTL && !c.models.is_empty())
+                .unwrap_or(false)
+        };
+        if fresh {
+            return true;
+        }
+        let models = self.refresh_models(&mut cr).await;
+        if models.is_empty() {
+            return false;
+        }
+        crate::logline!(
+            "Qoder 模型清单预热完成：uid={} region={}，{} 个模型（倍率列首屏可用）",
+            cr.uid,
+            cr.region.label(),
+            models.len()
+        );
+        true
+    }
 }
 
 /// 按账号构造 Qoder 凭证（Go `credOf`）。
@@ -254,6 +335,34 @@ fn available_keys(models: &[DynamicModel]) -> Vec<String> {
         seen.insert(m.key.as_str());
     }
     seen.into_iter().map(|s| s.to_string()).collect()
+}
+
+/// 取清单里 `key` 对应那一项的元数据；找不到则退化成 key-only。
+///
+/// # 为什么找不到也要发（而不是拒绝）
+///
+/// 找不到有两种正当来源：
+///
+/// 1. `qmodel*` **逃生口** —— 用户明确写了上游 key，而清单有 10 分钟缓存，
+///    新模型在缓存过期前本来就查不到；
+/// 2. 清单为空（拉取失败）—— 那时 [`resolve_in_list`] 的语义是「本次不校验」。
+///
+/// 两种情况都**不该**因为"拿不到元数据"而拒绝请求 —— 那是把一次网络抖动放大成
+/// 「模型不可用」。key-only 的 `model_config` 仍能工作（只是字段少几项），
+/// 缺的那几项由 [`ModelMeta`] 的兜底值补上。
+fn meta_of(models: &[DynamicModel], key: &str) -> ModelMeta {
+    match models.iter().find(|m| m.key == key) {
+        Some(m) => ModelMeta {
+            key: m.key.clone(),
+            display_name: m.display_name.clone(),
+            is_reasoning: m.is_reasoning,
+            is_vl: m.is_vl,
+            max_input_tokens: m.max_context_tokens(),
+            // 由 `chat_stream` 按当前账号填入，见那里的注释。
+            session_owner: String::new(),
+        },
+        None => ModelMeta::key_only(key),
+    }
 }
 
 /// 在清单里解析客户端模型名（Go `resolveInList`，**纯函数**）。
@@ -650,5 +759,73 @@ mod tests {
         assert!(text.contains(r#""content":"a""#), "{text}");
         assert!(text.contains("读取流失败"), "{text}");
         assert!(text.contains(r#""type":"upstream_error""#), "{text}");
+    }
+
+    // ── 倍率（`price_factor`）────────────────────────────────────────────
+
+    /// 往缓存里塞一份清单（不经过网络）。
+    fn seed(d: &Dispatch, region: QoderRegion, models: Vec<DynamicModel>) {
+        lock(&d.cache).insert(
+            region,
+            ModelCache { models, fetched: Instant::now() },
+        );
+    }
+
+    fn priced(key: &str, display: &str, price: f64) -> DynamicModel {
+        DynamicModel {
+            key: key.to_string(),
+            display_name: display.to_string(),
+            enable: true,
+            price_factor: price,
+            ..Default::default()
+        }
+    }
+
+    /// ★★ 现场缺陷：qoder 的 `price_factor` 一直躺在清单里，`/usage` 却永远
+    /// 输出 `hasMultiplier:false`。这条测试钉住「能查到真实值」。
+    #[test]
+    fn multiplier_reads_price_factor_from_the_cache() {
+        let d = Dispatch::new();
+        seed(
+            &d,
+            QoderRegion::CN,
+            vec![
+                priced("qmodel-ds-flash", "DeepSeek-Flash", 0.11),
+                priced("qfmodel-qwen", "Qwen3.8-Flash", 0.0),
+            ],
+        );
+        assert_eq!(d.multiplier_of("DeepSeek-Flash"), Some(0.11));
+        // ★ 0.0 是**免费**（确定），必须与「不知道」区分开
+        assert_eq!(d.multiplier_of("Qwen3.8-Flash"), Some(0.0));
+        // 按上游 key 也认
+        assert_eq!(d.multiplier_of("qmodel-ds-flash"), Some(0.11));
+    }
+
+    /// 用户写 `DeepSeek_Flash` / `deepseek flash` 时倍率也要查得到 ——
+    /// 与 `resolve_in_list` 同款匹配口径，否则「请求成功但倍率显示不出来」。
+    #[test]
+    fn multiplier_matches_normalized_display_names() {
+        let d = Dispatch::new();
+        seed(&d, QoderRegion::CN, vec![priced("qmodel-x", "DeepSeek-Flash", 0.11)]);
+        for v in ["DeepSeek_Flash", "deepseek flash", "  DeepSeek-Flash  ", "deepseek-flash"] {
+            assert_eq!(d.multiplier_of(v), Some(0.11), "变体 {v:?} 应能查到");
+        }
+    }
+
+    /// 缓存里没有 ⇒ `None`（不知道），**绝不是** `Some(0.0)`（免费）。
+    #[test]
+    fn multiplier_unknown_is_none_not_zero() {
+        let d = Dispatch::new();
+        assert_eq!(d.multiplier_of("whatever"), None, "空缓存不能编造免费");
+        seed(&d, QoderRegion::CN, vec![priced("qmodel-a", "A", 0.5)]);
+        assert_eq!(d.multiplier_of("qmodel-b"), None, "清单里没有的模型不能编造");
+    }
+
+    /// `price_factor` 不分区：两个区域的缓存任一份能查到就用它。
+    #[test]
+    fn multiplier_looks_across_regions() {
+        let d = Dispatch::new();
+        seed(&d, QoderRegion::Intl, vec![priced("qmodel-i", "Intl-Only", 0.29)]);
+        assert_eq!(d.multiplier_of("Intl-Only"), Some(0.29));
     }
 }

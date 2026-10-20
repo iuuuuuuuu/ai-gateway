@@ -69,6 +69,11 @@ pub struct AppState {
     pub api_key: String,
     /// 单请求最多换号次数。
     pub max_rotate: usize,
+    /// 在途名额全满时的排队等待上限（`pool.in_flight_wait_ms`）。
+    ///
+    /// 见 [`crate::forward::ForwardCtx::in_flight_wait`]：客户端并发重试把
+    /// 小产品池（qoder 2 个账号）的在途名额占满时，等待空位而不是立刻 503。
+    pub in_flight_wait: std::time::Duration,
     /// 429 软冷却时长。
     pub soft_cooldown: std::time::Duration,
     /// token 提前刷新窗口。
@@ -752,6 +757,10 @@ async fn models(
         &has_account,
         &product_models,
         |product| product_regions_of(&state, product),
+        // ★ 倍率交给产品自己答（Qoder 走 `price_factor`）。与
+        //   `record_usage` 用的是**同一个**查询源（`model_multiplier`），
+        //   两条路径必须给出一致的答案，否则界面自相矛盾。
+        |product, model| product_multiplier_of(&state, product, model),
     );
 
     // ★ 只有两个键（Go `handler.go:826-834` 逐字）：`object` + `data`。
@@ -2020,8 +2029,9 @@ async fn usage_report(State(state): State<Arc<AppState>>, headers: HeaderMap, ur
 /// `product` / `region` 是**计费归属**（见 [`crate::usage::Billing`]）：
 /// - `product` 空 → 归一成 `workbuddy`（WorkBuddy 在 auth 层就用空串表示产品）
 /// - `region` 空 → 该平台不分区，保持空（**不编造**区域）
-/// - 倍率只有 WorkBuddy 有：Qoder/ZCode 的 `has_multiplier` 保持 `false`，
-///   界面不显示倍率列 —— 宁可不说，也不给一个可能错的数字
+/// - 倍率**因产品而异**：WorkBuddy 按区域从能力索引取；Qoder 从模型清单的
+///   `price_factor` 取（不分区）；没有数据源的产品保持 `has_multiplier = false`
+///   —— 界面不显示倍率列，宁可不说，也不给一个可能错的数字
 fn record_usage(
     state: &Arc<AppState>,
     uid: &str,
@@ -2056,8 +2066,42 @@ fn record_usage(
         // 据它判断该烧哪个账号的额度，而那个判断一旦错就是真金白银。这也正是 Go 的
         // 行为：`fillBilling` 在 `idx == nil` 或该区域没有该模型时同样保持 nil。
         billing.multiplier = billing_multiplier_for(state, region, model);
+    } else if let Some(m) = product_multiplier_for(state, product, model) {
+        // ★ 非 WorkBuddy 产品：倍率由**产品自己**提供（Qoder 的 `price_factor`）。
+        //
+        // 关键区别：`has_multiplier = true` 只在**真拿到了值**时才置起。
+        // 没拿到（缓存未命中 / 该产品没有数据源）时保持 `false`，界面不显示
+        // 倍率列 —— 这比显示「—」更诚实：一个根本没有倍率概念的产品，
+        // 显示「不知道」会让用户以为「我们本该知道」。
+        //
+        // 现场缺陷（2026-10-20）：此前这里完全没有 else 分支 ⇒ qoder 的
+        // `price_factor` 明明在模型清单里躺着，`/usage` 却永远输出
+        // `"key":"qoder||?","hasMultiplier":false`。
+        billing.has_multiplier = true;
+        billing.multiplier = Some(m);
     }
     state.usage.record_billed(uid, model, billing, c);
+}
+
+/// 从**产品上游自己**取该模型的倍率（Qoder 的 `price_factor`）。
+///
+/// 走 [`crate::products::ProductUpstream::model_multiplier`]，故计费层不需要知道
+/// 任何产品内部的数据结构。取不到返回 `None`。
+///
+/// ⚠ 这**不是** WorkBuddy 那套能力索引 —— 能力索引按**区域**取值（`deepseek-v4.1-flash`
+/// 国服 `x0.03` / 国际版 `x0.00`），而 Qoder 的 `price_factor` 不分区。故
+/// 「按产品查」与「按区域查」是两条路，不可混用。
+fn product_multiplier_for(state: &AppState, product: &str, model: &str) -> Option<f64> {
+    product_multiplier_of(state, product, model)
+}
+
+/// [`product_multiplier_for`] 的直接别名，供 [`crate::capability`] 的回调使用。
+///
+/// 单独包一层是为了**让两条路径共用同一个实现** —— `/v1/models` 的渠道倍率与
+/// `/usage` 的计费倍率必须一致，分成两个函数就是给它们漂移的机会。
+fn product_multiplier_of(state: &AppState, product: &str, model: &str) -> Option<f64> {
+    let up = state.products.dispatch_by_product(product)?;
+    up.model_multiplier(model)
 }
 
 /// 从缓存的能力索引里取该区域该模型的积分倍率；取不到返回 `None`。
@@ -2494,6 +2538,7 @@ async fn run_forward(
         client: &state.client,
         session: state.session.as_ref(),
         max_rotate: state.max_rotate,
+        in_flight_wait: state.in_flight_wait,
         soft_cooldown: state.soft_cooldown,
         refresh_skew: state.refresh_skew,
         allowed_model: state.allowed_model.clone(),
@@ -3530,6 +3575,7 @@ mod tests {
             session: None,
             api_key: api_key.into(),
             max_rotate: 3,
+            in_flight_wait: std::time::Duration::ZERO,
             soft_cooldown: std::time::Duration::from_secs(60),
             refresh_skew: std::time::Duration::from_secs(600),
             redis_mode: String::new(),

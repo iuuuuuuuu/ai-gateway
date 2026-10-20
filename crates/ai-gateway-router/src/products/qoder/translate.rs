@@ -39,10 +39,105 @@ use super::cred::new_uuid;
 /// 而 [`super::stream`] 又在解析回传 `reasoning_content` ⇒ 下游永远白等。
 const MODEL_SOURCE_SYSTEM: &str = "system";
 
+/// `model_config.format`：上游只认 `openai`（与官方客户端一致）。
+const MODEL_FORMAT_OPENAI: &str = "openai";
+
+/// `model_config` 里 `max_input_tokens` 缺失时的兜底值。
+///
+/// 取自官方客户端抓包的 `180000`。★ 这只是**兜底**：真实值优先取模型清单里的
+/// `max_input_tokens` / `context_config`（见 [`ModelMeta`]）。
+const DEFAULT_MAX_INPUT_TOKENS: i64 = 180_000;
+
+/// `model_config` 的元数据来源（模型清单里那一项的投影）。
+///
+/// # 为什么必须带上这些字段，而不是只发 `key`
+///
+/// 我们原先只发 `{key, is_reasoning, source}` 三个字段，而上游的
+/// `model_config` 是一个**结构体**：缺字段时它不会报错，而是**回落成官方客户端的
+/// 默认身份**（`display_name="Auto"`、`format` 缺失、`max_input_tokens` 缺失）。
+///
+/// 表现就是本次现场：模型名明明传对了（`model=DeepSeek-Flash`、`x-model-key` 头正确、
+/// `/usage` 里也有 qoder 归属的 `DeepSeek-Flash` 记录），但**回答自称是 Qoder** ——
+/// 上游按"官方 Qoder CLI 默认身份"接管了系统提示。
+///
+/// ⇒ 结论：**模型名不是问题，`model_config` 的完整度才是**。字段必须与模型清单
+/// 里那一项对齐，让上游认出"这是在用某个具体模型"，而不是"一个没填身份的客户端"。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct ModelMeta {
+    /// 上游 key（`model_config.key`）。
+    pub(crate) key: String,
+    /// 展示名（`model_config.display_name`）。空则回落 `key`。
+    pub(crate) display_name: String,
+    /// 是否推理模型（`model_config.is_reasoning`）。
+    pub(crate) is_reasoning: bool,
+    /// 是否视觉模型（`model_config.is_vl`）。
+    pub(crate) is_vl: bool,
+    /// 最大输入 token（`model_config.max_input_tokens`）。
+    pub(crate) max_input_tokens: i64,
+    /// 会话归属（账号 uid）：**只参与 `session_id` 派生，不写进 `model_config`**。
+    ///
+    /// # 为什么必须按账号隔离会话（2026-10-20 现场）
+    ///
+    /// `session_id` 是上游的会话键。若同一段对话在换号后继续用**同一个**
+    /// `session_id`，新账号可能继承前一个账号的会话状态（或直接被视为
+    /// 「不属于你的会话」）—— 现场表现为两个账号**连续空流**，而官方客户端
+    /// （一个会话固定一个账号）完全正常。
+    ///
+    /// 空字符串 = 不隔离（单测与老调用点）；生产路径由 `Dispatch` 填入 `cr.uid`。
+    pub(crate) session_owner: String,
+}
+
+impl ModelMeta {
+    /// 只给 key 时的最小元数据（测试与"清单里查不到"时用）。
+    pub(crate) fn key_only(key: &str) -> Self {
+        Self {
+            key: key.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// 实际写进 `display_name` 的值：空则回落 key。
+    fn display_name_or_key(&self) -> &str {
+        if self.display_name.is_empty() {
+            &self.key
+        } else {
+            &self.display_name
+        }
+    }
+
+    /// 实际写进 `max_input_tokens` 的值：非正数则回落兜底常量。
+    fn max_input_tokens_or_default(&self) -> i64 {
+        if self.max_input_tokens > 0 {
+            self.max_input_tokens
+        } else {
+            DEFAULT_MAX_INPUT_TOKENS
+        }
+    }
+
+    /// 构造 `model_config`（顶层与 `chat_context.extra.modelConfig` **共用同一份**）。
+    fn to_config(&self) -> Value {
+        json!({
+            "key": self.key,
+            "display_name": self.display_name_or_key(),
+            // 上游对空 model 的容忍度未知，显式给空串（与官方客户端一致）
+            "model": "",
+            "format": MODEL_FORMAT_OPENAI,
+            "is_vl": self.is_vl,
+            "is_reasoning": self.is_reasoning,
+            "api_key": "",
+            "url": "",
+            "source": MODEL_SOURCE_SYSTEM,
+            "max_input_tokens": self.max_input_tokens_or_default(),
+        })
+    }
+}
+
 /// 构造 Qoder agent 请求体。
 ///
-/// `model_key` 必须是**上游 key**（不是客户端看到的显示名）。
-pub(crate) fn build_agent_body(openai_body: &[u8], model_key: &str) -> Result<Vec<u8>, String> {
+/// `meta` 是**上游 key + 模型清单里的元数据**（不是客户端看到的显示名）。
+/// 只传 key 也能工作（[`ModelMeta::key_only`]），但 `model_config` 会缺字段，
+/// 上游会回落成官方客户端默认身份 —— 见 [`ModelMeta`] 的说明。
+pub(crate) fn build_agent_body(openai_body: &[u8], meta: &ModelMeta) -> Result<Vec<u8>, String> {
     let req: Value =
         serde_json::from_slice(openai_body).map_err(|e| format!("解析 OpenAI 请求体失败: {e}"))?;
 
@@ -55,7 +150,7 @@ pub(crate) fn build_agent_body(openai_body: &[u8], model_key: &str) -> Result<Ve
         return Err("请求里没有 messages".to_string());
     }
 
-    let mut out = agent_body(&messages, model_key)?;
+    let mut out = agent_body(&messages, meta)?;
 
     // tools 仅在客户端**显式**传入时注入（模板 tools 会让 prompt_tokens 从 ~60 涨到 ~10K）
     if let Some(tools) = req.get("tools").and_then(|v| v.as_array()) {
@@ -71,16 +166,12 @@ pub(crate) fn build_agent_body(openai_body: &[u8], model_key: &str) -> Result<Ve
 }
 
 /// 构造 agent 请求体（不含 tools）。
-fn agent_body(messages: &[Value], model_key: &str) -> Result<Vec<u8>, String> {
+fn agent_body(messages: &[Value], meta: &ModelMeta) -> Result<Vec<u8>, String> {
     let prompt = last_user_text(messages);
     let now_ms = now_unix_millis();
     let new_id = new_uuid();
 
-    let model_config = json!({
-        "key": model_key,
-        "is_reasoning": false,
-        "source": MODEL_SOURCE_SYSTEM,
-    });
+    let model_config = meta.to_config();
 
     // 键序与 Go 侧源码一致（serde_json 无 preserve_order ⇒ BTreeMap，输出按 key 排序，
     // 与 Go 的 json.Marshal(map) 行为一致）。
@@ -89,7 +180,22 @@ fn agent_body(messages: &[Value], model_key: &str) -> Result<Vec<u8>, String> {
     // ★ 与 request_id **同一个** newID
     base.insert("chat_record_id".into(), json!(new_id));
     base.insert("request_set_id".into(), json!(new_uuid()));
-    base.insert("session_id".into(), json!(derive_session_id(model_key, &prompt)));
+    // ★★ session_id 必须用**首条** user 文本派生（不是最后一条）：
+    //    它在整段对话里稳定，上游的会话缓存才能命中。官方客户端就是这么做的
+    //    ——`sessionId` 在整个会话里不变（见 2026-10-20 现场实测日志）。
+    //    用 `prompt`（最后一条）会让每轮都是新 session。
+    //
+    // ★★ 同时把**账号 uid** 混进派生种子：换号后不能复用上一个账号的会话键，
+    //    否则新账号可能继承坏会话（现场表现为两号连续空流）。
+    let session_scope = if meta.session_owner.is_empty() {
+        meta.key.clone()
+    } else {
+        format!("{}\u{0}{}", meta.session_owner, meta.key)
+    };
+    base.insert(
+        "session_id".into(),
+        json!(derive_session_id(&session_scope, &first_user_text(messages))),
+    );
     base.insert("stream".into(), json!(true));
     base.insert("aliyun_user_type".into(), json!("personal_professional_trial"));
     base.insert("agent_id".into(), json!("agent_common"));
@@ -159,7 +265,10 @@ fn normalize_developer_roles(messages: &[Value]) -> Vec<Value> {
     out
 }
 
-/// 会话 ID：`sha256(modelKey + "\0" + 首条 user 文本)` 取前 16 字节拼 UUID 形态。
+/// 会话 ID：`sha256(会话命名空间 + "\0" + 首条 user 文本)` 取前 16 字节拼 UUID 形态。
+///
+/// `session_namespace` 通常是上游模型 key；生产路径由 [`agent_body`] 拼成
+/// `账号 uid + "\0" + 模型 key`，避免换号后复用上一个账号的会话键。
 ///
 /// # 为什么不能每次 new UUID
 ///
@@ -172,12 +281,12 @@ fn normalize_developer_roles(messages: &[Value]) -> Vec<Value> {
 /// CodeBuddy 等 agentic IDE 每轮向 system prompt 注入动态内容
 ///（时间 / git 快照 / linter / 光标），system 逐轮变 → session 逐轮变
 /// → 上游缓存永远读不到上一轮前缀（**命中恒 0**）。
-/// 只用「模型 + 首条 user 文本」。不引入安全风险（session_id 不是凭据）。
+/// 只用「会话命名空间 + 首条 user 文本」。不引入安全风险（session_id 不是凭据）。
 ///
 /// `\0` 是分隔符：避免 `("ab","c")` 与 `("a","bc")` 撞同一个哈希。
-pub(crate) fn derive_session_id(model_key: &str, first_user_text: &str) -> String {
+pub(crate) fn derive_session_id(session_namespace: &str, first_user_text: &str) -> String {
     let mut h = Sha256::new();
-    h.update(model_key.as_bytes());
+    h.update(session_namespace.as_bytes());
     h.update([0u8]);
     h.update(first_user_text.as_bytes());
     let sum = h.finalize();
@@ -199,20 +308,33 @@ pub(crate) fn derive_session_id(model_key: &str, first_user_text: &str) -> Strin
 /// 只认字符串会让带图片的请求拿到空 prompt，而 `chat_context.text`
 /// 为空时上游可能直接拒绝。
 pub(crate) fn last_user_text(messages: &[Value]) -> String {
-    for msg in messages.iter().rev() {
-        if msg.get("role").and_then(|v| v.as_str()) != Some("user") {
-            continue;
-        }
-        let Some(content) = msg.get("content") else {
-            continue;
-        };
-        if let Some(s) = content.as_str() {
-            if !s.is_empty() {
-                return s.to_string();
-            }
-            continue;
-        }
-        if let Some(parts) = content.as_array() {
+    messages.iter().rev().find_map(user_text_of).unwrap_or_default()
+}
+
+/// 取**首条** user 消息的文本（`session_id` 的稳定输入）。
+///
+/// # 为什么必须是**首条**（2026-10-20 现场）
+///
+/// 官方 Qoder 客户端的 `sessionId` 在**整段对话**里不变（实测日志：
+/// `sessionId=8937ddb7…` 连续数十个请求都一样）。上游按它做会话级缓存；
+/// 若每轮取最后一条 user 文本，多轮对话的每一轮都会派生出**新的**
+/// `session_id` ⇒ 缓存永不命中，且上游会把同一段对话当成大量新会话，
+/// 触发限流/空流的概率显著上升。
+///
+/// 首条 user 文本在同一次对话中天然稳定（用户不会改第一句话），
+/// 跨对话又不同，是网关在**无状态**前提下能做到的最好近似。
+pub(crate) fn first_user_text(messages: &[Value]) -> String {
+    messages.iter().find_map(user_text_of).unwrap_or_default()
+}
+
+/// 从一条消息里取文本；非 user 或空文本返回 `None`。
+fn user_text_of(msg: &Value) -> Option<String> {
+    if msg.get("role").and_then(|v| v.as_str()) != Some("user") {
+        return None;
+    }
+    match msg.get("content")? {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Array(parts) => {
             let mut sb = String::new();
             for p in parts {
                 if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
@@ -221,12 +343,14 @@ pub(crate) fn last_user_text(messages: &[Value]) -> String {
                     }
                 }
             }
-            if !sb.is_empty() {
-                return sb;
+            if sb.is_empty() {
+                None
+            } else {
+                Some(sb)
             }
         }
+        _ => None,
     }
-    String::new()
 }
 
 /// 按**字符**（不是字节）截断 —— 按字节截会把汉字劈两半。
@@ -258,19 +382,77 @@ mod tests {
         let body = br#"{"model":"m","messages":[
             {"role":"developer","content":"you are helpful"},
             {"role":"user","content":"hi"}]}"#;
-        let out = parse(&build_agent_body(body, "qmodel_x").unwrap());
+        let out = parse(&build_agent_body(body, &ModelMeta::key_only("qmodel_x")).unwrap());
         assert_eq!(out["messages"][0]["role"], "system");
         // 其它角色不动
         assert_eq!(out["messages"][1]["role"], "user");
         // 大小写/空格也要认
         let body2 = br#"{"messages":[{"role":" Developer ","content":"x"},{"role":"user","content":"y"}]}"#;
-        let out2 = parse(&build_agent_body(body2, "k").unwrap());
+        let out2 = parse(&build_agent_body(body2, &ModelMeta::key_only("k")).unwrap());
         assert_eq!(out2["messages"][0]["role"], "system");
     }
 
     #[test]
+    fn model_config_carries_every_field_the_upstream_expects() {
+        // ★ 现场缺陷：只发 {key, is_reasoning, source} 三个字段时，上游会回落成
+        //   「官方客户端默认身份」—— 模型名传对了，回答却自称是 Qoder。
+        //   这条测试钉住「必须发全 10 个字段」。
+        let meta = ModelMeta {
+            key: "qmodel_preview".into(),
+            display_name: "DeepSeek-Flash".into(),
+            is_reasoning: true,
+            is_vl: false,
+            max_input_tokens: 128_000,
+            ..Default::default()
+        };
+        let out = parse(&build_agent_body(br#"{"messages":[{"role":"user","content":"hi"}]}"#, &meta).unwrap());
+        let mc = &out["model_config"];
+        assert_eq!(mc["key"], "qmodel_preview");
+        assert_eq!(mc["display_name"], "DeepSeek-Flash");
+        assert_eq!(mc["model"], "");
+        assert_eq!(mc["format"], "openai");
+        assert_eq!(mc["is_vl"], false);
+        assert_eq!(mc["is_reasoning"], true, "必须如实转发清单里的值");
+        assert_eq!(mc["api_key"], "");
+        assert_eq!(mc["url"], "");
+        assert_eq!(mc["source"], "system");
+        assert_eq!(mc["max_input_tokens"], 128_000);
+        // 字段总数：少一个就说明有人删了
+        assert_eq!(
+            mc.as_object().unwrap().len(),
+            10,
+            "model_config 必须发全 10 个字段，实际: {mc}"
+        );
+        // chat_context.extra 里的那份必须与顶层**完全一致**
+        assert_eq!(out["chat_context"]["extra"]["modelConfig"], *mc);
+    }
+
+    #[test]
+    fn model_config_falls_back_when_metadata_is_missing() {
+        // 清单里查不到（qmodel* 逃生口 / 清单为空）⇒ key-only 也必须能构造出
+        // 完整的 model_config，用兜底值填，而不是漏字段。
+        let out = parse(&build_agent_body(br#"{"messages":[{"role":"user","content":"hi"}]}"#, &ModelMeta::key_only("k")).unwrap());
+        let mc = &out["model_config"];
+        assert_eq!(mc["key"], "k");
+        assert_eq!(mc["display_name"], "k", "空展示名回落 key");
+        assert_eq!(mc["max_input_tokens"], DEFAULT_MAX_INPUT_TOKENS);
+        assert_eq!(mc.as_object().unwrap().len(), 10);
+        // 非推理模型默认 false，视觉默认 false
+        assert_eq!(mc["is_reasoning"], false);
+        assert_eq!(mc["is_vl"], false);
+    }
+
+    #[test]
+    fn model_config_zero_max_tokens_falls_back() {
+        // 清单里 max_input_tokens 为 0 时不能原样发 0（上游会认为收不了任何输入）
+        let meta = ModelMeta { key: "k".into(), max_input_tokens: 0, ..Default::default() };
+        let out = parse(&build_agent_body(br#"{"messages":[{"role":"user","content":"hi"}]}"#, &meta).unwrap());
+        assert_eq!(out["model_config"]["max_input_tokens"], DEFAULT_MAX_INPUT_TOKENS);
+    }
+
+    #[test]
     fn model_config_has_source_system_and_is_reasoning_false() {
-        let out = parse(&build_agent_body(br#"{"messages":[{"role":"user","content":"hi"}]}"#, "qmodel_preview").unwrap());
+        let out = parse(&build_agent_body(br#"{"messages":[{"role":"user","content":"hi"}]}"#, &ModelMeta::key_only("qmodel_preview")).unwrap());
         assert_eq!(out["model_config"]["key"], "qmodel_preview");
         assert_eq!(out["model_config"]["source"], "system");
         assert_eq!(out["model_config"]["is_reasoning"], false);
@@ -283,7 +465,7 @@ mod tests {
         // ★ 非 ASCII 内容必须走 `&str` 再 `.as_bytes()`：`br#"..."#` 是**字节**串，
         // 只接受 ASCII（rustc 会直接报 "non-ASCII character in raw byte string literal"）。
         let body = r#"{"messages":[{"role":"user","content":"你好"}]}"#;
-        let out = parse(&build_agent_body(body.as_bytes(), "k").unwrap());
+        let out = parse(&build_agent_body(body.as_bytes(), &ModelMeta::key_only("k")).unwrap());
         assert_eq!(out["agent_id"], "agent_common");
         assert_eq!(out["chat_task"], "FREE_INPUT");
         assert_eq!(out["session_type"], "qodercli");
@@ -313,7 +495,7 @@ mod tests {
             "messages": [{"role":"user","content": long}]
         }))
         .unwrap();
-        let out = parse(&build_agent_body(&body, "k").unwrap());
+        let out = parse(&build_agent_body(&body, &ModelMeta::key_only("k")).unwrap());
         let name = out["business"]["name"].as_str().unwrap();
         assert_eq!(name.chars().count(), 30, "按字符截断，不能按字节");
         assert_eq!(name, "一".repeat(30));
@@ -322,23 +504,23 @@ mod tests {
     #[test]
     fn tools_injected_only_when_client_sends_them() {
         // 不带 tools
-        let out = parse(&build_agent_body(br#"{"messages":[{"role":"user","content":"hi"}]}"#, "k").unwrap());
+        let out = parse(&build_agent_body(br#"{"messages":[{"role":"user","content":"hi"}]}"#, &ModelMeta::key_only("k")).unwrap());
         assert!(out.get("tools").is_none(), "客户端没传 tools 就不该注入");
         // 带 tools
         let body = br#"{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}"#;
-        let out = parse(&build_agent_body(body, "k").unwrap());
+        let out = parse(&build_agent_body(body, &ModelMeta::key_only("k")).unwrap());
         assert_eq!(out["tools"][0]["function"]["name"], "f");
         // 空数组也不注入
-        let out = parse(&build_agent_body(br#"{"messages":[{"role":"user","content":"hi"}],"tools":[]}"#, "k").unwrap());
+        let out = parse(&build_agent_body(br#"{"messages":[{"role":"user","content":"hi"}],"tools":[]}"#, &ModelMeta::key_only("k")).unwrap());
         assert!(out.get("tools").is_none());
     }
 
     #[test]
     fn build_rejects_bad_body_and_missing_messages() {
-        assert!(build_agent_body(b"not json", "k").unwrap_err().contains("解析 OpenAI 请求体失败"));
-        let e = build_agent_body(br#"{"model":"m"}"#, "k").unwrap_err();
+        assert!(build_agent_body(b"not json", &ModelMeta::key_only("k")).unwrap_err().contains("解析 OpenAI 请求体失败"));
+        let e = build_agent_body(br#"{"model":"m"}"#, &ModelMeta::key_only("k")).unwrap_err();
         assert!(e.contains("没有 messages"), "实际: {e}");
-        assert!(build_agent_body(br#"{"messages":[]}"#, "k").unwrap_err().contains("没有 messages"));
+        assert!(build_agent_body(br#"{"messages":[]}"#, &ModelMeta::key_only("k")).unwrap_err().contains("没有 messages"));
     }
 
     #[test]
@@ -402,9 +584,81 @@ mod tests {
         // 上游原话：system 逐轮变会让缓存命中恒 0 ⇒ 绝不能纳入哈希
         let a = br#"{"messages":[{"role":"system","content":"time=1"},{"role":"user","content":"hi"}]}"#;
         let b = br#"{"messages":[{"role":"system","content":"time=2"},{"role":"user","content":"hi"}]}"#;
-        let sa = parse(&build_agent_body(a, "k").unwrap())["session_id"].clone();
-        let sb = parse(&build_agent_body(b, "k").unwrap())["session_id"].clone();
+        let sa = parse(&build_agent_body(a, &ModelMeta::key_only("k")).unwrap())["session_id"].clone();
+        let sb = parse(&build_agent_body(b, &ModelMeta::key_only("k")).unwrap())["session_id"].clone();
         assert_eq!(sa, sb, "system 变化不得改变 session_id");
+    }
+
+    /// ★★ 现场缺陷（2026-10-20）：`session_id` 此前用**最后一条** user 文本派生，
+    /// 于是多轮对话的每一轮都是新 session —— 而上游按它做会话级缓存/会话计数。
+    /// 官方客户端的 `sessionId` 在整段对话里**不变**（实测日志：同一个 UUID
+    /// 连续数十个请求）。
+    ///
+    /// 这条钉住「新增一条 user 消息不得改变 session_id」。
+    #[test]
+    fn session_id_is_stable_across_turns() {
+        let turn1 = r#"{"messages":[
+            {"role":"user","content":"第一句：帮我看看这个项目"},
+            {"role":"assistant","content":"好的"}]}"#;
+        let turn2 = r#"{"messages":[
+            {"role":"user","content":"第一句：帮我看看这个项目"},
+            {"role":"assistant","content":"好的"},
+            {"role":"user","content":"第二句：现在改一下"}]}"#;
+        let s1 = parse(&build_agent_body(turn1.as_bytes(), &ModelMeta::key_only("dfmodel")).unwrap())["session_id"].clone();
+        let s2 = parse(&build_agent_body(turn2.as_bytes(), &ModelMeta::key_only("dfmodel")).unwrap())["session_id"].clone();
+        assert_eq!(s1, s2, "同一段对话新增一轮后 session_id 必须保持不变");
+    }
+
+    /// 首条 user 文本不同 ⇒ 不同对话，session_id 必须不同。
+    #[test]
+    fn session_id_differs_across_conversations() {
+        let a = r#"{"messages":[{"role":"user","content":"问题 A"},{"role":"assistant","content":"x"},{"role":"user","content":"追问"}]}"#;
+        let b = r#"{"messages":[{"role":"user","content":"问题 B"},{"role":"assistant","content":"x"},{"role":"user","content":"追问"}]}"#;
+        let sa = parse(&build_agent_body(a.as_bytes(), &ModelMeta::key_only("k")).unwrap())["session_id"].clone();
+        let sb = parse(&build_agent_body(b.as_bytes(), &ModelMeta::key_only("k")).unwrap())["session_id"].clone();
+        assert_ne!(sa, sb, "不同对话不能共用 session_id（否则跨对话串味）");
+    }
+
+    /// ★★ 会话按键号隔离：同一段对话换号后必须换 session_id。
+    ///
+    /// 否则新账号会继承前一个账号的坏会话 —— 现场表现为两个账号**连续空流**，
+    /// 而官方客户端（一个会话固定一个账号）完全正常。
+    #[test]
+    fn session_id_is_scoped_to_account() {
+        let body = r#"{"messages":[{"role":"user","content":"同一段对话"}]}"#;
+        let mut a = ModelMeta::key_only("dfmodel");
+        a.session_owner = "account-a".into();
+        let mut b = ModelMeta::key_only("dfmodel");
+        b.session_owner = "account-b".into();
+        let sa = parse(&build_agent_body(body.as_bytes(), &a).unwrap())["session_id"].clone();
+        let sb = parse(&build_agent_body(body.as_bytes(), &b).unwrap())["session_id"].clone();
+        assert_ne!(sa, sb, "换号必须换 session_id，不能复用上一个账号的会话键");
+        // 同一账号重复构造必须稳定
+        let sa2 = parse(&build_agent_body(body.as_bytes(), &a).unwrap())["session_id"].clone();
+        assert_eq!(sa, sa2);
+    }
+
+    #[test]
+    fn first_user_text_is_stable_and_handles_parts() {
+        let msgs: Vec<Value> = serde_json::from_str(
+            r#"[{"role":"system","content":"sys"},
+                {"role":"user","content":"first"},
+                {"role":"assistant","content":"mid"},
+                {"role":"user","content":"last"}]"#,
+        )
+        .unwrap();
+        assert_eq!(first_user_text(&msgs), "first");
+        let parts: Vec<Value> = serde_json::from_str(
+            r#"[{"role":"user","content":[
+                {"type":"text","text":"看这"},
+                {"type":"image_url","image_url":{"url":"data:..."}},
+                {"type":"text","text":"张图"}]}]"#,
+        )
+        .unwrap();
+        assert_eq!(first_user_text(&parts), "看这张图");
+        let none: Vec<Value> =
+            serde_json::from_str(r#"[{"role":"system","content":"s"}]"#).unwrap();
+        assert_eq!(first_user_text(&none), "");
     }
 
     #[test]
@@ -415,7 +669,7 @@ mod tests {
             {"role":"assistant","content":"a1"},
             {"role":"tool","content":"t1","tool_call_id":"x"},
             {"role":"user","content":"u2"}]}"#;
-        let out = parse(&build_agent_body(body, "k").unwrap());
+        let out = parse(&build_agent_body(body, &ModelMeta::key_only("k")).unwrap());
         assert_eq!(out["messages"].as_array().unwrap().len(), 5, "消息全量透传");
         assert_eq!(out["messages"][3]["role"], "tool");
     }

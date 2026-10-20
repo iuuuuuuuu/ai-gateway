@@ -134,6 +134,10 @@ pub fn default_gateway_config() -> Value {
         "enabled": false,
         "port": 7863,
         "listen": ":7863",
+        // 是否监听局域网（0.0.0.0）。默认 false = 仅回环，避免 api_key 为空时
+        // 把账号额度暴露给整个局域网。`finalize_gateway_config` 会把它落成
+        // 明确的 `listen`（0.0.0.0 / 127.0.0.1），见 `resolve_listen`。
+        "lan_access": false,
         "api_key": "",
         "auto_start": false,
         // 网关工作模式：
@@ -250,7 +254,23 @@ fn finalize_gateway_config(mut cfg: Value) -> Value {
             }
         });
     cfg["port"] = json!(port);
-    cfg["listen"] = json!(normalize_listen(port));
+    // 监听地址由 `lan_access` + port 派生（2026-10-20）。
+    //
+    // # 为什么不能继续写 `:port`
+    //
+    // `ai-gateway-router` 的 `ensure_listen_host(":port")` 会把空 host 归一成
+    // `127.0.0.1`（安全默认，避免 Windows 上 bind 到 IPv6 link-local 导致宿主
+    // 探活超时）。于是**手改 `listen = "0.0.0.0:7864"` 也会在下次读/存配置时
+    // 被这里覆盖回 `:port`** —— 用户看到的就是「又不能监听 0.0.0.0 了」。
+    //
+    // 现在显式存一个 `lan_access`：
+    //   - `true`  → `0.0.0.0:{port}`（局域网可访问）
+    //   - `false` → `127.0.0.1:{port}`（默认，仅本机）
+    //   - 缺键    → 从已有的 `listen` 推断（兼容手写 `0.0.0.0:port` 的老配置），
+    //               并**原样保留**用户指定的 host（如某个具体网卡 IP）。
+    let (listen, lan_access) = resolve_listen(&cfg, port);
+    cfg["lan_access"] = json!(lan_access);
+    cfg["listen"] = json!(listen);
     // 「限制使用的模型」统一成**数组**形状。
     //
     // 老配置里这个键是单值字符串（实测所有者本机的 gateway_config.json 就是
@@ -280,11 +300,39 @@ fn read_existing_config() -> Option<Value> {
 /// listen / api_key 一起重置为默认值，导致界面与网关实际配置不一致
 ///（曾经因此让账号池查询带上空 api_key，前端显示异常）。
 fn merge_gateway_config(input: &Value) -> Value {
-    let base = match read_existing_config() {
+    let mut existing = read_existing_config();
+    // 老配置兼容：手写 `listen = "0.0.0.0:..."` 而没有 `lan_access` 时，
+    // 必须在 overlay(defaults) **之前**把它提升成 `lan_access=true` ——
+    // 否则默认值里的 false 会变成「显式关闭」，finalize 把 0.0.0.0 改回回环。
+    if let Some(obj) = existing.as_mut().and_then(Value::as_object_mut) {
+        infer_lan_access_from_listen(obj);
+    }
+    let mut input = input.clone();
+    if let Some(obj) = input.as_object_mut() {
+        infer_lan_access_from_listen(obj);
+    }
+    let base = match existing {
         Some(existing) => overlay(default_gateway_config(), &existing),
         None => default_gateway_config(),
     };
-    finalize_gateway_config(overlay(base, input))
+    finalize_gateway_config(overlay(base, &input))
+}
+
+/// 缺 `lan_access` 但手写了非回环、非空 host 的 `listen` ⇒ 补 `lan_access=true`。
+///
+/// 只用于**输入侧**兼容（老配置/直接调 API 的场景）。显式写了
+/// `lan_access=false` 的对象不动 —— 那才是「用户明确要回环」。
+fn infer_lan_access_from_listen(obj: &mut serde_json::Map<String, Value>) {
+    if obj.contains_key("lan_access") {
+        return;
+    }
+    let Some(s) = obj.get("listen").and_then(Value::as_str) else {
+        return;
+    };
+    let s = s.trim();
+    if !s.is_empty() && !is_loopback_listen(s) && !has_empty_host(s) {
+        obj.insert("lan_access".to_string(), json!(true));
+    }
 }
 
 /// 读取网关配置（缺字段自动补默认值）。
@@ -1816,6 +1864,56 @@ pub fn normalize_listen(port: u16) -> String {
     format!(":{port}")
 }
 
+/// 由 `lan_access` + 现有 `listen` 解析出 `(监听地址, 是否局域网)`。
+///
+/// # 三条规则
+///
+/// 1. `lan_access` **显式存在** → 它说了算：`true` ⇒ `0.0.0.0:{port}`，
+///    `false` ⇒ `127.0.0.1:{port}`；
+/// 2. 缺键且现有 `listen` 有**非回环、非空 host**（`0.0.0.0` / 具体网卡 IP）
+///    → 原样保留。这是为兼容「手改 gateway_config.json 的老配置」——
+///    2026-10-20 现场正是手写 `0.0.0.0` 被 `:port` 覆盖，表现为「又不能监听
+///    0.0.0.0 了」；
+/// 3. 其余（空 host / 裸端口 / 回环）→ `127.0.0.1:{port}`（安全默认）。
+///
+/// **三处调用点必须共用本函数**（finalize / resync / start）：各写一份必然
+/// 分叉，而分叉的表现是「保存后改了回来，重启又变回去」这类幽灵行为。
+fn resolve_listen(cfg: &Value, port: u16) -> (String, bool) {
+    let listen = cfg.get("listen").and_then(Value::as_str).unwrap_or("");
+    let trimmed = listen.trim();
+    let inferred_lan =
+        !trimmed.is_empty() && !is_loopback_listen(trimmed) && !has_empty_host(trimmed);
+    match cfg.get("lan_access").and_then(Value::as_bool) {
+        Some(true) => (format!("0.0.0.0:{port}"), true),
+        Some(false) => (format!("127.0.0.1:{port}"), false),
+        // 缺键 + 手写 host：原样保留（可能是具体网卡 IP）。
+        None if inferred_lan => (trimmed.to_string(), true),
+        None => (format!("127.0.0.1:{port}"), false),
+    }
+}
+
+/// `listen` 的 host 是否是回环（`127.*` / `localhost` / `[::1]`）。
+fn is_loopback_listen(s: &str) -> bool {
+    let host = if let Some(rest) = s.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        s.rsplit_once(':').map(|(h, _)| h).unwrap_or(s)
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
+}
+
+/// `listen` 是否没有 host（`:7863` / 裸端口 `7863` / `[]:7863`）。
+fn has_empty_host(s: &str) -> bool {
+    if s.starts_with('[') {
+        return s.starts_with("[]");
+    }
+    match s.rsplit_once(':') {
+        Some((host, _)) => host.trim().is_empty(),
+        // 裸端口没有冒号 ⇒ 等价于空 host。
+        None => true,
+    }
+}
+
 /// 端口是否可绑定（对外暴露，供前端做占用检测）。
 pub fn is_port_available(port: u16) -> bool {
     port > 0 && port_free(port)
@@ -2979,7 +3077,8 @@ pub fn resync_native_config() -> Result<PathBuf, String> {
         .unwrap_or_else(|| port_of(cfg.get("listen").and_then(Value::as_str).unwrap_or(":7863")));
     let mut cfg = cfg;
     cfg["port"] = json!(port);
-    cfg["listen"] = json!(normalize_listen(port));
+    let (listen, _) = resolve_listen(&cfg, port);
+    cfg["listen"] = json!(listen);
     write_native_config(&cfg)
 }
 
@@ -3931,7 +4030,8 @@ pub async fn start_gateway(cfg: &Value) -> Result<Value, String> {
         });
     let mut cfg = cfg.clone();
     cfg["port"] = json!(port);
-    cfg["listen"] = json!(normalize_listen(port));
+    let (listen, _) = resolve_listen(&cfg, port);
+    cfg["listen"] = json!(listen);
 
     let native_cfg = write_native_config(&cfg)?;
 
@@ -6630,7 +6730,65 @@ mod tests {
     #[test]
     fn finalize_fills_listen_default() {
         let cfg = super::finalize_gateway_config(json!({"listen": "  "}));
-        assert_eq!(cfg["listen"], ":7863");
+        assert_eq!(cfg["listen"], "127.0.0.1:7863");
+        assert_eq!(cfg["lan_access"], false, "空 host ⇒ 默认仅回环");
+    }
+
+    /// ★★ 2026-10-20 现场：手改 `listen = "0.0.0.0:..."` 会被 `:port` 覆盖，
+    /// 网关再把空 host 归一成回环 ⇒ 用户看到「又不能监听 0.0.0.0 了」。
+    #[test]
+    fn finalize_keeps_manual_wildcard_listen() {
+        let cfg = super::finalize_gateway_config(json!({"listen": "0.0.0.0:7864"}));
+        assert_eq!(cfg["listen"], "0.0.0.0:7864", "手写 wildcard 不能被抹掉");
+        assert_eq!(cfg["lan_access"], true);
+    }
+
+    #[test]
+    fn finalize_preserves_specific_manual_host() {
+        let cfg = super::finalize_gateway_config(json!({"listen": "192.168.1.10:7864"}));
+        assert_eq!(cfg["listen"], "192.168.1.10:7864", "具体网卡 IP 也不能被改宽成 0.0.0.0");
+        assert_eq!(cfg["lan_access"], true);
+    }
+
+    #[test]
+    fn finalize_lan_access_controls_listen_host() {
+        let on = super::finalize_gateway_config(json!({"port": 7864, "lan_access": true}));
+        assert_eq!(on["listen"], "0.0.0.0:7864");
+        assert_eq!(on["lan_access"], true);
+
+        let off = super::finalize_gateway_config(json!({"port": 7864, "lan_access": false}));
+        assert_eq!(off["listen"], "127.0.0.1:7864");
+        assert_eq!(off["lan_access"], false);
+    }
+
+    /// 老配置兼容：磁盘上缺 `lan_access` 但手写了 `0.0.0.0` 时，必须在
+    /// overlay(defaults) 之前补 `true`，否则默认值的 `false` 会把 wildcard 改回回环。
+    #[test]
+    fn infer_lan_access_from_manual_listen() {
+        let mut obj = json!({"listen": "0.0.0.0:7864"}).as_object().unwrap().clone();
+        super::infer_lan_access_from_listen(&mut obj);
+        assert_eq!(obj["lan_access"], true);
+
+        let mut obj = json!({"listen": ":7864"}).as_object().unwrap().clone();
+        super::infer_lan_access_from_listen(&mut obj);
+        assert!(obj.get("lan_access").is_none(), "空 host 不得被推断成局域网");
+
+        // 显式 false 优先：不能被手写 listen 覆盖
+        let mut obj = json!({"listen": "0.0.0.0:7864", "lan_access": false})
+            .as_object()
+            .unwrap()
+            .clone();
+        super::infer_lan_access_from_listen(&mut obj);
+        assert_eq!(obj["lan_access"], false, "显式 false 才是用户明确要回环");
+    }
+
+    #[test]
+    fn finalize_normalizes_empty_host_to_loopback() {
+        for raw in [":7864", "7864"] {
+            let cfg = super::finalize_gateway_config(json!({"listen": raw}));
+            assert_eq!(cfg["listen"], "127.0.0.1:7864", "raw={raw}");
+            assert_eq!(cfg["lan_access"], false, "raw={raw}");
+        }
     }
 
     // 回归保护：被标记「需重新登录」的账号不得导出到网关。

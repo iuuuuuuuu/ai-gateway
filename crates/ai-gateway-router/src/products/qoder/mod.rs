@@ -99,6 +99,39 @@ impl ProductUpstream for QoderUpstream {
     async fn aggregate(&self, sse: &str, model: &str) -> std::result::Result<Map<String, Value>, String> {
         stream::aggregate(sse, model)
     }
+
+    /// 倍率来自模型清单里的 `price_factor`（上游自带、不分区）。
+    ///
+    /// # 为什么以前这里是 `false`
+    ///
+    /// [`crate::capability`] 里那条注释写的是「Qoder 有 `price_factor`，但那个值
+    /// 来自账号登录时的模型清单，**不在本函数的可见范围内**」—— 那是真的：
+    /// 能力索引只拿到「模型名清单」，拿不到 `price_factor`。于是当时的选择是
+    /// `has_multiplier = false`（界面不显示倍率列），并把理由写成「宁可不说」。
+    ///
+    /// 但 `price_factor` 一直躺在 [`Dispatch`] 的模型清单缓存里（[`DynamicModel`]
+    /// 的字段，注释还写着「网关路径不用」）—— **不是没有数据，是没接线**。
+    /// 现场 `/usage` 的输出就是证据：`"key":"qoder||?","hasMultiplier":false`。
+    ///
+    /// ⇒ 现在由 [`Dispatch::multiplier_of`] 直接读缓存，走 trait 的
+    /// [`ProductUpstream::model_multiplier`]，计费层不需要知道 Qoder 的数据在哪。
+    fn model_multiplier(&self, model: &str) -> Option<f64> {
+        self.dispatch.multiplier_of(model)
+    }
+
+    /// 启动时拉一次模型清单，让 `/v1/models` 的倍率列**首屏**就有真值。
+    ///
+    /// 依次尝试各个账号：国际版清单端点可能被上游限制（实测 `api3.qoder.sh`
+    /// TLS 层被重置），若第一个账号恰好是国际版，直接放弃会让国服账号的倍率
+    /// 也空白。成功一个即可 —— 各账号的 `price_factor` 相同（上游按模型定价）。
+    /// 失败由 [`Dispatch::warm_models`] 自己打日志并返回，不影响启动。
+    async fn warm_model_cache(&self, accounts: &[Auth]) {
+        for a in accounts {
+            if self.dispatch.warm_models(a).await {
+                break;
+            }
+        }
+    }
 }
 
 /// 加载一个目录下的全部 Qoder 凭证，转成账号池用的 [`Auth`]。

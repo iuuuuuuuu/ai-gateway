@@ -47,9 +47,62 @@ pub const EMPTY_STREAM_WINDOW: Duration = Duration::from_secs(60);
 /// 2 个仍有偶发凑巧的空间（现场 6 波重试里任意两波撞上就够了）；
 /// 3 个**不同**账号在 60 秒内接连空流，基本只剩「上游整体故障」一种解释。
 ///
-/// ★ 副作用是刻意设计：账号总数少于 3 的小池子**永远触发不了**本判定 ——
-/// 那种池子里换号本来就是把每个号试一遍，没有可省的轮转。
+/// ★★ 这是**上限**，不是固定阈值：实际阈值由 [`effective_threshold`] 按该通道的
+/// 账号总数夹小。此前这里是一刀切的常量，注释还把它当成「刻意设计」——
+///
+/// > ★ 副作用是刻意设计：账号总数少于 3 的小池子**永远触发不了**本判定
+///
+/// 那个「刻意」是错的。qoder 只有 **2 个账号**，于是 qoder 通道上的风暴熔断
+/// **永久失效**：现场（2026-10-20 07:34）1 分钟内 23 次「上游返回空流 ⇒ 换号 ⇒
+/// 再空流」，每次都以「轮转耗尽（本请求已试 2 个账号）」收尾，客户端一路 503。
+/// 「换号本来就是把每个号试一遍，没有可省的轮转」这个理由只在小池子**健康**时成立；
+/// 上游整体故障时，把每个号都试一遍正是要避免的事（每次尝试都加深上游风控）。
 pub const EMPTY_STREAM_THRESHOLD: usize = 3;
+
+/// 按通道账号总数把阈值夹到「不超过账号数」。
+///
+/// - `accounts >= EMPTY_STREAM_THRESHOLD` ⇒ 用常量（大池子行为不变）；
+/// - `accounts <  EMPTY_STREAM_THRESHOLD` ⇒ 用 `accounts`，但**至少 2**。
+///
+/// 下界 2 的理由：阈值 1 会让**单个**账号的一次偶发空流立刻熔断整条通道 ——
+/// 那正是本模块开头警告的「单号问题被误判成上游整体故障」。两个不同账号在同一
+/// 窗口内都空流，才排除了「单个账号自己的问题」。
+///
+/// `accounts == 0`（池子里没有该通道的账号）时返回 2：那种情况下根本选不到号，
+/// 轮转会在别处失败，不该由这里给出「上游故障」的错误结论。
+pub fn effective_threshold(accounts: usize) -> usize {
+    if accounts == 0 {
+        return 2;
+    }
+    accounts.clamp(2, EMPTY_STREAM_THRESHOLD)
+}
+
+/// 空流风暴的分桶键里「区域」那一段取什么值。
+///
+/// # 为什么不能一律用账号自带区域（2026-10-20 现场）
+///
+/// Qoder 的两个账号分属 `qoder.com.cn`（国服）与 `qoder.sh`（国际版），而
+/// `qoder:模型名` 的选号**不分区域**（`Region::Any`，一次轮转可以换到另一个
+/// 区域的号）。若按账号区域分桶，两个账号会落进**两个各只有 1 个账号的桶** ——
+/// 而判据是「窗口内不同账号数」，下界又是 2，于是两边都永远凑不满：现场
+/// 08:36 的 8 次「空流 ⇒ 换号 ⇒ 再空流」里熔断一次都没生效。
+///
+/// ⇒ 桶必须与**轮转范围**一致：
+///
+/// - 产品前缀请求（`qoder:...`）用**请求的区域**；未指定时是 `any`，即整产品；
+/// - 裸名请求的轮转范围就是账号区域，保持原样（WorkBuddy 的国服/国际版是
+///   两条不同上游，不能互相连坐）。
+pub fn channel_region<'a>(
+    is_product_request: bool,
+    request_region: &'a str,
+    account_region: &'a str,
+) -> &'a str {
+    if is_product_request {
+        request_region
+    } else {
+        account_region
+    }
+}
 
 /// 时钟注入点：生产用 [`Instant::now`]，单测注入假时钟以断言「窗口过期」。
 ///
@@ -157,9 +210,13 @@ impl EmptyStreamWindow {
 
     /// 该通道是否已判定「上游整体空流」，返回 `(判定, 窗口内不同账号数)`。
     ///
+    /// `accounts_on_channel` 是**该（产品, 区域）通道上一共多少账号**（不看健康度），
+    /// 由调用方从账号池取（[`crate::pool::Pool::channel_account_count`]）。阈值按它
+    /// 夹小 —— 见 [`effective_threshold`] 与 [`EMPTY_STREAM_THRESHOLD`] 的说明。
+    ///
     /// 读路径同样触发过期清理：判定必须随窗口**滑动**失效，而不是一旦
     /// 成立就永久拦下去 —— 上游恢复之后网关不能还在替它「节省轮转」。
-    pub fn blocked(&self, product: &str, region: &str) -> (bool, usize) {
+    pub fn blocked(&self, product: &str, region: &str, accounts_on_channel: usize) -> (bool, usize) {
         let mut inner = lock_or_recover(&self.inner);
         evict(&mut inner, self.now.now());
         let n = inner
@@ -167,7 +224,12 @@ impl EmptyStreamWindow {
             .get(&(product.to_string(), region.to_string()))
             .map(|b| b.len())
             .unwrap_or(0);
-        (n >= inner.threshold, n)
+        (n >= effective_threshold(accounts_on_channel), n)
+    }
+
+    /// 该通道**当前生效**的阈值（供日志与界面说明，不参与判定）。
+    pub fn threshold_for(&self, accounts_on_channel: usize) -> usize {
+        effective_threshold(accounts_on_channel)
     }
 
     pub fn window(&self) -> Duration {
@@ -272,6 +334,79 @@ mod tests {
         EmptyStreamWindow::with_limits(EMPTY_STREAM_WINDOW, EMPTY_STREAM_THRESHOLD, clk.clock())
     }
 
+    /// 「大池子」的通道账号数：≥ 阈值 ⇒ 阈值就是 [`EMPTY_STREAM_THRESHOLD`]。
+    ///
+    /// 绝大多数既有测试关心的是**窗口语义**，与池子大小无关，故统一用这个值，
+    /// 让它们的断言保持原样。小池子的行为见 `small_pool_*` 那几条专测。
+    const BIG_POOL: usize = 19;
+
+    /// ★★ 小池子（qoder 只有 2 个账号）必须**能**判定上游整体故障。
+    ///
+    /// 现场缺陷（2026-10-20 07:34）：固定阈值 3 对 2 个账号永远达不到 ⇒ 熔断
+    /// 永久失效 ⇒ 1 分钟内 23 次「空流 ⇒ 换号 ⇒ 再空流」，每次「轮转耗尽
+    /// （已试 2 个账号）」。两个不同账号都空流，已经排除了「单号问题」。
+    #[test]
+    fn small_pool_reaches_verdict() {
+        let clk = FakeClock::new();
+        let s = test_window(&clk);
+
+        // 2 个账号的通道
+        assert_eq!(s.note("uid-a", "qoder", ""), 1);
+        let (blocked, _) = s.blocked("qoder", "", 2);
+        assert!(!blocked, "只有 1 个账号空流不能判定 —— 那可能是这个号自己的问题");
+
+        assert_eq!(s.note("uid-b", "qoder", ""), 2);
+        let (blocked, n) = s.blocked("qoder", "", 2);
+        assert!(
+            blocked,
+            "2 个账号的通道上，2 个**不同**账号都空流就该判定上游整体故障"
+        );
+        assert_eq!(n, 2);
+    }
+
+    /// 单账号通道：阈值夹到 2 ⇒ 一个号反复空流**仍然不判定**。
+    ///
+    /// 这是 [`effective_threshold`] 下界为 2 的理由：阈值 1 会让单个账号的
+    /// 一次偶发空流立刻熔断整条通道，把「单号问题」误判成「上游整体故障」。
+    #[test]
+    fn single_account_channel_never_self_trips() {
+        let clk = FakeClock::new();
+        let s = test_window(&clk);
+        for _ in 0..10 {
+            s.note("uid-only", "qoder", "");
+            let (blocked, _) = s.blocked("qoder", "", 1);
+            assert!(!blocked, "单个账号自己不能凑成「上游整体故障」");
+        }
+    }
+
+    /// ★★ 分桶键必须与**轮转范围**一致（2026-10-20 现场）。
+    ///
+    /// Qoder 的两个账号分别在 cn / intl；`qoder:模型名` 的轮转是整产品。
+    /// 按账号区域分桶会让两个账号落在两个单号桶里 —— 不同账号数永远到不了 2，
+    /// 风暴熔断**永久失效**。
+    #[test]
+    fn product_request_buckets_by_request_region_not_account_region() {
+        // 产品前缀请求：看请求区域（未指定 = any ⇒ 整产品一个桶）
+        assert_eq!(channel_region(true, "any", "cn"), "any");
+        assert_eq!(channel_region(true, "any", "intl"), "any");
+        // 显式区域前缀：仍按请求区域（只轮转该区域）
+        assert_eq!(channel_region(true, "cn", "intl"), "cn");
+        // 裸名请求：轮转范围就是账号区域，保持原口径
+        assert_eq!(channel_region(false, "any", "cn"), "cn");
+        assert_eq!(channel_region(false, "intl", "cn"), "cn");
+    }
+
+    /// 阈值只被**夹小**，绝不被放大：大池子仍是 3。
+    #[test]
+    fn threshold_is_clamped_not_raised() {
+        assert_eq!(effective_threshold(0), 2, "池子为空时不给出「上游故障」结论");
+        assert_eq!(effective_threshold(1), 2, "下界 2");
+        assert_eq!(effective_threshold(2), 2);
+        assert_eq!(effective_threshold(3), 3);
+        assert_eq!(effective_threshold(19), EMPTY_STREAM_THRESHOLD);
+        assert_eq!(effective_threshold(1000), EMPTY_STREAM_THRESHOLD);
+    }
+
     /// 同一账号反复空流**不算**上游整体故障。
     #[test]
     fn same_account_repeated_does_not_trigger() {
@@ -281,7 +416,7 @@ mod tests {
         for i in 0..10 {
             let n = s.note("uid-a", "workbuddy", "intl");
             assert_eq!(n, 1, "第 {} 次同一账号空流的不同账号数应恒为 1", i + 1);
-            let (blocked, _) = s.blocked("workbuddy", "intl");
+            let (blocked, _) = s.blocked("workbuddy", "intl", BIG_POOL);
             assert!(
                 !blocked,
                 "第 {} 次同一账号空流就判定上游故障 —— 这是单号问题，不该中止轮转",
@@ -300,13 +435,13 @@ mod tests {
         let s = test_window(&clk);
 
         assert_eq!(s.note("uid-a", "workbuddy", "intl"), 1);
-        let (blocked, _) = s.blocked("workbuddy", "intl");
+        let (blocked, _) = s.blocked("workbuddy", "intl", BIG_POOL);
         assert!(!blocked, "第 1 个账号空流不该判定（阈值是 3 个不同账号）");
         assert_eq!(s.note("uid-b", "workbuddy", "intl"), 2);
-        let (blocked, _) = s.blocked("workbuddy", "intl");
+        let (blocked, _) = s.blocked("workbuddy", "intl", BIG_POOL);
         assert!(!blocked, "第 2 个不同账号空流仍不该判定");
         assert_eq!(s.note("uid-c", "workbuddy", "intl"), 3);
-        let (blocked, n) = s.blocked("workbuddy", "intl");
+        let (blocked, n) = s.blocked("workbuddy", "intl", BIG_POOL);
         assert!(blocked, "第 3 个**不同**账号空流应判定上游整体故障");
         assert_eq!(n, 3);
     }
@@ -323,11 +458,11 @@ mod tests {
         s.note("uid-a", "workbuddy", "intl");
         s.note("uid-b", "workbuddy", "intl");
         s.note("uid-c", "workbuddy", "intl");
-        let (blocked, _) = s.blocked("workbuddy", "intl");
+        let (blocked, _) = s.blocked("workbuddy", "intl", BIG_POOL);
         assert!(blocked);
         // 窗口内继续：重复账号再来一次也应仍判 blocked。
         s.note("uid-a", "workbuddy", "intl");
-        let (blocked, _) = s.blocked("workbuddy", "intl");
+        let (blocked, _) = s.blocked("workbuddy", "intl", BIG_POOL);
         assert!(blocked, "判定在窗口内应持续有效（重复账号不撤销判定）");
         // 新通道此时仍不受影响（见 keys_are_isolated 的专测）。
     }
@@ -345,21 +480,21 @@ mod tests {
         s.note("uid-a", "workbuddy", "intl");
         s.note("uid-b", "workbuddy", "intl");
         s.note("uid-c", "workbuddy", "intl");
-        let (blocked, _) = s.blocked("workbuddy", "intl");
+        let (blocked, _) = s.blocked("workbuddy", "intl", BIG_POOL);
         assert!(blocked);
         // 时间推进到窗口之外。
         clk.advance(EMPTY_STREAM_WINDOW + Duration::from_secs(1));
 
-        let (blocked, n) = s.blocked("workbuddy", "intl");
+        let (blocked, n) = s.blocked("workbuddy", "intl", BIG_POOL);
         assert!(!blocked, "窗口过期后判定必须解除");
         assert_eq!(n, 0, "过期条目必须被清理");
         // 重新凑 3 个不同账号才能再次判定 —— 证明是滑动窗口不是永久封锁。
         assert_eq!(s.note("uid-d", "workbuddy", "intl"), 1);
         assert_eq!(s.note("uid-e", "workbuddy", "intl"), 2);
-        let (blocked, _) = s.blocked("workbuddy", "intl");
+        let (blocked, _) = s.blocked("workbuddy", "intl", BIG_POOL);
         assert!(!blocked);
         assert_eq!(s.note("uid-f", "workbuddy", "intl"), 3);
-        let (blocked, _) = s.blocked("workbuddy", "intl");
+        let (blocked, _) = s.blocked("workbuddy", "intl", BIG_POOL);
         assert!(blocked);
     }
 
@@ -412,14 +547,14 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for _ in 0..50 {
                     s.note(&format!("uid-{}", (b'a' + k) as char), "workbuddy", "intl");
-                    let _ = s.blocked("workbuddy", "intl");
+                    let _ = s.blocked("workbuddy", "intl", BIG_POOL);
                 }
             }));
         }
         for h in handles {
             h.join().expect("并发线程不该 panic");
         }
-        let (blocked, n) = s.blocked("workbuddy", "intl");
+        let (blocked, n) = s.blocked("workbuddy", "intl", BIG_POOL);
         assert_eq!(n, 8, "并发写入后不同账号数应为 8");
         assert!(blocked);
     }
@@ -434,7 +569,7 @@ mod tests {
 
         for (i, uid) in ["a", "b", "c", "d"].iter().enumerate() {
             let n = s.note(uid, "workbuddy", "intl");
-            let (blocked, _) = s.blocked("workbuddy", "intl");
+            let (blocked, _) = s.blocked("workbuddy", "intl", BIG_POOL);
             assert_eq!(
                 blocked,
                 n >= s.threshold(),
@@ -450,7 +585,7 @@ mod tests {
         let a = EmptyStreamWindow::default();
         assert_eq!(a.window(), EMPTY_STREAM_WINDOW);
         assert_eq!(a.threshold(), EMPTY_STREAM_THRESHOLD);
-        let (blocked, n) = a.blocked("workbuddy", "intl");
+        let (blocked, n) = a.blocked("workbuddy", "intl", BIG_POOL);
         assert!(!blocked);
         assert_eq!(n, 0);
         // 非法参数走兜底（与 wafip 同款）。
@@ -471,12 +606,12 @@ mod tests {
         s.note("uid-a", "workbuddy", "intl");
         s.note("uid-b", "workbuddy", "intl");
         s.note("uid-c", "workbuddy", "intl");
-        let (intl_blocked, _) = s.blocked("workbuddy", "intl");
+        let (intl_blocked, _) = s.blocked("workbuddy", "intl", BIG_POOL);
         assert!(intl_blocked, "国际区凑满阈值应判定");
-        let (cn_blocked, n) = s.blocked("workbuddy", "cn");
+        let (cn_blocked, n) = s.blocked("workbuddy", "cn", BIG_POOL);
         assert!(!cn_blocked, "国际区故障不得连坐国服（cn 窗口应为空）");
         assert_eq!(n, 0);
-        let (zcode_blocked, _) = s.blocked("zcode", "intl");
+        let (zcode_blocked, _) = s.blocked("zcode", "intl", BIG_POOL);
         assert!(!zcode_blocked, "产品维度也必须隔离");
     }
 

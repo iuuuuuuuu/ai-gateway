@@ -73,6 +73,37 @@ pub trait ProductUpstream: Send + Sync {
     /// `model` 是客户端请求的裸模型名（已剥掉产品/区域前缀），用于回填
     /// 响应里的 `model` 字段。
     async fn aggregate(&self, sse: &str, model: &str) -> std::result::Result<Map<String, Value>, String>;
+
+    /// 该模型在本产品上的**计费倍率**（`None` = 本产品没有这个概念或未声明）。
+    ///
+    /// # 为什么放在 trait 上而不是各调用点自己查
+    ///
+    /// 倍率的**数据源因产品而异**：WorkBuddy 来自上游 `/v3/config` 的能力索引
+    /// （按区域、由 [`crate::capability`] 提供），Qoder 来自模型清单里的
+    /// `price_factor`（不分区、由账号凭证自带的清单提供）。若让
+    /// [`crate::server::record_usage`] 自己分支，它就得知道每个产品内部的
+    /// 数据放在哪 —— 那是把产品实现细节泄进计费层。
+    ///
+    /// 默认实现返回 `None`（= 该产品没有倍率概念，界面不显示倍率列）。
+    /// 这是**保守的正确默认**：宁可不说，也不给一个可能错的数字。
+    ///
+    /// ⚠ 返回 `Some(0.0)` 与 `None` **语义完全不同**：前者是「免费」（确定），
+    /// 后者是「不知道」。见 [`crate::usage::Billing`] 的三态语义。
+    fn model_multiplier(&self, _model: &str) -> Option<f64> {
+        None
+    }
+
+    /// 启动时预热「模型清单」缓存（默认什么也不做）。
+    ///
+    /// # 为什么需要它（2026-10-20 倍率现场）
+    ///
+    /// 倍率来自产品自己的模型清单缓存。缓存只在**第一次对话**时才填充，
+    /// 于是「网关刚启动、还没发过对话」时，模型路由清单里所有倍率都是空的 ——
+    /// 用户会以为这个功能没做。这里在启动后（后台任务）拉一次清单，
+    /// 让页面首次打开就能看到真实倍率。
+    ///
+    /// 失败**不得**影响启动：由实现自己打日志并返回。
+    async fn warm_model_cache(&self, _accounts: &[Auth]) {}
 }
 
 /// 已配置的产品上游集合。
@@ -135,5 +166,25 @@ impl ProductUpstreams {
     /// `forward.go:565-572` 的 `isProduct`。
     pub fn is_product_account(a: &Auth) -> bool {
         a.is_qoder() || a.is_zcode() || a.is_trae()
+    }
+
+    /// 按**产品名**选上游（不是按账号）。
+    ///
+    /// # 为什么需要它（与 [`Self::dispatch`] 的分工）
+    ///
+    /// [`Self::dispatch`] 回答的是「这个**账号**该走哪个上游」—— 转发路径用它。
+    /// 本函数回答的是「这个**产品**的上游在哪」—— 计费路径用它：
+    /// [`crate::server::record_usage`] 手上只有 `product` 字符串（计费归属），
+    /// 没有 `Auth`。
+    ///
+    /// 传 `workbuddy` 或未知产品名返回 `None`（WorkBuddy 的倍率走能力索引，
+    /// 与本集合无关）。
+    pub fn dispatch_by_product(&self, product: &str) -> Option<&Arc<dyn ProductUpstream>> {
+        match product {
+            crate::auth::PRODUCT_QODER => self.qoder.as_ref(),
+            crate::auth::PRODUCT_ZCODE => self.zcode.as_ref(),
+            crate::auth::PRODUCT_TRAE => self.trae.as_ref(),
+            _ => None,
+        }
     }
 }

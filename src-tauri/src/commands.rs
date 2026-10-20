@@ -871,6 +871,11 @@ pub fn get_gateway_config() -> Result<Value, String> {
 #[allow(clippy::too_many_arguments)]
 pub fn save_gateway_config(
     port: Option<u16>,
+    // 是否监听局域网（0.0.0.0）。camelCase: `lanAccess`。
+    //
+    // ★ 必须显式声明并透传：Tauri 的 serde 会把未声明的参数**静默丢弃**，
+    // 表现为「开关保存成功但网关仍只听回环」。
+    lan_access: Option<bool>,
     api_key: Option<String>,
     auto_start: Option<bool>,
     mode: Option<String>,
@@ -913,6 +918,9 @@ pub fn save_gateway_config(
     let mut patch = serde_json::Map::new();
     if let Some(p) = port {
         patch.insert("port".to_string(), json!(p));
+    }
+    if let Some(v) = lan_access {
+        patch.insert("lan_access".to_string(), json!(v));
     }
     if let Some(k) = api_key {
         patch.insert("api_key".to_string(), json!(k));
