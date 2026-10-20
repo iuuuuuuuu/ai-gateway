@@ -626,6 +626,40 @@ pub fn budget_exceeded_guess(
     Some(input + max_tokens > UPSTREAM_REQUEST_TOKEN_BUDGET)
 }
 
+/// Qoder 请求的预算估算：返回 `(输入估算, max_tokens, 合计)`。
+///
+/// # 为什么 Qoder 要单独算（2026-10-20 现场）
+///
+/// Qoder 上游对「输入 + max_tokens 超预算」的返回**不是** 11133，而是
+/// HTTP 200 + **14 字节**（`data: [DONE]`）就关流 —— 网关此前把它当空流，
+/// 换号后两个账号各回一次 `[DONE]`，最终报 `upstream_stream_stalled`。
+/// 客户端看到的是一个「稍后重试」的 503，**永远不会**触发压缩，
+/// 于是同一个超限请求无限重试。
+///
+/// 实测（隔离实例 57899，`qoder:国服:DeepSeek-Flash`）：
+/// - 输入 ≈ 216k + max_tokens 8 → 成功；
+/// - 输入 ≈ 1.2M + max_tokens 8 → 200 + 14 字节 `[DONE]`；
+/// - 小输入 + max_tokens 128000 → 成功（不是 max_tokens 单独触发）。
+///
+/// 故在发请求前用与 WorkBuddy 相同的 `1 << 20` 预算拒绝，文案明确要求
+/// 压缩上下文或调小 max_tokens。
+fn qoder_budget_of(body: &[u8]) -> (i64, i64, i64) {
+    let input = estimate_tokens(body);
+    let max_tokens = max_tokens_of(body).unwrap_or(0);
+    (input, max_tokens, input + max_tokens)
+}
+
+/// Qoder 超预算时给客户端的文案（`context_length_exceeded`）。
+fn qoder_context_budget_message(input: i64, max_tokens: i64) -> String {
+    format!(
+        "这次请求的上下文加上输出上限超过了模型一次能处理的上限（估算输入约 {input} + max_tokens {max_tokens}，\
+         上限约 {budget}）。请压缩或清空会话后重试；若必须保留 {max_tokens} 的输出，\
+         输入需要控制在约 {room} 以内。",
+        budget = UPSTREAM_REQUEST_TOKEN_BUDGET,
+        room = (UPSTREAM_REQUEST_TOKEN_BUDGET - max_tokens).max(0),
+    )
+}
+
 /// 取请求体里的 `max_tokens` / `maxTokens`（缺失或非数字 ⇒ `None`）。
 ///
 /// 缺失按 0 计：那种请求**确实**没有为输出预留预算，不该因为我们不知道就判超限。
@@ -1155,6 +1189,43 @@ pub async fn forward_chat(
 
             break;
         };
+
+        // ★★ Qoder 的「上下文超限」是 HTTP 200 + 14 字节 `data: [DONE]`，
+        // 不是 11133。必须**发请求前**按「输入 + max_tokens」拒绝：
+        // 否则客户端只看到 upstream_stream_stalled，永远不会触发压缩，
+        // 同一个超限请求会无限重试（2026-10-20 现场：1M 上下文 + 128K 输出）。
+        //
+        // 放在选号之后而不是之前：裸名请求也可能选中 Qoder 账号。
+        // 未 acquire 名额，故这里直接返回、无需 release。
+        if acct.is_qoder() {
+            let (input, max_tokens, total) = qoder_budget_of(body);
+            if total > UPSTREAM_REQUEST_TOKEN_BUDGET {
+                crate::logline!(
+                    "qoder dispatch uid={} model={}: 请求预算超限（估算输入 {} + max_tokens {} = {} > {}），拒绝发送",
+                    acct.uid,
+                    model,
+                    input,
+                    max_tokens,
+                    total,
+                    UPSTREAM_REQUEST_TOKEN_BUDGET
+                );
+                return (
+                    Some(ChatResult::Response {
+                        uid: acct.uid.clone(),
+                        model: model.clone(),
+                        product: "qoder".to_string(),
+                        region: String::new(),
+                        body: serde_json::Map::new(),
+                    }),
+                    400,
+                    Some(ForwardFailure {
+                        kind: FailureKind::ContextTooLong,
+                        status: 400,
+                        message: qoder_context_budget_message(input, max_tokens),
+                    }),
+                );
+            }
+        }
 
         tried.push(acct.uid.clone());
         last_uid = acct.uid.clone();
@@ -4304,12 +4375,44 @@ mod tests {
     /// 估算函数：CJK ≈ 2 字符/token，ASCII ≈ 4 字符/token，且**向上取整**。
     #[test]
     fn estimate_tokens_matches_measured_ratios() {
-        // 实测：3000 CJK 字符 → 150210-1502... 见 doc 表（≈2 字符/token）
+        // 实测：3000 CJK 字符 → 1502... 见 doc 表（≈2 字符/token）
         assert_eq!(estimate_tokens("测试文本内容".repeat(500).as_bytes()), 1500);
         // 纯 ASCII：4 字符/token，向上取整
         assert_eq!(estimate_tokens(b"abcd"), 1);
         assert_eq!(estimate_tokens(b"abcde"), 2);
         assert_eq!(estimate_tokens(b""), 0);
+    }
+
+    /// ★★ Qoder 的超限形态是 HTTP 200 + `[DONE]`，必须在发请求前用
+    /// 「输入 + max_tokens」拒绝；否则客户端只看到 `upstream_stream_stalled`。
+    #[test]
+    fn qoder_budget_detects_one_m_context_plus_128k_output() {
+        let filler = "测试".repeat(1_000_000); // ≈ 1,000,000 tokens（CJK 2 字符/token）
+        let body = format!(
+            r#"{{"max_tokens":128000,"messages":[{{"role":"user","content":"{}"}}]}}"#,
+            filler
+        );
+        let (input, max_tokens, total) = qoder_budget_of(body.as_bytes());
+        assert!(input > 900_000, "估算输入应接近 1M，实际 {input}");
+        assert_eq!(max_tokens, 128_000);
+        assert!(
+            total > UPSTREAM_REQUEST_TOKEN_BUDGET,
+            "1M 输入 + 128K 输出必须被判超限，实际 {total}"
+        );
+    }
+
+    #[test]
+    fn qoder_budget_allows_normal_requests() {
+        let body = r#"{"max_tokens":128000,"messages":[{"role":"user","content":"你好"}]}"#;
+        let (_, _, total) = qoder_budget_of(body.as_bytes());
+        assert!(total < UPSTREAM_REQUEST_TOKEN_BUDGET);
+    }
+
+    #[test]
+    fn qoder_budget_message_names_the_budget_and_room() {
+        let msg = qoder_context_budget_message(1_000_000, 128_000);
+        assert!(msg.contains("1048576"), "{msg}");
+        assert!(msg.contains("920576"), "应给出 128K 输出下可用的输入余量：{msg}");
     }
 
     /// ★ 内联图片的 base64 段**不能**按字符数计。

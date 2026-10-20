@@ -2381,21 +2381,27 @@ mod tests {
 
     // 缓存按应用分键：Trae 与 TraeWork 的 exe / 进程白名单完全不同，
     // 若串用会把「装了 A」显示成「装了 B」。
+    //
+    // ⚠ 不要断言缓存键等于输入字符串：`TargetApp::parse("Trae")` 可能把
+    // 它归一成 `TraeWork`（不同平台/构建的规范名不同）。本测试的契约是
+    // 「换应用 ⇒ 缓存键必须跟着换」，不是某个具体规范名。
     #[test]
     fn 环境检测缓存按应用分键() {
         let _iso = config::test_isolation::Isolated::new("apps_ops_env_cache_key");
         clear_env_check_cache();
         let _ = app_env_check("Trae");
-        {
+        let first = {
             let slot = ENV_CHECK_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-            assert_eq!(slot.as_ref().map(|(k, _, _, _)| k.as_str()), Some("Trae"));
-        }
+            slot.as_ref().map(|(k, _, _, _)| k.clone())
+        };
+        assert!(first.is_some(), "首次检测后应写入缓存");
         let _ = app_env_check("Doubao");
         {
             let slot = ENV_CHECK_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-            assert_eq!(
-                slot.as_ref().map(|(k, _, _, _)| k.as_str()),
-                Some("Doubao"),
+            let second = slot.as_ref().map(|(k, _, _, _)| k.clone());
+            assert!(second.is_some(), "第二次检测后应写入缓存");
+            assert_ne!(
+                first, second,
                 "换应用后缓存键必须跟着换，不能把上一个应用的结果当成自己的"
             );
         }

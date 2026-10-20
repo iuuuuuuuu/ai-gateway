@@ -112,6 +112,7 @@ async fn state_with(
         session: None,
         api_key: String::new(),
         max_rotate,
+        in_flight_wait: std::time::Duration::ZERO,
         soft_cooldown: std::time::Duration::from_secs(60),
         refresh_skew: std::time::Duration::from_secs(600),
         redis_mode: String::new(),

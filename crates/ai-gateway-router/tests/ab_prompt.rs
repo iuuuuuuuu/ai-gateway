@@ -94,6 +94,7 @@ async fn state_with(mode: &str, text: &str) -> (Arc<AppState>, Arc<Mutex<Vec<Vec
         session: None,
         api_key: String::new(),
         max_rotate: 1,
+        in_flight_wait: std::time::Duration::ZERO,
         soft_cooldown: std::time::Duration::from_secs(60),
         refresh_skew: std::time::Duration::from_secs(600),
         redis_mode: String::new(),
